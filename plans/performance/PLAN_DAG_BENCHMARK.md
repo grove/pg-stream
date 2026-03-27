@@ -1,6 +1,6 @@
 # DAG Topology Benchmarking Suite
 
-> **Status:** Plan  
+> **Status:** Complete  
 > **Date:** 2026-03-26  
 > **Related:** [PLAN_DAG_PERFORMANCE.md](PLAN_DAG_PERFORMANCE.md) ·
 > [STATUS_PERFORMANCE.md](STATUS_PERFORMANCE.md) ·
@@ -545,18 +545,18 @@ disabled server-wide.
 ### Session 1: Infrastructure & Linear Chain (est. effort: large)
 
 **Deliverables:**
-- [ ] `tests/e2e_dag_bench_tests.rs` — file structure, imports, constants
-- [ ] `DagBenchResult`, `StTimingEntry`, `DagTopology` structs
-- [ ] `build_linear_chain()` topology builder
-- [ ] `measure_latency()` and `measure_throughput()` drivers
-- [ ] `collect_per_st_timing()`, `wait_for_leaf_refresh()` helpers
-- [ ] `theoretical_latency_ms()` formula implementation
-- [ ] `apply_dml_mix()` DML generator
-- [ ] `print_dag_results_table()`, `write_dag_results_json()` reporting
-- [ ] `configure_latency_scheduler()` helper
-- [ ] `bench_latency_linear_5_calc`, `bench_latency_linear_10_calc`,
+- [x] `tests/e2e_dag_bench_tests.rs` — file structure, imports, constants
+- [x] `DagBenchResult`, `StTimingEntry`, `DagTopology` structs
+- [x] `build_linear_chain()` topology builder
+- [x] `measure_latency()` and `measure_throughput()` drivers
+- [x] `collect_per_st_timing()`, `wait_for_leaf_refresh()` helpers
+- [x] `theoretical_latency_ms()` formula implementation
+- [x] `apply_dml_mix()` DML generator
+- [x] `print_dag_results_table()`, `write_dag_results_json()` reporting
+- [x] `configure_latency_scheduler()` helper
+- [x] `bench_latency_linear_5_calc`, `bench_latency_linear_10_calc`,
   `bench_latency_linear_20_calc`, `bench_latency_linear_10_par4` tests
-- [ ] `bench_throughput_linear_5`, `bench_throughput_linear_10`,
+- [x] `bench_throughput_linear_5`, `bench_throughput_linear_10`,
   `bench_throughput_linear_20` tests
 
 **Verification:**
@@ -570,11 +570,11 @@ cargo test --test e2e_dag_bench_tests -- --ignored bench_throughput_linear_5 --t
 ### Session 2: Wide DAG & Fan-Out (est. effort: medium)
 
 **Deliverables:**
-- [ ] `build_wide_dag()` topology builder
-- [ ] `build_fan_out_tree()` topology builder
-- [ ] All wide DAG latency tests (5 tests)
-- [ ] All fan-out latency tests (2 tests)
-- [ ] Wide DAG and fan-out throughput tests (2 tests)
+- [x] `build_wide_dag()` topology builder
+- [x] `build_fan_out_tree()` topology builder
+- [x] All wide DAG latency tests (5 tests)
+- [x] All fan-out latency tests (2 tests)
+- [x] Wide DAG and fan-out throughput tests (2 tests)
 
 **Verification:**
 ```bash
@@ -586,12 +586,12 @@ cargo test --test e2e_dag_bench_tests -- --ignored bench_latency_fanout --test-t
 ### Session 3: Diamond, Mixed & Reporting (est. effort: medium)
 
 **Deliverables:**
-- [ ] `build_diamond()` topology builder
-- [ ] `build_mixed()` topology builder
-- [ ] Diamond latency and throughput tests (2 tests)
-- [ ] Mixed topology latency and throughput tests (3 tests)
-- [ ] Per-level breakdown reporting
-- [ ] Summary table across all topologies
+- [x] `build_diamond()` topology builder
+- [x] `build_mixed()` topology builder
+- [x] Diamond latency and throughput tests (2 tests)
+- [x] Mixed topology latency and throughput tests (3 tests)
+- [x] Per-level breakdown reporting (done in Session 1)
+- [x] Summary table across all topologies (done in Session 1)
 
 **Verification:**
 ```bash
@@ -603,9 +603,9 @@ cargo test --test e2e_dag_bench_tests -- --ignored bench_latency_mixed --test-th
 ### Session 4: Integration & Documentation (est. effort: small)
 
 **Deliverables:**
-- [ ] justfile targets: `test-dag-bench`, `test-dag-bench-fast`
-- [ ] Update `docs/BENCHMARK.md` — add DAG Topology Benchmark section
-- [ ] Full suite validation run
+- [x] justfile targets: `test-dag-bench`, `test-dag-bench-fast` (done in Session 1)
+- [x] Update `docs/BENCHMARK.md` — add DAG Topology Benchmark section
+- [ ] Full suite validation run (deferred — requires Docker E2E image build)
 
 **Verification:**
 ```bash

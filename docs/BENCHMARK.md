@@ -282,6 +282,140 @@ A passing result confirms the scheduler's per-cycle overhead is negligible. Valu
 
 ---
 
+## DAG Topology Benchmarks
+
+The DAG topology benchmark suite in `tests/e2e_dag_bench_tests.rs` measures **end-to-end propagation latency and throughput** through multi-level DAG topologies. While the single-ST benchmarks above measure per-operator refresh speed, these benchmarks measure how efficiently changes propagate through chains, fan-outs, diamonds, and mixed topologies with 5–100+ stream tables.
+
+The core questions these benchmarks answer:
+
+> **How long does it take for a source-table INSERT to propagate through an entire DAG to the leaf stream tables?**
+>
+> **How does PARALLEL refresh mode compare to CALCULATED mode across different topology shapes?**
+
+### Running DAG Benchmarks
+
+```bash
+# Full suite (rebuilds Docker image)
+just test-dag-bench
+
+# Skip Docker image rebuild
+just test-dag-bench-fast
+
+# Individual topology tests
+cargo test --test e2e_dag_bench_tests --features pg18 -- --ignored bench_latency_linear_5 --test-threads=1 --nocapture
+cargo test --test e2e_dag_bench_tests --features pg18 -- --ignored bench_throughput_diamond --test-threads=1 --nocapture
+```
+
+### Topology Patterns
+
+| Topology | Shape | Description |
+|----------|-------|-------------|
+| **Linear Chain** | `src → st_1 → st_2 → ... → st_N` | Sequential pipeline; L1 aggregate, L2+ alternating project/filter |
+| **Wide DAG** | `src → [W parallel chains × D deep]` | W independent chains of depth D from a shared source; tests parallel refresh mode |
+| **Fan-Out Tree** | `src → root → [b children] → [b² grandchildren] → ...` | Exponential fan-out; each parent spawns b children with filter/project variants |
+| **Diamond** | `src → [fan-out aggregates] → JOIN → [extension]` | Fan-out to independent aggregates (SUM/COUNT/MAX/MIN/AVG) then converge via JOIN |
+| **Mixed** | Two sources, 4 layers, ~15 STs | Realistic e-commerce scenario with chains, fan-out, cross-source joins, and alerts |
+
+### Measurement Modes
+
+**Latency benchmarks** (auto-refresh): The scheduler is enabled with a 200 ms interval. The test INSERTs into the source table and polls `pgt_refresh_history` until the leaf stream table has a new COMPLETED entry. This measures the full propagation latency including scheduler overhead.
+
+**Throughput benchmarks** (manual refresh): The scheduler is disabled. The test applies mixed DML (70% UPDATE, 15% DELETE, 15% INSERT) then manually refreshes all STs in topological order. This isolates pure refresh cost from scheduler overhead.
+
+### Theoretical Comparison
+
+Each latency benchmark computes the theoretical prediction from [PLAN_DAG_PERFORMANCE.md](../plans/performance/PLAN_DAG_PERFORMANCE.md) and reports the delta:
+
+| Mode | Formula |
+|------|---------|
+| CALCULATED | L = I_s + N × T_r |
+| PARALLEL(C) | L = Σ ⌈W_l / C⌉ × max(I_p, T_r) per level |
+
+Where T_r is the measured average per-ST refresh time, I_s = 200 ms (scheduler interval), and C is the concurrency limit.
+
+### Reading the Output
+
+#### Per-Cycle Machine-Parseable Lines (stderr)
+
+```
+[DAG_BENCH] topology=linear_chain mode=CALCULATED sts=10 depth=10 width=1 cycle=1 actual_ms=820.3 theory_ms=700.0 overhead_pct=17.2 per_hop_ms=82.0
+```
+
+#### ASCII Summary Table (stdout)
+
+```
+╔══════════════════════════════════════════════════════════════════════════════════════════════════════╗
+║                         pg_trickle DAG Topology Benchmark Results                                 ║
+╠═══════════════╤═══════════════╤══════╤═══════╤═══════╤════════════╤════════════╤═══════════════════╣
+║ Topology      │ Mode          │ STs  │ Depth │ Width │ Actual ms  │ Theory ms  │ Overhead          ║
+╠═══════════════╪═══════════════╪══════╪═══════╪═══════╪════════════╪════════════╪═══════════════════╣
+║ linear_chain  │ CALCULATED    │   10 │    10 │     1 │      820.3 │      700.0 │ +17.2%            ║
+║ wide_dag      │ PARALLEL_C8   │   60 │     3 │    20 │     2430.1 │     1800.0 │ +35.0%            ║
+╚═══════════════╧═══════════════╧══════╧═══════╧═══════╧════════════╧════════════╧═══════════════════╝
+```
+
+#### Per-Level Breakdown
+
+```
+  Per-Level Breakdown (linear_chain D=10, CALCULATED):
+  Level  1: avg  52.3ms  [st_lc_1]
+  Level  2: avg  48.7ms  [st_lc_2]
+  ...
+  Level 10: avg  51.2ms  [st_lc_10]
+  Total:       513.5ms  (scheduler overhead: 306.8ms)
+```
+
+#### JSON Export
+
+Results are written to `target/dag_bench_results/<timestamp>.json` (overridable via `PGS_DAG_BENCH_JSON_DIR` env var) for cross-run comparison.
+
+### Available DAG Benchmark Tests
+
+#### Latency Tests (Auto-Refresh)
+
+| Test Name | Topology | Mode | STs |
+|-----------|----------|------|-----|
+| `bench_latency_linear_5_calc` | Linear, D=5 | CALCULATED | 5 |
+| `bench_latency_linear_10_calc` | Linear, D=10 | CALCULATED | 10 |
+| `bench_latency_linear_20_calc` | Linear, D=20 | CALCULATED | 20 |
+| `bench_latency_linear_10_par4` | Linear, D=10 | PARALLEL(4) | 10 |
+| `bench_latency_wide_3x20_calc` | Wide, D=3 W=20 | CALCULATED | 60 |
+| `bench_latency_wide_3x20_par4` | Wide, D=3 W=20 | PARALLEL(4) | 60 |
+| `bench_latency_wide_3x20_par8` | Wide, D=3 W=20 | PARALLEL(8) | 60 |
+| `bench_latency_wide_5x20_calc` | Wide, D=5 W=20 | CALCULATED | 100 |
+| `bench_latency_wide_5x20_par8` | Wide, D=5 W=20 | PARALLEL(8) | 100 |
+| `bench_latency_fanout_b2d5_calc` | Fan-out, b=2 d=5 | CALCULATED | 31 |
+| `bench_latency_fanout_b2d5_par8` | Fan-out, b=2 d=5 | PARALLEL(8) | 31 |
+| `bench_latency_diamond_4_calc` | Diamond, fan=4 | CALCULATED | 5 |
+| `bench_latency_mixed_calc` | Mixed, ~15 STs | CALCULATED | ~15 |
+| `bench_latency_mixed_par8` | Mixed, ~15 STs | PARALLEL(8) | ~15 |
+
+#### Throughput Tests (Manual Refresh)
+
+| Test Name | Topology | STs | Delta Sizes |
+|-----------|----------|-----|-------------|
+| `bench_throughput_linear_5` | Linear, D=5 | 5 | 10, 100, 1000 |
+| `bench_throughput_linear_10` | Linear, D=10 | 10 | 10, 100, 1000 |
+| `bench_throughput_linear_20` | Linear, D=20 | 20 | 10, 100, 1000 |
+| `bench_throughput_wide_3x20` | Wide, D=3 W=20 | 60 | 10, 100, 1000 |
+| `bench_throughput_fanout_b2d5` | Fan-out, b=2 d=5 | 31 | 10, 100, 1000 |
+| `bench_throughput_diamond_4` | Diamond, fan=4 | 5 | 10, 100, 1000 |
+| `bench_throughput_mixed` | Mixed, ~15 STs | ~15 | 10, 100, 1000 |
+
+### What to Look For
+
+1. **Linear chain: CALCULATED faster than PARALLEL.** For width=1 DAGs, PARALLEL adds poll overhead without parallelism benefit. CALCULATED should be faster.
+
+2. **Wide DAG: PARALLEL(C=8) speedup over CALCULATED.** For width ≥ 20, PARALLEL should show measurable improvement — it refreshes up to C STs concurrently per level instead of sequentially.
+
+3. **Overhead < 100%.** Theoretical vs actual overhead should stay below 100% across all topologies — the formulas should be in the right ballpark.
+
+4. **DIFFERENTIAL action in per-ST breakdown.** ST-on-ST hops should show `DIFFERENTIAL` rather than `FULL`, confirming differential propagation is working.
+
+5. **Throughput scaling with delta size.** Smaller deltas (10 rows) should yield lower per-cycle wall-clock time than larger deltas (1000 rows).
+
+---
+
 ## In-Process Micro-Benchmarks (Criterion.rs)
 
 In addition to the E2E database benchmarks, the project includes two **Criterion.rs** benchmark suites that measure pure Rust computation time without database overhead. These are useful for tracking performance regressions in the internal query-building and IVM differentiation logic.
