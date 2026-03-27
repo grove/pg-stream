@@ -23,6 +23,13 @@
 //!    must pick up those changes (since there is no CDC change buffer
 //!    between stream tables).
 //!
+//! 5. **ST-on-ST must use DIFFERENTIAL, not FULL** — When a downstream
+//!    ST has `refresh_mode = DIFFERENTIAL` and its upstream ST has changes,
+//!    the scheduler must use DIFFERENTIAL refresh via ST change buffers
+//!    (`changes_pgt_{id}`), not force FULL. Guards against the Phase 8
+//!    regression where code restructuring re-introduced a force-FULL
+//!    override.
+//!
 //! Prerequisites: `./tests/build_e2e_image.sh`
 
 mod e2e;
@@ -830,4 +837,139 @@ async fn test_st_on_st_dependency_is_stream_table_type() {
         base_source_type, "TABLE",
         "Dependency on a base table must be recorded as TABLE"
     );
+}
+
+// ── Test: ST-on-ST must use DIFFERENTIAL, never force FULL ──────────────────
+
+/// Regression guard: When an ST-on-ST downstream has `refresh_mode =
+/// DIFFERENTIAL` and its upstream ST has fresh changes in the change buffer
+/// (`changes_pgt_{id}`), the scheduler must use DIFFERENTIAL — not force
+/// FULL.
+///
+/// Phase 8 (v0.11.0) built full infrastructure for differential ST-on-ST
+/// refresh (change buffers, pgt_ placeholders, scan operator routing,
+/// frontier tracking).  A subsequent merge (Phase 6 code restructuring)
+/// accidentally re-introduced a `has_stream_table_changes → Full` override
+/// in several scheduler paths.  This test prevents that regression from
+/// recurring.
+#[tokio::test]
+async fn test_st_on_st_uses_differential_not_full() {
+    let db = E2eDb::new().await.with_extension().await;
+
+    // Source table
+    db.execute(
+        "CREATE TABLE ssd_src (
+            id  SERIAL PRIMARY KEY,
+            grp TEXT NOT NULL,
+            val INT NOT NULL
+        )",
+    )
+    .await;
+    db.execute(
+        "INSERT INTO ssd_src (grp, val) VALUES
+            ('a', 10), ('a', 20), ('b', 30)",
+    )
+    .await;
+
+    // L1: aggregate ST reading from base table
+    db.create_st(
+        "ssd_upstream",
+        "SELECT grp, SUM(val) AS total FROM ssd_src GROUP BY grp",
+        "calculated",
+        "DIFFERENTIAL",
+    )
+    .await;
+
+    // L2: downstream ST reading from the upstream ST (ST-on-ST)
+    db.execute(
+        "SELECT pgtrickle.create_stream_table(
+            'ssd_downstream',
+            $$SELECT grp, total * 2 AS doubled FROM ssd_upstream$$,
+            'calculated',
+            'DIFFERENTIAL'
+        )",
+    )
+    .await;
+
+    // Populate both STs in topological order
+    db.refresh_st_with_retry("ssd_upstream").await;
+    db.refresh_st_with_retry("ssd_downstream").await;
+
+    // Record how many COMPLETED refreshes the downstream had before the delta
+    let before_count: i64 = db
+        .query_scalar(
+            "SELECT count(*) FROM pgtrickle.pgt_refresh_history h
+             JOIN pgtrickle.pgt_stream_tables st ON st.pgt_id = h.pgt_id
+             WHERE st.pgt_name = 'ssd_downstream' AND h.status = 'COMPLETED'",
+        )
+        .await;
+
+    // Enable fast scheduler
+    configure_fast_scheduler(&db).await;
+
+    // Insert delta into source table — triggers CDC
+    db.execute("INSERT INTO ssd_src (grp, val) VALUES ('a', 40), ('b', 50)")
+        .await;
+
+    // Wait for the downstream ST to get a new COMPLETED refresh
+    let timeout = std::time::Duration::from_secs(60);
+    let start = std::time::Instant::now();
+    loop {
+        if start.elapsed() > timeout {
+            panic!(
+                "Timed out waiting for ssd_downstream to receive a scheduler-driven \
+                 refresh after delta INSERT"
+            );
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+        let current_count: i64 = db
+            .query_scalar(
+                "SELECT count(*) FROM pgtrickle.pgt_refresh_history h
+                 JOIN pgtrickle.pgt_stream_tables st ON st.pgt_id = h.pgt_id
+                 WHERE st.pgt_name = 'ssd_downstream' AND h.status = 'COMPLETED'",
+            )
+            .await;
+        if current_count > before_count {
+            break;
+        }
+    }
+
+    // The downstream ST's most recent scheduler-driven refresh must be DIFFERENTIAL.
+    // If the force-FULL regression recurs, this will be 'FULL'.
+    let action: String = db
+        .query_scalar(
+            "SELECT h.action
+             FROM pgtrickle.pgt_refresh_history h
+             JOIN pgtrickle.pgt_stream_tables st ON st.pgt_id = h.pgt_id
+             WHERE st.pgt_name = 'ssd_downstream'
+               AND h.status = 'COMPLETED'
+             ORDER BY h.refresh_id DESC
+             LIMIT 1",
+        )
+        .await;
+
+    assert_eq!(
+        action, "DIFFERENTIAL",
+        "ST-on-ST downstream must use DIFFERENTIAL refresh when upstream has \
+         changes in the change buffer — force-FULL is a Phase 8 regression. \
+         Got action='{action}'"
+    );
+
+    // Verify data correctness: doubled values should reflect the new totals
+    let doubled_a: i64 = db
+        .query_scalar(
+            "SELECT doubled FROM ssd_downstream WHERE grp = 'a'",
+        )
+        .await;
+    // grp 'a' has vals 10+20+40 = 70, doubled = 140
+    assert_eq!(doubled_a, 140, "Expected grp 'a' doubled = 140, got {doubled_a}");
+
+    let doubled_b: i64 = db
+        .query_scalar(
+            "SELECT doubled FROM ssd_downstream WHERE grp = 'b'",
+        )
+        .await;
+    // grp 'b' has vals 30+50 = 80, doubled = 160
+    assert_eq!(doubled_b, 160, "Expected grp 'b' doubled = 160, got {doubled_b}");
 }
