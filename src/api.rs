@@ -5088,6 +5088,11 @@ fn cleanup_cdc_for_source(
 }
 
 /// Parse a possibly schema-qualified name into `(schema, table)`.
+pub(crate) fn parse_qualified_name_pub(name: &str) -> Result<(String, String), PgTrickleError> {
+    parse_qualified_name(name)
+}
+
+/// Parse a possibly schema-qualified name into `(schema, table)`.
 fn parse_qualified_name(name: &str) -> Result<(String, String), PgTrickleError> {
     let parts: Vec<&str> = name.splitn(2, '.').collect();
     match parts.len() {

@@ -25,6 +25,7 @@ mod catalog;
 mod cdc;
 mod config;
 pub mod dag;
+mod diagnostics;
 pub mod dvm;
 pub mod error;
 mod hash;

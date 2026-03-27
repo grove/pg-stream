@@ -18,4 +18,54 @@
 --   D-4: Shared change buffers -- new pgt_shared_change_buffers catalog
 --        table; multi-frontier cleanup coordination.
 --
--- (Add DDL here as features are implemented.)
+-- ── Phase 2: Developer Diagnostic Functions ───────────────────────────────
+
+-- DT-1: explain_query_rewrite — walk a query through every DVM rewrite pass.
+CREATE OR REPLACE FUNCTION pgtrickle."explain_query_rewrite"(
+        "query" TEXT
+) RETURNS TABLE (
+        "pass_name" TEXT,
+        "changed" bool,
+        "sql_after" TEXT
+)
+STRICT
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'explain_query_rewrite_wrapper';
+
+-- DT-2: diagnose_errors — last 5 FAILED refresh events with classification.
+CREATE OR REPLACE FUNCTION pgtrickle."diagnose_errors"(
+        "name" TEXT
+) RETURNS TABLE (
+        "event_time" timestamp with time zone,
+        "error_type" TEXT,
+        "error_message" TEXT,
+        "remediation" TEXT
+)
+STRICT
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'diagnose_errors_wrapper';
+
+-- DT-3: list_auxiliary_columns — __pgt_* columns on a stream table's storage.
+CREATE OR REPLACE FUNCTION pgtrickle."list_auxiliary_columns"(
+        "name" TEXT
+) RETURNS TABLE (
+        "column_name" TEXT,
+        "data_type" TEXT,
+        "purpose" TEXT
+)
+STRICT
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'list_auxiliary_columns_wrapper';
+
+-- DT-4: validate_query — parse and validate without creating a stream table.
+CREATE OR REPLACE FUNCTION pgtrickle."validate_query"(
+        "query" TEXT
+) RETURNS TABLE (
+        "check_name" TEXT,
+        "result" TEXT,
+        "severity" TEXT
+)
+STRICT
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'validate_query_wrapper';
+

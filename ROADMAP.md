@@ -2193,7 +2193,7 @@ action.
 
 > **DAG topology benchmark subtotal: ~3–5 days — ✅ Complete**
 
-### Developer Tooling & Observability Functions (from REPORT_OVERALL_STATUS.md §15)
+### Developer Tooling & Observability Functions (from REPORT_OVERALL_STATUS.md §15) ✅ Complete
 
 > **In plain terms:** pg_trickle's diagnostic toolbox today is limited to
 > `explain_st()` and `refresh_history()`. Operators debugging unexpected mode
@@ -2201,12 +2201,12 @@ action.
 > logs. This section adds four SQL-callable diagnostic functions that surface
 > internal state in a structured, queryable form.
 
-| Item | Description | Effort | Ref |
-|------|-------------|--------|-----|
-| DT-1 | **`explain_query_rewrite(query TEXT)`** — parse a query through the DVM pipeline and return the rewritten SQL plus a list of passes applied (operator rewrites, delta-key injections, TopK detection, group-rescan classification). Useful for debugging unexpected refresh behavior without creating a stream table. | ~1–2d | [plans/performance/REPORT_OVERALL_STATUS.md §15](plans/performance/REPORT_OVERALL_STATUS.md) |
-| DT-2 | **`diagnose_errors(name TEXT)`** — return the last 5 error events for a stream table, classified by type (correctness, performance, config, infrastructure), with a suggested remediation for each class. | ~2–3d | [plans/performance/REPORT_OVERALL_STATUS.md §15](plans/performance/REPORT_OVERALL_STATUS.md) |
-| DT-3 | **`list_auxiliary_columns(name TEXT)`** — list all `__pgt_*` internal columns injected into the stream table's query plan with their purpose (delta tracking, row identity, compaction key). Helps users understand unexpected columns in `SELECT *` output. | ~1d | [plans/performance/REPORT_OVERALL_STATUS.md §15](plans/performance/REPORT_OVERALL_STATUS.md) |
-| DT-4 | **`validate_query(query TEXT)`** — parse and run DVM validation on a query without creating a stream table; return the resolved refresh mode, detected SQL constructs (group-rescan aggregates, non-equijoins, multi-scan subtrees), and any warnings. | ~1–2d | [plans/performance/REPORT_OVERALL_STATUS.md §15](plans/performance/REPORT_OVERALL_STATUS.md) |
+| Item | Description | Effort | Status |
+|------|-------------|--------|--------|
+| DT-1 | **`explain_query_rewrite(query TEXT)`** — parse a query through the DVM pipeline and return the rewritten SQL plus a list of passes applied (operator rewrites, delta-key injections, TopK detection, group-rescan classification). Useful for debugging unexpected refresh behavior without creating a stream table. | ~1–2d | ✅ Done in v0.12.0 Phase 2 |
+| DT-2 | **`diagnose_errors(name TEXT)`** — return the last 5 error events for a stream table, classified by type (correctness, performance, config, infrastructure), with a suggested remediation for each class. | ~2–3d | ✅ Done in v0.12.0 Phase 2 |
+| DT-3 | **`list_auxiliary_columns(name TEXT)`** — list all `__pgt_*` internal columns injected into the stream table's query plan with their purpose (delta tracking, row identity, compaction key). Helps users understand unexpected columns in `SELECT *` output. | ~1d | ✅ Done in v0.12.0 Phase 2 |
+| DT-4 | **`validate_query(query TEXT)`** — parse and run DVM validation on a query without creating a stream table; return the resolved refresh mode, detected SQL constructs (group-rescan aggregates, non-equijoins, multi-scan subtrees), and any warnings. | ~1–2d | ✅ Done in v0.12.0 Phase 2 |
 
 > **Developer tooling subtotal: ~5–8 days**
 
@@ -2381,7 +2381,7 @@ large design changes; all build on existing infrastructure.
 - [x] PERF-3: `tiered_scheduling` default is `true`; CONFIGURATION.md documents tier thresholds ✅ Done in v0.12.0 Phase 1
 - [x] ~~PERF-4: `block_source_ddl` default is `true`~~ ➡️ Pulled to v0.11.0 as DEF-5
 - [x] ~~PERF-5: Wider bitmask (`BYTEA`) supports >63 columns; schema migration tested~~ ➡️ Pulled to v0.11.0 as WB-1/WB-2
-- [ ] DT-1–4: `explain_query_rewrite()`, `diagnose_errors()`, `list_auxiliary_columns()`, `validate_query()` all callable from SQL; each returns structured data
+- [x] DT-1–4: `explain_query_rewrite()`, `diagnose_errors()`, `list_auxiliary_columns()`, `validate_query()` all callable from SQL; each returns structured data — ✅ Done in v0.12.0 Phase 2
 - [x] G13-SD: Parse-tree visitors enforce `max_parse_depth`; pathological query returns `QueryTooComplex` error rather than stack overflow ✅ Done in v0.12.0 Phase 1
 - [ ] G17-IMS: IMMEDIATE mode concurrency stress test passes with 100+ concurrent DML transactions
 - [ ] G12-SQL-IN: Multi-column IN subquery behavior documented or fixed; regression test added

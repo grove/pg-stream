@@ -2958,4 +2958,190 @@ FROM pgtrickle.watermarks()
 ORDER BY watermark;
 ```
 
+---
+
+## Developer Diagnostics (v0.12.0)
+
+Four SQL-callable introspection functions that surface internal DVM state
+without side-effects. All functions are read-only — they never modify catalog
+tables or trigger refreshes.
+
+### `pgtrickle.explain_query_rewrite(query TEXT)`
+
+Walk a query through the full DVM rewrite pipeline and report each pass.
+
+Returns one row per rewrite pass. When a pass changes the query, `changed = true`
+and `sql_after` contains the SQL after the transformation. Two synthetic rows
+are appended: `topk_detection` (detects `ORDER BY … LIMIT`) and `dvm_patterns`
+(lists detected DVM constructs such as aggregation strategy, join types, and
+volatility).
+
+```sql
+SELECT pass_name, changed, sql_after
+FROM pgtrickle.explain_query_rewrite(
+  'SELECT customer_id, SUM(amount) FROM orders GROUP BY customer_id'
+);
+```
+
+**Return columns:**
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `pass_name` | `text` | Rewrite pass name (e.g. `view_inlining`, `distinct_on`, `grouping_sets`) |
+| `changed` | `bool` | Whether this pass modified the query |
+| `sql_after` | `text` | SQL text after this pass (NULL if unchanged) |
+
+**Rewrite passes (in order):**
+
+| Pass | Description |
+|------|-------------|
+| `view_inlining` | Expand view references to their defining SQL |
+| `nested_window_lift` | Lift window functions out of expressions (e.g. `CASE WHEN ROW_NUMBER() OVER (...) ...`) |
+| `distinct_on` | Rewrite `DISTINCT ON` to a `ROW_NUMBER()` window |
+| `grouping_sets` | Expand `GROUPING SETS / CUBE / ROLLUP` to `UNION ALL` of `GROUP BY` |
+| `scalar_subquery_in_where` | Rewrite scalar subqueries in `WHERE` to `CROSS JOIN` |
+| `correlated_scalar_in_select` | Rewrite correlated scalar subqueries in `SELECT` to `LEFT JOIN` |
+| `sublinks_in_or_demorgan` | Apply De Morgan normalization and expand `SubLinks` inside `OR` |
+| `rows_from` | Rewrite `ROWS FROM()` multi-function expressions |
+| `topk_detection` | Detect `ORDER BY … LIMIT n` TopK pattern |
+| `dvm_patterns` | Detected DVM constructs: join types, aggregate strategies, volatility |
+
+---
+
+### `pgtrickle.diagnose_errors(name TEXT)`
+
+Return the last 5 FAILED refresh events for a stream table, with each error
+classified by type and supplied with a remediation hint.
+
+```sql
+SELECT event_time, error_type, error_message, remediation
+FROM pgtrickle.diagnose_errors('my_stream_table');
+```
+
+**Return columns:**
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `event_time` | `timestamptz` | When the failed refresh started |
+| `error_type` | `text` | Classification: `user`, `schema`, `correctness`, `performance`, `infrastructure` |
+| `error_message` | `text` | Raw error text from `pgt_refresh_history` |
+| `remediation` | `text` | Suggested next step |
+
+**Error types:**
+
+| Type | Trigger patterns | Typical action |
+|------|-----------------|----------------|
+| `user` | `query parse error`, `unsupported operator`, `type mismatch` | Check query; run `validate_query()` |
+| `schema` | `upstream table schema changed`, `upstream table dropped` | Reinitialize; check `pgt_dependencies` |
+| `correctness` | `phantom`, `EXCEPT ALL`, `row count mismatch` | Switch to `refresh_mode='FULL'`; report bug |
+| `performance` | `lock timeout`, `deadlock`, `serialization failure`, `spill` | Tune `lock_timeout`; enable `buffer_partitioning` |
+| `infrastructure` | `permission denied`, `SPI error`, `replication slot` | Check role grants; verify slot config |
+
+---
+
+### `pgtrickle.list_auxiliary_columns(name TEXT)`
+
+List all `__pgt_*` internal columns on a stream table's storage relation,
+with an explanation of each column's role.
+
+These columns are normally hidden from `SELECT *` output. This function
+surfaces them for debugging and operator visibility.
+
+```sql
+SELECT column_name, data_type, purpose
+FROM pgtrickle.list_auxiliary_columns('my_stream_table');
+```
+
+**Return columns:**
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `column_name` | `text` | Internal column name (e.g. `__pgt_row_id`) |
+| `data_type` | `text` | PostgreSQL type (e.g. `bigint`, `text`) |
+| `purpose` | `text` | Human-readable description of the column's role |
+
+**Common auxiliary columns:**
+
+| Column | Purpose |
+|--------|---------|
+| `__pgt_row_id` | Row identity hash — MERGE join key for delta application |
+| `__pgt_count` | Multiplicity counter for DISTINCT / aggregation / UNION dedup |
+| `__pgt_count_l` | Left-side multiplicity for INTERSECT / EXCEPT |
+| `__pgt_count_r` | Right-side multiplicity for INTERSECT / EXCEPT |
+| `__pgt_aux_sum_<col>` | Running SUM for algebraic AVG maintenance |
+| `__pgt_aux_count_<col>` | Running COUNT for algebraic AVG maintenance |
+| `__pgt_aux_sum2_<col>` | Sum-of-squares for STDDEV / VAR maintenance |
+| `__pgt_aux_sum{x,y,xy,x2,y2}_<col>` | Five-column set for CORR / COVAR / REGR_* |
+| `__pgt_aux_nonnull_<col>` | Non-null count for SUM-above-FULL-JOIN maintenance |
+
+---
+
+### `pgtrickle.validate_query(query TEXT)`
+
+Parse and validate a query through the DVM pipeline without creating a stream
+table. Returns detected SQL constructs, warnings, and the resolved refresh mode.
+
+```sql
+SELECT check_name, result, severity
+FROM pgtrickle.validate_query(
+  'SELECT customer_id, COUNT(*) FROM orders GROUP BY customer_id'
+);
+```
+
+**Return columns:**
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `check_name` | `text` | Name of the check or detected construct |
+| `result` | `text` | Resolved value or construct description |
+| `severity` | `text` | `INFO`, `WARNING`, or `ERROR` |
+
+The first row always has `check_name = 'resolved_refresh_mode'` with the mode
+that would be assigned under `refresh_mode = 'AUTO'`: `DIFFERENTIAL`, `FULL`,
+or `TOPK`.
+
+**Common check names:**
+
+| Check | Description |
+|-------|-------------|
+| `resolved_refresh_mode` | `DIFFERENTIAL`, `FULL`, or `TOPK` |
+| `topk_pattern` | Detected LIMIT + ORDER BY values |
+| `unsupported_construct` | Feature not supported for DIFFERENTIAL mode (→ WARNING) |
+| `matview_or_foreign_table` | Query references matview/foreign table (→ WARNING, FULL) |
+| `ivm_support_check` | DVM parse result (→ WARNING if DIFFERENTIAL not possible) |
+| `aggregate` | Aggregate with strategy: `ALGEBRAIC_INVERTIBLE`, `ALGEBRAIC_VIA_AUX`, `SEMI_ALGEBRAIC`, or `GROUP_RESCAN` |
+| `join` | Detected join type: `INNER`, `LEFT_OUTER`, `FULL_OUTER`, `SEMI`, `ANTI` |
+| `set_op` | Set operation: `DISTINCT`, `UNION_ALL`, `INTERSECT`, `EXCEPT`, `EXCEPT_ALL` |
+| `window_function` | Query contains window functions |
+| `scalar_subquery` | Query contains scalar subqueries |
+| `lateral` | Query contains LATERAL functions or subqueries |
+| `recursive_cte` | Query uses `WITH RECURSIVE` |
+| `volatility` | Worst-case volatility of functions used: `immutable`, `stable`, `volatile` |
+| `needs_pgt_count` | Multiplicity counter column will be added |
+| `needs_dual_count` | Left/right multiplicity counters will be added |
+| `parse_warning` | Advisory warning from the DVM parse phase |
+
+**Example output for a GROUP_RESCAN query:**
+
+```sql
+SELECT check_name, result, severity
+FROM pgtrickle.validate_query(
+  'SELECT grp, STRING_AGG(tag, '','') FROM events GROUP BY grp'
+);
+```
+
+| check_name | result | severity |
+|---|---|---|
+| `resolved_refresh_mode` | `DIFFERENTIAL` | `INFO` |
+| `aggregate` | `STRING_AGG(GROUP_RESCAN)` | `WARNING` |
+| `needs_pgt_count` | `true — multiplicity counter column required` | `INFO` |
+| `volatility` | `immutable` | `INFO` |
+
+> **Note on GROUP_RESCAN:** `STRING_AGG`, `ARRAY_AGG`, `BOOL_AND`, and other
+> non-algebraic aggregates use a group-rescan strategy — any change in a group
+> triggers full re-aggregation from the source data for that group. This is
+> still DIFFERENTIAL (only changed groups are rescanned), but has higher
+> per-group cost than algebraic strategies. If this is performance-sensitive,
+> consider pre-aggregating with a simpler aggregate and post-processing.
+
 
