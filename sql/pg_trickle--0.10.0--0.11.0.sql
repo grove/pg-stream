@@ -35,6 +35,23 @@
 ALTER TABLE pgtrickle.pgt_stream_tables
     ADD COLUMN IF NOT EXISTS effective_refresh_mode TEXT;
 
+-- DAG perf: refresh_tier for hot/warm/cold/frozen scheduling tiers
+ALTER TABLE pgtrickle.pgt_stream_tables
+    ADD COLUMN IF NOT EXISTS refresh_tier TEXT NOT NULL DEFAULT 'hot';
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conname = 'pgt_stream_tables_refresh_tier_check'
+          AND conrelid = 'pgtrickle.pgt_stream_tables'::regclass
+    ) THEN
+        ALTER TABLE pgtrickle.pgt_stream_tables
+            ADD CONSTRAINT pgt_stream_tables_refresh_tier_check
+            CHECK (refresh_tier IN ('hot', 'warm', 'cold', 'frozen'));
+    END IF;
+END
+$$;
+
 -- FUSE-1: Fuse circuit breaker columns
 ALTER TABLE pgtrickle.pgt_stream_tables
     ADD COLUMN IF NOT EXISTS fuse_mode TEXT NOT NULL DEFAULT 'off';
