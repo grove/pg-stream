@@ -932,6 +932,65 @@ async fn dump_timeout_diagnostics(db: &E2eDb, since_ts: &str, all_sts: &[String]
         }
     }
 
+    // 5. Scheduler job table state — key for diagnosing parallel dispatch stalls
+    eprintln!("[DAG_BENCH_DIAG] Scheduler jobs:");
+    let job_summary = db
+        .query_scalar_opt::<String>(
+            "SELECT string_agg(line, E'\\n' ORDER BY rn) FROM (
+                SELECT ROW_NUMBER() OVER (ORDER BY enqueued_at DESC) AS rn,
+                    'job_id=' || job_id || ' key=' || unit_key || ' kind=' || unit_kind ||
+                    ' status=' || status ||
+                    ' enqueued=' || to_char(enqueued_at, 'HH24:MI:SS.MS') ||
+                    COALESCE(' started=' || to_char(started_at, 'HH24:MI:SS.MS'), '') ||
+                    COALESCE(' finished=' || to_char(finished_at, 'HH24:MI:SS.MS'), '') ||
+                    COALESCE(' worker_pid=' || worker_pid::text, ' worker_pid=NULL') AS line
+                FROM pgtrickle.pgt_scheduler_jobs
+                ORDER BY enqueued_at DESC
+                LIMIT 40
+             ) sub",
+        )
+        .await;
+    match job_summary {
+        Some(s) => {
+            for line in s.lines() {
+                eprintln!("[DAG_BENCH_DIAG]   {line}");
+            }
+        }
+        None => eprintln!("[DAG_BENCH_DIAG]   (no scheduler jobs found)"),
+    }
+
+    let job_status_counts = db
+        .query_scalar_opt::<String>(
+            "SELECT string_agg(status || '=' || cnt::text, ', ' ORDER BY status)
+             FROM (SELECT status, count(*) AS cnt FROM pgtrickle.pgt_scheduler_jobs GROUP BY status) sub",
+        )
+        .await;
+    eprintln!(
+        "[DAG_BENCH_DIAG] Job status counts: {}",
+        job_status_counts.unwrap_or_else(|| "(none)".into())
+    );
+
+    // 6. Active worker processes and max_worker_processes
+    let active_workers = db
+        .query_scalar_opt::<i64>(
+            "SELECT count(*)::bigint FROM pg_stat_activity WHERE backend_type = 'pg_trickle refresh worker'",
+        )
+        .await
+        .unwrap_or(0);
+    let max_workers = db
+        .query_scalar_opt::<String>("SELECT current_setting('max_worker_processes')")
+        .await
+        .unwrap_or_else(|| "?".into());
+    let total_bgw = db
+        .query_scalar_opt::<i64>(
+            "SELECT count(*)::bigint FROM pg_stat_activity WHERE backend_type LIKE 'pg_trickle%'",
+        )
+        .await
+        .unwrap_or(0);
+    eprintln!(
+        "[DAG_BENCH_DIAG] Active refresh workers: {active_workers}, total pg_trickle BGW: {total_bgw}, max_worker_processes: {max_workers}"
+    );
+
     eprintln!("[DAG_BENCH_DIAG] === End Diagnostics ===");
 }
 

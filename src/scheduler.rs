@@ -1143,8 +1143,8 @@ fn execute_worker_fused_chain(job: &SchedulerJob) -> RefreshOutcome {
                     && action == RefreshAction::Differential
                     && refresh::has_downstream_st_consumers(pgt_id)
                 {
-                    let user_cols = refresh::get_st_user_columns(&st);
-                    match crate::refresh::capture_delta_to_bypass_table(&st, &user_cols) {
+                    let user_cols_typed = refresh::get_st_user_columns_typed(&st);
+                    match crate::refresh::capture_delta_to_bypass_table(&st, &user_cols_typed) {
                         Ok(n) => {
                             pgrx::debug1!(
                                 "[pg_trickle] DAG-4: bypass captured {} rows for pgt_id={}",

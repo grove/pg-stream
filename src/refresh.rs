@@ -745,7 +745,7 @@ fn capture_delta_to_st_buffer(
 /// Returns the number of captured rows.
 pub fn capture_delta_to_bypass_table(
     st: &StreamTableMeta,
-    user_cols: &[String],
+    user_cols_typed: &[(String, String)],
 ) -> Result<i64, PgTrickleError> {
     let pgt_id = st.pgt_id;
 
@@ -770,7 +770,7 @@ pub fn capture_delta_to_bypass_table(
 
     let bypass_table = format!("pg_temp.__pgt_bypass_{}", pgt_id);
 
-    let sql = build_bypass_capture_sql(pgt_id, user_cols, &bypass_table);
+    let sql = build_bypass_capture_sql(pgt_id, user_cols_typed, &bypass_table);
 
     let count = Spi::connect_mut(|client| {
         let result = client
@@ -797,27 +797,31 @@ pub fn capture_delta_to_bypass_table(
 /// Build the SQL for creating a bypass temp table and inserting delta rows.
 ///
 /// Pure-logic helper for unit testing.
-pub fn build_bypass_capture_sql(pgt_id: i64, user_cols: &[String], bypass_table: &str) -> String {
+pub fn build_bypass_capture_sql(
+    pgt_id: i64,
+    user_cols_typed: &[(String, String)],
+    bypass_table: &str,
+) -> String {
     let col_defs: String = std::iter::once("lsn pg_lsn".to_string())
         .chain(std::iter::once("action \"char\"".to_string()))
         .chain(std::iter::once("pk_hash bigint".to_string()))
         .chain(
-            user_cols
+            user_cols_typed
                 .iter()
-                .map(|c| format!("\"new_{}\" text", c.replace('"', "\"\""))),
+                .map(|(name, typ)| format!("\"new_{}\" {}", name.replace('"', "\"\""), typ)),
         )
         .collect::<Vec<_>>()
         .join(", ");
 
-    let new_col_list: String = user_cols
+    let new_col_list: String = user_cols_typed
         .iter()
-        .map(|c| format!("\"new_{}\"", c.replace('"', "\"\"")))
+        .map(|(name, _)| format!("\"new_{}\"", name.replace('"', "\"\"")))
         .collect::<Vec<_>>()
         .join(", ");
 
-    let d_col_list: String = user_cols
+    let d_col_list: String = user_cols_typed
         .iter()
-        .map(|c| format!("d.\"{}\"", c.replace('"', "\"\"")))
+        .map(|(name, _)| format!("d.\"{}\"", name.replace('"', "\"\"")))
         .collect::<Vec<_>>()
         .join(", ");
 
@@ -974,6 +978,13 @@ pub fn get_st_user_columns(st: &StreamTableMeta) -> Vec<String> {
         .into_iter()
         .map(|(name, _)| name)
         .collect()
+}
+
+/// Return user column (name, type) pairs for a stream table.
+///
+/// Used by bypass-table creation so column types match the original ST.
+pub fn get_st_user_columns_typed(st: &StreamTableMeta) -> Vec<(String, String)> {
+    crate::cdc::resolve_st_output_columns(st.pgt_relid).unwrap_or_default()
 }
 
 /// Check whether this ST has downstream ST consumers that need delta capture.
@@ -4693,7 +4704,10 @@ mod pg_tests {
     fn test_build_bypass_capture_sql_basic() {
         let sql = build_bypass_capture_sql(
             42,
-            &["id".to_string(), "name".to_string()],
+            &[
+                ("id".to_string(), "integer".to_string()),
+                ("name".to_string(), "text".to_string()),
+            ],
             "pg_temp.__pgt_bypass_42",
         );
         assert!(sql.contains("CREATE TEMP TABLE IF NOT EXISTS pg_temp.__pgt_bypass_42"));
@@ -4706,7 +4720,11 @@ mod pg_tests {
 
     #[test]
     fn test_build_bypass_capture_sql_quoted_columns() {
-        let sql = build_bypass_capture_sql(7, &["col\"name".to_string()], "pg_temp.__pgt_bypass_7");
+        let sql = build_bypass_capture_sql(
+            7,
+            &[("col\"name".to_string(), "text".to_string())],
+            "pg_temp.__pgt_bypass_7",
+        );
         // Column with quote should be properly escaped.
         assert!(sql.contains(r#""new_col""name""#));
         assert!(sql.contains(r#"d."col""name""#));
@@ -4716,14 +4734,17 @@ mod pg_tests {
     fn test_build_bypass_capture_sql_column_defs() {
         let sql = build_bypass_capture_sql(
             1,
-            &["a".to_string(), "b".to_string()],
+            &[
+                ("a".to_string(), "bigint".to_string()),
+                ("b".to_string(), "text".to_string()),
+            ],
             "pg_temp.__pgt_bypass_1",
         );
         // Verify the column definitions in CREATE TEMP TABLE.
         assert!(sql.contains("lsn pg_lsn"));
         assert!(sql.contains("action \"char\""));
         assert!(sql.contains("pk_hash bigint"));
-        assert!(sql.contains("\"new_a\" text"));
+        assert!(sql.contains("\"new_a\" bigint"));
         assert!(sql.contains("\"new_b\" text"));
     }
 
