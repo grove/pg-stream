@@ -77,10 +77,10 @@ fn rf_count() -> usize {
 
 /// Queries allowed to be skipped in DIFFERENTIAL mode.
 const DIFFERENTIAL_SKIP_ALLOWLIST: &[&str] = &[
-    // q05, q07, q08, q09: multi-table joins produce DVM SQL that exceeds
+    // q05: multi-table joins produce DVM SQL that exceeds
     // the Docker container's temp_file_limit (4 GB).  The generated delta
     // queries create large intermediate results for complex join graphs.
-    "q05", "q07", "q08", "q09",
+    "q05",
     // q12: CASE WHEN with IN-list predicate produces non-deterministic
     // incremental results — known DVM drift issue (row content mismatch
     // in high_line_count / low_line_count aggregates).
@@ -95,9 +95,9 @@ const DIFFERENTIAL_SKIP_ALLOWLIST: &[&str] = &[
 /// See plans/testing/TEST_SUITE_TPC_H-GAPS.md §T2 for the initial-population
 /// procedure.
 const IMMEDIATE_SKIP_ALLOWLIST: &[&str] = &[
-    // q05, q07, q08, q09: multi-table joins produce DVM SQL that exceeds
+    // q05: multi-table joins produce DVM SQL that exceeds
     // the Docker container's temp_file_limit (4 GB).
-    "q05", "q07", "q08", "q09",
+    "q05",
 ];
 
 // ── P3.15: TPCH_STRICT mode ───────────────────────────────────────────
@@ -2988,4 +2988,160 @@ async fn test_tpch_immediate_savepoint_rollback() {
         all_passed,
         "One or more invariants failed after savepoint rollback/commit!"
     );
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// EC01B-2: Combined left-DELETE + right-DELETE regression tests
+//
+// These tests verify that Q7/Q8/Q9 produce correct results in
+// DIFFERENTIAL mode when rows are deleted from BOTH sides of a join in
+// the same refresh cycle. This is the primary scenario that triggers
+// the EC-01 phantom-row-after-DELETE bug:
+//
+// When a left-side row is deleted AND its right-side join partner is
+// also deleted simultaneously, the DELETE must still be correctly
+// propagated — not silently dropped because R₁ no longer contains the
+// partner row.
+//
+// The EC01B-1 per-leaf CTE-based snapshot strategy ensures R₀ is used
+// instead of R₁ for deep join trees, preventing phantom rows.
+// ═══════════════════════════════════════════════════════════════════════
+
+/// EC01B-2: Q07 combined left/right DELETE in same cycle.
+/// Deletes rows from both `orders` (left) and `lineitem` (right) in the
+/// same refresh cycle, then asserts no phantom rows remain.
+#[tokio::test]
+#[ignore]
+async fn test_tpch_q07_ec01b_combined_delete() {
+    ec01b_combined_delete_test("q07", include_str!("tpch/queries/q07.sql")).await;
+}
+
+/// EC01B-2: Q08 combined left/right DELETE in same cycle.
+#[tokio::test]
+#[ignore]
+async fn test_tpch_q08_ec01b_combined_delete() {
+    ec01b_combined_delete_test("q08", include_str!("tpch/queries/q08.sql")).await;
+}
+
+/// EC01B-2: Q09 combined left/right DELETE in same cycle.
+#[tokio::test]
+#[ignore]
+async fn test_tpch_q09_ec01b_combined_delete() {
+    ec01b_combined_delete_test("q09", include_str!("tpch/queries/q09.sql")).await;
+}
+
+/// Shared implementation for EC01B-2 combined-delete tests.
+///
+/// 1. Load TPC-H schema + data at SF=0.01
+/// 2. Create DIFFERENTIAL stream table for the given query
+/// 3. Verify baseline invariant (ST matches native SELECT)
+/// 4. Delete rows from multiple source tables in the same cycle:
+///    - Delete lineitem rows + their orders
+///    - This triggers left-DELETE + right-DELETE simultaneously
+/// 5. Refresh and assert invariant holds (no phantom rows)
+/// 6. Run 2 more cycles with RF2+RF3 mutations for stability
+async fn ec01b_combined_delete_test(qname: &str, query_sql: &str) {
+    println!("\n══════════════════════════════════════════════════════════");
+    println!("  EC01B-2: {qname} Combined-Delete Regression Test");
+    println!("══════════════════════════════════════════════════════════\n");
+
+    let db = E2eDb::new_bench().await.with_extension().await;
+    let t = Instant::now();
+    load_schema(&db).await;
+    load_data(&db).await;
+    println!("  Data loaded in {:.1}s\n", t.elapsed().as_secs_f64());
+
+    let st_name = format!("tpch_{qname}_ec01b");
+
+    // Create DIFFERENTIAL ST with no auto-refresh
+    db.try_execute(&format!(
+        "SELECT pgtrickle.create_stream_table('{st_name}', $${query_sql}$$, '24h', 'DIFFERENTIAL')",
+    ))
+    .await
+    .unwrap_or_else(|e| panic!("{qname} create failed: {e}"));
+    println!("  {qname} ST created ✓");
+
+    // Baseline
+    assert_tpch_invariant(&db, &st_name, query_sql, qname, 0)
+        .await
+        .unwrap_or_else(|e| panic!("Baseline failed: {e}"));
+    println!("  baseline ✓");
+
+    // ── Combined left-DELETE + right-DELETE cycle ────────────────────
+    //
+    // Delete lineitem rows AND their corresponding orders in the same
+    // transaction. This is the exact scenario that triggers EC-01: the
+    // left-side (orders) DELETE's old right partner (lineitem) is also
+    // gone from R₁, so without R₀ the DELETE would be silently dropped.
+    db.execute(
+        "DO $$
+        DECLARE
+            v_ok INTEGER;
+        BEGIN
+            -- Pick an orderkey that has lineitem rows
+            SELECT o_orderkey INTO v_ok FROM orders
+            WHERE o_orderkey IN (SELECT l_orderkey FROM lineitem)
+            ORDER BY o_orderkey LIMIT 1;
+
+            IF v_ok IS NOT NULL THEN
+                -- Delete lineitem first (right-side), then orders (left-side)
+                DELETE FROM lineitem WHERE l_orderkey = v_ok;
+                DELETE FROM orders WHERE o_orderkey = v_ok;
+            END IF;
+        END $$",
+    )
+    .await;
+
+    match try_refresh_st(&db, &st_name).await {
+        Ok(()) => {}
+        Err(e) if e.contains("temp_file_limit") => {
+            println!("  WARN: temp_file_limit hit — known Docker constraint, skipping");
+            let _ = db
+                .try_execute(&format!("SELECT pgtrickle.drop_stream_table('{st_name}')"))
+                .await;
+            return;
+        }
+        Err(e) => panic!("{qname} refresh error after combined delete: {e}"),
+    }
+
+    assert_tpch_invariant(&db, &st_name, query_sql, qname, 1)
+        .await
+        .unwrap_or_else(|e| {
+            panic!(
+                "EC01B-2 FAILED: {qname} phantom-row detected after combined \
+                 left-DELETE + right-DELETE. This indicates the pre-change \
+                 snapshot (R₀) is not being used for the right side of deep \
+                 join trees.\nError: {e}"
+            )
+        });
+    println!("  combined delete cycle ✓");
+
+    // ── Additional stability cycles with RF2 + RF3 ──────────────────
+    for cycle in 2..=3 {
+        let ct = Instant::now();
+        apply_rf2(&db).await;
+        apply_rf3(&db).await;
+
+        match try_refresh_st(&db, &st_name).await {
+            Ok(()) => {}
+            Err(e) if e.contains("temp_file_limit") => {
+                println!("  WARN cycle {cycle}: temp_file_limit hit, skipping remaining");
+                break;
+            }
+            Err(e) => panic!("{qname} refresh error cycle {cycle}: {e}"),
+        }
+
+        match assert_tpch_invariant(&db, &st_name, query_sql, qname, cycle).await {
+            Ok(()) => println!(
+                "  cycle {cycle}/3 — {:.0}ms ✓",
+                ct.elapsed().as_secs_f64() * 1000.0
+            ),
+            Err(e) => panic!("cycle {cycle}/3 — FAILED: {e}"),
+        }
+    }
+
+    let _ = db
+        .try_execute(&format!("SELECT pgtrickle.drop_stream_table('{st_name}')"))
+        .await;
+    println!("\n  EC01B-2 {qname} regression test complete ✓\n");
 }

@@ -2154,10 +2154,10 @@ action.
 
 | Item | Description | Effort | Ref |
 |------|-------------|--------|-----|
-| EC01B-1 | Design and implement a per-subtree CTE-based snapshot strategy to replace EXCEPT ALL for right-side join chains with ≥3 scan nodes; remove the `join_scan_count(child) <= 2` threshold in `use_pre_change_snapshot` | 3–4 wk | [src/dvm/operators/join_common.rs](src/dvm/operators/join_common.rs) · [plans/PLAN_EDGE_CASES.md §EC-01](plans/PLAN_EDGE_CASES.md) |
-| EC01B-2 | TPC-H Q7/Q8/Q9 regression tests: combined left-DELETE + right-DELETE in same cycle; assert no phantom-row drop | 1–2d | `tests/e2e_tpch_tests.rs` |
+| ~~EC01B-1~~ | ~~Design and implement a per-subtree CTE-based snapshot strategy to replace EXCEPT ALL for right-side join chains with ≥3 scan nodes; remove the `join_scan_count(child) <= 2` threshold in `use_pre_change_snapshot`~~ ✅ Done | — | [src/dvm/operators/join_common.rs](src/dvm/operators/join_common.rs) · [plans/PLAN_EDGE_CASES.md §EC-01](plans/PLAN_EDGE_CASES.md) |
+| ~~EC01B-2~~ | ~~TPC-H Q7/Q8/Q9 regression tests: combined left-DELETE + right-DELETE in same cycle; assert no phantom-row drop~~ ✅ Done | — | [tests/e2e_tpch_tests.rs](tests/e2e_tpch_tests.rs) |
 
-> **EC-01 deep fix subtotal: ~3–4 weeks**
+> **EC-01 deep fix subtotal: ~3–4 weeks — ✅ Complete**
 
 ### CDC Write-Side Overhead Benchmark
 
@@ -2220,8 +2220,8 @@ action.
 | Item | Description | Effort | Ref |
 |------|-------------|--------|-----|
 | ~~G13-SD~~ | ~~**Parser recursion depth limit.** Add a recursion depth counter to all recursive parse-tree visitor functions in `dvm/parser.rs`. Return `PgTrickleError::QueryTooComplex` if depth exceeds `pg_trickle.max_parse_depth` (GUC, default 64). Prevents stack-overflow crashes on pathological queries.~~ ✅ Done | — | [src/dvm/parser.rs](src/dvm/parser.rs) · [src/config.rs](src/config.rs) · [src/error.rs](src/error.rs) |
-| G17-IMS | **IMMEDIATE mode concurrency stress test.** 100+ concurrent DML transactions on the same source table in `IMMEDIATE` refresh mode; assert zero lost updates, zero phantom rows, and no deadlocks. | ~2–3d | [plans/performance/REPORT_OVERALL_STATUS.md §17](plans/performance/REPORT_OVERALL_STATUS.md) |
-| G12-SQL-IN | **Multi-column `IN (subquery)` correctness investigation.** Determine behavior when DVM encounters `EXPR IN (subquery returning multiple columns)`. Add a correctness test; if the construct is broken, fix it or document as unsupported with a structured error. | ~2–4d | [plans/performance/REPORT_OVERALL_STATUS.md §12](plans/performance/REPORT_OVERALL_STATUS.md) |
+| ~~G17-IMS~~ | ~~**IMMEDIATE mode concurrency stress test.** 100+ concurrent DML transactions on the same source table in `IMMEDIATE` refresh mode; assert zero lost updates, zero phantom rows, and no deadlocks.~~ ✅ Done | — | [tests/e2e_immediate_concurrency_tests.rs](tests/e2e_immediate_concurrency_tests.rs) |
+| ~~G12-SQL-IN~~ | ~~**Multi-column `IN (subquery)` correctness investigation.** Determine behavior when DVM encounters `EXPR IN (subquery returning multiple columns)`. Add a correctness test; if the construct is broken, fix it or document as unsupported with a structured error.~~ ✅ Done — documented as unsupported | — | [tests/e2e_multi_column_in_tests.rs](tests/e2e_multi_column_in_tests.rs) · [src/dvm/parser.rs](src/dvm/parser.rs) |
 | G14-MDED | **MERGE deduplication profiling.** Profile how often concurrent-write scenarios produce duplicate key entries requiring pre-MERGE compaction. If ≥10% of refresh cycles need dedup, write an RFC for a two-pass MERGE strategy. | ~3–5d | [plans/performance/REPORT_OVERALL_STATUS.md §14](plans/performance/REPORT_OVERALL_STATUS.md) |
 | ~~G17-MERGEEX~~ | ~~**MERGE template EXPLAIN validation in E2E tests.** Add `EXPLAIN (COSTS OFF)` dry-run checks for generated MERGE SQL templates at E2E test startup. Catches malformed templates before any data is processed.~~ ✅ Done | — | [tests/e2e_merge_template_tests.rs](tests/e2e_merge_template_tests.rs) |
 

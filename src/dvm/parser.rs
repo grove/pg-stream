@@ -9913,11 +9913,41 @@ fn parse_any_sublink(
         unsafe { node_to_expr(sublink.testexpr)? }
     };
 
+    // ── G12-SQL-IN: Multi-column IN (subquery) guard ────────────────
+    //
+    // Multi-column IN like `(a, b) IN (SELECT x, y FROM t)` produces a
+    // RowExpr test expression with multiple inner SELECT targets. The
+    // DVM semi-join rewrite currently only handles single-column IN:
+    // it extracts the first target column and builds `test = col1`,
+    // silently ignoring additional columns. This produces incorrect
+    // results for multi-column comparisons.
+    //
+    // Detect this case and return a structured error. The DVM would need
+    // composite equality (`a = x AND b = y`) to handle this correctly.
+    if matches!(test_expr, Expr::Raw(ref s) if s.starts_with("ROW(")) {
+        return Err(PgTrickleError::QueryParseError(
+            "multi-column IN (subquery) is not supported in DIFFERENTIAL mode. \
+             Rewrite as EXISTS (SELECT 1 FROM ... WHERE a = x AND b = y) \
+             for equivalent semantics."
+                .into(),
+        ));
+    }
+
     // Extract the inner SELECT target (the column being compared)
     let target_list = pg_list::<pg_sys::Node>(inner_select.targetList);
     if target_list.is_empty() {
         return Err(PgTrickleError::QueryParseError(
             "IN subquery SELECT list is empty".into(),
+        ));
+    }
+
+    // G12-SQL-IN: Also detect multi-column via inner target count
+    if target_list.len() > 1 {
+        return Err(PgTrickleError::QueryParseError(
+            "multi-column IN (subquery) is not supported in DIFFERENTIAL mode: \
+             the inner SELECT returns multiple columns. Rewrite as \
+             EXISTS (SELECT 1 FROM ... WHERE a = x AND b = y) for equivalent semantics."
+                .into(),
         ));
     }
 

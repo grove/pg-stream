@@ -163,6 +163,15 @@ pub struct DiffContext {
     /// When set (by fused-chain execution), `diff_scan_change_buffer` reads
     /// from the bypass temp table instead of the persistent change buffer.
     pub st_bypass_tables: HashMap<i64, String>,
+    /// EC01B-1: Maps Scan alias → delta CTE name.
+    ///
+    /// Populated by `diff_scan` for each leaf Scan node during diff
+    /// traversal. Used by `build_pre_change_snapshot_sql` to construct
+    /// per-leaf pre-change snapshots for deep join trees (≥3 scan nodes),
+    /// avoiding the expensive full-snapshot EXCEPT ALL that spills temp
+    /// files. Each leaf's EXCEPT ALL operates on a single table (cheap),
+    /// and the join is reconstructed from pre-change leaves.
+    pub scan_delta_ctes: HashMap<String, String>,
 }
 
 impl DiffContext {
@@ -191,6 +200,7 @@ impl DiffContext {
             scan_pushed_predicate: None,
             st_source_pgt_ids: HashMap::new(),
             st_bypass_tables: HashMap::new(),
+            scan_delta_ctes: HashMap::new(),
         }
     }
 
@@ -222,6 +232,7 @@ impl DiffContext {
             scan_pushed_predicate: None,
             st_source_pgt_ids: HashMap::new(),
             st_bypass_tables: HashMap::new(),
+            scan_delta_ctes: HashMap::new(),
         }
     }
 

@@ -176,6 +176,11 @@ FROM {new_table}",
     // so the delta is inherently deduplicated for scan-chain queries.
     let is_deduplicated = ctx.merge_safe_dedup;
 
+    // EC01B-1: Record this scan's delta CTE name for per-leaf
+    // pre-change snapshots in deep join trees.
+    ctx.scan_delta_ctes
+        .insert(alias.to_string(), cte_name.clone());
+
     Ok(DiffResult {
         cte_name,
         columns: col_names,
@@ -693,6 +698,12 @@ FROM (
     };
 
     ctx.add_cte(cte_name.clone(), sql);
+
+    // EC01B-1: Record this scan's delta CTE name so that
+    // build_pre_change_snapshot_sql can construct per-leaf pre-change
+    // snapshots for deep join trees without full-snapshot EXCEPT ALL.
+    ctx.scan_delta_ctes
+        .insert(alias.to_string(), cte_name.clone());
 
     Ok(DiffResult {
         cte_name,

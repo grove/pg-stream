@@ -1635,6 +1635,7 @@ Subqueries are supported in the `WHERE` clause and `SELECT` list. They are parse
 
 **Notes:**
 - `EXISTS` and `IN (subquery)` in the `WHERE` clause are transformed into semi-join operators. `NOT EXISTS` and `NOT IN (subquery)` become anti-join operators.
+- **Multi-column `IN (subquery)` is not supported** (e.g., `WHERE (a, b) IN (SELECT x, y FROM ...)`). Rewrite as `WHERE EXISTS (SELECT 1 FROM ... WHERE a = x AND b = y)` for equivalent semantics.
 - Multiple subqueries in the same `WHERE` clause are supported when combined with `AND`. Subqueries combined with `OR` are also supported — they are automatically rewritten into `UNION` of separate filtered queries.
 - Scalar subqueries in the `SELECT` list are supported as long as they return exactly one row and one column.
 - `ALL (subquery)` is supported — see the worked example below.
