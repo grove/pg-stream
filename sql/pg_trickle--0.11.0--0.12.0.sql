@@ -1,0 +1,21 @@
+-- pg_trickle 0.11.0 -> 0.12.0 upgrade script
+--
+-- Changes will be documented here as phases are implemented.
+--
+-- Phase 1 (quick wins):
+--   PERF-3: tiered_scheduling GUC default changed to true. No DDL required.
+--
+-- Phase 2 (developer tooling):
+--   DT-1: pgtrickle.explain_query_rewrite(query TEXT) SQL function.
+--   DT-2: pgtrickle.diagnose_errors(name TEXT) SQL function.
+--   DT-3: pgtrickle.list_auxiliary_columns(name TEXT) SQL function.
+--   DT-4: pgtrickle.validate_query(query TEXT) SQL function.
+--
+-- Phase 5 (scalability foundations):
+--   A-2: Columnar change tracking -- per-column bitmask superset support.
+--        Changes may require ALTER TABLE on existing change buffer tables;
+--        handled at runtime by alter_change_buffer_add_columns().
+--   D-4: Shared change buffers -- new pgt_shared_change_buffers catalog
+--        table; multi-frontier cleanup coordination.
+--
+-- (Add DDL here as features are implemented.)
