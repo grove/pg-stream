@@ -2452,4 +2452,60 @@ mod tests {
         let rows = render_dependency_tree(&st_info, &st_children, &st_sources);
         assert!(rows.is_empty());
     }
+
+    // ── build_cdc_health_alert (missing branches) ────────────────────────────
+
+    #[test]
+    fn test_build_cdc_health_alert_ok_when_below_threshold_and_slot_present() {
+        let alert = build_cdc_health_alert(512, 1024, true, CdcMode::Wal);
+        assert!(
+            alert.is_none(),
+            "No alert when lag is below threshold and slot exists"
+        );
+    }
+
+    #[test]
+    fn test_build_cdc_health_alert_no_alert_for_trigger_mode_missing_slot() {
+        // A missing replication slot is not relevant for trigger-based CDC
+        let alert = build_cdc_health_alert(0, 1024, false, CdcMode::Trigger);
+        assert!(alert.is_none());
+    }
+
+    #[test]
+    fn test_build_cdc_health_alert_lag_takes_priority_over_missing_slot() {
+        // Both conditions true: lag > threshold and slot is missing.
+        // The lag check comes first so it should win.
+        let alert = build_cdc_health_alert(2048, 1024, false, CdcMode::Wal);
+        assert_eq!(
+            alert,
+            Some("slot_lag_exceeds_threshold: 2048 bytes > 1024 bytes".to_string())
+        );
+    }
+
+    #[test]
+    fn test_build_cdc_health_alert_exact_threshold_not_alerted() {
+        // `>` not `>=`: equal to threshold must not trigger
+        let alert = build_cdc_health_alert(1024, 1024, true, CdcMode::Wal);
+        assert!(alert.is_none());
+    }
+
+    // ── build_slot_lag_health_detail (missing branches) ──────────────────────
+
+    #[test]
+    fn test_build_slot_lag_health_detail_ok_when_empty() {
+        let (severity, detail) = build_slot_lag_health_detail(&[], 104_857_600);
+        assert_eq!(severity, "OK");
+        assert!(detail.contains("within normal range"));
+    }
+
+    #[test]
+    fn test_build_slot_lag_health_detail_multiple_lagging_slots() {
+        let lagging = vec!["slot_a (200 MB)".to_string(), "slot_b (300 MB)".to_string()];
+        let (severity, detail) = build_slot_lag_health_detail(&lagging, 104_857_600);
+        assert_eq!(severity, "WARN");
+        assert!(detail.contains("2 WAL slot(s)"));
+        assert!(detail.contains("slot_a (200 MB)"));
+        assert!(detail.contains("slot_b (300 MB)"));
+        assert!(detail.contains("104857600 bytes"));
+    }
 }

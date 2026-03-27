@@ -4704,4 +4704,196 @@ mod pg_tests {
         clear_all_st_bypass();
         assert!(get_st_bypass_tables().is_empty());
     }
+
+    // ── build_is_distinct_clause ─────────────────────────────────────────────
+
+    #[test]
+    fn test_build_is_distinct_clause_single_col() {
+        let cols = vec!["price".to_string()];
+        let clause = build_is_distinct_clause(&cols);
+        assert_eq!(
+            clause,
+            r#"st."price"::text IS DISTINCT FROM d."price"::text"#
+        );
+    }
+
+    #[test]
+    fn test_build_is_distinct_clause_multi_col() {
+        let cols = vec!["a".to_string(), "b".to_string()];
+        let clause = build_is_distinct_clause(&cols);
+        assert_eq!(
+            clause,
+            r#"st."a"::text IS DISTINCT FROM d."a"::text OR st."b"::text IS DISTINCT FROM d."b"::text"#
+        );
+    }
+
+    #[test]
+    fn test_build_is_distinct_clause_col_with_double_quote() {
+        let cols = vec!["col\"name".to_string()];
+        let clause = build_is_distinct_clause(&cols);
+        // Inner double-quote must be escaped as ""
+        assert!(clause.contains(r#""col""name""#));
+        assert!(clause.contains("IS DISTINCT FROM"));
+    }
+
+    #[test]
+    fn test_build_is_distinct_clause_at_threshold() {
+        // Exactly 50 columns — still per-column path
+        let cols: Vec<String> = (0..50).map(|i| format!("col{i}")).collect();
+        let clause = build_is_distinct_clause(&cols);
+        // Per-column path produces OR-joined expressions
+        assert!(clause.contains("IS DISTINCT FROM"));
+        assert!(!clause.contains("pgtrickle.pg_trickle_hash"));
+        let parts: Vec<&str> = clause.split(" OR ").collect();
+        assert_eq!(parts.len(), 50);
+    }
+
+    #[test]
+    fn test_build_is_distinct_clause_wide_table_hash_path() {
+        // 51 columns — crosses into hash-based comparison
+        let cols: Vec<String> = (0..51).map(|i| format!("col{i}")).collect();
+        let clause = build_is_distinct_clause(&cols);
+        assert!(clause.contains("pgtrickle.pg_trickle_hash"));
+        assert!(clause.contains("IS DISTINCT FROM"));
+        // Should reference both st. and d. prefixes
+        assert!(clause.contains("st.\"col0\""));
+        assert!(clause.contains("d.\"col0\""));
+        // Should use the record separator
+        assert!(clause.contains(r"'\x1E'"));
+        // No OR — single hash expression
+        assert!(!clause.contains(" OR "));
+    }
+
+    #[test]
+    fn test_build_is_distinct_clause_empty_cols() {
+        let cols: Vec<String> = vec![];
+        let clause = build_is_distinct_clause(&cols);
+        // Empty slice → empty string (no columns to compare)
+        assert_eq!(clause, "");
+    }
+
+    // ── pg_quote_literal ─────────────────────────────────────────────────────
+
+    #[test]
+    fn test_pg_quote_literal_simple() {
+        assert_eq!(pg_quote_literal("hello"), "'hello'");
+    }
+
+    #[test]
+    fn test_pg_quote_literal_empty() {
+        assert_eq!(pg_quote_literal(""), "''");
+    }
+
+    #[test]
+    fn test_pg_quote_literal_single_quote_escaped() {
+        assert_eq!(pg_quote_literal("it's"), "'it''s'");
+    }
+
+    #[test]
+    fn test_pg_quote_literal_multiple_single_quotes() {
+        assert_eq!(pg_quote_literal("a'b'c"), "'a''b''c'");
+    }
+
+    #[test]
+    fn test_pg_quote_literal_only_quotes() {
+        assert_eq!(pg_quote_literal("''"), "''''");
+    }
+
+    // ── inject_partition_predicate ───────────────────────────────────────────
+
+    #[test]
+    fn test_inject_partition_predicate_basic() {
+        let merge_sql = "MERGE INTO st USING d ON st.id = d.id__PGT_PART_PRED__";
+        let result =
+            inject_partition_predicate(merge_sql, "event_date", "2024-01-01", "2024-01-31");
+        assert!(result.contains("BETWEEN '2024-01-01' AND '2024-01-31'"));
+        assert!(result.contains(r#""event_date""#));
+        assert!(result.contains("st."));
+        assert!(!result.contains("__PGT_PART_PRED__"));
+    }
+
+    #[test]
+    fn test_inject_partition_predicate_no_placeholder() {
+        // If there is no placeholder the SQL is returned unchanged
+        let merge_sql = "MERGE INTO st USING d ON st.id = d.id";
+        let result =
+            inject_partition_predicate(merge_sql, "event_date", "2024-01-01", "2024-01-31");
+        assert_eq!(result, merge_sql);
+    }
+
+    #[test]
+    fn test_inject_partition_predicate_value_with_single_quote() {
+        let merge_sql = "MERGE INTO st USING d ON st.id = d.id__PGT_PART_PRED__";
+        let result = inject_partition_predicate(merge_sql, "name", "O'Brien", "O'Reilly");
+        // Single quotes must be doubled inside the predicate literals
+        assert!(result.contains("'O''Brien'"));
+        assert!(result.contains("'O''Reilly'"));
+    }
+
+    // ── build_weight_agg_using ───────────────────────────────────────────────
+
+    #[test]
+    fn test_build_weight_agg_using_contains_delta_sql() {
+        let delta = "SELECT * FROM my_delta";
+        let cols = "\"a\", \"b\"";
+        let sql = build_weight_agg_using(delta, cols);
+        assert!(sql.contains(delta));
+        assert!(sql.contains(cols));
+    }
+
+    #[test]
+    fn test_build_weight_agg_using_structure() {
+        let sql = build_weight_agg_using("SELECT 1", "\"x\"");
+        // Must contain the structural landmarks
+        assert!(sql.contains("DISTINCT ON"));
+        assert!(sql.contains("__pgt_row_id"));
+        assert!(sql.contains("__pgt_action"));
+        assert!(sql.contains("SUM"));
+        assert!(sql.contains("HAVING"));
+        assert!(sql.contains("GROUP BY"));
+        assert!(sql.contains("ORDER BY"));
+    }
+
+    #[test]
+    fn test_build_weight_agg_using_insert_delete_case() {
+        let sql = build_weight_agg_using("SELECT 1", "\"x\"");
+        assert!(sql.contains("'I'"));
+        assert!(sql.contains("'D'"));
+        // Net-weight sign decides the action
+        assert!(sql.contains("> 0"));
+        assert!(sql.contains("<> 0"));
+    }
+
+    // ── build_keyless_delete_template ────────────────────────────────────────
+
+    #[test]
+    fn test_build_keyless_delete_template_contains_table() {
+        let sql = build_keyless_delete_template("\"public\".\"my_table\"", 42);
+        assert!(sql.starts_with("DELETE FROM \"public\".\"my_table\""));
+    }
+
+    #[test]
+    fn test_build_keyless_delete_template_uses_pgt_id() {
+        let sql = build_keyless_delete_template("\"s\".\"t\"", 99);
+        assert!(sql.contains("__pgt_delta_99"));
+    }
+
+    #[test]
+    fn test_build_keyless_delete_template_structure() {
+        let sql = build_keyless_delete_template("\"s\".\"t\"", 1);
+        // Must use ctid-based deletion with ROW_NUMBER pairing
+        assert!(sql.contains("ctid"));
+        assert!(sql.contains("ROW_NUMBER()"));
+        assert!(sql.contains("PARTITION BY"));
+        assert!(sql.contains("JOIN"));
+        assert!(sql.contains("del_count"));
+        assert!(sql.contains("__pgt_action = 'D'"));
+    }
+
+    #[test]
+    fn test_build_keyless_delete_template_counts_correctly() {
+        let sql = build_keyless_delete_template("\"s\".\"t\"", 5);
+        // The WHERE clause must use <= del_count to limit paired deletions
+        assert!(sql.contains("<= dc.del_count"));
+    }
 }
