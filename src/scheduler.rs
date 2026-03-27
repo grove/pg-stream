@@ -3944,8 +3944,19 @@ fn execute_scheduled_refresh(
 
     // Execute the refresh
 
-    // Collect current WAL positions for upstream ST sources so we can
-    // embed them in the frontier.
+    // Collect current high-water marks for upstream ST change buffers so
+    // we can embed them in the frontier.
+    //
+    // ST-ST-7: Use MAX(lsn) from the actual change buffer rather than
+    // pg_current_wal_lsn(). Within a single scheduler tick (one transaction),
+    // an upstream ST's FULL-refresh capture writes rows to its change buffer
+    // using pg_current_wal_lsn(). If this downstream ST's augment ALSO uses
+    // pg_current_wal_lsn(), the augmented frontier LSN may be >= the captured
+    // rows' LSN. Then the next tick's delta (lsn > prev_lsn) misses those
+    // rows because they sit AT the frontier, not above it.
+    //
+    // Using MAX(lsn) from the buffer records EXACTLY the latest data point,
+    // ensuring the next tick's delta correctly starts AFTER consumed data.
     let change_schema_for_st = crate::config::pg_trickle_change_buffer_schema();
     let st_source_positions: Vec<(i64, String)> =
         crate::catalog::StDependency::get_for_st(st.pgt_id)
@@ -3958,9 +3969,17 @@ fn execute_scheduled_refresh(
                 if !crate::cdc::has_st_change_buffer(upstream_pgt_id, &change_schema_for_st) {
                     return None;
                 }
-                let lsn = Spi::get_one::<String>("SELECT pg_current_wal_lsn()::text")
-                    .unwrap_or(None)
-                    .unwrap_or_else(|| "0/0".to_string());
+                // ST-ST-7: Read the actual max LSN from the change buffer.
+                // Falls back to pg_current_wal_lsn() if the buffer is empty
+                // (e.g., freshly created, no data captured yet).
+                let lsn = Spi::get_one::<String>(&format!(
+                    "SELECT COALESCE(MAX(lsn)::text, pg_current_wal_lsn()::text) \
+                     FROM \"{schema}\".changes_pgt_{id}",
+                    schema = change_schema_for_st,
+                    id = upstream_pgt_id,
+                ))
+                .unwrap_or(None)
+                .unwrap_or_else(|| "0/0".to_string());
                 Some((upstream_pgt_id, lsn))
             })
             .collect();

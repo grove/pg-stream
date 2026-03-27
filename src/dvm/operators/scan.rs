@@ -415,9 +415,12 @@ fn diff_scan_change_buffer(
         let old_col_refs_raw: Vec<String> = columns
             .iter()
             .map(|c| {
+                // ST-ST-4: ST change buffers have no old_* columns.
+                // Use new_* columns for DELETE refs (ST deltas are I/D only).
+                let prefix = if is_st_source { "new" } else { "old" };
                 format!(
                     "c.{} AS {}",
-                    quote_ident(&format!("old_{}", c.name)),
+                    quote_ident(&format!("{prefix}_{}", c.name)),
                     quote_ident(&c.name),
                 )
             })
@@ -432,7 +435,29 @@ fn diff_scan_change_buffer(
             .collect();
 
         // CTE: Decompose all events into atomic +1/-1 per content hash.
+        // ST-ST-4: ST change buffers only emit I/D actions (no UPDATEs).
+        // Skip the UPDATE UNION ALL branches for ST sources.
         let decomp_cte = ctx.next_cte_name(&format!("kl_decomp_{alias}"));
+        let update_branches = if is_st_source {
+            String::new()
+        } else {
+            format!(
+                "\n\nUNION ALL\n\n\
+-- UPDATE INSERT side: +1 per new content hash\n\
+SELECT {pk_hash_expr} AS content_hash, 1 AS delta_sign,\n\
+       {new_refs}\n\
+FROM {change_table} c\n\
+WHERE {lsn_filter} AND c.action = 'U'\n\n\
+UNION ALL\n\n\
+-- UPDATE DELETE side: -1 per old content hash\n\
+SELECT {old_pk_hash_expr} AS content_hash, -1 AS delta_sign,\n\
+       {old_refs}\n\
+FROM {change_table} c\n\
+WHERE {lsn_filter} AND c.action = 'U'",
+                new_refs = new_col_refs_raw.join(",\n       "),
+                old_refs = old_col_refs_raw.join(",\n       "),
+            )
+        };
         let decomp_sql = format!(
             "\
 -- INSERT events: +1 per content hash
@@ -447,23 +472,7 @@ UNION ALL
 SELECT {pk_hash_expr} AS content_hash, -1 AS delta_sign,
        {old_refs}
 FROM {change_table} c
-WHERE {lsn_filter} AND c.action = 'D'
-
-UNION ALL
-
--- UPDATE INSERT side: +1 per new content hash
-SELECT {pk_hash_expr} AS content_hash, 1 AS delta_sign,
-       {new_refs}
-FROM {change_table} c
-WHERE {lsn_filter} AND c.action = 'U'
-
-UNION ALL
-
--- UPDATE DELETE side: -1 per old content hash
-SELECT {old_pk_hash_expr} AS content_hash, -1 AS delta_sign,
-       {old_refs}
-FROM {change_table} c
-WHERE {lsn_filter} AND c.action = 'U'",
+WHERE {lsn_filter} AND c.action = 'D'{update_branches}",
             new_refs = new_col_refs_raw.join(",\n       "),
             old_refs = old_col_refs_raw.join(",\n       "),
         );

@@ -1063,8 +1063,21 @@ fn build_rescan_cte(
 /// - No DISTINCT aggregates
 /// - All aggregate arguments are simple `ColumnRef` (or `None` for COUNT(*))
 /// - All group-by expressions are simple `ColumnRef`
-fn is_direct_agg_eligible(child: &OpTree, group_by: &[Expr], aggregates: &[AggExpr]) -> bool {
-    if !matches!(child, OpTree::Scan { .. }) {
+fn is_direct_agg_eligible(
+    child: &OpTree,
+    group_by: &[Expr],
+    aggregates: &[AggExpr],
+    ctx: &DiffContext,
+) -> bool {
+    // ST-ST-4: The P5 direct aggregate bypass reads directly from the
+    // change buffer table using old_*/new_* columns.  ST change buffers
+    // have a different schema (no old_*, no UPDATE actions), so disable
+    // the bypass for ST sources — fall back to the standard scan pipeline.
+    let table_oid = match child {
+        OpTree::Scan { table_oid, .. } => *table_oid,
+        _ => return false,
+    };
+    if ctx.st_source_pgt_ids.contains_key(&table_oid) {
         return false;
     }
     for agg in aggregates {
@@ -1307,7 +1320,7 @@ pub fn diff_aggregate(ctx: &mut DiffContext, op: &OpTree) -> Result<DiffResult, 
     // (IMMEDIATE mode), we always use the standard path which correctly
     // reads from the trigger transition temp tables via diff_scan.
     let use_p5 = matches!(ctx.delta_source, DeltaSource::ChangeBuffer)
-        && is_direct_agg_eligible(child, group_by, aggregates);
+        && is_direct_agg_eligible(child, group_by, aggregates, ctx);
     let (delta_cte, group_output) = if use_p5 {
         generate_direct_agg_delta(ctx, child, group_by, aggregates)?
     } else {
@@ -2632,6 +2645,16 @@ pub fn agg_merge_expr(agg: &AggExpr, has_rescan: bool) -> String {
 mod tests {
     use super::*;
     use crate::dvm::operators::test_helpers::*;
+
+    /// Wrapper for tests: calls is_direct_agg_eligible with an empty ctx
+    /// (no ST sources), matching the old 3-argument signature.
+    fn is_direct_agg_eligible(child: &OpTree, group_by: &[Expr], aggs: &[AggExpr]) -> bool {
+        let ctx = crate::dvm::diff::DiffContext::new_standalone(
+            crate::version::Frontier::default(),
+            crate::version::Frontier::default(),
+        );
+        super::is_direct_agg_eligible(child, group_by, aggs, &ctx)
+    }
 
     // ── is_direct_agg_eligible tests ────────────────────────────────
 

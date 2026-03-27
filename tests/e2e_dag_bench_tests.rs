@@ -822,6 +822,119 @@ async fn wait_for_leaf_refresh(
     }
 }
 
+/// Dump diagnostic info when a latency measurement times out.
+/// Shows refresh history, frontiers, and change buffer state per ST.
+async fn dump_timeout_diagnostics(db: &E2eDb, since_ts: &str, all_sts: &[String], source: &str) {
+    eprintln!("[DAG_BENCH_DIAG] === Timeout Diagnostics ===");
+
+    // 1. Show recent refresh history for ALL STs (last 30 entries)
+    eprintln!("[DAG_BENCH_DIAG] Recent refresh history since {since_ts}:");
+    let history = db
+        .query_scalar_opt::<String>(&format!(
+            "SELECT string_agg(line, E'\\n' ORDER BY rn) FROM (
+                SELECT ROW_NUMBER() OVER (ORDER BY h.start_time DESC) AS rn,
+                    st.pgt_name || ' | ' || h.action || ' | ' || h.status ||
+                    ' | +' || COALESCE(h.rows_inserted::text, '?') ||
+                    ' -' || COALESCE(h.rows_deleted::text, '?') ||
+                    ' | ' || to_char(h.start_time, 'HH24:MI:SS.MS') AS line
+                FROM pgtrickle.pgt_refresh_history h
+                JOIN pgtrickle.pgt_stream_tables st ON st.pgt_id = h.pgt_id
+                WHERE h.start_time >= '{since_ts}'::timestamptz
+                ORDER BY h.start_time DESC
+                LIMIT 30
+             ) sub"
+        ))
+        .await;
+    match history {
+        Some(h) => {
+            for line in h.lines() {
+                eprintln!("[DAG_BENCH_DIAG]   {line}");
+            }
+        }
+        None => eprintln!("[DAG_BENCH_DIAG]   (no refresh history found)"),
+    }
+
+    // 2. Per-ST status: populated, schedule, refresh_mode, completed count, frontier keys
+    eprintln!("[DAG_BENCH_DIAG] Per-ST status:");
+    for st_name in all_sts {
+        let info = db
+            .query_scalar_opt::<String>(&format!(
+                "SELECT st.pgt_name ||
+                    ' pop=' || st.is_populated::text ||
+                    ' sched=' || COALESCE(st.schedule, 'CALC') ||
+                    ' mode=' || st.refresh_mode ||
+                    ' status=' || st.status ||
+                    ' completed=' || (
+                        SELECT COUNT(*) FROM pgtrickle.pgt_refresh_history h
+                        WHERE h.pgt_id = st.pgt_id AND h.status = 'COMPLETED'
+                    )::text ||
+                    ' frontier_srcs=' || COALESCE(
+                        (SELECT string_agg(key, ',' ORDER BY key)
+                         FROM jsonb_object_keys(st.frontier -> 'sources') AS key), 'none')
+                 FROM pgtrickle.pgt_stream_tables st
+                 WHERE st.pgt_name = '{st_name}'"
+            ))
+            .await;
+        if let Some(i) = info {
+            eprintln!("[DAG_BENCH_DIAG]   {i}");
+        }
+    }
+
+    // 3. Source table change buffer row count
+    let source_oid = db
+        .query_scalar::<i64>(&format!(
+            "SELECT oid::bigint FROM pg_class WHERE relname = '{source}'"
+        ))
+        .await;
+    let cb_count = db
+        .query_scalar_opt::<i64>(&format!(
+            "SELECT COUNT(*)::bigint FROM pgtrickle_changes.changes_{source_oid}"
+        ))
+        .await;
+    eprintln!(
+        "[DAG_BENCH_DIAG] Change buffer for {source} (oid={source_oid}): {} rows",
+        cb_count.unwrap_or(-1)
+    );
+
+    // 4. ST change buffer row counts for STs that have downstream consumers
+    eprintln!("[DAG_BENCH_DIAG] ST change buffers:");
+    let st_ids: Vec<(String, i64)> = {
+        let rows = db
+            .query_scalar_opt::<String>(
+                "SELECT string_agg(pgt_name || ':' || pgt_id::text, ',' ORDER BY pgt_name)
+                 FROM pgtrickle.pgt_stream_tables",
+            )
+            .await;
+        rows.unwrap_or_default()
+            .split(',')
+            .filter_map(|pair| {
+                let mut parts = pair.splitn(2, ':');
+                let name = parts.next()?.to_string();
+                let id = parts.next()?.parse::<i64>().ok()?;
+                Some((name, id))
+            })
+            .collect()
+    };
+    for (name, pgt_id) in &st_ids {
+        let buf_exists = db
+            .query_scalar_opt::<bool>(&format!(
+                "SELECT to_regclass('pgtrickle_changes.changes_pgt_{pgt_id}') IS NOT NULL"
+            ))
+            .await
+            .unwrap_or(false);
+        if buf_exists {
+            let count = db
+                .query_scalar::<i64>(&format!(
+                    "SELECT COUNT(*)::bigint FROM pgtrickle_changes.changes_pgt_{pgt_id}"
+                ))
+                .await;
+            eprintln!("[DAG_BENCH_DIAG]   {name} (pgt_id={pgt_id}): {count} rows in ST buffer");
+        }
+    }
+
+    eprintln!("[DAG_BENCH_DIAG] === End Diagnostics ===");
+}
+
 /// Collect per-ST timing from pgt_refresh_history since a given timestamp.
 async fn collect_per_st_timing(
     db: &E2eDb,
@@ -934,12 +1047,17 @@ async fn measure_latency(
         let start = Instant::now();
         insert_delta(db, source, LATENCY_DELTA_ROWS).await;
 
-        let propagation_ms = wait_for_leaf_refresh(db, leaf, before, timeout)
-            .await
-            .unwrap_or_else(|| {
+        let propagation_ms = match wait_for_leaf_refresh(db, leaf, before, timeout).await {
+            Some(ms) => ms,
+            None => {
                 eprintln!("[DAG_BENCH] WARN: timeout waiting for leaf '{leaf}' in cycle {cycle}");
+                // Dump diagnostic info on first timeout only (avoid spam)
+                if cycle == 1 {
+                    dump_timeout_diagnostics(db, &since_ts, &topo.all_sts, source).await;
+                }
                 start.elapsed().as_secs_f64() * 1000.0
-            });
+            }
+        };
 
         // Collect per-ST timing breakdown
         let breakdown = collect_per_st_timing(db, &since_ts, &topo.levels).await;

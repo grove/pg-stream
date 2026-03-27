@@ -518,6 +518,29 @@ fn cleanup_st_change_buffers_by_frontier(change_schema: &str, st_source_pgt_ids:
             continue;
         }
 
+        // ST-ST-6: Check if any downstream consumer has a NULL or missing
+        // frontier for this ST source.  If so, skip cleanup — that consumer
+        // hasn't consumed any data from this buffer yet and we must not
+        // delete rows it still needs.
+        let has_uninitialized_consumer = Spi::get_one::<bool>(&format!(
+            "SELECT EXISTS( \
+               SELECT 1 FROM pgtrickle.pgt_stream_tables st \
+               JOIN pgtrickle.pgt_dependencies dep ON dep.pgt_id = st.pgt_id \
+               WHERE dep.source_type = 'STREAM_TABLE' \
+                 AND dep.source_relid = ( \
+                     SELECT pgt_relid FROM pgtrickle.pgt_stream_tables WHERE pgt_id = {upstream_pgt_id} \
+                 ) \
+                 AND (st.frontier IS NULL \
+                      OR st.frontier->'sources'->'{key}'->>'lsn' IS NULL) \
+             )",
+        ))
+        .unwrap_or(Some(false))
+        .unwrap_or(false);
+
+        if has_uninitialized_consumer {
+            continue;
+        }
+
         // Compute the minimum frontier LSN for this ST source across ALL
         // downstream consumers.
         let min_lsn: Option<String> = Spi::get_one::<String>(&format!(
@@ -895,24 +918,19 @@ fn capture_full_refresh_diff_to_st_buffer(
     })?;
     total_count += ins_count;
 
-    // Changed rows: same row_id but different content — emit as D+I pair
+    // Changed rows: same row_id but different content.
+    //
+    // ST-ST-8: Emit only an INSERT event (not a D+I pair) for changed rows.
+    // The downstream keyless decomposition CTE groups by pk_hash and computes
+    // net_count = SUM(delta_sign).  When D and I events share the same
+    // pk_hash (__pgt_row_id is based on the GROUP BY key, which is stable
+    // across value changes), they cancel to net_count=0 and the row is
+    // excluded from the delta — effectively losing the change.
+    //
+    // Emitting only an I event avoids the cancellation: net_count=+1 produces
+    // an INSERT action in the scan CTE.  The downstream MERGE then matches
+    // the existing row (WHEN MATCHED AND __pgt_action='I' THEN UPDATE).
     if !is_distinct_pairs.is_empty() {
-        let changed_del_sql = format!(
-            "INSERT INTO \"{change_schema}\".changes_pgt_{pgt_id} \
-             (lsn, action, pk_hash, {new_col_list}) \
-             SELECT pg_current_wal_lsn(), 'D', pre.__pgt_row_id, {pre_col_refs} \
-             FROM __pgt_pre_{pgt_id} pre \
-             JOIN {quoted_table} post ON pre.__pgt_row_id = post.__pgt_row_id \
-             WHERE {is_distinct_pairs}"
-        );
-        let chg_del = Spi::connect_mut(|client| {
-            let result = client
-                .update(&changed_del_sql, None, &[])
-                .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
-            Ok::<i64, PgTrickleError>(result.len() as i64)
-        })?;
-        total_count += chg_del;
-
         let changed_ins_sql = format!(
             "INSERT INTO \"{change_schema}\".changes_pgt_{pgt_id} \
              (lsn, action, pk_hash, {new_col_list}) \
@@ -921,13 +939,13 @@ fn capture_full_refresh_diff_to_st_buffer(
              JOIN __pgt_pre_{pgt_id} pre ON post.__pgt_row_id = pre.__pgt_row_id \
              WHERE {is_distinct_pairs}"
         );
-        let chg_ins = Spi::connect_mut(|client| {
+        let chg_count = Spi::connect_mut(|client| {
             let result = client
                 .update(&changed_ins_sql, None, &[])
                 .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
             Ok::<i64, PgTrickleError>(result.len() as i64)
         })?;
-        total_count += chg_ins;
+        total_count += chg_count;
     }
 
     if total_count > 0 {
@@ -2086,13 +2104,13 @@ pub fn post_full_refresh_cleanup(st: &StreamTableMeta) {
     // from re-examining them and re-triggering another adaptive fallback.
     cleanup_change_buffers_by_frontier(&change_schema, &source_oids);
 
-    // G4b: Also clean up ST change buffers for upstream ST sources.
-    let st_source_pgt_ids: Vec<i64> = deps
-        .iter()
-        .filter(|dep| dep.source_type == "STREAM_TABLE")
-        .filter_map(|dep| crate::catalog::StreamTableMeta::pgt_id_for_relid(dep.source_relid))
-        .collect();
-    cleanup_st_change_buffers_by_frontier(&change_schema, &st_source_pgt_ids);
+    // NOTE: ST change buffers (changes_pgt_{id}) are intentionally NOT
+    // cleaned here. A FULL refresh reads the source table directly, not
+    // the change buffer, so change buffer rows have NOT been consumed.
+    // Cleaning them would remove rows that sibling consumers (other STs
+    // depending on the same upstream ST) have not yet processed.
+    // ST change buffer cleanup happens only in the differential refresh
+    // path where the delta SQL actually reads from the change buffer.
 }
 
 /// Poll all FOREIGN_TABLE and MATVIEW dependencies for a stream table before
@@ -3205,16 +3223,25 @@ pub fn execute_differential_refresh(
     // If the delta template references source OIDs that are not in the
     // catalog deps, the MERGE will fail referencing nonexistent change
     // buffer tables.
+    //
+    // For ST-on-ST dependencies, the delta template references the
+    // upstream ST's pgt_relid (the storage table OID).  These must be
+    // included in the validation set alongside TABLE/FT/MV OIDs.
+    let all_dep_oids: Vec<u32> = StDependency::get_for_st(st.pgt_id)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|dep| dep.source_relid.to_u32())
+        .collect();
     let delta_oids = &resolved.source_oids;
     let missing_in_delta: Vec<&u32> = delta_oids
         .iter()
-        .filter(|oid| !catalog_source_oids.contains(oid))
+        .filter(|oid| !all_dep_oids.contains(oid))
         .collect();
     if !missing_in_delta.is_empty() {
         return Err(PgTrickleError::InternalError(format!(
             "OID MISMATCH (source_oids): delta template references \
              OIDs {missing_in_delta:?} not in catalog deps \
-             {catalog_source_oids:?}. Delta source_oids={delta_oids:?}, \
+             {all_dep_oids:?}. Delta source_oids={delta_oids:?}, \
              ST={schema}.{name} pgt_id={}",
             st.pgt_id,
         )));
@@ -3223,6 +3250,9 @@ pub fn execute_differential_refresh(
     // ── Diagnostic: scan merge SQL for change buffer table references ─
     // Extract all `changes_NNNNN` references from the SQL to detect
     // references to OIDs not in catalog_source_oids.
+    // Note: ST-on-ST queries use `changes_pgt_*` buffers (handled by
+    // resolve_delta_template), so `changes_NNNNN` patterns should only
+    // reference TABLE/FT/MV sources.
     {
         let re_pattern = "changes_(\\d+)";
         let mut sql_oids: Vec<u32> = Vec::new();
@@ -3244,7 +3274,7 @@ pub fn execute_differential_refresh(
         let _ = re_pattern; // suppress unused warning
         let missing_in_sql: Vec<&u32> = sql_oids
             .iter()
-            .filter(|oid| !catalog_source_oids.contains(oid))
+            .filter(|oid| !all_dep_oids.contains(oid))
             .collect();
         if !missing_in_sql.is_empty() {
             // Dump first 500 chars of merge SQL for diagnosis
@@ -3252,7 +3282,7 @@ pub fn execute_differential_refresh(
             return Err(PgTrickleError::InternalError(format!(
                 "OID MISMATCH (SQL text): merge SQL references changes_* \
                  for OIDs {missing_in_sql:?} not in catalog deps \
-                 {catalog_source_oids:?}. SQL OIDs found={sql_oids:?}, \
+                 {all_dep_oids:?}. SQL OIDs found={sql_oids:?}, \
                  delta source_oids={delta_oids:?}, \
                  ST={schema}.{name} pgt_id={}. \
                  SQL prefix: {sql_prefix}",
@@ -3398,10 +3428,21 @@ pub fn execute_differential_refresh(
     // A1-3: Disable for partitioned STs — the partition predicate is a
     // literal range that changes every refresh; a generic plan cannot prune
     // partitions from parameter values.
+    // ST-ST-5: Disable prepared statements when the parameterized SQL
+    // contains pgt_-prefixed LSN placeholders (ST sources). The
+    // parameterize function only handles numeric OID placeholders; pgt_
+    // placeholders remain as literals and fail to parse as pg_lsn.
+    let has_pgt_placeholders = resolved
+        .parameterized_merge_sql
+        .contains("__PGS_PREV_LSN_pgt_")
+        || resolved
+            .parameterized_merge_sql
+            .contains("__PGS_NEW_LSN_pgt_");
     let use_prepared = crate::config::pg_trickle_use_prepared_statements()
         && was_cache_hit
         && !st.pooler_compatibility_mode
-        && st.st_partition_key.is_none();
+        && st.st_partition_key.is_none()
+        && !has_pgt_placeholders;
 
     let (merge_count, strategy_label) = if use_explicit_dml {
         // ── User-trigger path: explicit DML ─────────────────────────
@@ -3411,6 +3452,7 @@ pub fn execute_differential_refresh(
         // Step 1: Materialize delta into a temp table (ON COMMIT DROP).
         // This avoids evaluating the delta query three times.
         let t_mat_start = Instant::now();
+
         let materialize_sql = format!(
             "CREATE TEMP TABLE __pgt_delta_{pgt_id} ON COMMIT DROP AS \
              SELECT * FROM {using_clause} AS d",
