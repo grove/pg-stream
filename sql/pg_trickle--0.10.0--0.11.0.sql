@@ -101,3 +101,127 @@ BEGIN
     END IF;
 END
 $$;
+
+-- ── Updated Function Signatures ───────────────────────────────────────────
+--
+--   A1-1: create_stream_table / create_stream_table_if_not_exists /
+--         create_or_replace_stream_table — added "partition_by" parameter.
+--   FUSE-1: alter_stream_table — added "fuse", "fuse_ceiling",
+--           "fuse_sensitivity" parameters.
+--
+--   Each function must be dropped-and-recreated so the new C wrapper
+--   receives the correct argument count at runtime (no PostgreSQL mechanism
+--   allows in-place extension of a function's argument list).
+
+-- A1-1: create_stream_table
+DROP FUNCTION IF EXISTS pgtrickle."create_stream_table"(TEXT, TEXT, TEXT, TEXT, bool, TEXT, TEXT, TEXT, bool, bool);
+CREATE FUNCTION pgtrickle."create_stream_table"(
+        "name" TEXT,
+        "query" TEXT,
+        "schedule" TEXT DEFAULT 'calculated',
+        "refresh_mode" TEXT DEFAULT 'AUTO',
+        "initialize" bool DEFAULT true,
+        "diamond_consistency" TEXT DEFAULT NULL,
+        "diamond_schedule_policy" TEXT DEFAULT NULL,
+        "cdc_mode" TEXT DEFAULT NULL,
+        "append_only" bool DEFAULT false,
+        "pooler_compatibility_mode" bool DEFAULT false,
+        "partition_by" TEXT DEFAULT NULL
+) RETURNS void
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'create_stream_table_wrapper';
+
+-- A1-1: create_stream_table_if_not_exists
+DROP FUNCTION IF EXISTS pgtrickle."create_stream_table_if_not_exists"(TEXT, TEXT, TEXT, TEXT, bool, TEXT, TEXT, TEXT, bool, bool);
+CREATE FUNCTION pgtrickle."create_stream_table_if_not_exists"(
+        "name" TEXT,
+        "query" TEXT,
+        "schedule" TEXT DEFAULT 'calculated',
+        "refresh_mode" TEXT DEFAULT 'AUTO',
+        "initialize" bool DEFAULT true,
+        "diamond_consistency" TEXT DEFAULT NULL,
+        "diamond_schedule_policy" TEXT DEFAULT NULL,
+        "cdc_mode" TEXT DEFAULT NULL,
+        "append_only" bool DEFAULT false,
+        "pooler_compatibility_mode" bool DEFAULT false,
+        "partition_by" TEXT DEFAULT NULL
+) RETURNS void
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'create_stream_table_if_not_exists_wrapper';
+
+-- A1-1: create_or_replace_stream_table
+DROP FUNCTION IF EXISTS pgtrickle."create_or_replace_stream_table"(TEXT, TEXT, TEXT, TEXT, bool, TEXT, TEXT, TEXT, bool, bool);
+CREATE FUNCTION pgtrickle."create_or_replace_stream_table"(
+        "name" TEXT,
+        "query" TEXT,
+        "schedule" TEXT DEFAULT 'calculated',
+        "refresh_mode" TEXT DEFAULT 'AUTO',
+        "initialize" bool DEFAULT true,
+        "diamond_consistency" TEXT DEFAULT NULL,
+        "diamond_schedule_policy" TEXT DEFAULT NULL,
+        "cdc_mode" TEXT DEFAULT NULL,
+        "append_only" bool DEFAULT false,
+        "pooler_compatibility_mode" bool DEFAULT false,
+        "partition_by" TEXT DEFAULT NULL
+) RETURNS void
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'create_or_replace_stream_table_wrapper';
+
+-- FUSE-1: alter_stream_table
+DROP FUNCTION IF EXISTS pgtrickle."alter_stream_table"(TEXT, TEXT, TEXT, TEXT, TEXT, TEXT, TEXT, TEXT, bool, bool, TEXT);
+CREATE FUNCTION pgtrickle."alter_stream_table"(
+        "name" TEXT,
+        "query" TEXT DEFAULT NULL,
+        "schedule" TEXT DEFAULT NULL,
+        "refresh_mode" TEXT DEFAULT NULL,
+        "status" TEXT DEFAULT NULL,
+        "diamond_consistency" TEXT DEFAULT NULL,
+        "diamond_schedule_policy" TEXT DEFAULT NULL,
+        "cdc_mode" TEXT DEFAULT NULL,
+        "append_only" bool DEFAULT NULL,
+        "pooler_compatibility_mode" bool DEFAULT NULL,
+        "tier" TEXT DEFAULT NULL,
+        "fuse" TEXT DEFAULT NULL,
+        "fuse_ceiling" bigint DEFAULT NULL,
+        "fuse_sensitivity" INT DEFAULT NULL
+) RETURNS void
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'alter_stream_table_wrapper';
+
+-- ── New Functions ──────────────────────────────────────────────────────────
+
+-- FUSE-1: reset_fuse — resets a blown fuse on a stream table.
+CREATE OR REPLACE FUNCTION pgtrickle."reset_fuse"(
+        "name" TEXT,
+        "action" TEXT DEFAULT 'apply'
+) RETURNS void
+STRICT
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'reset_fuse_wrapper';
+
+-- FUSE-1: fuse_status — returns fuse circuit breaker status for all stream tables.
+CREATE OR REPLACE FUNCTION pgtrickle."fuse_status"() RETURNS TABLE (
+        "stream_table" TEXT,
+        "fuse_mode" TEXT,
+        "fuse_state" TEXT,
+        "fuse_ceiling" bigint,
+        "effective_ceiling" bigint,
+        "fuse_sensitivity" INT,
+        "blown_at" timestamp with time zone,
+        "blow_reason" TEXT
+)
+STRICT
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'fuse_status_wrapper';
+
+-- G12-ERM-1: explain_refresh_mode — explains the effective refresh mode for a stream table.
+CREATE OR REPLACE FUNCTION pgtrickle."explain_refresh_mode"(
+        "name" TEXT
+) RETURNS TABLE (
+        "configured_mode" TEXT,
+        "effective_mode" TEXT,
+        "downgrade_reason" TEXT
+)
+STRICT
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'explain_refresh_mode_wrapper';

@@ -38,18 +38,18 @@ LABEL org.opencontainers.image.description="PostgreSQL 18.3 with pg_trickle for 
 # install scripts (which contain functions from the *current* source) with
 # the historical snapshots that match each version's actual function set.
 # Without this, CREATE EXTENSION VERSION '0.3.0' would get 0.4.0 functions.
+#
+# NOTE: We save the pgrx-generated install SQL for TO_VERSION before this
+# COPY overwrites it, then restore it afterward. The archive copy of the
+# current version lags behind pgrx output and would silently drop columns.
+RUN cp /usr/share/postgresql/18/extension/pg_trickle--${TO_VERSION}.sql \
+       /tmp/pg_trickle--current.sql
 COPY sql/archive/pg_trickle--*.sql \
      /usr/share/postgresql/18/extension/
-
-# Remove the archive install script for the CURRENT (TO_VERSION) release.
-# The base image already contains the authoritative pgrx-generated SQL for
-# the current version with the full, up-to-date schema. The archive copy is
-# a manually-maintained fallback for old versions and can lag behind pgrx
-# output. Keeping it in place would overwrite the correct pgrx-generated
-# install script and silently drop recently-added columns or functions.
-# Old versions (FROM_VERSION, intermediates) need their archive files to
-# support CREATE EXTENSION VERSION '<old>' — those are preserved above.
-RUN rm -f /usr/share/postgresql/18/extension/pg_trickle--${TO_VERSION}.sql
+# Restore the authoritative pgrx-generated SQL for the current version.
+RUN cp /tmp/pg_trickle--current.sql \
+       /usr/share/postgresql/18/extension/pg_trickle--${TO_VERSION}.sql && \
+    rm /tmp/pg_trickle--current.sql
 
 # Copy ALL upgrade scripts so PostgreSQL can automatically chain through
 # intermediate versions (e.g. 0.1.3→0.2.0→0.2.1→0.2.2 via BFS path-finding).
