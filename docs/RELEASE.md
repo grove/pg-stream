@@ -168,6 +168,51 @@ docker rm "$ID"
 ls -la /tmp/ext-lib/ /tmp/ext-share/extension/
 ```
 
+---
+
+## Post-Release Checklist
+
+Complete these steps immediately after a release tag has been pushed and both the Release and PGXN workflows have finished successfully.
+
+- [ ] **Create a post-release branch** from `main` (e.g. `post-release-<ver>-a`)
+- [ ] **Bump `Cargo.toml`** `version` to the next development version (e.g. `0.12.0` → `0.13.0`)
+- [ ] **Bump `META.json`** — both the top-level `"version"` and the nested `"provides" → "pg_trickle" → "version"` to match
+- [ ] **Write `plans/PLAN_0_<next>_0.md`** — initial planning document for the next milestone
+- [ ] **Delete `plans/PLAN_0_<released>_0.md`** — remove the now-completed plan
+- [ ] **Add `## [Unreleased]` stub** to `CHANGELOG.md` above the just-released entry
+- [ ] **Create `sql/pg_trickle--<released>--<next>.sql`** — empty upgrade script stub for the next migration hop
+- [ ] **Copy `sql/archive/pg_trickle--<released>.sql` → `sql/archive/pg_trickle--<next>.sql`** — placeholder archive baseline for the next version
+- [ ] **Update `justfile`** — advance `build-upgrade-image` and `test-upgrade` `to` defaults to `<next>`; update the `build-hub` Docker image tag
+- [ ] **Update `tests/e2e_upgrade_tests.rs`** — advance all `unwrap_or("<released>".into())` fallback strings to `<next>`
+- [ ] **Run `just check-version-sync`** — must exit 0 before opening the PR
+- [ ] **Open a PR** against `main` with the commit title `chore: start v<next> development cycle`
+
+---
+
+## Preparing for the Next Release (Pre-Work Checklist)
+
+Use this checklist at the start of each new release milestone to ensure the repository is properly set up before development begins. This maps directly to what `just check-version-sync` verifies.
+
+| File / target | Action | `check-version-sync` check |
+|---------------|--------|---------------------------|
+| `Cargo.toml` | `version = "<next>"` | canonical version source |
+| `META.json` | both `"version"` fields set to `<next>` | PGXN manifest |
+| `CHANGELOG.md` | `## [Unreleased]` section present | (manual hygiene) |
+| `sql/pg_trickle--<prev>--<next>.sql` | stub file exists | upgrade SQL exists |
+| `sql/archive/pg_trickle--<next>.sql` | placeholder file exists (copy of `<prev>`) | archive SQL exists |
+| `.github/workflows/ci.yml` | upgrade matrix and chain end at `<next>` | CI matrix up to date |
+| `justfile` | `build-upgrade-image` and `test-upgrade` `to` defaults = `<next>` | justfile defaults |
+| `tests/e2e_upgrade_tests.rs` | all `unwrap_or` fallbacks = `"<next>"` | e2e fallback strings |
+
+Quick-verify with:
+
+```bash
+just check-version-sync
+# Should print: All version references are in sync.
+```
+
+---
+
 ## Release Artifacts
 
 Each release produces:
