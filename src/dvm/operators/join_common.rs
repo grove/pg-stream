@@ -1584,18 +1584,18 @@ mod tests {
     }
 
     #[test]
-    fn test_pre_change_snapshot_3_scan_join_falls_back() {
-        // SF-5: ≥3 scan join subtree must NOT use pre-change snapshot
-        // to avoid CTE materialization that can exhaust temp_file_limit.
-        // This means EC-01 phantom-row fix does NOT apply for wide joins.
+    fn test_pre_change_snapshot_3_scan_join_uses_per_leaf_cte() {
+        // EC01B-1: the ≤2-scan threshold was removed.  All non-semijoin join
+        // subtrees (including ≥3 scans) now use the per-leaf CTE-based
+        // pre-change snapshot strategy.
         let a = scan(1, "a", "public", "a", &["id"]);
         let b = scan(2, "b", "public", "b", &["id"]);
         let c = scan(3, "c", "public", "c", &["id"]);
         let j_ab = inner_join(eq_cond("a", "id", "b", "id"), a, b);
         let j_abc = inner_join(eq_cond("a", "id", "c", "id"), j_ab, c);
         assert!(
-            !use_pre_change_snapshot(&j_abc, false),
-            "3-scan join should fall back to post-change snapshot (EC-01 boundary)"
+            use_pre_change_snapshot(&j_abc, false),
+            "3-scan join should use per-leaf pre-change snapshot (EC01B-1)"
         );
     }
 
