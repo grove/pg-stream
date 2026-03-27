@@ -83,8 +83,8 @@
 
 use crate::dvm::diff::{DiffContext, DiffResult, quote_ident};
 use crate::dvm::operators::join_common::{
-    build_base_table_key_exprs, build_snapshot_sql, is_join_child, is_simple_child,
-    join_scan_count, rewrite_join_condition, use_pre_change_snapshot,
+    build_base_table_key_exprs, build_pre_change_snapshot_sql, build_snapshot_sql, is_join_child,
+    is_simple_child, join_scan_count, rewrite_join_condition, use_pre_change_snapshot,
 };
 use crate::dvm::parser::{Expr, OpTree};
 use crate::error::PgTrickleError;
@@ -294,12 +294,10 @@ pub fn diff_inner_join(ctx: &mut DiffContext, op: &OpTree) -> Result<DiffResult,
     // shallow joins, or plain L₁ for deeper chains.
     //
     // For nested join children WITHOUT SemiJoin/AntiJoin (pure InnerJoin/
-    // LeftJoin chains), L₀ via EXCEPT ALL is safe but expensive: the
-    // full join snapshot must be materialized as temp files for the set
-    // difference.  At SF=0.01, a 3-table join snapshot can still spill
-    // several GB of temp files.  We limit L₀ to join subtrees with
-    // ≤ 2 scan nodes (simple 2-table joins) to keep temp usage bounded
-    // while still improving correctness at the first nesting level.
+    // LeftJoin chains), L₀ is computed using the per-leaf CTE-based
+    // snapshot strategy (EC01B-1): each leaf Scan's pre-change state is
+    // reconstructed individually, then re-joined. This avoids the
+    // full-snapshot EXCEPT ALL that spilled multi-GB temp files.
     //
     // Additionally, joins inside a SemiJoin/AntiJoin ancestor must use
     // L₁ to avoid Q21-type regressions where sub-join EXCEPT ALL
@@ -307,41 +305,73 @@ pub fn diff_inner_join(ctx: &mut DiffContext, op: &OpTree) -> Result<DiffResult,
     let use_l0 = use_pre_change_snapshot(left, ctx.inside_semijoin);
 
     let left_part2_source = if use_l0 {
-        // Scan, Subquery/Aggregate child, or non-SemiJoin join child:
-        // use L₀ via EXCEPT ALL
-        let left_data_cols: String = left_cols
-            .iter()
-            .map(|c| quote_ident(c))
-            .collect::<Vec<_>>()
-            .join(", ");
+        if is_join_child(left) {
+            // EC01B-1: Deep join child — use per-leaf CTE-based snapshot.
+            // Each leaf Scan's pre-change state is cheap (single-table
+            // EXCEPT ALL), and the results are re-joined with the original
+            // conditions. No full-snapshot materialization needed.
+            let pre_change = build_pre_change_snapshot_sql(left, &ctx.scan_delta_ctes);
 
-        let left_alias = left.alias();
-        let left_pre_change = format!(
-            "(SELECT {left_data_cols} FROM {left_table} {la} \
-             EXCEPT ALL \
-             SELECT {left_data_cols} FROM {delta_left} WHERE __pgt_action = 'I' \
-             UNION ALL \
-             SELECT {left_data_cols} FROM {delta_left} WHERE __pgt_action = 'D')",
-            la = quote_ident(left_alias),
-            delta_left = left_result.cte_name,
-        );
-        // Apply semi-join filter to L₀ if equi-keys are available
-        if equi_keys.is_empty() {
-            left_pre_change
+            // Mark all leaf delta CTEs as NOT MATERIALIZED since they're
+            // now referenced in both the inner join delta and the per-leaf
+            // EXCEPT ALL sub-selects.
+            mark_leaf_delta_ctes_not_materialized(left, ctx);
+
+            // Apply semi-join filter to L₀ if equi-keys are available
+            if equi_keys.is_empty() {
+                pre_change
+            } else {
+                let filters: Vec<String> = equi_keys
+                    .iter()
+                    .map(|(left_key, right_key)| {
+                        format!(
+                            "{left_key} IN (SELECT DISTINCT {right_key} FROM {})",
+                            right_result.cte_name
+                        )
+                    })
+                    .collect();
+                format!(
+                    "(SELECT * FROM {pre_change} __l0 WHERE {filters})",
+                    filters = filters.join(" AND "),
+                )
+            }
         } else {
-            let filters: Vec<String> = equi_keys
+            // Scan, Subquery/Aggregate child: use L₀ via single-table
+            // EXCEPT ALL (cheap, no join explosion)
+            let left_data_cols: String = left_cols
                 .iter()
-                .map(|(left_key, right_key)| {
-                    format!(
-                        "{left_key} IN (SELECT DISTINCT {right_key} FROM {})",
-                        right_result.cte_name
-                    )
-                })
-                .collect();
-            format!(
-                "(SELECT * FROM {left_pre_change} __l0 WHERE {filters})",
-                filters = filters.join(" AND "),
-            )
+                .map(|c| quote_ident(c))
+                .collect::<Vec<_>>()
+                .join(", ");
+
+            let left_alias = left.alias();
+            let left_pre_change = format!(
+                "(SELECT {left_data_cols} FROM {left_table} {la} \
+                 EXCEPT ALL \
+                 SELECT {left_data_cols} FROM {delta_left} WHERE __pgt_action = 'I' \
+                 UNION ALL \
+                 SELECT {left_data_cols} FROM {delta_left} WHERE __pgt_action = 'D')",
+                la = quote_ident(left_alias),
+                delta_left = left_result.cte_name,
+            );
+            // Apply semi-join filter to L₀ if equi-keys are available
+            if equi_keys.is_empty() {
+                left_pre_change
+            } else {
+                let filters: Vec<String> = equi_keys
+                    .iter()
+                    .map(|(left_key, right_key)| {
+                        format!(
+                            "{left_key} IN (SELECT DISTINCT {right_key} FROM {})",
+                            right_result.cte_name
+                        )
+                    })
+                    .collect();
+                format!(
+                    "(SELECT * FROM {left_pre_change} __l0 WHERE {filters})",
+                    filters = filters.join(" AND "),
+                )
+            }
         }
     } else {
         // SemiJoin-containing nested join child: use post-change L₁ with
@@ -376,42 +406,68 @@ pub fn diff_inner_join(ctx: &mut DiffContext, op: &OpTree) -> Result<DiffResult,
     let use_r0 = use_pre_change_snapshot(right, ctx.inside_semijoin);
 
     let right_part1_source = if use_r0 {
-        // Scan, Subquery/Aggregate child, or non-SemiJoin join child:
-        // use R₀ via EXCEPT ALL for DELETE delta rows
-        let right_data_cols: String = right_cols
-            .iter()
-            .map(|c| quote_ident(c))
-            .collect::<Vec<_>>()
-            .join(", ");
+        if is_join_child(right) {
+            // EC01B-1: Deep join child — use per-leaf CTE-based snapshot.
+            let pre_change = build_pre_change_snapshot_sql(right, &ctx.scan_delta_ctes);
 
-        let right_alias = right.alias();
-        let right_pre_change = format!(
-            "(SELECT {right_data_cols} FROM {right_table} {ra} \
-             EXCEPT ALL \
-             SELECT {right_data_cols} FROM {delta_right} WHERE __pgt_action = 'I' \
-             UNION ALL \
-             SELECT {right_data_cols} FROM {delta_right} WHERE __pgt_action = 'D')",
-            ra = quote_ident(right_alias),
-            delta_right = right_result.cte_name,
-        );
-        // Apply semi-join filter to R₀ if equi-keys are available
-        // (filter R₀ by join keys that appear in delta_left)
-        if equi_keys.is_empty() {
-            right_pre_change
+            // Mark leaf delta CTEs NOT MATERIALIZED
+            mark_leaf_delta_ctes_not_materialized(right, ctx);
+
+            // Apply semi-join filter to R₀
+            if equi_keys.is_empty() {
+                pre_change
+            } else {
+                let filters: Vec<String> = equi_keys
+                    .iter()
+                    .map(|(left_key, right_key)| {
+                        format!(
+                            "{right_key} IN (SELECT DISTINCT {left_key} FROM {})",
+                            left_result.cte_name
+                        )
+                    })
+                    .collect();
+                format!(
+                    "(SELECT * FROM {pre_change} __r0 WHERE {filters})",
+                    filters = filters.join(" AND "),
+                )
+            }
         } else {
-            let filters: Vec<String> = equi_keys
+            // Scan, Subquery/Aggregate child: use R₀ via single-table
+            // EXCEPT ALL for DELETE delta rows
+            let right_data_cols: String = right_cols
                 .iter()
-                .map(|(left_key, right_key)| {
-                    format!(
-                        "{right_key} IN (SELECT DISTINCT {left_key} FROM {})",
-                        left_result.cte_name
-                    )
-                })
-                .collect();
-            format!(
-                "(SELECT * FROM {right_pre_change} __r0 WHERE {filters})",
-                filters = filters.join(" AND "),
-            )
+                .map(|c| quote_ident(c))
+                .collect::<Vec<_>>()
+                .join(", ");
+
+            let right_alias = right.alias();
+            let right_pre_change = format!(
+                "(SELECT {right_data_cols} FROM {right_table} {ra} \
+                 EXCEPT ALL \
+                 SELECT {right_data_cols} FROM {delta_right} WHERE __pgt_action = 'I' \
+                 UNION ALL \
+                 SELECT {right_data_cols} FROM {delta_right} WHERE __pgt_action = 'D')",
+                ra = quote_ident(right_alias),
+                delta_right = right_result.cte_name,
+            );
+            // Apply semi-join filter to R₀
+            if equi_keys.is_empty() {
+                right_pre_change
+            } else {
+                let filters: Vec<String> = equi_keys
+                    .iter()
+                    .map(|(left_key, right_key)| {
+                        format!(
+                            "{right_key} IN (SELECT DISTINCT {left_key} FROM {})",
+                            left_result.cte_name
+                        )
+                    })
+                    .collect();
+                format!(
+                    "(SELECT * FROM {right_pre_change} __r0 WHERE {filters})",
+                    filters = filters.join(" AND "),
+                )
+            }
         }
     } else {
         // Nested/complex right child: fall back to R₁ (current right).
@@ -775,6 +831,36 @@ fn build_semijoin_subquery(
 #[cfg(test)]
 fn get_current_table_ref(op: &OpTree) -> String {
     build_snapshot_sql(op)
+}
+
+/// EC01B-1: Walk a join subtree and mark all leaf Scan delta CTEs as
+/// NOT MATERIALIZED.
+///
+/// When the per-leaf CTE-based pre-change snapshot is used, each leaf's
+/// delta CTE is referenced in both the inner join delta computation AND
+/// the EXCEPT ALL sub-selects of the pre-change snapshot. PostgreSQL
+/// auto-materializes CTEs with ≥2 references, which would spill temp files.
+/// Marking them NOT MATERIALIZED forces PostgreSQL to inline the CTE.
+pub fn mark_leaf_delta_ctes_not_materialized(op: &OpTree, ctx: &mut DiffContext) {
+    match op {
+        OpTree::Scan { alias, .. } => {
+            if let Some(cte_name) = ctx.scan_delta_ctes.get(alias.as_str()) {
+                ctx.mark_cte_not_materialized(&cte_name.clone());
+            }
+        }
+        OpTree::InnerJoin { left, right, .. }
+        | OpTree::LeftJoin { left, right, .. }
+        | OpTree::FullJoin { left, right, .. } => {
+            mark_leaf_delta_ctes_not_materialized(left, ctx);
+            mark_leaf_delta_ctes_not_materialized(right, ctx);
+        }
+        OpTree::Filter { child, .. }
+        | OpTree::Project { child, .. }
+        | OpTree::Subquery { child, .. } => {
+            mark_leaf_delta_ctes_not_materialized(child, ctx);
+        }
+        _ => {}
+    }
 }
 
 #[cfg(test)]

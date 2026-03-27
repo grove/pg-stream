@@ -17,6 +17,8 @@
 //!    these aliases are *inside* the snapshot subquery and must be
 //!    translated to disambiguated column names (e.g., `l."o__prod_id"`).
 
+use std::collections::HashMap;
+
 use crate::dvm::diff::quote_ident;
 use crate::dvm::operators::aggregate::agg_to_rescan_sql;
 use crate::dvm::parser::{Expr, OpTree};
@@ -357,6 +359,178 @@ fn build_join_snapshot(join_type: &str, condition: &Expr, left: &OpTree, right: 
     }
 
     // Rewrite condition for snapshot: use child aliases directly
+    let cond_sql = rewrite_join_condition(condition, left, left_alias, right, right_alias);
+
+    format!(
+        "(SELECT {} FROM {} {} {} {} {} ON {})",
+        select_parts.join(", "),
+        left_snap,
+        quote_ident(left_alias),
+        join_type,
+        right_snap,
+        quote_ident(right_alias),
+        cond_sql
+    )
+}
+
+// ── EC01B-1: Per-leaf CTE-based pre-change snapshot ─────────────────────
+
+/// Build a SQL expression for the pre-change (L₀/R₀) snapshot of an
+/// operator subtree using per-leaf CTE-based snapshots.
+///
+/// Instead of the expensive approach of materializing the entire join
+/// result and applying `EXCEPT ALL` against the combined join delta, this
+/// function decomposes the snapshot into per-leaf pre-change states that
+/// are individually cheap to compute, then re-joins them.
+///
+/// **For Scan leaves**: `(SELECT cols FROM table EXCEPT ALL delta_inserts
+///   UNION ALL delta_deletes)` — operates on a single table, cheap.
+///
+/// **For join nodes**: recursively builds pre-change children and joins
+///   them with the original condition and column disambiguation.
+///
+/// **Semantic equivalence**: For INNER/LEFT/FULL JOINs, the join of
+/// per-leaf pre-change states is identical to the pre-change state of
+/// the join. This avoids materializing the full join result (which can
+/// spill GBs of temp files for deep join trees at any scale factor).
+///
+/// `scan_delta_ctes` maps each Scan alias to its delta CTE name, as
+/// populated by `diff_scan` during the diff traversal.
+pub fn build_pre_change_snapshot_sql(
+    op: &OpTree,
+    scan_delta_ctes: &HashMap<String, String>,
+) -> String {
+    match op {
+        OpTree::Scan {
+            schema,
+            table_name,
+            alias,
+            columns,
+            ..
+        } => {
+            if let Some(delta_cte) = scan_delta_ctes.get(alias.as_str()) {
+                // Per-leaf EXCEPT ALL: reconstruct pre-change state from
+                // current table minus inserts plus deletes.
+                let col_list: String = columns
+                    .iter()
+                    .map(|c| quote_ident(&c.name))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!(
+                    "(SELECT {col_list} FROM \"{schema}\".\"{table_name}\" {alias_q} \
+                     EXCEPT ALL \
+                     SELECT {col_list} FROM {delta_cte} WHERE __pgt_action = 'I' \
+                     UNION ALL \
+                     SELECT {col_list} FROM {delta_cte} WHERE __pgt_action = 'D')",
+                    schema = schema.replace('"', "\"\""),
+                    table_name = table_name.replace('"', "\"\""),
+                    alias_q = quote_ident(alias),
+                )
+            } else {
+                // No delta for this scan — fall back to current state
+                build_snapshot_sql(op)
+            }
+        }
+        OpTree::InnerJoin {
+            condition,
+            left,
+            right,
+        } => build_pre_change_join_snapshot("JOIN", condition, left, right, scan_delta_ctes),
+        OpTree::LeftJoin {
+            condition,
+            left,
+            right,
+        } => build_pre_change_join_snapshot("LEFT JOIN", condition, left, right, scan_delta_ctes),
+        OpTree::FullJoin {
+            condition,
+            left,
+            right,
+        } => build_pre_change_join_snapshot("FULL JOIN", condition, left, right, scan_delta_ctes),
+        OpTree::Filter { child, predicate } => {
+            let child_snap = build_pre_change_snapshot_sql(child, scan_delta_ctes);
+            if matches!(child.as_ref(), OpTree::Scan { .. }) {
+                let alias = child.alias();
+                format!(
+                    "(SELECT * FROM {} {} WHERE {})",
+                    child_snap,
+                    quote_ident(alias),
+                    predicate.to_sql()
+                )
+            } else {
+                child_snap
+            }
+        }
+        OpTree::Project {
+            expressions,
+            aliases,
+            child,
+        } => {
+            let inner = build_pre_change_snapshot_sql(child, scan_delta_ctes);
+            let child_alias = child.alias();
+            let selects: Vec<String> = expressions
+                .iter()
+                .zip(aliases.iter())
+                .map(|(expr, alias)| {
+                    let expr_sql = expr.to_sql();
+                    let alias_ident = quote_ident(alias);
+                    if expr_sql == *alias {
+                        alias_ident
+                    } else {
+                        format!("{expr_sql} AS {alias_ident}")
+                    }
+                })
+                .collect();
+            format!(
+                "(SELECT {} FROM {} {})",
+                selects.join(", "),
+                inner,
+                quote_ident(child_alias),
+            )
+        }
+        OpTree::Subquery { child, .. } => build_pre_change_snapshot_sql(child, scan_delta_ctes),
+        // For all other node types, fall back to the current snapshot.
+        // CteScan, Aggregate, etc. don't have per-leaf delta tracking.
+        _ => build_snapshot_sql(op),
+    }
+}
+
+/// Build a pre-change join snapshot with per-leaf CTE-based sub-snapshots.
+///
+/// Analogous to [`build_join_snapshot`] but recursively applies per-leaf
+/// pre-change snapshots instead of current-state snapshots.
+fn build_pre_change_join_snapshot(
+    join_type: &str,
+    condition: &Expr,
+    left: &OpTree,
+    right: &OpTree,
+    scan_delta_ctes: &HashMap<String, String>,
+) -> String {
+    let left_snap = build_pre_change_snapshot_sql(left, scan_delta_ctes);
+    let right_snap = build_pre_change_snapshot_sql(right, scan_delta_ctes);
+    let left_alias = left.alias();
+    let right_alias = right.alias();
+
+    let left_cols = snapshot_output_columns(left);
+    let right_cols = snapshot_output_columns(right);
+
+    let mut select_parts = Vec::new();
+    for c in &left_cols {
+        select_parts.push(format!(
+            "{}.{} AS {}",
+            quote_ident(left_alias),
+            quote_ident(c),
+            quote_ident(&format!("{left_alias}__{c}"))
+        ));
+    }
+    for c in &right_cols {
+        select_parts.push(format!(
+            "{}.{} AS {}",
+            quote_ident(right_alias),
+            quote_ident(c),
+            quote_ident(&format!("{right_alias}__{c}"))
+        ));
+    }
+
     let cond_sql = rewrite_join_condition(condition, left, left_alias, right, right_alias);
 
     format!(
@@ -1108,41 +1282,32 @@ pub fn join_scan_count(op: &OpTree) -> usize {
     }
 }
 
-/// Returns true when the pre-change snapshot (via EXCEPT ALL) should be
-/// used for the given child node.  This is safe when:
-/// - The child is a simple Scan (cheap EXCEPT ALL)
+/// Returns true when the pre-change snapshot (via per-leaf CTE-based
+/// reconstruction) should be used for the given child node.  This is
+/// safe when:
+/// - The child is a simple Scan (cheap single-table EXCEPT ALL)
 /// - The child is NOT a join (Subquery/Aggregate — safe for EXCEPT ALL)
-/// - The child is a join without SemiJoin/AntiJoin and ≤ 2 scan nodes
+/// - The child is a join without SemiJoin/AntiJoin (any depth)
 ///
-/// When false, the post-change snapshot should be used (possibly with a
-/// correction term for shallow join children).
+/// When false, the post-change snapshot should be used (with a correction
+/// term for shallow join children).
 ///
-/// # EC-01 boundary (SF-5)
+/// # EC01B-1: Per-leaf CTE-based snapshot (v0.12.0)
 ///
-/// The `join_scan_count(child) <= 2` threshold is a **known correctness
-/// trade-off**.  For join subtrees with ≥3 scan nodes (e.g. TPC-H Q7/Q8/Q9),
-/// the pre-change snapshot via EXCEPT ALL can cause PostgreSQL to spill
-/// multiple GB of temporary files — even at small scale factors — because:
+/// The previous `join_scan_count(child) <= 2` threshold has been
+/// **removed**.  Deep join trees (≥3 scan nodes, e.g. TPC-H Q7/Q8/Q9)
+/// now use a per-leaf CTE-based snapshot strategy: each leaf Scan's
+/// pre-change state is computed individually via `table EXCEPT ALL
+/// delta_inserts UNION ALL delta_deletes` (cheap, single-table), and
+/// the results are re-joined with the original conditions.  This avoids
+/// the full-snapshot EXCEPT ALL that spilled multi-GB temp files.
 ///
-/// 1. The full snapshot of a multi-table join must be materialized
-/// 2. Delta CTEs are materialized within the EXCEPT ALL set operations
-/// 3. PostgreSQL auto-materializes CTEs referenced ≥2 times
-///
-/// With the threshold at 2, queries with wide right-side join chains (≥3
-/// scan nodes) fall back to L₁/R₁ (post-change snapshots). This means the
-/// original EC-01 phantom-row-after-DELETE bug remains present for those
-/// queries: when a left-side row DELETE coincides with its right-side join
-/// partner also being deleted, the DELETE action may be silently dropped
-/// because R₁ no longer contains the partner row.
-///
-/// The `NOT MATERIALIZED` CTE hint (see `diff.rs`) mitigates some cases
-/// but does not fully solve the cascading materialization problem for deep
-/// join trees.  Removing this threshold requires either a PostgreSQL-level
-/// query optimizer change or a fundamentally different snapshot strategy.
+/// SemiJoin/AntiJoin-containing subtrees still fall back to L₁/R₁
+/// (post-change) to avoid the Q21-type numwait regression.
 pub fn use_pre_change_snapshot(child: &OpTree, inside_semijoin: bool) -> bool {
     is_simple_child(child)
         || !is_join_child(child)
-        || (!contains_semijoin(child) && !inside_semijoin && join_scan_count(child) <= 2)
+        || (!contains_semijoin(child) && !inside_semijoin)
 }
 
 #[cfg(test)]
@@ -1460,22 +1625,18 @@ mod tests {
         );
     }
 
-    // ── G17-EC01B-NEG: ≥3-scan join subtrees must NOT use pre-change snapshot ──
+    // ── G17-EC01B: ≥3-scan join subtrees now use per-leaf CTE-based
+    //    pre-change snapshots (EC01B-1, v0.12.0)
     //
-    // These tests assert the current correctness boundary: join subtrees with
-    // ≥3 scan nodes fall back to the post-change snapshot (L₁/R₁) to avoid
-    // cascading CTE materialization that exhausts temp_file_limit.
-    //
-    // This means the EC-01 phantom-row-after-DELETE bug is **still present**
-    // for these queries — the tests exist to prevent regressions that might
-    // accidentally enable pre-change snapshots for wide join trees before the
-    // underlying fix is implemented.
-    //
-    // TODO: Remove when EC01B-1/EC01B-2 fixed in v0.12.0
+    // These tests assert that `use_pre_change_snapshot` returns true for
+    // pure InnerJoin/LeftJoin chains of any depth (no SemiJoin/AntiJoin).
+    // The EC01B-1 per-leaf CTE strategy enables correct pre-change
+    // snapshots without the temp_file_limit spillover that the old
+    // full-snapshot EXCEPT ALL caused.
 
     #[test]
-    fn test_ec01b_neg_three_way_join_no_pre_change_snapshot() {
-        // a ⋈ b ⋈ c → 3 scan nodes → must NOT use pre-change snapshot
+    fn test_ec01b_three_way_join_uses_pre_change_snapshot() {
+        // a ⋈ b ⋈ c → 3 scan nodes → now uses per-leaf pre-change snapshot
         let a = scan(1, "a", "public", "a", &["id", "b_id"]);
         let b = scan(2, "b", "public", "b", &["id", "c_id"]);
         let c = scan(3, "c", "public", "c", &["id"]);
@@ -1483,13 +1644,13 @@ mod tests {
         let outer = inner_join(eq_cond("a", "b_id", "b", "id"), a, inner);
         assert_eq!(join_scan_count(&outer), 3);
         assert!(
-            !use_pre_change_snapshot(&outer, false),
-            "≥3-scan join subtree must fall back to post-change snapshot (EC-01 boundary)"
+            use_pre_change_snapshot(&outer, false),
+            "≥3-scan join subtree should use per-leaf pre-change snapshot (EC01B-1)"
         );
     }
 
     #[test]
-    fn test_ec01b_neg_four_way_join_no_pre_change_snapshot() {
+    fn test_ec01b_four_way_join_uses_pre_change_snapshot() {
         // a ⋈ b ⋈ c ⋈ d → 4 scan nodes
         let a = scan(1, "a", "public", "a", &["id"]);
         let b = scan(2, "b", "public", "b", &["id"]);
@@ -1500,25 +1661,24 @@ mod tests {
         let abcd = inner_join(eq_cond("a", "id", "b", "id"), a, bcd);
         assert_eq!(join_scan_count(&abcd), 4);
         assert!(
-            !use_pre_change_snapshot(&abcd, false),
-            "4-scan join subtree must fall back to post-change snapshot"
+            use_pre_change_snapshot(&abcd, false),
+            "4-scan join subtree should use per-leaf pre-change snapshot (EC01B-1)"
         );
     }
 
     #[test]
-    fn test_ec01b_neg_right_subtree_three_scans() {
+    fn test_ec01b_right_subtree_three_scans_uses_pre_change_snapshot() {
         // For a join (left ⋈ right) where right has 3 scans, the right
-        // side must NOT use pre-change snapshot.
+        // side now uses per-leaf pre-change snapshot.
         let r1 = scan(2, "r1", "public", "r1", &["id"]);
         let r2 = scan(3, "r2", "public", "r2", &["id"]);
         let r3 = scan(4, "r3", "public", "r3", &["id"]);
         let right_inner = inner_join(eq_cond("r1", "id", "r2", "id"), r1, r2);
         let right_outer = inner_join(eq_cond("r2", "id", "r3", "id"), right_inner, r3);
         assert_eq!(join_scan_count(&right_outer), 3);
-        // The right subtree alone has ≥3 scans → no pre-change snapshot
         assert!(
-            !use_pre_change_snapshot(&right_outer, false),
-            "Right subtree with 3 scans must not use pre-change snapshot"
+            use_pre_change_snapshot(&right_outer, false),
+            "Right subtree with 3 scans should use per-leaf pre-change snapshot (EC01B-1)"
         );
     }
 
