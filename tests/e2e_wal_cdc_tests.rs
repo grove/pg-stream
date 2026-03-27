@@ -431,6 +431,14 @@ async fn test_wal_fallback_on_missing_slot() {
     db.execute(&format!("SELECT pg_drop_replication_slot('{slot_name}')"))
         .await;
 
+    // Pin cdc_mode to 'trigger' so the scheduler doesn't immediately
+    // re-promote back to WAL after fallback. In 'auto' mode the scheduler
+    // would re-create the slot within one tick, making TRIGGER unobservable.
+    db.execute("ALTER SYSTEM SET pg_trickle.cdc_mode = 'trigger'")
+        .await;
+    db.execute("SELECT pg_reload_conf()").await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+
     // Wait for the health check / poll error to trigger fallback
     let fallback_mode = wait_for_cdc_mode(&db, "wal_fb", "TRIGGER", Duration::from_secs(60)).await;
     assert_eq!(
