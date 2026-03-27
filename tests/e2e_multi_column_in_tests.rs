@@ -107,7 +107,9 @@ async fn test_multi_column_in_subquery_returns_error() {
         )
         .await;
 
-    let err = result.expect_err("Multi-column IN should be rejected").to_string();
+    let err = result
+        .expect_err("Multi-column IN should be rejected")
+        .to_string();
     assert!(
         err.contains("multi-column IN") || err.contains("not supported"),
         "Expected structured error about multi-column IN, got: {err}"
