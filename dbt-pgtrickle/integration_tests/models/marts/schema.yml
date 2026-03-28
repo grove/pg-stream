@@ -60,3 +60,42 @@ models:
         description: "Number of orders"
         tests:
           - not_null
+
+  - name: order_totals_partitioned
+    description: "Order totals with RANGE partitioning on customer_id (DBT-1 test)"
+    tests:
+      - dbt_pgtrickle.stream_table_healthy:
+          warn_seconds: 600
+    columns:
+      - name: customer_id
+        description: "Customer identifier"
+        tests:
+          - not_null
+      - name: total_amount
+        description: "Sum of all order amounts"
+        tests:
+          - not_null
+      - name: order_count
+        description: "Number of orders"
+        tests:
+          - not_null
+
+  - name: order_totals_fused
+    description: "Order totals with fuse circuit-breaker configured (DBT-2 test)"
+    tests:
+      - dbt_pgtrickle.stream_table_healthy:
+          warn_seconds: 600
+    columns:
+      - name: customer_id
+        description: "Customer identifier"
+        tests:
+          - not_null
+          - unique
+      - name: total_amount
+        description: "Sum of all order amounts"
+        tests:
+          - not_null
+      - name: order_count
+        description: "Number of orders"
+        tests:
+          - not_null

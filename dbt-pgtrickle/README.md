@@ -66,11 +66,67 @@ dbt test --select order_totals  # Tests work normally (it's a real table)
 |-----|------|---------|-------------|
 | `materialized` | string | — | Must be `'stream_table'` |
 | `schedule` | string/null | `'1m'` | Refresh schedule (e.g., `'5m'`, `'1h'`, cron). `null` for pg_trickle's CALCULATED schedule. |
-| `refresh_mode` | string | `'DIFFERENTIAL'` | `'FULL'` or `'DIFFERENTIAL'` |
+| `refresh_mode` | string | `'DIFFERENTIAL'` | `'FULL'`, `'DIFFERENTIAL'`, `'AUTO'`, or `'IMMEDIATE'` |
 | `initialize` | bool | `true` | Populate on creation |
 | `status` | string/null | `null` | `'ACTIVE'` or `'PAUSED'`. When set, applies on subsequent runs via `alter_stream_table()`. |
 | `stream_table_name` | string | model name | Override stream table name |
 | `stream_table_schema` | string | target schema | Override schema |
+| `cdc_mode` | string/null | `null` | CDC mode override: `'auto'`, `'trigger'`, or `'wal'`. `null` uses the GUC default. |
+| `partition_by` | string/null | `null` | Column name for RANGE partitioning of the storage table (v0.13.0+). Cannot be changed after creation. |
+| `fuse` | string/null | `null` | Fuse circuit-breaker mode: `'off'`, `'on'`, or `'auto'` (v0.13.0+). Applied via `alter_stream_table()` on every run; no-op if unchanged. |
+| `fuse_ceiling` | int/null | `null` | Change-count threshold that triggers the fuse (v0.13.0+). `null` uses the global GUC default. |
+| `fuse_sensitivity` | int/null | `null` | Number of consecutive over-ceiling observations before the fuse blows (v0.13.0+). `null` means 1 (immediate). |
+
+### `partition_by` — RANGE partitioning
+
+Partition the stream table's storage table by a column value. pg_trickle creates a `PARTITION BY RANGE (<col>)` storage table with a default catch-all partition. Add your own date/integer range partitions via standard PostgreSQL DDL after `dbt run`.
+
+```sql
+-- models/marts/events_by_day.sql
+{{ config(
+    materialized='stream_table',
+    schedule='1m',
+    refresh_mode='DIFFERENTIAL',
+    partition_by='event_day'
+) }}
+
+SELECT
+    event_day,
+    user_id,
+    COUNT(*) AS event_count
+FROM {{ source('raw', 'events') }}
+GROUP BY event_day, user_id
+```
+
+> **Note:** `partition_by` is applied only at creation time. Changing it after the stream table exists has no effect. Use `dbt run --full-refresh` to recreate with a new partition key.
+
+### `fuse` — Circuit breaker
+
+The fuse circuit breaker suspends refreshes when the change volume exceeds a threshold, protecting against runaway refresh cycles during bulk ingestion.
+
+```sql
+-- models/marts/order_totals.sql
+{{ config(
+    materialized='stream_table',
+    schedule='5m',
+    refresh_mode='DIFFERENTIAL',
+    fuse='auto',
+    fuse_ceiling=50000,
+    fuse_sensitivity=3
+) }}
+
+SELECT customer_id, SUM(amount) AS total
+FROM {{ source('raw', 'orders') }}
+GROUP BY customer_id
+```
+
+| `fuse` value | Behaviour |
+|-------------|-----------|
+| `'off'` | Fuse disabled (default) |
+| `'on'` | Fuse always active; blows when ceiling is exceeded |
+| `'auto'` | Fuse activates only when the delta is large enough to make FULL refresh cheaper than DIFFERENTIAL |
+
+Fuse parameters are applied on every `dbt run` via `alter_stream_table()` — only calls the SQL function when the values have genuinely changed from the catalog state.
 
 ### Project-level defaults
 

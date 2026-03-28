@@ -31,6 +31,10 @@
   {%- set status = config.get('status', none) -%}
   {%- set st_name = config.get('stream_table_name', target_relation.identifier) -%}
   {%- set st_schema = config.get('stream_table_schema', target_relation.schema) -%}
+  {%- set partition_by = config.get('partition_by', none) -%}
+  {%- set fuse = config.get('fuse', none) -%}
+  {%- set fuse_ceiling = config.get('fuse_ceiling', none) -%}
+  {%- set fuse_sensitivity = config.get('fuse_sensitivity', none) -%}
   {#- should_full_refresh() is the stable API from dbt 1.0+; flags.FULL_REFRESH
       was deprecated in dbt 1.10 and may warn or fail in 1.11+. -#}
   {%- set full_refresh_mode = should_full_refresh() -%}
@@ -63,17 +67,19 @@
   {% if has_cor and not full_refresh_mode %}
     {# ── Fast path: idempotent create_or_replace (pg_trickle ≥ 0.6.0) ── #}
     {{ dbt_pgtrickle.pgtrickle_create_or_replace_stream_table(
-         qualified_name, defining_query, schedule, refresh_mode, initialize, cdc_mode
+         qualified_name, defining_query, schedule, refresh_mode, initialize, cdc_mode,
+         partition_by=partition_by
        ) }}
 
-    {# Handle status changes separately — create_or_replace doesn't accept status #}
-    {% if status is not none and st_exists %}
+    {# Handle status/fuse changes separately — create_or_replace doesn't accept them #}
+    {% if (status is not none and st_exists) or fuse is not none or fuse_ceiling is not none or fuse_sensitivity is not none %}
       {%- set current_info = dbt_pgtrickle.pgtrickle_get_stream_table_info(qualified_name) -%}
-      {% if current_info and current_info.status != status %}
+      {% if current_info and (current_info.status != status or fuse is not none or fuse_ceiling is not none or fuse_sensitivity is not none) %}
         {{ dbt_pgtrickle.pgtrickle_alter_stream_table(
              qualified_name, schedule, refresh_mode,
              status=status, current_info=current_info,
-             cdc_mode=cdc_mode
+             cdc_mode=cdc_mode,
+             fuse=fuse, fuse_ceiling=fuse_ceiling, fuse_sensitivity=fuse_sensitivity
            ) }}
       {% endif %}
     {% endif %}
@@ -82,7 +88,8 @@
     {% if not st_exists %}
       {# -- CREATE: stream table does not exist yet -- #}
       {{ dbt_pgtrickle.pgtrickle_create_stream_table(
-            qualified_name, defining_query, schedule, refresh_mode, initialize, cdc_mode
+            qualified_name, defining_query, schedule, refresh_mode, initialize, cdc_mode,
+            partition_by=partition_by
          ) }}
     {% else %}
       {# -- UPDATE: stream table exists — check if query changed -- #}
@@ -93,17 +100,19 @@
         {{ log("pg_trickle: query changed — altering '" ~ qualified_name ~ "' in place", info=true) }}
         {{ dbt_pgtrickle.pgtrickle_alter_stream_table(
              qualified_name, schedule, refresh_mode,
-           status=status, current_info=current_info,
-           cdc_mode=cdc_mode,
-             query=defining_query
+             status=status, current_info=current_info,
+             cdc_mode=cdc_mode,
+             query=defining_query,
+             fuse=fuse, fuse_ceiling=fuse_ceiling, fuse_sensitivity=fuse_sensitivity
            ) }}
       {% else %}
-        {# Query unchanged: update schedule/mode/status if they differ.
+        {# Query unchanged: update schedule/mode/status/fuse if they differ.
            Pass current_info to avoid redundant catalog lookup. #}
         {{ dbt_pgtrickle.pgtrickle_alter_stream_table(
              qualified_name, schedule, refresh_mode,
-           status=status, current_info=current_info,
-           cdc_mode=cdc_mode
+             status=status, current_info=current_info,
+             cdc_mode=cdc_mode,
+             fuse=fuse, fuse_ceiling=fuse_ceiling, fuse_sensitivity=fuse_sensitivity
            ) }}
       {% endif %}
     {% endif %}

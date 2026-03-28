@@ -1,5 +1,5 @@
 {#
-  pgtrickle_create_stream_table(name, query, schedule, refresh_mode, initialize, cdc_mode)
+  pgtrickle_create_stream_table(name, query, schedule, refresh_mode, initialize, cdc_mode, partition_by)
 
   Creates a new stream table via pgtrickle.create_stream_table().
   Called by the stream_table materialization on first run.
@@ -11,8 +11,11 @@
                          Pass none for pg_trickle's CALCULATED schedule (SQL NULL).
     refresh_mode (str): 'FULL' or 'DIFFERENTIAL'
     initialize (bool): Whether to populate immediately on creation
+    cdc_mode (str|none): Optional CDC mode override ('auto', 'trigger', 'wal')
+    partition_by (str|none): Optional column name to partition the storage table by (RANGE).
+                             e.g. 'created_at'. Cannot be changed after creation.
 #}
-{% macro pgtrickle_create_stream_table(name, query, schedule, refresh_mode, initialize, cdc_mode=none) %}
+{% macro pgtrickle_create_stream_table(name, query, schedule, refresh_mode, initialize, cdc_mode=none, partition_by=none) %}
   {#
     Run create_stream_table() outside of dbt's model transaction.
     dbt wraps the model's main statement in BEGIN...ROLLBACK (for testing /
@@ -30,7 +33,10 @@
       {{ initialize }},
       NULL,
       NULL,
-      {% if cdc_mode is none %}NULL{% else %}{{ dbt.string_literal(cdc_mode) }}{% endif %}
+      {% if cdc_mode is none %}NULL{% else %}{{ dbt.string_literal(cdc_mode) }}{% endif %},
+      false,
+      false,
+      {% if partition_by is none %}NULL{% else %}{{ dbt.string_literal(partition_by) }}{% endif %}
     );
     COMMIT;
   {% endcall %}

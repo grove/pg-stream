@@ -81,6 +81,9 @@ Complete reference for all SQL functions, views, and catalog tables provided by 
   - [pgtrickle.pgt\_refresh\_groups](#pgtricklepgt_refresh_groups)
 - [Delta SQL Profiling (v0.13.0)](#delta-sql-profiling-v0130)
   - [pgtrickle.explain\_delta](#pgtrickleexplain_delta)
+- [dbt Integration (v0.13.0)](#dbt-integration-v0130)
+  - [partition\_by config](#partition_by-config)
+  - [fuse config](#fuse-config)
 
 ---
 
@@ -3225,6 +3228,95 @@ SELECT * FROM pgtrickle.dedup_stats();
 A `dedup_ratio_pct` ≥ 10 is the threshold recommended for investigating a
 two-pass MERGE strategy. See `plans/performance/REPORT_OVERALL_STATUS.md §14`
 for background.
+
+
+
+---
+
+## dbt Integration (v0.13.0)
+
+The `dbt-pgtrickle` package exposes two new `config(...)` keys added in
+v0.13.0: `partition_by` and the fuse circuit-breaker options. Use them directly
+in any `stream_table` materialization model.
+
+For full dbt documentation see `dbt-pgtrickle/README.md`.
+
+---
+
+### `partition_by` config
+
+Partition the stream table's underlying storage table using PostgreSQL
+`PARTITION BY RANGE`. Only applied at **creation time** — changing it after the
+stream table exists has no effect (use `--full-refresh` to recreate).
+
+```sql
+-- models/marts/events_by_day.sql
+{{ config(
+    materialized='stream_table',
+    schedule='1m',
+    refresh_mode='DIFFERENTIAL',
+    partition_by='event_day'
+) }}
+
+SELECT
+    event_day,
+    user_id,
+    COUNT(*) AS event_count
+FROM {{ source('raw', 'events') }}
+GROUP BY event_day, user_id
+```
+
+pg_trickle creates a `PARTITION BY RANGE (event_day)` storage table with an
+automatic default catch-all partition. Add named partitions via standard DDL:
+
+```sql
+CREATE TABLE analytics.events_by_day_2026
+  PARTITION OF analytics.events_by_day
+  FOR VALUES FROM ('2026-01-01') TO ('2027-01-01');
+```
+
+The `partition_by` value is stored in `pgtrickle.pgt_stream_tables.st_partition_key`
+and visible via `pgtrickle.stream_tables_info`.
+
+---
+
+### `fuse` config
+
+The fuse circuit breaker suspends differential refreshes when the incoming
+change volume exceeds a threshold, preventing runaway refresh cycles during
+bulk ingestion. Fuse parameters are applied via `alter_stream_table()` on
+every `dbt run`; they are a **no-op if the values have not changed**.
+
+```sql
+-- models/marts/order_totals.sql
+{{ config(
+    materialized='stream_table',
+    schedule='5m',
+    refresh_mode='DIFFERENTIAL',
+    fuse='auto',
+    fuse_ceiling=50000,
+    fuse_sensitivity=3
+) }}
+
+SELECT customer_id, SUM(amount) AS total
+FROM {{ source('raw', 'orders') }}
+GROUP BY customer_id
+```
+
+| Config key | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `fuse` | `'off'`\|`'on'`\|`'auto'` | `null` (no-op) | Fuse mode. `'auto'` activates only when FULL refresh would be cheaper than DIFFERENTIAL. |
+| `fuse_ceiling` | integer | `null` | Change-count threshold (number of changed rows) that triggers the fuse. `null` uses the global `pg_trickle.fuse_default_ceiling` GUC. |
+| `fuse_sensitivity` | integer | `null` | Number of consecutive over-ceiling observations required before the fuse blows. `null` means 1 (blow immediately). |
+
+Monitor fuse state via `pgtrickle.dedup_stats()` or check
+`pgtrickle.pgt_stream_tables.fuse_state` directly:
+
+```sql
+SELECT pgt_name, fuse_mode, fuse_state, fuse_ceiling, fuse_sensitivity
+FROM pgtrickle.pgt_stream_tables
+WHERE fuse_mode != 'off';
+```
 
 
 
