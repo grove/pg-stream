@@ -878,6 +878,169 @@ pub fn build_bypass_capture_sql(
     )
 }
 
+/// Capture the effective delta from a DIFFERENTIAL refresh into the ST's
+/// change buffer using a pre/post snapshot comparison.
+///
+/// Called after the explicit DML (DELETE + UPDATE + INSERT) when the ST has
+/// downstream consumers.  The weight-aggregation wrapper in the USING clause
+/// collapses D+I pairs for the same `__pgt_row_id` into a single I action,
+/// which is correct for the MERGE/DML steps but loses the DELETE for old
+/// column values.  Downstream STs that filter on changed columns would never
+/// learn that the old row was removed.
+///
+/// This function compares a scoped pre-DML snapshot (`__pgt_pre_{pgt_id}`)
+/// — containing only rows whose `__pgt_row_id` appears in the delta — with
+/// the post-DML state to produce accurate I/D pairs for downstream
+/// propagation.
+///
+/// Expects:
+///   - `__pgt_pre_{pgt_id}` temp table (created before DML with
+///     affected rows)
+///   - `__pgt_delta_{pgt_id}` temp table (the materialized delta,
+///     used to scope the "inserted" query to delta-affected row IDs)
+fn capture_incremental_diff_to_st_buffer(
+    st: &StreamTableMeta,
+    user_cols: &[String],
+) -> Result<i64, PgTrickleError> {
+    let change_schema = crate::config::pg_trickle_change_buffer_schema().replace('"', "\"\"");
+    let pgt_id = st.pgt_id;
+
+    if !crate::cdc::has_st_change_buffer(pgt_id, &change_schema) {
+        return Ok(0);
+    }
+
+    let schema = &st.pgt_schema;
+    let name = &st.pgt_name;
+    let quoted_table = format!(
+        "\"{}\".\"{}\"",
+        schema.replace('"', "\"\""),
+        name.replace('"', "\"\""),
+    );
+
+    let new_col_list: String = user_cols
+        .iter()
+        .map(|c| format!("\"new_{}\"", c.replace('"', "\"\"")))
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    let pre_col_refs: String = user_cols
+        .iter()
+        .map(|c| format!("pre.\"{}\"", c.replace('"', "\"\"")))
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    let post_col_refs: String = user_cols
+        .iter()
+        .map(|c| format!("post.\"{}\"", c.replace('"', "\"\"")))
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    let is_distinct_pairs: String = user_cols
+        .iter()
+        .map(|c| {
+            let qc = format!("\"{}\"", c.replace('"', "\"\""));
+            format!("pre.{qc} IS DISTINCT FROM post.{qc}")
+        })
+        .collect::<Vec<_>>()
+        .join(" OR ");
+
+    let pre_pk_hash = build_content_hash_expr("pre.", user_cols);
+    let post_pk_hash = build_content_hash_expr("post.", user_cols);
+
+    let mut total_count: i64 = 0;
+
+    // Deleted rows: in pre-snapshot but no longer in the table.
+    let deleted_sql = format!(
+        "INSERT INTO \"{change_schema}\".changes_pgt_{pgt_id} \
+         (lsn, action, pk_hash, {new_col_list}) \
+         SELECT pg_current_wal_lsn(), 'D', {pre_pk_hash}, {pre_col_refs} \
+         FROM __pgt_pre_{pgt_id} pre \
+         LEFT JOIN {quoted_table} post ON pre.__pgt_row_id = post.__pgt_row_id \
+         WHERE post.__pgt_row_id IS NULL"
+    );
+    let del_count = Spi::connect_mut(|client| {
+        let result = client
+            .update(&deleted_sql, None, &[])
+            .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
+        Ok::<i64, PgTrickleError>(result.len() as i64)
+    })?;
+    total_count += del_count;
+
+    // Inserted rows: in the table but not in the pre-snapshot.
+    // Scoped to rows whose __pgt_row_id appears in the delta to avoid
+    // scanning the entire table.
+    let inserted_sql = format!(
+        "INSERT INTO \"{change_schema}\".changes_pgt_{pgt_id} \
+         (lsn, action, pk_hash, {new_col_list}) \
+         SELECT pg_current_wal_lsn(), 'I', {post_pk_hash}, {post_col_refs} \
+         FROM {quoted_table} post \
+         JOIN (SELECT DISTINCT __pgt_row_id FROM __pgt_delta_{pgt_id}) delta \
+           ON delta.__pgt_row_id = post.__pgt_row_id \
+         LEFT JOIN __pgt_pre_{pgt_id} pre ON post.__pgt_row_id = pre.__pgt_row_id \
+         WHERE pre.__pgt_row_id IS NULL"
+    );
+    let ins_count = Spi::connect_mut(|client| {
+        let result = client
+            .update(&inserted_sql, None, &[])
+            .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
+        Ok::<i64, PgTrickleError>(result.len() as i64)
+    })?;
+    total_count += ins_count;
+
+    // Changed rows: same row_id but different column values.
+    // Emit D (old values) + I (new values) so downstream filters can
+    // correctly evaluate both the removal and the insertion.
+    if !is_distinct_pairs.is_empty() {
+        let changed_del_sql = format!(
+            "INSERT INTO \"{change_schema}\".changes_pgt_{pgt_id} \
+             (lsn, action, pk_hash, {new_col_list}) \
+             SELECT pg_current_wal_lsn(), 'D', {pre_pk_hash}, {pre_col_refs} \
+             FROM __pgt_pre_{pgt_id} pre \
+             JOIN {quoted_table} post ON post.__pgt_row_id = pre.__pgt_row_id \
+             WHERE {is_distinct_pairs}"
+        );
+        let chg_del_count = Spi::connect_mut(|client| {
+            let result = client
+                .update(&changed_del_sql, None, &[])
+                .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
+            Ok::<i64, PgTrickleError>(result.len() as i64)
+        })?;
+        total_count += chg_del_count;
+
+        let changed_ins_sql = format!(
+            "INSERT INTO \"{change_schema}\".changes_pgt_{pgt_id} \
+             (lsn, action, pk_hash, {new_col_list}) \
+             SELECT pg_current_wal_lsn(), 'I', {post_pk_hash}, {post_col_refs} \
+             FROM {quoted_table} post \
+             JOIN __pgt_pre_{pgt_id} pre ON post.__pgt_row_id = pre.__pgt_row_id \
+             WHERE {is_distinct_pairs}"
+        );
+        let chg_ins_count = Spi::connect_mut(|client| {
+            let result = client
+                .update(&changed_ins_sql, None, &[])
+                .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
+            Ok::<i64, PgTrickleError>(result.len() as i64)
+        })?;
+        total_count += chg_ins_count;
+    }
+
+    if total_count > 0 {
+        pgrx::debug1!(
+            "[pg_trickle] ST-ST INCR: captured {} diff rows to changes_pgt_{} for {}.{} \
+             (deleted={}, inserted={}, changed={})",
+            total_count,
+            pgt_id,
+            schema,
+            name,
+            del_count,
+            ins_count,
+            total_count - del_count - ins_count,
+        );
+    }
+
+    Ok(total_count)
+}
+
 /// Capture the full-refresh diff into the ST's change buffer.
 ///
 /// Called after a FULL refresh when the ST has downstream consumers.
@@ -3536,6 +3699,54 @@ pub fn execute_differential_refresh(
         Spi::run(&materialize_sql).map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
         let t_mat = t_mat_start.elapsed();
 
+        // ST-ST-10: When this ST has downstream ST consumers, snapshot
+        // the affected rows BEFORE applying DML.  The weight-aggregation
+        // wrapper collapses D+I pairs for the same __pgt_row_id into a
+        // single I action, which is correct for the MERGE but loses the
+        // DELETE for old column values.  The pre-snapshot lets us compute
+        // the true effective delta (including value-change DELETEs) after
+        // the DML completes.
+        let needs_diff_capture = has_downstream_st_consumers(st.pgt_id);
+        let diff_capture_cols = if needs_diff_capture {
+            let cols = get_st_user_columns(st);
+            let col_list: String = cols
+                .iter()
+                .map(|c| format!("\"{}\"", c.replace('"', "\"\"")))
+                .collect::<Vec<_>>()
+                .join(", ");
+
+            let qt = format!(
+                "\"{}\".\"{}\"",
+                schema.replace('"', "\"\""),
+                name.replace('"', "\"\""),
+            );
+
+            let _ = Spi::run(&format!("DROP TABLE IF EXISTS __pgt_pre_{}", st.pgt_id));
+
+            let snapshot_sql = format!(
+                "CREATE TEMP TABLE __pgt_pre_{pgt_id} ON COMMIT DROP AS \
+                 SELECT __pgt_row_id, {col_list} FROM {qt} \
+                 WHERE __pgt_row_id IN (\
+                   SELECT __pgt_row_id FROM __pgt_delta_{pgt_id}\
+                 )",
+                pgt_id = st.pgt_id,
+            );
+            if let Err(e) = Spi::run(&snapshot_sql) {
+                pgrx::warning!(
+                    "[pg_trickle] ST-ST-10: pre-snapshot failed for {}.{}: {} — \
+                     falling back to delta-based capture",
+                    schema,
+                    name,
+                    e,
+                );
+                Vec::new()
+            } else {
+                cols
+            }
+        } else {
+            Vec::new()
+        };
+
         // Step 2: DELETE removed rows (AFTER DELETE triggers fire)
         let t_del_start = Instant::now();
         let del_count = Spi::connect_mut(|client| {
@@ -3580,16 +3791,31 @@ pub fn execute_differential_refresh(
             name,
         );
 
-        // ST-ST-2: Capture delta to change buffer for downstream ST consumers.
-        if has_downstream_st_consumers(st.pgt_id) {
-            let user_cols = get_st_user_columns(st);
-            if let Err(e) = capture_delta_to_st_buffer(st, &user_cols) {
-                pgrx::warning!(
-                    "[pg_trickle] ST-ST: delta capture failed for {}.{}: {}",
-                    schema,
-                    name,
-                    e,
-                );
+        // ST-ST-2/ST-ST-10: Capture effective delta to change buffer for
+        // downstream ST consumers.  When a pre-snapshot was taken
+        // (diff_capture_cols is non-empty), use the pre/post comparison
+        // to produce accurate I/D pairs that include value-change DELETEs.
+        // Otherwise, fall back to the delta-based capture.
+        if needs_diff_capture {
+            if !diff_capture_cols.is_empty() {
+                if let Err(e) = capture_incremental_diff_to_st_buffer(st, &diff_capture_cols) {
+                    pgrx::warning!(
+                        "[pg_trickle] ST-ST-10: incremental diff capture failed for {}.{}: {}",
+                        schema,
+                        name,
+                        e,
+                    );
+                }
+            } else {
+                let user_cols = get_st_user_columns(st);
+                if let Err(e) = capture_delta_to_st_buffer(st, &user_cols) {
+                    pgrx::warning!(
+                        "[pg_trickle] ST-ST: delta capture failed for {}.{}: {}",
+                        schema,
+                        name,
+                        e,
+                    );
+                }
             }
         }
 
