@@ -79,6 +79,10 @@ async fn test_prop_noop_cycles_do_not_drift() {
 
 async fn run_linear_mixed_trace(seed: u64, config: TraceConfig) {
     let db = E2eDb::new().await.with_extension().await;
+    // Disable background scheduler to prevent races with manual refreshes.
+    db.execute("ALTER SYSTEM SET pg_trickle.enabled = false")
+        .await;
+    db.execute("SELECT pg_reload_conf()").await;
     let mut rng = SeededRng::new(seed);
     let mut ids = TrackedIds::new();
 
@@ -94,6 +98,10 @@ async fn run_linear_mixed_trace(seed: u64, config: TraceConfig) {
 
 async fn run_diamond_mixed_trace(seed: u64, config: TraceConfig) {
     let db = E2eDb::new().await.with_extension().await;
+    // Disable background scheduler to prevent races with manual refreshes.
+    db.execute("ALTER SYSTEM SET pg_trickle.enabled = false")
+        .await;
+    db.execute("SELECT pg_reload_conf()").await;
     let mut rng = SeededRng::new(seed);
     let mut ids = TrackedIds::new();
 
@@ -109,6 +117,10 @@ async fn run_diamond_mixed_trace(seed: u64, config: TraceConfig) {
 
 async fn run_linear_noop_trace(seed: u64, config: TraceConfig) {
     let db = E2eDb::new().await.with_extension().await;
+    // Disable background scheduler to prevent races with manual refreshes.
+    db.execute("ALTER SYSTEM SET pg_trickle.enabled = false")
+        .await;
+    db.execute("SELECT pg_reload_conf()").await;
     let mut rng = SeededRng::new(seed);
     let mut ids = TrackedIds::new();
 
@@ -348,6 +360,10 @@ async fn test_prop_refresh_order_variation_converges() {
 
 async fn run_order_variation_trace(seed: u64, config: TraceConfig) {
     let db = E2eDb::new().await.with_extension().await;
+    // Disable background scheduler to prevent races with manual refreshes.
+    db.execute("ALTER SYSTEM SET pg_trickle.enabled = false")
+        .await;
+    db.execute("SELECT pg_reload_conf()").await;
     let mut rng = SeededRng::new(seed);
     let mut ids = TrackedIds::new();
 
