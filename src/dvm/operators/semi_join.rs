@@ -523,4 +523,87 @@ mod tests {
                 "semi-join SQL must contain EXISTS");
         }
     }
+
+    /// Regression: IN subquery where outer and inner tables share a column
+    /// name (e.g., both have `id`).  The inner column ref must be qualified
+    /// with the inner table's alias so `rewrite_join_condition` maps it to
+    /// the right side (delta_right), not the left.
+    ///
+    /// Without the fix in `parse_any_sublink` (qualify_inner_col_refs), the
+    /// unqualified `id` would resolve to the LEFT table in Part 2, making
+    /// the delta_right correlation condition `l.cust_id = l.id` instead of
+    /// `l.cust_id = dr.id`.
+    #[test]
+    fn test_diff_semi_join_ambiguous_column_name() {
+        let mut ctx = test_ctx();
+        // sc_orders has columns: id, cust_id, amount
+        let left = scan(
+            1,
+            "sc_orders",
+            "public",
+            "sc_orders",
+            &["id", "cust_id", "amount"],
+        );
+        // sc_vip_customers has columns: id  (same name as left!)
+        let right = scan(2, "sc_vip_customers", "public", "sc_vip_customers", &["id"]);
+
+        // Condition as produced by parse_any_sublink AFTER qualification:
+        // outer.cust_id = sc_vip_customers.id  (inner ref is qualified)
+        let cond = binop("=", colref("cust_id"), qcolref("sc_vip_customers", "id"));
+
+        let tree = OpTree::SemiJoin {
+            condition: cond,
+            left: Box::new(left),
+            right: Box::new(right),
+        };
+
+        let result = diff_semi_join(&mut ctx, &tree).unwrap();
+        let sql = ctx.build_with_query(&result.cte_name);
+
+        // Part 2 must correlate with delta_right using `dr."id"`,
+        // not `l."id"`.  The crucial WHERE clause is:
+        //   WHERE EXISTS (SELECT 1 FROM <delta_right> dr WHERE l."cust_id" = dr."id")
+        assert!(
+            sql.contains(r#""dr"."id""#),
+            "Part 2 must reference dr.\"id\" (inner table), not l.\"id\"\nSQL: {sql}"
+        );
+
+        // Also verify Part 2 doesn't have `l."cust_id" = l."id"` (the bug)
+        assert!(
+            !sql.contains(r#""l"."cust_id" = "l"."id""#),
+            "Part 2 must NOT correlate left with itself\nSQL: {sql}"
+        );
+    }
+
+    /// Verify that qualified inner column refs work when the column name
+    /// is unique (no ambiguity) — should still produce correct SQL.
+    #[test]
+    fn test_diff_semi_join_qualified_no_ambiguity() {
+        let mut ctx = test_ctx();
+        let left = scan(1, "orders", "public", "orders", &["order_id", "cust_id"]);
+        let right = scan(
+            2,
+            "customers",
+            "public",
+            "customers",
+            &["customer_id", "name"],
+        );
+
+        // After qualification: cust_id = customers.customer_id
+        let cond = binop("=", colref("cust_id"), qcolref("customers", "customer_id"));
+
+        let tree = OpTree::SemiJoin {
+            condition: cond,
+            left: Box::new(left),
+            right: Box::new(right),
+        };
+
+        let result = diff_semi_join(&mut ctx, &tree).unwrap();
+        let sql = ctx.build_with_query(&result.cte_name);
+
+        assert!(
+            sql.contains(r#""dr"."customer_id""#),
+            "Part 2 must reference dr.\"customer_id\"\nSQL: {sql}"
+        );
+    }
 }

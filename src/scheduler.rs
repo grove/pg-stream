@@ -3854,6 +3854,24 @@ fn execute_scheduled_refresh(
         return RefreshOutcome::RetryableFailure;
     }
 
+    // TOCTOU fix: reload ST metadata now that we hold the row lock.
+    // Between the caller loading `st` and acquiring this lock, another
+    // session (manual refresh or a parallel worker) may have refreshed
+    // this ST and advanced its frontier.  Using the stale frontier would
+    // cause the differential refresh to re-process already-consumed
+    // change buffer rows, producing incorrect aggregate deltas.
+    let st = match load_st_by_id(st.pgt_id) {
+        Some(fresh) => fresh,
+        None => {
+            log!(
+                "pg_trickle: ST pgt_id={} disappeared after lock acquisition",
+                st.pgt_id,
+            );
+            return RefreshOutcome::PermanentFailure;
+        }
+    };
+    let st = &st;
+
     // Record refresh start
     // Compute freshness_deadline for duration-based schedules:
     // deadline = data_timestamp + schedule_seconds (when data becomes stale)

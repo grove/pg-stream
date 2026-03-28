@@ -3151,6 +3151,14 @@ fn refresh_stream_table_impl(name: &str) -> Result<(), PgTrickleError> {
         )));
     }
 
+    // Reload the ST metadata now that we hold both the advisory lock and
+    // the row lock.  Between the initial get_by_name() and acquiring these
+    // locks, the background scheduler may have refreshed this ST and
+    // advanced its frontier.  Using the stale frontier would cause the
+    // differential refresh to re-process already-consumed change buffer
+    // rows, producing incorrect aggregate deltas.
+    let st = StreamTableMeta::get_by_name(&schema, &table_name)?;
+
     // Transaction-level advisory lock is released automatically at
     // transaction end (commit or rollback); no explicit unlock needed.
     execute_manual_refresh(&st, &schema, &table_name, &source_oids)

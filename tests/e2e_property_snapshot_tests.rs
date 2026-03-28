@@ -112,6 +112,10 @@ async fn test_prop_cross_source_skewed_churn_no_drift() {
 
 async fn run_two_source_trace(seed: u64, config: TraceConfig) {
     let db = E2eDb::new().await.with_extension().await;
+    // Disable background scheduler to prevent races with manual refreshes.
+    db.execute("ALTER SYSTEM SET pg_trickle.enabled = false")
+        .await;
+    db.execute("SELECT pg_reload_conf()").await;
     let mut rng = SeededRng::new(seed);
     let mut ids_alpha = TrackedIds::new();
     let mut ids_beta = TrackedIds::new();
@@ -150,6 +154,10 @@ async fn run_two_source_trace(seed: u64, config: TraceConfig) {
 
 async fn run_diamond_simultaneous_trace(seed: u64, config: TraceConfig) {
     let db = E2eDb::new().await.with_extension().await;
+    // Disable background scheduler to prevent races with manual refreshes.
+    db.execute("ALTER SYSTEM SET pg_trickle.enabled = false")
+        .await;
+    db.execute("SELECT pg_reload_conf()").await;
     let mut rng = SeededRng::new(seed);
     let mut ids_alpha = TrackedIds::new();
     let mut ids_beta = TrackedIds::new();
@@ -180,6 +188,10 @@ async fn run_diamond_simultaneous_trace(seed: u64, config: TraceConfig) {
 
 async fn run_skewed_churn_trace(seed: u64, config: TraceConfig) {
     let db = E2eDb::new().await.with_extension().await;
+    // Disable background scheduler to prevent races with manual refreshes.
+    db.execute("ALTER SYSTEM SET pg_trickle.enabled = false")
+        .await;
+    db.execute("SELECT pg_reload_conf()").await;
     let mut rng = SeededRng::new(seed);
     let mut ids_alpha = TrackedIds::new();
     let mut ids_beta = TrackedIds::new();
