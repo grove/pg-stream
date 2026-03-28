@@ -317,6 +317,11 @@ pub fn generate_delta_query(
     // scan operator can build a changed_cols bitmask filter.
     ctx.source_cdc_columns = resolve_cdc_columns_for_sources(&source_oids);
 
+    // A-2: Resolve key columns (GROUP BY, JOIN ON, WHERE) per source table
+    // so the scan operator can compute a key-only bitmask for value-only
+    // UPDATE detection.
+    ctx.source_key_columns = result.tree.source_key_columns_used();
+
     // ST-ST-4: Resolve which sources are STs for proper buffer table routing.
     ctx.st_source_pgt_ids = resolve_st_source_pgt_ids(&source_oids);
 
@@ -427,6 +432,9 @@ pub fn generate_delta_query_cached(
 
     // P2-5: Resolve CDC column ordinals for bitmask filter.
     ctx.source_cdc_columns = resolve_cdc_columns_for_sources(&source_oids);
+
+    // A-2: Resolve key columns for value-only UPDATE detection.
+    ctx.source_key_columns = result.tree.source_key_columns_used();
 
     // ST-ST-4: Resolve which sources are STs for proper buffer table routing.
     ctx.st_source_pgt_ids = resolve_st_source_pgt_ids(&source_oids);

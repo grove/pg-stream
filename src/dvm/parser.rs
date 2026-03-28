@@ -1185,6 +1185,29 @@ impl ParseResult {
             .collect()
     }
 
+    /// A-2: Collect source columns from key positions (GROUP BY, JOIN ON,
+    /// WHERE) across the main tree and CTE bodies.
+    ///
+    /// Returns `(table_oid, Vec<column_name>)` pairs for columns whose changes
+    /// can affect row identity, grouping, or filtering. Used by the
+    /// `changed_cols` bitmask to distinguish key changes from value-only changes.
+    pub fn source_key_columns_used(&self) -> std::collections::HashMap<u32, Vec<String>> {
+        let mut main_keys = self.tree.source_key_columns_used();
+        for (_, cte_tree) in &self.cte_registry.entries {
+            let cte_keys = cte_tree.source_key_columns_used();
+            for (oid, cols) in cte_keys {
+                let entry = main_keys.entry(oid).or_default();
+                for col in cols {
+                    if !entry.contains(&col) {
+                        entry.push(col);
+                    }
+                }
+                entry.sort();
+            }
+        }
+        main_keys
+    }
+
     /// Collect all function names referenced in the defining query (G8.2).
     ///
     /// Used to populate `pgt_stream_tables.functions_used` at creation time
@@ -2169,6 +2192,203 @@ impl OpTree {
                 (oid, cols)
             })
             .collect()
+    }
+
+    /// A-2: Collect source columns from "key" positions — GROUP BY expressions,
+    /// JOIN ON conditions, and Filter WHERE predicates.
+    ///
+    /// Returns `(table_oid, Vec<column_name>)` pairs where columns appear in key
+    /// contexts. A change to a key column can affect row identity/grouping,
+    /// whereas a change to a value-only column (only in SELECT / aggregate input)
+    /// cannot move a row to a different group.
+    ///
+    /// Used by the changed_cols bitmask infrastructure to distinguish key changes
+    /// from value-only changes.
+    pub fn source_key_columns_used(&self) -> std::collections::HashMap<u32, Vec<String>> {
+        // Step 1: Collect column names from key-position expressions.
+        let mut key_names: std::collections::HashSet<String> = std::collections::HashSet::new();
+        self.collect_key_column_names(&mut key_names);
+
+        // Step 2: Build a mapping from table_alias → (table_oid, column_names).
+        let mut alias_map: std::collections::HashMap<
+            String,
+            (u32, std::collections::HashSet<String>),
+        > = std::collections::HashMap::new();
+        self.collect_scan_alias_map(&mut alias_map);
+
+        // Step 3: Intersect key names with Scan columns per table.
+        // A column name in key_names matches a Scan column if:
+        // - It appears in a ColumnRef with a matching table_alias, OR
+        // - It appears unqualified and matches a Scan column name.
+        let mut result_map: std::collections::HashMap<u32, std::collections::HashSet<String>> =
+            std::collections::HashMap::new();
+
+        for (oid, scan_cols) in alias_map.values() {
+            for kn in &key_names {
+                if scan_cols.contains(kn) {
+                    result_map.entry(*oid).or_default().insert(kn.clone());
+                }
+            }
+        }
+
+        result_map
+            .into_iter()
+            .map(|(oid, set)| {
+                let mut cols: Vec<String> = set.into_iter().collect();
+                cols.sort();
+                (oid, cols)
+            })
+            .collect()
+    }
+
+    /// Recursive helper — collects column names from GROUP BY, JOIN ON, and
+    /// Filter WHERE expressions (key positions that affect row identity).
+    fn collect_key_column_names(&self, names: &mut std::collections::HashSet<String>) {
+        match self {
+            OpTree::Aggregate {
+                group_by, child, ..
+            } => {
+                for expr in group_by {
+                    Self::collect_column_names_from_expr(expr, names);
+                }
+                child.collect_key_column_names(names);
+            }
+            OpTree::InnerJoin {
+                condition,
+                left,
+                right,
+            }
+            | OpTree::LeftJoin {
+                condition,
+                left,
+                right,
+            }
+            | OpTree::FullJoin {
+                condition,
+                left,
+                right,
+            } => {
+                Self::collect_column_names_from_expr(condition, names);
+                left.collect_key_column_names(names);
+                right.collect_key_column_names(names);
+            }
+            OpTree::Filter { predicate, child } => {
+                Self::collect_column_names_from_expr(predicate, names);
+                child.collect_key_column_names(names);
+            }
+            OpTree::Project { child, .. }
+            | OpTree::Distinct { child }
+            | OpTree::Subquery { child, .. }
+            | OpTree::Window { child, .. }
+            | OpTree::LateralFunction { child, .. }
+            | OpTree::LateralSubquery { child, .. }
+            | OpTree::ScalarSubquery { child, .. } => {
+                child.collect_key_column_names(names);
+            }
+            OpTree::SemiJoin {
+                condition,
+                left,
+                right,
+            }
+            | OpTree::AntiJoin {
+                condition,
+                left,
+                right,
+            } => {
+                Self::collect_column_names_from_expr(condition, names);
+                left.collect_key_column_names(names);
+                right.collect_key_column_names(names);
+            }
+            OpTree::Intersect { left, right, .. } | OpTree::Except { left, right, .. } => {
+                left.collect_key_column_names(names);
+                right.collect_key_column_names(names);
+            }
+            OpTree::UnionAll { children } => {
+                for c in children {
+                    c.collect_key_column_names(names);
+                }
+            }
+            OpTree::RecursiveCte {
+                base, recursive, ..
+            } => {
+                base.collect_key_column_names(names);
+                recursive.collect_key_column_names(names);
+            }
+            OpTree::Scan { .. } | OpTree::CteScan { .. } | OpTree::RecursiveSelfRef { .. } => {}
+        }
+    }
+
+    /// Extract column names from an expression (GROUP BY, JOIN ON, WHERE).
+    fn collect_column_names_from_expr(expr: &Expr, names: &mut std::collections::HashSet<String>) {
+        match expr {
+            Expr::ColumnRef { column_name, .. } => {
+                names.insert(column_name.clone());
+            }
+            Expr::BinaryOp { left, right, .. } => {
+                Self::collect_column_names_from_expr(left, names);
+                Self::collect_column_names_from_expr(right, names);
+            }
+            Expr::FuncCall { args, .. } => {
+                for arg in args {
+                    Self::collect_column_names_from_expr(arg, names);
+                }
+            }
+            Expr::Literal(_) | Expr::Star { .. } | Expr::Raw(_) => {}
+        }
+    }
+
+    /// Build a mapping from table alias/name → (table_oid, column_names) from
+    /// Scan nodes in the tree.
+    fn collect_scan_alias_map(
+        &self,
+        map: &mut std::collections::HashMap<String, (u32, std::collections::HashSet<String>)>,
+    ) {
+        match self {
+            OpTree::Scan {
+                table_oid,
+                alias,
+                columns,
+                ..
+            } => {
+                let entry = map
+                    .entry(alias.clone())
+                    .or_insert_with(|| (*table_oid, std::collections::HashSet::new()));
+                for col in columns {
+                    entry.1.insert(col.name.clone());
+                }
+            }
+            OpTree::Project { child, .. }
+            | OpTree::Filter { child, .. }
+            | OpTree::Distinct { child }
+            | OpTree::Subquery { child, .. }
+            | OpTree::Window { child, .. }
+            | OpTree::LateralFunction { child, .. }
+            | OpTree::LateralSubquery { child, .. }
+            | OpTree::ScalarSubquery { child, .. } => child.collect_scan_alias_map(map),
+            OpTree::Aggregate { child, .. } => child.collect_scan_alias_map(map),
+            OpTree::InnerJoin { left, right, .. }
+            | OpTree::LeftJoin { left, right, .. }
+            | OpTree::FullJoin { left, right, .. }
+            | OpTree::SemiJoin { left, right, .. }
+            | OpTree::AntiJoin { left, right, .. }
+            | OpTree::Intersect { left, right, .. }
+            | OpTree::Except { left, right, .. } => {
+                left.collect_scan_alias_map(map);
+                right.collect_scan_alias_map(map);
+            }
+            OpTree::UnionAll { children } => {
+                for c in children {
+                    c.collect_scan_alias_map(map);
+                }
+            }
+            OpTree::RecursiveCte {
+                base, recursive, ..
+            } => {
+                base.collect_scan_alias_map(map);
+                recursive.collect_scan_alias_map(map);
+            }
+            OpTree::CteScan { .. } | OpTree::RecursiveSelfRef { .. } => {}
+        }
     }
 
     /// Recursive helper — collects column names per table OID from Scan nodes.
@@ -20528,5 +20748,122 @@ mod tests {
         assert_eq!(ctx.depth, 1);
         ctx.ascend(d0);
         assert_eq!(ctx.depth, 0);
+    }
+
+    // ── A-2: source_key_columns_used tests ──────────────────────────
+
+    #[test]
+    fn test_source_key_columns_aggregate_group_by() {
+        // SELECT region, SUM(amount) FROM orders GROUP BY region
+        let scan = scan_node("orders", 100, &["region", "amount", "id"]);
+        let tree = OpTree::Aggregate {
+            group_by: vec![col("region")],
+            aggregates: vec![AggExpr {
+                function: AggFunc::Sum,
+                argument: Some(col("amount")),
+                alias: "total".to_string(),
+                is_distinct: false,
+                second_arg: None,
+                filter: None,
+                order_within_group: None,
+            }],
+            child: Box::new(scan),
+        };
+
+        let keys = tree.source_key_columns_used();
+        let key_cols = keys.get(&100).unwrap();
+        assert_eq!(key_cols, &["region".to_string()]);
+    }
+
+    #[test]
+    fn test_source_key_columns_scan_only_no_keys() {
+        // SELECT a, b, c FROM t — no GROUP BY, no JOIN, no WHERE
+        let tree = scan_node("t", 200, &["a", "b", "c"]);
+        let keys = tree.source_key_columns_used();
+        assert!(
+            keys.is_empty(),
+            "scan-only query should have no key columns"
+        );
+    }
+
+    #[test]
+    fn test_source_key_columns_inner_join() {
+        // SELECT ... FROM a JOIN b ON a.id = b.a_id
+        let left = scan_node("a", 100, &["id", "name"]);
+        let right = scan_node("b", 200, &["a_id", "value"]);
+        let tree = OpTree::InnerJoin {
+            condition: Expr::BinaryOp {
+                op: "=".to_string(),
+                left: Box::new(qualified_col("a", "id")),
+                right: Box::new(qualified_col("b", "a_id")),
+            },
+            left: Box::new(left),
+            right: Box::new(right),
+        };
+
+        let keys = tree.source_key_columns_used();
+        // "id" appears in JOIN ON for table 100
+        assert!(
+            keys.get(&100)
+                .is_some_and(|v| v.contains(&"id".to_string()))
+        );
+        // "a_id" appears in JOIN ON for table 200
+        assert!(
+            keys.get(&200)
+                .is_some_and(|v| v.contains(&"a_id".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_source_key_columns_filter_where() {
+        // SELECT a, b FROM t WHERE a > 10
+        let scan = scan_node("t", 100, &["a", "b"]);
+        let tree = OpTree::Filter {
+            predicate: Expr::BinaryOp {
+                op: ">".to_string(),
+                left: Box::new(col("a")),
+                right: Box::new(Expr::Literal("10".to_string())),
+            },
+            child: Box::new(scan),
+        };
+
+        let keys = tree.source_key_columns_used();
+        assert_eq!(keys.get(&100).unwrap(), &["a".to_string()]);
+    }
+
+    #[test]
+    fn test_source_key_columns_aggregate_with_filter() {
+        // SELECT region, SUM(amount) FROM orders WHERE active = true GROUP BY region
+        let scan = scan_node("orders", 100, &["region", "amount", "active"]);
+        let filter = OpTree::Filter {
+            predicate: Expr::BinaryOp {
+                op: "=".to_string(),
+                left: Box::new(col("active")),
+                right: Box::new(Expr::Literal("true".to_string())),
+            },
+            child: Box::new(scan),
+        };
+        let tree = OpTree::Aggregate {
+            group_by: vec![col("region")],
+            aggregates: vec![AggExpr {
+                function: AggFunc::Sum,
+                argument: Some(col("amount")),
+                alias: "total".to_string(),
+                is_distinct: false,
+                second_arg: None,
+                filter: None,
+                order_within_group: None,
+            }],
+            child: Box::new(filter),
+        };
+
+        let keys = tree.source_key_columns_used();
+        let key_cols = keys.get(&100).unwrap();
+        assert!(key_cols.contains(&"active".to_string()), "WHERE column");
+        assert!(key_cols.contains(&"region".to_string()), "GROUP BY column");
+        assert!(
+            !key_cols.contains(&"amount".to_string()),
+            "value-only column"
+        );
     }
 }

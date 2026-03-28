@@ -143,6 +143,14 @@ pub struct DiffContext {
     /// trigger. Used by `diff_scan_change_buffer` to build a bitmask filter
     /// that skips UPDATE rows where none of the referenced columns changed.
     pub source_cdc_columns: HashMap<u32, Vec<String>>,
+    /// A-2: Key column names per source table.
+    ///
+    /// Maps `table_oid` → column names that appear in key positions
+    /// (GROUP BY, JOIN ON, WHERE). Used by the scan operator to compute
+    /// a key-column-only bitmask. UPDATE rows where `changed_cols & key_mask
+    /// = 0` are "value-only" changes — the row stays in its group/join
+    /// bucket — enabling downstream optimization.
+    pub source_key_columns: HashMap<u32, Vec<String>>,
     /// P2-7: Predicate pushed down from a Filter node into the Scan.
     ///
     /// When a Filter sits directly above a Scan and the predicate only
@@ -197,6 +205,7 @@ impl DiffContext {
             st_column_alias_map: None,
             having_filter: false,
             source_cdc_columns: HashMap::new(),
+            source_key_columns: HashMap::new(),
             scan_pushed_predicate: None,
             st_source_pgt_ids: HashMap::new(),
             st_bypass_tables: HashMap::new(),
@@ -229,6 +238,7 @@ impl DiffContext {
             st_column_alias_map: None,
             having_filter: false,
             source_cdc_columns: HashMap::new(),
+            source_key_columns: HashMap::new(),
             scan_pushed_predicate: None,
             st_source_pgt_ids: HashMap::new(),
             st_bypass_tables: HashMap::new(),

@@ -397,6 +397,29 @@ fn diff_scan_change_buffer(
         ));
     }
 
+    // ── A-2: Key-column change detection expression ──────────────────
+    //
+    // When key columns (GROUP BY, JOIN ON, WHERE) are a strict subset of
+    // CDC columns, compute an expression that evaluates to TRUE when a key
+    // column changed (or the row is INSERT/DELETE). FALSE means only
+    // value columns changed — the row stays in its group/join bucket.
+    let key_change_expr: Option<String> = if !is_keyless {
+        if let Some(cdc_cols) = ctx.source_cdc_columns.get(&table_oid)
+            && let Some(key_cols) = ctx.source_key_columns.get(&table_oid)
+            && let Some((key_mask, key_zero)) = compute_varbit_key_cols_mask(key_cols, cdc_cols)
+        {
+            Some(format!(
+                "CASE WHEN c.changed_cols IS NOT NULL \
+                 AND (c.changed_cols & B'{key_mask}') = B'{key_zero}' \
+                 THEN FALSE ELSE TRUE END"
+            ))
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
     // ── EC-06: Keyless net-counting path ─────────────────────────────
     //
     // For keyless tables, identical rows share the same pk_hash (content
@@ -544,6 +567,9 @@ GROUP BY {pk_hash_expr}",
     // ~95% of PKs typically have exactly one change per refresh cycle.
     // For these, first_action = last_action = action — skip the sort.
     let single_cte = ctx.next_cte_name(&format!("single_{alias}"));
+    let key_col_single = key_change_expr.as_deref().map_or(String::new(), |expr| {
+        format!(",\n       {expr} AS __pgt_key_changed")
+    });
     let single_sql = format!(
         "\
 SELECT {pk_hash_expr} AS __pk_hash,
@@ -552,7 +578,7 @@ SELECT {pk_hash_expr} AS __pk_hash,
        c.change_id,
        {typed_col_refs_str},
        c.action AS __first_action,
-       c.action AS __last_action
+       c.action AS __last_action{key_col_single}
 FROM {change_table} c
 JOIN {pk_stats_cte} p ON p.__pk_hash = {pk_hash_expr} AND p.cnt = 1
 WHERE {lsn_filter}",
@@ -564,6 +590,17 @@ WHERE {lsn_filter}",
     // Only apply FIRST_VALUE/LAST_VALUE to PKs with multiple changes.
     // The window sort now operates on a much smaller data set.
     let multi_cte = ctx.next_cte_name(&format!("multi_raw_{alias}"));
+    // A-2: For multi-change PKs, key_changed = TRUE if ANY change in the
+    // PK's change set touched a key column. Use bool_or() over the window.
+    let key_col_multi = if let Some(ref expr) = key_change_expr {
+        format!(
+            ",\n       bool_or({expr}) OVER (\
+             PARTITION BY {pk_hash_expr}\
+             ) AS __pgt_key_changed"
+        )
+    } else {
+        String::new()
+    };
     let multi_sql = format!(
         "\
 SELECT {pk_hash_expr} AS __pk_hash,
@@ -577,7 +614,7 @@ SELECT {pk_hash_expr} AS __pk_hash,
        LAST_VALUE(c.action) OVER (
            PARTITION BY {pk_hash_expr} ORDER BY c.change_id
            ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING
-       ) AS __last_action
+       ) AS __last_action{key_col_multi}
 FROM {change_table} c
 JOIN {pk_stats_cte} p ON p.__pk_hash = {pk_hash_expr} AND p.cnt > 1
 WHERE {lsn_filter}",
@@ -617,6 +654,17 @@ SELECT * FROM {multi_cte}",
             (String::new(), String::new())
         };
 
+    // ── A-2: Key-changed column for downstream operators ───────────
+    // When key_change_expr is available, include __pgt_key_changed in
+    // the final delta CTE output. Downstream operators (aggregate, join)
+    // can use this to optimize value-only UPDATEs.
+    let key_changed_col_del = if key_change_expr.is_some() {
+        ",\n       c.__pgt_key_changed"
+    } else {
+        ""
+    };
+    let key_changed_col_ins = key_changed_col_del; // Same for both branches.
+
     let sql = if ctx.merge_safe_dedup {
         // ── Merge-safe dedup mode ──────────────────────────────────────
         // Emit at most ONE row per PK: DELETE only for true deletes OR
@@ -631,7 +679,7 @@ SELECT * FROM {multi_cte}",
 -- clause never fires → no regression.
 SELECT c.__pk_hash_old AS __pgt_row_id,
        'D'::TEXT AS __pgt_action,
-       {old_col_refs}
+       {old_col_refs}{key_del}
 FROM (
   SELECT DISTINCT ON (s.__pk_hash_old)
          s.*
@@ -646,7 +694,7 @@ UNION ALL
 -- INSERT events: row exists after (handles inserts + updates)
 SELECT c.__pk_hash AS __pgt_row_id,
        'I'::TEXT AS __pgt_action,
-       {new_col_refs}
+       {new_col_refs}{key_ins}
 FROM (
   SELECT DISTINCT ON (s.__pk_hash)
          s.*
@@ -656,6 +704,8 @@ FROM (
 ) c{ins_pushed_filter}",
             old_col_refs = old_col_refs.join(",\n       "),
             new_col_refs = new_col_refs.join(",\n       "),
+            key_del = key_changed_col_del,
+            key_ins = key_changed_col_ins,
         )
     } else {
         // ── Standard mode (D+I pairs for updates) ──────────────────────
@@ -669,7 +719,7 @@ FROM (
 -- which is critical for keyless tables where all-column hash changes.
 SELECT c.__pk_hash_old AS __pgt_row_id,
        'D'::TEXT AS __pgt_action,
-       {old_col_refs}
+       {old_col_refs}{key_del}
 FROM (
   SELECT DISTINCT ON (s.__pk_hash)
          s.*
@@ -684,7 +734,7 @@ UNION ALL
 -- Uses new_* columns from the latest non-DELETE change per PK.
 SELECT c.__pk_hash AS __pgt_row_id,
        'I'::TEXT AS __pgt_action,
-       {new_col_refs}
+       {new_col_refs}{key_ins}
 FROM (
   SELECT DISTINCT ON (s.__pk_hash)
          s.*
@@ -694,6 +744,8 @@ FROM (
 ) c{ins_pushed_filter}",
             old_col_refs = old_col_refs.join(",\n       "),
             new_col_refs = new_col_refs.join(",\n       "),
+            key_del = key_changed_col_del,
+            key_ins = key_changed_col_ins,
         )
     };
 
@@ -757,6 +809,48 @@ fn compute_varbit_changed_cols_mask(
     let any_unset = mask_bits.contains(&'0');
     // Only useful when it is a strict subset (not empty, not fully set).
     if !any_set || !any_unset {
+        return None;
+    }
+    let mask_str: String = mask_bits.iter().collect();
+    let zero_str: String = "0".repeat(n);
+    Some((mask_str, zero_str))
+}
+
+/// A-2: Compute a VARBIT mask for key columns only (GROUP BY, JOIN ON, WHERE).
+///
+/// Similar to `compute_varbit_changed_cols_mask` but restricted to columns
+/// that appear in key positions. When `changed_cols & key_mask = all_zeros`,
+/// the UPDATE changed only value columns — the row stays in its group/join
+/// bucket.
+///
+/// Returns `Some((key_mask, zero_str))` when the key set is non-empty and a
+/// strict subset of all CDC columns. Returns `None` when:
+/// - No key columns mapped (all columns are value-only — mask is trivially zero).
+/// - All CDC columns are key columns (mask equals the all-columns mask — no benefit).
+/// - No key columns data available.
+pub(crate) fn compute_varbit_key_cols_mask(
+    key_columns: &[String],
+    cdc_columns: &[String],
+) -> Option<(String, String)> {
+    let n = cdc_columns.len();
+    if n == 0 || key_columns.is_empty() {
+        return None;
+    }
+    let mut mask_bits: Vec<char> = vec!['0'; n];
+    let mut any_set = false;
+    for key_col in key_columns {
+        if let Some(idx) = cdc_columns.iter().position(|c| c == key_col) {
+            mask_bits[idx] = '1';
+            any_set = true;
+        }
+    }
+    if !any_set {
+        return None;
+    }
+    // Only useful when it's a strict subset (not all key columns).
+    let any_unset = mask_bits.contains(&'0');
+    if !any_unset {
+        // All columns are key columns — no value-only optimization possible.
         return None;
     }
     let mask_str: String = mask_bits.iter().collect();
@@ -1530,5 +1624,101 @@ mod tests {
 
         assert!(!sql.contains("old_status\" ="));
         assert!(!sql.contains("new_status\" ="));
+    }
+
+    // ── A-2: Key-column mask tests ──────────────────────────────────
+
+    #[test]
+    fn test_compute_varbit_key_cols_mask_basic() {
+        // 4 CDC cols, 1 is a key column
+        let cdc_cols: Vec<String> = vec![
+            "id".into(),
+            "region".into(),
+            "amount".into(),
+            "notes".into(),
+        ];
+        let key_cols: Vec<String> = vec!["region".into()];
+        let result = compute_varbit_key_cols_mask(&key_cols, &cdc_cols);
+        assert_eq!(result, Some(("0100".to_string(), "0000".to_string())));
+    }
+
+    #[test]
+    fn test_compute_varbit_key_cols_mask_multiple_keys() {
+        let cdc_cols: Vec<String> = vec!["a".into(), "b".into(), "c".into(), "d".into()];
+        let key_cols: Vec<String> = vec!["a".into(), "c".into()];
+        let result = compute_varbit_key_cols_mask(&key_cols, &cdc_cols);
+        assert_eq!(result, Some(("1010".to_string(), "0000".to_string())));
+    }
+
+    #[test]
+    fn test_compute_varbit_key_cols_mask_all_keys() {
+        // When all columns are key columns, no value-only optimization
+        let cdc_cols: Vec<String> = vec!["a".into(), "b".into()];
+        let key_cols: Vec<String> = vec!["a".into(), "b".into()];
+        let result = compute_varbit_key_cols_mask(&key_cols, &cdc_cols);
+        assert_eq!(result, None, "all-key mask should return None");
+    }
+
+    #[test]
+    fn test_compute_varbit_key_cols_mask_no_keys() {
+        // No key columns → no mask
+        let cdc_cols: Vec<String> = vec!["a".into(), "b".into()];
+        let key_cols: Vec<String> = vec![];
+        let result = compute_varbit_key_cols_mask(&key_cols, &cdc_cols);
+        assert_eq!(result, None, "empty key cols should return None");
+    }
+
+    #[test]
+    fn test_compute_varbit_key_cols_mask_no_match() {
+        // Key column name doesn't match any CDC column
+        let cdc_cols: Vec<String> = vec!["a".into(), "b".into()];
+        let key_cols: Vec<String> = vec!["x".into()];
+        let result = compute_varbit_key_cols_mask(&key_cols, &cdc_cols);
+        assert_eq!(result, None, "non-matching key should return None");
+    }
+
+    #[test]
+    fn test_a2_key_changed_annotation_in_scan_sql() {
+        // When source_key_columns has entries for a scan' source table,
+        // the generated delta SQL should contain __pgt_key_changed.
+        let mut ctx = test_ctx();
+        ctx.source_cdc_columns
+            .insert(100, vec!["id".into(), "region".into(), "amount".into()]);
+        ctx.source_key_columns.insert(100, vec!["region".into()]);
+
+        let tree = scan_with_pk(
+            100,
+            "orders",
+            "public",
+            "o",
+            &["id", "region", "amount"],
+            &["id"],
+        );
+        let result = diff_scan(&mut ctx, &tree).unwrap();
+        let sql = ctx.build_with_query(&result.cte_name);
+        assert!(
+            sql.contains("__pgt_key_changed"),
+            "delta SQL should contain __pgt_key_changed column when key cols are set"
+        );
+    }
+
+    #[test]
+    fn test_a2_no_key_changed_without_key_cols() {
+        // Without source_key_columns, no __pgt_key_changed annotation.
+        let mut ctx = test_ctx();
+        let tree = scan_with_pk(
+            100,
+            "orders",
+            "public",
+            "o",
+            &["id", "region", "amount"],
+            &["id"],
+        );
+        let result = diff_scan(&mut ctx, &tree).unwrap();
+        let sql = ctx.build_with_query(&result.cte_name);
+        assert!(
+            !sql.contains("__pgt_key_changed"),
+            "delta SQL should NOT contain __pgt_key_changed without key cols"
+        );
     }
 }
