@@ -1,8 +1,8 @@
 # pg_trickle — Project Roadmap
 
-> **Last updated:** 2026-03-26
-> **Latest release:** 0.11.0 (2026-03-26)
-> **Current milestone:** v0.12.0 — Scalability Foundations, Partitioning Enhancements & Correctness
+> **Last updated:** 2026-03-28
+> **Latest release:** 0.12.0 (2026-03-28)
+> **Current milestone:** v0.13.0 — Scalability Foundations, Partitioning Enhancements & MERGE Profiling
 
 For a concise description of what pg_trickle is and why it exists, read
 [ESSENCE.md](ESSENCE.md) — it explains the core problem (full `REFRESH
@@ -28,9 +28,10 @@ coverage, all in plain language.
 - [v0.9.0 — Incremental Aggregate Maintenance](#v090--incremental-aggregate-maintenance)
 - [v0.10.0 — DVM Hardening, Connection Pooler Compatibility, Core Refresh Optimizations & Infrastructure Prep](#v0100--dvm-hardening-connection-pooler-compatibility-core-refresh-optimizations--infrastructure-prep)
 - [v0.11.0 — Partitioned Stream Tables, Prometheus & Grafana Observability, Safety Hardening & Correctness](#v0110--partitioned-stream-tables-prometheus--grafana-observability-safety-hardening--correctness)
-- [v0.12.0 — Scalability Foundations, Partitioning Enhancements & Correctness](#v0120--scalability-foundations-partitioning-enhancements--correctness)
-- [v0.13.0 — Tiered Scheduling, PG Backward Compatibility & UNLOGGED Buffers](#v0130--tiered-scheduling-pg-backward-compatibility--unlogged-buffers)
-- [v0.14.0 — Native DDL Syntax, External Test Suites & Integration](#v0140--native-ddl-syntax-external-test-suites--integration)
+- [v0.12.0 — Correctness, Reliability & Developer Tooling](#v0120--correctness-reliability--developer-tooling)
+- [v0.13.0 — Scalability Foundations, Partitioning Enhancements & MERGE Profiling](#v0130--scalability-foundations-partitioning-enhancements--merge-profiling)
+- [v0.14.0 — Tiered Scheduling, PG Backward Compatibility & UNLOGGED Buffers](#v0140--tiered-scheduling-pg-backward-compatibility--unlogged-buffers)
+- [v0.15.0 — Native DDL Syntax, External Test Suites & Integration](#v0150--native-ddl-syntax-external-test-suites--integration)
 - [v1.0.0 — Stable Release](#v100--stable-release)
 - [Post-1.0 — Scale & Ecosystem](#post-10--scale--ecosystem)
 - [Effort Summary](#effort-summary)
@@ -49,23 +50,23 @@ last resort. All 13 design phases are complete. This roadmap tracks the path
 from the v0.1.x series to 1.0 and beyond.
 
 ```
-                                                                                                                                        We are here
-                                                                                                                                           │
-                                                                                                                                           ▼
+                                                                                                                                                    We are here
+                                                                                                                                                         │
+                                                                                                                                                         ▼
                                                                    ┌────────┐ ┌────────┐ ┌────────┐ ┌────────┐ ┌────────┐ ┌────────┐ ┌────────┐ ┌────────┐ ┌────────┐ ┌────────┐
                                                                    │ 0.1.x  │ │ 0.2.0  │ │ 0.2.1  │ │ 0.2.2  │ │ 0.2.3  │ │ 0.3.0  │ │ 0.4.0  │ │ 0.5.0  │ │ 0.6.0  │ │ 0.7.0  │
                                                                    │Released│─│Released│─│Released│─│Released│─│Released│─│Released│─│Released│─│Released│─│Released│─│Released│
                                                                    │ ✅      │ │ ✅      │ │ ✅      │ │ ✅      │ │ ✅      │ │ ✅      │ │ ✅      │ │ ✅      │ │ ✅      │ │ ✅      │
                                                                    └────────┘ └────────┘ └────────┘ └────────┘ └────────┘ └────────┘ └────────┘ └────────┘ └────────┘ └────────┘
                                                                      │
-                                                                     └─ ┌────────┐ ┌────────┐ ┌─────────┐ ┌─────────┐ ┌─────────┐
-                                                                        │ 0.8.0  │ │ 0.9.0  │ │ 0.10.0  │ │ 0.11.0  │ │ 0.12.0  │
-                                                                        │Released│─│Released│─│Released │─│Released │─│Scalabil.│
-                                                                        │ ✅      │ │ ✅      │ │ ✅       │ │ ✅       │ │CDC&PGBk │
-                                                                        └────────┘ └────────┘ └─────────┘ └─────────┘ └─────────┘
+                                                                     └─ ┌────────┐ ┌────────┐ ┌─────────┐ ┌─────────┐ ┌─────────┐ ┌─────────┐
+                                                                        │ 0.8.0  │ │ 0.9.0  │ │ 0.10.0  │ │ 0.11.0  │ │ 0.12.0  │ │ 0.13.0  │
+                                                                        │Released│─│Released│─│Released │─│Released │─│Released │─│Scalabil.│
+                                                                        │ ✅      │ │ ✅      │ │ ✅       │ │ ✅       │ │ ✅       │ │Partition│
+                                                                        └────────┘ └────────┘ └─────────┘ └─────────┘ └─────────┘ └─────────┘
               │
               └─ ┌─────────┐ ┌─────────┐ ┌────────┐ ┌────────┐
-                 │ 0.13.0  │ │ 0.14.0  │ │ 1.0.0  │ │ 1.x+   │
+                 │ 0.14.0  │ │ 0.15.0  │ │ 1.0.0  │ │ 1.x+   │
                  │Perf.Opt │─│DDL,Test │─│Stable  │─│Scale & │
                  │&Scale   │ │&Integ.  │ │Release │ │Ecosys. │
                  └─────────┘ └─────────┘ └────────┘ └────────┘
@@ -2104,14 +2105,19 @@ Deliver **one** of TS1 or TS2; whichever is completed first meets the exit crite
 
 ---
 
-## v0.12.0 — Scalability Foundations, Partitioning Enhancements & Correctness
+## v0.12.0 — Correctness, Reliability & Developer Tooling
 
-**Goal:** Deliver scalability foundations that directly serve the project's
-performance and throughput goals — columnar change tracking for 50–90%
-delta-volume reduction and shared change buffers for multi-ST deployments.
-Also land the anomalous change fuse and ship developer tooling and correctness
-improvements. PG 16/17 backward compatibility and the D-2 async CDC research
-spike are **deferred to v0.13.0** and the post-1.0 research backlog respectively.
+**Goal:** Close the last known wrong-answer bugs in the incremental query
+engine, add SQL-callable diagnostic functions for observability, harden the
+scheduler against edge cases uncovered with deeper topologies, and back the
+whole release with thousands of automatically generated property and fuzz tests.
+
+Phases 5–8 from the original v0.12.0 scope (Scalability Foundations,
+Partitioning Enhancements, MERGE Profiling, and dbt Macro Updates) have been
+**moved to v0.13.0** to keep this release tightly focused on correctness and
+reliability. See §v0.13.0 for those items.
+
+**Status: Released (2026-03-28).**
 
 ### Anomalous Change Detection (Fuse)
 
@@ -2364,42 +2370,116 @@ large design changes; all build on existing infrastructure.
 > **dbt macro updates subtotal: ~2–3.5 days**
 
 
+**Exit criteria — all met (v0.12.0 Released 2026-03-28):**
+- [x] EC01B-1/2: No phantom-row drop for ≥3-scan right-subtree joins; TPC-H Q7/Q8/Q9 DELETE regression tests pass ✅
+- [x] BENCH-W: Write-side overhead benchmarks published in `docs/BENCHMARK.md` ✅
+- [x] DAG-B1–B4: DAG topology benchmark suite complete ✅
+- [x] SQLANCER-1/2/3: Crash-test + equivalence oracles in weekly CI job; zero mismatches ✅
+- [x] PROP-5+6: Topology stress and DAG/scheduler helper property tests pass ✅
+- [x] DT-1–4: `explain_query_rewrite()`, `diagnose_errors()`, `list_auxiliary_columns()`, `validate_query()` callable from SQL ✅
+- [x] G13-SD: `max_parse_depth` guard active; pathological query returns `QueryTooComplex` ✅
+- [x] G17-IMS: IMMEDIATE mode concurrency stress test (5 scenarios × 100+ concurrent DML) passes ✅
+- [x] G12-SQL-IN: Multi-column IN subquery documented as unsupported with structured error + EXISTS hint ✅
+- [x] G17-MERGEEX: MERGE template EXPLAIN validation at E2E test startup ✅
+- [x] PERF-3: `tiered_scheduling` default is `true`; CONFIGURATION.md updated ✅
+- [x] ST-ST-9: Content-hash pk_hash in ST change buffers; stale-row-after-UPDATE bug fixed ✅
+- [x] DAG-4 bypass column types fixed; parallel worker tests complete without timeout ✅
+- [x] `docs/UPGRADING.md` updated with v0.11.0→v0.12.0 migration notes ✅
+- [x] `scripts/check_upgrade_completeness.sh` passes ✅
+- [x] Extension upgrade path tested (`0.11.0 → 0.12.0`) ✅
+
+---
+
+## v0.13.0 — Scalability Foundations, Partitioning Enhancements & MERGE Profiling
+
+**Goal:** Deliver the scalability foundations deferred from v0.12.0 —
+columnar change tracking and shared change buffers — alongside the
+partitioning enhancements that build on v0.11.0's RANGE partitioning spike,
+a MERGE deduplication profiling pass, and the dbt macro updates.
+
+> **Phases from PLAN_0_12_0.md:** Phases 5 (Scalability), 6 (Partitioning),
+> 7 (MERGE Profiling), and 8 (dbt Macro Updates).
+
+### Scalability Foundations (Phase 5)
+
+> **In plain terms:** These items directly serve the project's primary goal of
+> world-class performance and scalability. Columnar change tracking eliminates
+> wasted delta processing for wide tables, and shared change buffers reduce
+> I/O multiplication in deployments with many stream tables reading from the
+> same source.
+
+| Item | Description | Effort | Ref |
+|------|-------------|--------|-----|
+| A-2 | **Columnar Change Tracking.** Per-column bitmask in CDC triggers; skip rows where no referenced column changed; lightweight UPDATE-only path when only projected columns changed; 50–90% delta-volume reduction for wide-table UPDATE workloads. | 3–4 wk | [PLAN_NEW_STUFF.md §A-2](plans/performance/PLAN_NEW_STUFF.md) |
+| D-4 | **Shared Change Buffers.** Single buffer per source shared across all dependent STs; multi-frontier cleanup coordination; static-superset column mode for initial implementation. | 3–4 wk | [PLAN_NEW_STUFF.md §D-4](plans/performance/PLAN_NEW_STUFF.md) |
+| PERF-2 | **Auto-enable `buffer_partitioning` for high-throughput sources.** Add `'auto'` option to `pg_trickle.buffer_partitioning` GUC; heuristic auto-detection: switch to RANGE(lsn) partitioned mode when the change buffer exceeds `compact_threshold` in less than one scheduler tick. | 1–2 wk | [REPORT_OVERALL_STATUS.md §R7](plans/performance/REPORT_OVERALL_STATUS.md) |
+
+> ⚠️ D-4 **multi-frontier cleanup is the hardest correctness hazard.** Use
+> `MIN(consumer_frontier)` in the cleanup query, never `MAX`. Write a
+> property-based test with 5+ consumers advancing frontiers in random order
+> before merging D-4.
+
+> **Scalability foundations subtotal: ~6–8 weeks**
+
+### Partitioning Enhancements (Phase 6)
+
+> **In plain terms:** The v0.11.0 spike delivered RANGE partitioning end-to-end.
+> These follow-on items extend coverage to the use cases deliberately deferred
+> from A1: multi-column keys, retrofitting existing stream tables, LIST-based
+> partitions, HASH partitions, and operational quality-of-life improvements.
+
+| Item | Description | Effort | Ref |
+|------|-------------|--------|-----|
+| A1-1b | **Multi-column partition keys.** Extend `partition_by` to accept a comma-separated list of columns; composite `BETWEEN` predicate in MERGE ON clause. | 1–2 wk | [PLAN_PARTITIONING_SPIKE.md §10](plans/PLAN_PARTITIONING_SPIKE.md) |
+| A1-1c | **`alter_stream_table(partition_by => …)` support.** Allow adding or changing the partition key on an existing stream table with in-place repartitioning. | 1–2 wk | [PLAN_PARTITIONING_SPIKE.md §10](plans/PLAN_PARTITIONING_SPIKE.md) |
+| A1-1d | **LIST partitioning support.** `PARTITION BY LIST` for low-cardinality columns; `IN (…)` predicate style from the delta. | 1 wk | [PLAN_PARTITIONING_SPIKE.md §10](plans/PLAN_PARTITIONING_SPIKE.md) |
+| A1-3b | **HASH partitioning via per-partition MERGE loop.** Predicate injection cannot prune HASH partitions; issue one targeted MERGE per affected child partition at refresh time. | 2–3 wk | [PLAN_PARTITIONING_SPIKE.md §3](plans/PLAN_PARTITIONING_SPIKE.md) |
+| PART-WARN | **Default-partition growth warning.** Emit `WARNING` when the default catch-all partition contains rows after a refresh. | 1–2d | [PLAN_PARTITIONING_SPIKE.md §11](plans/PLAN_PARTITIONING_SPIKE.md) |
+
+> **Partitioning enhancements subtotal: ~5–8 weeks**
+
+### MERGE Profiling (Phase 7)
+
+| Item | Description | Effort | Ref |
+|------|-------------|--------|-----|
+| G14-MDED | **MERGE deduplication profiling.** Profile how often concurrent-write scenarios produce duplicate key entries requiring pre-MERGE compaction. If ≥10% of refresh cycles need dedup, write an RFC for a two-pass MERGE strategy. | 3–5d | [plans/performance/REPORT_OVERALL_STATUS.md §14](plans/performance/REPORT_OVERALL_STATUS.md) |
+
+> **MERGE profiling subtotal: ~3–5 days**
+
+### dbt Macro Updates (Phase 8)
+
+> **In plain terms:** Expose the v0.11.0 SQL API additions (`partition_by`, `fuse`,
+> `fuse_ceiling`, `fuse_sensitivity`) in the dbt materialization macros so
+> dbt users can configure them via `config(...)`. No catalog changes; pure
+> Jinja/SQL.
+
+| Item | Description | Effort |
+|------|-------------|--------|
+| DBT-1 | `partition_by` config option wired through `stream_table.sql`, `create_stream_table.sql`, and `alter_stream_table.sql` | ~1d |
+| DBT-2 | `fuse`, `fuse_ceiling`, `fuse_sensitivity` config options wired through the materialization and alter macro with change-detection logic | ~1–2d |
+| DBT-3 | dbt docs update: README and SQL_REFERENCE.md dbt section | ~0.5d |
+
+> **dbt macro updates subtotal: ~2–3.5 days**
+
+> **v0.13.0 total: ~11–17 weeks**
+
 **Exit criteria:**
 - [ ] A-2: Columnar change tracking bitmask skips irrelevant rows; UPDATE-only path reduces delta volume (benchmarked)
-- [ ] D-4: Shared buffer serves multiple STs; multi-frontier cleanup prevents premature deletion
-- [x] ~~Fuse exit criterion~~ ➡️ FUSE-1–6 shipped in v0.11.0; no action in v0.12.0
-- [ ] EC01B: No phantom-row drop for ≥3-scan right-subtree joins; TPC-H Q7/Q8/Q9 DELETE regression tests pass
-- [x] BENCH-W: Write-side overhead benchmarks published in `docs/BENCHMARK.md`; CDC write overhead benchmark implemented ✅ Done in v0.12.0 Phase 1
-- [x] DAG-B1: DAG topology benchmark infrastructure + linear chain benchmarks (Session 1) ✅
-- [x] DAG-B2+B3: Wide DAG, fan-out, diamond, mixed topology benchmarks (Sessions 2–3) ✅
-- [x] DAG-B4: `docs/BENCHMARK.md` updated with DAG topology section ✅
-- [x] SQLANCER: Crash-test oracle + equivalence oracle running in weekly CI job; zero correctness mismatches on known test corpus ✅ Done in v0.12.0 Phase 4
-- [x] PROP-5+6: Topology stress and DAG/scheduler helper property tests pass ✅ Done in v0.12.0 Phase 4
-- [x] ~~D-2 spike~~ ➡️ Deferred to post-1.0 research backlog (SPI-in-change-callback infeasibility; Very High risk; no production code until a separate feasibility study produces an RFC)
-- [x] ~~PG 16/17 backward compatibility~~ ➡️ Deferred to v0.13.0 (BC1–BC5)
-- [ ] PERF-2: `buffer_partitioning = 'auto'` implemented; auto-promote benchmark passes
-- [x] PERF-3: `tiered_scheduling` default is `true`; CONFIGURATION.md documents tier thresholds ✅ Done in v0.12.0 Phase 1
-- [x] ~~PERF-4: `block_source_ddl` default is `true`~~ ➡️ Pulled to v0.11.0 as DEF-5
-- [x] ~~PERF-5: Wider bitmask (`BYTEA`) supports >63 columns; schema migration tested~~ ➡️ Pulled to v0.11.0 as WB-1/WB-2
-- [x] DT-1–4: `explain_query_rewrite()`, `diagnose_errors()`, `list_auxiliary_columns()`, `validate_query()` all callable from SQL; each returns structured data — ✅ Done in v0.12.0 Phase 2
-- [x] G13-SD: Parse-tree visitors enforce `max_parse_depth`; pathological query returns `QueryTooComplex` error rather than stack overflow ✅ Done in v0.12.0 Phase 1
-- [ ] G17-IMS: IMMEDIATE mode concurrency stress test passes with 100+ concurrent DML transactions
-- [ ] G12-SQL-IN: Multi-column IN subquery behavior documented or fixed; regression test added
-- [ ] G14-MDED: Deduplication frequency profiling complete; RFC written if compaction threshold exceeded
-- [x] G17-MERGEEX: MERGE template EXPLAIN validation runs at E2E test startup ✅ Done in v0.12.0 Phase 1
+- [ ] D-4: Shared buffer serves multiple STs; multi-frontier cleanup never races; property-based test with 5 concurrent consumers passes
+- [ ] PERF-2: `buffer_partitioning = 'auto'` activates RANGE(lsn) partitioned mode for high-throughput sources
 - [ ] A1-1b: Multi-column RANGE partition keys work end-to-end; composite predicate triggers partition pruning
 - [ ] A1-1c: `alter_stream_table(partition_by => …)` repartitions existing storage table without data loss
 - [ ] A1-1d: LIST partitioning creates `PARTITION BY LIST` storage; IN-list predicate confirmed via `EXPLAIN`
 - [ ] A1-3b: HASH partitioning uses per-partition MERGE loop; only affected child partitions are targeted
 - [ ] PART-WARN: `WARNING` emitted when default partition has rows after refresh
-- [ ] DBT-1/2/3 (P2): `partition_by`, `fuse`, `fuse_ceiling`, `fuse_sensitivity` exposed in dbt macros; dbt integration tests pass
-- [ ] `docs/UPGRADING.md` updated with v0.11.0→v0.12.0 migration notes and supported upgrade chain
-- [ ] `scripts/check_upgrade_completeness.sh` passes (all catalog changes in `sql/pg_trickle--0.11.0--0.12.0.sql`)
-- [ ] Extension upgrade path tested (`0.11.0 → 0.12.0`)
+- [ ] G14-MDED: Deduplication frequency profiling complete; RFC written if compaction threshold exceeded
+- [ ] DBT-1/2/3: `partition_by`, `fuse`, `fuse_ceiling`, `fuse_sensitivity` exposed in dbt macros; dbt integration tests pass
+- [ ] `scripts/check_upgrade_completeness.sh` passes (all catalog changes in `sql/pg_trickle--0.12.0--0.13.0.sql`)
+- [ ] Extension upgrade path tested (`0.12.0 → 0.13.0`)
 
 ---
 
-## v0.13.0 — Tiered Scheduling, PG Backward Compatibility & UNLOGGED Buffers
+## v0.14.0 — Tiered Scheduling, PG Backward Compatibility & UNLOGGED Buffers
 
 **Goal:** Advance tiered refresh scheduling with manual tier assignment,
 widen the deployment target to PG 16–18, and deliver opt-in UNLOGGED change
@@ -2420,7 +2500,7 @@ buffers for reduced WAL amplification.
 > expose explicit per-ST tier overrides only. See PLAN_NEW_STUFF.md §C-1 risk analysis.
 
 > **Retraction consideration (C-1):** The auto-classification goal (80% scheduler-CPU
-> reduction) cannot be achieved with `pg_stat_user_tables` as the signal. Scope v0.13.0
+> reduction) cannot be achieved with `pg_stat_user_tables` as the signal. Scope v0.14.0
 > to **manual-only tier assignment** (`ALTER STREAM TABLE … SET (tier = 'hot')`) only;
 > drop the Hot/Warm/Cold/Frozen auto-classification and the lazy-refresh trigger path.
 > Auto-classification requiring a custom `ExecutorStart/End` hook can be revisited
@@ -2469,7 +2549,7 @@ buffers for reduced WAL amplification.
 
 ### Long-Running Stability & Multi-Database Testing (G17-SOAK, G17-MDB)
 
-> **In plain terms:** By v0.13.0 the core engine is mature enough to warrant
+> **In plain terms:** By v0.14.0 the core engine is mature enough to warrant
 > a 24-hour continuous-integration soak test and a multi-database isolation
 > test. Both gaps were identified in the §17 testing analysis.
 
@@ -2480,7 +2560,7 @@ buffers for reduced WAL amplification.
 
 > **Stability & multi-database testing subtotal: ~2–4 days**
 
-> **v0.13.0 total: ~9–18 weeks + ~1wk patterns guide + ~2–4 days stability tests**
+> **v0.14.0 total: ~9–18 weeks + ~1wk patterns guide + ~2–4 days stability tests**
 
 **Exit criteria:**
 - [ ] C-1: Tier classification uses delta-based read tracking; Cold STs skip refresh correctly
@@ -2491,11 +2571,11 @@ buffers for reduced WAL amplification.
 - [ ] G16-PAT: Patterns guide published in `docs/PATTERNS.md` covering at least 4 patterns (bronze/silver/gold, event sourcing, SCD type-1, SCD type-2)
 - [ ] G17-SOAK: 24h soak test passes with zero worker crashes, zero zombie stream tables, stable memory usage
 - [ ] G17-MDB: Multi-database scheduler isolation verified; no cross-database quota interference
-- [ ] Extension upgrade path tested (`0.12.0 → 0.13.0`)
+- [ ] Extension upgrade path tested (`0.13.0 → 0.14.0`)
 
 ---
 
-## v0.14.0 — Native DDL Syntax, External Test Suites & Integration
+## v0.15.0 — Native DDL Syntax, External Test Suites & Integration
 
 **Goal:** Add `CREATE MATERIALIZED VIEW … WITH (pgtrickle.stream = true)` DDL
 syntax so stream tables feel native to PostgreSQL tooling (pg_dump, ORMs,
@@ -2538,7 +2618,7 @@ tables naturally without calling `pgtrickle.create_stream_table()`.
 Validate correctness against independent query corpora beyond TPC-H.
 
 > ➡️ **TS1 and TS2 pulled forward to v0.11.0.** Delivering one of TS1 or TS2 is an
-> exit criterion for 0.11.0. TS3 (Nexmark) remains in 0.14.0. If TS1/TS2 slip
+> exit criterion for 0.11.0. TS3 (Nexmark) remains in 0.15.0. If TS1/TS2 slip
 > from 0.11.0, they land here.
 
 | Item | Description | Effort | Ref |
@@ -2564,7 +2644,7 @@ Validate correctness against independent query corpora beyond TPC-H.
 
 > **Integration subtotal: ~6–9 hours**
 
-> **v0.14.0 total: ~140–230 hours**
+> **v0.15.0 total: ~140–230 hours**
 
 **Exit criteria:**
 - [ ] `CREATE MATERIALIZED VIEW … WITH (pgtrickle.stream = true)` creates a stream table
@@ -2572,7 +2652,7 @@ Validate correctness against independent query corpora beyond TPC-H.
 - [ ] At least one external test corpus (sqllogictest, JOB, or Nexmark) passes
 - [ ] dbt-pgtrickle 0.1.0 on PyPI
 - [ ] Complete documentation review done
-- [ ] Extension upgrade path tested (`0.13.0 → 0.14.0`)
+- [ ] Extension upgrade path tested (`0.14.0 → 0.15.0`)
 
 ---
 
@@ -2606,7 +2686,7 @@ distribution — getting pg_trickle onto package registries.
 - [ ] Published on PGXN (stable) and apt/rpm via PGDG
 - [x] CNPG extension image published to GHCR (`pg_trickle-ext`)
 - [x] CNPG cluster-example.yaml validated (Image Volume approach)
-- [ ] Upgrade path from v0.14.0 tested
+- [ ] Upgrade path from v0.15.0 tested
 - [ ] Semantic versioning policy in effect
 
 ---

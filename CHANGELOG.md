@@ -8,7 +8,8 @@ For future plans and release milestones, see [ROADMAP.md](ROADMAP.md).
 ## Table of Contents
 
 <!-- TOC start -->
-- [0.12.0 — Unreleased](#0120--unreleased)
+- [0.13.0 — Unreleased](#0130--unreleased)
+- [0.12.0 — 2026-03-28](#0120--2026-03-28)
 - [0.11.0 — 2026-03-26](#0110--2026-03-26)
 - [0.10.0 — 2026-03-25](#0100--2026-03-25)
 - [0.9.0 — 2026-03-20](#090--2026-03-20)
@@ -30,31 +31,183 @@ For future plans and release milestones, see [ROADMAP.md](ROADMAP.md).
 
 ---
 
-## [0.12.0] — Unreleased
+## [0.13.0] — Unreleased
 
-### Added
+_This release is under development. See [ROADMAP.md](ROADMAP.md) for planned
+items._
 
-- **G13-SD: Parser recursion depth limit.** New `pg_trickle.max_parse_depth` GUC
-  (default 64) prevents stack-overflow crashes on pathological queries with deeply
-  nested subqueries, CTEs, or set operations. Exceeding the limit returns a
-  `QueryTooComplex` error instead of crashing the backend.
-- **G17-MERGEEX: MERGE template EXPLAIN validation.** New E2E test suite
-  (`tests/e2e_merge_template_tests.rs`) validates MERGE SQL templates across 9
-  representative query patterns (scan, filter, aggregate, inner join, left join,
-  join+aggregate, distinct, union all, TopK) via differential refresh + EXPLAIN
-  dry-run.
-- **BENCH-W1/W2: CDC write-side overhead benchmark.** New benchmark suite
-  (`tests/e2e_cdc_write_overhead_tests.rs`) measures DML throughput overhead from
-  CDC triggers across 5 scenarios: single-row INSERT, bulk INSERT, bulk UPDATE,
-  bulk DELETE, and concurrent writers. Results published in `docs/BENCHMARK.md`.
+---
 
-### Changed
+## [0.12.0] — 2026-03-28
 
-- **PERF-3: `tiered_scheduling` default flipped to `true`.** Large deployments no
-  longer waste CPU refreshing cold stream tables at full speed. New stream tables
-  default to the `hot` tier (1× multiplier, no behavior change). Set
-  `pg_trickle.tiered_scheduling = off` to restore pre-v0.12.0 behavior. Added
-  tier thresholds reference section to `docs/CONFIGURATION.md`.
+0.12.0 is a correctness, reliability, and developer-experience release built on
+top of 0.11.0's major new features. It closes the last known wrong-answer bugs
+for complex join queries, adds tools to help you understand and debug stream
+table behavior, hardens the scheduler against several edge cases that could
+cause stale data or crashes, and backs it all with thousands of new
+automatically generated tests.
+
+### Stale Rows Fixed in Stream-Table Chains
+
+**What was the problem?** When a stream table (B) reads from another stream
+table (A), each change in A is recorded as a small "what changed" entry — a
+row added or removed. But the identity key used for those entries was computed
+differently inside the change buffer than it was inside B's own storage. As a
+result, when A changed via an upstream UPDATE, B's refresh could silently fail
+to delete the old version of a row, leaving a stale duplicate.
+
+**What changed?** The change buffer now computes row identity the same way B
+does — using a hash of all the data columns rather than the upstream source's
+primary key. Stale rows after UPDATE no longer appear in stream-table chains.
+This bug was found and confirmed by the new property-based test suite (see
+below).
+
+### Phantom Rows Fixed for Complex Joins (TPC-H Q7 / Q8 / Q9)
+
+**What was the problem?** When a stream table's query joins three or more
+tables together and rows are deleted from more than one join side at the same
+time, the incremental engine could silently drop the correction — leaving rows
+in the stream table that should have been removed.
+
+This affected TPC-H queries Q7, Q8, and Q9 (which all involve deep join
+trees), and any user query with a similar multi-table join structure. A
+temporary workaround (falling back to full refresh for wide joins) was in
+place since v0.11.0 and has now been lifted.
+
+**What changed?** The incremental engine now takes an individual "before
+snapshot" for each leaf table in the join tree — each one cheaply computed
+from a single-table comparison — and re-joins them after the delete. This
+avoids writing multi-gigabyte temp files to disk (the root cause of the
+original workaround) and eliminates the phantom-row bug entirely. Q7, Q8, and
+Q9 now run in differential mode without any workarounds.
+
+### Type Errors Fixed in Parallel Refresh Chains
+
+**What was the problem?** When a chain of stream tables is fused into a single
+execution unit for efficiency (the "bypass" optimisation added in v0.11.0),
+the internal bypass table used `text` for every column regardless of the
+actual column type. This caused an `operator does not exist: text > integer`
+error whenever a downstream stream table had a type-sensitive WHERE clause
+(e.g. `WHERE amount > 100`), making the parallel worker tests fail silently
+across all topologies that included a fused chain.
+
+**What changed?** Bypass tables now use the real column types. The six
+parallel-worker benchmark tests now complete in 9–26 seconds rather than
+timing out after 120 seconds.
+
+### Scheduler Fixes for Diamond and ST-on-ST Topologies
+
+Two scheduler bugs that caused incorrect refresh behavior with complex
+dependency graphs were fixed:
+
+- **Diamond timeout.** In a diamond topology (A → B, A → C, B+C → D), the L1
+  arm stream tables (B and C) were created with a 1-minute fixed interval
+  rather than a calculated schedule. This meant D never received updates within
+  the test window. The scheduler also had a bug loading stream table records
+  by ID that caused silent failures in parallel worker paths. Both are fixed.
+
+- **ST-on-ST parallel workers.** When an upstream stream table changed, the
+  parallel worker paths (singleton, atomic group, immediate closure, fused
+  chain) were not forcing a full refresh on downstream stream tables the way
+  the main scheduler loop did. This could leave downstream tables stale. The
+  fix ensures all parallel paths treat upstream stream-table changes the same
+  way.
+
+### Four New Diagnostic Functions
+
+When stream table behavior is unexpected — wrong refresh mode, a query being
+rewritten in a surprising way, persistent errors — it previously required
+reading server logs or source code to understand why. Four new SQL functions
+expose that internal state directly in queries:
+
+- **`pgtrickle.explain_query_rewrite(query TEXT)`** — shows exactly how
+  pg_trickle rewrites your query for incremental refresh: which operators were
+  applied, how delta keys are injected, and how aggregates are classified.
+  Useful for understanding why a query got a particular refresh mode.
+
+- **`pgtrickle.diagnose_errors(name TEXT)`** — shows the last 5 errors for a
+  stream table, each classified by type (correctness, performance,
+  configuration, infrastructure) with a suggested fix.
+
+- **`pgtrickle.list_auxiliary_columns(name TEXT)`** — lists the internal
+  `__pgt_*` columns that pg_trickle injects into a stream table's query plan,
+  with an explanation of each one's purpose. Helpful when `SELECT *` returns
+  unexpected extra columns.
+
+- **`pgtrickle.validate_query(query TEXT)`** — analyses a SQL query and
+  reports which refresh mode it would get, which SQL constructs were detected,
+  and any warnings — all without creating a stream table.
+
+### Multi-Column `IN (subquery)` Now Gives a Clear Error
+
+**What was the problem?** A query like `WHERE (col_a, col_b) IN (SELECT x, y
+FROM …)` passed validation but produced silently wrong results — the engine
+was only matching on the first column and ignoring the second.
+
+**What changed?** This construct is now detected at stream table creation time
+and rejected with a clear error message that recommends rewriting it as
+`EXISTS (SELECT 1 FROM … WHERE col_a = x AND col_b = y)`.
+
+### IMMEDIATE Mode Proven Correct Under High Concurrency
+
+IMMEDIATE mode (where the stream table updates inside the same transaction as
+the source table change) now has a dedicated concurrency stress test: 100–120
+concurrent transactions firing simultaneously against the same source table,
+across five scenarios (all inserts, all updates to distinct rows, all updates
+to the same row, all deletes, and a mixed workload). Zero lost updates, zero
+phantom rows, and no deadlocks were observed in any run.
+
+### Protection Against Pathological Queries
+
+A new guard prevents a particularly deep or convoluted query from consuming
+all available stack space and crashing the database backend. When the query
+analyser recurses more than 64 levels deep (configurable via
+`pg_trickle.max_parse_depth`), it now returns a clear `QueryTooComplex` error
+instead of crashing.
+
+### Tiered Scheduling Now On By Default
+
+The tiered scheduling feature — which automatically slows down cold
+(infrequently-read) stream tables and speeds up hot ones — is now enabled by
+default. In large deployments this reduces the scheduler's CPU usage
+significantly. Stream tables you query often continue refreshing at full speed.
+Stream tables that nobody has read recently back off gracefully.
+
+If you rely on all stream tables refreshing at the same rate regardless of
+read frequency, set `pg_trickle.tiered_scheduling = off`.
+
+### Thousands of Automatically Generated Tests
+
+Two new automated testing systems were added to complement the hand-written
+test suite:
+
+- **Property-based tests** — the test framework automatically generates
+  thousands of random DAG shapes, schedule combinations, and edge cases and
+  checks that the scheduler's ordering guarantees hold for all of them. If any
+  configuration would cause a table to refresh in the wrong order or get
+  spuriously suspended, these tests catch it.
+
+- **SQLancer fuzzing** — SQLancer generates random SQL queries and checks
+  that pg_trickle's incremental result matches the result of running the same
+  query directly in PostgreSQL. Any mismatch is automatically saved as a
+  permanent regression test. A weekly CI job runs this continuously. At time
+  of release, zero mismatches have been found.
+
+### CDC Write-Side Benchmark Published
+
+A new benchmark suite measures the overhead that pg_trickle's change capture
+triggers add to your write workload. Results across five scenarios (single-row
+INSERT, bulk INSERT, bulk UPDATE, bulk DELETE, concurrent writers) are
+published in [docs/BENCHMARK.md](docs/BENCHMARK.md). Use these numbers to
+estimate the impact before deploying pg_trickle on a write-heavy table.
+
+### MERGE Template Validation at Test Startup
+
+The SQL templates that pg_trickle generates for applying incremental changes
+(the MERGE statements) are now validated with an `EXPLAIN` dry-run at every
+test startup. If a code change accidentally produces a malformed MERGE
+template, the tests catch it before any data is processed — rather than
+manifesting as a cryptic runtime error.
 
 ---
 
