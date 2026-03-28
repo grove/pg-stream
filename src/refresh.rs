@@ -3293,6 +3293,14 @@ pub fn execute_differential_refresh(
 
     let t1 = Instant::now();
 
+    // PROF-DLT / PGS_PROFILE_DELTA: When the env var is set, capture
+    // EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) for the delta query and write
+    // the result to /tmp/delta_plans/<schema>_<name>.json.  This env var is
+    // intended for E2E test diagnostics and local profiling runs.
+    if std::env::var("PGS_PROFILE_DELTA").as_deref() == Ok("1") {
+        capture_delta_explain(schema, name, &resolved.resolved_delta_sql);
+    }
+
     // ── Diagnostic: detect OID mismatch between catalog and delta ────
     // If the delta template references source OIDs that are not in the
     // catalog deps, the MERGE will fail referencing nonexistent change
@@ -3439,6 +3447,11 @@ pub fn execute_differential_refresh(
     // __pgt_row_id). Force explicit DML path for counted deletion.
     let is_dedup_flag = crate::dvm::is_delta_deduplicated(st.pgt_id);
     let use_explicit_dml = use_explicit_dml || (st.has_keyless_source && !is_dedup_flag);
+
+    // G14-MDED: Record this differential refresh execution in the shared-memory
+    // profiling counters.  Called here (after the no-data short-circuit) so we
+    // only count refreshes that actually process delta rows.
+    crate::shmem::record_diff_refresh(is_dedup_flag);
 
     // ST-ST-2: Force explicit DML when this ST has downstream ST consumers.
     // The explicit DML path materializes the delta into __pgt_delta_{pgt_id},
@@ -3972,6 +3985,67 @@ pub fn execute_reinitialize_refresh(st: &StreamTableMeta) -> Result<(i64, i64), 
 }
 
 // ── Unit tests ─────────────────────────────────────────────────────────────
+
+/// PROF-DLT: Capture `EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON)` for the
+/// resolved delta SQL and persist the plan to
+/// `/tmp/delta_plans/<schema>_<name>.json`.
+///
+/// Called when `PGS_PROFILE_DELTA=1` is set in the environment.  Errors are
+/// logged as warnings so profiling failures never abort a real refresh cycle.
+pub(crate) fn capture_delta_explain(schema: &str, name: &str, delta_sql: &str) {
+    use std::path::PathBuf;
+
+    let dir = PathBuf::from("/tmp/delta_plans");
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        pgrx::warning!("[pg_trickle] PGS_PROFILE_DELTA: failed to create /tmp/delta_plans: {e}");
+        return;
+    }
+
+    // Build EXPLAIN query wrapping the delta SQL.
+    let explain_sql = format!(
+        "EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) SELECT * FROM ({delta_sql}) __pgt_explain_d"
+    );
+
+    let plan_json = Spi::connect(|client| {
+        let result = client
+            .select(&explain_sql, None, &[])
+            .map_err(|e| format!("SPI error in explain: {e}"))?;
+        let mut lines = Vec::new();
+        for row in result {
+            let line: Option<pgrx::JsonB> = row.get(1).unwrap_or(None);
+            if let Some(j) = line {
+                lines.push(j.0.to_string());
+            }
+        }
+        Ok::<String, String>(lines.join("\n"))
+    });
+
+    let plan_json = match plan_json {
+        Ok(j) => j,
+        Err(e) => {
+            pgrx::warning!(
+                "[pg_trickle] PGS_PROFILE_DELTA: EXPLAIN failed for {schema}.{name}: {e}"
+            );
+            return;
+        }
+    };
+
+    // Write to /tmp/delta_plans/<schema>_<name>.json
+    let safe_schema = schema.replace('"', "").replace('/', "_");
+    let safe_name = name.replace('"', "").replace('/', "_");
+    let path = dir.join(format!("{safe_schema}_{safe_name}.json"));
+    if let Err(e) = std::fs::write(&path, &plan_json) {
+        pgrx::warning!(
+            "[pg_trickle] PGS_PROFILE_DELTA: failed to write {}: {e}",
+            path.display()
+        );
+    } else {
+        pgrx::debug1!(
+            "[pg_trickle] PGS_PROFILE_DELTA: plan written to {}",
+            path.display()
+        );
+    }
+}
 
 #[cfg(test)]
 mod tests {

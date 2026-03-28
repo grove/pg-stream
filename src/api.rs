@@ -3995,6 +3995,138 @@ fn explain_refresh_mode_impl(name: &str) -> Vec<(String, Option<String>, Option<
 
 // ── FUSE-3: reset_fuse() ───────────────────────────────────────────────────
 
+// ── PROF-DLT: explain_delta() ──────────────────────────────────────────────
+
+/// Show the delta SQL query plan for a stream table without executing a refresh.
+///
+/// Generates the differential delta SQL that would be used on the next refresh,
+/// then runs `EXPLAIN (ANALYZE false, FORMAT <format>)` on it and returns the
+/// plan lines. Useful for identifying slow joins, missing indexes, or
+/// unexpected plan shapes in the auto-generated delta query.
+///
+/// Parameters:
+/// - `name` — qualified stream table name (e.g. `'public.orders_summary'`)
+/// - `format` — output format: `'text'` (default), `'json'`, `'xml'`, `'yaml'`
+///
+/// The delta SQL is generated against a hypothetical "scan all changes" window
+/// (LSN 0/0 → FF/FFFFFFFF) so the plan shows full join/filter structure
+/// even when the change buffer is currently empty.
+///
+/// Example:
+/// ```sql
+/// SELECT line FROM pgtrickle.explain_delta('public.orders_summary');
+/// SELECT line FROM pgtrickle.explain_delta('public.orders_summary', 'json');
+/// ```
+#[pg_extern(schema = "pgtrickle", name = "explain_delta")]
+fn explain_delta_text(
+    name: &str,
+    format: default!(&str, "'text'"),
+) -> SetOfIterator<'static, String> {
+    let rows = match explain_delta_impl(name, format) {
+        Ok(r) => r,
+        Err(e) => raise_error_with_context(e),
+    };
+    SetOfIterator::new(rows)
+}
+
+fn explain_delta_impl(name: &str, format: &str) -> Result<Vec<String>, PgTrickleError> {
+    let (schema, table_name) = parse_qualified_name(name)?;
+    let st = StreamTableMeta::get_by_name(&schema, &table_name)?;
+
+    // Get source OIDs by parsing the defining query.
+    let source_oids = crate::dvm::get_source_oids_for_query(&st.defining_query)?;
+
+    // Build a max new-frontier so the change buffer filter covers all rows
+    // (lsn > '0/0' AND lsn <= 'FF/FFFFFFFF'), giving a plan representative
+    // of a real refresh against a fully-populated change buffer.
+    let prev_frontier = crate::version::Frontier::new();
+    let mut new_frontier = crate::version::Frontier::new();
+    for &oid in &source_oids {
+        new_frontier.set_source(oid, "FF/FFFFFFFF".to_string(), String::new());
+    }
+
+    // Generate delta SQL.
+    let delta_result = crate::dvm::generate_delta_query(
+        &st.defining_query,
+        &prev_frontier,
+        &new_frontier,
+        &st.pgt_schema,
+        &st.pgt_name,
+    )?;
+
+    let delta_sql = &delta_result.delta_sql;
+
+    // Normalise format string.
+    let fmt_upper = format.trim().to_uppercase();
+    let fmt_kw = match fmt_upper.as_str() {
+        "JSON" | "XML" | "YAML" | "TEXT" => fmt_upper.as_str(),
+        other => {
+            return Err(PgTrickleError::InvalidArgument(format!(
+                "unsupported EXPLAIN format '{other}'; expected 'text', 'json', 'xml', or 'yaml'"
+            )));
+        }
+    };
+
+    // Run EXPLAIN without ANALYZE (no side effects).
+    let explain_sql = format!(
+        "EXPLAIN (ANALYZE false, FORMAT {fmt_kw}) \
+         SELECT * FROM ({delta_sql}) __pgt_explain_d"
+    );
+
+    let rows: Vec<String> = Spi::connect(|client| {
+        let result = client
+            .select(&explain_sql, None, &[])
+            .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
+        let mut lines = Vec::new();
+        for row in result {
+            let line: Option<String> = row
+                .get(1)
+                .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
+            if let Some(l) = line {
+                lines.push(l);
+            }
+        }
+        Ok::<Vec<String>, PgTrickleError>(lines)
+    })?;
+
+    Ok(rows)
+}
+
+// ── G14-MDED: dedup_stats() ────────────────────────────────────────────────
+
+/// Show MERGE deduplication profiling counters accumulated since server start.
+///
+/// When the delta cannot be guaranteed to have at most one row per
+/// `__pgt_row_id` (e.g. for aggregate queries or keyless sources), the MERGE
+/// must group + aggregate the delta before merging. This is tracked as
+/// "dedup needed". A high ratio indicates that pre-MERGE compaction in the
+/// change buffer would reduce refresh latency.
+///
+/// Counters reset to zero on server restart. Only differential refreshes that
+/// actually process rows (post no-data short-circuit) are counted.
+///
+/// Example:
+/// ```sql
+/// SELECT * FROM pgtrickle.dedup_stats();
+/// ```
+#[pg_extern(schema = "pgtrickle", name = "dedup_stats")]
+fn dedup_stats_fn() -> TableIterator<
+    'static,
+    (
+        name!(total_diff_refreshes, i64),
+        name!(dedup_needed, i64),
+        name!(dedup_ratio_pct, f64),
+    ),
+> {
+    let (total, dedup) = crate::shmem::read_dedup_stats();
+    let ratio = if total == 0 {
+        0.0_f64
+    } else {
+        (dedup as f64 / total as f64) * 100.0
+    };
+    TableIterator::new(vec![(total as i64, dedup as i64, ratio)])
+}
+
 /// Reset a blown fuse on a stream table.
 ///
 /// The `action` parameter controls how pending changes are handled:

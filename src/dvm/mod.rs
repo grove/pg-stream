@@ -210,6 +210,20 @@ pub fn is_delta_deduplicated(pgt_id: i64) -> bool {
     })
 }
 
+/// PROF-DLT: Parse a defining query and return the deduplicated list of source
+/// table OIDs (TABLE, MATVIEW, FOREIGN_TABLE, and upstream ST storage OIDs).
+///
+/// Used by `explain_delta()` to build a max-frontier before generating the
+/// delta SQL for EXPLAIN without performing a real refresh.
+pub fn get_source_oids_for_query(query: &str) -> Result<Vec<u32>, crate::error::PgTrickleError> {
+    let result = parse_defining_query_full(query)?;
+    let mut oids: Vec<u32> = result.tree.source_oids();
+    oids.extend(result.cte_registry.source_oids());
+    oids.sort_unstable();
+    oids.dedup();
+    Ok(oids)
+}
+
 /// Check whether an OpTree is a "scan-chain" — only Scan, Filter, Project,
 /// and Subquery nodes (no Aggregate, Join, UnionAll, Distinct, Window,
 /// RecursiveCte, or CteScan).

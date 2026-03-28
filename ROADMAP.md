@@ -2527,8 +2527,8 @@ cleanup for PG 16+ expression types.
 - [ ] A1-1d: LIST partitioning creates `PARTITION BY LIST` storage; IN-list predicate confirmed via `EXPLAIN`
 - [ ] A1-3b: HASH partitioning uses per-partition MERGE loop; only affected child partitions are targeted
 - [ ] PART-WARN: `WARNING` emitted when default partition has rows after refresh
-- [ ] G14-MDED: Deduplication frequency profiling complete; RFC written if compaction threshold exceeded
-- [ ] PROF-DLT: `pgtrickle.explain_delta(st_name, format)` function captures delta query plans in text/json; `PGS_PROFILE_DELTA=1` enables auto-capture in E2E tests; documented in SQL_REFERENCE.md
+- [x] G14-MDED: Deduplication frequency profiling complete; `TOTAL_DIFF_REFRESHES` + `DEDUP_NEEDED_REFRESHES` shared-memory atomic counters; `pgtrickle.dedup_stats()` reports ratio; RFC threshold documented at ≥10% ✅ Done
+- [x] PROF-DLT: `pgtrickle.explain_delta(st_name, format)` function captures delta query plans in text/json/xml/yaml; `PGS_PROFILE_DELTA=1` auto-capture to `/tmp/delta_plans/`; documented in SQL_REFERENCE.md ✅ Done
 - [ ] C-3: Per-database worker quota enforced; one busy database cannot starve others; quota respected under 8-database concurrent workload
 - [ ] TPCH-1/2: `TPCH_BENCH=1` mode emits `[TPCH_BENCH]` lines + summary table; `just bench-tpch` and `bench-tpch-large` targets functional
 - [ ] TPCH-3: Five TPC-H OpTree Criterion benchmarks pass and run without a PostgreSQL backend

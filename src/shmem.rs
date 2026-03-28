@@ -97,6 +97,25 @@ pub static ACTIVE_REFRESH_WORKERS: PgAtomic<AtomicU32> =
 pub static RECONCILE_EPOCH: PgAtomic<AtomicU64> =
     unsafe { PgAtomic::new(c"pg_trickle_reconcile_epoch") };
 
+/// G14-MDED: Total number of differential refreshes executed since server start.
+///
+/// Incremented once per `execute_differential_refresh` call that proceeds past
+/// the no-data short-circuit (i.e., at least one change buffer has rows in the
+/// current frontier window).
+// SAFETY: PgAtomic::new requires a static CStr name.
+pub static TOTAL_DIFF_REFRESHES: PgAtomic<AtomicU64> =
+    unsafe { PgAtomic::new(c"pg_trickle_total_diff_refreshes") };
+
+/// G14-MDED: Number of differential refreshes where the delta required weight
+/// aggregation (deduplication) in the MERGE USING clause.
+///
+/// When `is_deduplicated = false` the DVM cannot prove that each `__pgt_row_id`
+/// appears at most once in the delta, so the MERGE must group + aggregate
+/// before merging. This counter tracks how often that occurs.
+// SAFETY: PgAtomic::new requires a static CStr name.
+pub static DEDUP_NEEDED_REFRESHES: PgAtomic<AtomicU64> =
+    unsafe { PgAtomic::new(c"pg_trickle_dedup_needed_refreshes") };
+
 /// Register shared memory allocations. Called from `_PG_init()`.
 pub fn init_shared_memory() {
     pg_shmem_init!(PGS_STATE);
@@ -104,7 +123,43 @@ pub fn init_shared_memory() {
     pg_shmem_init!(CACHE_GENERATION);
     pg_shmem_init!(ACTIVE_REFRESH_WORKERS);
     pg_shmem_init!(RECONCILE_EPOCH);
+    pg_shmem_init!(TOTAL_DIFF_REFRESHES);
+    pg_shmem_init!(DEDUP_NEEDED_REFRESHES);
     SHMEM_INITIALIZED.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// G14-MDED: Increment the total-diff-refreshes counter.
+///
+/// No-op when shared memory is not initialized (extension not loaded via
+/// `shared_preload_libraries`).
+pub fn record_diff_refresh(is_deduplicated: bool) {
+    if !SHMEM_INITIALIZED.load(std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    TOTAL_DIFF_REFRESHES
+        .get()
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if !is_deduplicated {
+        DEDUP_NEEDED_REFRESHES
+            .get()
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// G14-MDED: Read the dedup profiling counters.
+///
+/// Returns `(total_diff_refreshes, dedup_needed_refreshes)`.
+pub fn read_dedup_stats() -> (u64, u64) {
+    if !SHMEM_INITIALIZED.load(std::sync::atomic::Ordering::Relaxed) {
+        return (0, 0);
+    }
+    let total = TOTAL_DIFF_REFRESHES
+        .get()
+        .load(std::sync::atomic::Ordering::Relaxed);
+    let dedup = DEDUP_NEEDED_REFRESHES
+        .get()
+        .load(std::sync::atomic::Ordering::Relaxed);
+    (total, dedup)
 }
 
 /// Signal the scheduler to rebuild the dependency DAG.

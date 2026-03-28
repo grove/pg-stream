@@ -79,6 +79,8 @@ Complete reference for all SQL functions, views, and catalog tables provided by 
   - [pgtrickle.pgt\_change\_tracking](#pgtricklepgt_change_tracking)
   - [pgtrickle.pgt\_source\_gates](#pgtricklepgt_source_gates)
   - [pgtrickle.pgt\_refresh\_groups](#pgtricklepgt_refresh_groups)
+- [Delta SQL Profiling (v0.13.0)](#delta-sql-profiling-v0130)
+  - [pgtrickle.explain\_delta](#pgtrickleexplain_delta)
 
 ---
 
@@ -3144,5 +3146,85 @@ FROM pgtrickle.validate_query(
 > still DIFFERENTIAL (only changed groups are rescanned), but has higher
 > per-group cost than algebraic strategies. If this is performance-sensitive,
 > consider pre-aggregating with a simpler aggregate and post-processing.
+
+---
+
+## Delta SQL Profiling (v0.13.0)
+
+### `pgtrickle.explain_delta(st_name text, format text DEFAULT 'text')`
+
+Generate the delta SQL query plan for a stream table without executing a refresh.
+
+`explain_delta` produces the differential delta SQL that would be used on the
+next DIFFERENTIAL refresh, then runs `EXPLAIN (ANALYZE false, FORMAT <format>)`
+on it and returns the plan lines. This function is useful for:
+
+- Identifying slow joins or missing indexes in auto-generated delta SQL.
+- Comparing plan complexity between different query forms.
+- Monitoring how the size of change buffers affects plan shape.
+
+The delta SQL is generated against a hypothetical "scan all changes" window
+(LSN `0/0 → FF/FFFFFFFF`) so the plan shows the full join/filter structure
+even when the change buffer is currently empty.
+
+**Parameters:**
+
+| Name | Type | Description |
+|------|------|-------------|
+| `st_name` | `text` | Qualified stream table name (e.g. `'public.orders_summary'`). |
+| `format` | `text` | Plan format: `'text'` (default), `'json'`, `'xml'`, or `'yaml'`. |
+
+**Returns:** `SETOF text` — one row per plan line (text format) or one row containing the full JSON/XML/YAML plan.
+
+**Example:**
+
+```sql
+-- Show the text plan for the delta query
+SELECT line FROM pgtrickle.explain_delta('public.orders_summary');
+
+-- Get the JSON plan for programmatic analysis
+SELECT line FROM pgtrickle.explain_delta('public.orders_summary', 'json');
+```
+
+**Environment variable (`PGS_PROFILE_DELTA=1`):** When the environment variable
+`PGS_PROFILE_DELTA=1` is set in the PostgreSQL server process, every
+DIFFERENTIAL refresh automatically captures `EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON)`
+for the resolved delta SQL and writes the plan to
+`/tmp/delta_plans/<schema>_<table>.json`. This is intended for E2E test
+diagnostics and local profiling sessions.
+
+---
+
+### `pgtrickle.dedup_stats()`
+
+Show MERGE deduplication profiling counters accumulated since server start.
+
+When the delta cannot be guaranteed to contain at most one row per
+`__pgt_row_id` (e.g. for aggregate queries or keyless sources), the MERGE
+must group and aggregate the delta before merging. This is tracked as
+*dedup needed*. A consistently high ratio indicates that pre-MERGE compaction
+in the change buffer would reduce refresh latency.
+
+**Returns:** one row with:
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `total_diff_refreshes` | `bigint` | Total DIFFERENTIAL refreshes executed since server start that processed at least one change. Resets on server restart. |
+| `dedup_needed` | `bigint` | Number of those refreshes where the delta required weight aggregation / deduplication in the MERGE USING clause. |
+| `dedup_ratio_pct` | `float8` | `dedup_needed / total_diff_refreshes × 100`. 0 when `total_diff_refreshes = 0`. |
+
+**Example:**
+
+```sql
+SELECT * FROM pgtrickle.dedup_stats();
+-- total_diff_refreshes | dedup_needed | dedup_ratio_pct
+-- ----------------------+--------------+-----------------
+--                  1234 |           87 |            7.05
+```
+
+A `dedup_ratio_pct` ≥ 10 is the threshold recommended for investigating a
+two-pass MERGE strategy. See `plans/performance/REPORT_OVERALL_STATUS.md §14`
+for background.
+
 
 
