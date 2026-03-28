@@ -5273,6 +5273,13 @@ fn validate_partition_key(
             "partition_by must contain at least one non-empty column name".to_string(),
         ));
     }
+    // A1-1d: PostgreSQL LIST partitioning supports exactly one column.
+    let method = parse_partition_method(partition_key);
+    if method == PartitionMethod::List && parts.len() > 1 {
+        return Err(PgTrickleError::InvalidArgument(
+            "LIST partitioning supports only a single column".to_string(),
+        ));
+    }
     let available: Vec<&str> = columns.iter().map(|c| c.name.as_str()).collect();
     for part in &parts {
         let found = columns.iter().any(|c| c.name.eq_ignore_ascii_case(part));
@@ -5298,11 +5305,51 @@ fn validate_partition_key(
 /// " a , b , c "            → ["a", "b", "c"]
 /// ```
 pub(crate) fn parse_partition_key_columns(partition_key: &str) -> Vec<String> {
-    partition_key
-        .split(',')
+    let raw = strip_partition_mode_prefix(partition_key);
+    raw.split(',')
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .collect()
+}
+
+/// A1-1d: Partition method: RANGE (default), LIST, or HASH.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PartitionMethod {
+    Range,
+    List,
+}
+
+/// Parse the partition method from the `partition_by` specification.
+///
+/// Format: `"[LIST:]col[,col2]"`.  The `LIST:` prefix selects LIST
+/// partitioning; bare column names default to RANGE.
+///
+/// # Examples
+/// ```text
+/// "sale_date"              → Range
+/// "sale_date,region"       → Range  (multi-column RANGE)
+/// "LIST:region"            → List
+/// ```
+pub(crate) fn parse_partition_method(partition_key: &str) -> PartitionMethod {
+    let trimmed = partition_key.trim();
+    if trimmed.to_uppercase().starts_with("LIST:") {
+        PartitionMethod::List
+    } else {
+        PartitionMethod::Range
+    }
+}
+
+/// Strip the partition method prefix from a partition key specification,
+/// returning only the column name(s).  Case-insensitive.
+///
+/// `"LIST:region"` → `"region"`, `"sale_date"` → `"sale_date"`
+pub(crate) fn strip_partition_mode_prefix(partition_key: &str) -> &str {
+    let trimmed = partition_key.trim();
+    if trimmed.len() >= 5 && trimmed[..5].eq_ignore_ascii_case("LIST:") {
+        &trimmed[5..]
+    } else {
+        trimmed
+    }
 }
 
 /// Column metadata from a defining query.
@@ -6291,16 +6338,21 @@ fn build_create_table_sql(
         ));
     }
 
-    // A1-1/A1-1b: partition clause — appended after the closing ')' of
-    // CREATE TABLE.  Supports single and multi-column RANGE keys.
+    // A1-1/A1-1b/A1-1d: partition clause — appended after the closing ')' of
+    // CREATE TABLE.  Supports RANGE (single/multi-column) and LIST keys.
     let partition_clause = partition_key
         .map(|k| {
+            let method = parse_partition_method(k);
             let cols = parse_partition_key_columns(k);
             let quoted: Vec<String> = cols
                 .iter()
                 .map(|c| quote_identifier(c).to_string())
                 .collect();
-            format!("\nPARTITION BY RANGE ({})", quoted.join(", "))
+            let method_kw = match method {
+                PartitionMethod::Range => "RANGE",
+                PartitionMethod::List => "LIST",
+            };
+            format!("\nPARTITION BY {} ({})", method_kw, quoted.join(", "))
         })
         .unwrap_or_default();
 
@@ -7817,6 +7869,110 @@ mod tests {
         let msg = err.unwrap_err().to_string();
         assert!(
             msg.contains("nonexistent"),
+            "Error should mention the missing column: {msg}"
+        );
+    }
+
+    // ── A1-1d: LIST partitioning tests ──────────────────────────────────────
+
+    #[test]
+    fn test_parse_partition_method_range_default() {
+        assert_eq!(parse_partition_method("sale_date"), PartitionMethod::Range);
+    }
+
+    #[test]
+    fn test_parse_partition_method_range_multi() {
+        assert_eq!(parse_partition_method("a,b"), PartitionMethod::Range,);
+    }
+
+    #[test]
+    fn test_parse_partition_method_list_upper() {
+        assert_eq!(parse_partition_method("LIST:region"), PartitionMethod::List,);
+    }
+
+    #[test]
+    fn test_parse_partition_method_list_lower() {
+        assert_eq!(parse_partition_method("list:region"), PartitionMethod::List,);
+    }
+
+    #[test]
+    fn test_parse_partition_method_list_mixed_case() {
+        assert_eq!(parse_partition_method("List:region"), PartitionMethod::List,);
+    }
+
+    #[test]
+    fn test_strip_partition_mode_prefix_none() {
+        assert_eq!(strip_partition_mode_prefix("sale_date"), "sale_date");
+    }
+
+    #[test]
+    fn test_strip_partition_mode_prefix_list() {
+        assert_eq!(strip_partition_mode_prefix("LIST:region"), "region");
+    }
+
+    #[test]
+    fn test_strip_partition_mode_prefix_list_lower() {
+        assert_eq!(strip_partition_mode_prefix("list:region"), "region");
+    }
+
+    #[test]
+    fn test_strip_partition_mode_prefix_mixed_case() {
+        assert_eq!(strip_partition_mode_prefix("LiSt:region"), "region");
+    }
+
+    #[test]
+    fn test_parse_partition_key_columns_with_list_prefix() {
+        let cols = parse_partition_key_columns("LIST:region");
+        assert_eq!(cols, vec!["region"]);
+    }
+
+    #[test]
+    fn test_validate_partition_key_list_single_column_ok() {
+        let columns = vec![
+            ColumnDef {
+                name: "region".to_string(),
+                type_oid: PgOid::Invalid,
+            },
+            ColumnDef {
+                name: "amount".to_string(),
+                type_oid: PgOid::Invalid,
+            },
+        ];
+        assert!(validate_partition_key("LIST:region", &columns).is_ok());
+    }
+
+    #[test]
+    fn test_validate_partition_key_list_multi_column_rejected() {
+        let columns = vec![
+            ColumnDef {
+                name: "region".to_string(),
+                type_oid: PgOid::Invalid,
+            },
+            ColumnDef {
+                name: "category".to_string(),
+                type_oid: PgOid::Invalid,
+            },
+        ];
+        let err = validate_partition_key("LIST:region,category", &columns);
+        assert!(err.is_err());
+        let msg = err.unwrap_err().to_string();
+        assert!(
+            msg.contains("single column"),
+            "Error should mention single column: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_validate_partition_key_list_missing_column() {
+        let columns = vec![ColumnDef {
+            name: "amount".to_string(),
+            type_oid: PgOid::Invalid,
+        }];
+        let err = validate_partition_key("LIST:region", &columns);
+        assert!(err.is_err());
+        let msg = err.unwrap_err().to_string();
+        assert!(
+            msg.contains("region"),
             "Error should mention the missing column: {msg}"
         );
     }

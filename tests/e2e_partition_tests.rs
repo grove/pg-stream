@@ -1264,3 +1264,209 @@ async fn test_partitioned_st_explicit_partitions_no_warning() {
     )
     .await;
 }
+
+// ── A1-1d: LIST-partitioned stream tables ──────────────────────────────
+
+#[tokio::test]
+async fn test_partitioned_st_list_create_and_refresh() {
+    let db = E2eDb::new().await.with_extension().await;
+
+    db.execute(
+        "CREATE TABLE list_src (
+            id SERIAL PRIMARY KEY,
+            region TEXT NOT NULL,
+            amount NUMERIC NOT NULL
+        )",
+    )
+    .await;
+
+    db.execute(
+        "INSERT INTO list_src (region, amount) VALUES
+         ('US', 100), ('EU', 200), ('APAC', 300), ('US', 150)",
+    )
+    .await;
+
+    // A1-1d: create LIST-partitioned stream table
+    db.create_st_partitioned(
+        "list_summary",
+        "SELECT region, SUM(amount) AS total FROM list_src GROUP BY region",
+        "1m",
+        "DIFFERENTIAL",
+        "LIST:region",
+    )
+    .await;
+
+    // Verify catalog stores the LIST: prefix
+    let pk: Option<String> = db
+        .query_scalar_opt(
+            "SELECT st_partition_key FROM pgtrickle.pgt_stream_tables \
+             WHERE pgt_name = 'list_summary'",
+        )
+        .await;
+    assert_eq!(pk.as_deref(), Some("LIST:region"));
+
+    // Verify storage table is LIST-partitioned
+    let part_strategy: String = db
+        .query_scalar(
+            "SELECT partstrat FROM pg_partitioned_table pt \
+             JOIN pg_class c ON c.oid = pt.partrelid \
+             WHERE c.relname = 'list_summary'",
+        )
+        .await;
+    assert_eq!(
+        part_strategy, "l",
+        "storage table should be LIST-partitioned (partstrat='l')"
+    );
+
+    // Default partition must exist
+    let default_exists: bool = db
+        .query_scalar(
+            "SELECT EXISTS(\
+               SELECT 1 FROM pg_class WHERE relname = 'list_summary_default'\
+             )",
+        )
+        .await;
+    assert!(default_exists, "default partition should exist");
+
+    db.refresh_st("list_summary").await;
+
+    let count: i64 = db.count("list_summary").await;
+    assert_eq!(count, 3, "3 regions should be in the LIST-partitioned ST");
+
+    db.assert_st_matches_query(
+        "list_summary",
+        "SELECT region, SUM(amount) AS total FROM list_src GROUP BY region",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn test_partitioned_st_list_differential_refresh() {
+    let db = E2eDb::new().await.with_extension().await;
+
+    db.execute(
+        "CREATE TABLE ldiff_src (
+            id SERIAL PRIMARY KEY,
+            category TEXT NOT NULL,
+            val INT NOT NULL
+        )",
+    )
+    .await;
+
+    db.execute("INSERT INTO ldiff_src (category, val) VALUES ('A', 10), ('B', 20), ('C', 30)")
+        .await;
+
+    db.create_st_partitioned(
+        "ldiff_st",
+        "SELECT category, SUM(val) AS total FROM ldiff_src GROUP BY category",
+        "1m",
+        "DIFFERENTIAL",
+        "LIST:category",
+    )
+    .await;
+
+    // Create explicit LIST partitions
+    db.execute("CREATE TABLE ldiff_st_a PARTITION OF ldiff_st FOR VALUES IN ('A')")
+        .await;
+    db.execute("CREATE TABLE ldiff_st_b PARTITION OF ldiff_st FOR VALUES IN ('B')")
+        .await;
+
+    db.refresh_st("ldiff_st").await;
+
+    // Insert more data into category A only
+    db.execute("INSERT INTO ldiff_src (category, val) VALUES ('A', 5)")
+        .await;
+
+    db.refresh_st("ldiff_st").await;
+
+    // Verify correctness — category A should be updated, B/C unchanged
+    db.assert_st_matches_query(
+        "ldiff_st",
+        "SELECT category, SUM(val) AS total FROM ldiff_src GROUP BY category",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn test_partitioned_st_list_with_explicit_partitions() {
+    let db = E2eDb::new().await.with_extension().await;
+
+    db.execute(
+        "CREATE TABLE lexp_src (
+            id SERIAL PRIMARY KEY,
+            status TEXT NOT NULL,
+            amount NUMERIC NOT NULL
+        )",
+    )
+    .await;
+
+    db.execute(
+        "INSERT INTO lexp_src (status, amount) VALUES
+         ('active', 100), ('inactive', 200), ('active', 50)",
+    )
+    .await;
+
+    db.create_st_partitioned(
+        "lexp_st",
+        "SELECT status, SUM(amount) AS total FROM lexp_src GROUP BY status",
+        "1m",
+        "DIFFERENTIAL",
+        "LIST:status",
+    )
+    .await;
+
+    // Create named partitions before refresh
+    db.execute("CREATE TABLE lexp_st_active PARTITION OF lexp_st FOR VALUES IN ('active')")
+        .await;
+    db.execute("CREATE TABLE lexp_st_inactive PARTITION OF lexp_st FOR VALUES IN ('inactive')")
+        .await;
+
+    db.refresh_st("lexp_st").await;
+
+    // Verify data lands in the correct partitions
+    let active_count: i64 = db.count("lexp_st_active").await;
+    assert_eq!(active_count, 1, "active partition should have 1 row");
+
+    let inactive_count: i64 = db.count("lexp_st_inactive").await;
+    assert_eq!(inactive_count, 1, "inactive partition should have 1 row");
+
+    db.assert_st_matches_query(
+        "lexp_st",
+        "SELECT status, SUM(amount) AS total FROM lexp_src GROUP BY status",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn test_partitioned_st_list_multi_column_rejected() {
+    let db = E2eDb::new().await.with_extension().await;
+
+    db.execute(
+        "CREATE TABLE lmc_src (
+            id SERIAL PRIMARY KEY,
+            region TEXT NOT NULL,
+            category TEXT NOT NULL,
+            val INT NOT NULL
+        )",
+    )
+    .await;
+
+    // LIST with multiple columns should be rejected
+    let err = db
+        .try_execute(
+            "SELECT pgtrickle.create_stream_table('lmc_st', \
+             $$SELECT region, category, SUM(val) AS total \
+               FROM lmc_src GROUP BY region, category$$, \
+             '1m', 'DIFFERENTIAL', partition_by => 'LIST:region,category')",
+        )
+        .await;
+    assert!(
+        err.is_err(),
+        "LIST with multiple columns should be rejected"
+    );
+    let msg = err.unwrap_err().to_string();
+    assert!(
+        msg.contains("single column"),
+        "Error should mention single column: {msg}"
+    );
+}
