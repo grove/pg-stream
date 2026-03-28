@@ -1521,7 +1521,18 @@ pub fn prewarm_merge_cache(st: &StreamTableMeta) {
     // B3-2: For non-deduplicated deltas, use weight aggregation instead of
     // DISTINCT ON.  Weight aggregation correctly handles diamond-flow queries
     // where multiple delta branches produce overlapping corrections.
-    let using_clause = if delta_result.is_deduplicated {
+    //
+    // A-2: When `has_key_changed` is available on a deduplicated delta, wrap
+    // the USING clause with a filter that suppresses D-side rows for value-only
+    // UPDATEs (__pgt_key_changed = FALSE).  The remaining I-side row triggers
+    // the existing WHEN MATCHED THEN UPDATE clause — converting a DELETE+INSERT
+    // cycle into a single UPDATE (cheaper WAL, HOT-eligible, no index churn).
+    let using_clause = if delta_result.is_deduplicated && delta_result.has_key_changed {
+        format!(
+            "(SELECT * FROM ({delta_sql_template}) __d \
+             WHERE NOT (__d.__pgt_action = 'D' AND __d.__pgt_key_changed = FALSE))"
+        )
+    } else if delta_result.is_deduplicated {
         format!("({delta_sql_template})")
     } else if st.has_keyless_source {
         // Keyless: do NOT collapse — duplicate row_ids are intentional
@@ -3477,6 +3488,7 @@ pub fn execute_differential_refresh(
         let user_cols = delta_result.output_columns;
         let source_oids = delta_result.source_oids;
         let is_dedup = delta_result.is_deduplicated;
+        let has_key_changed = delta_result.has_key_changed;
 
         let quoted_table = format!(
             "\"{}\".\"{}\"",
@@ -3531,7 +3543,13 @@ pub fn execute_differential_refresh(
         // EC-06: For keyless sources, never collapse.
         // B3-2: Use weight aggregation instead of DISTINCT ON for correctness
         // on diamond-flow queries.
-        let template_using = if is_dedup || st.has_keyless_source {
+        // A-2: Filter D-side value-only UPDATE rows when __pgt_key_changed is available.
+        let template_using = if (is_dedup || st.has_keyless_source) && has_key_changed {
+            format!(
+                "(SELECT * FROM ({delta_sql_template}) __d \
+                 WHERE NOT (__d.__pgt_action = 'D' AND __d.__pgt_key_changed = FALSE))"
+            )
+        } else if is_dedup || st.has_keyless_source {
             format!("({delta_sql_template})")
         } else {
             build_weight_agg_using(&delta_sql_template, &user_col_list)

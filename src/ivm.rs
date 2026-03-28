@@ -815,7 +815,8 @@ fn get_or_compute_ivm_delta(
     ctx.st_has_pgt_count = has_pgt_count;
 
     // Differentiate the operator tree to get delta SQL.
-    let (delta_sql, user_columns, _is_dedup) = ctx.differentiate_with_columns(&op_tree)?;
+    let (delta_sql, user_columns, _is_dedup, _has_key_changed) =
+        ctx.differentiate_with_columns(&op_tree)?;
 
     // Store in cache.
     IVM_DELTA_CACHE.with(|cache| {

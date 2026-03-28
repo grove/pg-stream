@@ -355,10 +355,15 @@ impl DiffContext {
     pub fn differentiate_with_columns(
         &mut self,
         op: &OpTree,
-    ) -> Result<(String, Vec<String>, bool), PgTrickleError> {
+    ) -> Result<(String, Vec<String>, bool, bool), PgTrickleError> {
         let result = self.diff_node(op)?;
         let sql = self.build_with_query(&result.cte_name);
-        Ok((sql, result.columns, result.is_deduplicated))
+        Ok((
+            sql,
+            result.columns,
+            result.is_deduplicated,
+            result.has_key_changed,
+        ))
     }
 
     /// Recursively differentiate an operator tree node.

@@ -93,6 +93,8 @@ struct CachedDeltaTemplate {
     source_oids: Vec<u32>,
     /// Whether the delta output is already deduplicated per __pgt_row_id.
     is_deduplicated: bool,
+    /// A-2: Whether the delta includes `__pgt_key_changed` boolean column.
+    has_key_changed: bool,
 }
 
 thread_local! {
@@ -210,6 +212,18 @@ pub fn is_delta_deduplicated(pgt_id: i64) -> bool {
     })
 }
 
+/// A-2: Check whether the cached delta for a ST includes a `__pgt_key_changed`
+/// boolean column, enabling the MERGE to filter out D-side value-only UPDATEs.
+pub fn delta_has_key_changed(pgt_id: i64) -> bool {
+    DELTA_TEMPLATE_CACHE.with(|cache| {
+        cache
+            .borrow()
+            .get(&pgt_id)
+            .map(|entry| entry.has_key_changed)
+            .unwrap_or(false)
+    })
+}
+
 /// PROF-DLT: Parse a defining query and return the deduplicated list of source
 /// table OIDs (TABLE, MATVIEW, FOREIGN_TABLE, and upstream ST storage OIDs).
 ///
@@ -263,6 +277,11 @@ pub struct DeltaQueryResult {
     /// When true, the delta has at most one row per `__pgt_row_id`,
     /// so the MERGE can skip the outer DISTINCT ON + ORDER BY.
     pub is_deduplicated: bool,
+    /// A-2: When true, the top-level delta CTE includes a `__pgt_key_changed`
+    /// boolean column. The MERGE template can use this to filter out D-side
+    /// rows for value-only UPDATEs, halving MERGE source rows and converting
+    /// DELETE+INSERT to a single UPDATE.
+    pub has_key_changed: bool,
 }
 
 /// Generate the full delta SQL query for a defining query.
@@ -328,13 +347,15 @@ pub fn generate_delta_query(
     // DAG-4: Apply any active bypass table mappings from fused-chain execution.
     ctx.st_bypass_tables = crate::refresh::get_st_bypass_tables();
 
-    let (delta_sql, output_columns, diff_dedup) = ctx.differentiate_with_columns(&result.tree)?;
+    let (delta_sql, output_columns, diff_dedup, diff_has_key_changed) =
+        ctx.differentiate_with_columns(&result.tree)?;
 
     Ok(DeltaQueryResult {
         delta_sql,
         output_columns,
         source_oids,
         is_deduplicated: diff_dedup,
+        has_key_changed: diff_has_key_changed,
     })
 }
 
@@ -403,6 +424,7 @@ pub fn generate_delta_query_cached(
             output_columns: entry.output_columns,
             source_oids: entry.source_oids,
             is_deduplicated: entry.is_deduplicated,
+            has_key_changed: entry.has_key_changed,
         });
     }
 
@@ -439,7 +461,7 @@ pub fn generate_delta_query_cached(
     // ST-ST-4: Resolve which sources are STs for proper buffer table routing.
     ctx.st_source_pgt_ids = resolve_st_source_pgt_ids(&source_oids);
 
-    let (template_sql, output_columns, diff_dedup) =
+    let (template_sql, output_columns, diff_dedup, diff_has_key_changed) =
         ctx.differentiate_with_columns(&result.tree)?;
 
     // Store in cache.
@@ -449,6 +471,7 @@ pub fn generate_delta_query_cached(
         output_columns: output_columns.clone(),
         source_oids: source_oids.clone(),
         is_deduplicated: diff_dedup,
+        has_key_changed: diff_has_key_changed,
     };
     DELTA_TEMPLATE_CACHE.with(|cache| {
         cache.borrow_mut().insert(pgt_id, entry);
@@ -463,6 +486,7 @@ pub fn generate_delta_query_cached(
         output_columns,
         source_oids,
         is_deduplicated: diff_dedup,
+        has_key_changed: diff_has_key_changed,
     })
 }
 
@@ -1390,6 +1414,7 @@ mod tests {
             output_columns: vec!["id".to_string()],
             source_oids: vec![42],
             is_deduplicated: true,
+            has_key_changed: false,
         };
         DELTA_TEMPLATE_CACHE.with(|cache| {
             cache.borrow_mut().insert(pgt_id, entry);
@@ -1413,6 +1438,7 @@ mod tests {
             output_columns: vec![],
             source_oids: vec![],
             is_deduplicated: false,
+            has_key_changed: false,
         };
         DELTA_TEMPLATE_CACHE.with(|cache| {
             cache.borrow_mut().insert(pgt_id, entry);
@@ -1422,6 +1448,32 @@ mod tests {
         invalidate_delta_cache(pgt_id);
         assert!(get_delta_sql_template(pgt_id).is_none());
         assert!(!is_delta_deduplicated(pgt_id));
+    }
+
+    #[test]
+    fn test_cache_has_key_changed_returns_correct_value() {
+        let pgt_id = -9996;
+        invalidate_delta_cache(pgt_id);
+        // Default when not cached:
+        assert!(!delta_has_key_changed(pgt_id));
+
+        // Insert with has_key_changed = true
+        let entry = CachedDeltaTemplate {
+            defining_query_hash: 0,
+            delta_sql_template: "SELECT 1".to_string(),
+            output_columns: vec![],
+            source_oids: vec![],
+            is_deduplicated: true,
+            has_key_changed: true,
+        };
+        DELTA_TEMPLATE_CACHE.with(|cache| {
+            cache.borrow_mut().insert(pgt_id, entry);
+        });
+        assert!(delta_has_key_changed(pgt_id));
+
+        // Cleanup
+        invalidate_delta_cache(pgt_id);
+        assert!(!delta_has_key_changed(pgt_id));
     }
 
     // ── OpTree::needs_pgt_count() (unit, no PG parse) ──────────────
