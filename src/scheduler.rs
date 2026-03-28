@@ -1350,9 +1350,14 @@ pub fn compute_per_db_quota(
 ///
 /// Topological order is preserved within each priority tier because the
 /// input queue was built by iterating `topo_order`.
+///
+/// The secondary sort key is `tier_priority`: tier values should be
+/// `0 = Hot` (highest urgency), `1 = Warm`, `2 = Cold`.  Pass an empty map
+/// when tier information is unavailable (all units treated as Hot).
 fn sort_ready_queue_by_priority(
     queue: VecDeque<ExecutionUnitId>,
     eu_dag: &ExecutionUnitDag,
+    tier_priorities: &HashMap<ExecutionUnitId, u8>,
 ) -> VecDeque<ExecutionUnitId> {
     use crate::dag::ExecutionUnitKind;
     fn unit_priority(kind: ExecutionUnitKind) -> u8 {
@@ -1364,16 +1369,59 @@ fn sort_ready_queue_by_priority(
             ExecutionUnitKind::CyclicScc => 3,
         }
     }
+    // C3-1: Tier priority: Hot(0) > Warm(1) > Cold(2).  ImmediateClosure EUs
+    // are already priority 0 by kind and do not need a tier secondary key.
+    let default_tier: u8 = 0; // default to Hot when not in map
     let mut items: Vec<ExecutionUnitId> = queue.into_iter().collect();
     // stable sort preserves topological order within each priority tier.
     items.sort_by_key(|&uid| {
-        eu_dag
+        let (kind_prio, tier_prio) = eu_dag
             .units()
             .find(|u| u.id == uid)
-            .map(|u| unit_priority(u.kind))
-            .unwrap_or(u8::MAX)
+            .map(|u| {
+                let kp = unit_priority(u.kind);
+                // ImmediateClosure ignores tier — it always wins.
+                let tp = if kp == 0 {
+                    0u8
+                } else {
+                    *tier_priorities.get(&uid).unwrap_or(&default_tier)
+                };
+                (kp, tp)
+            })
+            .unwrap_or((u8::MAX, default_tier));
+        (kind_prio, tier_prio)
     });
     items.into_iter().collect()
+}
+
+/// C3-1: Compute the "best" (most-urgent) tier priority for an execution unit.
+///
+/// Iterates the unit's member STs, loads each, and returns the minimum tier
+/// priority value (Hot=0, Warm=1, Cold=2).  Returns `0` (Hot) for any unit
+/// whose members cannot be loaded so they are never accidentally deprioritised.
+///
+/// Pure logic in the sense that it only reads catalog data that has already
+/// been loaded; the `load_st_by_id` calls are cheap (SPI reads, already cached
+/// by the catalog layer during this same scheduler tick).
+fn compute_unit_tier_priority(member_pgt_ids: &[i64]) -> u8 {
+    let mut best: u8 = 2; // Cold — start at lowest urgency
+    for &pgt_id in member_pgt_ids {
+        let tier_prio = match load_st_by_id(pgt_id) {
+            Some(st) => match RefreshTier::from_sql_str(&st.refresh_tier) {
+                RefreshTier::Hot => 0,
+                RefreshTier::Warm => 1,
+                RefreshTier::Cold | RefreshTier::Frozen => 2,
+            },
+            None => 0, // default to Hot urgency when ST cannot be loaded
+        };
+        if tier_prio < best {
+            best = tier_prio;
+        }
+        if best == 0 {
+            break; // Hot is the highest urgency; short-circuit
+        }
+    }
+    best
 }
 
 /// Run one tick of the parallel dispatch loop.
@@ -1602,10 +1650,24 @@ fn parallel_dispatch_tick(
         ready_queue.push_back(uid);
     }
 
+    // C3-1: Build tier priority map for the ready queue.
+    // For each EU in the ready queue, compute the "best" (most urgent) tier
+    // among its member STs.  This is the secondary sort key used below.
+    // We only compute for units that are actually ready so the map stays small.
+    let tier_map: HashMap<ExecutionUnitId, u8> = ready_queue
+        .iter()
+        .filter_map(|&uid| {
+            eu_dag
+                .units()
+                .find(|u| u.id == uid)
+                .map(|u| (uid, compute_unit_tier_priority(&u.member_pgt_ids)))
+        })
+        .collect();
+
     // C3-1: Priority sort — IMMEDIATE closures first for transactional safety,
-    // then atomic groups, singletons, cyclic SCCs.  Topological order within
-    // each priority tier is preserved (we appended in topo_order above).
-    let ready_queue = sort_ready_queue_by_priority(ready_queue, eu_dag);
+    // then atomic groups, singletons (Hot > Warm > Cold), cyclic SCCs.
+    // Topological order within each priority tier is preserved.
+    let ready_queue = sort_ready_queue_by_priority(ready_queue, eu_dag, &tier_map);
 
     // ── Step 3: Dispatch ready units within budget ───────────────────────
     let mut ready_queue = ready_queue;
@@ -5229,5 +5291,117 @@ mod tests {
         assert_eq!(state.unit_states[&uid_b].remaining_upstreams, 1);
         assert_eq!(state.unit_states[&uid_c].remaining_upstreams, 1);
         assert!(state.unit_states.values().all(|us| !us.succeeded));
+    }
+
+    // ── C3-1: sort_ready_queue_by_priority tier-aware tests ───────────────
+
+    /// Build a minimal ExecutionUnitDag with entries of requested kinds so the
+    /// sort function can look up `unit_priority`.  No edges are needed.
+    fn make_single_dag(
+        entries: &[(ExecutionUnitId, crate::dag::ExecutionUnitKind)],
+    ) -> ExecutionUnitDag {
+        use crate::dag::{ExecutionUnit, ExecutionUnitDag};
+        let mut units = Vec::new();
+        for &(uid, kind) in entries {
+            units.push(ExecutionUnit {
+                id: uid,
+                kind,
+                root_pgt_id: uid.0 as i64,
+                member_pgt_ids: vec![uid.0 as i64],
+                label: format!("unit-{}", uid.0),
+            });
+        }
+        ExecutionUnitDag::from_units_for_test(units)
+    }
+
+    #[test]
+    fn test_sort_priority_immediate_before_singleton() {
+        use crate::dag::{ExecutionUnitId, ExecutionUnitKind};
+        let uid_imm = ExecutionUnitId(1);
+        let uid_sing = ExecutionUnitId(2);
+        let dag = make_single_dag(&[
+            (uid_imm, ExecutionUnitKind::ImmediateClosure),
+            (uid_sing, ExecutionUnitKind::Singleton),
+        ]);
+        let queue: VecDeque<ExecutionUnitId> = vec![uid_sing, uid_imm].into();
+        let tier_map = HashMap::new();
+        let sorted = sort_ready_queue_by_priority(queue, &dag, &tier_map);
+        assert_eq!(sorted[0], uid_imm, "ImmediateClosure must come first");
+        assert_eq!(sorted[1], uid_sing);
+    }
+
+    #[test]
+    fn test_sort_priority_hot_singleton_before_warm_singleton() {
+        use crate::dag::{ExecutionUnitId, ExecutionUnitKind};
+        let uid_hot = ExecutionUnitId(10);
+        let uid_warm = ExecutionUnitId(20);
+        let dag = make_single_dag(&[
+            (uid_hot, ExecutionUnitKind::Singleton),
+            (uid_warm, ExecutionUnitKind::Singleton),
+        ]);
+        // Warm first in queue, Hot second — tier sort should flip them.
+        let queue: VecDeque<ExecutionUnitId> = vec![uid_warm, uid_hot].into();
+        let mut tier_map = HashMap::new();
+        tier_map.insert(uid_hot, 0u8); // Hot
+        tier_map.insert(uid_warm, 1u8); // Warm
+        let sorted = sort_ready_queue_by_priority(queue, &dag, &tier_map);
+        assert_eq!(sorted[0], uid_hot, "Hot singleton must come before Warm");
+        assert_eq!(sorted[1], uid_warm);
+    }
+
+    #[test]
+    fn test_sort_priority_warm_singleton_before_cold_singleton() {
+        use crate::dag::{ExecutionUnitId, ExecutionUnitKind};
+        let uid_warm = ExecutionUnitId(30);
+        let uid_cold = ExecutionUnitId(40);
+        let dag = make_single_dag(&[
+            (uid_warm, ExecutionUnitKind::Singleton),
+            (uid_cold, ExecutionUnitKind::Singleton),
+        ]);
+        let queue: VecDeque<ExecutionUnitId> = vec![uid_cold, uid_warm].into();
+        let mut tier_map = HashMap::new();
+        tier_map.insert(uid_warm, 1u8); // Warm
+        tier_map.insert(uid_cold, 2u8); // Cold
+        let sorted = sort_ready_queue_by_priority(queue, &dag, &tier_map);
+        assert_eq!(sorted[0], uid_warm, "Warm singleton must come before Cold");
+        assert_eq!(sorted[1], uid_cold);
+    }
+
+    #[test]
+    fn test_sort_priority_immediate_beats_hot_singleton() {
+        use crate::dag::{ExecutionUnitId, ExecutionUnitKind};
+        let uid_imm = ExecutionUnitId(50);
+        let uid_hot = ExecutionUnitId(60);
+        let dag = make_single_dag(&[
+            (uid_imm, ExecutionUnitKind::ImmediateClosure),
+            (uid_hot, ExecutionUnitKind::Singleton),
+        ]);
+        let queue: VecDeque<ExecutionUnitId> = vec![uid_hot, uid_imm].into();
+        let mut tier_map = HashMap::new();
+        tier_map.insert(uid_hot, 0u8); // Hot — but ImmediateClosure kind wins anyway
+        let sorted = sort_ready_queue_by_priority(queue, &dag, &tier_map);
+        assert_eq!(sorted[0], uid_imm, "ImmediateClosure beats Hot Singleton");
+    }
+
+    #[test]
+    fn test_sort_priority_missing_tier_defaults_to_hot() {
+        use crate::dag::{ExecutionUnitId, ExecutionUnitKind};
+        let uid_a = ExecutionUnitId(70);
+        let uid_b = ExecutionUnitId(80);
+        let dag = make_single_dag(&[
+            (uid_a, ExecutionUnitKind::Singleton),
+            (uid_b, ExecutionUnitKind::Singleton),
+        ]);
+        let queue: VecDeque<ExecutionUnitId> = vec![uid_b, uid_a].into();
+        // uid_b is "Cold" in the map; uid_a has no entry (defaults to Hot=0)
+        let mut tier_map = HashMap::new();
+        tier_map.insert(uid_b, 2u8); // Cold
+        // uid_a absent → defaults to 0 (Hot) → should come first
+        let sorted = sort_ready_queue_by_priority(queue, &dag, &tier_map);
+        assert_eq!(
+            sorted[0], uid_a,
+            "Missing-tier unit defaults to Hot urgency"
+        );
+        assert_eq!(sorted[1], uid_b);
     }
 }

@@ -2073,6 +2073,26 @@ impl ExecutionUnitDag {
 
         out
     }
+
+    /// Build an `ExecutionUnitDag` from a flat list of `ExecutionUnit`s with no
+    /// edges.  For unit tests only — lets tests construct minimal dags without
+    /// going through `build_from_st_dag`.
+    #[cfg(test)]
+    pub fn from_units_for_test(units: Vec<ExecutionUnit>) -> Self {
+        let mut dag = ExecutionUnitDag {
+            units: HashMap::new(),
+            edges: HashMap::new(),
+            reverse_edges: HashMap::new(),
+            pgt_to_unit: HashMap::new(),
+        };
+        for unit in units {
+            for &pgt_id in &unit.member_pgt_ids {
+                dag.pgt_to_unit.insert(pgt_id, unit.id);
+            }
+            dag.units.insert(unit.id, unit);
+        }
+        dag
+    }
 }
 
 /// Recursively collect IMMEDIATE-mode stream tables reachable from `start`.

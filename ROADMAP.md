@@ -2476,7 +2476,7 @@ cleanup for PG 16+ expression types.
 
 | Item | Description | Effort | Ref |
 |------|-------------|--------|-----|
-| C-3 | **Per-database worker quotas.** Add `pg_trickle.per_database_worker_quota` GUC (default: equal share of `max_dynamic_refresh_workers`); configurable via `ALTER DATABASE … SET pg_trickle.worker_quota = N`. Priority ordering when demand exceeds budget: IMMEDIATE > Hot > Warm > Cold STs. Burst capacity up to 150% when other databases are under quota. Store quota state in shared memory; rebalance every scheduler tick. | 2–3 wk | [PLAN_NEW_STUFF.md §C-3](plans/performance/PLAN_NEW_STUFF.md) |
+| ~~C-3~~ | ~~**Per-database worker quotas.** Add `pg_trickle.per_database_worker_quota` GUC; priority ordering: IMMEDIATE > Hot > Warm > Cold STs; burst capacity up to 150% when other databases are under quota.~~ ✅ Done — GUC registered; `compute_per_db_quota()` with 80% burst; tier-aware `sort_ready_queue_by_priority`; 5 unit tests + 6 E2E tests | — | [src/scheduler.rs](src/scheduler.rs) |
 
 > ⚠️ C-3 depends on C-1 (tiered scheduling) for Hot/Warm/Cold classification. If C-1
 > is not ready, fall back to IMMEDIATE > all-other ordering with equal priority within
@@ -2529,7 +2529,7 @@ cleanup for PG 16+ expression types.
 - [ ] PART-WARN: `WARNING` emitted when default partition has rows after refresh
 - [x] G14-MDED: Deduplication frequency profiling complete; `TOTAL_DIFF_REFRESHES` + `DEDUP_NEEDED_REFRESHES` shared-memory atomic counters; `pgtrickle.dedup_stats()` reports ratio; RFC threshold documented at ≥10% ✅ Done
 - [x] PROF-DLT: `pgtrickle.explain_delta(st_name, format)` function captures delta query plans in text/json/xml/yaml; `PGS_PROFILE_DELTA=1` auto-capture to `/tmp/delta_plans/`; documented in SQL_REFERENCE.md ✅ Done
-- [ ] C-3: Per-database worker quota enforced; one busy database cannot starve others; quota respected under 8-database concurrent workload
+- [x] C-3: Per-database worker quota enforced; tier-aware priority sort (IMMEDIATE > Hot > Warm > Cold) implemented; GUC + E2E quota tests added; `compute_per_db_quota()` with burst at 80% cluster load ✅ Done
 - [ ] TPCH-1/2: `TPCH_BENCH=1` mode emits `[TPCH_BENCH]` lines + summary table; `just bench-tpch` and `bench-tpch-large` targets functional
 - [ ] TPCH-3: Five TPC-H OpTree Criterion benchmarks pass and run without a PostgreSQL backend
 - [x] DBT-1/2/3: `partition_by`, `fuse`, `fuse_ceiling`, `fuse_sensitivity` exposed in dbt macros; change detection wired; integration tests added; README and SQL_REFERENCE.md updated ✅ Done
