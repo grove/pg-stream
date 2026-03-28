@@ -19,7 +19,7 @@ A separate [PGXN workflow](../.github/workflows/pgxn.yml) also fires on the same
 ## Prerequisites
 
 - Push access to the repository (or a PR merged by a maintainer)
-- All CI checks passing on `main`
+- All CI checks passing on `main` (verify the last run on the version-bump commit succeeded)
 - The version in `Cargo.toml` matches the tag you intend to push
 - Required GitHub secrets configured (see [Required GitHub Secrets](#required-github-secrets) below)
 
@@ -87,19 +87,35 @@ git commit -m "release: v0.8.0"
 git push origin main
 ```
 
-### 4. Wait for CI to pass
+### 4. Wait for CI to pass and verify upgrade completeness
 
 Ensure the [CI workflow](../.github/workflows/ci.yml) passes on `main` with
 the version bump commit. All unit, integration, E2E, and pgrx tests must be
 green.
 
-Before tagging, make sure the upgrade automation also targets the new release:
+**Critical:** Before tagging, verify that the upgrade script covers all SQL schema changes:
 
 ```bash
-just check-upgrade <previous-version> <new-version>
+# Run comprehensive upgrade completeness checks
+just check-upgrade-all
 
-# Confirm the local and CI upgrade-image / upgrade-E2E defaults
-# were advanced to the new release where applicable.
+# If any check fails (e.g. "ERROR: X new function(s) missing from upgrade script"),
+# fix the issue by adding the missing SQL objects to:
+#   sql/pg_trickle--<prev>--<new>.sql
+#
+# Then re-run until all checks pass:
+just check-upgrade-all  # Should print "All 14 upgrade step(s) passed completeness checks."
+```
+
+**Why this matters:** New SQL functions, views, tables, and columns added in any prior
+release must be carried forward in the upgrade script, even if the current release
+doesn't change them. The upgrade script is the source of truth for what PostgreSQL
+applies when users run `ALTER EXTENSION pg_trickle UPDATE`.
+
+Confirm the local and CI upgrade-E2E defaults were advanced to the new release:
+
+```bash
+just check-version-sync  # Verifies ci.yml, justfile, and test defaults
 ```
 
 ### 5. Create and push the tag
@@ -279,10 +295,17 @@ Every release requires manual updates to the files below. Missing any of them le
 | `README.md` | Update test-count line (`~N unit tests + M E2E tests`) if test counts changed significantly | The README is the first thing users read; stale numbers erode trust. |
 | `INSTALL.md` | Update any version numbers in install commands or example URLs | Users copy-paste installation commands; stale versions cause failures. |
 | `docs/UPGRADING.md` | Add the new version-specific migration notes and extend the supported upgrade-path table | Documents exactly what `ALTER EXTENSION ... UPDATE` will do and which chains are supported. |
-| `sql/pg_trickle--<old>--<new>.sql` | Add or update the hand-authored upgrade script for every SQL-surface change (new objects, changed signatures, changed defaults, view changes) | `ALTER EXTENSION ... UPDATE` only applies what is explicitly scripted; function defaults and signatures stored in `pg_proc` do not update themselves. |
-| `sql/archive/pg_trickle--<new>.sql` | Commit the generated full-install SQL baseline for the new version | Future upgrade-completeness checks and upgrade E2E tests need an exact baseline for the released version. |
+| `sql/pg_trickle--<old>--<new>.sql` | Add or update the hand-authored upgrade script for every SQL-surface change (new objects, changed signatures, changed defaults, view changes). **Also carry forward all functions/views/tables added in previous releases — the upgrade script is cumulative.** | `ALTER EXTENSION ... UPDATE` only applies what is explicitly scripted; function defaults and signatures stored in `pg_proc` do not update themselves. Omitting a function that existed in `<old>` but is expected in `<new>` will break user upgrades. |
+| `sql/archive/pg_trickle--<new>.sql` | Regenerate and commit the full-install SQL baseline for the new version. **This file was created as a placeholder copy of `<prev>` at the start of the development cycle — it must be replaced with the actual generated SQL before tagging.** Run `cargo pgrx schema` (or the equivalent `just` target) to produce the final schema, then overwrite the placeholder. | Future upgrade-completeness checks and upgrade E2E tests need an exact baseline for the released version. A stale placeholder from the start of the cycle will cause spurious failures. |
 | `.github/workflows/ci.yml`, `justfile`, `tests/build_e2e_upgrade_image.sh`, `tests/Dockerfile.e2e-upgrade` | Advance the upgrade-check chain and default upgrade-E2E target version to the new release | Prevents release automation and local upgrade validation from getting stuck on the previous version after a new migration hop is added. |
 | `pg_trickle.control` | **No manual edit needed** — `default_version` is set to `'@CARGO_VERSION@'` and pgrx substitutes it at build time. Verify the substitution in the built artifact. | Ensures the SQL `CREATE EXTENSION` command installs the right version. |
+
+> **CRITICAL:** After updating `sql/pg_trickle--<old>--<new>.sql`, always run
+> `just check-upgrade-all` to verify that the upgrade script is complete. This
+> checks not just the immediate hop to the new version, but the entire upgrade
+> chain from v0.1.3 onwards. If the check fails (e.g. "ERROR: 3 new function(s)
+> missing"), it means the upgrade script is missing one or more SQL objects that
+> users will expect to have after upgrading. Fix all failures before tagging.
 
 ### Checklist summary
 
@@ -294,10 +317,12 @@ Every release requires manual updates to the files below. Missing any of them le
 [ ] README.md — test counts current (if materially changed)
 [ ] INSTALL.md — version references current
 [ ] docs/UPGRADING.md — latest migration notes and supported chains added
-[ ] sql/pg_trickle--<old>--<new>.sql — covers every SQL-surface change
-[ ] sql/archive/pg_trickle--<new>.sql — archived full install SQL committed
+[ ] sql/pg_trickle--<old>--<new>.sql — covers every SQL-surface change AND carries forward all previous release functions
+[ ] sql/archive/pg_trickle--<new>.sql — regenerated from final schema and committed (replaces the dev-cycle placeholder)
+[ ] just check-upgrade-all — all upgrade steps pass completeness checks (not just the one-step hop)
 [ ] Upgrade automation defaults — CI/local upgrade checks and E2E target the new version
 [ ] just check-version-sync — all version references in sync
+[ ] All CI checks on main have passed (verify the last run on the version-bump commit succeeded)
 [ ] git tag matches Cargo.toml version
 ```
 
@@ -352,6 +377,40 @@ If the workflow created a draft or partial Release before failing:
 2. Delete the broken release (this does **not** delete the tag)
 3. Then follow Option A or Option B above
 
+### Upgrade script completeness check failed
+
+If `just check-upgrade-all` reports errors like `"ERROR: X new function(s) missing
+from upgrade script"`, it means the upgrade SQL script is incomplete:
+
+```bash
+# 1. Look at the error — it tells you exactly what's missing
+just check-upgrade-all  # e.g. "ERROR: 3 new function(s) missing from upgrade script:
+                        #        - pgtrickle.\"explain_refresh_mode\"
+                        #        - pgtrickle.\"fuse_status\"
+                        #        - pgtrickle.\"reset_fuse\""
+
+# 2. Find where those objects are defined in the previous release
+#    (they should already exist in sql/archive/pg_trickle--<prev>.sql)
+grep -n "CREATE.*FUNCTION.*explain_refresh_mode" sql/archive/pg_trickle--*.sql
+
+# 3. Copy the function definitions (CREATE OR REPLACE FUNCTION) to the
+#    upgrade script you're fixing. They should go into:
+#    sql/pg_trickle--<old>--<new>.sql
+#    
+#    Typically, carry-forward functions are grouped in their own section
+#    at the top of the upgrade script with a comment explaining they're
+#    from a prior release.
+
+# 4. Re-run the check to verify it passes
+just check-upgrade-all
+```
+
+**Why this happens:** When a new release (e.g. v0.11.0) adds SQL functions, those
+functions must be explicitly included in all subsequent upgrade scripts. The upgrade
+script is the ground truth — PostgreSQL only applies what is listed in the `.sql` file.
+If you skip a function that users expect, their upgraded extension will be missing
+that object.
+
 #### Common failure causes
 
 | Symptom | Cause | Fix |
@@ -361,6 +420,7 @@ If the workflow created a draft or partial Release before failing:
 | Docker push failed | Missing permissions | Verify `packages: write` is in the workflow and `GITHUB_TOKEN` has GHCR access, then re-run (Option A) |
 | Smoke test failed | Extension doesn't load in PostgreSQL | Fix the issue, re-tag (Option B) |
 | PGXN upload failed | Missing `PGXN_USERNAME` / `PGXN_PASSWORD` secrets, or `META.json` version not updated | Add the secrets in repository settings; verify `META.json` version matches the tag; re-run the `pgxn.yml` workflow from the Actions tab |
+| `just check-upgrade-all` reports missing functions/views | Upgrade script is incomplete — new objects from prior releases not carried forward | See "Upgrade script completeness check failed" above for recovery steps |
 | Rate limited | GitHub API or GHCR throttling | Wait a few minutes, then re-run (Option A) |
 
 ### Yanking a release
