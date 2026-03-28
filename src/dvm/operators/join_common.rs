@@ -487,7 +487,39 @@ pub fn build_pre_change_snapshot_sql(
                 quote_ident(child_alias),
             )
         }
-        OpTree::Subquery { child, .. } => build_pre_change_snapshot_sql(child, scan_delta_ctes),
+        OpTree::Subquery {
+            column_aliases,
+            child,
+            ..
+        } => {
+            if column_aliases.is_empty() {
+                build_pre_change_snapshot_sql(child, scan_delta_ctes)
+            } else {
+                // Mirror the ordinal-renaming logic from build_snapshot_sql:
+                // wrap the child in a SELECT that renames columns positionally
+                // to match the subquery's column aliases.
+                let inner = build_pre_change_snapshot_sql(child, scan_delta_ctes);
+                let child_alias = child.alias();
+                let child_cols = child.output_columns();
+                let inner_selects: Vec<String> = child_cols
+                    .iter()
+                    .enumerate()
+                    .map(|(i, c)| format!("{} AS col{}", quote_ident(c), i + 1))
+                    .collect();
+                let selects: Vec<String> = column_aliases
+                    .iter()
+                    .enumerate()
+                    .map(|(i, alias)| format!("__sub.col{} AS {}", i + 1, quote_ident(alias)))
+                    .collect();
+                format!(
+                    "(SELECT {} FROM (SELECT {} FROM {} {}) __sub)",
+                    selects.join(", "),
+                    inner_selects.join(", "),
+                    inner,
+                    quote_ident(child_alias),
+                )
+            }
+        }
         // For all other node types, fall back to the current snapshot.
         // CteScan, Aggregate, etc. don't have per-leaf delta tracking.
         _ => build_snapshot_sql(op),

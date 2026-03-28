@@ -112,11 +112,6 @@ const IMMEDIATE_SKIP_ALLOWLIST: &[&str] = &[
     // q09: 6-table join (nation, supplier, part, partsupp, orders, lineitem)
     // exceeds temp_file_limit (4 GB) — same root cause as q05/q07/q08.
     "q09",
-    // q15: IMMEDIATE IVM trigger references a generated column alias
-    // (__pgt_v_1.__pgt_c_1) that does not exist in the IVM delta view —
-    // known column-naming mismatch in IVM trigger generation for CTE-based
-    // views that compute aggregates with intermediate CTEs.
-    "q15",
 ];
 
 // ── P3.15: TPCH_STRICT mode ───────────────────────────────────────────
