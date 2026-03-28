@@ -185,6 +185,23 @@ test-tpch-fast:
 test-tpch-large: build-e2e-image
     TPCH_SCALE=0.1 ./scripts/run_e2e_tests.sh --test e2e_tpch_tests --run-ignored all --no-capture
 
+# Run TPC-H as a performance benchmark (SF-0.01, TPCH_BENCH=1, ~5 min, rebuilds Docker image).
+# Emits [TPCH_BENCH] structured lines and a per-query median/P95/MERGE% summary table.
+# Warm-up cycles are discarded before measurement (controlled by WARMUP_CYCLES, default 2).
+[group: "tpch"]
+bench-tpch: build-e2e-image
+    TPCH_BENCH=1 ./scripts/run_e2e_tests.sh --test e2e_tpch_tests --run-ignored all --no-capture -E 'test(test_tpch_performance_comparison)'
+
+# Run TPC-H benchmark, skip Docker image rebuild.
+[group: "tpch"]
+bench-tpch-fast:
+    TPCH_BENCH=1 ./scripts/run_e2e_tests.sh --test e2e_tpch_tests --run-ignored all --no-capture -E 'test(test_tpch_performance_comparison)'
+
+# Run TPC-H benchmark at larger scale: SF-0.1, TPCH_CYCLES=5, warm-up=2 (~15 min, rebuilds image).
+[group: "tpch"]
+bench-tpch-large: build-e2e-image
+    TPCH_BENCH=1 TPCH_SCALE=0.1 TPCH_CYCLES=5 ./scripts/run_e2e_tests.sh --test e2e_tpch_tests --run-ignored all --no-capture -E 'test(test_tpch_performance_comparison)'
+
 # ── Correctness Gate (Phase 9) ────────────────────────────────────────────
 
 # Run Phase 9 external correctness gate (rebuilds Docker image, ~5-10 min)

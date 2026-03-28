@@ -1116,3 +1116,75 @@ impl E2eDb {
         }
     }
 }
+
+// ── Shared profiling utilities ─────────────────────────────────────────────
+//
+// Used by both `e2e_bench_tests` and `e2e_tpch_tests` to extract
+// `[PGS_PROFILE]` lines emitted by `src/refresh.rs` into the container log.
+
+/// Per-phase timing extracted from `[PGS_PROFILE]` log lines.
+#[derive(Clone, Debug)]
+#[allow(dead_code)]
+pub struct ProfileData {
+    pub decision_ms: f64,
+    pub generate_ms: f64,
+    pub merge_ms: f64,
+    pub cleanup_ms: f64,
+    pub total_ms: f64,
+    pub affected: i64,
+    pub path: String,
+}
+
+/// Extract the last `[PGS_PROFILE]` line from docker container logs.
+#[allow(dead_code)]
+pub async fn extract_last_profile(container_id: &str) -> Option<ProfileData> {
+    let output = tokio::process::Command::new("docker")
+        .args(["logs", "--tail", "50", container_id])
+        .output()
+        .await
+        .ok()?;
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let line = stderr.lines().rev().find(|l| l.contains("[PGS_PROFILE]"))?;
+    parse_profile_line(line)
+}
+
+/// Parse a `[PGS_PROFILE]` log line into structured data.
+///
+/// Format: `[PGS_PROFILE] decision=X.XXms generate+build=X.XXms
+///          merge_exec=X.XXms cleanup=X.XXms total=X.XXms
+///          affected=N mode=INCR path=cache_hit`
+#[allow(dead_code)]
+pub fn parse_profile_line(line: &str) -> Option<ProfileData> {
+    let extract_ms = |key: &str| -> Option<f64> {
+        let prefix = format!("{key}=");
+        let start = line.find(&prefix)? + prefix.len();
+        let rest = &line[start..];
+        let end = rest.find("ms")?;
+        rest[..end].parse().ok()
+    };
+    let extract_int = |key: &str| -> Option<i64> {
+        let prefix = format!("{key}=");
+        let start = line.find(&prefix)? + prefix.len();
+        let rest = &line[start..];
+        let end = rest
+            .find(|c: char| !c.is_ascii_digit())
+            .unwrap_or(rest.len());
+        rest[..end].parse().ok()
+    };
+    let extract_str = |key: &str| -> Option<String> {
+        let prefix = format!("{key}=");
+        let start = line.find(&prefix)? + prefix.len();
+        let rest = &line[start..];
+        let end = rest.find(|c: char| c.is_whitespace()).unwrap_or(rest.len());
+        Some(rest[..end].to_string())
+    };
+    Some(ProfileData {
+        decision_ms: extract_ms("decision")?,
+        generate_ms: extract_ms("generate+build")?,
+        merge_ms: extract_ms("merge_exec")?,
+        cleanup_ms: extract_ms("cleanup")?,
+        total_ms: extract_ms("total")?,
+        affected: extract_int("affected")?,
+        path: extract_str("path")?,
+    })
+}

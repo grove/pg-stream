@@ -28,7 +28,7 @@ mod e2e;
 #[allow(unused_imports)]
 mod tpch;
 
-use e2e::E2eDb;
+use e2e::{E2eDb, extract_last_profile};
 use std::time::Instant;
 
 // ── Configuration ──────────────────────────────────────────────────────
@@ -535,6 +535,117 @@ async fn try_refresh_st(db: &E2eDb, st_name: &str) -> Result<(), String> {
         .map_err(|e| e.to_string());
     db.try_execute("SET lock_timeout = 0").await.ok();
     result
+}
+
+// ── TPCH_BENCH mode helpers ────────────────────────────────────────────
+//
+// When `TPCH_BENCH=1` is set, `test_tpch_performance_comparison` switches
+// into benchmark mode: warm-up cycles are discarded, `[TPCH_BENCH]`
+// structured lines are emitted per cycle, and a summary table with median,
+// P95, and MERGE% is printed at the end.
+
+/// Whether benchmark mode is active (`TPCH_BENCH=1`).
+fn bench_mode() -> bool {
+    std::env::var("TPCH_BENCH")
+        .map(|v| v == "1")
+        .unwrap_or(false)
+}
+
+/// Number of warm-up cycles to discard before measurement starts.
+/// Warm-up cycles are run but their timings are excluded from statistics.
+/// Defaults to 2; configurable via `WARMUP_CYCLES` env var.
+fn warmup_cycles() -> usize {
+    std::env::var("WARMUP_CYCLES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(2)
+}
+
+/// Compute a percentile from a sorted Vec.
+fn tpch_percentile(sorted: &[f64], pct: f64) -> f64 {
+    if sorted.is_empty() {
+        return 0.0;
+    }
+    if sorted.len() == 1 {
+        return sorted[0];
+    }
+    let rank = pct / 100.0 * (sorted.len() - 1) as f64;
+    let lo = rank.floor() as usize;
+    let hi = (lo + 1).min(sorted.len() - 1);
+    let frac = rank - rank.floor();
+    sorted[lo] * (1.0 - frac) + sorted[hi] * frac
+}
+
+/// Per-query benchmark results collected during a `TPCH_BENCH=1` run.
+#[allow(dead_code)]
+struct TpchBenchRow {
+    name: String,
+    tier: u8,
+    full_ms: Vec<f64>,
+    diff_ms: Vec<f64>,
+    /// MERGE phase fraction per DIFF cycle (merge_ms / total_ms).
+    merge_pct: Vec<f64>,
+}
+
+/// Print the two-table benchmark summary for a `TPCH_BENCH=1` run.
+fn print_tpch_bench_summary(rows: &[TpchBenchRow]) {
+    println!();
+    println!("┌──────┬──────┬────────────┬────────────┬──────────┬──────────┬──────────┐");
+    println!("│ Query│ Tier │ FULL med ms│ DIFF med ms│ Speedup  │ DIFF P95 │  MERGE%  │");
+    println!("├──────┼──────┼────────────┼────────────┼──────────┼──────────┼──────────┤");
+
+    for r in rows {
+        let mut fs = r.full_ms.clone();
+        let mut ds = r.diff_ms.clone();
+        fs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        ds.sort_by(|a, b| a.partial_cmp(b).unwrap());
+
+        let full_med = tpch_percentile(&fs, 50.0);
+        let diff_med = tpch_percentile(&ds, 50.0);
+        let diff_p95 = tpch_percentile(&ds, 95.0);
+        let speedup = if diff_med > 0.0 {
+            full_med / diff_med
+        } else {
+            f64::NAN
+        };
+        let merge_pct_avg = if r.merge_pct.is_empty() {
+            f64::NAN
+        } else {
+            r.merge_pct.iter().sum::<f64>() / r.merge_pct.len() as f64
+        };
+
+        println!(
+            "│ {:<4} │  T{}  │ {:>10.1} │ {:>10.1} │ {:>7.2}x │ {:>8.1} │ {:>7.0}% │",
+            r.name,
+            r.tier,
+            full_med,
+            diff_med,
+            speedup,
+            diff_p95,
+            merge_pct_avg * 100.0,
+        );
+    }
+    println!("└──────┴──────┴────────────┴────────────┴──────────┴──────────┴──────────┘");
+    println!();
+
+    let total_full: f64 = rows
+        .iter()
+        .filter_map(|r| r.full_ms.iter().copied().reduce(f64::max))
+        .sum::<f64>();
+    let total_diff: f64 = rows
+        .iter()
+        .filter_map(|r| r.diff_ms.iter().copied().reduce(f64::max))
+        .sum::<f64>();
+    println!(
+        "  Total wall-clock: FULL {:.1}s, DIFF {:.1}s (overall speedup: {:.1}x)",
+        total_full / 1000.0,
+        total_diff / 1000.0,
+        if total_diff > 0.0 {
+            total_full / total_diff
+        } else {
+            f64::NAN
+        },
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -1463,11 +1574,22 @@ async fn test_tpch_q07_isolation() {
 async fn test_tpch_performance_comparison() {
     let sf = scale_factor();
     let n_cycles = cycles();
-    println!("\n══════════════════════════════════════════════════════════");
-    println!("  TPC-H T1-B Performance — SF={sf}, cycles={n_cycles}");
-    println!("══════════════════════════════════════════════════════════\n");
+    let is_bench = bench_mode();
+    let n_warmup = if is_bench { warmup_cycles() } else { 0 };
+
+    if is_bench {
+        println!("\n══════════════════════════════════════════════════════════");
+        println!("  TPC-H Benchmark Mode — SF={sf}, warmup={n_warmup}, measured={n_cycles}");
+        println!("  Emit: [TPCH_BENCH] lines + summary table");
+        println!("══════════════════════════════════════════════════════════\n");
+    } else {
+        println!("\n══════════════════════════════════════════════════════════");
+        println!("  TPC-H T1-B Performance — SF={sf}, cycles={n_cycles}");
+        println!("══════════════════════════════════════════════════════════\n");
+    }
 
     let db = E2eDb::new_bench().await.with_extension().await;
+    let cid = db.container_id().to_string();
 
     let t = Instant::now();
     load_schema(&db).await;
@@ -1476,6 +1598,7 @@ async fn test_tpch_performance_comparison() {
 
     let queries = tpch_queries();
 
+    // Legacy result struct for non-bench mode table output.
     struct PerfRow {
         name: String,
         tier: u8,
@@ -1484,7 +1607,10 @@ async fn test_tpch_performance_comparison() {
     }
 
     let mut results: Vec<PerfRow> = Vec::new();
+    let mut bench_rows: Vec<TpchBenchRow> = Vec::new();
     let mut skipped: Vec<String> = Vec::new();
+
+    let total_iters = n_warmup + n_cycles;
 
     for q in &queries {
         let st_full = format!("perf_f_{}", q.name);
@@ -1519,9 +1645,13 @@ async fn test_tpch_performance_comparison() {
 
         let mut full_times = Vec::new();
         let mut diff_times = Vec::new();
+        let mut merge_pcts: Vec<f64> = Vec::new();
         let mut ok = true;
 
-        for cycle in 1..=n_cycles {
+        for iter in 1..=total_iters {
+            let is_warmup = iter <= n_warmup;
+            let measured_cycle = if is_warmup { 0 } else { iter - n_warmup };
+
             let next_ok = max_orderkey(&db).await + 1;
             apply_rf1(&db, next_ok).await;
             apply_rf2(&db).await;
@@ -1532,34 +1662,92 @@ async fn test_tpch_performance_comparison() {
             let t_full = Instant::now();
             if let Err(e) = try_refresh_st(&db, &st_full).await {
                 println!(
-                    "  WARN: {} FULL cycle {}: {}",
+                    "  WARN: {} FULL iter {}: {}",
                     q.name,
-                    cycle,
+                    iter,
                     e.lines().next().unwrap_or(&e)
                 );
                 ok = false;
                 break;
             }
-            full_times.push(t_full.elapsed().as_secs_f64() * 1000.0);
+            let full_ms = t_full.elapsed().as_secs_f64() * 1000.0;
 
             let t_diff = Instant::now();
             if let Err(e) = try_refresh_st(&db, &st_diff).await {
                 println!(
-                    "  WARN: {} DIFF cycle {}: {}",
+                    "  WARN: {} DIFF iter {}: {}",
                     q.name,
-                    cycle,
+                    iter,
                     e.lines().next().unwrap_or(&e)
                 );
                 ok = false;
                 break;
             }
-            diff_times.push(t_diff.elapsed().as_secs_f64() * 1000.0);
+            let diff_ms = t_diff.elapsed().as_secs_f64() * 1000.0;
+
+            // Extract [PGS_PROFILE] from container logs (DIFFERENTIAL refresh path).
+            let profile = extract_last_profile(&cid).await;
+
+            if is_warmup {
+                if is_bench {
+                    println!(
+                        "  [WARMUP] {} tier={} iter={}/{} FULL={full_ms:.1}ms DIFF={diff_ms:.1}ms",
+                        q.name, q.tier, iter, total_iters
+                    );
+                }
+            } else {
+                // Emit structured benchmark line.
+                if is_bench {
+                    if let Some(ref p) = profile {
+                        println!(
+                            "[TPCH_BENCH] query={} tier={} cycle={} mode=FULL ms={full_ms:.2}",
+                            q.name, q.tier, measured_cycle
+                        );
+                        println!(
+                            "[TPCH_BENCH] query={} tier={} cycle={} mode=DIFF ms={diff_ms:.2} \
+                             decision={:.2} gen={:.2} merge={:.2} cleanup={:.2} path={}",
+                            q.name,
+                            q.tier,
+                            measured_cycle,
+                            p.decision_ms,
+                            p.generate_ms,
+                            p.merge_ms,
+                            p.cleanup_ms,
+                            p.path,
+                        );
+                        if p.total_ms > 0.0 {
+                            merge_pcts.push(p.merge_ms / p.total_ms);
+                        }
+                    } else {
+                        println!(
+                            "[TPCH_BENCH] query={} tier={} cycle={} mode=FULL ms={full_ms:.2}",
+                            q.name, q.tier, measured_cycle
+                        );
+                        println!(
+                            "[TPCH_BENCH] query={} tier={} cycle={} mode=DIFF ms={diff_ms:.2}",
+                            q.name, q.tier, measured_cycle,
+                        );
+                    }
+                }
+
+                full_times.push(full_ms);
+                diff_times.push(diff_ms);
+            }
 
             db.execute("CHECKPOINT").await;
             db.execute("VACUUM ANALYZE").await;
         }
 
         if ok {
+            if is_bench {
+                bench_rows.push(TpchBenchRow {
+                    name: q.name.to_string(),
+                    tier: q.tier,
+                    full_ms: full_times.clone(),
+                    diff_ms: diff_times.clone(),
+                    merge_pct: merge_pcts,
+                });
+            }
             results.push(PerfRow {
                 name: q.name.to_string(),
                 tier: q.tier,
@@ -1578,45 +1766,51 @@ async fn test_tpch_performance_comparison() {
             .await;
     }
 
-    // ── Results table ────────────────────────────────────────────
+    // ── Results output ────────────────────────────────────────────
 
-    println!();
-    println!("┌──────┬──────┬────────────┬────────────┬──────────┐");
-    println!("│ Query│ Tier │  FULL (ms) │  DIFF (ms) │ Speedup  │");
-    println!("├──────┼──────┼────────────┼────────────┼──────────┤");
+    if is_bench {
+        // TPCH_BENCH=1: structured summary table with median, P95, MERGE%.
+        print_tpch_bench_summary(&bench_rows);
+    } else {
+        // Default mode: simple average speedup table.
+        println!();
+        println!("┌──────┬──────┬────────────┬────────────┬──────────┐");
+        println!("│ Query│ Tier │  FULL (ms) │  DIFF (ms) │ Speedup  │");
+        println!("├──────┼──────┼────────────┼────────────┼──────────┤");
 
-    let mut total_full = 0.0f64;
-    let mut total_diff = 0.0f64;
+        let mut total_full = 0.0f64;
+        let mut total_diff = 0.0f64;
 
-    for r in &results {
-        let avg_full = r.full_ms.iter().sum::<f64>() / r.full_ms.len().max(1) as f64;
-        let avg_diff = r.diff_ms.iter().sum::<f64>() / r.diff_ms.len().max(1) as f64;
-        let speedup = if avg_diff > 0.0 {
-            avg_full / avg_diff
+        for r in &results {
+            let avg_full = r.full_ms.iter().sum::<f64>() / r.full_ms.len().max(1) as f64;
+            let avg_diff = r.diff_ms.iter().sum::<f64>() / r.diff_ms.len().max(1) as f64;
+            let speedup = if avg_diff > 0.0 {
+                avg_full / avg_diff
+            } else {
+                f64::NAN
+            };
+            total_full += avg_full;
+            total_diff += avg_diff;
+
+            println!(
+                "│ {:<4} │  T{}  │ {:>8.1}   │ {:>8.1}   │ {:>6.2}x  │",
+                r.name, r.tier, avg_full, avg_diff, speedup,
+            );
+        }
+
+        let total_speedup = if total_diff > 0.0 {
+            total_full / total_diff
         } else {
             f64::NAN
         };
-        total_full += avg_full;
-        total_diff += avg_diff;
 
+        println!("├──────┼──────┼────────────┼────────────┼──────────┤");
         println!(
-            "│ {:<4} │  T{}  │ {:>8.1}   │ {:>8.1}   │ {:>6.2}x  │",
-            r.name, r.tier, avg_full, avg_diff, speedup,
+            "│ Total│      │ {:>8.1}   │ {:>8.1}   │ {:>6.2}x  │",
+            total_full, total_diff, total_speedup,
         );
+        println!("└──────┴──────┴────────────┴────────────┴──────────┘");
     }
-
-    let total_speedup = if total_diff > 0.0 {
-        total_full / total_diff
-    } else {
-        f64::NAN
-    };
-
-    println!("├──────┼──────┼────────────┼────────────┼──────────┤");
-    println!(
-        "│ Total│      │ {:>8.1}   │ {:>8.1}   │ {:>6.2}x  │",
-        total_full, total_diff, total_speedup,
-    );
-    println!("└──────┴──────┴────────────┴────────────┴──────────┘");
 
     if !skipped.is_empty() {
         println!("\n  Skipped (DVM limitation): {}", skipped.join(", "));

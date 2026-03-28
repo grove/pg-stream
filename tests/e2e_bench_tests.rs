@@ -200,18 +200,9 @@ fn query_scenarios() -> Vec<QueryScenario> {
 
 // ── Result reporting ───────────────────────────────────────────────────
 
-/// Per-phase timing extracted from `[PGS_PROFILE]` log lines.
-#[derive(Clone, Debug)]
-#[allow(dead_code)]
-struct ProfileData {
-    decision_ms: f64,
-    generate_ms: f64,
-    merge_ms: f64,
-    cleanup_ms: f64,
-    total_ms: f64,
-    affected: i64,
-    path: String,
-}
+// ProfileData, extract_last_profile, and parse_profile_line are shared
+// utilities defined in tests/e2e/mod.rs.
+use e2e::{ProfileData, extract_last_profile};
 
 /// A single benchmark measurement.
 #[derive(Clone)]
@@ -239,57 +230,6 @@ fn percentile(sorted: &[f64], pct: f64) -> f64 {
     let hi = (lo + 1).min(sorted.len() - 1);
     let frac = rank - rank.floor();
     sorted[lo] * (1.0 - frac) + sorted[hi] * frac
-}
-
-/// Extract the last `[PGS_PROFILE]` line from docker container logs.
-async fn extract_last_profile(container_id: &str) -> Option<ProfileData> {
-    let output = tokio::process::Command::new("docker")
-        .args(["logs", "--tail", "50", container_id])
-        .output()
-        .await
-        .ok()?;
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let line = stderr.lines().rev().find(|l| l.contains("[PGS_PROFILE]"))?;
-    parse_profile_line(line)
-}
-
-/// Parse a `[PGS_PROFILE]` log line into structured data.
-fn parse_profile_line(line: &str) -> Option<ProfileData> {
-    // Format: [PGS_PROFILE] decision=X.XXms generate+build=X.XXms
-    //         merge_exec=X.XXms cleanup=X.XXms total=X.XXms
-    //         affected=N mode=INCR path=cache_hit
-    let extract_ms = |key: &str| -> Option<f64> {
-        let prefix = format!("{}=", key);
-        let start = line.find(&prefix)? + prefix.len();
-        let rest = &line[start..];
-        let end = rest.find("ms")?;
-        rest[..end].parse().ok()
-    };
-    let extract_int = |key: &str| -> Option<i64> {
-        let prefix = format!("{}=", key);
-        let start = line.find(&prefix)? + prefix.len();
-        let rest = &line[start..];
-        let end = rest
-            .find(|c: char| !c.is_ascii_digit())
-            .unwrap_or(rest.len());
-        rest[..end].parse().ok()
-    };
-    let extract_str = |key: &str| -> Option<String> {
-        let prefix = format!("{}=", key);
-        let start = line.find(&prefix)? + prefix.len();
-        let rest = &line[start..];
-        let end = rest.find(|c: char| c.is_whitespace()).unwrap_or(rest.len());
-        Some(rest[..end].to_string())
-    };
-    Some(ProfileData {
-        decision_ms: extract_ms("decision")?,
-        generate_ms: extract_ms("generate+build")?,
-        merge_ms: extract_ms("merge_exec")?,
-        cleanup_ms: extract_ms("cleanup")?,
-        total_ms: extract_ms("total")?,
-        affected: extract_int("affected")?,
-        path: extract_str("path")?,
-    })
 }
 
 /// I-4: Write benchmark results to a JSON file for cross-run comparison.
