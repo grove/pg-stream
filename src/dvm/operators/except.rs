@@ -173,6 +173,7 @@ WHERE (old_count_l > 0 AND old_count_r = 0)
         cte_name: final_cte,
         columns: output_cols,
         is_deduplicated: false,
+        has_key_changed: false,
     })
 }
 

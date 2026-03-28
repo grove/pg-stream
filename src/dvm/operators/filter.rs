@@ -180,6 +180,7 @@ pub fn diff_filter(ctx: &mut DiffContext, op: &OpTree) -> Result<DiffResult, PgT
         cte_name,
         columns: child_result.columns,
         is_deduplicated: child_result.is_deduplicated,
+        has_key_changed: false,
     })
 }
 

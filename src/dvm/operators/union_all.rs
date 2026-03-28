@@ -59,6 +59,7 @@ pub fn diff_union_all(ctx: &mut DiffContext, op: &OpTree) -> Result<DiffResult, 
         cte_name,
         columns: output_cols,
         is_deduplicated: false,
+        has_key_changed: false,
     })
 }
 

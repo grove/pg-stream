@@ -408,6 +408,7 @@ pub fn diff_window(ctx: &mut DiffContext, op: &OpTree) -> Result<DiffResult, PgT
         cte_name: final_cte,
         columns: all_output_cols,
         is_deduplicated: false,
+        has_key_changed: false,
     })
 }
 

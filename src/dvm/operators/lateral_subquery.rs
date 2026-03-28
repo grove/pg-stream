@@ -354,6 +354,7 @@ pub fn diff_lateral_subquery(
         cte_name: final_cte,
         columns: all_output_cols,
         is_deduplicated: false,
+        has_key_changed: false,
     })
 }
 

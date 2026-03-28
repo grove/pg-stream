@@ -109,6 +109,7 @@ pub fn diff_cte_scan(ctx: &mut DiffContext, op: &OpTree) -> Result<DiffResult, P
         cte_name: cte_name_str,
         columns: effective_cols,
         is_deduplicated: base_result.is_deduplicated,
+        has_key_changed: base_result.has_key_changed,
     })
 }
 

@@ -392,6 +392,7 @@ fn generate_recomputation_delta(
         cte_name: final_cte,
         columns: out_cols,
         is_deduplicated: false,
+        has_key_changed: false,
     })
 }
 
@@ -609,6 +610,7 @@ fn generate_dred_delta(
         cte_name: combined_cte,
         columns: columns.to_vec(),
         is_deduplicated: false,
+        has_key_changed: false,
     })
 }
 
@@ -721,6 +723,7 @@ fn generate_semi_naive_ins_only(
         cte_name: ins_final_cte,
         columns: columns.to_vec(),
         is_deduplicated: false,
+        has_key_changed: false,
     })
 }
 
@@ -1244,6 +1247,7 @@ fn build_semi_naive_result(
         cte_name: final_cte_name,
         columns: columns.to_vec(),
         is_deduplicated: false,
+        has_key_changed: false,
     })
 }
 
@@ -3886,6 +3890,7 @@ mod tests {
                 "name".to_string(),
             ],
             is_deduplicated: false,
+            has_key_changed: false,
         };
 
         let columns = vec![
@@ -3990,6 +3995,7 @@ mod tests {
             cte_name: base_delta_cte,
             columns: vec!["id".to_string(), "parent_id".to_string()],
             is_deduplicated: false,
+            has_key_changed: false,
         };
 
         let columns = vec!["id".to_string(), "parent_id".to_string()];

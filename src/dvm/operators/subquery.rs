@@ -71,6 +71,7 @@ pub fn diff_subquery(ctx: &mut DiffContext, op: &OpTree) -> Result<DiffResult, P
         cte_name,
         columns: column_aliases.clone(),
         is_deduplicated: child_result.is_deduplicated,
+        has_key_changed: child_result.has_key_changed,
     })
 }
 

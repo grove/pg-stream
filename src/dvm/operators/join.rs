@@ -666,6 +666,7 @@ JOIN {delta_right} dr ON {join_cond_part2}{correction_sql}",
         cte_name,
         columns: output_cols,
         is_deduplicated: false,
+        has_key_changed: false,
     })
 }
 

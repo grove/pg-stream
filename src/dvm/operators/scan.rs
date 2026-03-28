@@ -185,6 +185,7 @@ FROM {new_table}",
         cte_name,
         columns: col_names,
         is_deduplicated,
+        has_key_changed: false,
     })
 }
 
@@ -548,6 +549,7 @@ CROSS JOIN generate_series(1, -sub.net_count) gs",
             cte_name,
             columns: col_names,
             is_deduplicated: false,
+            has_key_changed: false,
         });
     }
 
@@ -761,6 +763,7 @@ FROM (
         cte_name,
         columns: col_names,
         is_deduplicated,
+        has_key_changed: key_change_expr.is_some(),
     })
 }
 

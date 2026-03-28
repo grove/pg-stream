@@ -726,6 +726,7 @@ FROM {new_rescan_cte} n",
             cte_name: final_cte,
             columns: output_cols,
             is_deduplicated: false,
+            has_key_changed: false,
         })
     } else {
         // ── EXCEPT ALL path: rescan old data ────────────────────────
@@ -861,6 +862,7 @@ FROM {new_rescan_cte} n",
             cte_name: final_cte,
             columns: output_cols,
             is_deduplicated: false,
+            has_key_changed: false,
         })
     }
 }
@@ -2008,6 +2010,7 @@ WHERE m.__pgt_meta_action IN ('I', 'D')
         cte_name: final_cte,
         columns: output_cols,
         is_deduplicated: true,
+        has_key_changed: false,
     })
 }
 

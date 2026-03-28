@@ -226,6 +226,7 @@ WHERE EXISTS (SELECT 1 FROM {delta_right} dr WHERE {cond_part2_dr})
         cte_name,
         columns: output_cols,
         is_deduplicated: false,
+        has_key_changed: false,
     })
 }
 

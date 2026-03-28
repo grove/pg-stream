@@ -432,6 +432,7 @@ WHERE dl.__pgt_action = 'D'
         cte_name,
         columns: output_cols,
         is_deduplicated: false,
+        has_key_changed: false,
     })
 }
 

@@ -114,6 +114,7 @@ WHERE old_count > 0 AND new_count > 0 AND new_count != old_count",
         cte_name: final_cte,
         columns: output_cols,
         is_deduplicated: false,
+        has_key_changed: false,
     })
 }
 

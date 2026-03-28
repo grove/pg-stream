@@ -228,6 +228,7 @@ WHERE (SELECT has_changes FROM {gate_cte})
         cte_name,
         columns: output_cols,
         is_deduplicated: false,
+        has_key_changed: false,
     })
 }
 

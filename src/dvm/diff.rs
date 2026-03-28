@@ -59,6 +59,12 @@ pub struct DiffResult {
     /// When true, the delta output has at most one row per `__pgt_row_id`.
     /// The MERGE statement can skip the outer DISTINCT ON + ORDER BY.
     pub is_deduplicated: bool,
+    /// A-2: When true, the delta CTE includes a `__pgt_key_changed` boolean
+    /// column indicating whether any key column (GROUP BY, JOIN ON, WHERE)
+    /// was modified. Downstream operators can use this signal to optimize
+    /// value-only UPDATEs — e.g., skip the DELETE+INSERT cycle for
+    /// invertible aggregates when only aggregate argument columns changed.
+    pub has_key_changed: bool,
 }
 
 /// Context for delta query generation.
@@ -753,6 +759,7 @@ mod tests {
             cte_name: "cte_1".to_string(),
             columns: vec!["id".to_string()],
             is_deduplicated: true,
+            has_key_changed: false,
         };
         ctx.set_cte_delta(0, result);
         let cached = ctx.get_cte_delta(0).unwrap();
