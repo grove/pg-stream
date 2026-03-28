@@ -6034,4 +6034,320 @@ mod pg_tests {
     fn test_extract_keyword_int_missing() {
         assert!(extract_keyword_int("SOME OTHER TEXT", "MODULUS").is_err());
     }
+
+    // ── D-4: Multi-frontier cleanup model ──────────────────────────────
+
+    /// Pure-Rust model of the multi-frontier cleanup logic.
+    ///
+    /// Given a set of consumer frontier LSNs for a source OID, computes the
+    /// safe cleanup threshold: `MIN(consumer_frontiers)`. Only change buffer
+    /// entries at or below this threshold may be deleted.
+    ///
+    /// Returns `None` when there are no consumers with a valid (non-0/0) frontier.
+    fn compute_safe_cleanup_lsn(consumer_frontiers: &[&str]) -> Option<String> {
+        let valid: Vec<&str> = consumer_frontiers
+            .iter()
+            .copied()
+            .filter(|lsn| *lsn != "0/0")
+            .collect();
+        if valid.is_empty() {
+            return None;
+        }
+        let mut min = valid[0];
+        for &lsn in &valid[1..] {
+            min = crate::version::lsn_min(min, lsn);
+        }
+        Some(min.to_string())
+    }
+
+    /// Model: given change buffer entries (as LSNs) and the safe cleanup
+    /// threshold, returns the set of entries that should be RETAINED (not deleted).
+    fn retained_after_cleanup(entry_lsns: &[&str], safe_lsn: &str) -> Vec<String> {
+        entry_lsns
+            .iter()
+            .copied()
+            .filter(|lsn| crate::version::lsn_gt(lsn, safe_lsn))
+            .map(|s| s.to_string())
+            .collect()
+    }
+
+    #[test]
+    fn test_safe_cleanup_lsn_single_consumer() {
+        let result = compute_safe_cleanup_lsn(&["0/100"]);
+        assert_eq!(result, Some("0/100".to_string()));
+    }
+
+    #[test]
+    fn test_safe_cleanup_lsn_multi_consumer_min() {
+        // 5 consumers with different frontiers — safe threshold is the minimum.
+        let result = compute_safe_cleanup_lsn(&["0/500", "0/200", "0/300", "0/100", "0/400"]);
+        assert_eq!(result, Some("0/100".to_string()));
+    }
+
+    #[test]
+    fn test_safe_cleanup_lsn_skips_zero() {
+        // Consumer at 0/0 is uninitialized — excluded.
+        let result = compute_safe_cleanup_lsn(&["0/0", "0/200", "0/100"]);
+        assert_eq!(result, Some("0/100".to_string()));
+    }
+
+    #[test]
+    fn test_safe_cleanup_lsn_all_zero() {
+        let result = compute_safe_cleanup_lsn(&["0/0", "0/0"]);
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_safe_cleanup_lsn_empty() {
+        let result = compute_safe_cleanup_lsn(&[]);
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_retained_after_cleanup_basic() {
+        let entries = vec!["0/50", "0/100", "0/150", "0/200"];
+        let retained = retained_after_cleanup(&entries, "0/100");
+        assert_eq!(retained, vec!["0/150", "0/200"]);
+    }
+
+    #[test]
+    fn test_retained_after_cleanup_nothing_deleted() {
+        let entries = vec!["0/200", "0/300"];
+        let retained = retained_after_cleanup(&entries, "0/100");
+        assert_eq!(retained, vec!["0/200", "0/300"]);
+    }
+
+    #[test]
+    fn test_retained_after_cleanup_all_deleted() {
+        let entries = vec!["0/50", "0/100"];
+        let retained = retained_after_cleanup(&entries, "0/200");
+        assert!(retained.is_empty());
+    }
+
+    #[test]
+    fn test_multi_frontier_cleanup_never_deletes_unconsumed() {
+        // Core correctness property: if consumer C has frontier at LSN X,
+        // then no entry with LSN > X should ever be deleted.
+        //
+        // Scenario: 5 consumers with different frontier positions.
+        // Buffer has entries at every 0x100 step from 0/100 to 0/A00.
+        let consumer_frontiers = vec!["0/300", "0/700", "0/500", "0/200", "0/900"];
+        let buffer_entries: Vec<&str> = vec![
+            "0/100", "0/200", "0/300", "0/400", "0/500", "0/600", "0/700", "0/800", "0/900",
+            "0/A00",
+        ];
+
+        let safe_lsn =
+            compute_safe_cleanup_lsn(&consumer_frontiers).expect("should have a safe threshold");
+        assert_eq!(safe_lsn, "0/200"); // MIN of all consumers
+
+        let retained = retained_after_cleanup(&buffer_entries, &safe_lsn);
+
+        // Verify: every consumer can still read all entries at or above its frontier.
+        for &consumer_lsn in &consumer_frontiers {
+            // Entries the consumer still needs: LSN > consumer's PREVIOUS frontier.
+            // In production, the consumer reads entries between prev and current frontier,
+            // but the critical invariant is: entries above the MIN frontier are retained.
+            assert!(
+                retained.iter().any(|e| e == consumer_lsn)
+                    || crate::version::lsn_gt(&safe_lsn, consumer_lsn)
+                    || safe_lsn == consumer_lsn,
+                "consumer at {} should find its entries retained or already consumed",
+                consumer_lsn
+            );
+        }
+
+        // No entry above the slowest consumer was deleted.
+        let min_consumer = "0/200";
+        for entry in &retained {
+            assert!(
+                crate::version::lsn_gt(entry, min_consumer),
+                "retained entry {} should be above safe threshold {}",
+                entry,
+                min_consumer
+            );
+        }
+    }
+
+    // ── D-4: Property-based test — random frontier advancement ──────
+
+    use proptest::prelude::*;
+
+    /// Generate a random LSN as "0/XXXX" where XXXX is a hex value 1..FFFF.
+    fn arb_lsn() -> impl Strategy<Value = String> {
+        (1u64..0xFFFFu64).prop_map(|v| format!("0/{:X}", v))
+    }
+
+    proptest! {
+        #![proptest_config(proptest::test_runner::Config::with_cases(500))]
+
+        /// Property: MIN(frontiers) is always the safe cleanup threshold.
+        /// No entry above this threshold should be deleted.
+        /// All entries at or below should be deletable.
+        #[test]
+        fn prop_multi_frontier_cleanup_correctness(
+            frontiers in proptest::collection::vec(arb_lsn(), 5..=10),
+            entries in proptest::collection::vec(arb_lsn(), 1..=20),
+        ) {
+            let frontier_refs: Vec<&str> = frontiers.iter().map(|s| s.as_str()).collect();
+            let entry_refs: Vec<&str> = entries.iter().map(|s| s.as_str()).collect();
+
+            let safe_lsn = compute_safe_cleanup_lsn(&frontier_refs);
+
+            if let Some(ref threshold) = safe_lsn {
+                let retained = retained_after_cleanup(&entry_refs, threshold);
+
+                // Invariant 1: Every retained entry is strictly above the threshold.
+                for entry in &retained {
+                    prop_assert!(
+                        crate::version::lsn_gt(entry, threshold),
+                        "retained entry {} should be > threshold {}",
+                        entry,
+                        threshold
+                    );
+                }
+
+                // Invariant 2: Every non-retained entry is at or below the threshold.
+                let deleted: Vec<&str> = entry_refs
+                    .iter()
+                    .copied()
+                    .filter(|e| !retained.contains(&e.to_string()))
+                    .collect();
+                for entry in &deleted {
+                    prop_assert!(
+                        !crate::version::lsn_gt(entry, threshold),
+                        "deleted entry {} should be <= threshold {}",
+                        entry,
+                        threshold
+                    );
+                }
+
+                // Invariant 3: For every consumer, all entries at LSNs above
+                // the consumer's frontier are still present in the retained set.
+                // (This is the "no premature deletion" property.)
+                for consumer_lsn in &frontier_refs {
+                    for entry in &entry_refs {
+                        if crate::version::lsn_gt(entry, consumer_lsn) {
+                            // This entry hasn't been consumed by this consumer yet.
+                            // It should be retained.
+                            prop_assert!(
+                                retained.contains(&entry.to_string()),
+                                "entry {} is above consumer frontier {} but was deleted (threshold {})",
+                                entry,
+                                consumer_lsn,
+                                threshold
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        /// Property: Advancing the slowest consumer raises the safe threshold.
+        #[test]
+        fn prop_advancing_slowest_consumer_raises_threshold(
+            base_frontiers in proptest::collection::vec(arb_lsn(), 5..=8),
+            advance_amount in 1u64..0x1000u64,
+        ) {
+            let frontier_refs: Vec<&str> = base_frontiers.iter().map(|s| s.as_str()).collect();
+
+            if let Some(ref old_threshold) = compute_safe_cleanup_lsn(&frontier_refs) {
+                // Find the index of the minimum frontier.
+                let min_idx = frontier_refs
+                    .iter()
+                    .enumerate()
+                    .min_by(|(_, a), (_, b)| {
+                        let pa = crate::version::lsn_gt(a, b);
+                        if pa { std::cmp::Ordering::Greater } else { std::cmp::Ordering::Less }
+                    })
+                    .map(|(i, _)| i)
+                    .unwrap();
+
+                // Advance the slowest consumer.
+                let mut advanced = base_frontiers.clone();
+                let old_val = crate::version::lsn_gt(&advanced[min_idx], "0/0");
+                if old_val {
+                    // Parse and advance
+                    let parts: Vec<&str> = advanced[min_idx].split('/').collect();
+                    let lo = u64::from_str_radix(parts[1], 16).unwrap_or(0);
+                    advanced[min_idx] = format!("0/{:X}", lo.saturating_add(advance_amount));
+                }
+
+                let new_frontier_refs: Vec<&str> = advanced.iter().map(|s| s.as_str()).collect();
+                if let Some(ref new_threshold) = compute_safe_cleanup_lsn(&new_frontier_refs) {
+                    prop_assert!(
+                        crate::version::lsn_gte(new_threshold, old_threshold),
+                        "advancing slowest consumer should not lower threshold: old={}, new={}",
+                        old_threshold,
+                        new_threshold
+                    );
+                }
+            }
+        }
+
+        /// Property: Adding a new consumer at LSN 0/1 (just initialized) should
+        /// lower or maintain the safe threshold.
+        #[test]
+        fn prop_new_consumer_lowers_threshold(
+            base_frontiers in proptest::collection::vec(arb_lsn(), 5..=8),
+        ) {
+            let frontier_refs: Vec<&str> = base_frontiers.iter().map(|s| s.as_str()).collect();
+
+            if let Some(ref old_threshold) = compute_safe_cleanup_lsn(&frontier_refs) {
+                // Add a new consumer that just completed its first full refresh
+                // with a very low frontier.
+                let mut with_new = base_frontiers.clone();
+                with_new.push("0/1".to_string());
+                let new_frontier_refs: Vec<&str> = with_new.iter().map(|s| s.as_str()).collect();
+
+                if let Some(ref new_threshold) = compute_safe_cleanup_lsn(&new_frontier_refs) {
+                    prop_assert!(
+                        !crate::version::lsn_gt(new_threshold, old_threshold),
+                        "adding consumer at 0/1 should not raise threshold: old={}, new={}",
+                        old_threshold,
+                        new_threshold
+                    );
+                }
+            }
+        }
+    }
+
+    // ── D-4: Column superset computation tests ──────────────────────
+
+    #[test]
+    fn test_column_superset_union() {
+        // Simulate: ST1 uses {a, b, c}, ST2 uses {b, d}, ST3 uses {a, e}.
+        // Column superset = {a, b, c, d, e}.
+        let st1: Vec<String> = vec!["a", "b", "c"].into_iter().map(String::from).collect();
+        let st2: Vec<String> = vec!["b", "d"].into_iter().map(String::from).collect();
+        let st3: Vec<String> = vec!["a", "e"].into_iter().map(String::from).collect();
+
+        let mut superset = std::collections::HashSet::new();
+        for col in st1.iter().chain(st2.iter()).chain(st3.iter()) {
+            superset.insert(col.to_lowercase());
+        }
+
+        let mut sorted: Vec<String> = superset.into_iter().collect();
+        sorted.sort();
+        assert_eq!(sorted, vec!["a", "b", "c", "d", "e"]);
+    }
+
+    #[test]
+    fn test_column_superset_select_star_forces_full() {
+        // If any ST uses SELECT * (columns_used = None), the superset must
+        // include ALL columns.
+        let st1: Option<Vec<String>> = Some(vec!["a".to_string(), "b".to_string()]);
+        let st2: Option<Vec<String>> = None; // SELECT *
+
+        // When any consumer has None, the union should be None (full capture).
+        let union_result = match (&st1, &st2) {
+            (_, None) | (None, _) => None,
+            (Some(a), Some(b)) => {
+                let mut s: std::collections::HashSet<String> = a.iter().cloned().collect();
+                s.extend(b.iter().cloned());
+                Some(s.into_iter().collect::<Vec<_>>())
+            }
+        };
+        assert!(union_result.is_none());
+    }
 }

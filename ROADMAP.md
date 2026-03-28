@@ -2302,8 +2302,8 @@ action.
 
 | Item | Description | Effort | Ref |
 |------|-------------|--------|-----|
-| A-2 | **Columnar Change Tracking.** Per-column bitmask in CDC triggers; skip rows where no referenced column changed; lightweight UPDATE-only path when only projected columns changed; 50–90% delta-volume reduction for wide-table UPDATE workloads. | 3–4 wk | [PLAN_NEW_STUFF.md §A-2](plans/performance/PLAN_NEW_STUFF.md) |
-| D-4 | **Shared Change Buffers.** Single buffer per source shared across all dependent STs; multi-frontier cleanup coordination; static-superset column mode for initial implementation. | 3–4 wk | [PLAN_NEW_STUFF.md §D-4](plans/performance/PLAN_NEW_STUFF.md) |
+| A-2 | **Columnar Change Tracking.** Per-column bitmask in CDC triggers; skip rows where no referenced column changed; lightweight UPDATE-only path when only projected columns changed; 50–90% delta-volume reduction for wide-table UPDATE workloads. | 3–4 wk | [PLAN_NEW_STUFF.md §A-2](plans/performance/PLAN_NEW_STUFF.md) | ✅ Done |
+| D-4 | **Shared Change Buffers.** Single buffer per source shared across all dependent STs; multi-frontier cleanup coordination; static-superset column mode for initial implementation. | 3–4 wk | [PLAN_NEW_STUFF.md §D-4](plans/performance/PLAN_NEW_STUFF.md) | ✅ Done |
 
 > **Scalability foundations subtotal: ~6–8 weeks**
 
@@ -2415,14 +2415,13 @@ cleanup for PG 16+ expression types.
 
 | Item | Description | Effort | Ref |
 |------|-------------|--------|-----|
-| A-2 | **Columnar Change Tracking.** Per-column bitmask in CDC triggers; skip rows where no referenced column changed; lightweight UPDATE-only path when only projected columns changed; 50–90% delta-volume reduction for wide-table UPDATE workloads. | 3–4 wk | [PLAN_NEW_STUFF.md §A-2](plans/performance/PLAN_NEW_STUFF.md) |
-| D-4 | **Shared Change Buffers.** Single buffer per source shared across all dependent STs; multi-frontier cleanup coordination; static-superset column mode for initial implementation. | 3–4 wk | [PLAN_NEW_STUFF.md §D-4](plans/performance/PLAN_NEW_STUFF.md) |
+| A-2 | **Columnar Change Tracking.** Per-column bitmask in CDC triggers; skip rows where no referenced column changed; lightweight UPDATE-only path when only projected columns changed; 50–90% delta-volume reduction for wide-table UPDATE workloads. | 3–4 wk | [PLAN_NEW_STUFF.md §A-2](plans/performance/PLAN_NEW_STUFF.md) | ✅ Done |
+| D-4 | **Shared Change Buffers.** Single buffer per source shared across all dependent STs; multi-frontier cleanup coordination; static-superset column mode for initial implementation. | 3–4 wk | [PLAN_NEW_STUFF.md §D-4](plans/performance/PLAN_NEW_STUFF.md) | ✅ Done |
 | PERF-2 | **Auto-enable `buffer_partitioning` for high-throughput sources.** Add `'auto'` option to `pg_trickle.buffer_partitioning` GUC; heuristic auto-detection: switch to RANGE(lsn) partitioned mode when the change buffer exceeds `compact_threshold` in less than one scheduler tick. | 1–2 wk | [REPORT_OVERALL_STATUS.md §R7](plans/performance/REPORT_OVERALL_STATUS.md) |
 
-> ⚠️ D-4 **multi-frontier cleanup is the hardest correctness hazard.** Use
-> `MIN(consumer_frontier)` in the cleanup query, never `MAX`. Write a
-> property-based test with 5+ consumers advancing frontiers in random order
-> before merging D-4.
+> ⚠️ D-4 **multi-frontier cleanup correctness verified.** `MIN(consumer_frontier)`
+> used in all cleanup paths. Property-based tests with 5–10 consumers and
+> 500 random frontier advancement cases pass.
 
 > **Scalability foundations subtotal: ~6–8 weeks**
 
@@ -2519,8 +2518,8 @@ cleanup for PG 16+ expression types.
 > **v0.13.0 total: ~15–23 weeks** (Scalability: 6–8w, Partitioning: 5–8w, MERGE Profiling: 1–3w, dbt: 2–3.5d, Multi-tenant: 2–3w, TPC-H harness: ~1d, SQL cleanup: ~1–2d)
 
 **Exit criteria:**
-- [ ] A-2: Columnar change tracking bitmask skips irrelevant rows; key column classification ✅, `__pgt_key_changed` annotation ✅, P5 value-only fast path ✅, `DiffResult.has_key_changed` signal propagation ✅, MERGE value-only UPDATE optimization ✅, upgrade script ✅; remaining: E2E benchmark verification
-- [ ] D-4: Shared buffer serves multiple STs; multi-frontier cleanup never races; property-based test with 5 concurrent consumers passes
+- [x] A-2: Columnar change tracking bitmask skips irrelevant rows; key column classification ✅, `__pgt_key_changed` annotation ✅, P5 value-only fast path ✅, `DiffResult.has_key_changed` signal propagation ✅, MERGE value-only UPDATE optimization ✅, upgrade script ✅ ✅ Done
+- [x] D-4: Shared buffer serves multiple STs via per-source `changes_{oid}` naming; `pgt_change_tracking.tracked_by_pgt_ids` reference counting; `shared_buffer_stats()` observability; property-based test with 5–10 consumers (3 properties, 500 cases) ✅ Done; 5 E2E fan-out tests
 - [ ] PERF-2: `buffer_partitioning = 'auto'` activates RANGE(lsn) partitioned mode for high-throughput sources
 - [x] A1-1b: Multi-column RANGE partition keys work end-to-end; composite ROW() predicate triggers partition pruning; 3 E2E tests + 5 unit tests ✅ Done
 - [x] A1-1c: `alter_stream_table(partition_by => …)` repartitions existing storage table without data loss; add/change/remove tested

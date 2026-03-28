@@ -4288,6 +4288,126 @@ fn dedup_stats_fn() -> TableIterator<
     TableIterator::new(vec![(total as i64, dedup as i64, ratio)])
 }
 
+/// D-4: Shared change buffer statistics.
+///
+/// Returns one row per shared change buffer (one per source table), showing
+/// how many stream tables share the buffer, the columns tracked, the safe
+/// cleanup frontier (MIN across all consumers), and the current buffer row count.
+///
+/// Example:
+/// ```sql
+/// SELECT * FROM pgtrickle.shared_buffer_stats();
+/// ```
+#[allow(clippy::type_complexity)]
+#[pg_extern(schema = "pgtrickle", name = "shared_buffer_stats")]
+fn shared_buffer_stats_fn() -> TableIterator<
+    'static,
+    (
+        name!(source_oid, i64),
+        name!(source_table, String),
+        name!(consumer_count, i32),
+        name!(consumers, String),
+        name!(columns_tracked, i32),
+        name!(safe_frontier_lsn, Option<String>),
+        name!(buffer_rows, i64),
+        name!(is_partitioned, bool),
+    ),
+> {
+    let rows = shared_buffer_stats_impl();
+    TableIterator::new(rows)
+}
+
+#[allow(clippy::type_complexity)]
+fn shared_buffer_stats_impl() -> Vec<(i64, String, i32, String, i32, Option<String>, i64, bool)> {
+    let change_schema = "pgtrickle_changes";
+
+    let query = "\
+        SELECT ct.source_relid, \
+               format('%I.%I', n.nspname, c.relname) AS source_table, \
+               array_length(ct.tracked_by_pgt_ids, 1) AS consumer_count, \
+               ct.tracked_by_pgt_ids \
+        FROM pgtrickle.pgt_change_tracking ct \
+        JOIN pg_class c ON c.oid = ct.source_relid \
+        JOIN pg_namespace n ON n.oid = c.relnamespace \
+        ORDER BY ct.source_relid";
+
+    let mut rows = Vec::new();
+
+    Spi::connect(|client| {
+        if let Ok(table) = client.select(query, None, &[]) {
+            for row in table {
+                let source_oid: i64 = row
+                    .get_by_name::<i64, _>("source_relid")
+                    .ok()
+                    .flatten()
+                    .unwrap_or(0);
+                let source_table: String = row
+                    .get_by_name::<String, _>("source_table")
+                    .ok()
+                    .flatten()
+                    .unwrap_or_default();
+                let consumer_count: i32 = row
+                    .get_by_name::<i32, _>("consumer_count")
+                    .ok()
+                    .flatten()
+                    .unwrap_or(0);
+
+                let consumers = Spi::get_one::<String>(&format!(
+                    "SELECT string_agg(format('%I.%I', st.pgt_schema, st.pgt_name), ', ' \
+                     ORDER BY st.pgt_name) \
+                     FROM pgtrickle.pgt_stream_tables st \
+                     WHERE st.pgt_id = ANY( \
+                       (SELECT tracked_by_pgt_ids FROM pgtrickle.pgt_change_tracking \
+                        WHERE source_relid = {source_oid}))",
+                ))
+                .unwrap_or(None)
+                .unwrap_or_default();
+
+                let columns_tracked: i32 = Spi::get_one::<i64>(&format!(
+                    "SELECT count(*)::bigint FROM information_schema.columns \
+                     WHERE table_schema = '{change_schema}' \
+                       AND table_name = 'changes_{source_oid}' \
+                       AND column_name LIKE 'new\\_%'",
+                ))
+                .unwrap_or(None)
+                .unwrap_or(0) as i32;
+
+                let safe_frontier_lsn: Option<String> = Spi::get_one::<String>(&format!(
+                    "SELECT MIN((st.frontier->'sources'->'{source_oid}'->>'lsn')::pg_lsn)::TEXT \
+                     FROM pgtrickle.pgt_stream_tables st \
+                     JOIN pgtrickle.pgt_dependencies dep ON dep.pgt_id = st.pgt_id \
+                     WHERE dep.source_relid = {source_oid} \
+                       AND st.frontier IS NOT NULL \
+                       AND st.frontier->'sources'->'{source_oid}'->>'lsn' IS NOT NULL",
+                ))
+                .unwrap_or(None);
+
+                let buffer_rows: i64 = Spi::get_one::<i64>(&format!(
+                    "SELECT count(*)::bigint FROM \"{change_schema}\".changes_{source_oid}",
+                ))
+                .unwrap_or(None)
+                .unwrap_or(0);
+
+                let is_partitioned =
+                    crate::cdc::is_buffer_partitioned(change_schema, source_oid as u32);
+
+                rows.push((
+                    source_oid,
+                    source_table,
+                    consumer_count,
+                    consumers,
+                    columns_tracked,
+                    safe_frontier_lsn,
+                    buffer_rows,
+                    is_partitioned,
+                ));
+            }
+        }
+    });
+
+    rows
+}
+
 /// Reset a blown fuse on a stream table.
 ///
 /// The `action` parameter controls how pending changes are handled:

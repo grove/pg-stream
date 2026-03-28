@@ -228,3 +228,18 @@ CREATE FUNCTION pgtrickle."alter_stream_table"(
 LANGUAGE c /* Rust */
 AS 'MODULE_PATHNAME', 'alter_stream_table_wrapper';
 
+-- ── D-4: Shared change buffer observability ───────────────────────────────
+CREATE FUNCTION pgtrickle."shared_buffer_stats"() RETURNS TABLE (
+        "source_oid" bigint,
+        "source_table" text,
+        "consumer_count" integer,
+        "consumers" text,
+        "columns_tracked" integer,
+        "safe_frontier_lsn" text,
+        "buffer_rows" bigint,
+        "is_partitioned" boolean
+)
+STRICT
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'shared_buffer_stats_fn_wrapper';
+

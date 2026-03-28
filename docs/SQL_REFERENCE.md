@@ -3229,6 +3229,36 @@ A `dedup_ratio_pct` ≥ 10 is the threshold recommended for investigating a
 two-pass MERGE strategy. See `plans/performance/REPORT_OVERALL_STATUS.md §14`
 for background.
 
+### `pgtrickle.shared_buffer_stats()`
+
+> **Added in v0.13.0**
+
+D-4 observability function. Returns one row per shared change buffer (one per
+tracked source table), showing how many stream tables share the buffer, which
+columns are tracked, the safe cleanup frontier, and the current buffer size.
+
+**Return columns:**
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `source_oid` | `bigint` | PostgreSQL OID of the source table |
+| `source_table` | `text` | Fully qualified source table name |
+| `consumer_count` | `integer` | Number of stream tables sharing this buffer |
+| `consumers` | `text` | Comma-separated list of consumer stream table names |
+| `columns_tracked` | `integer` | Number of `new_*` columns in the buffer (column superset) |
+| `safe_frontier_lsn` | `text` | MIN(frontier LSN) across all consumers — rows at or below this are safe to clean up |
+| `buffer_rows` | `bigint` | Current number of rows in the change buffer |
+| `is_partitioned` | `boolean` | Whether the buffer uses LSN-range partitioning |
+
+**Example:**
+
+```sql
+SELECT * FROM pgtrickle.shared_buffer_stats();
+-- source_oid | source_table       | consumer_count | consumers                          | columns_tracked | safe_frontier_lsn | buffer_rows | is_partitioned
+-- -----------+--------------------+----------------+------------------------------------+-----------------+-------------------+-------------+----------------
+--      16456 | public.orders      |              3 | public.orders_by_region, public... |               5 | 0/1A2B3C4D        |         142 | f
+```
+
 
 
 ---
