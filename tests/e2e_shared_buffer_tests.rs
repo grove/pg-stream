@@ -359,3 +359,188 @@ async fn test_d4_drop_st_reduces_consumer_count() {
         .await;
     assert_eq!(stats_count, 0, "no shared buffers should remain");
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// PERF-2 — Auto Buffer Partitioning
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Verify that `buffer_partitioning = 'on'` creates a partitioned change buffer
+/// from the start and that differential refresh works correctly through it.
+#[tokio::test]
+async fn test_perf2_buffer_partitioning_on_creates_partitioned() {
+    let db = E2eDb::new().await.with_extension().await;
+
+    // Enable buffer partitioning.
+    db.execute("SET pg_trickle.buffer_partitioning = 'on'")
+        .await;
+
+    db.execute(
+        "CREATE TABLE perf2_src (
+            id   SERIAL PRIMARY KEY,
+            grp  TEXT NOT NULL,
+            val  INT NOT NULL
+        )",
+    )
+    .await;
+    db.execute("INSERT INTO perf2_src (grp, val) VALUES ('a', 10), ('b', 20), ('c', 30)")
+        .await;
+
+    db.create_st(
+        "perf2_sum",
+        "SELECT grp, SUM(val) AS total FROM perf2_src GROUP BY grp",
+        "1m",
+        "DIFFERENTIAL",
+    )
+    .await;
+
+    // Full refresh.
+    db.refresh_st("perf2_sum").await;
+
+    // Verify the change buffer is partitioned (relkind = 'p').
+    let is_partitioned: bool = db
+        .query_scalar("SELECT is_partitioned FROM pgtrickle.shared_buffer_stats() LIMIT 1")
+        .await;
+    assert!(
+        is_partitioned,
+        "buffer should be partitioned with mode='on'"
+    );
+
+    // Insert new rows and differential refresh.
+    db.execute("INSERT INTO perf2_src (grp, val) VALUES ('a', 100)")
+        .await;
+    db.refresh_st("perf2_sum").await;
+
+    let sum_a: i64 = db
+        .query_scalar("SELECT total FROM perf2_sum WHERE grp = 'a'")
+        .await;
+    assert_eq!(
+        sum_a, 110,
+        "differential refresh through partitioned buffer"
+    );
+}
+
+/// Verify that `buffer_partitioning = 'auto'` starts with an unpartitioned
+/// buffer for normal workloads (below compact_threshold).
+#[tokio::test]
+async fn test_perf2_auto_mode_starts_unpartitioned() {
+    let db = E2eDb::new().await.with_extension().await;
+
+    // Enable auto mode.
+    db.execute("SET pg_trickle.buffer_partitioning = 'auto'")
+        .await;
+
+    db.execute(
+        "CREATE TABLE perf2_auto_src (
+            id   SERIAL PRIMARY KEY,
+            val  INT NOT NULL
+        )",
+    )
+    .await;
+    db.execute("INSERT INTO perf2_auto_src (val) VALUES (1), (2), (3)")
+        .await;
+
+    db.create_st(
+        "perf2_auto_cnt",
+        "SELECT COUNT(*) AS cnt FROM perf2_auto_src",
+        "1m",
+        "DIFFERENTIAL",
+    )
+    .await;
+
+    db.refresh_st("perf2_auto_cnt").await;
+
+    // With only 3 rows, the buffer should NOT be auto-promoted.
+    let is_partitioned: bool = db
+        .query_scalar("SELECT is_partitioned FROM pgtrickle.shared_buffer_stats() LIMIT 1")
+        .await;
+    assert!(
+        !is_partitioned,
+        "with low volume, auto mode should keep buffer unpartitioned"
+    );
+
+    // Normal differential refresh should still work.
+    db.execute("INSERT INTO perf2_auto_src (val) VALUES (4)")
+        .await;
+    db.refresh_st("perf2_auto_cnt").await;
+
+    let cnt: i64 = db.query_scalar("SELECT cnt FROM perf2_auto_cnt").await;
+    assert_eq!(cnt, 4);
+}
+
+/// Verify that `buffer_partitioning = 'auto'` promotes to partitioned mode
+/// when the buffer fill rate exceeds compact_threshold within a single cycle.
+///
+/// This test lowers the compact_threshold to a small value, inserts enough
+/// rows to exceed it, and verifies the auto-promotion happens during
+/// differential refresh.
+#[tokio::test]
+async fn test_perf2_auto_mode_promotes_on_high_throughput() {
+    let db = E2eDb::new().await.with_extension().await;
+
+    // Set auto mode + low threshold so we can trigger promotion easily.
+    db.execute("SET pg_trickle.buffer_partitioning = 'auto'")
+        .await;
+    db.execute("SET pg_trickle.compact_threshold = 50").await;
+
+    db.execute(
+        "CREATE TABLE perf2_promo_src (
+            id   SERIAL PRIMARY KEY,
+            val  INT NOT NULL
+        )",
+    )
+    .await;
+    db.execute("INSERT INTO perf2_promo_src (val) VALUES (1)")
+        .await;
+
+    db.create_st(
+        "perf2_promo_cnt",
+        "SELECT COUNT(*) AS cnt FROM perf2_promo_src",
+        "1m",
+        "DIFFERENTIAL",
+    )
+    .await;
+
+    // Full refresh to establish baseline.
+    db.refresh_st("perf2_promo_cnt").await;
+
+    // Verify buffer starts unpartitioned.
+    let is_part_before: bool = db
+        .query_scalar("SELECT is_partitioned FROM pgtrickle.shared_buffer_stats() LIMIT 1")
+        .await;
+    assert!(
+        !is_part_before,
+        "buffer should start unpartitioned in auto mode"
+    );
+
+    // Insert >50 rows to exceed the lowered compact_threshold.
+    db.execute(
+        "INSERT INTO perf2_promo_src (val)
+         SELECT generate_series(1, 100)",
+    )
+    .await;
+
+    // Differential refresh — this should trigger auto-promotion.
+    db.refresh_st("perf2_promo_cnt").await;
+
+    // Verify buffer was promoted to partitioned.
+    let is_part_after: bool = db
+        .query_scalar("SELECT is_partitioned FROM pgtrickle.shared_buffer_stats() LIMIT 1")
+        .await;
+    assert!(
+        is_part_after,
+        "buffer should be auto-promoted after exceeding compact_threshold"
+    );
+
+    // Verify data correctness after promotion.
+    let cnt: i64 = db.query_scalar("SELECT cnt FROM perf2_promo_cnt").await;
+    assert_eq!(cnt, 101, "1 initial + 100 inserted = 101");
+
+    // Verify subsequent differential refresh still works through the
+    // partitioned buffer.
+    db.execute("INSERT INTO perf2_promo_src (val) VALUES (999)")
+        .await;
+    db.refresh_st("perf2_promo_cnt").await;
+
+    let cnt_after: i64 = db.query_scalar("SELECT cnt FROM perf2_promo_cnt").await;
+    assert_eq!(cnt_after, 102, "post-promotion differential refresh");
+}

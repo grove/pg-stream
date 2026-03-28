@@ -2335,7 +2335,7 @@ large design changes; all build on existing infrastructure.
 
 | Item | Description | Effort | Ref |
 |------|-------------|--------|-----|
-| PERF-2 | **Auto-enable `buffer_partitioning` for high-throughput sources.** `buffer_partitioning` is available but off by default. Add heuristic auto-detection: if a source's change buffer grows beyond `compact_threshold` in less than one scheduler tick interval, automatically switch it to RANGE(lsn) partitioned mode. The `pg_trickle.buffer_partitioning` GUC (default `'off'`) gains an `'auto'` option. Manual override per-source still possible. | 1–2 wk | [REPORT_OVERALL_STATUS.md §R7](plans/performance/REPORT_OVERALL_STATUS.md) |
+| ~~PERF-2~~ | ~~**Auto-enable `buffer_partitioning` for high-throughput sources.**~~ ✅ Done — `should_promote_inner()` throughput-based heuristic; `convert_buffer_to_partitioned()` runtime migration; auto-promote hook in `execute_differential_refresh()`; `docs/CONFIGURATION.md` updated; 10 unit tests + 3 E2E tests | — | [REPORT_OVERALL_STATUS.md §R7](plans/performance/REPORT_OVERALL_STATUS.md) |
 | ~~PERF-3~~ | ~~**Flip `tiered_scheduling` default to `true`.** The feature is implemented and tested since v0.10.0.~~ ✅ Done — default flipped; CONFIGURATION.md updated with tier thresholds section | — | [src/config.rs](src/config.rs) · [docs/CONFIGURATION.md](docs/CONFIGURATION.md) |
 | ~~PERF-1~~ | ~~**Adaptive scheduler wake interval.**~~ ➡️ Pulled forward to v0.11.0 as WAKE-1. | — | [REPORT_OVERALL_STATUS.md §R3/R16](plans/performance/REPORT_OVERALL_STATUS.md) |
 | ~~PERF-4~~ | ~~**Flip `block_source_ddl` default to `true`.**~~ ➡️ Pulled forward to v0.11.0 as DEF-5. | — | [REPORT_OVERALL_STATUS.md §R12](plans/performance/REPORT_OVERALL_STATUS.md) |
@@ -2417,7 +2417,7 @@ cleanup for PG 16+ expression types.
 |------|-------------|--------|-----|
 | A-2 | **Columnar Change Tracking.** Per-column bitmask in CDC triggers; skip rows where no referenced column changed; lightweight UPDATE-only path when only projected columns changed; 50–90% delta-volume reduction for wide-table UPDATE workloads. | 3–4 wk | [PLAN_NEW_STUFF.md §A-2](plans/performance/PLAN_NEW_STUFF.md) | ✅ Done |
 | D-4 | **Shared Change Buffers.** Single buffer per source shared across all dependent STs; multi-frontier cleanup coordination; static-superset column mode for initial implementation. | 3–4 wk | [PLAN_NEW_STUFF.md §D-4](plans/performance/PLAN_NEW_STUFF.md) | ✅ Done |
-| PERF-2 | **Auto-enable `buffer_partitioning` for high-throughput sources.** Add `'auto'` option to `pg_trickle.buffer_partitioning` GUC; heuristic auto-detection: switch to RANGE(lsn) partitioned mode when the change buffer exceeds `compact_threshold` in less than one scheduler tick. | 1–2 wk | [REPORT_OVERALL_STATUS.md §R7](plans/performance/REPORT_OVERALL_STATUS.md) |
+| ~~PERF-2~~ | ~~**Auto-enable `buffer_partitioning` for high-throughput sources.**~~ ✅ Done — throughput-based auto-promotion: buffer exceeding `compact_threshold` in a single refresh cycle is converted to RANGE(lsn) partitioned mode at runtime. | — | [REPORT_OVERALL_STATUS.md §R7](plans/performance/REPORT_OVERALL_STATUS.md) |
 
 > ⚠️ D-4 **multi-frontier cleanup correctness verified.** `MIN(consumer_frontier)`
 > used in all cleanup paths. Property-based tests with 5–10 consumers and
@@ -2520,7 +2520,7 @@ cleanup for PG 16+ expression types.
 **Exit criteria:**
 - [x] A-2: Columnar change tracking bitmask skips irrelevant rows; key column classification ✅, `__pgt_key_changed` annotation ✅, P5 value-only fast path ✅, `DiffResult.has_key_changed` signal propagation ✅, MERGE value-only UPDATE optimization ✅, upgrade script ✅ ✅ Done
 - [x] D-4: Shared buffer serves multiple STs via per-source `changes_{oid}` naming; `pgt_change_tracking.tracked_by_pgt_ids` reference counting; `shared_buffer_stats()` observability; property-based test with 5–10 consumers (3 properties, 500 cases) ✅ Done; 5 E2E fan-out tests
-- [ ] PERF-2: `buffer_partitioning = 'auto'` activates RANGE(lsn) partitioned mode for high-throughput sources
+- [x] PERF-2: `buffer_partitioning = 'auto'` activates RANGE(lsn) partitioned mode for high-throughput sources — throughput-based `should_promote_inner()` heuristic, `convert_buffer_to_partitioned()` runtime migration, 10 unit tests + 3 E2E tests, `docs/CONFIGURATION.md` updated ✅ Done
 - [x] A1-1b: Multi-column RANGE partition keys work end-to-end; composite ROW() predicate triggers partition pruning; 3 E2E tests + 5 unit tests ✅ Done
 - [x] A1-1c: `alter_stream_table(partition_by => …)` repartitions existing storage table without data loss; add/change/remove tested
 - [x] A1-1d: LIST partitioning creates `PARTITION BY LIST` storage; IN-list predicate injected; single-column-only validated; 4 E2E tests pass

@@ -2579,6 +2579,255 @@ pub fn poll_matview_changes(
     poll_foreign_table_changes(source_oid, change_schema)
 }
 
+// ── PERF-2: Auto Buffer Partitioning ────────────────────────────────────
+
+/// Pure decision logic for auto-promotion — testable without a PostgreSQL
+/// backend.  All GUC values are passed as parameters.
+///
+/// Returns `true` when:
+/// 1. `mode` is `"auto"`
+/// 2. The buffer is not already partitioned
+/// 3. `pending_count > threshold` and `threshold > 0`
+fn should_promote_inner(
+    pending_count: i64,
+    already_partitioned: bool,
+    mode: &str,
+    threshold: i64,
+) -> bool {
+    if already_partitioned {
+        return false;
+    }
+    if mode != "auto" {
+        return false;
+    }
+    if threshold <= 0 {
+        return false;
+    }
+    pending_count > threshold
+}
+
+/// Should an unpartitioned buffer be promoted to RANGE(lsn) partitioned mode?
+///
+/// Reads GUC values and delegates to the pure [`should_promote_inner`].
+pub fn should_promote_to_partitioned(pending_count: i64, already_partitioned: bool) -> bool {
+    let mode = crate::config::pg_trickle_buffer_partitioning();
+    let threshold = crate::config::pg_trickle_compact_threshold();
+    should_promote_inner(pending_count, already_partitioned, &mode, threshold)
+}
+
+/// Convert an existing unpartitioned change buffer to RANGE(lsn) partitioned
+/// mode at runtime.
+///
+/// Strategy:
+/// 1. Rename the existing heap table to a temporary name
+/// 2. Create a new partitioned table with the same schema
+/// 3. Create a default partition to accept incoming rows immediately
+/// 4. Migrate existing rows via INSERT … SELECT
+/// 5. Recreate the covering index
+/// 6. Drop the old table
+///
+/// This runs inside the current transaction and acquires an ACCESS EXCLUSIVE
+/// lock on the buffer table during the rename — which is safe because it
+/// runs between refresh cycles when no concurrent readers exist.
+pub fn convert_buffer_to_partitioned(
+    change_schema: &str,
+    source_oid: u32,
+) -> Result<i64, PgTrickleError> {
+    let table_name = format!("changes_{source_oid}");
+    let migrated_name = format!("changes_{source_oid}_pre_part");
+
+    // Step 1: Rename the existing unpartitioned table.
+    let rename_sql = format!(
+        "ALTER TABLE \"{schema}\".\"{table}\" RENAME TO \"{migrated}\"",
+        schema = change_schema,
+        table = table_name,
+        migrated = migrated_name,
+    );
+    Spi::run(&rename_sql).map_err(|e| {
+        PgTrickleError::SpiError(format!(
+            "PERF-2: Failed to rename buffer for partitioning: {e}"
+        ))
+    })?;
+
+    // Step 2: Read the column definitions from the renamed table so we can
+    // recreate the partitioned table with identical schema.
+    let col_defs: Vec<(String, String, i32)> = Spi::connect(|client| {
+        let sql = format!(
+            "SELECT column_name::text, data_type::text, ordinal_position::int \
+             FROM information_schema.columns \
+             WHERE table_schema = '{schema}' AND table_name = '{migrated}' \
+             ORDER BY ordinal_position",
+            schema = change_schema,
+            migrated = migrated_name,
+        );
+        let result = client
+            .select(&sql, None, &[])
+            .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
+        let mut cols = Vec::new();
+        for row in result {
+            let name: String = row.get(1).unwrap_or(None).unwrap_or_default();
+            let dtype: String = row.get(2).unwrap_or(None).unwrap_or_default();
+            let pos: i32 = row.get(3).unwrap_or(None).unwrap_or(0);
+            cols.push((name, dtype, pos));
+        }
+        Ok::<_, PgTrickleError>(cols)
+    })?;
+
+    // Build CREATE TABLE statement replicating all columns.
+    let col_sql: String = col_defs
+        .iter()
+        .map(|(name, dtype, _)| {
+            let qname = name.replace('"', "\"\"");
+            // Map information_schema types back to SQL types.
+            let sql_type = match dtype.as_str() {
+                "bigint" => "BIGINT",
+                "pg_lsn" => "PG_LSN",
+                "character" => "CHAR(1)",
+                "bit varying" => "VARBIT",
+                _ => dtype.as_str(),
+            };
+            // change_id uses BIGSERIAL for auto-increment.
+            if name == "change_id" {
+                return format!("\"{qname}\" BIGSERIAL");
+            }
+            // lsn is NOT NULL.
+            if name == "lsn" {
+                return format!("\"{qname}\" {sql_type} NOT NULL");
+            }
+            // action is NOT NULL.
+            if name == "action" {
+                return format!("\"{qname}\" {sql_type} NOT NULL");
+            }
+            format!("\"{qname}\" {sql_type}")
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    let create_sql = format!(
+        "CREATE TABLE \"{schema}\".\"{table}\" ({col_sql}) PARTITION BY RANGE (lsn)",
+        schema = change_schema,
+        table = table_name,
+    );
+    Spi::run(&create_sql).map_err(|e| {
+        PgTrickleError::SpiError(format!("PERF-2: Failed to create partitioned buffer: {e}"))
+    })?;
+
+    // Disable RLS on the new partitioned table.
+    Spi::run(&format!(
+        "ALTER TABLE \"{schema}\".\"{table}\" DISABLE ROW LEVEL SECURITY",
+        schema = change_schema,
+        table = table_name,
+    ))
+    .map_err(|e| PgTrickleError::SpiError(format!("PERF-2: Failed to disable RLS: {e}")))?;
+
+    // Step 3: Create default partition.
+    let default_sql = format!(
+        "CREATE TABLE \"{schema}\".\"changes_{oid}_default\" \
+         PARTITION OF \"{schema}\".\"{table}\" DEFAULT",
+        schema = change_schema,
+        oid = source_oid,
+        table = table_name,
+    );
+    Spi::run(&default_sql).map_err(|e| {
+        PgTrickleError::SpiError(format!("PERF-2: Failed to create default partition: {e}"))
+    })?;
+
+    // Step 4: Migrate existing rows.
+    let migrate_sql = format!(
+        "INSERT INTO \"{schema}\".\"{table}\" SELECT * FROM \"{schema}\".\"{migrated}\"",
+        schema = change_schema,
+        table = table_name,
+        migrated = migrated_name,
+    );
+    Spi::run(&migrate_sql).map_err(|e| {
+        PgTrickleError::SpiError(format!(
+            "PERF-2: Failed to migrate rows to partitioned buffer: {e}"
+        ))
+    })?;
+
+    // Count migrated rows for logging.
+    let migrated_count = Spi::get_one::<i64>(&format!(
+        "SELECT count(*)::bigint FROM \"{schema}\".\"{table}\"",
+        schema = change_schema,
+        table = table_name,
+    ))
+    .unwrap_or(Some(0))
+    .unwrap_or(0);
+
+    // Step 5: Recreate the covering index.
+    let idx_sql = format!(
+        "CREATE INDEX IF NOT EXISTS idx_changes_{oid}_lsn_pk_cid \
+         ON \"{schema}\".changes_{oid} (lsn, pk_hash, change_id) INCLUDE (action)",
+        schema = change_schema,
+        oid = source_oid,
+    );
+    Spi::run(&idx_sql).map_err(|e| {
+        PgTrickleError::SpiError(format!(
+            "PERF-2: Failed to create index on partitioned buffer: {e}"
+        ))
+    })?;
+
+    // Step 6: Drop the old table.
+    let drop_sql = format!(
+        "DROP TABLE IF EXISTS \"{schema}\".\"{migrated}\"",
+        schema = change_schema,
+        migrated = migrated_name,
+    );
+    Spi::run(&drop_sql).map_err(|e| {
+        PgTrickleError::SpiError(format!("PERF-2: Failed to drop old buffer table: {e}"))
+    })?;
+
+    pgrx::log!(
+        "pg_trickle PERF-2: promoted changes_{} to RANGE(lsn) partitioned mode ({} rows migrated)",
+        source_oid,
+        migrated_count,
+    );
+
+    Ok(migrated_count)
+}
+
+/// PERF-2: Check if a buffer should be auto-promoted and do the conversion.
+///
+/// Called after compaction in `execute_differential_refresh()`. If the
+/// buffer accumulated more rows than `compact_threshold` in a single
+/// refresh cycle AND `buffer_partitioning = 'auto'`, converts the buffer
+/// to RANGE(lsn) partitioned mode for O(1) cleanup.
+///
+/// Returns `Ok(true)` if the buffer was promoted, `Ok(false)` otherwise.
+pub fn maybe_auto_promote_buffer(
+    change_schema: &str,
+    source_oid: u32,
+    pending_count: i64,
+) -> Result<bool, PgTrickleError> {
+    let already_partitioned = is_buffer_partitioned(change_schema, source_oid);
+    if !should_promote_to_partitioned(pending_count, already_partitioned) {
+        return Ok(false);
+    }
+
+    convert_buffer_to_partitioned(change_schema, source_oid)?;
+    Ok(true)
+}
+
+/// Count the number of pending change rows in a buffer between two LSN boundaries.
+///
+/// Used by the auto-promote heuristic to measure buffer fill rate within
+/// a single refresh cycle.
+pub fn count_pending_changes(
+    change_schema: &str,
+    source_oid: u32,
+    prev_lsn: &str,
+    new_lsn: &str,
+) -> i64 {
+    Spi::get_one::<i64>(&format!(
+        "SELECT count(*)::bigint FROM \"{schema}\".changes_{oid} \
+         WHERE lsn > '{prev_lsn}'::pg_lsn AND lsn <= '{new_lsn}'::pg_lsn",
+        schema = change_schema,
+        oid = source_oid,
+    ))
+    .unwrap_or(Some(0))
+    .unwrap_or(0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3066,5 +3315,61 @@ mod tests {
         let k1 = compact_st_advisory_lock_key(1);
         let k2 = compact_st_advisory_lock_key(2);
         assert_ne!(k1, k2, "Different pgt_ids must produce different keys");
+    }
+
+    // ── PERF-2: should_promote_inner tests ─────────────────────────
+
+    #[test]
+    fn test_promote_already_partitioned_returns_false() {
+        assert!(!should_promote_inner(999_999, true, "auto", 100_000));
+    }
+
+    #[test]
+    fn test_promote_below_threshold_returns_false() {
+        assert!(!should_promote_inner(50_000, false, "auto", 100_000));
+    }
+
+    #[test]
+    fn test_promote_at_threshold_returns_false() {
+        // Exactly at threshold — not above.
+        assert!(!should_promote_inner(100_000, false, "auto", 100_000));
+    }
+
+    #[test]
+    fn test_promote_above_threshold_auto_mode() {
+        assert!(should_promote_inner(100_001, false, "auto", 100_000));
+    }
+
+    #[test]
+    fn test_promote_above_threshold_off_mode() {
+        // Mode = "off" — never promote.
+        assert!(!should_promote_inner(100_001, false, "off", 100_000));
+    }
+
+    #[test]
+    fn test_promote_above_threshold_on_mode() {
+        // Mode = "on" — buffers created pre-partitioned, never runtime promote.
+        assert!(!should_promote_inner(100_001, false, "on", 100_000));
+    }
+
+    #[test]
+    fn test_promote_zero_pending_returns_false() {
+        assert!(!should_promote_inner(0, false, "auto", 100_000));
+    }
+
+    #[test]
+    fn test_promote_negative_pending_returns_false() {
+        assert!(!should_promote_inner(-1, false, "auto", 100_000));
+    }
+
+    #[test]
+    fn test_promote_zero_threshold_returns_false() {
+        // Threshold disabled (0) — never promote.
+        assert!(!should_promote_inner(999_999, false, "auto", 0));
+    }
+
+    #[test]
+    fn test_promote_negative_threshold_returns_false() {
+        assert!(!should_promote_inner(999_999, false, "auto", -1));
     }
 }

@@ -35,6 +35,7 @@ Complete reference for all pg_trickle GUC (Grand Unified Configuration) variable
     - [pg\_trickle.block\_source\_ddl](#pg_trickleblock_source_ddl)
     - [pg\_trickle.buffer\_alert\_threshold](#pg_tricklebuffer_alert_threshold)
     - [pg\_trickle.compact\_threshold](#pg_tricklecompact_threshold)
+    - [pg\_trickle.buffer\_partitioning](#pg_tricklebuffer_partitioning)
     - [pg\_trickle.max\_grouping\_set\_branches](#pg_tricklemax_grouping_set_branches)
     - [pg\_trickle.max\_parse\_depth](#pg_tricklemax_parse_depth)
     - [pg\_trickle.ivm\_topk\_max\_limit](#pg_trickleivm_topk_max_limit)
@@ -800,6 +801,38 @@ SET pg_trickle.compact_threshold = 0;
 
 ---
 
+### pg_trickle.buffer_partitioning
+
+Controls whether change buffer tables use `PARTITION BY RANGE (lsn)` for
+O(1) cleanup via partition detach instead of O(n) DELETE.
+
+| Value | Behaviour |
+|-------|----------|
+| `'off'` | **(Default)** Unpartitioned heap tables. Cleanup uses DELETE or TRUNCATE. Lowest DDL overhead per cycle. |
+| `'on'` | Always create partitioned change buffers. Old partitions are detached and dropped after consumption — O(1) cleanup regardless of buffer size. Best for high-throughput sources where buffers routinely exceed `compact_threshold`. |
+| `'auto'` | Start with unpartitioned buffers. If a buffer accumulates more rows than `compact_threshold` within a single refresh cycle, automatically promote it to RANGE(lsn) partitioned mode. Once promoted, the buffer stays partitioned. Combines low overhead for quiet sources with O(1) cleanup for hot ones. |
+
+**Default:** `'off'`
+**Context:** `SUSET` (superuser session-level)
+
+```sql
+-- Always partition change buffers
+SET pg_trickle.buffer_partitioning = 'on';
+
+-- Auto-promote based on throughput
+SET pg_trickle.buffer_partitioning = 'auto';
+
+-- Disable partitioning (default)
+SET pg_trickle.buffer_partitioning = 'off';
+```
+
+> **Interaction with `compact_threshold`:** In `'auto'` mode, the
+> `compact_threshold` value serves double duty — it triggers both compaction
+> and the auto-promotion decision. Lowering `compact_threshold` makes
+> auto-promotion more sensitive.
+
+---
+
 ### pg_trickle.max_grouping_set_branches
 
 Maximum allowed grouping set branches in `CUBE`/`ROLLUP` queries.
@@ -1128,6 +1161,7 @@ documents these cross-dependencies to help avoid misconfiguration.
 | `cdc_mode` | `cdc_trigger_mode` | `cdc_trigger_mode` (`'statement'` / `'row'`) only applies when CDC is trigger-based. When `cdc_mode = 'wal'` (or after auto-transition to WAL), `cdc_trigger_mode` is irrelevant. |
 | `cdc_mode` | `wal_transition_timeout` | `wal_transition_timeout` only applies when `cdc_mode = 'auto'`. It controls how many seconds to wait for the first WAL-based refresh to succeed before falling back to triggers. |
 | `cleanup_use_truncate` | `compact_threshold` | `cleanup_use_truncate = true` uses TRUNCATE to clear consumed change buffers (fastest, acquires AccessExclusiveLock briefly). `compact_threshold` controls when fully-consumed buffers are compacted via DELETE — only relevant when TRUNCATE is disabled. |
+| `buffer_partitioning` | `compact_threshold` | In `'auto'` mode, `compact_threshold` serves as the promotion trigger: if a buffer exceeds this many rows in a single refresh cycle, it is promoted to RANGE(lsn) partitioned mode. Lowering `compact_threshold` makes auto-promotion more sensitive. |
 | `allow_circular` | `max_fixpoint_iterations` | `max_fixpoint_iterations` is only evaluated when `allow_circular = true`. It caps the number of convergence iterations for circular dependency chains. |
 | `ivm_topk_max_limit` | TopK queries | Queries with `LIMIT > ivm_topk_max_limit` fall back to FULL refresh instead of the optimized TopK path. Raise this if you have legitimate large TopK queries. |
 | `ivm_recursive_max_depth` | Recursive CTEs | Recursive expansion beyond `ivm_recursive_max_depth` iterations is terminated with a warning and falls back to FULL refresh. Set to 0 to disable the guard (not recommended). |
@@ -1198,6 +1232,7 @@ pg_trickle.merge_seqscan_threshold = 0.01    # allow seq scans for >1% changes
 pg_trickle.cleanup_use_truncate = true
 pg_trickle.use_prepared_statements = true
 pg_trickle.auto_backoff = true
+pg_trickle.buffer_partitioning = 'auto'      # O(1) cleanup for hot buffers
 
 # Safety for bulk workloads
 pg_trickle.fuse_default_ceiling = 500000     # pause on >500K changes
@@ -1271,6 +1306,7 @@ pg_trickle.user_triggers = 'auto'
 pg_trickle.block_source_ddl = false
 pg_trickle.buffer_alert_threshold = 1000000
 pg_trickle.compact_threshold = 100000
+pg_trickle.buffer_partitioning = 'off'
 pg_trickle.max_grouping_set_branches = 64
 pg_trickle.max_parse_depth = 64
 pg_trickle.ivm_topk_max_limit = 1000

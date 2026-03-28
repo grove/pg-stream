@@ -226,13 +226,15 @@ fn drain_pending_cleanups() {
         // attempting any DML.  When a ST is dropped between refresh
         // cycles, cleanup_cdc_for_source removes the buffer table but
         // the thread-local pending queue may still reference it.
+        // PERF-2: Accept both 'r' (regular) and 'p' (partitioned) relkinds
+        // because auto-promotion converts buffers to partitioned at runtime.
         let table_exists = Spi::get_one::<bool>(&format!(
             "SELECT EXISTS(\
                SELECT 1 FROM pg_class c \
                JOIN pg_namespace n ON n.oid = c.relnamespace \
                WHERE n.nspname = '{schema}' \
                  AND c.relname = 'changes_{oid}' \
-                 AND c.relkind = 'r'\
+                 AND c.relkind IN ('r', 'p')\
              )",
             schema = change_schema,
         ))
@@ -392,13 +394,14 @@ fn cleanup_change_buffers_by_frontier(change_schema: &str, source_oids: &[u32]) 
 
     for &oid in source_oids {
         // Check that the change buffer table exists
+        // PERF-2: Accept both 'r' (regular) and 'p' (partitioned) relkinds.
         let table_exists = Spi::get_one::<bool>(&format!(
             "SELECT EXISTS(\
                SELECT 1 FROM pg_class c \
                JOIN pg_namespace n ON n.oid = c.relnamespace \
                WHERE n.nspname = '{schema}' \
                  AND c.relname = 'changes_{oid}' \
-                 AND c.relkind = 'r'\
+                 AND c.relkind IN ('r', 'p')\
              )",
             schema = change_schema,
         ))
@@ -3191,6 +3194,33 @@ pub fn execute_differential_refresh(
                 oid,
                 e,
             );
+        }
+    }
+
+    // PERF-2: Auto-promote unpartitioned buffers to RANGE(lsn) partitioned
+    // mode when `buffer_partitioning = 'auto'` and the buffer fill rate
+    // exceeds `compact_threshold` within a single refresh cycle.
+    for &oid in &catalog_source_oids {
+        let prev_lsn = prev_frontier.get_lsn(oid);
+        let new_lsn = new_frontier.get_lsn(oid);
+        let pending = crate::cdc::count_pending_changes(&change_schema, oid, &prev_lsn, &new_lsn);
+        match crate::cdc::maybe_auto_promote_buffer(&change_schema, oid, pending) {
+            Ok(true) => {
+                pgrx::debug1!(
+                    "[pg_trickle] PERF-2: auto-promoted changes_{} to partitioned mode \
+                     (pending={} exceeded threshold)",
+                    oid,
+                    pending,
+                );
+            }
+            Err(e) => {
+                pgrx::warning!(
+                    "[pg_trickle] PERF-2: auto-promotion failed for changes_{}: {}",
+                    oid,
+                    e,
+                );
+            }
+            _ => {}
         }
     }
 
