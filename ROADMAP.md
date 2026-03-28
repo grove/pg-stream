@@ -2516,6 +2516,22 @@ cleanup for PG 16+ expression types.
 
 > **SQL coverage cleanup subtotal: ~1–2 days**
 
+### Regression-Free Testing Initiative (Q2 2026)
+
+> Tracking: [TESTING_GAPS_2_IMPLEMENTATION_PROPOSAL.md](plans/testing/TESTING_GAPS_2_IMPLEMENTATION_PROPOSAL.md)
+
+Addresses 9 structural weaknesses identified in the regression risk analysis.
+Target: reduce regression escape rate from ~15% to <5%.
+
+| Phase | Item | Status |
+|-------|------|--------|
+| P1 | Test infrastructure hardening: `#[must_use]` on poll helpers; `wait_for_condition` with exponential backoff; `assert_column_types_match` | ✅ Done (2026-03-28) |
+| P2 | Join multi-cycle correctness: 7 tests — LEFT/RIGHT/FULL join, join-key update, both-sides DML, 4-table chain, NULL key | ✅ Done (2026-03-28) |
+| P3 | Differential ≡ Full equivalence: 11 tests covering every major DVM operator class; `effective_refresh_mode` guard | ✅ Done (2026-03-28) |
+| P4 | DVM operator execution: 24 tests — window, lateral, recursive unit tests | 🔲 Pending |
+| P5 | Failure recovery & schema evolution: 11 tests — timeouts, concurrent DDL, schema changes | 🔲 Pending |
+| P6 | MERGE template unit tests: 8 tests — pure-Rust, no DB required | 🔲 Pending |
+
 > **v0.13.0 total: ~15–23 weeks** (Scalability: 6–8w, Partitioning: 5–8w, MERGE Profiling: 1–3w, dbt: 2–3.5d, Multi-tenant: 2–3w, TPC-H harness: ~1d, SQL cleanup: ~1–2d)
 
 **Exit criteria:**

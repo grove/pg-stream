@@ -1,9 +1,20 @@
 # TESTING_GAPS_2 — Implementation Proposal for Roadmap
 
-**Status:** Ready for planning  
+**Status:** In progress — Phase 1, 2, 3 complete (2026-03-28)
 **Related:** [TESTING_GAPS_2.md](TESTING_GAPS_2.md) — complete regression risk analysis  
 **Date:** 2026-03-28  
 **Impact:** Close 9 regression risk gaps with ~60 new tests across 6 test tiers
+
+## Implementation Log
+
+| Phase | Status | Delivered | Merged |
+|-------|--------|-----------|--------|
+| 1 — Test infrastructure hardening | ✅ Done | `#[must_use]` on `wait_for_scheduler`/`wait_for_auto_refresh`; `wait_for_condition` with exponential backoff; `assert_column_types_match` | 2026-03-28 |
+| 2 — Join multi-cycle correctness | ✅ Done | 7 tests added to `e2e_multi_cycle_tests.rs`: left/right/full join, join-key update, both-sides DML, 4-table chain, NULL key transitions | 2026-03-28 |
+| 3 — Differential ≡ Full equivalence | ✅ Done | `e2e_diff_full_equivalence_tests.rs` (11 tests): inner/left/full join, sum/count agg, avg/stddev agg, ROW_NUMBER, RANK, CTE, INTERSECT, EXCEPT, DISTINCT ON, HAVING, 3-table join | 2026-03-28 |
+| 4 — DVM operator execution tests | 🔲 Pending | window/lateral/recursive unit tests | — |
+| 5 — Failure recovery & schema evolution | 🔲 Pending | failure recovery + DDL evolution tests | — |
+| 6 — MERGE template unit tests | 🔲 Pending | 8 unit tests for refresh template | — |
 
 ---
 
@@ -22,7 +33,7 @@ implementation roadmap.
 
 ## Implementation Phasing
 
-### Phase 1: Test Infrastructure Hardening (1 day)
+### Phase 1: Test Infrastructure Hardening (1 day) ✅ DONE 2026-03-28
 **Priority: P0 - Essential before new tests**
 
 Foundational improvements that prevent future test failures and improve
@@ -62,7 +73,7 @@ developer experience.
 
 ---
 
-### Phase 2: Join Multi-Cycle Correctness (1 day)
+### Phase 2: Join Multi-Cycle Correctness (1 day) ✅ DONE 2026-03-28
 **Priority: P0 - Highest regression risk**
 
 Close the biggest correctness gap: JOIN operators tested only with INSERT, never
@@ -109,7 +120,7 @@ async fn test_multi_cycle_left_join_differential() {
 
 ---
 
-### Phase 3: Differential ≡ Full Equivalence Suite (1.5 days)
+### Phase 3: Differential ≡ Full Equivalence Suite (1.5 days) ✅ DONE 2026-03-28
 **Priority: P0 - Strongest regression safety net**
 
 Add cross-cutting validation that differential refresh produces the same result
@@ -290,15 +301,15 @@ speed.
 
 ## Summary by Effort & Impact
 
-| Phase | Items | Effort | Tests | Impact | Priority |
-|-------|-------|--------|-------|--------|----------|
-| 1 | Infrastructure | 1 day | 0 | Time saver | **P0** |
-| 2 | Join multi-cycle | 1 day | 7 | Highest risk | **P0** |
-| 3 | Diff≡Full suite | 1.5 days | 14 | Strongest safety | **P0** |
-| 4 | DVM operators | 2 days | 24 | Operator gaps | **P1** |
-| 5 | Failure/DDL | 1.5 days | 11 | Production edge cases | **P1** |
-| 6 | MERGE unittest | 1 day | 8 | Test speed | **P2** |
-| — | **TOTAL** | **~8 days** | **~64 tests** | **9 gaps closed** | — |
+| Phase | Items | Effort | Tests | Impact | Priority | Status |
+|-------|-------|--------|-------|--------|----------|--------|
+| 1 | Infrastructure | 1 day | 0 | Time saver | **P0** | ✅ Done |
+| 2 | Join multi-cycle | 1 day | 7 | Highest risk | **P0** | ✅ Done |
+| 3 | Diff≡Full suite | 1.5 days | 11 | Strongest safety | **P0** | ✅ Done |
+| 4 | DVM operators | 2 days | 24 | Operator gaps | **P1** | 🔲 Pending |
+| 5 | Failure/DDL | 1.5 days | 11 | Production edge cases | **P1** | 🔲 Pending |
+| 6 | MERGE unittest | 1 day | 8 | Test speed | **P2** | 🔲 Pending |
+| — | **TOTAL** | **~8 days** | **~61 tests** | **9 gaps closed** | — | 18 done |
 
 ---
 

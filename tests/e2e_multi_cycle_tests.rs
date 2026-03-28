@@ -629,3 +629,341 @@ async fn test_ec16_no_functions_unaffected() {
     );
     assert_eq!(db.count("public.ec16n_st").await, 3);
 }
+
+// ═══════════════════════════════════════════════════════════════════════
+// Phase 2 (TESTING_GAPS_2): Join multi-cycle correctness
+// ═══════════════════════════════════════════════════════════════════════
+
+/// LEFT JOIN multi-cycle: INSERT, unmatched-right INSERT, join-key UPDATE,
+/// DELETE, restore — all modes exercised over 5 cycles.
+#[tokio::test]
+async fn test_multi_cycle_left_join_differential() {
+    let db = E2eDb::new().await.with_extension().await;
+    db.execute("CREATE TABLE lj_left (id INT PRIMARY KEY, val TEXT)")
+        .await;
+    db.execute("CREATE TABLE lj_right (id INT PRIMARY KEY, lft_id INT, rval TEXT)")
+        .await;
+    db.execute("INSERT INTO lj_left VALUES (1, 'alpha'), (2, 'beta'), (3, 'gamma')")
+        .await;
+    db.execute("INSERT INTO lj_right VALUES (10, 1, 'rx'), (11, 2, 'ry')")
+        .await;
+
+    let q = "SELECT l.id, l.val, r.rval \
+             FROM lj_left l LEFT JOIN lj_right r ON r.lft_id = l.id \
+             ORDER BY l.id";
+    db.create_st("lj_st", q, "1m", "DIFFERENTIAL").await;
+    db.assert_st_matches_query("lj_st", q).await;
+
+    // Cycle 1: INSERT matched rows on both sides
+    db.execute("INSERT INTO lj_left VALUES (4, 'delta')").await;
+    db.execute("INSERT INTO lj_right VALUES (12, 4, 'rz')")
+        .await;
+    db.refresh_st("lj_st").await;
+    db.assert_st_matches_query("lj_st", q).await;
+
+    // Cycle 2: INSERT unmatched right (should not affect result)
+    db.execute("INSERT INTO lj_right VALUES (99, 999, 'orphan')")
+        .await;
+    db.refresh_st("lj_st").await;
+    db.assert_st_matches_query("lj_st", q).await;
+
+    // Cycle 3: UPDATE join key on left — loses old match, gains new
+    db.execute("UPDATE lj_left SET id = 5 WHERE id = 3").await;
+    db.refresh_st("lj_st").await;
+    db.assert_st_matches_query("lj_st", q).await;
+
+    // Cycle 4: DELETE from left — row disappears entirely
+    db.execute("DELETE FROM lj_right WHERE lft_id = 1").await;
+    db.execute("DELETE FROM lj_left WHERE id = 1").await;
+    db.refresh_st("lj_st").await;
+    db.assert_st_matches_query("lj_st", q).await;
+
+    // Cycle 5: restore a match for the previously unmatched left row
+    db.execute("INSERT INTO lj_right VALUES (20, 5, 'restored')")
+        .await;
+    db.refresh_st("lj_st").await;
+    db.assert_st_matches_query("lj_st", q).await;
+}
+
+/// RIGHT JOIN multi-cycle: symmetric of the LEFT JOIN test.
+#[tokio::test]
+async fn test_multi_cycle_right_join_differential() {
+    let db = E2eDb::new().await.with_extension().await;
+    db.execute("CREATE TABLE rj_left (id INT PRIMARY KEY, val TEXT)")
+        .await;
+    db.execute("CREATE TABLE rj_right (id INT PRIMARY KEY, lft_id INT, rval TEXT)")
+        .await;
+    db.execute("INSERT INTO rj_left VALUES (1, 'a'), (2, 'b')")
+        .await;
+    db.execute("INSERT INTO rj_right VALUES (10, 1, 'x'), (11, 3, 'z')")
+        .await;
+
+    let q = "SELECT l.id AS lid, l.val, r.id AS rid, r.rval \
+             FROM rj_left l RIGHT JOIN rj_right r ON l.id = r.lft_id";
+    db.create_st("rj_st", q, "1m", "DIFFERENTIAL").await;
+    db.assert_st_matches_query("rj_st", q).await;
+
+    // Cycle 1: new right row with a matching left
+    db.execute("INSERT INTO rj_right VALUES (12, 2, 'y')").await;
+    db.refresh_st("rj_st").await;
+    db.assert_st_matches_query("rj_st", q).await;
+
+    // Cycle 2: UPDATE right join-key to break match
+    db.execute("UPDATE rj_right SET lft_id = 99 WHERE id = 10")
+        .await;
+    db.refresh_st("rj_st").await;
+    db.assert_st_matches_query("rj_st", q).await;
+
+    // Cycle 3: DELETE unmatched right row
+    db.execute("DELETE FROM rj_right WHERE id = 11").await;
+    db.refresh_st("rj_st").await;
+    db.assert_st_matches_query("rj_st", q).await;
+
+    // Cycle 4: INSERT left to match orphaned right
+    db.execute("INSERT INTO rj_left VALUES (99, 'new')").await;
+    db.refresh_st("rj_st").await;
+    db.assert_st_matches_query("rj_st", q).await;
+
+    // Cycle 5: bulk DELETE left — all rows become NULL-left
+    db.execute("DELETE FROM rj_left").await;
+    db.refresh_st("rj_st").await;
+    db.assert_st_matches_query("rj_st", q).await;
+}
+
+/// FULL JOIN multi-cycle: rows appear on either or both sides.
+#[tokio::test]
+async fn test_multi_cycle_full_join_differential() {
+    let db = E2eDb::new().await.with_extension().await;
+    db.execute("CREATE TABLE fj_a (k INT PRIMARY KEY, av TEXT)")
+        .await;
+    db.execute("CREATE TABLE fj_b (k INT PRIMARY KEY, bv TEXT)")
+        .await;
+    db.execute("INSERT INTO fj_a VALUES (1, 'a1'), (2, 'a2')")
+        .await;
+    db.execute("INSERT INTO fj_b VALUES (2, 'b2'), (3, 'b3')")
+        .await;
+
+    let q = "SELECT a.k AS ak, a.av, b.k AS bk, b.bv \
+             FROM fj_a a FULL JOIN fj_b b ON a.k = b.k";
+    db.create_st("fj_st", q, "1m", "DIFFERENTIAL").await;
+    db.assert_st_matches_query("fj_st", q).await;
+
+    // Cycle 1: add matched pair
+    db.execute("INSERT INTO fj_a VALUES (3, 'a3')").await;
+    db.refresh_st("fj_st").await;
+    db.assert_st_matches_query("fj_st", q).await;
+
+    // Cycle 2: insert unmatched on each side
+    db.execute("INSERT INTO fj_a VALUES (4, 'a4')").await;
+    db.execute("INSERT INTO fj_b VALUES (5, 'b5')").await;
+    db.refresh_st("fj_st").await;
+    db.assert_st_matches_query("fj_st", q).await;
+
+    // Cycle 3: UPDATE to create new match (was previously unmatched)
+    db.execute("INSERT INTO fj_b VALUES (4, 'b4')").await;
+    db.refresh_st("fj_st").await;
+    db.assert_st_matches_query("fj_st", q).await;
+
+    // Cycle 4: DELETE from one side — partner becomes NULL-padded
+    db.execute("DELETE FROM fj_a WHERE k = 3").await;
+    db.refresh_st("fj_st").await;
+    db.assert_st_matches_query("fj_st", q).await;
+
+    // Cycle 5: DELETE from both sides of a matched pair
+    db.execute("DELETE FROM fj_a WHERE k = 2").await;
+    db.execute("DELETE FROM fj_b WHERE k = 2").await;
+    db.refresh_st("fj_st").await;
+    db.assert_st_matches_query("fj_st", q).await;
+}
+
+/// Focused test: UPDATE on the join key severs old match and forges new one.
+#[tokio::test]
+async fn test_multi_cycle_join_key_update() {
+    let db = E2eDb::new().await.with_extension().await;
+    db.execute("CREATE TABLE jku_parent (id INT PRIMARY KEY, pval TEXT)")
+        .await;
+    db.execute("CREATE TABLE jku_child (id INT PRIMARY KEY, parent_id INT, cval TEXT)")
+        .await;
+    db.execute("INSERT INTO jku_parent VALUES (1, 'p1'), (2, 'p2'), (3, 'p3')")
+        .await;
+    db.execute("INSERT INTO jku_child VALUES (10, 1, 'c1'), (11, 2, 'c2')")
+        .await;
+
+    let q = "SELECT p.id, p.pval, c.cval \
+             FROM jku_parent p JOIN jku_child c ON c.parent_id = p.id";
+    db.create_st("jku_st", q, "1m", "DIFFERENTIAL").await;
+    db.assert_st_matches_query("jku_st", q).await;
+
+    // Cycle 1: change child join key → moves from p1 to p2
+    db.execute("UPDATE jku_child SET parent_id = 2 WHERE id = 10")
+        .await;
+    db.refresh_st("jku_st").await;
+    db.assert_st_matches_query("jku_st", q).await;
+
+    // Cycle 2: change child join key to previously unmatched parent
+    db.execute("UPDATE jku_child SET parent_id = 3 WHERE id = 11")
+        .await;
+    db.refresh_st("jku_st").await;
+    db.assert_st_matches_query("jku_st", q).await;
+
+    // Cycle 3: change parent PK — both sides updated
+    db.execute("UPDATE jku_parent SET id = 4 WHERE id = 3")
+        .await;
+    db.execute("UPDATE jku_child SET parent_id = 4 WHERE parent_id = 3")
+        .await;
+    db.refresh_st("jku_st").await;
+    db.assert_st_matches_query("jku_st", q).await;
+
+    // Cycle 4: no changes (idempotent)
+    db.refresh_st("jku_st").await;
+    db.assert_st_matches_query("jku_st", q).await;
+}
+
+/// Concurrent DML on both sides of a join within the same cycle.
+#[tokio::test]
+async fn test_multi_cycle_join_both_sides_changed() {
+    let db = E2eDb::new().await.with_extension().await;
+    db.execute("CREATE TABLE jbs_orders (oid INT PRIMARY KEY, status TEXT)")
+        .await;
+    db.execute("CREATE TABLE jbs_items (iid INT PRIMARY KEY, oid INT, qty INT)")
+        .await;
+    db.execute("INSERT INTO jbs_orders VALUES (1, 'open'), (2, 'closed'), (3, 'open')")
+        .await;
+    db.execute("INSERT INTO jbs_items VALUES (101, 1, 5), (102, 1, 3), (103, 2, 7)")
+        .await;
+
+    let q = "SELECT o.oid, o.status, SUM(i.qty) AS total_qty \
+             FROM jbs_orders o JOIN jbs_items i ON i.oid = o.oid \
+             GROUP BY o.oid, o.status";
+    db.create_st("jbs_st", q, "1m", "DIFFERENTIAL").await;
+    db.assert_st_matches_query("jbs_st", q).await;
+
+    // Cycle 1: changes on both sides simultaneously
+    db.execute("INSERT INTO jbs_orders VALUES (4, 'open')")
+        .await;
+    db.execute("INSERT INTO jbs_items VALUES (104, 3, 2), (105, 4, 9)")
+        .await;
+    db.execute("UPDATE jbs_orders SET status = 'shipped' WHERE oid = 1")
+        .await;
+    db.execute("UPDATE jbs_items SET qty = 10 WHERE iid = 102")
+        .await;
+    db.refresh_st("jbs_st").await;
+    db.assert_st_matches_query("jbs_st", q).await;
+
+    // Cycle 2: delete order → all its items become orphaned (removed from join)
+    db.execute("DELETE FROM jbs_items WHERE oid = 2").await;
+    db.execute("DELETE FROM jbs_orders WHERE oid = 2").await;
+    db.refresh_st("jbs_st").await;
+    db.assert_st_matches_query("jbs_st", q).await;
+
+    // Cycle 3: move items to a different order
+    db.execute("UPDATE jbs_items SET oid = 4 WHERE oid = 3")
+        .await;
+    db.refresh_st("jbs_st").await;
+    db.assert_st_matches_query("jbs_st", q).await;
+}
+
+/// 4-table join chain: t1 → t2 → t3 → t4. DML at each position.
+#[tokio::test]
+async fn test_deep_join_chain_4_tables_differential() {
+    let db = E2eDb::new().await.with_extension().await;
+    db.execute("CREATE TABLE jc_t1 (id INT PRIMARY KEY, v1 TEXT)")
+        .await;
+    db.execute("CREATE TABLE jc_t2 (id INT PRIMARY KEY, t1_id INT, v2 TEXT)")
+        .await;
+    db.execute("CREATE TABLE jc_t3 (id INT PRIMARY KEY, t2_id INT, v3 TEXT)")
+        .await;
+    db.execute("CREATE TABLE jc_t4 (id INT PRIMARY KEY, t3_id INT, v4 TEXT)")
+        .await;
+    db.execute("INSERT INTO jc_t1 VALUES (1,'a'),(2,'b')").await;
+    db.execute("INSERT INTO jc_t2 VALUES (10,1,'c'),(11,2,'d')")
+        .await;
+    db.execute("INSERT INTO jc_t3 VALUES (100,10,'e'),(101,11,'f')")
+        .await;
+    db.execute("INSERT INTO jc_t4 VALUES (1000,100,'g')").await;
+
+    let q = "SELECT t1.v1, t2.v2, t3.v3, t4.v4 \
+             FROM jc_t1 t1 \
+             JOIN jc_t2 t2 ON t2.t1_id = t1.id \
+             JOIN jc_t3 t3 ON t3.t2_id = t2.id \
+             JOIN jc_t4 t4 ON t4.t3_id = t3.id";
+    db.create_st("jc_st", q, "1m", "DIFFERENTIAL").await;
+    db.assert_st_matches_query("jc_st", q).await;
+
+    // Cycle 1: extend chain from the middle
+    db.execute("INSERT INTO jc_t3 VALUES (102, 10, 'h')").await;
+    db.execute("INSERT INTO jc_t4 VALUES (1001, 101, 'i')")
+        .await;
+    db.refresh_st("jc_st").await;
+    db.assert_st_matches_query("jc_st", q).await;
+
+    // Cycle 2: update a value in the middle of the chain
+    db.execute("UPDATE jc_t2 SET v2 = 'D' WHERE id = 11").await;
+    db.refresh_st("jc_st").await;
+    db.assert_st_matches_query("jc_st", q).await;
+
+    // Cycle 3: delete a root row — cascades through the chain
+    db.execute("DELETE FROM jc_t4 WHERE t3_id IN (SELECT id FROM jc_t3 WHERE t2_id = 11)")
+        .await;
+    db.execute("DELETE FROM jc_t3 WHERE t2_id = 11").await;
+    db.execute("DELETE FROM jc_t2 WHERE t1_id = 2").await;
+    db.execute("DELETE FROM jc_t1 WHERE id = 2").await;
+    db.refresh_st("jc_st").await;
+    db.assert_st_matches_query("jc_st", q).await;
+
+    // Cycle 4: add new leaf only (result still same — no new chain)
+    db.execute("INSERT INTO jc_t4 VALUES (1002, 999, 'orphan')")
+        .await;
+    db.refresh_st("jc_st").await;
+    db.assert_st_matches_query("jc_st", q).await;
+}
+
+/// NULL in join key: rows with NULL never match (SQL three-valued logic).
+#[tokio::test]
+async fn test_multi_cycle_join_null_key_transitions() {
+    let db = E2eDb::new().await.with_extension().await;
+    db.execute("CREATE TABLE nk_fact (id INT PRIMARY KEY, dim_id INT, fval TEXT)")
+        .await;
+    db.execute("CREATE TABLE nk_dim (id INT PRIMARY KEY, dval TEXT)")
+        .await;
+    db.execute("INSERT INTO nk_dim VALUES (1, 'd1'), (2, 'd2')")
+        .await;
+    db.execute("INSERT INTO nk_fact VALUES (10, 1, 'f1'), (11, NULL, 'fnull'), (12, 2, 'f2')")
+        .await;
+
+    // INNER JOIN — NULL dim_id rows must be absent from result
+    let q = "SELECT f.id, f.fval, d.dval \
+             FROM nk_fact f JOIN nk_dim d ON f.dim_id = d.id";
+    db.create_st("nk_st", q, "1m", "DIFFERENTIAL").await;
+    db.assert_st_matches_query("nk_st", q).await;
+
+    // Cycle 1: set NULL key to a real value → row joins in
+    db.execute("UPDATE nk_fact SET dim_id = 1 WHERE id = 11")
+        .await;
+    db.refresh_st("nk_st").await;
+    db.assert_st_matches_query("nk_st", q).await;
+
+    // Cycle 2: set real key back to NULL → row drops out
+    db.execute("UPDATE nk_fact SET dim_id = NULL WHERE id = 11")
+        .await;
+    db.refresh_st("nk_st").await;
+    db.assert_st_matches_query("nk_st", q).await;
+
+    // Cycle 3: insert a row with NULL from the start
+    db.execute("INSERT INTO nk_fact VALUES (13, NULL, 'fnull2')")
+        .await;
+    db.refresh_st("nk_st").await;
+    db.assert_st_matches_query("nk_st", q).await;
+
+    // Cycle 4: delete a matched row
+    db.execute("DELETE FROM nk_fact WHERE id = 10").await;
+    db.refresh_st("nk_st").await;
+    db.assert_st_matches_query("nk_st", q).await;
+
+    // Cycle 5: insert dim and update NULL facts to point at it
+    db.execute("INSERT INTO nk_dim VALUES (3, 'd3')").await;
+    db.execute("UPDATE nk_fact SET dim_id = 3 WHERE dim_id IS NULL")
+        .await;
+    db.refresh_st("nk_st").await;
+    db.assert_st_matches_query("nk_st", q).await;
+}

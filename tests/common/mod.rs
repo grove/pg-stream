@@ -268,4 +268,56 @@ impl TestDb {
             table_a, table_b, col_list
         );
     }
+
+    /// Assert that two table names expose exactly the same column names **and**
+    /// data types (in declaration order).
+    ///
+    /// When `assert_types_match` is `false` this is a no-op, so callers can
+    /// keep the parameter in their call-sites while deferring the type check.
+    pub async fn assert_column_types_match(
+        &self,
+        table_a: &str,
+        table_b: &str,
+        assert_types_match: bool,
+    ) {
+        if !assert_types_match {
+            return;
+        }
+        let type_sql = |table: &str| {
+            // Strip optional schema prefix so the WHERE clause works for
+            // both `public.my_st` and plain `my_st`.
+            let (schema_filter, name_filter) = if let Some(dot) = table.rfind('.') {
+                (
+                    format!("table_schema = '{}'", &table[..dot]),
+                    format!("table_name = '{}'", &table[dot + 1..]),
+                )
+            } else {
+                (
+                    "table_schema NOT IN ('pg_catalog','information_schema')".to_string(),
+                    format!("table_name = '{table}'"),
+                )
+            };
+            format!(
+                "SELECT column_name, data_type \
+                 FROM information_schema.columns \
+                 WHERE {schema_filter} AND {name_filter} \
+                   AND column_name NOT LIKE '__pgt_%' \
+                 ORDER BY ordinal_position"
+            )
+        };
+
+        let cols_a: Vec<(String, String)> = sqlx::query_as(&type_sql(table_a))
+            .fetch_all(&self.pool)
+            .await
+            .unwrap_or_else(|e| panic!("type query for {table_a} failed: {e}"));
+        let cols_b: Vec<(String, String)> = sqlx::query_as(&type_sql(table_b))
+            .fetch_all(&self.pool)
+            .await
+            .unwrap_or_else(|e| panic!("type query for {table_b} failed: {e}"));
+
+        assert_eq!(
+            cols_a, cols_b,
+            "Column type mismatch between {table_a} and {table_b}"
+        );
+    }
 }

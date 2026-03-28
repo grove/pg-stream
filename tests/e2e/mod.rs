@@ -1048,6 +1048,7 @@ impl E2eDb {
     /// Returns `true` if the scheduler was detected within `timeout`, or
     /// `false` if it never appeared. In the latter case the caller can assert
     /// or produce a meaningful failure message rather than a generic timeout.
+    #[must_use]
     pub async fn wait_for_scheduler(&self, timeout: std::time::Duration) -> bool {
         let start = std::time::Instant::now();
         let nudge_interval = std::time::Duration::from_secs(10);
@@ -1084,6 +1085,7 @@ impl E2eDb {
     ///
     /// Polls `data_timestamp` until it advances past the initial value
     /// or the timeout expires. Returns `true` if a refresh was detected.
+    #[must_use]
     pub async fn wait_for_auto_refresh(
         &self,
         pgt_name: &str,
@@ -1113,6 +1115,43 @@ impl E2eDb {
             if current_ts != initial_ts && current_ts.is_some() {
                 return true;
             }
+        }
+    }
+
+    /// General-purpose async polling helper with exponential backoff.
+    ///
+    /// Evaluates `condition_sql` (must return a single `BOOLEAN`) repeatedly
+    /// until it returns `true` or `timeout` expires.  The polling interval
+    /// starts at `initial_backoff` and doubles on each iteration up to
+    /// `max_backoff` (default: 2 s).
+    ///
+    /// Returns `true` if the condition was met, `false` on timeout.
+    /// The `label` is used only in timeout log messages for diagnostics.
+    #[must_use]
+    pub async fn wait_for_condition(
+        &self,
+        label: &str,
+        condition_sql: &str,
+        timeout: std::time::Duration,
+        initial_backoff: std::time::Duration,
+    ) -> bool {
+        let max_backoff = std::time::Duration::from_secs(2);
+        let start = std::time::Instant::now();
+        let mut backoff = initial_backoff;
+        loop {
+            let met: bool = self.query_scalar(condition_sql).await;
+            if met {
+                return true;
+            }
+            if start.elapsed() >= timeout {
+                eprintln!(
+                    "wait_for_condition({label}): timed out after {:.1}s",
+                    timeout.as_secs_f64()
+                );
+                return false;
+            }
+            tokio::time::sleep(backoff).await;
+            backoff = (backoff * 2).min(max_backoff);
         }
     }
 }
