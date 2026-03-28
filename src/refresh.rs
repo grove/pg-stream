@@ -823,6 +823,25 @@ pub fn capture_delta_to_bypass_table(
     .unwrap_or(Some(false))
     .unwrap_or(false);
 
+    // DAG-4/ST-ST-10: Read the MAX(lsn) from the persistent change buffer
+    // so that bypass table rows use an LSN that falls within the downstream
+    // ST's frontier range.  Between capture_incremental_diff_to_st_buffer
+    // (which writes to the persistent buffer inside execute_differential_refresh)
+    // and this bypass capture (called after execute_scheduled_refresh stores
+    // frontier and other catalog metadata), WAL-generating catalog DMLs advance
+    // pg_current_wal_lsn().  Using the stale higher LSN would cause the
+    // downstream scan's `lsn <= new_lsn` filter to exclude bypass rows,
+    // silently dropping the entire delta.
+    let change_schema = crate::config::pg_trickle_change_buffer_schema().replace('"', "\"\"");
+    let buffer_lsn: Option<String> = if crate::cdc::has_st_change_buffer(pgt_id, &change_schema) {
+        Spi::get_one::<String>(&format!(
+            "SELECT MAX(lsn)::text FROM \"{change_schema}\".changes_pgt_{pgt_id}",
+        ))
+        .unwrap_or(None)
+    } else {
+        None
+    };
+
     let count = if pre_snapshot_exists {
         let user_cols: Vec<String> = user_cols_typed.iter().map(|(n, _)| n.clone()).collect();
         let col_defs: String = std::iter::once("lsn pg_lsn".to_string())
@@ -838,9 +857,14 @@ pub fn capture_delta_to_bypass_table(
         let create_sql =
             format!("CREATE TEMP TABLE IF NOT EXISTS {bypass_table} ({col_defs}) ON COMMIT DROP",);
         Spi::run(&create_sql).map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
-        capture_diff_to_table(st, &user_cols, &bypass_table, pgt_id)?
+        capture_diff_to_table(st, &user_cols, &bypass_table, pgt_id, buffer_lsn.as_deref())?
     } else {
-        let sql = build_bypass_capture_sql(pgt_id, user_cols_typed, &bypass_table);
+        let sql = build_bypass_capture_sql(
+            pgt_id,
+            user_cols_typed,
+            &bypass_table,
+            buffer_lsn.as_deref(),
+        );
         Spi::connect_mut(|client| {
             let result = client
                 .update(&sql, None, &[])
@@ -873,11 +897,18 @@ pub fn capture_delta_to_bypass_table(
 /// (`lsn, action, pk_hash, new_col1, ...`).
 /// Reads the pre-snapshot from `__pgt_pre_{pgt_id}` and compares with the
 /// current state of the ST backing table.
+///
+/// `lsn_override`: when `Some("0/1A2B3C")`, the given literal LSN is used
+/// instead of `pg_current_wal_lsn()`.  This is required for bypass tables
+/// (DAG-4) where WAL-generating catalog DMLs between the persistent buffer
+/// capture and the bypass capture advance `pg_current_wal_lsn()` past the
+/// downstream ST's frontier upper bound.
 fn capture_diff_to_table(
     st: &StreamTableMeta,
     user_cols: &[String],
     target_table: &str,
     pgt_id: i64,
+    lsn_override: Option<&str>,
 ) -> Result<i64, PgTrickleError> {
     let schema = &st.pgt_schema;
     let name = &st.pgt_name;
@@ -917,12 +948,19 @@ fn capture_diff_to_table(
     let pre_pk_hash = build_content_hash_expr("pre.", user_cols);
     let post_pk_hash = build_content_hash_expr("post.", user_cols);
 
+    // DAG-4: When an LSN override is provided (bypass tables), use the
+    // literal value so the rows fall within the downstream frontier range.
+    let lsn_expr = match lsn_override {
+        Some(lsn) => format!("'{lsn}'::pg_lsn"),
+        None => "pg_current_wal_lsn()".to_string(),
+    };
+
     let mut total: i64 = 0;
 
     // Deleted rows: in pre but no longer in the table.
     let del_sql = format!(
         "INSERT INTO {target_table} (lsn, action, pk_hash, {new_col_list}) \
-         SELECT pg_current_wal_lsn(), 'D', {pre_pk_hash}, {pre_col_refs} \
+         SELECT {lsn_expr}, 'D', {pre_pk_hash}, {pre_col_refs} \
          FROM __pgt_pre_{pgt_id} pre \
          LEFT JOIN {quoted_table} post ON pre.__pgt_row_id = post.__pgt_row_id \
          WHERE post.__pgt_row_id IS NULL"
@@ -938,7 +976,7 @@ fn capture_diff_to_table(
     // Inserted rows: in table (scoped to delta row_ids) but not in pre.
     let ins_sql = format!(
         "INSERT INTO {target_table} (lsn, action, pk_hash, {new_col_list}) \
-         SELECT pg_current_wal_lsn(), 'I', {post_pk_hash}, {post_col_refs} \
+         SELECT {lsn_expr}, 'I', {post_pk_hash}, {post_col_refs} \
          FROM {quoted_table} post \
          JOIN (SELECT DISTINCT __pgt_row_id FROM __pgt_delta_{pgt_id}) delta \
            ON delta.__pgt_row_id = post.__pgt_row_id \
@@ -957,7 +995,7 @@ fn capture_diff_to_table(
     if !is_distinct_pairs.is_empty() {
         let chg_del_sql = format!(
             "INSERT INTO {target_table} (lsn, action, pk_hash, {new_col_list}) \
-             SELECT pg_current_wal_lsn(), 'D', {pre_pk_hash}, {pre_col_refs} \
+             SELECT {lsn_expr}, 'D', {pre_pk_hash}, {pre_col_refs} \
              FROM __pgt_pre_{pgt_id} pre \
              JOIN {quoted_table} post ON post.__pgt_row_id = pre.__pgt_row_id \
              WHERE {is_distinct_pairs}"
@@ -972,7 +1010,7 @@ fn capture_diff_to_table(
 
         let chg_ins_sql = format!(
             "INSERT INTO {target_table} (lsn, action, pk_hash, {new_col_list}) \
-             SELECT pg_current_wal_lsn(), 'I', {post_pk_hash}, {post_col_refs} \
+             SELECT {lsn_expr}, 'I', {post_pk_hash}, {post_col_refs} \
              FROM {quoted_table} post \
              JOIN __pgt_pre_{pgt_id} pre ON post.__pgt_row_id = pre.__pgt_row_id \
              WHERE {is_distinct_pairs}"
@@ -996,6 +1034,7 @@ pub fn build_bypass_capture_sql(
     pgt_id: i64,
     user_cols_typed: &[(String, String)],
     bypass_table: &str,
+    lsn_override: Option<&str>,
 ) -> String {
     let col_defs: String = std::iter::once("lsn pg_lsn".to_string())
         .chain(std::iter::once("action \"char\"".to_string()))
@@ -1025,10 +1064,17 @@ pub fn build_bypass_capture_sql(
     let col_names: Vec<String> = user_cols_typed.iter().map(|(n, _)| n.clone()).collect();
     let pk_hash_expr = build_content_hash_expr("d.", &col_names);
 
+    // DAG-4: Use the persistent buffer's LSN when available so the bypass
+    // rows fall within the downstream scan's frontier range.
+    let lsn_expr = match lsn_override {
+        Some(lsn) => format!("'{lsn}'::pg_lsn"),
+        None => "pg_current_wal_lsn()".to_string(),
+    };
+
     format!(
         "CREATE TEMP TABLE IF NOT EXISTS {bypass_table} ({col_defs}) ON COMMIT DROP;\n\
          INSERT INTO {bypass_table} (lsn, action, pk_hash, {new_col_list}) \
-         SELECT pg_current_wal_lsn(), d.__pgt_action, {pk_hash_expr}, {d_col_list} \
+         SELECT {lsn_expr}, d.__pgt_action, {pk_hash_expr}, {d_col_list} \
          FROM __pgt_delta_{pgt_id} d \
          WHERE d.__pgt_action IN ('I', 'D')"
     )
@@ -1052,7 +1098,7 @@ fn capture_incremental_diff_to_st_buffer(
     }
 
     let target_table = format!("\"{change_schema}\".changes_pgt_{pgt_id}");
-    let total = capture_diff_to_table(st, user_cols, &target_table, pgt_id)?;
+    let total = capture_diff_to_table(st, user_cols, &target_table, pgt_id, None)?;
 
     if total > 0 {
         pgrx::debug1!(
@@ -4946,6 +4992,7 @@ mod tests {
                 ("name".to_string(), "text".to_string()),
             ],
             "pg_temp.__pgt_bypass_42",
+            None,
         );
         // ST-ST-9: pk_hash should be content hash, not d.__pgt_row_id
         assert!(sql.contains("pg_trickle_hash_multi(ARRAY[d.\"id\"::TEXT, d.\"name\"::TEXT])"));
@@ -5067,6 +5114,7 @@ mod pg_tests {
                 ("name".to_string(), "text".to_string()),
             ],
             "pg_temp.__pgt_bypass_42",
+            None,
         );
         assert!(sql.contains("CREATE TEMP TABLE IF NOT EXISTS pg_temp.__pgt_bypass_42"));
         assert!(sql.contains("ON COMMIT DROP"));
@@ -5082,6 +5130,7 @@ mod pg_tests {
             7,
             &[("col\"name".to_string(), "text".to_string())],
             "pg_temp.__pgt_bypass_7",
+            None,
         );
         // Column with quote should be properly escaped.
         assert!(sql.contains(r#""new_col""name""#));
@@ -5097,6 +5146,7 @@ mod pg_tests {
                 ("b".to_string(), "text".to_string()),
             ],
             "pg_temp.__pgt_bypass_1",
+            None,
         );
         // Verify the column definitions in CREATE TEMP TABLE.
         assert!(sql.contains("lsn pg_lsn"));
@@ -5104,6 +5154,31 @@ mod pg_tests {
         assert!(sql.contains("pk_hash bigint"));
         assert!(sql.contains("\"new_a\" bigint"));
         assert!(sql.contains("\"new_b\" text"));
+    }
+
+    #[test]
+    fn test_build_bypass_capture_sql_lsn_override() {
+        let sql = build_bypass_capture_sql(
+            42,
+            &[("id".to_string(), "integer".to_string())],
+            "pg_temp.__pgt_bypass_42",
+            Some("0/1A2B3C"),
+        );
+        // Should use the literal LSN, not pg_current_wal_lsn()
+        assert!(sql.contains("'0/1A2B3C'::pg_lsn"));
+        assert!(!sql.contains("pg_current_wal_lsn()"));
+    }
+
+    #[test]
+    fn test_build_bypass_capture_sql_no_lsn_override() {
+        let sql = build_bypass_capture_sql(
+            42,
+            &[("id".to_string(), "integer".to_string())],
+            "pg_temp.__pgt_bypass_42",
+            None,
+        );
+        // Should use pg_current_wal_lsn() by default
+        assert!(sql.contains("pg_current_wal_lsn()"));
     }
 
     #[test]
