@@ -296,7 +296,7 @@ Every release requires manual updates to the files below. Missing any of them le
 | `INSTALL.md` | Update any version numbers in install commands or example URLs | Users copy-paste installation commands; stale versions cause failures. |
 | `docs/UPGRADING.md` | Add the new version-specific migration notes and extend the supported upgrade-path table | Documents exactly what `ALTER EXTENSION ... UPDATE` will do and which chains are supported. |
 | `sql/pg_trickle--<old>--<new>.sql` | Add or update the hand-authored upgrade script for every SQL-surface change (new objects, changed signatures, changed defaults, view changes). **Also carry forward all functions/views/tables added in previous releases — the upgrade script is cumulative.** | `ALTER EXTENSION ... UPDATE` only applies what is explicitly scripted; function defaults and signatures stored in `pg_proc` do not update themselves. Omitting a function that existed in `<old>` but is expected in `<new>` will break user upgrades. |
-| `sql/archive/pg_trickle--<new>.sql` | Commit the generated full-install SQL baseline for the new version | Future upgrade-completeness checks and upgrade E2E tests need an exact baseline for the released version. |
+| `sql/archive/pg_trickle--<new>.sql` | Regenerate and commit the full-install SQL baseline for the new version. **This file was created as a placeholder copy of `<prev>` at the start of the development cycle — it must be replaced with the actual generated SQL before tagging.** Run `cargo pgrx schema` (or the equivalent `just` target) to produce the final schema, then overwrite the placeholder. | Future upgrade-completeness checks and upgrade E2E tests need an exact baseline for the released version. A stale placeholder from the start of the cycle will cause spurious failures. |
 | `.github/workflows/ci.yml`, `justfile`, `tests/build_e2e_upgrade_image.sh`, `tests/Dockerfile.e2e-upgrade` | Advance the upgrade-check chain and default upgrade-E2E target version to the new release | Prevents release automation and local upgrade validation from getting stuck on the previous version after a new migration hop is added. |
 | `pg_trickle.control` | **No manual edit needed** — `default_version` is set to `'@CARGO_VERSION@'` and pgrx substitutes it at build time. Verify the substitution in the built artifact. | Ensures the SQL `CREATE EXTENSION` command installs the right version. |
 
@@ -318,7 +318,7 @@ Every release requires manual updates to the files below. Missing any of them le
 [ ] INSTALL.md — version references current
 [ ] docs/UPGRADING.md — latest migration notes and supported chains added
 [ ] sql/pg_trickle--<old>--<new>.sql — covers every SQL-surface change AND carries forward all previous release functions
-[ ] sql/archive/pg_trickle--<new>.sql — archived full install SQL committed
+[ ] sql/archive/pg_trickle--<new>.sql — regenerated from final schema and committed (replaces the dev-cycle placeholder)
 [ ] just check-upgrade-all — all upgrade steps pass completeness checks (not just the one-step hop)
 [ ] Upgrade automation defaults — CI/local upgrade checks and E2E target the new version
 [ ] just check-version-sync — all version references in sync
