@@ -18,6 +18,45 @@
 --   D-4: Shared change buffers -- new pgt_shared_change_buffers catalog
 --        table; multi-frontier cleanup coordination.
 --
+-- ── Phase 0: Ensure 0.11.0 Functions Are Present ─────────────────────────────
+-- (These functions should have been in v0.11.0 and need to be carried forward)
+
+-- FUSE-1: reset_fuse — resets a blown fuse on a stream table.
+CREATE OR REPLACE FUNCTION pgtrickle."reset_fuse"(
+        "name" TEXT,
+        "action" TEXT DEFAULT 'apply'
+) RETURNS void
+STRICT
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'reset_fuse_wrapper';
+
+-- FUSE-1: fuse_status — returns fuse circuit breaker status for all stream tables.
+CREATE OR REPLACE FUNCTION pgtrickle."fuse_status"() RETURNS TABLE (
+        "stream_table" TEXT,
+        "fuse_mode" TEXT,
+        "fuse_state" TEXT,
+        "fuse_ceiling" bigint,
+        "effective_ceiling" bigint,
+        "fuse_sensitivity" INT,
+        "blown_at" timestamp with time zone,
+        "blow_reason" TEXT
+)
+STRICT
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'fuse_status_wrapper';
+
+-- G12-ERM-1: explain_refresh_mode — explains the effective refresh mode for a stream table.
+CREATE OR REPLACE FUNCTION pgtrickle."explain_refresh_mode"(
+        "name" TEXT
+) RETURNS TABLE (
+        "configured_mode" TEXT,
+        "effective_mode" TEXT,
+        "downgrade_reason" TEXT
+)
+STRICT
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'explain_refresh_mode_wrapper';
+
 -- ── Phase 2: Developer Diagnostic Functions ───────────────────────────────
 
 -- DT-1: explain_query_rewrite — walk a query through every DVM rewrite pass.
