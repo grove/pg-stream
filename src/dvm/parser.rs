@@ -9856,6 +9856,37 @@ fn try_extract_exists_corr_pair(pred: &Expr, inner_aliases: &[String]) -> Option
     }
 }
 
+/// Qualify unqualified column references in an expression with the given
+/// table alias.  Used for IN-subquery inner expressions to prevent ambiguity
+/// when the inner SELECT target shares column names with the outer query
+/// (e.g., both tables have an `id` column).  Without qualification the
+/// join-condition rewriter resolves the bare name against the left (outer)
+/// tree first, producing incorrect delta SQL.
+fn qualify_inner_col_refs(expr: Expr, alias: &str) -> Expr {
+    match expr {
+        Expr::ColumnRef {
+            table_alias: None,
+            column_name,
+        } => Expr::ColumnRef {
+            table_alias: Some(alias.to_string()),
+            column_name,
+        },
+        Expr::BinaryOp { op, left, right } => Expr::BinaryOp {
+            op,
+            left: Box::new(qualify_inner_col_refs(*left, alias)),
+            right: Box::new(qualify_inner_col_refs(*right, alias)),
+        },
+        Expr::FuncCall { func_name, args } => Expr::FuncCall {
+            func_name,
+            args: args
+                .into_iter()
+                .map(|a| qualify_inner_col_refs(a, alias))
+                .collect(),
+        },
+        other => other,
+    }
+}
+
 /// Parse an ANY SubLink (IN / = ANY) into a SublinkWrapper.
 ///
 /// `x IN (SELECT col FROM inner_table WHERE filter)`
@@ -10043,10 +10074,13 @@ fn parse_any_sublink(
         // Build the equality condition using the output column name.
         // The inner_col_expr (from the SELECT list) is a group-by column
         // that passes through Aggregate → Filter → Subquery.
+        // Qualify inner column refs with the Subquery alias to prevent
+        // ambiguity when outer and inner tables share column names.
+        let inner_col_qualified = qualify_inner_col_refs(inner_col_expr, inner_tree.alias());
         let equality = Expr::BinaryOp {
             op: "=".to_string(),
             left: Box::new(test_expr),
-            right: Box::new(inner_col_expr),
+            right: Box::new(inner_col_qualified),
         };
 
         return Ok(SublinkWrapper {
@@ -10058,11 +10092,17 @@ fn parse_any_sublink(
 
     // ── Simple case: no GROUP BY / HAVING ───────────────────────────
 
+    // Qualify inner column refs with the inner tree's alias to prevent
+    // ambiguity when outer and inner tables share column names (e.g.,
+    // both have "id").  Without this, the join-condition rewriter
+    // resolves bare "id" against the left (outer) tree first.
+    let inner_col_qualified = qualify_inner_col_refs(inner_col_expr, inner_tree.alias());
+
     // Build the equality condition: test_expr = inner_col_expr
     let equality = Expr::BinaryOp {
         op: "=".to_string(),
         left: Box::new(test_expr),
-        right: Box::new(inner_col_expr),
+        right: Box::new(inner_col_qualified),
     };
 
     // Combine with inner WHERE clause if present
