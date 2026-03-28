@@ -2391,6 +2391,14 @@ fn extract_partition_bounds(
     let cols = crate::api::parse_partition_key_columns(partition_key);
 
     match method {
+        crate::api::PartitionMethod::Hash => {
+            // HASH partitions use per-partition MERGE loop — this function
+            // should never be called for HASH. The orchestration dispatches
+            // HASH before reaching extract_partition_bounds.
+            Err(PgTrickleError::SpiError(
+                "extract_partition_bounds called for HASH partition (should use per-partition MERGE)".to_string(),
+            ))
+        }
         crate::api::PartitionMethod::List => {
             // LIST: single column — collect distinct values.
             let qcol = crate::api::quote_identifier(&cols[0]);
@@ -2515,6 +2523,241 @@ fn inject_partition_predicate(
         }
     };
     merge_sql.replace("__PGT_PART_PRED__", &pred)
+}
+
+// ── A1-3b: Per-partition MERGE for HASH partitioned stream tables ───
+
+/// Metadata for a HASH child partition.
+struct HashChild {
+    /// Fully-qualified name: `"schema"."child_name"`
+    qualified_name: String,
+    modulus: i32,
+    remainder: i32,
+}
+
+/// Discover HASH child partitions (modulus, remainder) for a parent table.
+fn get_hash_children(parent_oid: pg_sys::Oid) -> Result<Vec<HashChild>, PgTrickleError> {
+    Spi::connect(|client| {
+        let rows = client
+            .select(
+                "SELECT n.nspname::text, c.relname::text, \
+                        (pg_partition_bound_spec(c.oid, i.inhparent))::text \
+                 FROM pg_inherits i \
+                 JOIN pg_class c ON c.oid = i.inhrelid \
+                 JOIN pg_namespace n ON n.oid = c.relnamespace \
+                 WHERE i.inhparent = $1 \
+                 ORDER BY c.relname",
+                None,
+                &[parent_oid.into()],
+            )
+            .map_err(|e| PgTrickleError::SpiError(format!("hash children: {e}")))?;
+
+        let mut children = Vec::new();
+        for row in rows {
+            let map_spi = |e: pgrx::spi::SpiError| PgTrickleError::SpiError(e.to_string());
+            let schema = row.get::<String>(1).map_err(map_spi)?.unwrap_or_default();
+            let name = row.get::<String>(2).map_err(map_spi)?.unwrap_or_default();
+            let bound_spec = row.get::<String>(3).map_err(map_spi)?.unwrap_or_default();
+
+            // Parse "FOR VALUES WITH (modulus N, remainder M)"
+            let (modulus, remainder) = parse_hash_bound_spec(&bound_spec)?;
+
+            let qualified_name = format!(
+                "{}.{}",
+                crate::api::quote_identifier(&schema),
+                crate::api::quote_identifier(&name),
+            );
+            children.push(HashChild {
+                qualified_name,
+                modulus,
+                remainder,
+            });
+        }
+        Ok(children)
+    })
+}
+
+/// Parse a PostgreSQL HASH partition bound spec.
+///
+/// Input: `"FOR VALUES WITH (modulus 4, remainder 2)"`
+/// Returns: `(4, 2)`
+pub(crate) fn parse_hash_bound_spec(spec: &str) -> Result<(i32, i32), PgTrickleError> {
+    // Parsing pattern: "FOR VALUES WITH (modulus N, remainder M)"
+    let upper = spec.to_uppercase();
+    let modulus = extract_keyword_int(&upper, "MODULUS")?;
+    let remainder = extract_keyword_int(&upper, "REMAINDER")?;
+    Ok((modulus, remainder))
+}
+
+/// Extract an integer value following a keyword in a partition bound spec.
+fn extract_keyword_int(spec: &str, keyword: &str) -> Result<i32, PgTrickleError> {
+    let pos = spec
+        .find(keyword)
+        .ok_or_else(|| PgTrickleError::SpiError(format!("missing {keyword} in bound spec")))?;
+    let after = &spec[pos + keyword.len()..];
+    let digits: String = after
+        .chars()
+        .skip_while(|c| !c.is_ascii_digit())
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
+    digits
+        .parse::<i32>()
+        .map_err(|_| PgTrickleError::SpiError(format!("invalid {keyword} value in bound spec")))
+}
+
+/// Execute per-partition MERGE for a HASH partitioned stream table.
+///
+/// 1. Materialize the delta into a temp table.
+/// 2. Discover child partitions via `pg_inherits`.
+/// 3. For each child: MERGE from delta filtered by `satisfies_hash_partition()`.
+///
+/// Returns `(total_merge_count, "hash_merge")`.
+fn execute_hash_partitioned_merge(
+    merge_sql: &str,
+    resolved_delta_sql: &str,
+    schema: &str,
+    name: &str,
+    parent_oid: pg_sys::Oid,
+    partition_key: &str,
+    pgt_id: i64,
+) -> Result<usize, PgTrickleError> {
+    let cols = crate::api::parse_partition_key_columns(partition_key);
+    let qcol = crate::api::quote_identifier(&cols[0]);
+
+    // Step 1: Materialize delta into a temp table.
+    let temp_name = format!("__pgt_hash_delta_{pgt_id}");
+    let materialize_sql =
+        format!("CREATE TEMP TABLE {temp_name} ON COMMIT DROP AS {resolved_delta_sql}");
+    Spi::run(&materialize_sql)
+        .map_err(|e| PgTrickleError::SpiError(format!("hash delta materialize: {e}")))?;
+
+    // Check if delta is empty.
+    let delta_count = Spi::get_one::<i64>(&format!("SELECT count(*)::bigint FROM {temp_name}"))
+        .map_err(|e| PgTrickleError::SpiError(format!("hash delta count: {e}")))?
+        .unwrap_or(0);
+    if delta_count == 0 {
+        pgrx::debug1!("[pg_trickle] A1-3b: empty hash delta for {schema}.{name}, skipping MERGE");
+        return Ok(0);
+    }
+
+    // Step 2: Discover child partitions.
+    let children = get_hash_children(parent_oid)?;
+    if children.is_empty() {
+        return Err(PgTrickleError::SpiError(format!(
+            "HASH partitioned table {schema}.{name} has no child partitions"
+        )));
+    }
+
+    pgrx::debug1!(
+        "[pg_trickle] A1-3b: HASH per-partition MERGE for {}.{}: {} partitions, {} delta rows",
+        schema,
+        name,
+        children.len(),
+        delta_count,
+    );
+
+    // Step 3: Per-partition MERGE.
+    // The original merge_sql targets the parent table. We rewrite it for each
+    // child, replacing the parent target with the child, and filtering the
+    // delta USING clause through satisfies_hash_partition().
+    let parent_target = format!(
+        "{}.{}",
+        crate::api::quote_identifier(schema),
+        crate::api::quote_identifier(name),
+    );
+
+    let mut total_count = 0usize;
+    for child in &children {
+        // Build child-specific MERGE:
+        // 1. Replace target table with child partition (ONLY to avoid routing)
+        // 2. Replace the USING clause's delta with hash-filtered delta
+        // 3. Strip the __PGT_PART_PRED__ placeholder (not needed for direct child)
+        // Build per-child MERGE with filtered USING clause.
+        // Strategy: find USING clause and inject hash filter into the temp table.
+        // Simpler: just build a fresh MERGE targeting the child with filtered delta.
+        let child_merge_sql = build_hash_child_merge(
+            &child.qualified_name,
+            &temp_name,
+            &qcol,
+            parent_oid,
+            child.modulus,
+            child.remainder,
+            merge_sql,
+            &parent_target,
+        );
+
+        let n = Spi::connect_mut(|client| {
+            let result = client
+                .update(&child_merge_sql, None, &[])
+                .map_err(|e| PgTrickleError::SpiError(format!("hash merge child: {e}")))?;
+            Ok::<usize, PgTrickleError>(result.len())
+        })?;
+
+        if n > 0 {
+            pgrx::debug1!(
+                "[pg_trickle] A1-3b: MERGE into {} touched {} rows",
+                child.qualified_name,
+                n,
+            );
+        }
+        total_count += n;
+    }
+
+    Ok(total_count)
+}
+
+/// Build a MERGE SQL statement targeting a specific HASH child partition.
+///
+/// The delta is filtered to only rows whose partition key hashes to this child
+/// using PostgreSQL's `satisfies_hash_partition()` function.
+#[allow(clippy::too_many_arguments)]
+fn build_hash_child_merge(
+    child_target: &str,
+    temp_delta: &str,
+    quoted_partition_col: &str,
+    parent_oid: pg_sys::Oid,
+    modulus: i32,
+    remainder: i32,
+    original_merge: &str,
+    parent_target: &str,
+) -> String {
+    // The original MERGE has a USING clause that references the delta.
+    // We replace the entire MERGE to target the child with a filtered delta.
+    //
+    // Strategy: rewrite the original merge_sql by:
+    // 1. Replacing the parent target with ONLY child_target
+    // 2. Wrapping the USING subquery to filter through satisfies_hash_partition
+    // 3. Removing the __PGT_PART_PRED__ placeholder
+
+    // Find and replace "USING (...) AS d" with filtered version that reads
+    // from the materialized temp table.
+    let using_start = original_merge.find("USING (");
+    let on_clause = original_merge.find(" ON st.");
+
+    if let (Some(us), Some(on)) = (using_start, on_clause) {
+        // Reconstruct: everything before USING + filtered USING + everything from ON
+        let before_using = &original_merge[..us];
+        let from_on = &original_merge[on..];
+
+        // Build filtered USING clause
+        let filtered_using = format!(
+            "USING (SELECT * FROM {temp_delta} WHERE \
+             satisfies_hash_partition({parent_oid}::oid, {modulus}, {remainder}, {quoted_partition_col})) AS d",
+            parent_oid = parent_oid.to_u32(),
+        );
+
+        let result = format!("{before_using}{filtered_using}{from_on}",);
+
+        // Replace parent target with ONLY child_target and strip predicate placeholder
+        result
+            .replace(parent_target, &format!("ONLY {child_target}"))
+            .replace("__PGT_PART_PRED__", "")
+    } else {
+        // Fallback: simple replacement (shouldn't happen in practice)
+        original_merge
+            .replace(parent_target, &format!("ONLY {child_target}"))
+            .replace("__PGT_PART_PRED__", "")
+    }
 }
 
 // ── PART-WARN: Default partition growth warning ─────────────────────
@@ -3630,34 +3873,57 @@ pub fn execute_differential_refresh(
     // pruning: only partitions overlapping [min, max] are visited, reducing
     // MERGE I/O proportionally to the number of affected partitions.
     //
+    // A1-3b: HASH partitions use a per-partition MERGE loop instead of
+    // predicate injection (hash functions are not range-invertible).
+    //
     // If the delta is empty (all changes cancel out), return early —
     // there is nothing to MERGE.
-    if let Some(ref pk) = st.st_partition_key {
-        match extract_partition_bounds(&resolved.resolved_delta_sql, pk)? {
-            None => {
-                // Delta produced no rows for the partition key — fast path.
-                pgrx::debug1!(
-                    "[pg_trickle] A1-3: empty partition-key delta for {}.{}, skipping MERGE",
-                    schema,
-                    name,
-                );
-                return Ok((0, 0));
-            }
-            Some(bounds) => {
-                pgrx::debug1!(
-                    "[pg_trickle] A1-3: partition bounds for {}.{}: {:?}",
-                    schema,
-                    name,
-                    match &bounds {
-                        PartitionBounds::Range { mins, maxs } =>
-                            format!("RANGE [{mins:?}, {maxs:?}]"),
-                        PartitionBounds::List(vals) => format!("LIST {:?}", vals),
-                    },
-                );
-                resolved.merge_sql = inject_partition_predicate(&resolved.merge_sql, pk, &bounds);
+    let hash_merge_result: Option<(usize, &str)> = if let Some(ref pk) = st.st_partition_key {
+        let method = crate::api::parse_partition_method(pk);
+        if method == crate::api::PartitionMethod::Hash {
+            // A1-3b: Per-partition MERGE for HASH partitioned STs.
+            let count = execute_hash_partitioned_merge(
+                &resolved.merge_sql,
+                &resolved.resolved_delta_sql,
+                schema,
+                name,
+                st.pgt_relid,
+                pk,
+                st.pgt_id,
+            )?;
+            Some((count, "hash_merge"))
+        } else {
+            // RANGE / LIST: extract bounds and inject predicate.
+            match extract_partition_bounds(&resolved.resolved_delta_sql, pk)? {
+                None => {
+                    // Delta produced no rows for the partition key — fast path.
+                    pgrx::debug1!(
+                        "[pg_trickle] A1-3: empty partition-key delta for {}.{}, skipping MERGE",
+                        schema,
+                        name,
+                    );
+                    return Ok((0, 0));
+                }
+                Some(bounds) => {
+                    pgrx::debug1!(
+                        "[pg_trickle] A1-3: partition bounds for {}.{}: {:?}",
+                        schema,
+                        name,
+                        match &bounds {
+                            PartitionBounds::Range { mins, maxs } =>
+                                format!("RANGE [{mins:?}, {maxs:?}]"),
+                            PartitionBounds::List(vals) => format!("LIST {:?}", vals),
+                        },
+                    );
+                    resolved.merge_sql =
+                        inject_partition_predicate(&resolved.merge_sql, pk, &bounds);
+                    None
+                }
             }
         }
-    }
+    } else {
+        None
+    };
 
     // ── D-2: Prepared-statement flag ─────────────────────────────────
     // PB2: Disable prepared statements when pooler_compatibility_mode is on.
@@ -3680,7 +3946,10 @@ pub fn execute_differential_refresh(
         && st.st_partition_key.is_none()
         && !has_pgt_placeholders;
 
-    let (merge_count, strategy_label) = if use_explicit_dml {
+    let (merge_count, strategy_label) = if let Some(result) = hash_merge_result {
+        // A1-3b: HASH per-partition MERGE already executed above.
+        result
+    } else if use_explicit_dml {
         // ── User-trigger path: explicit DML ─────────────────────────
         // Decompose the MERGE into DELETE + UPDATE + INSERT so that
         // user-defined triggers fire with correct TG_OP / OLD / NEW.
@@ -5368,5 +5637,57 @@ mod pg_tests {
         let sql = build_keyless_delete_template("\"s\".\"t\"", 5);
         // The WHERE clause must use <= del_count to limit paired deletions
         assert!(sql.contains("<= dc.del_count"));
+    }
+
+    // ── A1-3b: HASH partition bound spec parsing ────────────────────────────
+
+    #[test]
+    fn test_parse_hash_bound_spec_basic() {
+        let (m, r) = parse_hash_bound_spec("FOR VALUES WITH (modulus 4, remainder 2)").unwrap();
+        assert_eq!(m, 4);
+        assert_eq!(r, 2);
+    }
+
+    #[test]
+    fn test_parse_hash_bound_spec_various_values() {
+        let (m, r) = parse_hash_bound_spec("FOR VALUES WITH (modulus 8, remainder 7)").unwrap();
+        assert_eq!(m, 8);
+        assert_eq!(r, 7);
+    }
+
+    #[test]
+    fn test_parse_hash_bound_spec_remainder_zero() {
+        let (m, r) = parse_hash_bound_spec("FOR VALUES WITH (modulus 4, remainder 0)").unwrap();
+        assert_eq!(m, 4);
+        assert_eq!(r, 0);
+    }
+
+    #[test]
+    fn test_parse_hash_bound_spec_missing_modulus() {
+        let result = parse_hash_bound_spec("FOR VALUES WITH (remainder 2)");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_hash_bound_spec_missing_remainder() {
+        let result = parse_hash_bound_spec("FOR VALUES WITH (modulus 4)");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_extract_keyword_int_basic() {
+        assert_eq!(
+            extract_keyword_int("MODULUS 4, REMAINDER 2", "MODULUS").unwrap(),
+            4
+        );
+        assert_eq!(
+            extract_keyword_int("MODULUS 4, REMAINDER 2", "REMAINDER").unwrap(),
+            2
+        );
+    }
+
+    #[test]
+    fn test_extract_keyword_int_missing() {
+        assert!(extract_keyword_int("SOME OTHER TEXT", "MODULUS").is_err());
     }
 }

@@ -1057,20 +1057,44 @@ fn setup_storage_table(
     Spi::run(&storage_ddl)
         .map_err(|e| PgTrickleError::SpiError(format!("Failed to create storage table: {}", e)))?;
 
-    // A1-1: For partitioned storage tables, create a catch-all default partition
-    // so that rows are never rejected due to missing partition coverage.
-    // Users add explicit partitions via standard PostgreSQL DDL (ATTACH PARTITION).
-    if let Some(_pk) = partition_key {
-        let default_partition_sql = format!(
-            "CREATE TABLE {}.{} PARTITION OF {}.{} DEFAULT",
-            quote_identifier(schema),
-            quote_identifier(&format!("{table_name}_default")),
-            quote_identifier(schema),
-            quote_identifier(table_name),
-        );
-        Spi::run(&default_partition_sql).map_err(|e| {
-            PgTrickleError::SpiError(format!("Failed to create default partition: {}", e))
-        })?;
+    // A1-1/A1-3b: For partitioned storage tables, create child partitions.
+    // RANGE/LIST: create a catch-all default partition so rows are never rejected.
+    // HASH: create N child partitions (no default allowed by PostgreSQL).
+    if let Some(pk) = partition_key {
+        let method = parse_partition_method(pk);
+        match method {
+            PartitionMethod::Hash => {
+                let modulus = parse_hash_modulus(pk).unwrap_or(4);
+                for remainder in 0..modulus {
+                    let child_name = format!("{table_name}_p{remainder}");
+                    let child_sql = format!(
+                        "CREATE TABLE {}.{} PARTITION OF {}.{} \
+                         FOR VALUES WITH (modulus {modulus}, remainder {remainder})",
+                        quote_identifier(schema),
+                        quote_identifier(&child_name),
+                        quote_identifier(schema),
+                        quote_identifier(table_name),
+                    );
+                    Spi::run(&child_sql).map_err(|e| {
+                        PgTrickleError::SpiError(format!(
+                            "Failed to create hash partition {child_name}: {e}"
+                        ))
+                    })?;
+                }
+            }
+            PartitionMethod::Range | PartitionMethod::List => {
+                let default_partition_sql = format!(
+                    "CREATE TABLE {}.{} PARTITION OF {}.{} DEFAULT",
+                    quote_identifier(schema),
+                    quote_identifier(&format!("{table_name}_default")),
+                    quote_identifier(schema),
+                    quote_identifier(table_name),
+                );
+                Spi::run(&default_partition_sql).map_err(|e| {
+                    PgTrickleError::SpiError(format!("Failed to create default partition: {}", e))
+                })?;
+            }
+        }
     }
 
     let pgt_relid = get_table_oid(schema, table_name)?;
@@ -5402,11 +5426,25 @@ fn validate_partition_key(
             "partition_by must contain at least one non-empty column name".to_string(),
         ));
     }
-    // A1-1d: PostgreSQL LIST partitioning supports exactly one column.
+    // A1-1d/A1-3b: PostgreSQL LIST and HASH partitioning support exactly one column.
     let method = parse_partition_method(partition_key);
-    if method == PartitionMethod::List && parts.len() > 1 {
+    if (method == PartitionMethod::List || method == PartitionMethod::Hash) && parts.len() > 1 {
+        return Err(PgTrickleError::InvalidArgument(format!(
+            "{} partitioning supports only a single column",
+            match method {
+                PartitionMethod::List => "LIST",
+                PartitionMethod::Hash => "HASH",
+                _ => unreachable!(),
+            }
+        )));
+    }
+    // A1-3b: Validate HASH modulus if specified.
+    if method == PartitionMethod::Hash
+        && let Some(m) = parse_hash_modulus(partition_key)
+        && !(2..=256).contains(&m)
+    {
         return Err(PgTrickleError::InvalidArgument(
-            "LIST partitioning supports only a single column".to_string(),
+            "HASH partition modulus must be between 2 and 256".to_string(),
         ));
     }
     let available: Vec<&str> = columns.iter().map(|c| c.name.as_str()).collect();
@@ -5441,41 +5479,80 @@ pub(crate) fn parse_partition_key_columns(partition_key: &str) -> Vec<String> {
         .collect()
 }
 
-/// A1-1d: Partition method: RANGE (default), LIST, or HASH.
+/// A1-1d/A1-3b: Partition method: RANGE (default), LIST, or HASH.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PartitionMethod {
     Range,
     List,
+    Hash,
 }
 
 /// Parse the partition method from the `partition_by` specification.
 ///
-/// Format: `"[LIST:]col[,col2]"`.  The `LIST:` prefix selects LIST
-/// partitioning; bare column names default to RANGE.
+/// Format: `"[LIST:|HASH:]col[,col2]"`.  The `LIST:` prefix selects LIST
+/// partitioning, `HASH:` selects HASH; bare column names default to RANGE.
+/// For HASH, an optional `:N` suffix sets the modulus (e.g. `HASH:id:8`).
 ///
 /// # Examples
 /// ```text
 /// "sale_date"              → Range
 /// "sale_date,region"       → Range  (multi-column RANGE)
 /// "LIST:region"            → List
+/// "HASH:customer_id"       → Hash  (default 4 partitions)
+/// "HASH:customer_id:8"     → Hash  (8 partitions)
 /// ```
 pub(crate) fn parse_partition_method(partition_key: &str) -> PartitionMethod {
     let trimmed = partition_key.trim();
-    if trimmed.to_uppercase().starts_with("LIST:") {
+    let upper = trimmed.to_uppercase();
+    if upper.starts_with("LIST:") {
         PartitionMethod::List
+    } else if upper.starts_with("HASH:") {
+        PartitionMethod::Hash
     } else {
         PartitionMethod::Range
     }
 }
 
+/// A1-3b: Parse the HASH modulus from a partition key specification.
+///
+/// `"HASH:id:8"` → `8`, `"HASH:id"` → `4` (default).
+/// Returns `None` for non-HASH partition methods.
+pub(crate) fn parse_hash_modulus(partition_key: &str) -> Option<u32> {
+    if parse_partition_method(partition_key) != PartitionMethod::Hash {
+        return None;
+    }
+    let trimmed = partition_key.trim();
+    // Strip "HASH:" prefix (5 chars)
+    let rest = &trimmed[5..];
+    // Look for second ":" — "col:N"
+    if let Some(pos) = rest.rfind(':') {
+        let modulus_str = &rest[pos + 1..];
+        if let Ok(m) = modulus_str.parse::<u32>() {
+            return Some(m);
+        }
+    }
+    Some(4) // default modulus
+}
+
 /// Strip the partition method prefix from a partition key specification,
 /// returning only the column name(s).  Case-insensitive.
 ///
-/// `"LIST:region"` → `"region"`, `"sale_date"` → `"sale_date"`
+/// `"LIST:region"` → `"region"`, `"HASH:id:8"` → `"id"`,
+/// `"sale_date"` → `"sale_date"`
 pub(crate) fn strip_partition_mode_prefix(partition_key: &str) -> &str {
     let trimmed = partition_key.trim();
     if trimmed.len() >= 5 && trimmed[..5].eq_ignore_ascii_case("LIST:") {
         &trimmed[5..]
+    } else if trimmed.len() >= 5 && trimmed[..5].eq_ignore_ascii_case("HASH:") {
+        let rest = &trimmed[5..];
+        // Strip optional ":N" modulus suffix
+        if let Some(pos) = rest.rfind(':') {
+            let suffix = &rest[pos + 1..];
+            if suffix.parse::<u32>().is_ok() {
+                return &rest[..pos];
+            }
+        }
+        rest
     } else {
         trimmed
     }
@@ -6480,6 +6557,7 @@ fn build_create_table_sql(
             let method_kw = match method {
                 PartitionMethod::Range => "RANGE",
                 PartitionMethod::List => "LIST",
+                PartitionMethod::Hash => "HASH",
             };
             format!("\nPARTITION BY {} ({})", method_kw, quoted.join(", "))
         })
@@ -8103,6 +8181,198 @@ mod tests {
         assert!(
             msg.contains("region"),
             "Error should mention the missing column: {msg}"
+        );
+    }
+
+    // ── A1-3b: HASH partitioning tests ──────────────────────────────────────
+
+    #[test]
+    fn test_parse_partition_method_hash_upper() {
+        assert_eq!(
+            parse_partition_method("HASH:customer_id"),
+            PartitionMethod::Hash,
+        );
+    }
+
+    #[test]
+    fn test_parse_partition_method_hash_lower() {
+        assert_eq!(
+            parse_partition_method("hash:customer_id"),
+            PartitionMethod::Hash,
+        );
+    }
+
+    #[test]
+    fn test_parse_partition_method_hash_mixed_case() {
+        assert_eq!(
+            parse_partition_method("Hash:customer_id"),
+            PartitionMethod::Hash,
+        );
+    }
+
+    #[test]
+    fn test_parse_partition_method_hash_with_modulus() {
+        assert_eq!(parse_partition_method("HASH:id:8"), PartitionMethod::Hash,);
+    }
+
+    #[test]
+    fn test_parse_hash_modulus_default() {
+        assert_eq!(parse_hash_modulus("HASH:id"), Some(4));
+    }
+
+    #[test]
+    fn test_parse_hash_modulus_explicit() {
+        assert_eq!(parse_hash_modulus("HASH:id:8"), Some(8));
+    }
+
+    #[test]
+    fn test_parse_hash_modulus_min_value() {
+        assert_eq!(parse_hash_modulus("HASH:id:2"), Some(2));
+    }
+
+    #[test]
+    fn test_parse_hash_modulus_large() {
+        assert_eq!(parse_hash_modulus("HASH:id:256"), Some(256));
+    }
+
+    #[test]
+    fn test_parse_hash_modulus_non_hash_returns_none() {
+        assert_eq!(parse_hash_modulus("sale_date"), None);
+    }
+
+    #[test]
+    fn test_parse_hash_modulus_list_returns_none() {
+        assert_eq!(parse_hash_modulus("LIST:region"), None);
+    }
+
+    #[test]
+    fn test_strip_partition_mode_prefix_hash() {
+        assert_eq!(
+            strip_partition_mode_prefix("HASH:customer_id"),
+            "customer_id"
+        );
+    }
+
+    #[test]
+    fn test_strip_partition_mode_prefix_hash_lower() {
+        assert_eq!(
+            strip_partition_mode_prefix("hash:customer_id"),
+            "customer_id"
+        );
+    }
+
+    #[test]
+    fn test_strip_partition_mode_prefix_hash_with_modulus() {
+        assert_eq!(strip_partition_mode_prefix("HASH:id:8"), "id");
+    }
+
+    #[test]
+    fn test_strip_partition_mode_prefix_hash_with_modulus_256() {
+        assert_eq!(
+            strip_partition_mode_prefix("HASH:customer_id:256"),
+            "customer_id"
+        );
+    }
+
+    #[test]
+    fn test_parse_partition_key_columns_with_hash_prefix() {
+        let cols = parse_partition_key_columns("HASH:customer_id");
+        assert_eq!(cols, vec!["customer_id"]);
+    }
+
+    #[test]
+    fn test_parse_partition_key_columns_with_hash_modulus() {
+        let cols = parse_partition_key_columns("HASH:customer_id:8");
+        assert_eq!(cols, vec!["customer_id"]);
+    }
+
+    #[test]
+    fn test_validate_partition_key_hash_single_column_ok() {
+        let columns = vec![
+            ColumnDef {
+                name: "customer_id".to_string(),
+                type_oid: PgOid::Invalid,
+            },
+            ColumnDef {
+                name: "amount".to_string(),
+                type_oid: PgOid::Invalid,
+            },
+        ];
+        assert!(validate_partition_key("HASH:customer_id", &columns).is_ok());
+    }
+
+    #[test]
+    fn test_validate_partition_key_hash_with_modulus_ok() {
+        let columns = vec![ColumnDef {
+            name: "id".to_string(),
+            type_oid: PgOid::Invalid,
+        }];
+        assert!(validate_partition_key("HASH:id:8", &columns).is_ok());
+    }
+
+    #[test]
+    fn test_validate_partition_key_hash_multi_column_rejected() {
+        let columns = vec![
+            ColumnDef {
+                name: "a".to_string(),
+                type_oid: PgOid::Invalid,
+            },
+            ColumnDef {
+                name: "b".to_string(),
+                type_oid: PgOid::Invalid,
+            },
+        ];
+        let err = validate_partition_key("HASH:a,b", &columns);
+        assert!(err.is_err());
+        let msg = err.unwrap_err().to_string();
+        assert!(
+            msg.contains("single column"),
+            "Error should mention single column: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_validate_partition_key_hash_missing_column() {
+        let columns = vec![ColumnDef {
+            name: "amount".to_string(),
+            type_oid: PgOid::Invalid,
+        }];
+        let err = validate_partition_key("HASH:customer_id", &columns);
+        assert!(err.is_err());
+        let msg = err.unwrap_err().to_string();
+        assert!(
+            msg.contains("customer_id"),
+            "Error should mention the missing column: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_validate_partition_key_hash_modulus_too_low() {
+        let columns = vec![ColumnDef {
+            name: "id".to_string(),
+            type_oid: PgOid::Invalid,
+        }];
+        let err = validate_partition_key("HASH:id:1", &columns);
+        assert!(err.is_err());
+        let msg = err.unwrap_err().to_string();
+        assert!(
+            msg.contains("modulus"),
+            "Error should mention modulus: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_validate_partition_key_hash_modulus_too_high() {
+        let columns = vec![ColumnDef {
+            name: "id".to_string(),
+            type_oid: PgOid::Invalid,
+        }];
+        let err = validate_partition_key("HASH:id:257", &columns);
+        assert!(err.is_err());
+        let msg = err.unwrap_err().to_string();
+        assert!(
+            msg.contains("modulus"),
+            "Error should mention modulus: {msg}"
         );
     }
 }

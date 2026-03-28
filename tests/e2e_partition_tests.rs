@@ -1705,3 +1705,330 @@ async fn test_alter_st_partition_by_invalid_column_error() {
         "Error should mention the invalid column: {msg}"
     );
 }
+
+// ── A1-3b: HASH partitioned stream tables ───────────────────────────────
+
+#[tokio::test]
+async fn test_partitioned_st_hash_create_and_refresh() {
+    let db = E2eDb::new().await.with_extension().await;
+
+    db.execute(
+        "CREATE TABLE hash_src (
+            id SERIAL PRIMARY KEY,
+            customer_id INT NOT NULL,
+            amount NUMERIC NOT NULL
+        )",
+    )
+    .await;
+
+    db.execute(
+        "INSERT INTO hash_src (customer_id, amount) VALUES
+         (1, 100), (2, 200), (3, 300), (4, 400), (1, 50)",
+    )
+    .await;
+
+    // A1-3b: create HASH-partitioned stream table (default 4 partitions)
+    db.create_st_partitioned(
+        "hash_summary",
+        "SELECT customer_id, SUM(amount) AS total FROM hash_src GROUP BY customer_id",
+        "1m",
+        "DIFFERENTIAL",
+        "HASH:customer_id",
+    )
+    .await;
+
+    // Verify catalog stores the HASH: prefix
+    let pk: Option<String> = db
+        .query_scalar_opt(
+            "SELECT st_partition_key FROM pgtrickle.pgt_stream_tables \
+             WHERE pgt_name = 'hash_summary'",
+        )
+        .await;
+    assert_eq!(pk.as_deref(), Some("HASH:customer_id"));
+
+    // Verify storage table is HASH-partitioned
+    let part_strategy: String = db
+        .query_scalar(
+            "SELECT partstrat FROM pg_partitioned_table pt \
+             JOIN pg_class c ON c.oid = pt.partrelid \
+             WHERE c.relname = 'hash_summary'",
+        )
+        .await;
+    assert_eq!(
+        part_strategy, "h",
+        "storage table should be HASH-partitioned (partstrat='h')"
+    );
+
+    // Verify 4 child partitions were auto-created (hash_summary_p0 .. p3)
+    let child_count: i64 = db
+        .query_scalar(
+            "SELECT count(*)::bigint FROM pg_inherits i \
+             JOIN pg_class c ON c.oid = i.inhrelid \
+             JOIN pg_class p ON p.oid = i.inhparent \
+             WHERE p.relname = 'hash_summary'",
+        )
+        .await;
+    assert_eq!(
+        child_count, 4,
+        "HASH:customer_id should auto-create 4 child partitions"
+    );
+
+    // No default partition for HASH
+    let default_exists: bool = db
+        .query_scalar(
+            "SELECT EXISTS(\
+               SELECT 1 FROM pg_class WHERE relname = 'hash_summary_default'\
+             )",
+        )
+        .await;
+    assert!(
+        !default_exists,
+        "HASH partitions should not have a default partition"
+    );
+
+    db.refresh_st("hash_summary").await;
+
+    let count: i64 = db.count("hash_summary").await;
+    assert_eq!(count, 4, "4 customers should be in the HASH-partitioned ST");
+
+    db.assert_st_matches_query(
+        "hash_summary",
+        "SELECT customer_id, SUM(amount) AS total FROM hash_src GROUP BY customer_id",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn test_partitioned_st_hash_differential_refresh() {
+    let db = E2eDb::new().await.with_extension().await;
+
+    db.execute(
+        "CREATE TABLE hdiff_src (
+            id SERIAL PRIMARY KEY,
+            customer_id INT NOT NULL,
+            val INT NOT NULL
+        )",
+    )
+    .await;
+
+    db.execute("INSERT INTO hdiff_src (customer_id, val) VALUES (10, 100), (20, 200), (30, 300)")
+        .await;
+
+    db.create_st_partitioned(
+        "hdiff_st",
+        "SELECT customer_id, SUM(val) AS total FROM hdiff_src GROUP BY customer_id",
+        "1m",
+        "DIFFERENTIAL",
+        "HASH:customer_id",
+    )
+    .await;
+
+    db.refresh_st("hdiff_st").await;
+    let count_1: i64 = db.count("hdiff_st").await;
+    assert_eq!(count_1, 3, "initial refresh should produce 3 rows");
+
+    // Insert more data — should be incrementally merged
+    db.execute("INSERT INTO hdiff_src (customer_id, val) VALUES (10, 50), (40, 400)")
+        .await;
+
+    db.refresh_st("hdiff_st").await;
+    let count_2: i64 = db.count("hdiff_st").await;
+    assert_eq!(count_2, 4, "after insert, 4 customers total");
+
+    db.assert_st_matches_query(
+        "hdiff_st",
+        "SELECT customer_id, SUM(val) AS total FROM hdiff_src GROUP BY customer_id",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn test_partitioned_st_hash_custom_modulus() {
+    let db = E2eDb::new().await.with_extension().await;
+
+    db.execute(
+        "CREATE TABLE hmod_src (
+            id SERIAL PRIMARY KEY,
+            key_col INT NOT NULL,
+            val INT NOT NULL
+        )",
+    )
+    .await;
+
+    db.execute("INSERT INTO hmod_src (key_col, val) VALUES (1, 10), (2, 20), (3, 30)")
+        .await;
+
+    // HASH with explicit modulus 8
+    db.create_st_partitioned(
+        "hmod_st",
+        "SELECT key_col, SUM(val) AS total FROM hmod_src GROUP BY key_col",
+        "1m",
+        "DIFFERENTIAL",
+        "HASH:key_col:8",
+    )
+    .await;
+
+    // Verify 8 child partitions were created
+    let child_count: i64 = db
+        .query_scalar(
+            "SELECT count(*)::bigint FROM pg_inherits i \
+             JOIN pg_class c ON c.oid = i.inhrelid \
+             JOIN pg_class p ON p.oid = i.inhparent \
+             WHERE p.relname = 'hmod_st'",
+        )
+        .await;
+    assert_eq!(
+        child_count, 8,
+        "HASH:key_col:8 should auto-create 8 child partitions"
+    );
+
+    db.refresh_st("hmod_st").await;
+
+    db.assert_st_matches_query(
+        "hmod_st",
+        "SELECT key_col, SUM(val) AS total FROM hmod_src GROUP BY key_col",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn test_partitioned_st_hash_multi_column_rejected() {
+    let db = E2eDb::new().await.with_extension().await;
+
+    db.execute(
+        "CREATE TABLE hmulti_src (
+            id SERIAL PRIMARY KEY,
+            a INT NOT NULL,
+            b INT NOT NULL,
+            val INT NOT NULL
+        )",
+    )
+    .await;
+
+    // HASH does not support multi-column partition keys
+    let err = db
+        .try_execute(
+            "SELECT pgtrickle.create_stream_table('hmulti_st', \
+             $$SELECT a, b, SUM(val) AS total FROM hmulti_src GROUP BY a, b$$, \
+             '1m', 'DIFFERENTIAL', partition_by => 'HASH:a,b')",
+        )
+        .await;
+    assert!(err.is_err(), "HASH with multi-column should be rejected");
+    let msg = err.unwrap_err().to_string();
+    assert!(
+        msg.contains("single column"),
+        "Error should mention single column: {msg}"
+    );
+}
+
+#[tokio::test]
+async fn test_partitioned_st_hash_updates_and_deletes() {
+    let db = E2eDb::new().await.with_extension().await;
+
+    db.execute(
+        "CREATE TABLE hud_src (
+            id SERIAL PRIMARY KEY,
+            customer_id INT NOT NULL,
+            val INT NOT NULL
+        )",
+    )
+    .await;
+
+    db.execute("INSERT INTO hud_src (customer_id, val) VALUES (1, 100), (2, 200), (3, 300)")
+        .await;
+
+    db.create_st_partitioned(
+        "hud_st",
+        "SELECT customer_id, SUM(val) AS total FROM hud_src GROUP BY customer_id",
+        "1m",
+        "DIFFERENTIAL",
+        "HASH:customer_id",
+    )
+    .await;
+
+    db.refresh_st("hud_st").await;
+    assert_eq!(db.count("hud_st").await, 3i64);
+
+    // Update an existing row
+    db.execute("UPDATE hud_src SET val = 999 WHERE customer_id = 2")
+        .await;
+    // Delete a row
+    db.execute("DELETE FROM hud_src WHERE customer_id = 3")
+        .await;
+
+    db.refresh_st("hud_st").await;
+
+    let count: i64 = db.count("hud_st").await;
+    assert_eq!(count, 2, "customer 3 should be removed after delete");
+
+    db.assert_st_matches_query(
+        "hud_st",
+        "SELECT customer_id, SUM(val) AS total FROM hud_src GROUP BY customer_id",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn test_alter_st_partition_by_hash() {
+    let db = E2eDb::new().await.with_extension().await;
+
+    db.execute(
+        "CREATE TABLE alt_hash_src (
+            id SERIAL PRIMARY KEY,
+            key_col INT NOT NULL,
+            val INT NOT NULL
+        )",
+    )
+    .await;
+
+    db.execute("INSERT INTO alt_hash_src (key_col, val) VALUES (1, 10), (2, 20)")
+        .await;
+
+    // Start with RANGE partition
+    db.create_st_partitioned(
+        "alt_hash_st",
+        "SELECT key_col, SUM(val) AS total FROM alt_hash_src GROUP BY key_col",
+        "1m",
+        "DIFFERENTIAL",
+        "key_col",
+    )
+    .await;
+
+    db.refresh_st("alt_hash_st").await;
+
+    // ALTER to HASH partition
+    db.execute(
+        "SELECT pgtrickle.alter_stream_table('alt_hash_st', partition_by => 'HASH:key_col')",
+    )
+    .await;
+
+    // Verify the partition key was updated
+    let pk: Option<String> = db
+        .query_scalar_opt(
+            "SELECT st_partition_key FROM pgtrickle.pgt_stream_tables \
+             WHERE pgt_name = 'alt_hash_st'",
+        )
+        .await;
+    assert_eq!(pk.as_deref(), Some("HASH:key_col"));
+
+    // Verify the storage is now HASH-partitioned
+    let part_strategy: String = db
+        .query_scalar(
+            "SELECT partstrat FROM pg_partitioned_table pt \
+             JOIN pg_class c ON c.oid = pt.partrelid \
+             WHERE c.relname = 'alt_hash_st'",
+        )
+        .await;
+    assert_eq!(
+        part_strategy, "h",
+        "ALTER should switch to HASH partitioning"
+    );
+
+    db.refresh_st("alt_hash_st").await;
+
+    db.assert_st_matches_query(
+        "alt_hash_st",
+        "SELECT key_col, SUM(val) AS total FROM alt_hash_src GROUP BY key_col",
+    )
+    .await;
+}
