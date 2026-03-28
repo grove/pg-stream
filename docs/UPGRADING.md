@@ -322,6 +322,58 @@ reinitialise to add them.
 - Recursive CTE stream tables with DELETE/UPDATE now use the Delete-and-Rederive
   algorithm (O(delta) instead of O(n)).
 
+### 0.10.0 → 0.11.0
+
+**New catalog columns** added to `pgtrickle.pgt_stream_tables`:
+
+| Column | Type | Default | Purpose |
+|--------|------|---------|--------|
+| `effective_refresh_mode` | `TEXT` | `NULL` | Actual refresh mode used in the last cycle (FULL / DIFFERENTIAL / APPEND_ONLY / TOP_K / NO_DATA); populated by the scheduler after each completed refresh |
+| `fuse_mode` | `TEXT NOT NULL` | `'off'` | Circuit-breaker mode: `off`, `on`, or `auto` |
+| `fuse_state` | `TEXT NOT NULL` | `'armed'` | Circuit-breaker state: `armed`, `blown`, or `disabled` |
+| `fuse_ceiling` | `BIGINT` | `NULL` | Maximum change-row count that can pass through in one refresh before the fuse blows; `NULL` = unlimited |
+| `fuse_sensitivity` | `INT` | `NULL` | Sensitivity multiplier for auto-fuse detection |
+| `blown_at` | `TIMESTAMPTZ` | `NULL` | Timestamp when the fuse last triggered |
+| `blow_reason` | `TEXT` | `NULL` | Human-readable reason the fuse blew |
+| `st_partition_key` | `TEXT` | `NULL` | Partition key column for declaratively partitioned stream tables; `NULL` = not partitioned |
+
+**Updated function signatures** — existing calls continue to work because new parameters all have defaults:
+
+- `pgtrickle.create_stream_table(...)` gains `partition_by TEXT DEFAULT NULL`
+- `pgtrickle.create_stream_table_if_not_exists(...)` likewise
+- `pgtrickle.create_or_replace_stream_table(...)` likewise
+- `pgtrickle.alter_stream_table(...)` gains `fuse TEXT DEFAULT NULL`, `fuse_ceiling BIGINT DEFAULT NULL`, `fuse_sensitivity INT DEFAULT NULL`
+
+**New functions**:
+
+- `pgtrickle.reset_fuse(name TEXT, action TEXT DEFAULT 'apply')` — clear a blown fuse and resume scheduling
+- `pgtrickle.fuse_status()` — returns circuit-breaker state for every stream table
+- `pgtrickle.explain_refresh_mode(name TEXT)` — shows configured mode, effective mode, and the reason for any downgrade
+
+**Behavioral notes:**
+
+- Event-driven wake (`pg_trickle.event_driven_wake`) is `on` by default — the background worker now wakes within ~15 ms of a source-table write instead of waiting up to 500 ms.
+- Stream-table-to-stream-table chains now refresh **incrementally** — downstream tables receive a small insert/delete delta rather than cascading full refreshes.
+- `pg_trickle.tiered_scheduling` now defaults to `on`.
+- Declaratively partitioned stream tables are supported via `partition_by` — the refresh MERGE is automatically restricted to only the changed partitions.
+
+### 0.11.0 → 0.12.0
+
+**No schema changes.** This release adds four new diagnostic SQL functions only:
+
+| Function | Returns | Purpose |
+|----------|---------|--------|
+| `pgtrickle.explain_query_rewrite(query TEXT)` | `TABLE(pass_name TEXT, changed BOOL, sql_after TEXT)` | Walk a query through every DVM rewrite pass to see how pg_trickle transforms it |
+| `pgtrickle.diagnose_errors(name TEXT)` | `TABLE(event_time TIMESTAMPTZ, error_type TEXT, error_message TEXT, remediation TEXT)` | Last 5 FAILED refresh events with error classification and suggested fixes |
+| `pgtrickle.list_auxiliary_columns(name TEXT)` | `TABLE(column_name TEXT, data_type TEXT, purpose TEXT)` | List all hidden `__pgt_*` auxiliary columns on a stream table's storage relation |
+| `pgtrickle.validate_query(query TEXT)` | `TABLE(valid BOOL, mode TEXT, reason TEXT)` | Parse and validate a query for stream-table compatibility without creating one |
+
+**Behavioral notes:**
+
+- The incremental engine now handles multi-table join deletes correctly — phantom rows after simultaneous deletes from multiple join sides no longer occur.
+- Stream-table-to-stream-table row identity is now computed consistently between the change buffer and the downstream table, eliminating stale duplicate rows after upstream UPDATEs.
+- `pg_trickle.tiered_scheduling` defaults to `on` (same as 0.11.0 runtime behaviour; this release makes it the explicit default).
+
 ---
 
 ## Supported Upgrade Paths
@@ -343,9 +395,11 @@ automatically when you run `ALTER EXTENSION pg_trickle UPDATE`.
 | 0.7.0 | 0.8.0 | `pg_trickle--0.7.0--0.8.0.sql` |
 | 0.8.0 | 0.9.0 | `pg_trickle--0.8.0--0.9.0.sql` |
 | 0.9.0 | 0.10.0 | `pg_trickle--0.9.0--0.10.0.sql` |
+| 0.10.0 | 0.11.0 | `pg_trickle--0.10.0--0.11.0.sql` |
+| 0.11.0 | 0.12.0 | `pg_trickle--0.11.0--0.12.0.sql` |
 
-That means any installation currently on 0.1.3 through 0.9.0 can upgrade to
-0.10.0 in one step after the new binaries are installed and PostgreSQL has been
+That means any installation currently on 0.1.3 through 0.11.0 can upgrade to
+0.12.0 in one step after the new binaries are installed and PostgreSQL has been
 restarted.
 
 ---

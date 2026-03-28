@@ -249,7 +249,7 @@ SELECT pgtrickle.drop_stream_table('regional_totals');
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | System architecture and data flow |
 | [docs/DVM_OPERATORS.md](docs/DVM_OPERATORS.md) | Supported operators and differentiation rules |
 | [docs/CONFIGURATION.md](docs/CONFIGURATION.md) | GUC variables and tuning guide |
-| [ROADMAP.md](ROADMAP.md) | Release milestones and future plans (current milestone: v0.11.0) |
+| [ROADMAP.md](ROADMAP.md) | Release milestones and future plans (current milestone: v0.12.0) |
 
 ### Research & Plans
 
@@ -384,7 +384,7 @@ cargo test
 cargo bench
 ```
 
-**Test counts:** ~1,042 unit tests + integration tests + 819 E2E tests.
+**Test counts:** ~1,590 unit tests + integration tests + ~1,260 E2E tests.
 
 ### Code Coverage
 
