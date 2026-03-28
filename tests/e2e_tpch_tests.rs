@@ -3106,6 +3106,7 @@ async fn ec01b_combined_delete_test(qname: &str, query_sql: &str) {
         }
         Err(e) => panic!("{qname} refresh error after combined delete: {e}"),
     }
+    let _t = Instant::now();
 
     assert_tpch_invariant(&db, &st_name, query_sql, qname, 1)
         .await

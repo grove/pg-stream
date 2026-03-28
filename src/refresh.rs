@@ -673,6 +673,38 @@ fn apply_planner_hints(estimated_delta: i64, st_relid: pg_sys::Oid) {
 
 // ── ST-to-ST Delta Capture (Phase 8.2/8.3) ─────────────────────────────
 
+/// Build a SQL expression that computes a content-hash of all user columns.
+///
+/// Downstream stream tables always see an upstream ST as keyless (no PK
+/// constraint), so they compute `__pgt_row_id` from ALL user columns via
+/// `row_id_key_columns()`.  The `pk_hash` stored in the ST change buffer
+/// **must** match that all-column content hash — otherwise the downstream
+/// MERGE will never find the existing row to DELETE.
+///
+/// This is a pure-logic helper for unit testing.
+pub fn build_content_hash_expr(prefix: &str, user_cols: &[String]) -> String {
+    match user_cols.len() {
+        0 => format!("{prefix}__pgt_row_id"),
+        1 => {
+            let c = user_cols[0].replace('"', "\"\"");
+            format!("pgtrickle.pg_trickle_hash({prefix}\"{c}\"::TEXT)")
+        }
+        _ => {
+            let args: Vec<String> = user_cols
+                .iter()
+                .map(|c| {
+                    let escaped = c.replace('"', "\"\"");
+                    format!("{prefix}\"{escaped}\"::TEXT")
+                })
+                .collect();
+            format!(
+                "pgtrickle.pg_trickle_hash_multi(ARRAY[{}])",
+                args.join(", ")
+            )
+        }
+    }
+}
+
 /// Capture delta rows from a materialized delta temp table into the ST's
 /// change buffer for downstream ST consumption.
 ///
@@ -705,10 +737,17 @@ fn capture_delta_to_st_buffer(
         .collect::<Vec<_>>()
         .join(", ");
 
+    // ST-ST-9: Use a content hash of ALL user columns as pk_hash.
+    // Downstream STs always treat upstream STs as keyless (no PK
+    // constraint), so their __pgt_row_id = hash(all columns).  The
+    // pk_hash in the buffer must match this content hash for MERGE
+    // matching to work during differential refresh.
+    let pk_hash_expr = build_content_hash_expr("d.", user_cols);
+
     let sql = format!(
         "INSERT INTO \"{change_schema}\".changes_pgt_{pgt_id} \
          (lsn, action, pk_hash, {new_col_list}) \
-         SELECT pg_current_wal_lsn(), d.__pgt_action, d.__pgt_row_id, \
+         SELECT pg_current_wal_lsn(), d.__pgt_action, {pk_hash_expr}, \
                 {d_col_list} \
          FROM __pgt_delta_{pgt_id} d \
          WHERE d.__pgt_action IN ('I', 'D')"
@@ -825,10 +864,15 @@ pub fn build_bypass_capture_sql(
         .collect::<Vec<_>>()
         .join(", ");
 
+    // ST-ST-9: Use content hash of all user columns (see
+    // build_content_hash_expr doc comment for rationale).
+    let col_names: Vec<String> = user_cols_typed.iter().map(|(n, _)| n.clone()).collect();
+    let pk_hash_expr = build_content_hash_expr("d.", &col_names);
+
     format!(
         "CREATE TEMP TABLE IF NOT EXISTS {bypass_table} ({col_defs}) ON COMMIT DROP;\n\
          INSERT INTO {bypass_table} (lsn, action, pk_hash, {new_col_list}) \
-         SELECT pg_current_wal_lsn(), d.__pgt_action, d.__pgt_row_id, {d_col_list} \
+         SELECT pg_current_wal_lsn(), d.__pgt_action, {pk_hash_expr}, {d_col_list} \
          FROM __pgt_delta_{pgt_id} d \
          WHERE d.__pgt_action IN ('I', 'D')"
     )
@@ -888,11 +932,16 @@ fn capture_full_refresh_diff_to_st_buffer(
 
     let mut total_count: i64 = 0;
 
+    // ST-ST-9: Use content hash of all user columns for pk_hash (see
+    // build_content_hash_expr doc comment for rationale).
+    let pre_pk_hash = build_content_hash_expr("pre.", user_cols);
+    let post_pk_hash = build_content_hash_expr("post.", user_cols);
+
     // Deleted rows: in pre but not in post
     let deleted_sql = format!(
         "INSERT INTO \"{change_schema}\".changes_pgt_{pgt_id} \
          (lsn, action, pk_hash, {new_col_list}) \
-         SELECT pg_current_wal_lsn(), 'D', pre.__pgt_row_id, {pre_col_refs} \
+         SELECT pg_current_wal_lsn(), 'D', {pre_pk_hash}, {pre_col_refs} \
          FROM __pgt_pre_{pgt_id} pre \
          LEFT JOIN {quoted_table} post ON pre.__pgt_row_id = post.__pgt_row_id \
          WHERE post.__pgt_row_id IS NULL"
@@ -909,7 +958,7 @@ fn capture_full_refresh_diff_to_st_buffer(
     let inserted_sql = format!(
         "INSERT INTO \"{change_schema}\".changes_pgt_{pgt_id} \
          (lsn, action, pk_hash, {new_col_list}) \
-         SELECT pg_current_wal_lsn(), 'I', post.__pgt_row_id, {post_col_refs} \
+         SELECT pg_current_wal_lsn(), 'I', {post_pk_hash}, {post_col_refs} \
          FROM {quoted_table} post \
          LEFT JOIN __pgt_pre_{pgt_id} pre ON post.__pgt_row_id = pre.__pgt_row_id \
          WHERE pre.__pgt_row_id IS NULL"
@@ -924,32 +973,46 @@ fn capture_full_refresh_diff_to_st_buffer(
 
     // Changed rows: same row_id but different content.
     //
-    // ST-ST-8: Emit only an INSERT event (not a D+I pair) for changed rows.
-    // The downstream keyless decomposition CTE groups by pk_hash and computes
-    // net_count = SUM(delta_sign).  When D and I events share the same
-    // pk_hash (__pgt_row_id is based on the GROUP BY key, which is stable
-    // across value changes), they cancel to net_count=0 and the row is
-    // excluded from the delta — effectively losing the change.
-    //
-    // Emitting only an I event avoids the cancellation: net_count=+1 produces
-    // an INSERT action in the scan CTE.  The downstream MERGE then matches
-    // the existing row (WHEN MATCHED AND __pgt_action='I' THEN UPDATE).
+    // ST-ST-9: With content-hash pk_hash, the old D and new I have
+    // DIFFERENT pk_hash values (content changed), so the downstream
+    // keyless decomposition correctly sees them as independent events
+    // (no accidental cancellation).  Emit both D (old values) and
+    // I (new values) so the downstream can delete the old row and
+    // insert the new one.
     if !is_distinct_pairs.is_empty() {
+        // D event: old content hash + old column values
+        let changed_del_sql = format!(
+            "INSERT INTO \"{change_schema}\".changes_pgt_{pgt_id} \
+             (lsn, action, pk_hash, {new_col_list}) \
+             SELECT pg_current_wal_lsn(), 'D', {pre_pk_hash}, {pre_col_refs} \
+             FROM __pgt_pre_{pgt_id} pre \
+             JOIN {quoted_table} post ON post.__pgt_row_id = pre.__pgt_row_id \
+             WHERE {is_distinct_pairs}"
+        );
+        let chg_del_count = Spi::connect_mut(|client| {
+            let result = client
+                .update(&changed_del_sql, None, &[])
+                .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
+            Ok::<i64, PgTrickleError>(result.len() as i64)
+        })?;
+        total_count += chg_del_count;
+
+        // I event: new content hash + new column values
         let changed_ins_sql = format!(
             "INSERT INTO \"{change_schema}\".changes_pgt_{pgt_id} \
              (lsn, action, pk_hash, {new_col_list}) \
-             SELECT pg_current_wal_lsn(), 'I', post.__pgt_row_id, {post_col_refs} \
+             SELECT pg_current_wal_lsn(), 'I', {post_pk_hash}, {post_col_refs} \
              FROM {quoted_table} post \
              JOIN __pgt_pre_{pgt_id} pre ON post.__pgt_row_id = pre.__pgt_row_id \
              WHERE {is_distinct_pairs}"
         );
-        let chg_count = Spi::connect_mut(|client| {
+        let chg_ins_count = Spi::connect_mut(|client| {
             let result = client
                 .update(&changed_ins_sql, None, &[])
                 .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
             Ok::<i64, PgTrickleError>(result.len() as i64)
         })?;
-        total_count += chg_count;
+        total_count += chg_ins_count;
     }
 
     if total_count > 0 {
@@ -4592,6 +4655,50 @@ mod tests {
     fn test_should_warn_low_threshold() {
         // threshold = 2.0, ratio = 10/2 = 5.0 → warn
         assert!(should_warn_amplification(2, 10, 2.0));
+    }
+
+    // ── ST-ST-9: Content hash for ST change buffer pk_hash ──────────
+
+    #[test]
+    fn test_build_content_hash_expr_single_col() {
+        let expr = build_content_hash_expr("d.", &["id".to_string()]);
+        assert_eq!(expr, "pgtrickle.pg_trickle_hash(d.\"id\"::TEXT)");
+    }
+
+    #[test]
+    fn test_build_content_hash_expr_multi_col() {
+        let expr = build_content_hash_expr("d.", &["id".to_string(), "val".to_string()]);
+        assert_eq!(
+            expr,
+            "pgtrickle.pg_trickle_hash_multi(ARRAY[d.\"id\"::TEXT, d.\"val\"::TEXT])"
+        );
+    }
+
+    #[test]
+    fn test_build_content_hash_expr_quoted_col() {
+        let expr = build_content_hash_expr("pre.", &["col\"name".to_string()]);
+        assert_eq!(expr, "pgtrickle.pg_trickle_hash(pre.\"col\"\"name\"::TEXT)");
+    }
+
+    #[test]
+    fn test_build_content_hash_expr_empty_cols_fallback() {
+        let expr = build_content_hash_expr("d.", &[]);
+        assert_eq!(expr, "d.__pgt_row_id");
+    }
+
+    #[test]
+    fn test_bypass_capture_uses_content_hash() {
+        let sql = build_bypass_capture_sql(
+            42,
+            &[
+                ("id".to_string(), "integer".to_string()),
+                ("name".to_string(), "text".to_string()),
+            ],
+            "pg_temp.__pgt_bypass_42",
+        );
+        // ST-ST-9: pk_hash should be content hash, not d.__pgt_row_id
+        assert!(sql.contains("pg_trickle_hash_multi(ARRAY[d.\"id\"::TEXT, d.\"name\"::TEXT])"));
+        assert!(!sql.contains("d.__pgt_row_id"));
     }
 }
 
