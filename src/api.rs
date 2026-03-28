@@ -481,6 +481,7 @@ fn create_or_replace_stream_table_impl(
                 None, // fuse: not set via create_or_replace
                 None, // fuse_ceiling: not set via create_or_replace
                 None, // fuse_sensitivity: not set via create_or_replace
+                None, // partition_by: not changed via create_or_replace
             )?;
 
             pgrx::info!(
@@ -1816,7 +1817,7 @@ fn alter_stream_table_query(
                 &vq.sum2_aux_columns,
                 &vq.covar_aux_columns,
                 &vq.nonnull_aux_columns,
-                None, // alter_stream_table: partition_key changes not supported
+                st.st_partition_key.as_deref(), // A1-1c: preserve partition key on query change
             )?
         }
     };
@@ -2040,6 +2041,112 @@ fn alter_stream_table_query(
             SchemaChange::Compatible { .. } => "compatible",
             SchemaChange::Incompatible { .. } => "incompatible (full rebuild)",
         }
+    );
+
+    Ok(())
+}
+
+/// A1-1c: Change the partition key on an existing stream table.
+///
+/// This is a destructive operation that:
+/// 1. Validates the new partition key against the ST's output columns.
+/// 2. Drops the old storage table (detaching pgt_relid first).
+/// 3. Recreates it with the new partition scheme (or unpartitioned).
+/// 4. Updates the catalog.
+/// 5. Runs a full refresh to repopulate.
+fn alter_stream_table_partition_key(
+    st: &StreamTableMeta,
+    schema: &str,
+    table_name: &str,
+    new_partition_key: Option<&str>,
+) -> Result<(), PgTrickleError> {
+    // Get current storage columns for validation.
+    let columns = get_storage_table_columns(schema, table_name)?;
+
+    // Validate new partition key against current columns.
+    if let Some(pk) = new_partition_key {
+        validate_partition_key(pk, &columns)?;
+    }
+
+    pgrx::warning!(
+        "pg_trickle: ALTER partition_by on {schema}.{table_name} requires full storage rebuild. \
+         The storage table will be recreated and a full refresh applied."
+    );
+
+    // Detach pgt_relid so the sql_drop event trigger does not delete the
+    // catalog row when we drop the old table.
+    Spi::run_with_args(
+        "UPDATE pgtrickle.pgt_stream_tables \
+         SET pgt_relid = 0 WHERE pgt_id = $1",
+        &[st.pgt_id.into()],
+    )
+    .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
+
+    // Drop the old storage table (CASCADE drops child partitions too).
+    let drop_sql = format!(
+        "DROP TABLE IF EXISTS {}.{} CASCADE",
+        quote_identifier(schema),
+        quote_identifier(table_name),
+    );
+    Spi::run(&drop_sql)
+        .map_err(|e| PgTrickleError::SpiError(format!("Failed to drop storage table: {e}")))?;
+
+    // Recompute auxiliary column needs from the defining query.
+    let needs_pgt_count = crate::dvm::query_needs_pgt_count(&st.defining_query);
+    let needs_dual_count = crate::dvm::query_needs_dual_count(&st.defining_query);
+    let avg_aux = crate::dvm::query_avg_aux_columns(&st.defining_query);
+    let sum2_aux = crate::dvm::query_sum2_aux_columns(&st.defining_query);
+    let covar_aux = crate::dvm::query_covar_aux_columns(&st.defining_query);
+    let nonnull_aux = crate::dvm::query_nonnull_aux_columns(&st.defining_query);
+
+    // Recreate the storage table with the new partition scheme.
+    let new_pgt_relid = setup_storage_table(
+        schema,
+        table_name,
+        &columns,
+        needs_pgt_count,
+        needs_dual_count,
+        st.has_keyless_source,
+        st.refresh_mode,
+        None, // parsed_tree not needed for storage creation
+        &avg_aux,
+        &sum2_aux,
+        &covar_aux,
+        &nonnull_aux,
+        new_partition_key,
+    )?;
+
+    // Update catalog: new relid + new partition key.
+    Spi::run_with_args(
+        "UPDATE pgtrickle.pgt_stream_tables \
+         SET pgt_relid = $1, st_partition_key = $2, \
+             is_populated = false, frontier = NULL, updated_at = now() \
+         WHERE pgt_id = $3",
+        &[
+            new_pgt_relid.into(),
+            new_partition_key.into(),
+            st.pgt_id.into(),
+        ],
+    )
+    .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
+
+    // Invalidate caches.
+    shmem::bump_cache_generation();
+    refresh::invalidate_merge_cache(st.pgt_id);
+
+    // Full refresh to repopulate.
+    let updated_st = StreamTableMeta::get_by_name(schema, table_name)?;
+    let deps = StDependency::get_for_st(st.pgt_id).unwrap_or_default();
+    let source_oids: Vec<pg_sys::Oid> = deps
+        .iter()
+        .filter(|d| d.source_type == "TABLE")
+        .map(|d| d.source_relid)
+        .collect();
+    execute_manual_full_refresh(&updated_st, schema, table_name, &source_oids)?;
+
+    pgrx::info!(
+        "pg_trickle: partition key for {schema}.{table_name} changed to {}; full refresh applied.",
+        new_partition_key.unwrap_or("(none)"),
     );
 
     Ok(())
@@ -2458,6 +2565,7 @@ fn alter_stream_table(
     fuse: default!(Option<&str>, "NULL"),
     fuse_ceiling: default!(Option<i64>, "NULL"),
     fuse_sensitivity: default!(Option<i32>, "NULL"),
+    partition_by: default!(Option<&str>, "NULL"),
 ) {
     let result = alter_stream_table_impl(
         name,
@@ -2474,6 +2582,7 @@ fn alter_stream_table(
         fuse,
         fuse_ceiling,
         fuse_sensitivity,
+        partition_by,
     );
     if let Err(e) = result {
         raise_error_with_context(e);
@@ -2496,6 +2605,7 @@ fn alter_stream_table_impl(
     fuse: Option<&str>,
     fuse_ceiling_arg: Option<i64>,
     fuse_sensitivity_arg: Option<i32>,
+    partition_by: Option<&str>,
 ) -> Result<(), PgTrickleError> {
     let (schema, table_name) = parse_qualified_name(name)?;
     let mut st = StreamTableMeta::get_by_name(&schema, &table_name)?;
@@ -2505,6 +2615,25 @@ fn alter_stream_table_impl(
     if let Some(new_query) = query {
         alter_stream_table_query(&st, &schema, &table_name, new_query)?;
         st = StreamTableMeta::get_by_name(&schema, &table_name)?;
+    }
+
+    // ── A1-1c: Partition key migration ──────────────────────────────────
+    // partition_by => '' (empty string) removes partitioning.
+    // partition_by => 'col' or 'LIST:col' adds/changes partitioning.
+    // This requires storage table recreation + full refresh.
+    if let Some(new_pk_raw) = partition_by {
+        let new_pk = if new_pk_raw.trim().is_empty() {
+            None
+        } else {
+            Some(new_pk_raw)
+        };
+
+        // Only act when the partition key is actually changing.
+        let old_pk = st.st_partition_key.as_deref();
+        if new_pk != old_pk {
+            alter_stream_table_partition_key(&st, &schema, &table_name, new_pk)?;
+            st = StreamTableMeta::get_by_name(&schema, &table_name)?;
+        }
     }
 
     let (requested_cdc_mode_override, effective_requested_cdc_mode, cdc_mode_source) =

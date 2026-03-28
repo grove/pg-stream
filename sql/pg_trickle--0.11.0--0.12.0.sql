@@ -69,3 +69,26 @@ STRICT
 LANGUAGE c /* Rust */
 AS 'MODULE_PATHNAME', 'validate_query_wrapper';
 
+-- ── A1-1c: ALTER partition_by support ─────────────────────────────────────
+-- Add partition_by parameter to alter_stream_table.
+DROP FUNCTION IF EXISTS pgtrickle."alter_stream_table"(TEXT, TEXT, TEXT, TEXT, TEXT, TEXT, TEXT, TEXT, bool, bool, TEXT, TEXT, bigint, INT);
+CREATE FUNCTION pgtrickle."alter_stream_table"(
+        "name" TEXT,
+        "query" TEXT DEFAULT NULL,
+        "schedule" TEXT DEFAULT NULL,
+        "refresh_mode" TEXT DEFAULT NULL,
+        "status" TEXT DEFAULT NULL,
+        "diamond_consistency" TEXT DEFAULT NULL,
+        "diamond_schedule_policy" TEXT DEFAULT NULL,
+        "cdc_mode" TEXT DEFAULT NULL,
+        "append_only" bool DEFAULT NULL,
+        "pooler_compatibility_mode" bool DEFAULT NULL,
+        "tier" TEXT DEFAULT NULL,
+        "fuse" TEXT DEFAULT NULL,
+        "fuse_ceiling" bigint DEFAULT NULL,
+        "fuse_sensitivity" INT DEFAULT NULL,
+        "partition_by" TEXT DEFAULT NULL
+) RETURNS void
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'alter_stream_table_wrapper';
+

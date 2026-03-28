@@ -722,6 +722,21 @@ impl StreamTableMeta {
         .map_err(|e: pgrx::spi::SpiError| PgTrickleError::SpiError(e.to_string()))
     }
 
+    /// A1-1c: Update the partition key for a stream table.
+    /// Pass `None` to remove partitioning.
+    pub fn update_partition_key(
+        pgt_id: i64,
+        partition_key: Option<&str>,
+    ) -> Result<(), PgTrickleError> {
+        Spi::run_with_args(
+            "UPDATE pgtrickle.pgt_stream_tables \
+             SET st_partition_key = $1, updated_at = now() \
+             WHERE pgt_id = $2",
+            &[partition_key.into(), pgt_id.into()],
+        )
+        .map_err(|e: pgrx::spi::SpiError| PgTrickleError::SpiError(e.to_string()))
+    }
+
     /// Update the SCC identifier for a stream table (CYC-3).
     ///
     /// `scc_id` — the SCC group identifier, or `None` to clear (no cycle).

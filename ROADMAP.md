@@ -2318,7 +2318,7 @@ action.
 | Item | Description | Effort | Ref |
 |------|-------------|--------|-----|
 | ~~A1-1b~~ | ~~**Multi-column partition keys.** Comma-separated `partition_by`; `PARTITION BY RANGE (col_a, col_b)`; multi-column MIN/MAX extraction; ROW() comparison predicates for partition pruning.~~ ✅ Done — `parse_partition_key_columns()`, composite `extract_partition_range()`, ROW comparison in `inject_partition_predicate()`; 5 unit tests + 3 E2E tests | — | [src/api.rs](src/api.rs), [src/refresh.rs](src/refresh.rs) |
-| A1-1c | **`alter_stream_table(partition_by => …)` support.** Allow adding or changing the partition key on an existing stream table. Requires repartitioning the underlying storage table in-place (`CREATE TABLE … AS SELECT` + rename + drop + rename sequence), updating the catalog, and rebuilding the MERGE template. | 1–2 wk | [PLAN_PARTITIONING_SPIKE.md §10](plans/PLAN_PARTITIONING_SPIKE.md) |
+| ~~A1-1c~~ | ~~**`alter_stream_table(partition_by => …)` support.** Add/change/remove partition key on existing stream tables; `alter_stream_table_partition_key()` handles DROP + recreate + full refresh; `update_partition_key()` in catalog; SQL migration adds parameter; also fixed `alter_stream_table_query` to preserve partition key.~~ ✅ Done — 4 E2E tests | — | [src/api.rs](src/api.rs), [src/catalog.rs](src/catalog.rs) |
 | ~~A1-1d~~ | ~~**LIST partitioning support.** `partition_by => 'LIST:col'` creates `PARTITION BY LIST` storage; `PartitionMethod` enum dispatches LIST vs RANGE; `extract_partition_bounds()` uses `SELECT DISTINCT` for LIST; `inject_partition_predicate()` emits `IN (…)` predicate; single-column-only validation.~~ ✅ Done — 16 unit tests + 4 E2E tests | — | [src/api.rs](src/api.rs), [src/refresh.rs](src/refresh.rs) |
 | A1-3b | **HASH partitioning via per-partition MERGE loop.** Predicate injection cannot prune HASH partitions (the hash function is not invertible). Implement Approach 2 from PLAN_PARTITIONING_SPIKE.md §3: at refresh time, query which child partitions contain delta rows, then issue one targeted MERGE per affected partition. | 2–3 wk | [PLAN_PARTITIONING_SPIKE.md §3](plans/PLAN_PARTITIONING_SPIKE.md) |
 | ~~PART-WARN~~ | ~~**Default-partition growth warning.** `warn_default_partition_growth()` emits `pgrx::warning!()` after FULL and DIFFERENTIAL refresh when the default partition has rows; includes example DDL.~~ ✅ Done — 2 E2E tests | — | [src/refresh.rs](src/refresh.rs) |
@@ -2436,7 +2436,7 @@ cleanup for PG 16+ expression types.
 | Item | Description | Effort | Ref |
 |------|-------------|--------|-----|
 | ~~A1-1b~~ | ~~**Multi-column partition keys.** Comma-separated `partition_by`; ROW() predicate for composite keys.~~ ✅ Done | — | [src/api.rs](src/api.rs), [src/refresh.rs](src/refresh.rs) |
-| A1-1c | **`alter_stream_table(partition_by => …)` support.** Allow adding or changing the partition key on an existing stream table with in-place repartitioning. | 1–2 wk | [PLAN_PARTITIONING_SPIKE.md §10](plans/PLAN_PARTITIONING_SPIKE.md) |
+| ~~A1-1c~~ | ~~**`alter_stream_table(partition_by => …)` support.** Add/change/remove partition key with full storage rebuild.~~ ✅ Done | — | [src/api.rs](src/api.rs), [src/catalog.rs](src/catalog.rs) |
 | ~~A1-1d~~ | ~~**LIST partitioning support.** `PARTITION BY LIST` for low-cardinality columns; `IN (…)` predicate style from the delta.~~ ✅ Done | — | [src/api.rs](src/api.rs), [src/refresh.rs](src/refresh.rs) |
 | A1-3b | **HASH partitioning via per-partition MERGE loop.** Predicate injection cannot prune HASH partitions; issue one targeted MERGE per affected child partition at refresh time. | 2–3 wk | [PLAN_PARTITIONING_SPIKE.md §3](plans/PLAN_PARTITIONING_SPIKE.md) |
 | ~~PART-WARN~~ | ~~**Default-partition growth warning.** `warn_default_partition_growth()` after FULL and DIFFERENTIAL refresh.~~ ✅ Done | — | [src/refresh.rs](src/refresh.rs) |
@@ -2523,7 +2523,7 @@ cleanup for PG 16+ expression types.
 - [ ] D-4: Shared buffer serves multiple STs; multi-frontier cleanup never races; property-based test with 5 concurrent consumers passes
 - [ ] PERF-2: `buffer_partitioning = 'auto'` activates RANGE(lsn) partitioned mode for high-throughput sources
 - [x] A1-1b: Multi-column RANGE partition keys work end-to-end; composite ROW() predicate triggers partition pruning; 3 E2E tests + 5 unit tests ✅ Done
-- [ ] A1-1c: `alter_stream_table(partition_by => …)` repartitions existing storage table without data loss
+- [x] A1-1c: `alter_stream_table(partition_by => …)` repartitions existing storage table without data loss; add/change/remove tested
 - [x] A1-1d: LIST partitioning creates `PARTITION BY LIST` storage; IN-list predicate injected; single-column-only validated; 4 E2E tests pass
 - [ ] A1-3b: HASH partitioning uses per-partition MERGE loop; only affected child partitions are targeted
 - [x] PART-WARN: `WARNING` emitted when default partition has rows after refresh; `warn_default_partition_growth()` on both FULL and DIFFERENTIAL paths ✅ Done

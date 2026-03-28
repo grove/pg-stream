@@ -1470,3 +1470,238 @@ async fn test_partitioned_st_list_multi_column_rejected() {
         "Error should mention single column: {msg}"
     );
 }
+
+// ── A1-1c: ALTER partition_by support ──────────────────────────────────
+
+#[tokio::test]
+async fn test_alter_st_add_partition_key() {
+    let db = E2eDb::new().await.with_extension().await;
+
+    db.execute(
+        "CREATE TABLE alt_add_src (
+            id SERIAL PRIMARY KEY,
+            sale_date DATE NOT NULL,
+            amount NUMERIC NOT NULL
+        )",
+    )
+    .await;
+
+    db.execute(
+        "INSERT INTO alt_add_src (sale_date, amount) VALUES
+         ('2026-01-10', 100), ('2026-02-15', 200), ('2026-03-20', 300)",
+    )
+    .await;
+
+    // Create an unpartitioned stream table first.
+    db.execute(
+        "SELECT pgtrickle.create_stream_table('alt_add_st', \
+         $$SELECT sale_date, SUM(amount) AS total FROM alt_add_src GROUP BY sale_date$$, \
+         '1m', 'DIFFERENTIAL')",
+    )
+    .await;
+    db.refresh_st("alt_add_st").await;
+
+    let count_before: i64 = db.count("alt_add_st").await;
+    assert_eq!(count_before, 3);
+
+    // Not partitioned initially.
+    let is_partitioned: bool = db
+        .query_scalar(
+            "SELECT relkind = 'p' FROM pg_class \
+             WHERE relname = 'alt_add_st' AND relnamespace = 'public'::regnamespace",
+        )
+        .await;
+    assert!(!is_partitioned, "should not be partitioned initially");
+
+    // ALTER to add RANGE partitioning.
+    db.execute("SELECT pgtrickle.alter_stream_table('alt_add_st', partition_by => 'sale_date')")
+        .await;
+
+    // Now it should be partitioned.
+    let is_partitioned_after: bool = db
+        .query_scalar(
+            "SELECT relkind = 'p' FROM pg_class \
+             WHERE relname = 'alt_add_st' AND relnamespace = 'public'::regnamespace",
+        )
+        .await;
+    assert!(
+        is_partitioned_after,
+        "should be RANGE-partitioned after ALTER"
+    );
+
+    // Catalog should have the partition key.
+    let pk: Option<String> = db
+        .query_scalar_opt(
+            "SELECT st_partition_key FROM pgtrickle.pgt_stream_tables \
+             WHERE pgt_name = 'alt_add_st'",
+        )
+        .await;
+    assert_eq!(pk.as_deref(), Some("sale_date"));
+
+    // Data should be preserved via full refresh.
+    let count_after: i64 = db.count("alt_add_st").await;
+    assert_eq!(count_after, 3, "data should be preserved after repartition");
+
+    db.assert_st_matches_query(
+        "alt_add_st",
+        "SELECT sale_date, SUM(amount) AS total FROM alt_add_src GROUP BY sale_date",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn test_alter_st_change_partition_key_to_list() {
+    let db = E2eDb::new().await.with_extension().await;
+
+    db.execute(
+        "CREATE TABLE alt_chg_src (
+            id SERIAL PRIMARY KEY,
+            region TEXT NOT NULL,
+            category TEXT NOT NULL,
+            val INT NOT NULL
+        )",
+    )
+    .await;
+
+    db.execute(
+        "INSERT INTO alt_chg_src (region, category, val) VALUES
+         ('US', 'A', 10), ('EU', 'B', 20), ('APAC', 'A', 30)",
+    )
+    .await;
+
+    // Start with RANGE partitioning on region.
+    db.create_st_partitioned(
+        "alt_chg_st",
+        "SELECT region, category, SUM(val) AS total FROM alt_chg_src GROUP BY region, category",
+        "1m",
+        "DIFFERENTIAL",
+        "region",
+    )
+    .await;
+    db.refresh_st("alt_chg_st").await;
+
+    // Change to LIST partitioning on category.
+    db.execute(
+        "SELECT pgtrickle.alter_stream_table('alt_chg_st', partition_by => 'LIST:category')",
+    )
+    .await;
+
+    // Verify LIST partitioning.
+    let part_strategy: String = db
+        .query_scalar(
+            "SELECT partstrat FROM pg_partitioned_table pt \
+             JOIN pg_class c ON c.oid = pt.partrelid \
+             WHERE c.relname = 'alt_chg_st'",
+        )
+        .await;
+    assert_eq!(part_strategy, "l", "should be LIST-partitioned after ALTER");
+
+    // Catalog should have the new key.
+    let pk: Option<String> = db
+        .query_scalar_opt(
+            "SELECT st_partition_key FROM pgtrickle.pgt_stream_tables \
+             WHERE pgt_name = 'alt_chg_st'",
+        )
+        .await;
+    assert_eq!(pk.as_deref(), Some("LIST:category"));
+
+    // Data preserved.
+    db.assert_st_matches_query(
+        "alt_chg_st",
+        "SELECT region, category, SUM(val) AS total FROM alt_chg_src GROUP BY region, category",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn test_alter_st_remove_partition_key() {
+    let db = E2eDb::new().await.with_extension().await;
+
+    db.execute(
+        "CREATE TABLE alt_rm_src (
+            id SERIAL PRIMARY KEY,
+            sale_date DATE NOT NULL,
+            amount NUMERIC NOT NULL
+        )",
+    )
+    .await;
+
+    db.execute(
+        "INSERT INTO alt_rm_src (sale_date, amount) VALUES
+         ('2026-01-10', 100), ('2026-02-15', 200)",
+    )
+    .await;
+
+    // Start partitioned.
+    db.create_st_partitioned(
+        "alt_rm_st",
+        "SELECT sale_date, SUM(amount) AS total FROM alt_rm_src GROUP BY sale_date",
+        "1m",
+        "DIFFERENTIAL",
+        "sale_date",
+    )
+    .await;
+    db.refresh_st("alt_rm_st").await;
+
+    // Remove partitioning by passing empty string.
+    db.execute("SELECT pgtrickle.alter_stream_table('alt_rm_st', partition_by => '')")
+        .await;
+
+    // Should no longer be partitioned.
+    let is_partitioned: bool = db
+        .query_scalar(
+            "SELECT relkind = 'p' FROM pg_class \
+             WHERE relname = 'alt_rm_st' AND relnamespace = 'public'::regnamespace",
+        )
+        .await;
+    assert!(!is_partitioned, "should not be partitioned after removal");
+
+    // Catalog should have no partition key.
+    let pk: Option<String> = db
+        .query_scalar_opt(
+            "SELECT st_partition_key FROM pgtrickle.pgt_stream_tables \
+             WHERE pgt_name = 'alt_rm_st'",
+        )
+        .await;
+    assert!(pk.is_none(), "partition key should be NULL after removal");
+
+    // Data preserved.
+    let count: i64 = db.count("alt_rm_st").await;
+    assert_eq!(
+        count, 2,
+        "data should be preserved after removing partition"
+    );
+}
+
+#[tokio::test]
+async fn test_alter_st_partition_by_invalid_column_error() {
+    let db = E2eDb::new().await.with_extension().await;
+
+    db.execute(
+        "CREATE TABLE alt_err_src (
+            id SERIAL PRIMARY KEY,
+            val INT NOT NULL
+        )",
+    )
+    .await;
+
+    db.execute(
+        "SELECT pgtrickle.create_stream_table('alt_err_st', \
+         $$SELECT val, COUNT(*) AS cnt FROM alt_err_src GROUP BY val$$, \
+         '1m', 'DIFFERENTIAL')",
+    )
+    .await;
+
+    // ALTER with a column not in the output should fail.
+    let err = db
+        .try_execute(
+            "SELECT pgtrickle.alter_stream_table('alt_err_st', partition_by => 'nonexistent')",
+        )
+        .await;
+    assert!(err.is_err(), "invalid column should be rejected");
+    let msg = err.unwrap_err().to_string();
+    assert!(
+        msg.contains("nonexistent"),
+        "Error should mention the invalid column: {msg}"
+    );
+}
