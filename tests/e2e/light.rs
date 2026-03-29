@@ -51,7 +51,9 @@ struct SharedContainer {
     admin_connection_string: String,
     port: u16,
     container_id: String,
-    _container: Mutex<ContainerAsync<GenericImage>>,
+    // When None the process does not own the container (it was started
+    // externally by the shell script via PGT_LIGHT_E2E_PORT).
+    _container: Option<Mutex<ContainerAsync<GenericImage>>>,
 }
 
 enum ContainerLease {
@@ -119,9 +121,51 @@ async fn create_database(admin_connection_string: &str, db_name: &str) {
     admin_pool.close().await;
 }
 
+async fn drop_database_if_exists(admin_cs: &str, db_name: &str) {
+    let Ok(pool) = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(admin_cs)
+        .await
+    else {
+        return;
+    };
+    // Terminate any lingering connections so DROP DATABASE succeeds.
+    let _ = sqlx::query(
+        "SELECT pg_terminate_backend(pid) FROM pg_stat_activity \
+         WHERE datname = $1 AND pid <> pg_backend_pid()",
+    )
+    .bind(db_name)
+    .execute(&pool)
+    .await;
+    let _ = sqlx::query(&format!("DROP DATABASE IF EXISTS \"{db_name}\""))
+        .execute(&pool)
+        .await;
+    pool.close().await;
+}
+
 async fn shared_container() -> &'static SharedContainer {
     SHARED_CONTAINER
         .get_or_init(|| async {
+            // ── Fast path: shell script pre-started a single container ────────
+            // PGT_LIGHT_E2E_PORT is set by run_light_e2e_tests.sh before cargo
+            // nextest is invoked.  All 48+ test binary processes share this one
+            // container instead of each spawning their own.  This prevents
+            // Docker resource exhaustion (StartupTimeout / PortNotExposed).
+            if let Ok(port_str) = std::env::var("PGT_LIGHT_E2E_PORT") {
+                let port: u16 = port_str
+                    .parse()
+                    .expect("PGT_LIGHT_E2E_PORT must be a valid port number");
+                let container_id = std::env::var("PGT_LIGHT_E2E_CONTAINER_ID")
+                    .unwrap_or_else(|_| "external".to_string());
+                return SharedContainer {
+                    admin_connection_string: connection_string(port, "postgres"),
+                    port,
+                    container_id,
+                    _container: None,
+                };
+            }
+
+            // ── Fallback: per-binary container (direct cargo test invocations) ─
             let ext_dir = find_extension_dir();
             let run_id = std::env::var("PGT_LIGHT_E2E_RUN_ID").ok();
 
@@ -168,7 +212,7 @@ async fn shared_container() -> &'static SharedContainer {
                 admin_connection_string,
                 port,
                 container_id: container.id().to_string(),
-                _container: Mutex::new(container),
+                _container: Some(Mutex::new(container)),
             }
         })
         .await
@@ -184,8 +228,29 @@ async fn shared_container() -> &'static SharedContainer {
 pub struct E2eDb {
     pub pool: PgPool,
     connection_string: String,
+    admin_connection_string: String,
+    db_name: String,
     container_id: String,
     _container: ContainerLease,
+}
+
+impl Drop for E2eDb {
+    fn drop(&mut self) {
+        let admin_cs = self.admin_connection_string.clone();
+        let db_name = self.db_name.clone();
+        // Clean up the test database in a background OS thread so cleanup is
+        // decoupled from any tokio runtime that may be shutting down.  Tests
+        // can run in parallel (each has its own database), so we just fire and
+        // forget; the count of live databases at any moment stays small.
+        std::thread::spawn(move || {
+            if let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                rt.block_on(drop_database_if_exists(&admin_cs, &db_name));
+            }
+        });
+    }
 }
 
 #[allow(dead_code)]
@@ -202,6 +267,8 @@ impl E2eDb {
         E2eDb {
             pool,
             connection_string,
+            admin_connection_string: shared.admin_connection_string.clone(),
+            db_name: db_name.clone(),
             container_id: shared.container_id.clone(),
             _container: ContainerLease::Shared { _shared: shared },
         }
