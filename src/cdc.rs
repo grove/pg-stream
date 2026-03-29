@@ -259,6 +259,8 @@ pub fn drop_change_trigger(
             format!("pg_trickle_cdc_del_{}", oid_u32), // statement DELETE
             format!("pg_trickle_cdc_truncate_{}", oid_u32), // TRUNCATE (both modes)
         ] {
+            // nosemgrep: semgrep.rust.spi.run.dynamic-format — DDL cannot be parameterized;
+            // trig is built from oid_u32 (a plain integer) and table is a regclass-quoted identifier.
             let _ = Spi::run(&format!("DROP TRIGGER IF EXISTS {trig} ON {table}"));
         }
     }
@@ -585,6 +587,7 @@ pub fn ensure_st_change_buffer(
 /// Count how many downstream STs depend on a given upstream ST.
 pub fn count_downstream_st_consumers(pgt_id: i64) -> i64 {
     // The upstream ST's pgt_relid is stored as source_relid in pgt_dependencies
+    // nosemgrep: semgrep.rust.spi.query.dynamic-format — pgt_id is a plain i64, not user-supplied input.
     Spi::get_one::<i64>(&format!(
         "SELECT COUNT(*)::bigint FROM pgtrickle.pgt_dependencies \
          WHERE source_relid = (\
@@ -1919,6 +1922,8 @@ pub fn rebuild_cdc_trigger(
         format!("pg_trickle_cdc_upd_{}", oid_u32),
         format!("pg_trickle_cdc_del_{}", oid_u32),
     ] {
+        // nosemgrep: semgrep.rust.spi.run.dynamic-format — DDL cannot be parameterized;
+        // trig is built from oid_u32 (a plain integer) and source_table is a regclass-quoted identifier.
         let _ = Spi::run(&format!("DROP TRIGGER IF EXISTS {trig} ON {source_table}"));
     }
 

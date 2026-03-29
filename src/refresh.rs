@@ -795,6 +795,7 @@ pub fn capture_delta_to_bypass_table(
     // refresh.  If `execute_scheduled_refresh` internally fell back to
     // FULL (e.g. no previous frontier), the table won't exist and we
     // must skip the capture to avoid a "relation does not exist" ERROR.
+    // nosemgrep: semgrep.rust.spi.query.dynamic-format — pgt_id is a plain i64, not user-supplied input.
     let delta_exists: bool = Spi::get_one::<bool>(&format!(
         "SELECT to_regclass('__pgt_delta_{}') IS NOT NULL",
         pgt_id
@@ -819,6 +820,7 @@ pub fn capture_delta_to_bypass_table(
     // __pgt_row_id into a single I, which omits the D for old column values.
     // Downstream STs with WHERE filters on changed columns would miss the
     // deletion and retain stale rows.
+    // nosemgrep: semgrep.rust.spi.query.dynamic-format — pgt_id is a plain i64, not user-supplied input.
     let pre_snapshot_exists: bool = Spi::get_one::<bool>(&format!(
         "SELECT to_regclass('__pgt_pre_{}') IS NOT NULL",
         pgt_id
@@ -2248,6 +2250,7 @@ pub fn execute_full_refresh(st: &StreamTableMeta) -> Result<(i64, i64), PgTrickl
         // Drop any leftover pre-snapshot from a previous iteration
         // (e.g., SCC fixpoint loops where subtransaction commits don't
         // fire ON COMMIT DROP until the outer transaction commits).
+        // nosemgrep: semgrep.rust.spi.run.dynamic-format — st.pgt_id is a plain i64, not user-supplied input.
         let _ = Spi::run(&format!("DROP TABLE IF EXISTS __pgt_pre_{}", st.pgt_id));
 
         let snapshot_sql = format!(
@@ -2880,6 +2883,7 @@ fn execute_hash_partitioned_merge(
         .map_err(|e| PgTrickleError::SpiError(format!("hash delta materialize: {e}")))?;
 
     // Check if delta is empty.
+    // nosemgrep: semgrep.rust.spi.query.dynamic-format — temp_name is derived from pgt_id (plain i64), not user-supplied input.
     let delta_count = Spi::get_one::<i64>(&format!("SELECT count(*)::bigint FROM {temp_name}"))
         .map_err(|e| PgTrickleError::SpiError(format!("hash delta count: {e}")))?
         .unwrap_or(0);
@@ -4271,6 +4275,7 @@ pub fn execute_differential_refresh(
                 name.replace('"', "\"\""),
             );
 
+            // nosemgrep: semgrep.rust.spi.run.dynamic-format — st.pgt_id is a plain i64, not user-supplied input.
             let _ = Spi::run(&format!("DROP TABLE IF EXISTS __pgt_pre_{}", st.pgt_id));
 
             let snapshot_sql = format!(

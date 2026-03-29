@@ -3339,6 +3339,7 @@ fn execute_manual_refresh(
     // always materializes the full result set regardless of who called
     // refresh_stream_table(). This mirrors REFRESH MATERIALIZED VIEW
     // semantics and prevents the "who refreshed it?" correctness hazard.
+    // nosemgrep: semgrep.sql.row-security.disabled — intentional R3 bypass, mirrors REFRESH MATERIALIZED VIEW semantics.
     Spi::run("SET LOCAL row_security = off")
         .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
 
@@ -4665,6 +4666,8 @@ fn gate_source(source: &str) -> Result<(), PgTrickleError> {
 
     // Signal the scheduler that the gate set has changed.
     let payload = format!("{}", source_relid.to_u32());
+    // nosemgrep: semgrep.rust.spi.run.dynamic-format — pg_notify does not support parameterized
+    // payloads; payload is source_relid.to_u32() (a plain integer, not user-supplied text).
     Spi::run(&format!(
         "SELECT pg_notify('pgtrickle_source_gate', '{}')",
         &payload
@@ -4690,6 +4693,8 @@ fn ungate_source(source: &str) -> Result<(), PgTrickleError> {
 
     // Signal the scheduler that the gate set has changed.
     let payload = format!("{}", source_relid.to_u32());
+    // nosemgrep: semgrep.rust.spi.run.dynamic-format — pg_notify does not support parameterized
+    // payloads; payload is source_relid.to_u32() (a plain integer, not user-supplied text).
     Spi::run(&format!(
         "SELECT pg_notify('pgtrickle_source_gate', '{}')",
         &payload
@@ -4848,6 +4853,8 @@ fn advance_watermark(source: &str, watermark: TimestampWithTimeZone) -> Result<(
 
     // Notify the scheduler that watermark state changed.
     let payload = format!("wm:{}", source_relid.to_u32());
+    // nosemgrep: semgrep.rust.spi.run.dynamic-format — pg_notify does not support parameterized
+    // payloads; payload is "wm:" + source_relid.to_u32() (plain integer, not user-supplied text).
     Spi::run(&format!(
         "SELECT pg_notify('pgtrickle_watermark', '{}')",
         &payload
