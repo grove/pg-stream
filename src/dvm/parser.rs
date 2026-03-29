@@ -1114,6 +1114,22 @@ pub enum OpTree {
         /// The outer query that produces the non-scalar columns.
         child: Box<OpTree>,
     },
+    /// Constant-expression SELECT with no FROM clause.
+    ///
+    /// Used exclusively for the base case of `WITH RECURSIVE` CTEs whose
+    /// anchor is a pure constant query such as `SELECT 1 AS id`.  These
+    /// anchors have no source tables and therefore produce no delta rows;
+    /// the full recursion is driven by the recursive term's source tables.
+    ///
+    /// The `sql` field holds the verbatim deparsed SQL so that helper
+    /// functions that need to embed the anchor into a `WITH RECURSIVE`
+    /// block (e.g., the DRed rederivation CTE) have a valid SQL fragment.
+    ConstantSelect {
+        /// Column names emitted by this node.
+        columns: Vec<String>,
+        /// Verbatim SQL of the original constant SELECT (no FROM clause).
+        sql: String,
+    },
 }
 
 /// Registry of parsed CTE bodies, shared across the OpTree.
@@ -1229,7 +1245,10 @@ impl ParseResult {
     /// Walk an OpTree recursively collecting function names from Expr nodes.
     fn collect_expr_funcs(tree: &OpTree, names: &mut std::collections::HashSet<String>) {
         match tree {
-            OpTree::Scan { .. } | OpTree::CteScan { .. } | OpTree::RecursiveSelfRef { .. } => {}
+            OpTree::Scan { .. }
+            | OpTree::CteScan { .. }
+            | OpTree::RecursiveSelfRef { .. }
+            | OpTree::ConstantSelect { .. } => {}
             OpTree::Project {
                 expressions, child, ..
             } => {
@@ -1399,6 +1418,7 @@ impl OpTree {
             OpTree::SemiJoin { .. } => "semi_join",
             OpTree::AntiJoin { .. } => "anti_join",
             OpTree::ScalarSubquery { alias, .. } => alias,
+            OpTree::ConstantSelect { .. } => "__const",
         }
     }
 
@@ -1438,6 +1458,7 @@ impl OpTree {
             OpTree::SemiJoin { .. } => "semi join",
             OpTree::AntiJoin { .. } => "anti join",
             OpTree::ScalarSubquery { .. } => "scalar subquery",
+            OpTree::ConstantSelect { .. } => "constant select",
         }
     }
 
@@ -2064,6 +2085,7 @@ impl OpTree {
                 cols.push(alias.clone());
                 cols
             }
+            OpTree::ConstantSelect { columns, .. } => columns.clone(),
         }
     }
 
@@ -2132,6 +2154,8 @@ impl OpTree {
                 oids.dedup();
                 oids
             }
+            // Constant anchors have no source tables — they never produce delta rows.
+            OpTree::ConstantSelect { .. } => vec![],
         }
     }
 
@@ -2314,7 +2338,10 @@ impl OpTree {
                 base.collect_key_column_names(names);
                 recursive.collect_key_column_names(names);
             }
-            OpTree::Scan { .. } | OpTree::CteScan { .. } | OpTree::RecursiveSelfRef { .. } => {}
+            OpTree::Scan { .. }
+            | OpTree::CteScan { .. }
+            | OpTree::RecursiveSelfRef { .. }
+            | OpTree::ConstantSelect { .. } => {}
         }
     }
 
@@ -2387,7 +2414,9 @@ impl OpTree {
                 base.collect_scan_alias_map(map);
                 recursive.collect_scan_alias_map(map);
             }
-            OpTree::CteScan { .. } | OpTree::RecursiveSelfRef { .. } => {}
+            OpTree::CteScan { .. }
+            | OpTree::RecursiveSelfRef { .. }
+            | OpTree::ConstantSelect { .. } => {}
         }
     }
 
@@ -2439,6 +2468,7 @@ impl OpTree {
                 right.collect_source_columns(map);
             }
             OpTree::ScalarSubquery { child, .. } => child.collect_source_columns(map),
+            OpTree::ConstantSelect { .. } => {}
         }
     }
 
@@ -2602,6 +2632,8 @@ impl OpTree {
             OpTree::ScalarSubquery {
                 subquery, child, ..
             } => subquery.collect_all_column_refs(refs) && child.collect_all_column_refs(refs),
+            // Constant anchors have no column references — scanning is a no-op.
+            OpTree::ConstantSelect { .. } => true,
         }
     }
 
@@ -2665,7 +2697,9 @@ impl OpTree {
                 base.apply_column_pruning(refs);
                 recursive.apply_column_pruning(refs);
             }
-            OpTree::CteScan { .. } | OpTree::RecursiveSelfRef { .. } => {}
+            OpTree::CteScan { .. }
+            | OpTree::RecursiveSelfRef { .. }
+            | OpTree::ConstantSelect { .. } => {}
         }
     }
 }
@@ -3433,6 +3467,8 @@ fn tree_collect_volatility(tree: &OpTree, worst: &mut char) -> Result<(), PgTric
             tree_collect_volatility(subquery, worst)?;
             tree_collect_volatility(child, worst)?;
         }
+        // Constant anchors have no expressions to scan — volatility is unaffected.
+        OpTree::ConstantSelect { .. } => {}
     }
     Ok(())
 }
@@ -3623,6 +3659,8 @@ fn check_ivm_support_inner(tree: &OpTree) -> Result<(), PgTrickleError> {
             check_ivm_support(subquery)?;
             check_ivm_support(child)
         }
+        // Constant anchors (no FROM) are always DVM-compatible — they produce no delta.
+        OpTree::ConstantSelect { .. } => Ok(()),
     }
 }
 
@@ -3746,6 +3784,8 @@ fn check_immediate_support(tree: &OpTree) -> Result<(), PgTrickleError> {
             check_immediate_support(base)?;
             check_immediate_support(recursive)
         }
+        // Constant anchors (no FROM) are always IMMEDIATE-compatible.
+        OpTree::ConstantSelect { .. } => Ok(()),
     }
 }
 
@@ -3862,6 +3902,9 @@ pub fn check_monotonicity(tree: &OpTree) -> Result<(), PgTrickleError> {
              fixed-point convergence."
                 .into(),
         )),
+        // Constant anchors are trivially monotone — they produce no rows and have
+        // no source tables, so adding more data can only grow the output, never shrink it.
+        OpTree::ConstantSelect { .. } => Ok(()),
     }
 }
 
@@ -4060,6 +4103,11 @@ struct CteParseContext {
     depth: usize,
     /// G13-SD: Maximum allowed recursion depth (from GUC).
     max_depth: usize,
+    /// Set to `true` while parsing the base (non-recursive) term of a
+    /// `WITH RECURSIVE` CTE anchor.  When true, `parse_select_stmt_inner`
+    /// accepts a SELECT with no FROM clause and returns an
+    /// `OpTree::ConstantSelect` instead of an error.
+    in_cte_anchor: bool,
 }
 
 impl CteParseContext {
@@ -4083,6 +4131,7 @@ impl CteParseContext {
             recursive_self_ref_columns: Vec::new(),
             depth: 0,
             max_depth,
+            in_cte_anchor: false,
         }
     }
 
@@ -10608,6 +10657,12 @@ unsafe fn parse_defining_query_inner(query: &str) -> Result<ParseResult, PgTrick
         // In PostgreSQL 18, the larg/rarg of a UNION may themselves appear
         // as set-operation wrappers (e.g., when the base case is itself a
         // multi-arm UNION). Check and dispatch accordingly.
+        //
+        // Set `in_cte_anchor = true` so that `parse_select_stmt_inner`
+        // accepts a constant SELECT without a FROM clause (e.g. `SELECT 1
+        // AS id`) and returns an `OpTree::ConstantSelect` instead of an
+        // error.
+        cte_ctx.in_cte_anchor = true;
         let base_tree = unsafe {
             let s = &**base_stmt;
             if s.op != pg_sys::SetOperation::SETOP_NONE {
@@ -10616,6 +10671,7 @@ unsafe fn parse_defining_query_inner(query: &str) -> Result<ParseResult, PgTrick
                 parse_select_stmt(s, "", &mut cte_ctx)?
             }
         };
+        cte_ctx.in_cte_anchor = false;
 
         // Determine output columns: CTE def aliases > base case output
         let columns = if def_cols.is_empty() {
@@ -10856,6 +10912,16 @@ unsafe fn parse_select_stmt_inner(
     // ── Step 1: Parse FROM clause into Scan/Join tree ──────────────────
     let from_list = pg_list::<pg_sys::Node>(select.fromClause);
     if from_list.is_empty() {
+        // Allow a constant SELECT (no FROM clause) when parsing the base case
+        // of a WITH RECURSIVE anchor, e.g. `SELECT 1 AS id`.  These nodes
+        // have no source tables and are represented as ConstantSelect so that
+        // helper functions like generate_query_sql can embed them verbatim.
+        if cte_ctx.in_cte_anchor {
+            let sql = deparse_select_stmt_with_view_subs(select as *const _, &[])?;
+            // SAFETY: `select.targetList` is a valid List pointer from the PG parser.
+            let columns = unsafe { extract_target_list_column_names(select.targetList) };
+            return Ok(OpTree::ConstantSelect { columns, sql });
+        }
         return Err(PgTrickleError::QueryParseError(format!(
             "Defining query must have a FROM clause (op={}, all={}, larg_null={}, rarg_null={}, target_len={}, where_null={})",
             select.op,
@@ -13378,6 +13444,39 @@ unsafe fn deparse_target_list(target_list: *mut pg_sys::List) -> Result<String, 
         }
     }
     Ok(items.join(", "))
+}
+
+/// Extract column names from a target list.
+///
+/// For each `ResTarget`:
+/// - If the target has an explicit alias (`AS col`), use that.
+/// - Otherwise generate a positional name `_col_N` (1-based).
+///
+/// Used to derive output column names from a constant anchor SELECT.
+///
+/// # Safety
+/// Caller must ensure `target_list` points to a valid `pg_sys::List`.
+unsafe fn extract_target_list_column_names(target_list: *mut pg_sys::List) -> Vec<String> {
+    let targets = pg_list::<pg_sys::Node>(target_list);
+    let mut cols = Vec::new();
+    for (i, node_ptr) in targets.iter_ptr().enumerate() {
+        if !unsafe { pgrx::is_a(node_ptr, pg_sys::NodeTag::T_ResTarget) } {
+            cols.push(format!("_col_{}", i + 1));
+            continue;
+        }
+        let rt = unsafe { &*(node_ptr as *const pg_sys::ResTarget) };
+        if !rt.name.is_null() {
+            let alias = pg_cstr_to_str(rt.name).unwrap_or("").to_string();
+            if alias.is_empty() {
+                cols.push(format!("_col_{}", i + 1));
+            } else {
+                cols.push(alias);
+            }
+        } else {
+            cols.push(format!("_col_{}", i + 1));
+        }
+    }
+    cols
 }
 
 /// Deparse a FROM clause (list of FROM items) into SQL text.

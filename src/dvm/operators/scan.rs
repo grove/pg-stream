@@ -388,13 +388,28 @@ fn diff_scan_change_buffer(
     // NULL for INSERT/DELETE (all columns populated). When column pruning
     // has reduced the referenced set, we can skip UPDATE rows where none
     // of the referenced columns actually changed. Works for any column count.
+    //
+    // Cross-backend safety: the cached delta SQL template embeds a fixed-
+    // width bitmask literal (e.g. B'0110' for 3 CDC columns).  If the CDC
+    // trigger is later rebuilt with additional columns (e.g. 4-bit), a
+    // stale prepared template on another backend would cause
+    // "cannot AND bit strings of different sizes" when the bit-widths
+    // differ.  Using a CASE expression ensures the bit operation is only
+    // evaluated when the widths match; PostgreSQL guarantees CASE WHEN
+    // branches are evaluated in order (unlike AND/OR in WHERE clauses
+    // which the optimizer may reorder).  Stale masks fall through to
+    // ELSE TRUE = conservatively include the row (slight over-scan, but
+    // always correct and never an error).
     if !is_keyless
         && let Some(cdc_cols) = ctx.source_cdc_columns.get(&table_oid)
         && let Some((mask_str, zero_str)) = compute_varbit_changed_cols_mask(columns, cdc_cols)
     {
+        let mask_len = mask_str.len();
         lsn_filter.push_str(&format!(
             " AND (c.changed_cols IS NULL \
-             OR (c.changed_cols & B'{mask_str}') != B'{zero_str}')"
+             OR CASE WHEN bit_length(c.changed_cols) = {mask_len} \
+                     THEN (c.changed_cols & B'{mask_str}') != B'{zero_str}' \
+                     ELSE TRUE END)"
         ));
     }
 
@@ -409,10 +424,12 @@ fn diff_scan_change_buffer(
             && let Some(key_cols) = ctx.source_key_columns.get(&table_oid)
             && let Some((key_mask, key_zero)) = compute_varbit_key_cols_mask(key_cols, cdc_cols)
         {
+            let mask_len = key_mask.len();
             Some(format!(
-                "CASE WHEN c.changed_cols IS NOT NULL \
-                 AND (c.changed_cols & B'{key_mask}') = B'{key_zero}' \
-                 THEN FALSE ELSE TRUE END"
+                "CASE WHEN c.changed_cols IS NULL THEN TRUE \
+                 WHEN bit_length(c.changed_cols) != {mask_len} THEN TRUE \
+                 WHEN (c.changed_cols & B'{key_mask}') = B'{key_zero}' THEN FALSE \
+                 ELSE TRUE END"
             ))
         } else {
             None
@@ -1468,10 +1485,10 @@ mod tests {
         let result = diff_scan(&mut ctx, &tree).unwrap();
         let sql = ctx.build_with_query(&result.cte_name);
 
-        // id=pos0, amount=pos2 → mask='1010', zero='0000'
+        // id=pos0, amount=pos2 → mask='1010', zero='0000', mask_len=4
         assert_sql_contains(
             &sql,
-            "c.changed_cols IS NULL OR (c.changed_cols & B'1010') != B'0000'",
+            "c.changed_cols IS NULL OR CASE WHEN bit_length(c.changed_cols) = 4 THEN (c.changed_cols & B'1010') != B'0000' ELSE TRUE END",
         );
     }
 

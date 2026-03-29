@@ -330,6 +330,57 @@ trap cleanup_light_e2e_containers EXIT INT TERM
 
 echo "Light-E2E run id: ${PGT_LIGHT_E2E_RUN_ID}"
 
+# Start ONE shared PostgreSQL container for all 48+ test binaries.
+# Each binary connects to this container via PGT_LIGHT_E2E_PORT instead of
+# spawning its own testcontainers instance.  This avoids 48 simultaneous
+# Docker containers overwhelming the host and causing StartupTimeout failures.
+start_shared_light_e2e_container() {
+    local run_id="$PGT_LIGHT_E2E_RUN_ID"
+    local ext_dir="${PGT_EXTENSION_DIR}"
+
+    echo "Starting shared light-E2E PostgreSQL container..."
+    local cid
+    cid=$(docker run -d \
+        -e POSTGRES_PASSWORD=postgres \
+        -e POSTGRES_DB=postgres \
+        -p 5432 \
+        -v "${ext_dir}:/tmp/pg_ext:ro" \
+        --label com.pgtrickle.test=true \
+        --label com.pgtrickle.suite=light-e2e \
+        --label "com.pgtrickle.run-id=${run_id}" \
+        postgres:18.3)
+
+    # Wait up to 120 s for PostgreSQL to accept connections
+    local i=0
+    until docker exec "$cid" pg_isready -U postgres >/dev/null 2>&1; do
+        i=$((i + 1))
+        if [[ $i -gt 120 ]]; then
+            echo "ERROR: shared light-E2E container failed to become ready" >&2
+            docker rm -f "$cid" >/dev/null 2>&1 || true
+            return 1
+        fi
+        sleep 1
+    done
+
+    # Install pg_trickle into the container
+    docker exec "$cid" sh -c \
+        "cp /tmp/pg_ext/usr/share/postgresql/18/extension/pg_trickle* \
+            /usr/share/postgresql/18/extension/ && \
+         cp /tmp/pg_ext/usr/lib/postgresql/18/lib/pg_trickle* \
+            /usr/lib/postgresql/18/lib/"
+
+    local port
+    port=$(docker inspect \
+        --format='{{(index (index .NetworkSettings.Ports "5432/tcp") 0).HostPort}}' \
+        "$cid")
+
+    export PGT_LIGHT_E2E_PORT="$port"
+    export PGT_LIGHT_E2E_CONTAINER_ID="$cid"
+    echo "Shared container ${cid:0:12} ready on port ${port}"
+}
+
+start_shared_light_e2e_container
+
 cargo_args=(--features light-e2e)
 for test_name in "${selected_tests[@]}"; do
     cargo_args+=(--test "$test_name")

@@ -329,7 +329,7 @@ fn collect_tree_constructs_inner(
         | OpTree::Subquery { child, .. } => {
             collect_tree_constructs_inner(child, cte_registry, out);
         }
-        OpTree::Scan { .. } | OpTree::RecursiveSelfRef { .. } => {}
+        OpTree::Scan { .. } | OpTree::RecursiveSelfRef { .. } | OpTree::ConstantSelect { .. } => {}
     }
 }
 

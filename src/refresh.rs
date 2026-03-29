@@ -1465,6 +1465,12 @@ pub fn invalidate_merge_cache(pgt_id: i64) {
     if PREPARED_MERGE_STMTS.with(|s| s.borrow_mut().remove(&pgt_id)) {
         deallocate_prepared_merge_statement(pgt_id);
     }
+    // Also invalidate the delta SQL template cache, which embeds the
+    // CDC bitmask width.  Without this, a cache-miss rebuild of the MERGE
+    // template would still pull a stale delta SQL template (e.g. 3-bit
+    // mask) from the DELTA_TEMPLATE_CACHE, producing "cannot AND bit
+    // strings of different sizes" on the first UPDATE after a CDC rebuild.
+    crate::dvm::invalidate_delta_cache(pgt_id);
 }
 
 /// Wide-table MERGE hash threshold (F41: G4.6).
@@ -2792,7 +2798,7 @@ fn get_hash_children(parent_oid: pg_sys::Oid) -> Result<Vec<HashChild>, PgTrickl
         let rows = client
             .select(
                 "SELECT n.nspname::text, c.relname::text, \
-                        (pg_partition_bound_spec(c.oid, i.inhparent))::text \
+                        pg_get_expr(c.relpartbound, c.oid) \
                  FROM pg_inherits i \
                  JOIN pg_class c ON c.oid = i.inhrelid \
                  JOIN pg_namespace n ON n.oid = c.relnamespace \
@@ -2856,106 +2862,41 @@ fn extract_keyword_int(spec: &str, keyword: &str) -> Result<i32, PgTrickleError>
         .map_err(|_| PgTrickleError::SpiError(format!("invalid {keyword} value in bound spec")))
 }
 
-/// Execute per-partition MERGE for a HASH partitioned stream table.
+/// Execute MERGE for a HASH partitioned stream table.
 ///
-/// 1. Materialize the delta into a temp table.
-/// 2. Discover child partitions via `pg_inherits`.
-/// 3. For each child: MERGE from delta filtered by `satisfies_hash_partition()`.
+/// PostgreSQL 15+ handles MERGE with partitioned tables natively — rows are
+/// routed to the correct child partition automatically for both INSERT and
+/// MATCHED (UPDATE/DELETE) operations. We therefore do NOT need per-child
+/// routing or the `satisfies_hash_partition()` internal function (which was
+/// removed in PG17+). Simply strip the `__PGT_PART_PRED__` placeholder from
+/// the merge SQL and run it against the parent table.
 ///
-/// Returns `(total_merge_count, "hash_merge")`.
+/// Returns the number of rows affected.
 fn execute_hash_partitioned_merge(
     merge_sql: &str,
-    resolved_delta_sql: &str,
+    _resolved_delta_sql: &str,
     schema: &str,
     name: &str,
-    parent_oid: pg_sys::Oid,
-    partition_key: &str,
-    pgt_id: i64,
+    _parent_oid: pg_sys::Oid,
+    _partition_key: &str,
+    _pgt_id: i64,
 ) -> Result<usize, PgTrickleError> {
-    let cols = crate::api::parse_partition_key_columns(partition_key);
-    let qcol = crate::api::quote_identifier(&cols[0]);
-
-    // Step 1: Materialize delta into a temp table.
-    let temp_name = format!("__pgt_hash_delta_{pgt_id}");
-    let materialize_sql =
-        format!("CREATE TEMP TABLE {temp_name} ON COMMIT DROP AS {resolved_delta_sql}");
-    Spi::run(&materialize_sql)
-        .map_err(|e| PgTrickleError::SpiError(format!("hash delta materialize: {e}")))?;
-
-    // Check if delta is empty.
-    // nosemgrep: semgrep.rust.spi.query.dynamic-format — temp_name is derived from pgt_id (plain i64), not user-supplied input.
-    let delta_count = Spi::get_one::<i64>(&format!("SELECT count(*)::bigint FROM {temp_name}"))
-        .map_err(|e| PgTrickleError::SpiError(format!("hash delta count: {e}")))?
-        .unwrap_or(0);
-    if delta_count == 0 {
-        pgrx::debug1!("[pg_trickle] A1-3b: empty hash delta for {schema}.{name}, skipping MERGE");
-        return Ok(0);
-    }
-
-    // Step 2: Discover child partitions.
-    let children = get_hash_children(parent_oid)?;
-    if children.is_empty() {
-        return Err(PgTrickleError::SpiError(format!(
-            "HASH partitioned table {schema}.{name} has no child partitions"
-        )));
-    }
+    // Strip the __PGT_PART_PRED__ placeholder — HASH partitions do not use
+    // a range predicate; PostgreSQL routes each row to the correct child.
+    let sql = merge_sql.replace("__PGT_PART_PRED__", "");
 
     pgrx::debug1!(
-        "[pg_trickle] A1-3b: HASH per-partition MERGE for {}.{}: {} partitions, {} delta rows",
+        "[pg_trickle] A1-3b: HASH parent-level MERGE for {}.{}",
         schema,
         name,
-        children.len(),
-        delta_count,
     );
 
-    // Step 3: Per-partition MERGE.
-    // The original merge_sql targets the parent table. We rewrite it for each
-    // child, replacing the parent target with the child, and filtering the
-    // delta USING clause through satisfies_hash_partition().
-    let parent_target = format!(
-        "{}.{}",
-        crate::api::quote_identifier(schema),
-        crate::api::quote_identifier(name),
-    );
-
-    let mut total_count = 0usize;
-    for child in &children {
-        // Build child-specific MERGE:
-        // 1. Replace target table with child partition (ONLY to avoid routing)
-        // 2. Replace the USING clause's delta with hash-filtered delta
-        // 3. Strip the __PGT_PART_PRED__ placeholder (not needed for direct child)
-        // Build per-child MERGE with filtered USING clause.
-        // Strategy: find USING clause and inject hash filter into the temp table.
-        // Simpler: just build a fresh MERGE targeting the child with filtered delta.
-        let child_merge_sql = build_hash_child_merge(
-            &child.qualified_name,
-            &temp_name,
-            &qcol,
-            parent_oid,
-            child.modulus,
-            child.remainder,
-            merge_sql,
-            &parent_target,
-        );
-
-        let n = Spi::connect_mut(|client| {
-            let result = client
-                .update(&child_merge_sql, None, &[])
-                .map_err(|e| PgTrickleError::SpiError(format!("hash merge child: {e}")))?;
-            Ok::<usize, PgTrickleError>(result.len())
-        })?;
-
-        if n > 0 {
-            pgrx::debug1!(
-                "[pg_trickle] A1-3b: MERGE into {} touched {} rows",
-                child.qualified_name,
-                n,
-            );
-        }
-        total_count += n;
-    }
-
-    Ok(total_count)
+    Spi::connect_mut(|client| {
+        let result = client
+            .update(&sql, None, &[])
+            .map_err(|e| PgTrickleError::SpiError(format!("hash merge: {e}")))?;
+        Ok::<usize, PgTrickleError>(result.len())
+    })
 }
 
 /// Build a MERGE SQL statement targeting a specific HASH child partition.
@@ -3025,6 +2966,29 @@ fn warn_default_partition_growth(schema: &str, name: &str) {
     let default_name = format!("{name}_default");
     let qschema = crate::api::quote_identifier(schema);
     let qdefault = crate::api::quote_identifier(&default_name);
+
+    // Check existence first via pg_catalog to avoid "relation does not exist"
+    // errors from SPI (pgrx SPI does not catch catalog errors via Result).
+    // Use parameterized query to safely pass schema/table names.
+    let exists = Spi::connect(|client| {
+        let rows = client
+            .select(
+                "SELECT 1 FROM pg_catalog.pg_class c \
+                 JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+                 WHERE n.nspname = $1 AND c.relname = $2 \
+                 LIMIT 1",
+                None,
+                &[schema.into(), default_name.as_str().into()],
+            )
+            .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
+        Ok::<bool, PgTrickleError>(!rows.is_empty())
+    })
+    .unwrap_or(false);
+
+    if !exists {
+        return; // No default partition — nothing to warn about.
+    }
+
     let sql = format!("SELECT count(*)::bigint FROM {qschema}.{qdefault}");
     match Spi::get_one::<i64>(&sql) {
         Ok(Some(count)) if count > 0 => {
@@ -3038,7 +3002,7 @@ fn warn_default_partition_growth(schema: &str, name: &str) {
             );
         }
         Ok(_) => {}  // Default partition is empty — no warning.
-        Err(_) => {} // Default partition does not exist — silently skip.
+        Err(_) => {} // Silently skip on any other error.
     }
 }
 

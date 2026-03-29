@@ -400,6 +400,28 @@ impl DiffContext {
             OpTree::ScalarSubquery { .. } => {
                 operators::scalar_subquery::diff_scalar_subquery(self, op)
             }
+            OpTree::ConstantSelect { columns, .. } => {
+                // A constant anchor has no source tables and never contributes
+                // delta rows. Return an empty DiffResult so the recursive CTE
+                // diff engine can split the base / recursive arms correctly.
+                let empty_cte = self.next_cte_name("const_empty");
+                let col_list = columns
+                    .iter()
+                    .map(|c| format!("NULL::text AS {}", quote_ident(c)))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                // A WHERE FALSE CTE always produces zero rows — correct for a delta.
+                self.add_cte(
+                    empty_cte.clone(),
+                    format!("SELECT 'I'::text AS __pgt_action, {col_list} WHERE FALSE"),
+                );
+                Ok(DiffResult {
+                    cte_name: empty_cte,
+                    columns: columns.clone(),
+                    is_deduplicated: false,
+                    has_key_changed: false,
+                })
+            }
         }
     }
 

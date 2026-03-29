@@ -1212,9 +1212,16 @@ fn generate_direct_agg_delta(
             let old_col = format!("c.{}", quote_ident(&format!("old_{name}")));
             val_v_parts.push(format!("({new_col} - {old_col})"));
         }
+        // Use a CASE expression to guarantee evaluation order: the bit AND
+        // only runs when the widths match, preventing "cannot AND bit strings
+        // of different sizes" when a stale cached template has a different
+        // bitmask width than the current CDC trigger.
+        let mask_len = mask.len();
         let pred = format!(
             "c.action = 'U' AND c.changed_cols IS NOT NULL \
-             AND (c.changed_cols & B'{mask}') = B'{zero}'"
+             AND CASE WHEN bit_length(c.changed_cols) = {mask_len} \
+                      THEN (c.changed_cols & B'{mask}') = B'{zero}' \
+                      ELSE FALSE END"
         );
         (Some(val_v_parts.join(", ")), Some(pred))
     } else {

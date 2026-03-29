@@ -1022,7 +1022,7 @@ async fn test_partitioned_st_multi_column_create_and_refresh() {
 
     // Verify storage is RANGE partitioned
     let relkind: String = db
-        .query_scalar("SELECT relkind FROM pg_class WHERE relname = 'mc_summary'")
+        .query_scalar("SELECT relkind::text FROM pg_class WHERE relname = 'mc_summary'")
         .await;
     assert_eq!(
         relkind, "p",
@@ -1308,7 +1308,7 @@ async fn test_partitioned_st_list_create_and_refresh() {
     // Verify storage table is LIST-partitioned
     let part_strategy: String = db
         .query_scalar(
-            "SELECT partstrat FROM pg_partitioned_table pt \
+            "SELECT partstrat::text FROM pg_partitioned_table pt \
              JOIN pg_class c ON c.oid = pt.partrelid \
              WHERE c.relname = 'list_summary'",
         )
@@ -1356,16 +1356,14 @@ async fn test_partitioned_st_list_differential_refresh() {
     db.execute("INSERT INTO ldiff_src (category, val) VALUES ('A', 10), ('B', 20), ('C', 30)")
         .await;
 
-    db.create_st_partitioned(
-        "ldiff_st",
-        "SELECT category, SUM(val) AS total FROM ldiff_src GROUP BY category",
-        "1m",
-        "DIFFERENTIAL",
-        "LIST:category",
+    db.execute(
+        "SELECT pgtrickle.create_stream_table('ldiff_st', \
+         $$SELECT category, SUM(val) AS total FROM ldiff_src GROUP BY category$$, \
+         '1m', 'DIFFERENTIAL', initialize => false, partition_by => 'LIST:category')",
     )
     .await;
 
-    // Create explicit LIST partitions
+    // Create explicit LIST partitions (before first refresh, so default partition is empty)
     db.execute("CREATE TABLE ldiff_st_a PARTITION OF ldiff_st FOR VALUES IN ('A')")
         .await;
     db.execute("CREATE TABLE ldiff_st_b PARTITION OF ldiff_st FOR VALUES IN ('B')")
@@ -1406,12 +1404,10 @@ async fn test_partitioned_st_list_with_explicit_partitions() {
     )
     .await;
 
-    db.create_st_partitioned(
-        "lexp_st",
-        "SELECT status, SUM(amount) AS total FROM lexp_src GROUP BY status",
-        "1m",
-        "DIFFERENTIAL",
-        "LIST:status",
+    db.execute(
+        "SELECT pgtrickle.create_stream_table('lexp_st', \
+         $$SELECT status, SUM(amount) AS total FROM lexp_src GROUP BY status$$, \
+         '1m', 'DIFFERENTIAL', initialize => false, partition_by => 'LIST:status')",
     )
     .await;
 
@@ -1589,7 +1585,7 @@ async fn test_alter_st_change_partition_key_to_list() {
     // Verify LIST partitioning.
     let part_strategy: String = db
         .query_scalar(
-            "SELECT partstrat FROM pg_partitioned_table pt \
+            "SELECT partstrat::text FROM pg_partitioned_table pt \
              JOIN pg_class c ON c.oid = pt.partrelid \
              WHERE c.relname = 'alt_chg_st'",
         )
@@ -1749,7 +1745,7 @@ async fn test_partitioned_st_hash_create_and_refresh() {
     // Verify storage table is HASH-partitioned
     let part_strategy: String = db
         .query_scalar(
-            "SELECT partstrat FROM pg_partitioned_table pt \
+            "SELECT partstrat::text FROM pg_partitioned_table pt \
              JOIN pg_class c ON c.oid = pt.partrelid \
              WHERE c.relname = 'hash_summary'",
         )
@@ -2014,7 +2010,7 @@ async fn test_alter_st_partition_by_hash() {
     // Verify the storage is now HASH-partitioned
     let part_strategy: String = db
         .query_scalar(
-            "SELECT partstrat FROM pg_partitioned_table pt \
+            "SELECT partstrat::text FROM pg_partitioned_table pt \
              JOIN pg_class c ON c.oid = pt.partrelid \
              WHERE c.relname = 'alt_hash_st'",
         )

@@ -1292,7 +1292,10 @@ pub fn contains_semijoin(op: &OpTree) -> bool {
         OpTree::RecursiveCte {
             base, recursive, ..
         } => contains_semijoin(base) || contains_semijoin(recursive),
-        OpTree::Scan { .. } | OpTree::CteScan { .. } | OpTree::RecursiveSelfRef { .. } => false,
+        OpTree::Scan { .. }
+        | OpTree::CteScan { .. }
+        | OpTree::RecursiveSelfRef { .. }
+        | OpTree::ConstantSelect { .. } => false,
     }
 }
 

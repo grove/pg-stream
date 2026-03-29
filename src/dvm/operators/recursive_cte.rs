@@ -1465,6 +1465,8 @@ fn generate_query_sql(
             ))
         }
 
+        OpTree::ConstantSelect { sql, .. } => Ok(sql.clone()),
+
         _ => Err(PgTrickleError::InternalError(format!(
             "generate_query_sql: unsupported OpTree variant {:?} in recursive term",
             op.alias(),

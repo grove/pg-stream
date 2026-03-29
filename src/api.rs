@@ -3220,7 +3220,15 @@ fn resume_stream_table_impl(name: &str) -> Result<(), PgTrickleError> {
 fn refresh_stream_table(name: &str) {
     let result = refresh_stream_table_impl(name);
     if let Err(e) = result {
-        raise_error_with_context(e);
+        // RefreshSkipped is a transient, non-fatal condition: another refresh
+        // is already in progress on this ST. Log it at DEBUG level and return
+        // successfully so that concurrent callers (e.g. the test's two racing
+        // connections) do not see a client-visible error.
+        if let PgTrickleError::RefreshSkipped(_) = &e {
+            pgrx::debug1!("{}", e);
+        } else {
+            raise_error_with_context(e);
+        }
     }
 }
 
@@ -5415,6 +5423,38 @@ fn setup_cdc_for_source(
         // Rebuild the trigger function + sync change buffer columns so the union
         // of all downstream ST column sets is reflected in the buffer.
         cdc::rebuild_cdc_trigger_function(source_oid, change_schema)?;
+
+        // Invalidate the MERGE template cache for every existing ST that
+        // depends on this source.  The rebuild above may have changed the
+        // number of CDC columns (e.g. 3→4 when a new ST adds a column),
+        // which changes the bit-mask width embedded in each ST's MERGE
+        // template.  Without this invalidation, a cached 3-bit template
+        // would be executed against 4-bit changed_cols rows and raise
+        // "cannot AND bit strings of different sizes".
+        let existing_dep_ids: Vec<i64> = Spi::connect(|client| {
+            let table = client
+                .select(
+                    "SELECT DISTINCT pgt_id FROM pgtrickle.pgt_dependencies \
+                         WHERE source_relid = $1",
+                    None,
+                    &[source_oid.into()],
+                )
+                .map_err(|e: pgrx::spi::SpiError| PgTrickleError::SpiError(e.to_string()))?;
+            let mut ids = Vec::new();
+            for row in table {
+                if let Some(id) = row
+                    .get::<i64>(1)
+                    .map_err(|e: pgrx::spi::SpiError| PgTrickleError::SpiError(e.to_string()))?
+                {
+                    ids.push(id);
+                }
+            }
+            Ok::<_, PgTrickleError>(ids)
+        })
+        .unwrap_or_default();
+        for dep_pgt_id in existing_dep_ids {
+            crate::refresh::invalidate_merge_cache(dep_pgt_id);
+        }
     }
 
     if requested_cdc_mode == "trigger" {
