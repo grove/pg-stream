@@ -532,15 +532,15 @@ DI-2 is a v1.x architectural change; all others are v0.x candidates.
 
 | Priority | Proposal | Impact | Effort | Target |
 |----------|----------|--------|--------|--------|
-| P0 | DI-1: Named CTE L₀ | High (Q05/Q09) | Medium | v0.14 |
-| P0 | DI-3: Group-key aggregate filter | Medium-High | Low | v0.14 |
-| P1 | DI-6: Lazy semi-join R_old | High (Q20) | Medium | v0.14 |
-| P1 | DI-4: Shared R₀ cache | Medium | Medium | v0.14 |
-| P2 | DI-7: Strategy selector | Safety net | Low | v0.14 |
-| P2 | DI-5: Part 3 consolidation | Low-Medium | Medium | v0.15+ |
+| P0 | DI-1: Named CTE L₀ | High (Q05/Q09) | Medium | v0.13 |
+| P0 | DI-3: Group-key aggregate filter | Medium-High | Low | v0.13 |
+| P1 | DI-6: Lazy semi-join R_old | High (Q20) | Medium | v0.13 |
+| P1 | DI-4: Shared R₀ cache | Medium | Medium | v0.13 |
+| P2 | DI-7: Strategy selector | Safety net | Low | v0.13 |
+| P2 | DI-5: Part 3 consolidation | Low-Medium | Medium | v0.13 |
 | P3 | DI-2: Pre-image capture | Very high | High | v1.x |
 
-**Recommended sequence for v0.14:**
+**Recommended sequence for v0.13:**
 1. DI-1 (unblocks DI-4, biggest single improvement for deep joins)
 2. DI-3 (independent, small, high ROI for aggregate queries)
 3. DI-6 (semi-join optimization, improves Q20 and similar)
@@ -549,7 +549,7 @@ DI-2 is a v1.x architectural change; all others are v0.x candidates.
 
 **Validation gate:** After DI-1 + DI-3, re-run TPC-H at SF=0.01 with
 `temp_file_limit = '4GB'`. If Q05/Q09 pass, the v0.13.0 correctness gate
-(22/22) is achievable retroactively. If not, temporarily raise
+(22/22) is met. If not, temporarily raise
 `temp_file_limit` and measure actual disk usage delta.
 
 ---

@@ -2515,6 +2515,32 @@ cleanup for PG 16+ expression types.
 
 > **SQL coverage cleanup subtotal: ~1–2 days**
 
+### DVM Engine Improvements (Phase 10)
+
+> **In plain terms:** The delta SQL generated for deep multi-table joins
+> (e.g., TPC-H Q05/Q09 with 6 joined tables) computes identical pre-change
+> snapshots redundantly at every reference site, spilling multi-GB temporary
+> files that exceed `temp_file_limit`. Nested semi-joins (Q20) exhibit an
+> O(n²) blowup from fully materializing the right-side pre-change state.
+> These improvements target the intermediate data volume directly in the
+> delta SQL generator, with TPC-H 22/22 DIFFERENTIAL correctness as the
+> measurable gate.
+
+| Item | Description | Effort | Ref |
+|------|-------------|--------|-----|
+| DI-1 | **Named CTE L₀ snapshots.** Emit per-leaf pre-change snapshots as named CTEs instead of inline SQL; deduplicate 3–10× redundant `EXCEPT ALL` evaluations per leaf; MATERIALIZED when reference count ≥ 3. Targets the root cause of Q05/Q09 temp spill. | 2–3d | [PLAN_DVM_IMPROVEMENTS.md §DI-1](plans/performance/PLAN_DVM_IMPROVEMENTS.md) |
+| DI-3 | **Group-key filtered aggregate old rescan.** Restrict non-algebraic aggregate `EXCEPT ALL` rescans to only affected groups via a `WHERE group_key IN (...)` filter. Independent quick win. | 0.5–1d | [PLAN_DVM_IMPROVEMENTS.md §DI-3](plans/performance/PLAN_DVM_IMPROVEMENTS.md) |
+| DI-6 | **Lazy semi-join R_old materialization.** Skip `EXCEPT ALL` for unchanged semi-join right children; push down equi-join key as a filter when R_old is needed. Eliminates Q20-type O(n²) blowup. | 1–2d | [PLAN_DVM_IMPROVEMENTS.md §DI-6](plans/performance/PLAN_DVM_IMPROVEMENTS.md) |
+| DI-4 | **Shared R₀ CTE cache.** Cache pre-change snapshot SQL by OpTree node identity to avoid regenerating duplicate inline subqueries for shared subtrees. Depends on DI-1. | 1–2d | [PLAN_DVM_IMPROVEMENTS.md §DI-4](plans/performance/PLAN_DVM_IMPROVEMENTS.md) |
+| DI-5 | **Part 3 correction consolidation.** Consolidate per-node Part 3 correction CTEs for linear inner-join chains into a single term. | 2–3d | [PLAN_DVM_IMPROVEMENTS.md §DI-5](plans/performance/PLAN_DVM_IMPROVEMENTS.md) |
+| DI-7 | **Scan-count-aware strategy selector.** `max_differential_joins` per-stream-table option; auto-fallback to FULL refresh above threshold. Safety-net after DI-1/DI-3/DI-6 raise the bar. | 1d | [PLAN_DVM_IMPROVEMENTS.md §DI-7](plans/performance/PLAN_DVM_IMPROVEMENTS.md) |
+
+> DI-2 (pre-image capture from CDC) is deferred to v1.x — architectural change.
+
+> **Implementation order:** DI-1 → DI-3 → DI-6 → DI-4 → DI-5 → DI-7
+
+> **DVM improvements subtotal: ~1–2 weeks**
+
 ### Regression-Free Testing Initiative (Q2 2026)
 
 > Tracking: [TESTING_GAPS_2_IMPLEMENTATION_PROPOSAL.md](plans/testing/TESTING_GAPS_2_IMPLEMENTATION_PROPOSAL.md)
@@ -2531,7 +2557,7 @@ Target: reduce regression escape rate from ~15% to <5%.
 | P5 | Failure recovery & schema evolution: 6 failure recovery tests (FR-1..6 in `e2e_failure_recovery_tests.rs`) + 5 schema evolution tests (SE-1..5 in `e2e_ddl_event_tests.rs`) | ✅ Done (2026-03-28) |
 | P6 | MERGE template unit tests: 8 pure-Rust tests — `determine_refresh_action` (×5) + `build_is_distinct_clause` boundary (×3) in `src/refresh.rs` | ✅ Done (2026-03-28) |
 
-> **v0.13.0 total: ~15–23 weeks** (Scalability: 6–8w, Partitioning: 5–8w, MERGE Profiling: 1–3w, dbt: 2–3.5d, Multi-tenant: 2–3w, TPC-H harness: ~1d, SQL cleanup: ~1–2d)
+> **v0.13.0 total: ~15–23 weeks** (Scalability: 6–8w, Partitioning: 5–8w, MERGE Profiling: 1–3w, dbt: 2–3.5d, Multi-tenant: 2–3w, TPC-H harness: ~1d, SQL cleanup: ~1–2d, DVM improvements: ~1–2w)
 
 **Exit criteria:**
 - [x] A-2: Columnar change tracking bitmask skips irrelevant rows; key column classification ✅, `__pgt_key_changed` annotation ✅, P5 value-only fast path ✅, `DiffResult.has_key_changed` signal propagation ✅, MERGE value-only UPDATE optimization ✅, upgrade script ✅ ✅ Done
@@ -2552,6 +2578,10 @@ Target: reduce regression escape rate from ~15% to <5%.
 - [x] SQL-PG16-1: `IS JSON` predicate accepted in DIFFERENTIAL defining queries; E2E tests in `e2e_expression_tests.rs` confirm correct delta behaviour ✅ Done
 - [x] SQL-PG16-2: `JSON_OBJECT`, `JSON_ARRAY`, `JSON_OBJECTAGG`, `JSON_ARRAYAGG` accepted in DIFFERENTIAL defining queries; E2E tests in `e2e_expression_tests.rs` confirm correct delta behaviour ✅ Done
 - [x] `scripts/check_upgrade_completeness.sh` passes (all catalog changes in `sql/pg_trickle--0.12.0--0.13.0.sql`) ✅ Done — 58 functions, 8 new columns, all covered
+- [ ] DI-1: Named CTE L₀ snapshots implemented; Q05/Q09 pass DIFFERENTIAL correctness with `temp_file_limit = '4GB'`
+- [ ] DI-3: Non-algebraic aggregate old rescan filtered to affected groups only
+- [ ] DI-6: Semi-join R_old lazy materialization with key push-down; Q20 DIFF latency below 1000ms at SF=0.01
+- [ ] DI-4/5/7: R₀ cache, Part 3 consolidation, strategy selector complete
 - [ ] Extension upgrade path tested (`0.12.0 → 0.13.0`)
 
 ---
