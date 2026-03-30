@@ -1,7 +1,7 @@
 # PLAN: DVM Engine Improvements — Reducing Delta SQL Intermediate Cardinality
 
 **Date:** 2025-07-22  
-**Status:** In Progress (DI-8 ✅, DI-9 ✅, DI-1 ✅, DI-3 ✅ (already implemented), DI-10 ✅, DI-6 ✅, DI-4 ✅ (subset of DI-1), DI-7 ✅)  
+**Status:** In Progress (DI-8 ✅, DI-9 ✅, DI-1 ✅, DI-3 ✅ (already implemented), DI-10 ✅, DI-6 ✅, DI-4 ✅ (subset of DI-1), DI-7 ✅, DI-5 ✅)  
 **Scope:** Reduce temporary data volume in generated delta SQL, targeting the
 multi-GB temp file spill that blocks TPC-H Q05/Q09 in DIFFERENTIAL mode and
 the O(n²) blowup on correlated semi-joins (Q20).
@@ -461,39 +461,27 @@ state is fixed for the entire delta computation, this should be safe.
 
 ---
 
-### DI-5: Part 3 Correction Consolidation
+### DI-5: Part 3 Correction Consolidation ✅
+
+**Status:** Completed (threshold raise approach).
 
 **Problem:** Part 3 (correction for double-counted rows in nested joins)
 generates separate CTEs for each join node in the chain. For a 6-table
 join, this can produce 2–4 correction CTEs, each referencing deltas from
 both left and right children.
 
-**Proposal:** Consolidate Part 3 corrections for adjacent join nodes in a
-linear chain into a single correction CTE that handles all overlapping
-deltas at once.
+**Analysis:** Part 3 correction is only emitted when `use_pre_change_snapshot`
+returns `false` for the left child, which happens only when the left child
+contains a semi-join or anti-join. For pure inner-join chains (TPC-H
+Q05/Q07/Q08), `use_l0` is always `true` and Part 3 is never emitted —
+making the original "consolidation across join levels" approach moot.
 
-**Implementation:**
-1. In `diff_inner_join`, detect when both left and right children are also
-   inner joins (linear chain pattern).
-2. For linear chains, emit a single correction CTE that joins all deltas
-   with appropriate conditions, instead of per-node corrections.
-3. Fall back to per-node corrections for non-linear (bushy) join trees.
-
-**Estimated impact:** 5–10% reduction in CTE count for linear join chains.
-Modest impact on data volume since Part 3 corrections typically have low
-cardinality (they process only the intersection of left and right deltas).
-
-**Effort:** Medium (2–3 days). Requires understanding the correction term
-algebra for chains and proving the consolidated version is equivalent.
-
-**Risk:** Medium. Correctness of the consolidated correction is non-trivial
-to verify. The existing per-node approach is well-tested. Incorrect
-consolidation would cause silent data corruption of type
-insert duplication or missed deletes.
-
-**Prerequisite:** None, but should be validated against TPC-H Q05/Q07/Q08/Q09
-to confirm the correction volume is actually significant enough to warrant
-this complexity.
+**Implementation (revised):** Raised the `join_scan_count` eligibility
+threshold from 3 to 5 via new constant `PART3_MAX_SCAN_COUNT`. DI-1's
+named CTE L₀ snapshots (NOT MATERIALIZED, shared via cache) reduce the
+temp-file pressure that motivated the old limit, allowing Part 3 to cover
+6-table semi-join chains. Added diagnostic SQL comment when correction is
+suppressed. 2 unit tests added.
 
 ---
 
