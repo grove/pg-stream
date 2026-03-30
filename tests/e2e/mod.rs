@@ -698,6 +698,28 @@ impl E2eDb {
         self.query_scalar(&format!("SHOW {setting}")).await
     }
 
+    /// SET a GUC and immediately SHOW it on the **same** connection.
+    ///
+    /// Session-level SET is visible only on the connection that ran it; with
+    /// a connection pool the subsequent SHOW may hit a different backend.
+    /// This helper guarantees both statements share a single connection.
+    pub async fn set_and_show_setting(&self, set_sql: &str, setting: &str) -> String {
+        let mut conn = self
+            .pool
+            .acquire()
+            .await
+            .expect("Failed to acquire connection for set_and_show_setting");
+        sqlx::query(set_sql)
+            .execute(&mut *conn)
+            .await
+            .unwrap_or_else(|e| panic!("SET failed: {e}\nSQL: {set_sql}"));
+        let result: (String,) = sqlx::query_as(&format!("SHOW {setting}"))
+            .fetch_one(&mut *conn)
+            .await
+            .unwrap_or_else(|e| panic!("SHOW {setting} failed: {e}"));
+        result.0
+    }
+
     /// Wait until `SHOW <setting>` reports the expected value.
     pub async fn wait_for_setting(&self, setting: &str, expected: &str) {
         for _ in 0..10 {

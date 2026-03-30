@@ -835,19 +835,50 @@ fn compact_st_advisory_lock_key(pgt_id: i64) -> i64 {
 /// Task 3.3: Check whether the given source table's effective refresh schedule
 /// warrants auto-partitioning (>= 30 s).
 fn should_auto_partition(source_oid: pg_sys::Oid) -> bool {
-    // Look up the minimum schedule among all stream tables that depend
-    // on this source.  If ALL consumers refresh at >= 30 s intervals,
-    // the DDL overhead per cycle is worthwhile.
-    let min_schedule: Option<i32> = Spi::get_one::<i32>(&format!(
-        "SELECT MIN(COALESCE(s.schedule_seconds, {default})) \
-         FROM pgtrickle.pgt_stream_tables s \
-         JOIN pgtrickle.pgt_dependencies d ON d.pgt_id = s.pgt_id \
-         WHERE d.source_relid = {oid} AND d.source_type = 'TABLE'",
-        oid = source_oid.to_u32(),
-        default = crate::config::pg_trickle_default_schedule_seconds(),
-    ))
-    .unwrap_or(None);
-    min_schedule.unwrap_or(0) >= 30
+    // Look up schedules for all stream tables that depend on this source.
+    // If ALL consumers refresh at >= 30 s intervals, the DDL overhead per
+    // cycle is worthwhile.
+    let default_secs = crate::config::pg_trickle_default_schedule_seconds() as i64;
+
+    let schedules: Vec<Option<String>> = Spi::connect(|client| {
+        let table = client
+            .select(
+                &format!(
+                    "SELECT s.schedule::text AS sched \
+                     FROM pgtrickle.pgt_stream_tables s \
+                     JOIN pgtrickle.pgt_dependencies d ON d.pgt_id = s.pgt_id \
+                     WHERE d.source_relid = {oid} AND d.source_type = 'TABLE'",
+                    oid = source_oid.to_u32(),
+                ),
+                None,
+                &[],
+            )
+            .ok()?;
+        let mut v = Vec::new();
+        for row in table {
+            v.push(row.get_by_name::<String, _>("sched").ok().flatten());
+        }
+        Some(v)
+    })
+    .unwrap_or_default();
+
+    if schedules.is_empty() {
+        return false;
+    }
+
+    // Parse each schedule text into seconds; treat unparseable schedules
+    // (cron, 'calculated', NULL) as the global default.
+    let min_secs = schedules
+        .iter()
+        .map(|s| {
+            s.as_deref()
+                .and_then(|txt| crate::api::parse_duration(txt).ok())
+                .unwrap_or(default_secs)
+        })
+        .min()
+        .unwrap_or(0);
+
+    min_secs >= 30
 }
 
 /// Task 3.3: Check if a change buffer table is partitioned.

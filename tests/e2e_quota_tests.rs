@@ -38,10 +38,11 @@ async fn test_per_database_worker_quota_guc_default() {
 async fn test_per_database_worker_quota_guc_set_roundtrip() {
     let db = E2eDb::new().await.with_extension().await;
 
-    db.execute("SET pg_trickle.per_database_worker_quota = 4")
-        .await;
     let quota = db
-        .show_setting("pg_trickle.per_database_worker_quota")
+        .set_and_show_setting(
+            "SET pg_trickle.per_database_worker_quota = 4",
+            "pg_trickle.per_database_worker_quota",
+        )
         .await;
     assert_eq!(
         quota, "4",
@@ -54,10 +55,11 @@ async fn test_per_database_worker_quota_guc_set_roundtrip() {
 async fn test_per_database_worker_quota_guc_max_value() {
     let db = E2eDb::new().await.with_extension().await;
 
-    db.execute("SET pg_trickle.per_database_worker_quota = 64")
-        .await;
     let quota = db
-        .show_setting("pg_trickle.per_database_worker_quota")
+        .set_and_show_setting(
+            "SET pg_trickle.per_database_worker_quota = 64",
+            "pg_trickle.per_database_worker_quota",
+        )
         .await;
     assert_eq!(
         quota, "64",

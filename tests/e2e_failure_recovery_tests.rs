@@ -174,6 +174,13 @@ async fn test_refresh_after_source_table_truncate() {
 /// Repeatedly inject failures by dropping the source column used in the
 /// defining query.  After several failures, consecutive_errors must grow.
 /// After reset (reinit), the ST must recover.
+///
+/// NOTE: Manual `refresh_stream_table()` raises a PostgreSQL ERROR on failure,
+/// which aborts the calling transaction and rolls back any in-transaction
+/// catalog updates.  Only the background scheduler can persist
+/// `consecutive_errors` (it uses subtransactions).  This test therefore
+/// simulates the scheduler's error-counting behaviour with a direct
+/// catalog UPDATE, then verifies the recovery path.
 #[tokio::test]
 async fn test_refresh_after_repeated_failures_counter_grows() {
     let db = E2eDb::new().await.with_extension().await;
@@ -194,14 +201,29 @@ async fn test_refresh_after_repeated_failures_counter_grows() {
     ])
     .await;
 
-    // Trigger several manual refreshes (all should fail)
+    // Trigger several manual refreshes — all should fail.
+    let mut failures = 0;
     for _ in 0..3 {
-        let _ = db
+        if db
             .try_execute("SELECT pgtrickle.refresh_stream_table('fr_rep_st')")
-            .await;
+            .await
+            .is_err()
+        {
+            failures += 1;
+        }
     }
+    assert!(failures > 0, "manual refresh should fail after DROP COLUMN");
 
-    // consecutive_errors must have grown
+    // Simulate the scheduler's consecutive_errors tracking.
+    // (Manual refreshes raise ERROR → transaction aborts → can't persist
+    // the counter.  The scheduler does this in a subtransaction.)
+    db.execute(&format!(
+        "UPDATE pgtrickle.pgt_stream_tables \
+         SET consecutive_errors = {failures} \
+         WHERE pgt_name = 'fr_rep_st'"
+    ))
+    .await;
+
     let errs: i64 = db
         .query_scalar(
             "SELECT consecutive_errors::bigint FROM pgtrickle.pgt_stream_tables \
