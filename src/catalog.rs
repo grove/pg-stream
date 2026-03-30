@@ -98,6 +98,16 @@ pub struct StreamTableMeta {
     /// created as a declaratively partitioned table (RANGE on this column),
     /// and the refresh path will inject a partition-key range predicate (A1-3).
     pub st_partition_key: Option<String>,
+    /// DI-7: Maximum number of join scans allowed for DIFFERENTIAL mode.
+    /// When the defining query has more Scan nodes in its join tree than
+    /// this threshold, the scheduler automatically falls back to FULL refresh.
+    /// `None` means no limit (use DIFFERENTIAL regardless of join count).
+    pub max_differential_joins: Option<i32>,
+    /// DI-7: Maximum delta fraction (0.0–1.0) for DIFFERENTIAL mode.
+    /// When the change buffer row count exceeds this fraction of the
+    /// estimated base table size, the scheduler falls back to FULL refresh.
+    /// `None` means no limit.
+    pub max_delta_fraction: Option<f64>,
 }
 
 /// CDC mode for a source dependency — tracks whether change capture uses
@@ -210,13 +220,20 @@ impl StreamTableMeta {
         is_append_only: bool,
         pooler_compatibility_mode: bool,
         st_partition_key: Option<&str>,
+        max_differential_joins: Option<i32>,
+        max_delta_fraction: Option<f64>,
     ) -> Result<i64, PgTrickleError> {
         Spi::connect_mut(|client| {
             let row = client
                 .update(
                     "INSERT INTO pgtrickle.pgt_stream_tables \
-                     (pgt_relid, pgt_name, pgt_schema, defining_query, original_query, schedule, refresh_mode, functions_used, topk_limit, topk_order_by, topk_offset, diamond_consistency, diamond_schedule_policy, has_keyless_source, requested_cdc_mode, is_append_only, pooler_compatibility_mode, st_partition_key) \
-                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18) \
+                     (pgt_relid, pgt_name, pgt_schema, defining_query, original_query, schedule, \
+                      refresh_mode, functions_used, topk_limit, topk_order_by, topk_offset, \
+                      diamond_consistency, diamond_schedule_policy, has_keyless_source, \
+                      requested_cdc_mode, is_append_only, pooler_compatibility_mode, \
+                      st_partition_key, max_differential_joins, max_delta_fraction) \
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, \
+                             $15, $16, $17, $18, $19, $20) \
                      RETURNING pgt_id",
                     None,
                     &[
@@ -238,6 +255,8 @@ impl StreamTableMeta {
                         is_append_only.into(),
                         pooler_compatibility_mode.into(),
                         st_partition_key.into(),
+                        max_differential_joins.into(),
+                        max_delta_fraction.into(),
                     ],
                 )
                 .map_err(|e: pgrx::spi::SpiError| PgTrickleError::SpiError(e.to_string()))?
@@ -265,7 +284,7 @@ impl StreamTableMeta {
                      COALESCE(fuse_mode, 'off') AS fuse_mode, \
                      COALESCE(fuse_state, 'armed') AS fuse_state, \
                      fuse_ceiling, fuse_sensitivity, blown_at, blow_reason, \
-                     st_partition_key \
+                     st_partition_key, max_differential_joins, max_delta_fraction \
                      FROM pgtrickle.pgt_stream_tables \
                      WHERE pgt_schema = $1 AND pgt_name = $2",
                     None,
@@ -297,7 +316,7 @@ impl StreamTableMeta {
                      COALESCE(fuse_mode, 'off') AS fuse_mode, \
                      COALESCE(fuse_state, 'armed') AS fuse_state, \
                      fuse_ceiling, fuse_sensitivity, blown_at, blow_reason, \
-                     st_partition_key \
+                     st_partition_key, max_differential_joins, max_delta_fraction \
                      FROM pgtrickle.pgt_stream_tables \
                      WHERE pgt_relid = $1",
                     None,
@@ -334,7 +353,7 @@ impl StreamTableMeta {
                      COALESCE(fuse_mode, 'off') AS fuse_mode, \
                      COALESCE(fuse_state, 'armed') AS fuse_state, \
                      fuse_ceiling, fuse_sensitivity, blown_at, blow_reason, \
-                     st_partition_key \
+                     st_partition_key, max_differential_joins, max_delta_fraction \
                      FROM pgtrickle.pgt_stream_tables \
                      WHERE pgt_id = $1",
                     None,
@@ -366,7 +385,7 @@ impl StreamTableMeta {
                      COALESCE(fuse_mode, 'off') AS fuse_mode, \
                      COALESCE(fuse_state, 'armed') AS fuse_state, \
                      fuse_ceiling, fuse_sensitivity, blown_at, blow_reason, \
-                     st_partition_key \
+                     st_partition_key, max_differential_joins, max_delta_fraction \
                      FROM pgtrickle.pgt_stream_tables",
                     None,
                     &[],
@@ -402,7 +421,7 @@ impl StreamTableMeta {
                      COALESCE(fuse_mode, 'off') AS fuse_mode, \
                      COALESCE(fuse_state, 'armed') AS fuse_state, \
                      fuse_ceiling, fuse_sensitivity, blown_at, blow_reason, \
-                     st_partition_key \
+                     st_partition_key, max_differential_joins, max_delta_fraction \
                      FROM pgtrickle.pgt_stream_tables \
                      WHERE status = 'ACTIVE'",
                     None,
@@ -991,6 +1010,8 @@ impl StreamTableMeta {
         let blown_at = table.get::<TimestampWithTimeZone>(35).map_err(map_spi)?;
         let blow_reason = table.get::<String>(36).map_err(map_spi)?;
         let st_partition_key = table.get::<String>(37).map_err(map_spi)?;
+        let max_differential_joins = table.get::<i32>(38).map_err(map_spi)?;
+        let max_delta_fraction = table.get::<f64>(39).map_err(map_spi)?;
 
         Ok(StreamTableMeta {
             pgt_id,
@@ -1030,6 +1051,8 @@ impl StreamTableMeta {
             blown_at,
             blow_reason,
             st_partition_key,
+            max_differential_joins,
+            max_delta_fraction,
         })
     }
 
@@ -1133,6 +1156,8 @@ impl StreamTableMeta {
         let blown_at = row.get::<TimestampWithTimeZone>(35).map_err(map_spi)?;
         let blow_reason = row.get::<String>(36).map_err(map_spi)?;
         let st_partition_key = row.get::<String>(37).map_err(map_spi)?;
+        let max_differential_joins = row.get::<i32>(38).map_err(map_spi)?;
+        let max_delta_fraction = row.get::<f64>(39).map_err(map_spi)?;
 
         Ok(StreamTableMeta {
             pgt_id,
@@ -1172,6 +1197,8 @@ impl StreamTableMeta {
             blown_at,
             blow_reason,
             st_partition_key,
+            max_differential_joins,
+            max_delta_fraction,
         })
     }
 }

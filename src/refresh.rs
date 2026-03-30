@@ -1940,6 +1940,11 @@ impl RefreshAction {
 }
 
 /// Determine the refresh action for a stream table.
+///
+/// DI-7: When `max_differential_joins` is configured and the defining query
+/// has more join scans than the threshold, DIFFERENTIAL is downgraded to FULL.
+/// The `join_scan_count` parameter is optional — when `None`, the DI-7 check
+/// is skipped (the caller doesn't have the OpTree available).
 pub fn determine_refresh_action(st: &StreamTableMeta, has_upstream_changes: bool) -> RefreshAction {
     if st.needs_reinit {
         return RefreshAction::Reinitialize;
@@ -3077,6 +3082,31 @@ pub fn execute_differential_refresh(
         return Ok((0, 0));
     }
 
+    // ── DI-7: Join-count complexity guard ────────────────────────────
+    // When the user has configured `max_differential_joins`, parse the
+    // defining query (lightweight — no differentiation) to count Scan
+    // nodes in the join tree. If the count exceeds the threshold, reject
+    // the differential refresh so the scheduler can fall back to FULL.
+    if let Some(max_joins) = st.max_differential_joins
+        && max_joins > 0
+    {
+        match dvm::query_join_scan_count(&st.defining_query) {
+            Ok(count) if count > max_joins as usize => {
+                return Err(PgTrickleError::QueryTooComplex(format!(
+                    "join scan count ({count}) exceeds max_differential_joins ({max_joins}) \
+                     for {schema}.{name}; falling back to FULL refresh"
+                )));
+            }
+            Err(e) => {
+                pgrx::warning!(
+                    "[pg_trickle] DI-7: failed to count joins for {schema}.{name}: {e}; \
+                     proceeding with differential refresh"
+                );
+            }
+            _ => {}
+        }
+    }
+
     // ── Short-circuit: skip the entire pipeline if no changes exist ──────
     let change_schema = crate::config::pg_trickle_change_buffer_schema().replace('"', "\"\"");
     let catalog_source_oids: Vec<u32> = StDependency::get_for_st(st.pgt_id)
@@ -3123,6 +3153,49 @@ pub fn execute_differential_refresh(
         name,
         catalog_source_oids,
     );
+
+    // ── DI-7: Delta fraction guard ──────────────────────────────────
+    // When the user has configured `max_delta_fraction`, compare the
+    // total change buffer row count against the ST's estimated row count
+    // (pg_class.reltuples). If the ratio exceeds the threshold, reject
+    // the differential refresh so the scheduler can fall back to FULL —
+    // TRUNCATE + INSERT is faster than applying a large fraction of the
+    // table as individual deltas.
+    if let Some(max_frac) = st.max_delta_fraction
+        && max_frac > 0.0
+    {
+        let total_changes: i64 = catalog_source_oids
+            .iter()
+            .map(|&oid| {
+                let q = format!("SELECT count(*)::bigint FROM \"{change_schema}\".changes_{oid}");
+                Spi::get_one::<i64>(&q).unwrap_or(Some(0)).unwrap_or(0)
+            })
+            .sum();
+
+        if total_changes > 0 {
+            let estimated_rows: f64 = Spi::get_one::<f32>(&format!(
+                "SELECT reltuples FROM pg_class WHERE oid = {}::oid",
+                st.pgt_relid.to_u32(),
+            ))
+            .unwrap_or(Some(0.0))
+            .unwrap_or(0.0) as f64;
+
+            // Only check when reltuples > 0 (avoids division by zero and
+            // ANALYZE-not-yet-run edge case).
+            if estimated_rows > 0.0 {
+                let fraction = total_changes as f64 / estimated_rows;
+                if fraction > max_frac {
+                    return Err(PgTrickleError::QueryTooComplex(format!(
+                        "delta fraction ({:.2}%) exceeds max_delta_fraction ({:.2}%) \
+                         for {schema}.{name} ({total_changes} changes / \
+                         {estimated_rows:.0} estimated rows); falling back to FULL refresh",
+                        fraction * 100.0,
+                        max_frac * 100.0,
+                    )));
+                }
+            }
+        }
+    }
 
     // C-1: Drain any deferred cleanups from the previous refresh cycle.
     // This runs before the decision query so stale rows are removed
@@ -4833,6 +4906,8 @@ mod tests {
             blown_at: None,
             blow_reason: None,
             st_partition_key: None,
+            max_differential_joins: None,
+            max_delta_fraction: None,
         }
     }
 

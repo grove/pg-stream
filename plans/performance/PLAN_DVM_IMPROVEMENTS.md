@@ -1,7 +1,7 @@
 # PLAN: DVM Engine Improvements — Reducing Delta SQL Intermediate Cardinality
 
 **Date:** 2025-07-22  
-**Status:** In Progress (DI-8 ✅, DI-9 ✅, DI-1 ✅, DI-3 ✅ (already implemented), DI-10 ✅)  
+**Status:** In Progress (DI-8 ✅, DI-9 ✅, DI-1 ✅, DI-3 ✅ (already implemented), DI-10 ✅, DI-6 ✅, DI-4 ✅ (subset of DI-1), DI-7 ✅)  
 **Scope:** Reduce temporary data volume in generated delta SQL, targeting the
 multi-GB temp file spill that blocks TPC-H Q05/Q09 in DIFFERENTIAL mode and
 the O(n²) blowup on correlated semi-joins (Q20).

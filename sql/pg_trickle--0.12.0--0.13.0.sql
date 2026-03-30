@@ -94,6 +94,13 @@ ALTER TABLE pgtrickle.pgt_stream_tables
 ALTER TABLE pgtrickle.pgt_stream_tables
     ADD COLUMN IF NOT EXISTS st_partition_key TEXT;
 
+-- DI-7: Strategy selector columns for automatic FULL fallback
+ALTER TABLE pgtrickle.pgt_stream_tables
+    ADD COLUMN IF NOT EXISTS max_differential_joins INT;
+
+ALTER TABLE pgtrickle.pgt_stream_tables
+    ADD COLUMN IF NOT EXISTS max_delta_fraction DOUBLE PRECISION;
+
 -- ── Developer diagnostic functions (DT-1 through DT-4) ───────────────────
 
 -- DT-1: explain_query_rewrite

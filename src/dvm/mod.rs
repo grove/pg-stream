@@ -238,6 +238,14 @@ pub fn get_source_oids_for_query(query: &str) -> Result<Vec<u32>, crate::error::
     Ok(oids)
 }
 
+/// DI-7: Parse a defining query and return the number of Scan nodes in the
+/// join tree. Used to decide whether to fall back to FULL refresh when the
+/// join tree complexity exceeds `max_differential_joins`.
+pub fn query_join_scan_count(query: &str) -> Result<usize, PgTrickleError> {
+    let result = parse_defining_query_full(query)?;
+    Ok(operators::join_common::join_scan_count(&result.tree))
+}
+
 /// Check whether an OpTree is a "scan-chain" — only Scan, Filter, Project,
 /// and Subquery nodes (no Aggregate, Join, UnionAll, Distinct, Window,
 /// RecursiveCte, or CteScan).

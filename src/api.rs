@@ -150,6 +150,8 @@ fn create_stream_table(
     append_only: default!(bool, false),
     pooler_compatibility_mode: default!(bool, false),
     partition_by: default!(Option<&str>, "NULL"),
+    max_differential_joins: default!(Option<i32>, "NULL"),
+    max_delta_fraction: default!(Option<f64>, "NULL"),
 ) {
     let result = create_stream_table_impl(
         name,
@@ -163,6 +165,8 @@ fn create_stream_table(
         append_only,
         pooler_compatibility_mode,
         partition_by,
+        max_differential_joins,
+        max_delta_fraction,
     );
     if let Err(e) = result {
         raise_error_with_context(e);
@@ -189,6 +193,8 @@ fn create_stream_table_if_not_exists(
     append_only: default!(bool, false),
     pooler_compatibility_mode: default!(bool, false),
     partition_by: default!(Option<&str>, "NULL"),
+    max_differential_joins: default!(Option<i32>, "NULL"),
+    max_delta_fraction: default!(Option<f64>, "NULL"),
 ) {
     let result = create_stream_table_if_not_exists_impl(
         name,
@@ -202,6 +208,8 @@ fn create_stream_table_if_not_exists(
         append_only,
         pooler_compatibility_mode,
         partition_by,
+        max_differential_joins,
+        max_delta_fraction,
     );
     if let Err(e) = result {
         raise_error_with_context(e);
@@ -221,6 +229,8 @@ fn create_stream_table_if_not_exists_impl(
     append_only: bool,
     pooler_compatibility_mode: bool,
     partition_by: Option<&str>,
+    max_differential_joins: Option<i32>,
+    max_delta_fraction: Option<f64>,
 ) -> Result<(), PgTrickleError> {
     let (schema, table_name) = parse_qualified_name(name)?;
 
@@ -245,6 +255,8 @@ fn create_stream_table_if_not_exists_impl(
             append_only,
             pooler_compatibility_mode,
             partition_by,
+            max_differential_joins,
+            max_delta_fraction,
         ),
         Err(e) => Err(e),
     }
@@ -276,6 +288,8 @@ fn create_or_replace_stream_table(
     append_only: default!(bool, false),
     pooler_compatibility_mode: default!(bool, false),
     partition_by: default!(Option<&str>, "NULL"),
+    max_differential_joins: default!(Option<i32>, "NULL"),
+    max_delta_fraction: default!(Option<f64>, "NULL"),
 ) {
     let result = create_or_replace_stream_table_impl(
         name,
@@ -289,6 +303,8 @@ fn create_or_replace_stream_table(
         append_only,
         pooler_compatibility_mode,
         partition_by,
+        max_differential_joins,
+        max_delta_fraction,
     );
     if let Err(e) = result {
         raise_error_with_context(e);
@@ -421,6 +437,8 @@ fn create_or_replace_stream_table_impl(
     append_only: bool,
     pooler_compatibility_mode: bool,
     partition_by: Option<&str>,
+    max_differential_joins: Option<i32>,
+    max_delta_fraction: Option<f64>,
 ) -> Result<(), PgTrickleError> {
     let (schema, table_name) = parse_qualified_name(name)?;
 
@@ -482,6 +500,8 @@ fn create_or_replace_stream_table_impl(
                 None, // fuse_ceiling: not set via create_or_replace
                 None, // fuse_sensitivity: not set via create_or_replace
                 None, // partition_by: not changed via create_or_replace
+                max_differential_joins,
+                max_delta_fraction,
             )?;
 
             pgrx::info!(
@@ -508,6 +528,8 @@ fn create_or_replace_stream_table_impl(
                 append_only,
                 pooler_compatibility_mode,
                 partition_by,
+                max_differential_joins,
+                max_delta_fraction,
             )
         }
         Err(e) => Err(e),
@@ -1179,6 +1201,8 @@ fn insert_catalog_and_deps(
     is_append_only: bool,
     pooler_compatibility_mode: bool,
     partition_by: Option<&str>,
+    max_differential_joins: Option<i32>,
+    max_delta_fraction: Option<f64>,
 ) -> Result<i64, PgTrickleError> {
     let pgt_id = StreamTableMeta::insert(
         pgt_relid,
@@ -1201,6 +1225,8 @@ fn insert_catalog_and_deps(
         is_append_only,
         pooler_compatibility_mode,
         partition_by,
+        max_differential_joins,
+        max_delta_fraction,
     )?;
 
     // Build per-source column usage map
@@ -2227,6 +2253,8 @@ fn create_stream_table_impl(
     append_only: bool,
     pooler_compatibility_mode: bool,
     partition_by: Option<&str>,
+    max_differential_joins: Option<i32>,
+    max_delta_fraction: Option<f64>,
 ) -> Result<(), PgTrickleError> {
     let is_auto = RefreshMode::is_auto_str(refresh_mode_str);
     let mut refresh_mode = RefreshMode::from_str(refresh_mode_str)?;
@@ -2441,6 +2469,8 @@ fn create_stream_table_impl(
         append_only,
         pooler_compatibility_mode,
         partition_by,
+        max_differential_joins,
+        max_delta_fraction,
     )?;
 
     // ── Phase 2: CDC / IVM trigger setup ──
@@ -2607,6 +2637,8 @@ fn alter_stream_table(
     fuse_ceiling: default!(Option<i64>, "NULL"),
     fuse_sensitivity: default!(Option<i32>, "NULL"),
     partition_by: default!(Option<&str>, "NULL"),
+    max_differential_joins: default!(Option<i32>, "NULL"),
+    max_delta_fraction: default!(Option<f64>, "NULL"),
 ) {
     let result = alter_stream_table_impl(
         name,
@@ -2624,6 +2656,8 @@ fn alter_stream_table(
         fuse_ceiling,
         fuse_sensitivity,
         partition_by,
+        max_differential_joins,
+        max_delta_fraction,
     );
     if let Err(e) = result {
         raise_error_with_context(e);
@@ -2647,6 +2681,8 @@ fn alter_stream_table_impl(
     fuse_ceiling_arg: Option<i64>,
     fuse_sensitivity_arg: Option<i32>,
     partition_by: Option<&str>,
+    max_differential_joins: Option<i32>,
+    max_delta_fraction: Option<f64>,
 ) -> Result<(), PgTrickleError> {
     let (schema, table_name) = parse_qualified_name(name)?;
     let mut st = StreamTableMeta::get_by_name(&schema, &table_name)?;
@@ -3044,6 +3080,39 @@ fn alter_stream_table_impl(
         }
 
         StreamTableMeta::update_fuse_config(st.pgt_id, &fuse_mode, ceiling, sensitivity)?;
+    }
+
+    // DI-7: Update max_differential_joins if explicitly set.
+    if let Some(mdj) = max_differential_joins {
+        if mdj < 0 {
+            return Err(PgTrickleError::InvalidArgument(
+                "max_differential_joins must be a non-negative integer (0 disables the limit)"
+                    .into(),
+            ));
+        }
+        let val: Option<i32> = if mdj == 0 { None } else { Some(mdj) };
+        Spi::run_with_args(
+            "UPDATE pgtrickle.pgt_stream_tables \
+             SET max_differential_joins = $1, updated_at = now() WHERE pgt_id = $2",
+            &[val.into(), st.pgt_id.into()],
+        )
+        .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
+    }
+
+    // DI-7: Update max_delta_fraction if explicitly set.
+    if let Some(mdf) = max_delta_fraction {
+        if mdf < 0.0 {
+            return Err(PgTrickleError::InvalidArgument(
+                "max_delta_fraction must be a non-negative number (0 disables the limit)".into(),
+            ));
+        }
+        let val: Option<f64> = if mdf == 0.0 { None } else { Some(mdf) };
+        Spi::run_with_args(
+            "UPDATE pgtrickle.pgt_stream_tables \
+             SET max_delta_fraction = $1, updated_at = now() WHERE pgt_id = $2",
+            &[val.into(), st.pgt_id.into()],
+        )
+        .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
     }
 
     shmem::signal_dag_invalidation(st.pgt_id);
@@ -7995,6 +8064,8 @@ mod tests {
             blown_at: None,
             blow_reason: None,
             st_partition_key: None,
+            max_differential_joins: None,
+            max_delta_fraction: None,
         }
     }
 

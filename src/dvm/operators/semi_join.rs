@@ -123,9 +123,44 @@ pub fn diff_semi_join(ctx: &mut DiffContext, op: &OpTree) -> Result<DiffResult, 
     // At SF=0.01 with 3 mutation cycles, this reduces Q21 from ~5.4s to
     // sub-second by allowing PostgreSQL to hash-probe the pre-computed
     // snapshot instead of repeatedly scanning and differencing the tables.
+    //
+    // DI-6: Push equi-join key filter into R_old's base table scan.
+    // Part 1 queries R_old with delta_left keys; Part 2 queries R_old with
+    // delta_right-correlated left keys. The key filter restricts R_old to
+    // only rows whose join key appears in either delta source, reducing
+    // materialization volume for high-cardinality right tables (Q20/Q21).
+    let r_old_equi_keys = extract_equijoin_keys_aliased(condition, left, "dl", right, right_alias);
+    let r_old_key_filter = {
+        let valid_keys: Vec<_> = r_old_equi_keys
+            .iter()
+            .filter(|(lk, rk)| {
+                lk.starts_with("dl.") && rk.starts_with(&format!("\"{}\".", right_alias))
+            })
+            .collect();
+        if valid_keys.is_empty() {
+            String::new()
+        } else {
+            // Filter: right_key IN (keys from delta_left UNION ALL keys from delta_right)
+            let filters: Vec<String> = valid_keys
+                .iter()
+                .map(|(left_key, right_key)| {
+                    format!(
+                        "{right_key} IN (\
+                         SELECT {left_key} FROM {delta_left} dl \
+                         UNION ALL \
+                         SELECT {right_key} FROM {delta_right} dr)",
+                        delta_left = left_result.cte_name,
+                        delta_right = right_result.cte_name,
+                    )
+                })
+                .collect();
+            format!(" WHERE {}", filters.join(" AND "))
+        }
+    };
+
     let r_old_cte_name = ctx.next_cte_name("r_old");
     let r_old_sql = format!(
-        "SELECT {right_col_list} FROM {right_table} {right_alias} \
+        "SELECT {right_col_list} FROM {right_table} {right_alias}{r_old_key_filter} \
          EXCEPT ALL \
          SELECT {right_col_list} FROM {delta_right} WHERE __pgt_action = 'I' \
          UNION ALL \
@@ -605,6 +640,29 @@ mod tests {
         assert!(
             sql.contains(r#""dr"."customer_id""#),
             "Part 2 must reference dr.\"customer_id\"\nSQL: {sql}"
+        );
+    }
+
+    // ── DI-6: R_old key push-down ───────────────────────────────────
+
+    #[test]
+    fn test_di6_r_old_key_pushdown_present() {
+        let mut ctx = test_ctx();
+        let left = scan(1, "orders", "public", "o", &["id", "cust_id"]);
+        let right = scan(2, "customers", "public", "c", &["id", "name"]);
+        let cond = eq_cond("o", "cust_id", "c", "id");
+        let tree = OpTree::SemiJoin {
+            condition: cond,
+            left: Box::new(left),
+            right: Box::new(right),
+        };
+        let result = diff_semi_join(&mut ctx, &tree).unwrap();
+        let sql = ctx.build_with_query(&result.cte_name);
+
+        // DI-6: R_old should have a WHERE key IN (...) filter
+        assert!(
+            sql.contains("WHERE") && sql.contains("EXCEPT ALL"),
+            "R_old CTE should have a WHERE key filter before EXCEPT ALL\nSQL: {sql}"
         );
     }
 }
