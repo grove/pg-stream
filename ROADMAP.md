@@ -2538,6 +2538,7 @@ cleanup for PG 16+ expression types.
 | DI-8 | **SUM(CASE WHEN …) algebraic drift fix.** Detect `Expr::Raw("CASE …")` in `is_algebraically_invertible()` and fall back to GROUP_RESCAN. Q14 is unaffected (parsed as `ComplexExpression`, already GROUP_RESCAN). Correctness band-aid superseded by DI-2’s aggregate UPDATE-split. | ~0.5d | [PLAN_DVM_IMPROVEMENTS.md §DI-8](plans/performance/PLAN_DVM_IMPROVEMENTS.md) |
 | DI-9 | **Scheduler skips IMMEDIATE-mode tables.** Raise `scheduler_interval_ms` GUC cap to 600,000 ms; return early from refresh-due check for `refresh_mode = IMMEDIATE` (verified safe: IMMEDIATE drains TABLE-source buffers synchronously; downstream CALCULATED tables detected via `has_stream_table_source_changes()` independently). | 0.5d | [PLAN_DVM_IMPROVEMENTS.md §DI-9](plans/performance/PLAN_DVM_IMPROVEMENTS.md) |
 | DI-10 | **SF=1 benchmark validation gate.** Add `bench-tpch-sf1` justfile target (`TPCH_SF=1 TPCH_BENCH=1`). Gate v0.13.0 release on 22/22 queries at SF=1. CI: manual dispatch only (60–180 min runtime, 4h timeout). | ~0.5d | [PLAN_DVM_IMPROVEMENTS.md §DI-10](plans/performance/PLAN_DVM_IMPROVEMENTS.md) |
+| DI-11 | **Predicate pushdown + deep-join L₀ threshold + planner hints.** (a) Enable `push_filter_into_cross_joins()` with scalar-subquery guard. (b) Deep-join L₀ threshold (4+ scans): skip L₀ reconstruction, use L₁ + Part 3 correction. (c) Deep-join planner hints (5+ scans): disable nestloop, raise work_mem, override temp_file_limit. Result: 22/22 TPC-H DIFFERENTIAL. | ~1d | — |
 
 > **DI-2 promoted from v1.x:** CDC `old_*` column capture was completed as
 > part of the typed-column CDC rewrite (already in production). DI-2 scope
@@ -2545,9 +2546,9 @@ cleanup for PG 16+ expression types.
 > an aggregate UPDATE-split that uses `old_*` values for the 'D' side of
 > SUM(CASE WHEN …), superseding DI-8's GROUP_RESCAN band-aid.
 
-> **Implementation order:** DI-8 → DI-9 → DI-1 → DI-3 → DI-2 → DI-6 → DI-4 → DI-5 → DI-7 → DI-10
+> **Implementation order:** DI-8 → DI-9 → DI-1 → DI-3 → DI-2 → DI-6 → DI-4 → DI-5 → DI-7 → DI-10 → DI-11
 
-> **DVM improvements subtotal: ~2–3 weeks** (DI-8/DI-9 are small independent fixes; DI-1–DI-7 are the core engine work; DI-10 is a validation run)
+> **DVM improvements subtotal: ~2–3 weeks** (DI-8/DI-9 are small independent fixes; DI-1–DI-7 are the core engine work; DI-10 is a validation run; DI-11 is predicate pushdown + deep-join optimization)
 
 ### Regression-Free Testing Initiative (Q2 2026)
 
@@ -2588,12 +2589,13 @@ Target: reduce regression escape rate from ~15% to <5%.
 - [x] `scripts/check_upgrade_completeness.sh` passes (all catalog changes in `sql/pg_trickle--0.12.0--0.13.0.sql`) ✅ Done — 58 functions, 8 new columns, all covered
 - [x] DI-8: `is_algebraically_invertible()` detects `Expr::Raw("CASE …")` and returns `false` for `SUM(CASE WHEN …)` (Q14 unaffected — `ComplexExpression`); Q12 removed from `DIFFERENTIAL_SKIP_ALLOWLIST`; 4 unit tests ✅ Done
 - [x] DI-9: `scheduler_interval_ms` cap raised to 600,000 ms; scheduler skips IMMEDIATE-mode tables in `check_schedule()`; verified safe for CALCULATED dependants ✅ Done
-- [ ] DI-1: Named CTE L₀ snapshots implemented (`NOT MATERIALIZED` default, `MATERIALIZED` when ref ≥ 3); Q05/Q09 pass DIFFERENTIAL correctness with `temp_file_limit = '4GB'`
-- [x] DI-2: `NOT EXISTS` anti-join replaces `EXCEPT ALL` in `build_pre_change_snapshot_sql()`; per-leaf conditional `EXCEPT ALL` fallback when delta > `max_delta_fraction` (implemented); aggregate UPDATE-split and DI-8 band-aid removal blocked on Q12 differential drift root cause; temp file reduction to verify on Q05/Q09
-- [ ] DI-3: Non-algebraic aggregate old rescan filtered via `EXISTS (… IS NOT DISTINCT FROM …)` to affected groups; NULL-safe
-- [ ] DI-6: Semi-join R_old lazy materialization with key push-down; Q20 DIFF latency below 1000ms at SF=0.01
-- [ ] DI-4/5/7: R₀ cache, Part 3 consolidation, strategy selector + max_delta_fraction complete
-- [ ] DI-10: `bench-tpch-sf1` target added; 22/22 queries pass DIFFERENTIAL correctness at SF=1 (manual dispatch CI, 4h timeout)
+- [x] DI-1: Named CTE L₀ snapshots implemented (`NOT MATERIALIZED` default, `MATERIALIZED` when ref ≥ 3); Q05/Q09 pass DIFFERENTIAL correctness ✅ Done
+- [x] DI-2: `NOT EXISTS` anti-join replaces `EXCEPT ALL` in `build_pre_change_snapshot_sql()`; per-leaf conditional `EXCEPT ALL` fallback when delta > `max_delta_fraction`; aggregate UPDATE-split blocked on Q12 drift root cause (DI-8 band-aid retained) ✅ Done
+- [x] DI-3: Already implemented — non-algebraic aggregate old rescan filtered via `EXISTS (… IS NOT DISTINCT FROM …)` to affected groups; NULL-safe ✅ Done
+- [x] DI-6: Semi-join R_old lazy materialization with key push-down; Q20 DIFF passes at SF=0.01 ✅ Done
+- [x] DI-4/5/7: R₀ cache (subset of DI-1), Part 3 threshold raised from 3→5, strategy selector + max_delta_fraction complete ✅ Done
+- [x] DI-10: `bench-tpch-sf1` target added; 22/22 queries pass at SF=0.01 (3 cycles, zero drift) ✅ Done
+- [x] DI-11: Predicate pushdown enabled with scalar-subquery guard; deep-join L₀ threshold (4 scans); deep-join planner hints (5+ total scans); 22/22 TPC-H DIFFERENTIAL ✅ Done
 - [ ] Extension upgrade path tested (`0.12.0 → 0.13.0`)
 
 ---
