@@ -161,6 +161,12 @@ thread_local! {
     /// table via this mapping.
     static ST_BYPASS_TABLES: RefCell<HashMap<i64, String>> =
         RefCell::new(HashMap::new());
+
+    /// DI-2: Source table OIDs whose per-leaf delta fraction exceeds
+    /// `max_delta_fraction`. These leaves fall back from NOT EXISTS
+    /// (index-based) to EXCEPT ALL (hash-based) in snapshot construction.
+    static FALLBACK_LEAF_OIDS: RefCell<std::collections::HashSet<u32>> =
+        RefCell::new(std::collections::HashSet::new());
 }
 
 /// Register a bypass temp table for the given upstream pgt_id.
@@ -181,6 +187,21 @@ pub fn clear_all_st_bypass() {
 /// Return the current bypass table mappings.
 pub fn get_st_bypass_tables() -> HashMap<i64, String> {
     ST_BYPASS_TABLES.with(|m| m.borrow().clone())
+}
+
+/// DI-2: Set the per-leaf fallback OIDs for the current refresh cycle.
+pub fn set_fallback_leaf_oids(oids: std::collections::HashSet<u32>) {
+    FALLBACK_LEAF_OIDS.with(|m| *m.borrow_mut() = oids);
+}
+
+/// DI-2: Return the current per-leaf fallback OIDs.
+pub fn get_fallback_leaf_oids() -> std::collections::HashSet<u32> {
+    FALLBACK_LEAF_OIDS.with(|m| m.borrow().clone())
+}
+
+/// DI-2: Clear the per-leaf fallback OIDs.
+pub fn clear_fallback_leaf_oids() {
+    FALLBACK_LEAF_OIDS.with(|m| m.borrow_mut().clear());
 }
 
 /// Execute any pending cleanups from previous refresh cycles.
@@ -606,17 +627,80 @@ const PLANNER_HINT_NESTLOOP_THRESHOLD: i64 = 100;
 /// Minimum delta rows before raising `work_mem` for hash joins.
 const PLANNER_HINT_WORKMEM_THRESHOLD: i64 = 10_000;
 
-/// Apply `SET LOCAL` planner hints based on the estimated delta size.
+/// Minimum Scan-node count before deep-join planner hints activate.
+/// At 5+ tables the delta SQL generates cascading L₀ snapshot CTEs
+/// whose intermediate hash joins can spill multi-GB temp files under
+/// PostgreSQL's default planner choices (nested loops, low work_mem).
+const DEEP_JOIN_SCAN_THRESHOLD: usize = 5;
+
+/// Apply `SET LOCAL` planner hints based on the estimated delta size
+/// and the join depth (scan count) of the defining query.
 ///
 /// - Small delta (ratio < merge_seqscan_threshold): `SET LOCAL enable_seqscan = off`
 ///   to force index lookups on the stream table.
 /// - delta 100–9 999: `SET LOCAL enable_nestloop = off`
 /// - delta >= 10 000: also `SET LOCAL work_mem = '<N>MB'`
+/// - scan_count >= 5 (deep join): disable nest loops, raise work_mem,
+///   raise join_collapse_limit, and remove temp_file_limit. The delta
+///   SQL for 5+ table joins produces O(n) snapshot CTEs whose hash
+///   joins can exceed default temp_file_limit under poor plans.
 ///
 /// `SET LOCAL` is automatically reset at the end of the current transaction,
 /// so these hints cannot leak to other queries.
-fn apply_planner_hints(estimated_delta: i64, st_relid: pg_sys::Oid) {
+fn apply_planner_hints(estimated_delta: i64, st_relid: pg_sys::Oid, scan_count: usize) {
     if !crate::config::pg_trickle_merge_planner_hints() {
+        return;
+    }
+
+    // ── Deep-join hints (DI-11) ─────────────────────────────────────
+    // For 5+ table joins the delta SQL generates cascading L₀ snapshot
+    // CTEs. Without planner guidance, PostgreSQL may choose nested-loop
+    // plans that create pathological temp file spills (>8 GB at SF=0.01).
+    // Fix: disable nest loops, raise work_mem, bump join_collapse_limit
+    // so the planner considers all join orderings, and remove the
+    // temp_file_limit cap so the query can run to completion.
+    if scan_count >= DEEP_JOIN_SCAN_THRESHOLD {
+        if let Err(e) = Spi::run("SET LOCAL enable_nestloop = off") {
+            pgrx::debug1!(
+                "[pg_trickle] DI-11: failed to SET LOCAL enable_nestloop: {}",
+                e
+            );
+        }
+        let mb = crate::config::pg_trickle_merge_work_mem_mb().max(512);
+        if let Err(e) = Spi::run(&format!("SET LOCAL work_mem = '{mb}MB'")) {
+            pgrx::debug1!("[pg_trickle] DI-11: failed to SET LOCAL work_mem: {}", e);
+        }
+        // Raise join_collapse_limit so the planner evaluates all join
+        // orderings for the inlined NOT MATERIALIZED snapshot CTEs.
+        // Default is 8; deep joins can exceed this after CTE inlining.
+        let jcl = (scan_count + 2).max(12);
+        if let Err(e) = Spi::run(&format!("SET LOCAL join_collapse_limit = {jcl}")) {
+            pgrx::debug1!(
+                "[pg_trickle] DI-11: failed to SET LOCAL join_collapse_limit: {}",
+                e
+            );
+        }
+        if let Err(e) = Spi::run(&format!("SET LOCAL from_collapse_limit = {jcl}")) {
+            pgrx::debug1!(
+                "[pg_trickle] DI-11: failed to SET LOCAL from_collapse_limit: {}",
+                e
+            );
+        }
+        // Remove temp_file_limit for this transaction so the delta query
+        // can complete even if intermediate hash batches spill to disk.
+        if let Err(e) = Spi::run("SET LOCAL temp_file_limit = -1") {
+            pgrx::debug1!(
+                "[pg_trickle] DI-11: failed to SET LOCAL temp_file_limit: {}",
+                e
+            );
+        }
+        pgrx::debug1!(
+            "[pg_trickle] DI-11: deep join (scan_count={scan_count}) — \
+             disabled nestloop, work_mem={mb}MB, join_collapse_limit={jcl}, \
+             temp_file_limit=-1",
+        );
+        // Skip the normal delta-size hints below — deep-join hints
+        // already cover nest-loop and work_mem.
         return;
     }
 
@@ -3083,27 +3167,28 @@ pub fn execute_differential_refresh(
     }
 
     // ── DI-7: Join-count complexity guard ────────────────────────────
-    // When the user has configured `max_differential_joins`, parse the
-    // defining query (lightweight — no differentiation) to count Scan
-    // nodes in the join tree. If the count exceeds the threshold, reject
-    // the differential refresh so the scheduler can fall back to FULL.
+    // Parse the defining query (lightweight — no differentiation) to count
+    // Scan nodes in the join tree. Used for:
+    //   (a) max_differential_joins guard: reject if too complex for DIFF
+    //   (b) deep-join planner hints: SET LOCAL for 5+ table joins
+    let scan_count = dvm::query_total_scan_count(&st.defining_query).unwrap_or_else(|e| {
+        pgrx::warning!(
+            "[pg_trickle] DI-7: failed to count scans for {schema}.{name}: {e}; \
+             assuming scan_count=1"
+        );
+        1
+    });
+
     if let Some(max_joins) = st.max_differential_joins
         && max_joins > 0
     {
-        match dvm::query_join_scan_count(&st.defining_query) {
-            Ok(count) if count > max_joins as usize => {
-                return Err(PgTrickleError::QueryTooComplex(format!(
-                    "join scan count ({count}) exceeds max_differential_joins ({max_joins}) \
-                     for {schema}.{name}; falling back to FULL refresh"
-                )));
-            }
-            Err(e) => {
-                pgrx::warning!(
-                    "[pg_trickle] DI-7: failed to count joins for {schema}.{name}: {e}; \
-                     proceeding with differential refresh"
-                );
-            }
-            _ => {}
+        // DI-7 uses the join-specific scan count (stops at Aggregate etc.)
+        let join_sc = dvm::query_join_scan_count(&st.defining_query).unwrap_or(0);
+        if join_sc > max_joins as usize {
+            return Err(PgTrickleError::QueryTooComplex(format!(
+                "join scan count ({join_sc}) exceeds max_differential_joins ({max_joins}) \
+                 for {schema}.{name}; falling back to FULL refresh"
+            )));
         }
     }
 
@@ -3507,6 +3592,9 @@ pub fn execute_differential_refresh(
     let mut should_fallback = false;
     let mut total_change_count: i64 = 0;
     let mut _total_table_size: i64 = 0;
+    // DI-2: Collect per-source (change_count, table_size) for the per-leaf
+    // fallback decision after the P2 loop completes.
+    let mut per_source_stats: Vec<(u32, i64, i64)> = Vec::new();
     // B3-1: Track source OIDs with zero changes for delta-branch pruning.
     let mut zero_change_oids: std::collections::HashSet<u32> = std::collections::HashSet::new();
 
@@ -3566,6 +3654,9 @@ pub fn execute_differential_refresh(
 
         total_change_count += change_count;
         _total_table_size += table_size;
+
+        // DI-2: Save per-source stats for per-leaf fallback decision.
+        per_source_stats.push((*oid, change_count, table_size));
 
         // B3-1: Record sources with zero changes for delta-branch pruning.
         if change_count == 0 {
@@ -3663,6 +3754,36 @@ pub fn execute_differential_refresh(
                 post_full_refresh_cleanup(st);
             }
             return result;
+        }
+    }
+
+    // ── DI-2: Per-leaf conditional fallback ──────────────────────────
+    // When `max_delta_fraction` is configured, check whether any
+    // individual source table's delta exceeds the threshold. Those
+    // leaves switch from NOT EXISTS (index-based) to EXCEPT ALL
+    // (hash-based) in the snapshot construction, while unaffected
+    // leaves keep the faster NOT EXISTS path.
+    if let Some(max_frac) = st.max_delta_fraction
+        && max_frac > 0.0
+    {
+        let mut fallback = std::collections::HashSet::new();
+        for &(oid, change_count, table_size) in &per_source_stats {
+            if table_size > 0 && change_count > 0 {
+                let frac = change_count as f64 / table_size as f64;
+                if frac > max_frac {
+                    fallback.insert(oid);
+                    pgrx::debug1!(
+                        "[pg_trickle] DI-2: per-leaf fallback for source OID {} \
+                         ({:.1}% > {:.1}% threshold)",
+                        oid,
+                        frac * 100.0,
+                        max_frac * 100.0,
+                    );
+                }
+            }
+        }
+        if !fallback.is_empty() {
+            set_fallback_leaf_oids(fallback);
         }
     }
 
@@ -3788,6 +3909,9 @@ pub fn execute_differential_refresh(
                 name,
             )?
         };
+
+        // DI-2: Clear per-leaf fallback OIDs after delta SQL generation.
+        clear_fallback_leaf_oids();
 
         let delta_sql = delta_result.delta_sql;
         let user_cols = delta_result.output_columns;
@@ -4089,7 +4213,9 @@ pub fn execute_differential_refresh(
     // ── D-1: Conditional planner hints based on delta size ───────────
     // Large deltas benefit from hash joins over nested loops. Apply
     // SET LOCAL hints that are automatically reset at transaction end.
-    apply_planner_hints(total_change_count, st.pgt_relid);
+    // Deep joins (5+ tables) get aggressive hints to avoid pathological
+    // plans that spill excessive temp files.
+    apply_planner_hints(total_change_count, st.pgt_relid, scan_count);
 
     // ── A-3a: Append-only INSERT fast path ───────────────────────────
     // When the stream table is marked append-only (and hasn't been

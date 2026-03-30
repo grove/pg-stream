@@ -246,6 +246,15 @@ pub fn query_join_scan_count(query: &str) -> Result<usize, PgTrickleError> {
     Ok(operators::join_common::join_scan_count(&result.tree))
 }
 
+/// Count the total number of Scan nodes in the defining query, traversing
+/// through ALL node types (Aggregate, Window, Distinct, etc.).
+/// Used by DI-11 planner hints to detect deep-join queries that need
+/// aggressive plan guidance.
+pub fn query_total_scan_count(query: &str) -> Result<usize, PgTrickleError> {
+    let result = parse_defining_query_full(query)?;
+    Ok(operators::join_common::total_scan_count(&result.tree))
+}
+
 /// Check whether an OpTree is a "scan-chain" — only Scan, Filter, Project,
 /// and Subquery nodes (no Aggregate, Join, UnionAll, Distinct, Window,
 /// RecursiveCte, or CteScan).
@@ -355,6 +364,10 @@ pub fn generate_delta_query(
     // DAG-4: Apply any active bypass table mappings from fused-chain execution.
     ctx.st_bypass_tables = crate::refresh::get_st_bypass_tables();
 
+    // DI-2: Per-leaf conditional fallback — leaves whose delta fraction
+    // exceeds max_delta_fraction use EXCEPT ALL instead of NOT EXISTS.
+    ctx.fallback_leaf_oids = crate::refresh::get_fallback_leaf_oids();
+
     let (delta_sql, output_columns, diff_dedup, diff_has_key_changed) =
         ctx.differentiate_with_columns(&result.tree)?;
 
@@ -390,6 +403,20 @@ pub fn generate_delta_query_cached(
     // has the wrong table names.  Fall back to the uncached path.
     let bypass_tables = crate::refresh::get_st_bypass_tables();
     if !bypass_tables.is_empty() {
+        return generate_delta_query(
+            defining_query,
+            prev_frontier,
+            new_frontier,
+            pgt_schema,
+            pgt_name,
+        );
+    }
+
+    // DI-2: When per-leaf fallback OIDs are active, the cached SQL
+    // template uses NOT EXISTS for all leaves. Fall back to the uncached
+    // path so the affected leaves emit EXCEPT ALL instead.
+    let fallback_oids = crate::refresh::get_fallback_leaf_oids();
+    if !fallback_oids.is_empty() {
         return generate_delta_query(
             defining_query,
             prev_frontier,

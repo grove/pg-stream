@@ -17,7 +17,7 @@
 //!    these aliases are *inside* the snapshot subquery and must be
 //!    translated to disambiguated column names (e.g., `l."o__prod_id"`).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::dvm::diff::quote_ident;
 use crate::dvm::operators::aggregate::agg_to_rescan_sql;
@@ -411,9 +411,20 @@ fn build_pk_hash_expr(
 /// CTE's `__pgt_row_id` (pk_hash match), which replaces the expensive
 /// EXCEPT ALL that required sorting/hashing the full base table.
 ///
+/// When a Scan's `table_oid` is in `fallback_oids`, the NOT EXISTS
+/// optimisation is bypassed in favour of EXCEPT ALL. This per-leaf
+/// conditional fallback (DI-2) is activated when the delta exceeds
+/// `max_delta_fraction` for that specific source table, making the
+/// hash-based EXCEPT ALL more efficient than indexed NOT EXISTS.
+///
 /// For non-`Scan` children (Filter, Subquery, Aggregate, etc.), falls
 /// back to the traditional EXCEPT ALL approach.
-pub fn build_leaf_snapshot_sql(op: &OpTree, delta_cte: &str, data_cols: &[String]) -> String {
+pub fn build_leaf_snapshot_sql(
+    op: &OpTree,
+    delta_cte: &str,
+    data_cols: &[String],
+    fallback_oids: &HashSet<u32>,
+) -> String {
     let col_list: String = data_cols
         .iter()
         .map(|c| quote_ident(c))
@@ -427,21 +438,36 @@ pub fn build_leaf_snapshot_sql(op: &OpTree, delta_cte: &str, data_cols: &[String
             alias,
             columns,
             pk_columns,
-            ..
+            table_oid,
         } => {
-            let pk_hash_expr = build_pk_hash_expr(alias, columns, pk_columns);
-            format!(
-                "(SELECT {col_list} FROM \"{schema}\".\"{table_name}\" {alias_q} \
-                 WHERE NOT EXISTS (\
-                   SELECT 1 FROM {delta_cte} __pgt_d \
-                   WHERE __pgt_d.__pgt_row_id = {pk_hash_expr}\
-                 ) \
-                 UNION ALL \
-                 SELECT {col_list} FROM {delta_cte} WHERE __pgt_action = 'D')",
-                schema = schema.replace('"', "\"\""),
-                table_name = table_name.replace('"', "\"\""),
-                alias_q = quote_ident(alias),
-            )
+            // DI-2 per-leaf fallback: when this source's delta fraction
+            // exceeds max_delta_fraction, emit EXCEPT ALL instead of the
+            // index-based NOT EXISTS anti-join.
+            if fallback_oids.contains(table_oid) {
+                let table = build_snapshot_sql(op);
+                format!(
+                    "(SELECT {col_list} FROM {table} {alias_q} \
+                     EXCEPT ALL \
+                     SELECT {col_list} FROM {delta_cte} WHERE __pgt_action = 'I' \
+                     UNION ALL \
+                     SELECT {col_list} FROM {delta_cte} WHERE __pgt_action = 'D')",
+                    alias_q = quote_ident(alias),
+                )
+            } else {
+                let pk_hash_expr = build_pk_hash_expr(alias, columns, pk_columns);
+                format!(
+                    "(SELECT {col_list} FROM \"{schema}\".\"{table_name}\" {alias_q} \
+                     WHERE NOT EXISTS (\
+                       SELECT 1 FROM {delta_cte} __pgt_d \
+                       WHERE __pgt_d.__pgt_row_id = {pk_hash_expr}\
+                     ) \
+                     UNION ALL \
+                     SELECT {col_list} FROM {delta_cte} WHERE __pgt_action = 'D')",
+                    schema = schema.replace('"', "\"\""),
+                    table_name = table_name.replace('"', "\"\""),
+                    alias_q = quote_ident(alias),
+                )
+            }
         }
         _ => {
             // Fallback: EXCEPT ALL for non-Scan children (Filter, Subquery, etc.)
@@ -485,9 +511,12 @@ pub fn build_leaf_snapshot_sql(op: &OpTree, delta_cte: &str, data_cols: &[String
 ///
 /// DI-2: For Scan leaves, uses NOT EXISTS anti-join against the delta
 /// CTE's `__pgt_row_id` (pk_hash) instead of the expensive EXCEPT ALL.
+/// When a Scan's `table_oid` is in `fallback_oids`, EXCEPT ALL is used
+/// instead (per-leaf conditional fallback).
 pub fn build_pre_change_snapshot_sql(
     op: &OpTree,
     scan_delta_ctes: &HashMap<String, String>,
+    fallback_oids: &HashSet<u32>,
 ) -> String {
     match op {
         OpTree::Scan { alias, columns, .. } => {
@@ -495,7 +524,7 @@ pub fn build_pre_change_snapshot_sql(
                 // DI-2: Delegate to build_leaf_snapshot_sql which uses
                 // NOT EXISTS for Scan nodes.
                 let data_cols: Vec<String> = columns.iter().map(|c| c.name.clone()).collect();
-                build_leaf_snapshot_sql(op, delta_cte, &data_cols)
+                build_leaf_snapshot_sql(op, delta_cte, &data_cols, fallback_oids)
             } else {
                 // No delta for this scan — fall back to current state
                 build_snapshot_sql(op)
@@ -505,19 +534,40 @@ pub fn build_pre_change_snapshot_sql(
             condition,
             left,
             right,
-        } => build_pre_change_join_snapshot("JOIN", condition, left, right, scan_delta_ctes),
+        } => build_pre_change_join_snapshot(
+            "JOIN",
+            condition,
+            left,
+            right,
+            scan_delta_ctes,
+            fallback_oids,
+        ),
         OpTree::LeftJoin {
             condition,
             left,
             right,
-        } => build_pre_change_join_snapshot("LEFT JOIN", condition, left, right, scan_delta_ctes),
+        } => build_pre_change_join_snapshot(
+            "LEFT JOIN",
+            condition,
+            left,
+            right,
+            scan_delta_ctes,
+            fallback_oids,
+        ),
         OpTree::FullJoin {
             condition,
             left,
             right,
-        } => build_pre_change_join_snapshot("FULL JOIN", condition, left, right, scan_delta_ctes),
+        } => build_pre_change_join_snapshot(
+            "FULL JOIN",
+            condition,
+            left,
+            right,
+            scan_delta_ctes,
+            fallback_oids,
+        ),
         OpTree::Filter { child, predicate } => {
-            let child_snap = build_pre_change_snapshot_sql(child, scan_delta_ctes);
+            let child_snap = build_pre_change_snapshot_sql(child, scan_delta_ctes, fallback_oids);
             if matches!(child.as_ref(), OpTree::Scan { .. }) {
                 let alias = child.alias();
                 format!(
@@ -535,7 +585,7 @@ pub fn build_pre_change_snapshot_sql(
             aliases,
             child,
         } => {
-            let inner = build_pre_change_snapshot_sql(child, scan_delta_ctes);
+            let inner = build_pre_change_snapshot_sql(child, scan_delta_ctes, fallback_oids);
             let child_alias = child.alias();
             let selects: Vec<String> = expressions
                 .iter()
@@ -563,12 +613,12 @@ pub fn build_pre_change_snapshot_sql(
             ..
         } => {
             if column_aliases.is_empty() {
-                build_pre_change_snapshot_sql(child, scan_delta_ctes)
+                build_pre_change_snapshot_sql(child, scan_delta_ctes, fallback_oids)
             } else {
                 // Mirror the ordinal-renaming logic from build_snapshot_sql:
                 // wrap the child in a SELECT that renames columns positionally
                 // to match the subquery's column aliases.
-                let inner = build_pre_change_snapshot_sql(child, scan_delta_ctes);
+                let inner = build_pre_change_snapshot_sql(child, scan_delta_ctes, fallback_oids);
                 let child_alias = child.alias();
                 let child_cols = child.output_columns();
                 let inner_selects: Vec<String> = child_cols
@@ -606,9 +656,10 @@ fn build_pre_change_join_snapshot(
     left: &OpTree,
     right: &OpTree,
     scan_delta_ctes: &HashMap<String, String>,
+    fallback_oids: &HashSet<u32>,
 ) -> String {
-    let left_snap = build_pre_change_snapshot_sql(left, scan_delta_ctes);
-    let right_snap = build_pre_change_snapshot_sql(right, scan_delta_ctes);
+    let left_snap = build_pre_change_snapshot_sql(left, scan_delta_ctes, fallback_oids);
+    let right_snap = build_pre_change_snapshot_sql(right, scan_delta_ctes, fallback_oids);
     let left_alias = left.alias();
     let right_alias = right.alias();
 
@@ -1387,6 +1438,35 @@ pub fn join_scan_count(op: &OpTree) -> usize {
     }
 }
 
+/// Count the total number of Scan nodes in the operator tree, traversing
+/// through ALL node types including Aggregate, Window, Distinct, etc.
+/// Used by the DI-11 planner hints to detect deep-join queries.
+pub fn total_scan_count(op: &OpTree) -> usize {
+    match op {
+        OpTree::Scan { .. } => 1,
+        OpTree::InnerJoin { left, right, .. }
+        | OpTree::LeftJoin { left, right, .. }
+        | OpTree::FullJoin { left, right, .. } => total_scan_count(left) + total_scan_count(right),
+        OpTree::SemiJoin { left, right, .. } | OpTree::AntiJoin { left, right, .. } => {
+            total_scan_count(left) + total_scan_count(right)
+        }
+        OpTree::Filter { child, .. }
+        | OpTree::Project { child, .. }
+        | OpTree::Subquery { child, .. } => total_scan_count(child),
+        OpTree::Aggregate { child, .. }
+        | OpTree::Window { child, .. }
+        | OpTree::Distinct { child, .. } => total_scan_count(child),
+        OpTree::UnionAll { children, .. } => children.iter().map(total_scan_count).sum(),
+        OpTree::CteScan { body, .. } => body.as_ref().map_or(0, |b| total_scan_count(b)),
+        OpTree::RecursiveCte {
+            base, recursive, ..
+        } => total_scan_count(base) + total_scan_count(recursive),
+        OpTree::RecursiveSelfRef { .. } => 0,
+        // Intersect, Except, LateralFunction, Values, etc.
+        _ => 0,
+    }
+}
+
 /// Returns true when the pre-change snapshot (via per-leaf CTE-based
 /// reconstruction) should be used for the given child node.  This is
 /// safe when:
@@ -1409,10 +1489,26 @@ pub fn join_scan_count(op: &OpTree) -> usize {
 ///
 /// SemiJoin/AntiJoin-containing subtrees still fall back to L₁/R₁
 /// (post-change) to avoid the Q21-type numwait regression.
-pub fn use_pre_change_snapshot(child: &OpTree, inside_semijoin: bool) -> bool {
-    is_simple_child(child)
-        || !is_join_child(child)
-        || (!contains_semijoin(child) && !inside_semijoin)
+///
+/// DI-11: Deep join children (≥ `deep_scan_threshold` scans) also fall
+/// back to L₁ + Part 3 correction — the per-leaf CTE reconstruction at
+/// that depth generates 100+ GB of temp files from cascading hash joins.
+pub fn use_pre_change_snapshot(
+    child: &OpTree,
+    inside_semijoin: bool,
+    deep_scan_threshold: usize,
+) -> bool {
+    if is_simple_child(child) || !is_join_child(child) {
+        return true;
+    }
+    if contains_semijoin(child) || inside_semijoin {
+        return false;
+    }
+    // DI-11: For deep join children, skip L₀ reconstruction and use
+    // L₁ + Part 3 correction instead. The per-leaf CTE snapshot at
+    // this depth generates enormous temp file spills.
+    let sc = join_scan_count(child);
+    sc < deep_scan_threshold
 }
 
 #[cfg(test)]
@@ -1672,7 +1768,7 @@ mod tests {
     fn test_pre_change_snapshot_simple_scan() {
         let child = scan(1, "t", "public", "t", &["id"]);
         assert!(
-            use_pre_change_snapshot(&child, false),
+            use_pre_change_snapshot(&child, false, 999),
             "Simple scan should use pre-change snapshot"
         );
     }
@@ -1683,7 +1779,7 @@ mod tests {
         let b = scan(2, "b", "public", "b", &["id"]);
         let j = inner_join(eq_cond("a", "id", "b", "id"), a, b);
         assert!(
-            use_pre_change_snapshot(&j, false),
+            use_pre_change_snapshot(&j, false, 999),
             "2-scan join should use pre-change snapshot (EC-01 applies)"
         );
     }
@@ -1699,7 +1795,7 @@ mod tests {
         let j_ab = inner_join(eq_cond("a", "id", "b", "id"), a, b);
         let j_abc = inner_join(eq_cond("a", "id", "c", "id"), j_ab, c);
         assert!(
-            use_pre_change_snapshot(&j_abc, false),
+            use_pre_change_snapshot(&j_abc, false, 999),
             "3-scan join should use per-leaf pre-change snapshot (EC01B-1)"
         );
     }
@@ -1711,7 +1807,7 @@ mod tests {
         let j = inner_join(eq_cond("a", "id", "b", "id"), a, b);
         // inside_semijoin=true forces fallback regardless of scan count
         assert!(
-            !use_pre_change_snapshot(&j, true),
+            !use_pre_change_snapshot(&j, true, 999),
             "Inside semijoin should fall back even for 2-scan join"
         );
     }
@@ -1725,7 +1821,7 @@ mod tests {
             scan(1, "t", "public", "t", &["id", "region"]),
         );
         assert!(
-            use_pre_change_snapshot(&child, false),
+            use_pre_change_snapshot(&child, false, 999),
             "Non-join child (Aggregate) should use pre-change snapshot"
         );
     }
@@ -1749,7 +1845,7 @@ mod tests {
         let outer = inner_join(eq_cond("a", "b_id", "b", "id"), a, inner);
         assert_eq!(join_scan_count(&outer), 3);
         assert!(
-            use_pre_change_snapshot(&outer, false),
+            use_pre_change_snapshot(&outer, false, 999),
             "≥3-scan join subtree should use per-leaf pre-change snapshot (EC01B-1)"
         );
     }
@@ -1766,7 +1862,7 @@ mod tests {
         let abcd = inner_join(eq_cond("a", "id", "b", "id"), a, bcd);
         assert_eq!(join_scan_count(&abcd), 4);
         assert!(
-            use_pre_change_snapshot(&abcd, false),
+            use_pre_change_snapshot(&abcd, false, 999),
             "4-scan join subtree should use per-leaf pre-change snapshot (EC01B-1)"
         );
     }
@@ -1782,7 +1878,7 @@ mod tests {
         let right_outer = inner_join(eq_cond("r2", "id", "r3", "id"), right_inner, r3);
         assert_eq!(join_scan_count(&right_outer), 3);
         assert!(
-            use_pre_change_snapshot(&right_outer, false),
+            use_pre_change_snapshot(&right_outer, false, 999),
             "Right subtree with 3 scans should use per-leaf pre-change snapshot (EC01B-1)"
         );
     }
@@ -1795,8 +1891,52 @@ mod tests {
         let j = inner_join(eq_cond("a", "id", "b", "id"), a, b);
         assert_eq!(join_scan_count(&j), 2);
         assert!(
-            use_pre_change_snapshot(&j, false),
+            use_pre_change_snapshot(&j, false, 999),
             "2-scan join should allow pre-change snapshot"
+        );
+    }
+
+    // ── DI-11: Deep join L₀ threshold tests ────────────────────────
+
+    #[test]
+    fn test_di11_deep_join_4_scans_skips_l0_at_threshold_4() {
+        // 4-scan join child with threshold=4 → skip L₀, use L₁ + Part 3
+        let a = scan(1, "a", "public", "a", &["id"]);
+        let b = scan(2, "b", "public", "b", &["id"]);
+        let c = scan(3, "c", "public", "c", &["id"]);
+        let d = scan(4, "d", "public", "d", &["id"]);
+        let ab = inner_join(eq_cond("a", "id", "b", "id"), a, b);
+        let abc = inner_join(eq_cond("b", "id", "c", "id"), ab, c);
+        let abcd = inner_join(eq_cond("c", "id", "d", "id"), abc, d);
+        assert_eq!(join_scan_count(&abcd), 4);
+        assert!(
+            !use_pre_change_snapshot(&abcd, false, 4),
+            "4-scan join at threshold=4 should skip L₀"
+        );
+    }
+
+    #[test]
+    fn test_di11_deep_join_3_scans_keeps_l0_at_threshold_4() {
+        // 3-scan join child with threshold=4 → keep L₀
+        let a = scan(1, "a", "public", "a", &["id"]);
+        let b = scan(2, "b", "public", "b", &["id"]);
+        let c = scan(3, "c", "public", "c", &["id"]);
+        let ab = inner_join(eq_cond("a", "id", "b", "id"), a, b);
+        let abc = inner_join(eq_cond("b", "id", "c", "id"), ab, c);
+        assert_eq!(join_scan_count(&abc), 3);
+        assert!(
+            use_pre_change_snapshot(&abc, false, 4),
+            "3-scan join at threshold=4 should keep L₀"
+        );
+    }
+
+    #[test]
+    fn test_di11_simple_scan_unaffected_by_threshold() {
+        // Simple scan child always uses L₀ regardless of threshold
+        let child = scan(1, "t", "public", "t", &["id"]);
+        assert!(
+            use_pre_change_snapshot(&child, false, 1),
+            "Simple scan should always use L₀ even at threshold=1"
         );
     }
 
@@ -1806,7 +1946,9 @@ mod tests {
     fn test_di2_leaf_snapshot_scan_single_pk() {
         // DI-2: Scan with single-column PK uses NOT EXISTS + pg_trickle_hash.
         let op = scan_with_pk(1, "orders", "public", "o", &["id", "amount"], &["id"]);
-        let sql = build_leaf_snapshot_sql(&op, "scan_o", &["id".into(), "amount".into()]);
+        let no_fallback = HashSet::new();
+        let sql =
+            build_leaf_snapshot_sql(&op, "scan_o", &["id".into(), "amount".into()], &no_fallback);
         assert!(
             sql.contains("NOT EXISTS"),
             "DI-2: single-PK Scan should use NOT EXISTS\n{sql}"
@@ -1830,7 +1972,13 @@ mod tests {
     fn test_di2_leaf_snapshot_scan_multi_pk() {
         // DI-2: Scan with multi-column PK uses pg_trickle_hash_multi.
         let op = scan_with_pk(1, "t", "public", "t", &["a", "b", "val"], &["a", "b"]);
-        let sql = build_leaf_snapshot_sql(&op, "scan_t", &["a".into(), "b".into(), "val".into()]);
+        let no_fallback = HashSet::new();
+        let sql = build_leaf_snapshot_sql(
+            &op,
+            "scan_t",
+            &["a".into(), "b".into(), "val".into()],
+            &no_fallback,
+        );
         assert!(
             sql.contains("pgtrickle.pg_trickle_hash_multi(ARRAY["),
             "DI-2: multi-PK should use pg_trickle_hash_multi\n{sql}"
@@ -1845,7 +1993,8 @@ mod tests {
     fn test_di2_leaf_snapshot_scan_keyless() {
         // DI-2: Keyless Scan uses all columns for hash.
         let op = scan(1, "t", "public", "t", &["x", "y"]);
-        let sql = build_leaf_snapshot_sql(&op, "scan_t", &["x".into(), "y".into()]);
+        let no_fallback = HashSet::new();
+        let sql = build_leaf_snapshot_sql(&op, "scan_t", &["x".into(), "y".into()], &no_fallback);
         assert!(
             sql.contains("NOT EXISTS"),
             "DI-2: keyless Scan should still use NOT EXISTS\n{sql}"
@@ -1864,7 +2013,13 @@ mod tests {
             vec![count_star("cnt")],
             scan(1, "t", "public", "t", &["id", "region"]),
         );
-        let sql = build_leaf_snapshot_sql(&child, "agg_delta", &["region".into(), "cnt".into()]);
+        let no_fallback = HashSet::new();
+        let sql = build_leaf_snapshot_sql(
+            &child,
+            "agg_delta",
+            &["region".into(), "cnt".into()],
+            &no_fallback,
+        );
         assert!(
             sql.contains("EXCEPT ALL"),
             "DI-2: non-Scan child should fall back to EXCEPT ALL\n{sql}"
@@ -1872,6 +2027,48 @@ mod tests {
         assert!(
             !sql.contains("NOT EXISTS"),
             "DI-2: non-Scan child should NOT use NOT EXISTS\n{sql}"
+        );
+    }
+
+    #[test]
+    fn test_di2_per_leaf_fallback_scan_uses_except_all() {
+        // DI-2 per-leaf fallback: when source OID is in fallback set,
+        // Scan uses EXCEPT ALL instead of NOT EXISTS.
+        let op = scan_with_pk(42, "orders", "public", "o", &["id", "amount"], &["id"]);
+        let mut fallback = HashSet::new();
+        fallback.insert(42u32);
+        let sql =
+            build_leaf_snapshot_sql(&op, "scan_o", &["id".into(), "amount".into()], &fallback);
+        assert!(
+            sql.contains("EXCEPT ALL"),
+            "DI-2 fallback: Scan with OID in fallback set should use EXCEPT ALL\n{sql}"
+        );
+        assert!(
+            !sql.contains("NOT EXISTS"),
+            "DI-2 fallback: Scan with OID in fallback set should NOT use NOT EXISTS\n{sql}"
+        );
+        assert!(
+            sql.contains("__pgt_action = 'I'") && sql.contains("__pgt_action = 'D'"),
+            "DI-2 fallback: should have both I and D branches\n{sql}"
+        );
+    }
+
+    #[test]
+    fn test_di2_per_leaf_fallback_other_oid_keeps_not_exists() {
+        // DI-2 per-leaf fallback: unrelated OID in fallback set does not
+        // affect this Scan.
+        let op = scan_with_pk(42, "orders", "public", "o", &["id", "amount"], &["id"]);
+        let mut fallback = HashSet::new();
+        fallback.insert(99u32); // different OID
+        let sql =
+            build_leaf_snapshot_sql(&op, "scan_o", &["id".into(), "amount".into()], &fallback);
+        assert!(
+            sql.contains("NOT EXISTS"),
+            "DI-2: Scan with different OID should keep NOT EXISTS\n{sql}"
+        );
+        assert!(
+            !sql.contains("EXCEPT ALL"),
+            "DI-2: Scan with different OID should NOT use EXCEPT ALL\n{sql}"
         );
     }
 }

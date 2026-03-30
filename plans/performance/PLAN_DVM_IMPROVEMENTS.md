@@ -240,8 +240,13 @@ names matching what inline SQL currently produces.
 ### DI-2: Pre-Image Capture from Change Buffer (partial ✅)
 
 **Status:** NOT EXISTS anti-join implemented for all Scan leaf snapshots.
-Remaining: per-leaf conditional fallback, aggregate UPDATE-split, DI-8
-band-aid removal, Q05/Q09 E2E verification.
+Per-leaf conditional fallback implemented: when a source's delta exceeds
+`max_delta_fraction`, that leaf switches from NOT EXISTS to EXCEPT ALL.
+E2E validated: all diff-full-equivalence, multi-cycle, profiling, and
+autorefresh tests pass after bootstrap DDL fix and snapshot CTE cache key
+collision fix. Remaining: aggregate UPDATE-split (DI-8 band-aid removal
+blocked on Q12 differential drift — root cause in join×aggregate
+interaction), Q05/Q09 E2E verification.
 
 **Problem:** `EXCEPT ALL` is fundamentally expensive — it requires sorting or
 hashing the full base table to subtract delta inserts. For large tables
@@ -449,6 +454,12 @@ node identity.
    OpTree pointer or node ID).
 2. In `build_pre_change_snapshot_sql()`, check the cache before generating SQL.
 3. On first computation, register as a named CTE and cache the name.
+
+**Note (2026-03-30):** The cache key was initially `op.alias()`, which returns
+`"join"` for all `InnerJoin` nodes — causing 4+ table deep join chains to
+reuse the wrong CTE. Fixed by `snapshot_cache_key()` in `src/dvm/diff.rs`
+which collects leaf Scan aliases in tree order (e.g. `"t1+t2"` vs
+`"t1+t2+t3"`).
 
 **Estimated impact:** 10–20% reduction for 4+ table joins. Eliminates ~1
 redundant snapshot computation per shared subtree.

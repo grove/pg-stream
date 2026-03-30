@@ -195,6 +195,54 @@ pub struct DiffContext {
     /// For a 6-table join, this deduplicates 3–10× redundant EXCEPT ALL
     /// evaluations per leaf.
     snapshot_cte_cache: HashMap<String, String>,
+    /// DI-2: Source table OIDs whose delta fraction exceeds
+    /// `max_delta_fraction` for the current refresh cycle.
+    ///
+    /// When a Scan's `table_oid` is in this set,
+    /// `build_leaf_snapshot_sql` emits `EXCEPT ALL` instead of the
+    /// `NOT EXISTS` anti-join. NOT EXISTS with an index scan is optimal
+    /// for small deltas; EXCEPT ALL (hash-based) is more efficient when
+    /// the delta approaches a significant fraction of the base table.
+    pub fallback_leaf_oids: HashSet<u32>,
+}
+
+/// Build a unique cache key for an OpTree's pre-change snapshot CTE.
+///
+/// For Scan nodes, uses the table alias. For join nodes, collects all
+/// leaf Scan aliases in tree order and joins them with `+`. This ensures
+/// that `(t1 ⋈ t2)` and `(t1 ⋈ t2) ⋈ t3` get distinct cache keys even
+/// though both have `alias() == "join"`.
+fn snapshot_cache_key(op: &crate::dvm::parser::OpTree) -> String {
+    use crate::dvm::parser::OpTree;
+    fn collect_leaf_aliases(op: &OpTree, out: &mut Vec<String>) {
+        match op {
+            OpTree::Scan { alias, .. } | OpTree::CteScan { alias, .. } => {
+                out.push(alias.clone());
+            }
+            OpTree::InnerJoin { left, right, .. }
+            | OpTree::LeftJoin { left, right, .. }
+            | OpTree::FullJoin { left, right, .. } => {
+                collect_leaf_aliases(left, out);
+                collect_leaf_aliases(right, out);
+            }
+            OpTree::Filter { child, .. }
+            | OpTree::Project { child, .. }
+            | OpTree::Distinct { child }
+            | OpTree::Window { child, .. }
+            | OpTree::Aggregate { child, .. } => {
+                collect_leaf_aliases(child, out);
+            }
+            OpTree::Subquery { child, .. } => {
+                collect_leaf_aliases(child, out);
+            }
+            _ => {
+                out.push(op.alias().to_string());
+            }
+        }
+    }
+    let mut aliases = Vec::new();
+    collect_leaf_aliases(op, &mut aliases);
+    aliases.join("+")
 }
 
 impl DiffContext {
@@ -226,6 +274,7 @@ impl DiffContext {
             st_bypass_tables: HashMap::new(),
             scan_delta_ctes: HashMap::new(),
             snapshot_cte_cache: HashMap::new(),
+            fallback_leaf_oids: HashSet::new(),
         }
     }
 
@@ -260,6 +309,7 @@ impl DiffContext {
             st_bypass_tables: HashMap::new(),
             scan_delta_ctes: HashMap::new(),
             snapshot_cte_cache: HashMap::new(),
+            fallback_leaf_oids: HashSet::new(),
         }
     }
 
@@ -486,7 +536,7 @@ impl DiffContext {
     /// or materialize based on cost. When the reference count reaches ≥3
     /// (checked retroactively), the CTE is promoted to MATERIALIZED.
     pub fn get_or_register_snapshot_cte(&mut self, op: &crate::dvm::parser::OpTree) -> String {
-        let cache_key = op.alias().to_string();
+        let cache_key = snapshot_cache_key(op);
 
         if let Some(cte_name) = self.snapshot_cte_cache.get(&cache_key) {
             return cte_name.clone();
@@ -495,6 +545,7 @@ impl DiffContext {
         let snapshot_sql = crate::dvm::operators::join_common::build_pre_change_snapshot_sql(
             op,
             &self.scan_delta_ctes,
+            &self.fallback_leaf_oids,
         );
 
         let cte_name = self.next_cte_name("l0_snap");

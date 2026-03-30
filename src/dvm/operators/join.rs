@@ -95,6 +95,14 @@ use crate::error::PgTrickleError;
 /// 6-table semi-join chains.
 const PART3_MAX_SCAN_COUNT: usize = 5;
 
+/// DI-11: Maximum number of Scan nodes in a join child before switching
+/// from L₀/R₀ per-leaf reconstruction to L₁/R₁ + Part 3 correction.
+/// At 4+ scans, the per-leaf CTE snapshot (5-table re-join with NOT
+/// EXISTS per leaf) generates 100+ GB of temp files at SF=0.01.
+/// Using L₁ + correction is dramatically cheaper (joins only ΔL × ΔR)
+/// and equally correct for pure inner-join chains.
+const DEEP_JOIN_L0_SCAN_THRESHOLD: usize = 4;
+
 /// Returns true if `op` is a join whose **both** children are simple (Scan)
 /// nodes.  Previously this gated Part 3 correction term generation — now
 /// used only for diagnostics; Part 3 is generated for all join children
@@ -314,7 +322,7 @@ pub fn diff_inner_join(ctx: &mut DiffContext, op: &OpTree) -> Result<DiffResult,
     // Additionally, joins inside a SemiJoin/AntiJoin ancestor must use
     // L₁ to avoid Q21-type regressions where sub-join EXCEPT ALL
     // interacts with the SemiJoin's R_old computation.
-    let use_l0 = use_pre_change_snapshot(left, ctx.inside_semijoin);
+    let use_l0 = use_pre_change_snapshot(left, ctx.inside_semijoin, DEEP_JOIN_L0_SCAN_THRESHOLD);
 
     let left_part2_source = if use_l0 {
         if is_join_child(left) {
@@ -349,7 +357,12 @@ pub fn diff_inner_join(ctx: &mut DiffContext, op: &OpTree) -> Result<DiffResult,
         } else {
             // Scan, Subquery/Aggregate child: use L₀ via single-table
             // snapshot (DI-2: NOT EXISTS for Scan, EXCEPT ALL fallback)
-            let left_pre_change = build_leaf_snapshot_sql(left, &left_result.cte_name, left_cols);
+            let left_pre_change = build_leaf_snapshot_sql(
+                left,
+                &left_result.cte_name,
+                left_cols,
+                &ctx.fallback_leaf_oids,
+            );
             // Apply semi-join filter to L₀ if equi-keys are available
             if equi_keys.is_empty() {
                 left_pre_change
@@ -399,7 +412,7 @@ pub fn diff_inner_join(ctx: &mut DiffContext, op: &OpTree) -> Result<DiffResult,
     //
     // The same child-type heuristics as use_l0 apply: Scan and simple
     // children use R₀; SemiJoin-containing deep chains fall back to R₁.
-    let use_r0 = use_pre_change_snapshot(right, ctx.inside_semijoin);
+    let use_r0 = use_pre_change_snapshot(right, ctx.inside_semijoin, DEEP_JOIN_L0_SCAN_THRESHOLD);
 
     let right_part1_source = if use_r0 {
         if is_join_child(right) {
@@ -430,8 +443,12 @@ pub fn diff_inner_join(ctx: &mut DiffContext, op: &OpTree) -> Result<DiffResult,
         } else {
             // Scan, Subquery/Aggregate child: use R₀ via single-table
             // snapshot (DI-2: NOT EXISTS for Scan, EXCEPT ALL fallback)
-            let right_pre_change =
-                build_leaf_snapshot_sql(right, &right_result.cte_name, right_cols);
+            let right_pre_change = build_leaf_snapshot_sql(
+                right,
+                &right_result.cte_name,
+                right_cols,
+                &ctx.fallback_leaf_oids,
+            );
             // Apply semi-join filter to R₀
             if equi_keys.is_empty() {
                 right_pre_change
@@ -1389,8 +1406,13 @@ mod tests {
 
     #[test]
     fn test_di5_part3_suppressed_above_threshold() {
-        // DI-5: Part 3 correction suppressed when join_scan_count > 5.
-        // Build a left child with join_scan_count = 6 (exceeds threshold).
+        // DI-5: Part 3 correction suppressed at the outermost join when
+        // left_scan_count > PART3_MAX_SCAN_COUNT (5).
+        //
+        // DI-11: Inner join levels with 4+ scan children now use L₁ + Part 3
+        // (instead of L₀ per-leaf). So "Correction for nested join" may appear
+        // at inner levels. We verify the outermost join CTE does NOT contain
+        // the correction.
         let a = scan(1, "a", "public", "a", &["id"]);
         let b = scan(2, "b", "public", "b", &["id"]);
         let c = scan(3, "c", "public", "c", &["id"]);
@@ -1418,10 +1440,19 @@ mod tests {
 
         let mut ctx = test_ctx();
         let result = diff_inner_join(&mut ctx, &tree).unwrap();
-        let sql = ctx.build_with_query(&result.cte_name);
 
-        // scan_count 6 > PART3_MAX_SCAN_COUNT (5) → correction suppressed
-        assert_sql_not_contains(&sql, "Correction for nested join");
+        // The outermost CTE is result.cte_name. Extract its SQL body.
+        let outer_cte_sql = ctx
+            .cte_sql(&result.cte_name)
+            .expect("outer CTE should exist");
+
+        // scan_count 6 > PART3_MAX_SCAN_COUNT (5) → outermost correction
+        // suppressed (inner levels may still have corrections due to DI-11).
+        assert!(
+            !outer_cte_sql.contains("Correction for nested join"),
+            "Outermost CTE should NOT contain Part 3 correction, got:\n{}",
+            &outer_cte_sql[..outer_cte_sql.len().min(500)]
+        );
     }
 
     // ── EC-01: R₀ via EXCEPT ALL tests ──────────────────────────────

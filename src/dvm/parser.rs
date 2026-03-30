@@ -11026,21 +11026,14 @@ unsafe fn parse_select_stmt_inner(
         // Promote eligible predicates from the Filter into appropriate
         // JOIN ON clauses, converting cross joins to equi-joins.
         //
-        // DISABLED: two remaining issues prevent enabling this:
-        //  (a) Correlated scalar subqueries (Q17) — promoted predicates
-        //      remove column refs that the scalar subquery correlation
-        //      still needs, causing "column X does not exist" errors.
-        //  (b) The quoting fix in Expr::to_sql() resolves the "syntax
-        //      error at or near '.'" from reserved-keyword aliases, but
-        //      Q07 still shows revenue drift even with pushdown enabled.
-        //      The Q07 root cause is not L₀/L₁ double-counting — all
-        //      right sides (customer, nation) are static in TPC-H RF.
-        //      The issue is deeper (possibly aggregate or MERGE layer).
+        // Guard (a): predicates containing scalar subqueries (e.g.
+        // TPC-H Q17 correlated subquery) are kept in the Filter and
+        // never promoted — see `expr_contains_subquery()`.
         //
-        // To re-enable: fix (a) by skipping pushdown when the Filter
-        // predicate contains ScalarSubquery/SubLink references, and
-        // investigate (b) in the aggregate diff or MERGE pipeline.
-        // tree = push_filter_into_cross_joins(tree);
+        // Note: Q07 previously showed revenue drift with pushdown
+        // enabled — if it recurs, investigate the aggregate diff or
+        // MERGE pipeline; the root cause is not in pushdown itself.
+        tree = push_filter_into_cross_joins(tree);
     }
 
     // ── Step 3: Parse GROUP BY + aggregates ─────────────────────────────
@@ -15328,6 +15321,15 @@ fn push_filter_into_cross_joins(tree: OpTree) -> OpTree {
     let mut remaining: Vec<Expr> = Vec::new();
 
     for part in parts {
+        // Guard (a): never promote predicates containing scalar subqueries.
+        // Correlated subqueries (e.g. TPC-H Q17) appear as Expr::Raw with
+        // an embedded SELECT — promoting them removes column references that
+        // the correlation still needs.
+        if expr_contains_subquery(&part) {
+            remaining.push(part);
+            continue;
+        }
+
         let mut aliases = Vec::new();
         collect_expr_source_aliases(&part, &child, &mut aliases);
         aliases.sort();
@@ -15384,6 +15386,24 @@ fn has_cross_join(op: &OpTree) -> bool {
         | OpTree::Project { child, .. }
         | OpTree::Subquery { child, .. } => has_cross_join(child),
         OpTree::SemiJoin { left, .. } | OpTree::AntiJoin { left, .. } => has_cross_join(left),
+        _ => false,
+    }
+}
+
+/// Returns `true` if an `Expr` tree contains a scalar subquery (embedded
+/// SELECT).  Correlated scalar subqueries arrive as `Expr::Raw(sql)` from
+/// the parser; we also recurse into `BinaryOp` / `FuncCall` children.
+fn expr_contains_subquery(expr: &Expr) -> bool {
+    match expr {
+        Expr::Raw(sql) => {
+            // Case-insensitive check for SELECT keyword inside raw SQL
+            let upper = sql.to_uppercase();
+            upper.contains("SELECT") || upper.contains("EXISTS")
+        }
+        Expr::BinaryOp { left, right, .. } => {
+            expr_contains_subquery(left) || expr_contains_subquery(right)
+        }
+        Expr::FuncCall { args, .. } => args.iter().any(expr_contains_subquery),
         _ => false,
     }
 }

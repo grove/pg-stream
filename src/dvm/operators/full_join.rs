@@ -148,7 +148,8 @@ pub fn diff_full_join(ctx: &mut DiffContext, op: &OpTree) -> Result<DiffResult, 
     //
     // Same fix as inner_join / outer_join: when a left DELETE's old right
     // partner is simultaneously deleted, R₁ misses the match.
-    let use_r0 = use_pre_change_snapshot(right, ctx.inside_semijoin);
+    // DI-11: Use same threshold as inner join for deep R₀ reconstruction.
+    let use_r0 = use_pre_change_snapshot(right, ctx.inside_semijoin, 4);
 
     let r0_snapshot = if use_r0 {
         if is_join_child(right) {
@@ -158,7 +159,12 @@ pub fn diff_full_join(ctx: &mut DiffContext, op: &OpTree) -> Result<DiffResult, 
             Some(pre_change)
         } else {
             // DI-2: NOT EXISTS for Scan, EXCEPT ALL fallback for others
-            let r0 = build_leaf_snapshot_sql(right, &right_result.cte_name, right_cols);
+            let r0 = build_leaf_snapshot_sql(
+                right,
+                &right_result.cte_name,
+                right_cols,
+                &ctx.fallback_leaf_oids,
+            );
             Some(r0)
         }
     } else {

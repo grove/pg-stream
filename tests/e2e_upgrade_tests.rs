@@ -56,6 +56,8 @@ async fn test_upgrade_catalog_schema_stability() {
         ("last_fixpoint_iterations", "integer"),
         ("last_full_ms", "double precision"),
         ("last_refresh_at", "timestamp with time zone"),
+        ("max_delta_fraction", "double precision"),
+        ("max_differential_joins", "integer"),
         ("needs_reinit", "boolean"),
         ("original_query", "text"),
         ("pgt_id", "bigint"),
