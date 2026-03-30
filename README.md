@@ -129,6 +129,60 @@ Several layers reduce this cost automatically:
 
 For write-heavy workloads where trigger overhead is a concern, FULL refresh mode bypasses CDC entirely — no triggers are installed, and each refresh re-executes the full query.
 
+### TPC-H Validation (22 queries, SF=0.01)
+
+pg_trickle is validated against the full TPC-H benchmark suite — all 22 standard queries across all three refresh modes. The test suite runs 15 test scenarios and passes completely:
+
+| Test | Queries | Result |
+|---|---|---|
+| Differential correctness | 22/22 | ✅ pass |
+| Immediate correctness | 22/22 | ✅ pass |
+| Full correctness | 22/22 | ✅ pass |
+| Differential == Immediate | 22/22 | ✅ identical results |
+| Full == Differential | 22/22 | ✅ identical results |
+| Rollback correctness | INSERT / UPDATE / DELETE | ✅ pass |
+| Savepoint rollback | INSERT + DELETE | ✅ pass |
+| Single-row mutations | 3 queries | ✅ pass |
+| Combined-delete regression (q07, q08, q09) | 3 queries | ✅ pass |
+
+**Sustained churn (T1-C, 7 stream tables, 50 cycles, SF=0.01):**
+
+| Metric | Value |
+|---|---|
+| Avg cycle time | 150.7 ms |
+| Min / Max | 115.9 / 537.9 ms |
+| Drift detected | 0 |
+| Refresh failures | 0 |
+
+**Per-query FULL vs DIFFERENTIAL latency (SF=0.01, T1-B, avg over 3 cycles):**
+
+| Query | Tier | FULL (ms) | DIFF (ms) | Speedup |
+|---|---|---|---|---|
+| q02 | T1 | 24.6 | 16.9 | 1.45x |
+| q21 | T1 | 12.4 | 12.1 | 1.02x |
+| q13 | T1 | 9.4 | 18.3 | 0.51x |
+| q11 | T1 | 11.0 | 9.0 | 1.22x |
+| q08 | T1 | 18.0 | 43.7 | 0.41x |
+| q01 | T2 | 13.3 | 19.4 | 0.69x |
+| q05 | T2 | 15.0 | 202.5 | 0.07x |
+| q07 | T2 | 15.2 | 33.5 | 0.45x |
+| q09 | T2 | 15.6 | 129.5 | 0.12x |
+| q16 | T2 | 11.5 | 8.6 | 1.33x |
+| q22 | T2 | 10.4 | 17.0 | 0.61x |
+| q03 | T3 | 8.2 | 7.6 | 1.08x |
+| q04 | T3 | 12.0 | 20.5 | 0.58x |
+| q06 | T3 | 9.0 | 11.1 | 0.81x |
+| q10 | T3 | 9.6 | 8.4 | 1.13x |
+| q12 | T3 | 11.0 | 19.6 | 0.56x |
+| q14 | T3 | 10.6 | 21.2 | 0.50x |
+| q15 | T3 | 14.9 | 18.3 | 0.82x |
+| q17 | T3 | 11.5 | 51.4 | 0.22x |
+| q18 | T3 | 10.0 | 8.4 | 1.19x |
+| q19 | T3 | 12.3 | 29.8 | 0.41x |
+| q20 | T3 | 13.4 | 5663.0 | 0.00x |
+
+> **Note:** SF=0.01 is a very small dataset (1,500 orders). At this scale, FULL refresh is competitive because base table scans are cheap. q20 (a correlated subquery) is a known differential outlier — at higher scale factors where table scans dominate, differential speedups grow substantially. The `ADAPTIVE` fallback mode automatically selects FULL when the change ratio exceeds the threshold, covering the q20-class case.
+
 For full benchmark methodology and how to run your own benchmarks, see [docs/BENCHMARK.md](docs/BENCHMARK.md).
 
 ## SQL Support
