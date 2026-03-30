@@ -49,6 +49,11 @@ static SHARED_CONTAINER: tokio::sync::OnceCell<SharedContainer> =
 
 struct SharedContainer {
     admin_connection_string: String,
+    /// Name of a pre-seeded template database that already has
+    /// `CREATE EXTENSION pg_trickle` applied.  Per-test databases are
+    /// cloned from this template via `CREATE DATABASE … TEMPLATE`, avoiding
+    /// the full extension-install DDL cost on every test.
+    template_db_name: String,
     port: u16,
     container_id: String,
     // When None the process does not own the container (it was started
@@ -143,6 +148,53 @@ async fn drop_database_if_exists(admin_cs: &str, db_name: &str) {
     pool.close().await;
 }
 
+/// Create a database named `db_name` as a file-system clone of `template`.
+async fn create_database_from_template(
+    admin_connection_string: &str,
+    db_name: &str,
+    template: &str,
+) {
+    let admin_pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(admin_connection_string)
+        .await
+        .unwrap_or_else(|e| panic!("Failed to connect for CREATE DATABASE {db_name}: {e}"));
+
+    sqlx::query(&format!(
+        "CREATE DATABASE \"{db_name}\" TEMPLATE \"{template}\""
+    ))
+    .execute(&admin_pool)
+    .await
+    .unwrap_or_else(|e| panic!("Failed to CREATE DATABASE {db_name} from template: {e}"));
+
+    admin_pool.close().await;
+}
+
+/// Install pg_trickle once into a dedicated template database so that each
+/// per-test database can be cloned cheaply via `CREATE DATABASE … TEMPLATE`.
+///
+/// Returns the name of the created template database.
+async fn create_extension_template(admin_connection_string: &str, port: u16) -> String {
+    let template_name = "pgt_ext_template";
+
+    create_database(admin_connection_string, template_name).await;
+
+    let template_pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&connection_string(port, template_name))
+        .await
+        .unwrap_or_else(|e| panic!("Failed to connect to template DB for extension init: {e}"));
+
+    sqlx::query("CREATE EXTENSION pg_trickle CASCADE")
+        .execute(&template_pool)
+        .await
+        .unwrap_or_else(|e| panic!("Failed to CREATE EXTENSION on template DB: {e}"));
+
+    template_pool.close().await;
+
+    template_name.to_string()
+}
+
 async fn shared_container() -> &'static SharedContainer {
     SHARED_CONTAINER
         .get_or_init(|| async {
@@ -157,8 +209,12 @@ async fn shared_container() -> &'static SharedContainer {
                     .expect("PGT_LIGHT_E2E_PORT must be a valid port number");
                 let container_id = std::env::var("PGT_LIGHT_E2E_CONTAINER_ID")
                     .unwrap_or_else(|_| "external".to_string());
+                let admin_connection_string = connection_string(port, "postgres");
+                let template_db_name =
+                    create_extension_template(&admin_connection_string, port).await;
                 return SharedContainer {
-                    admin_connection_string: connection_string(port, "postgres"),
+                    admin_connection_string,
+                    template_db_name,
                     port,
                     container_id,
                     _container: None,
@@ -208,8 +264,12 @@ async fn shared_container() -> &'static SharedContainer {
                 .expect("Failed to get mapped port");
             let admin_connection_string = connection_string(port, "postgres");
 
+            // Pre-seed a template database with the extension installed once.
+            let template_db_name = create_extension_template(&admin_connection_string, port).await;
+
             SharedContainer {
                 admin_connection_string,
+                template_db_name,
                 port,
                 container_id: container.id().to_string(),
                 _container: Some(Mutex::new(container)),
@@ -260,7 +320,12 @@ impl E2eDb {
     pub async fn new() -> Self {
         let shared = shared_container().await;
         let db_name = shared_db_name("pgt_light_e2e");
-        create_database(&shared.admin_connection_string, &db_name).await;
+        create_database_from_template(
+            &shared.admin_connection_string,
+            &db_name,
+            &shared.template_db_name,
+        )
+        .await;
         let connection_string = connection_string(shared.port, &db_name);
         let pool = Self::connect_with_retry(&connection_string, 15).await;
 
