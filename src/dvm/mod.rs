@@ -355,6 +355,10 @@ pub fn generate_delta_query(
     // DAG-4: Apply any active bypass table mappings from fused-chain execution.
     ctx.st_bypass_tables = crate::refresh::get_st_bypass_tables();
 
+    // DI-2: Per-leaf conditional fallback — leaves whose delta fraction
+    // exceeds max_delta_fraction use EXCEPT ALL instead of NOT EXISTS.
+    ctx.fallback_leaf_oids = crate::refresh::get_fallback_leaf_oids();
+
     let (delta_sql, output_columns, diff_dedup, diff_has_key_changed) =
         ctx.differentiate_with_columns(&result.tree)?;
 
@@ -390,6 +394,20 @@ pub fn generate_delta_query_cached(
     // has the wrong table names.  Fall back to the uncached path.
     let bypass_tables = crate::refresh::get_st_bypass_tables();
     if !bypass_tables.is_empty() {
+        return generate_delta_query(
+            defining_query,
+            prev_frontier,
+            new_frontier,
+            pgt_schema,
+            pgt_name,
+        );
+    }
+
+    // DI-2: When per-leaf fallback OIDs are active, the cached SQL
+    // template uses NOT EXISTS for all leaves. Fall back to the uncached
+    // path so the affected leaves emit EXCEPT ALL instead.
+    let fallback_oids = crate::refresh::get_fallback_leaf_oids();
+    if !fallback_oids.is_empty() {
         return generate_delta_query(
             defining_query,
             prev_frontier,

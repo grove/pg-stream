@@ -240,10 +240,13 @@ names matching what inline SQL currently produces.
 ### DI-2: Pre-Image Capture from Change Buffer (partial ✅)
 
 **Status:** NOT EXISTS anti-join implemented for all Scan leaf snapshots.
+Per-leaf conditional fallback implemented: when a source's delta exceeds
+`max_delta_fraction`, that leaf switches from NOT EXISTS to EXCEPT ALL.
 E2E validated: all diff-full-equivalence, multi-cycle, profiling, and
 autorefresh tests pass after bootstrap DDL fix and snapshot CTE cache key
-collision fix. Remaining: per-leaf conditional fallback, aggregate
-UPDATE-split, DI-8 band-aid removal, Q05/Q09 E2E verification.
+collision fix. Remaining: aggregate UPDATE-split (DI-8 band-aid removal
+blocked on Q12 differential drift — root cause in join×aggregate
+interaction), Q05/Q09 E2E verification.
 
 **Problem:** `EXCEPT ALL` is fundamentally expensive — it requires sorting or
 hashing the full base table to subtract delta inserts. For large tables

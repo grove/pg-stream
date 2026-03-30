@@ -195,6 +195,15 @@ pub struct DiffContext {
     /// For a 6-table join, this deduplicates 3–10× redundant EXCEPT ALL
     /// evaluations per leaf.
     snapshot_cte_cache: HashMap<String, String>,
+    /// DI-2: Source table OIDs whose delta fraction exceeds
+    /// `max_delta_fraction` for the current refresh cycle.
+    ///
+    /// When a Scan's `table_oid` is in this set,
+    /// `build_leaf_snapshot_sql` emits `EXCEPT ALL` instead of the
+    /// `NOT EXISTS` anti-join. NOT EXISTS with an index scan is optimal
+    /// for small deltas; EXCEPT ALL (hash-based) is more efficient when
+    /// the delta approaches a significant fraction of the base table.
+    pub fallback_leaf_oids: HashSet<u32>,
 }
 
 /// Build a unique cache key for an OpTree's pre-change snapshot CTE.
@@ -265,6 +274,7 @@ impl DiffContext {
             st_bypass_tables: HashMap::new(),
             scan_delta_ctes: HashMap::new(),
             snapshot_cte_cache: HashMap::new(),
+            fallback_leaf_oids: HashSet::new(),
         }
     }
 
@@ -299,6 +309,7 @@ impl DiffContext {
             st_bypass_tables: HashMap::new(),
             scan_delta_ctes: HashMap::new(),
             snapshot_cte_cache: HashMap::new(),
+            fallback_leaf_oids: HashSet::new(),
         }
     }
 
@@ -534,6 +545,7 @@ impl DiffContext {
         let snapshot_sql = crate::dvm::operators::join_common::build_pre_change_snapshot_sql(
             op,
             &self.scan_delta_ctes,
+            &self.fallback_leaf_oids,
         );
 
         let cte_name = self.next_cte_name("l0_snap");

@@ -158,7 +158,12 @@ pub fn diff_full_join(ctx: &mut DiffContext, op: &OpTree) -> Result<DiffResult, 
             Some(pre_change)
         } else {
             // DI-2: NOT EXISTS for Scan, EXCEPT ALL fallback for others
-            let r0 = build_leaf_snapshot_sql(right, &right_result.cte_name, right_cols);
+            let r0 = build_leaf_snapshot_sql(
+                right,
+                &right_result.cte_name,
+                right_cols,
+                &ctx.fallback_leaf_oids,
+            );
             Some(r0)
         }
     } else {

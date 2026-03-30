@@ -2589,7 +2589,7 @@ Target: reduce regression escape rate from ~15% to <5%.
 - [x] DI-8: `is_algebraically_invertible()` detects `Expr::Raw("CASE …")` and returns `false` for `SUM(CASE WHEN …)` (Q14 unaffected — `ComplexExpression`); Q12 removed from `DIFFERENTIAL_SKIP_ALLOWLIST`; 4 unit tests ✅ Done
 - [x] DI-9: `scheduler_interval_ms` cap raised to 600,000 ms; scheduler skips IMMEDIATE-mode tables in `check_schedule()`; verified safe for CALCULATED dependants ✅ Done
 - [ ] DI-1: Named CTE L₀ snapshots implemented (`NOT MATERIALIZED` default, `MATERIALIZED` when ref ≥ 3); Q05/Q09 pass DIFFERENTIAL correctness with `temp_file_limit = '4GB'`
-- [ ] DI-2: `NOT EXISTS` anti-join replaces `EXCEPT ALL` in `build_pre_change_snapshot_sql()`; per-leaf conditional `EXCEPT ALL` fallback when delta > threshold; aggregate UPDATE-split uses `old_*` for 'D' side, DI-8 band-aid removed; temp file reduction verified on Q05/Q09
+- [x] DI-2: `NOT EXISTS` anti-join replaces `EXCEPT ALL` in `build_pre_change_snapshot_sql()`; per-leaf conditional `EXCEPT ALL` fallback when delta > `max_delta_fraction` (implemented); aggregate UPDATE-split and DI-8 band-aid removal blocked on Q12 differential drift root cause; temp file reduction to verify on Q05/Q09
 - [ ] DI-3: Non-algebraic aggregate old rescan filtered via `EXISTS (… IS NOT DISTINCT FROM …)` to affected groups; NULL-safe
 - [ ] DI-6: Semi-join R_old lazy materialization with key push-down; Q20 DIFF latency below 1000ms at SF=0.01
 - [ ] DI-4/5/7: R₀ cache, Part 3 consolidation, strategy selector + max_delta_fraction complete

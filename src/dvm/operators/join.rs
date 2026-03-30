@@ -349,7 +349,12 @@ pub fn diff_inner_join(ctx: &mut DiffContext, op: &OpTree) -> Result<DiffResult,
         } else {
             // Scan, Subquery/Aggregate child: use L₀ via single-table
             // snapshot (DI-2: NOT EXISTS for Scan, EXCEPT ALL fallback)
-            let left_pre_change = build_leaf_snapshot_sql(left, &left_result.cte_name, left_cols);
+            let left_pre_change = build_leaf_snapshot_sql(
+                left,
+                &left_result.cte_name,
+                left_cols,
+                &ctx.fallback_leaf_oids,
+            );
             // Apply semi-join filter to L₀ if equi-keys are available
             if equi_keys.is_empty() {
                 left_pre_change
@@ -430,8 +435,12 @@ pub fn diff_inner_join(ctx: &mut DiffContext, op: &OpTree) -> Result<DiffResult,
         } else {
             // Scan, Subquery/Aggregate child: use R₀ via single-table
             // snapshot (DI-2: NOT EXISTS for Scan, EXCEPT ALL fallback)
-            let right_pre_change =
-                build_leaf_snapshot_sql(right, &right_result.cte_name, right_cols);
+            let right_pre_change = build_leaf_snapshot_sql(
+                right,
+                &right_result.cte_name,
+                right_cols,
+                &ctx.fallback_leaf_oids,
+            );
             // Apply semi-join filter to R₀
             if equi_keys.is_empty() {
                 right_pre_change

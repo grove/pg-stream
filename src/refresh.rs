@@ -161,6 +161,12 @@ thread_local! {
     /// table via this mapping.
     static ST_BYPASS_TABLES: RefCell<HashMap<i64, String>> =
         RefCell::new(HashMap::new());
+
+    /// DI-2: Source table OIDs whose per-leaf delta fraction exceeds
+    /// `max_delta_fraction`. These leaves fall back from NOT EXISTS
+    /// (index-based) to EXCEPT ALL (hash-based) in snapshot construction.
+    static FALLBACK_LEAF_OIDS: RefCell<std::collections::HashSet<u32>> =
+        RefCell::new(std::collections::HashSet::new());
 }
 
 /// Register a bypass temp table for the given upstream pgt_id.
@@ -181,6 +187,21 @@ pub fn clear_all_st_bypass() {
 /// Return the current bypass table mappings.
 pub fn get_st_bypass_tables() -> HashMap<i64, String> {
     ST_BYPASS_TABLES.with(|m| m.borrow().clone())
+}
+
+/// DI-2: Set the per-leaf fallback OIDs for the current refresh cycle.
+pub fn set_fallback_leaf_oids(oids: std::collections::HashSet<u32>) {
+    FALLBACK_LEAF_OIDS.with(|m| *m.borrow_mut() = oids);
+}
+
+/// DI-2: Return the current per-leaf fallback OIDs.
+pub fn get_fallback_leaf_oids() -> std::collections::HashSet<u32> {
+    FALLBACK_LEAF_OIDS.with(|m| m.borrow().clone())
+}
+
+/// DI-2: Clear the per-leaf fallback OIDs.
+pub fn clear_fallback_leaf_oids() {
+    FALLBACK_LEAF_OIDS.with(|m| m.borrow_mut().clear());
 }
 
 /// Execute any pending cleanups from previous refresh cycles.
@@ -3507,6 +3528,9 @@ pub fn execute_differential_refresh(
     let mut should_fallback = false;
     let mut total_change_count: i64 = 0;
     let mut _total_table_size: i64 = 0;
+    // DI-2: Collect per-source (change_count, table_size) for the per-leaf
+    // fallback decision after the P2 loop completes.
+    let mut per_source_stats: Vec<(u32, i64, i64)> = Vec::new();
     // B3-1: Track source OIDs with zero changes for delta-branch pruning.
     let mut zero_change_oids: std::collections::HashSet<u32> = std::collections::HashSet::new();
 
@@ -3566,6 +3590,9 @@ pub fn execute_differential_refresh(
 
         total_change_count += change_count;
         _total_table_size += table_size;
+
+        // DI-2: Save per-source stats for per-leaf fallback decision.
+        per_source_stats.push((*oid, change_count, table_size));
 
         // B3-1: Record sources with zero changes for delta-branch pruning.
         if change_count == 0 {
@@ -3663,6 +3690,36 @@ pub fn execute_differential_refresh(
                 post_full_refresh_cleanup(st);
             }
             return result;
+        }
+    }
+
+    // ── DI-2: Per-leaf conditional fallback ──────────────────────────
+    // When `max_delta_fraction` is configured, check whether any
+    // individual source table's delta exceeds the threshold. Those
+    // leaves switch from NOT EXISTS (index-based) to EXCEPT ALL
+    // (hash-based) in the snapshot construction, while unaffected
+    // leaves keep the faster NOT EXISTS path.
+    if let Some(max_frac) = st.max_delta_fraction
+        && max_frac > 0.0
+    {
+        let mut fallback = std::collections::HashSet::new();
+        for &(oid, change_count, table_size) in &per_source_stats {
+            if table_size > 0 && change_count > 0 {
+                let frac = change_count as f64 / table_size as f64;
+                if frac > max_frac {
+                    fallback.insert(oid);
+                    pgrx::debug1!(
+                        "[pg_trickle] DI-2: per-leaf fallback for source OID {} \
+                         ({:.1}% > {:.1}% threshold)",
+                        oid,
+                        frac * 100.0,
+                        max_frac * 100.0,
+                    );
+                }
+            }
+        }
+        if !fallback.is_empty() {
+            set_fallback_leaf_oids(fallback);
         }
     }
 
@@ -3788,6 +3845,9 @@ pub fn execute_differential_refresh(
                 name,
             )?
         };
+
+        // DI-2: Clear per-leaf fallback OIDs after delta SQL generation.
+        clear_fallback_leaf_oids();
 
         let delta_sql = delta_result.delta_sql;
         let user_cols = delta_result.output_columns;
