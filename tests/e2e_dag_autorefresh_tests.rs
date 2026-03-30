@@ -475,6 +475,76 @@ const AUTO_INVARIANTS: [(&str, &str); 3] = [
     ),
 ];
 
+/// Check whether all AUTO_INVARIANTS hold without panicking.
+///
+/// Returns `true` if every ST matches its defining query, `false` otherwise.
+/// Used by `settle_auto_invariants` to retry after a `wait_for_refresh_cycle`
+/// that may have returned on a NO_DATA scheduler cycle (where `last_refresh_at`
+/// advances even though no pending CDC changes were processed).
+async fn check_auto_invariants(db: &E2eDb) -> bool {
+    for (st_table, defining_query) in AUTO_INVARIANTS {
+        // Query the non-internal column names (exclude __pgt_* columns) to
+        // avoid "different number of columns" errors in EXCEPT ALL.
+        let cols: Option<String> = db
+            .query_scalar_opt(&format!(
+                "SELECT string_agg(column_name, ', ' ORDER BY ordinal_position) \
+                 FROM information_schema.columns \
+                 WHERE table_name = '{st_table}' \
+                   AND column_name NOT LIKE '__pgt_%'"
+            ))
+            .await;
+        let cols = match cols {
+            Some(c) if !c.is_empty() => c,
+            _ => return false,
+        };
+        let matches: bool = db
+            .query_scalar(&format!(
+                "SELECT NOT EXISTS ( \
+                    (({defining_query}) EXCEPT ALL (SELECT {cols} FROM {st_table})) \
+                    UNION ALL \
+                    ((SELECT {cols} FROM {st_table}) EXCEPT ALL ({defining_query})) \
+                )"
+            ))
+            .await;
+        if !matches {
+            return false;
+        }
+    }
+    true
+}
+
+/// Wait until all AUTO_INVARIANTS hold, retrying scheduler cycles as needed.
+///
+/// `wait_for_refresh_cycle` uses `last_refresh_at` which advances even on
+/// NO_DATA cycles — so the scheduler may tick l3 before CDC changes from
+/// `prop_auto_src` have been ingested by `prop_auto_l1`.  This helper
+/// adds a retry loop so we only assert once the data has actually converged.
+async fn settle_auto_invariants(
+    db: &E2eDb,
+    seed: u64,
+    cycle: usize,
+    step: &str,
+    timeout: Duration,
+) {
+    let deadline = std::time::Instant::now() + timeout;
+    // First wait: give the fused chain one opportunity to run.
+    wait_for_refresh_cycle(db, "prop_auto_l3", timeout).await;
+
+    loop {
+        if check_auto_invariants(db).await {
+            return;
+        }
+        if std::time::Instant::now() >= deadline {
+            // Timeout — run the standard assertion to produce a clear failure.
+            assert_st_query_invariants(db, &AUTO_INVARIANTS, seed, cycle, step).await;
+            return;
+        }
+        // Wait for another scheduler cycle (l1 is the leaf and must process
+        // CDC before l2/l3 can be correct).
+        wait_for_refresh_cycle(db, "prop_auto_l1", Duration::from_secs(15)).await;
+    }
+}
+
 #[tokio::test]
 async fn test_prop_autorefresh_no_spurious_changes() {
     let config = TraceConfig::from_env();
@@ -503,8 +573,11 @@ async fn run_autorefresh_trace(seed: u64, config: &TraceConfig) {
             .await;
     }
 
-    // Wait for the full cascade to propagate through all 3 layers
-    wait_for_refresh_cycle(&db, "prop_auto_l3", Duration::from_secs(30)).await;
+    // Wait for the full cascade to propagate through all 3 layers and for
+    // the invariants to actually hold.  Under load the scheduler may fire a
+    // NO_DATA cycle before the initial inserts' CDC rows are ingested by l1,
+    // so we use settle_auto_invariants which retries until convergence.
+    settle_auto_invariants(&db, seed, 0, "init", Duration::from_secs(60)).await;
 
     for cycle in 1..=(config.cycles / 2).max(1) {
         let op = rng.usize_range(0, 100);
@@ -527,9 +600,9 @@ async fn run_autorefresh_trace(seed: u64, config: &TraceConfig) {
             }
         }
 
-        // Wait for the cascade to propagate the DML change
-        wait_for_refresh_cycle(&db, "prop_auto_l3", Duration::from_secs(30)).await;
-
-        assert_st_query_invariants(&db, &AUTO_INVARIANTS, seed, cycle, "auto").await;
+        // Wait for the cascade to propagate the DML change and verify
+        // invariants hold.  Retries if wait_for_refresh_cycle returned early
+        // on a NO_DATA cycle before the DML was processed.
+        settle_auto_invariants(&db, seed, cycle, "auto", Duration::from_secs(60)).await;
     }
 }

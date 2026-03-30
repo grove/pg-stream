@@ -204,12 +204,12 @@ async fn test_a2_mixed_referenced_unreferenced_updates() {
     db.refresh_st("mix_st").await;
 
     // Batch: update notes (unreferenced), update val (referenced), insert new
-    db.execute(
-        "UPDATE mix_src SET notes = 'foo' WHERE category = 'A'; \
-         UPDATE mix_src SET val = 99 WHERE category = 'B'; \
-         INSERT INTO mix_src (category, val) VALUES ('D', 40)",
-    )
-    .await;
+    db.execute("UPDATE mix_src SET notes = 'foo' WHERE category = 'A'")
+        .await;
+    db.execute("UPDATE mix_src SET val = 99 WHERE category = 'B'")
+        .await;
+    db.execute("INSERT INTO mix_src (category, val) VALUES ('D', 40)")
+        .await;
 
     db.refresh_st("mix_st").await;
 

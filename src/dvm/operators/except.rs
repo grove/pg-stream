@@ -127,7 +127,20 @@ SELECT __pgt_row_id, 'I' AS __pgt_action,
 FROM {merge_cte}
 WHERE GREATEST(0, old_count_l - old_count_r) > 0
   AND GREATEST(0, new_count_l - new_count_r) > 0
-  AND (new_count_l != old_count_l OR new_count_r != old_count_r)",
+  AND (new_count_l != old_count_l OR new_count_r != old_count_r)
+
+UNION ALL
+
+-- New row not yet visible but needs count tracking for future cycles.
+-- Without this, a row simultaneously added to both branches is never
+-- inserted into the ST, so later removals from the right branch
+-- cannot restore it.
+SELECT __pgt_row_id, 'I' AS __pgt_action,
+       {col_list}, new_count_l AS __pgt_count_l, new_count_r AS __pgt_count_r
+FROM {merge_cte}
+WHERE old_count_l = 0 AND old_count_r = 0
+  AND GREATEST(0, new_count_l - new_count_r) <= 0
+  AND (new_count_l > 0 OR new_count_r > 0)",
         )
     } else {
         // EXCEPT (set): row present iff count_L > 0 AND count_R = 0.
@@ -160,7 +173,20 @@ SELECT __pgt_row_id, 'I' AS __pgt_action,
 FROM {merge_cte}
 WHERE (old_count_l > 0 AND old_count_r = 0)
   AND (new_count_l > 0 AND new_count_r = 0)
-  AND (new_count_l != old_count_l OR new_count_r != old_count_r)",
+  AND (new_count_l != old_count_l OR new_count_r != old_count_r)
+
+UNION ALL
+
+-- New row not yet visible but needs count tracking for future cycles.
+-- When a value is simultaneously added to both branches, it is invisible
+-- (count_r > 0) but the ST must still track both counts so that a later
+-- DELETE from the right branch can make the row visible.
+SELECT __pgt_row_id, 'I' AS __pgt_action,
+       {col_list}, new_count_l AS __pgt_count_l, new_count_r AS __pgt_count_r
+FROM {merge_cte}
+WHERE old_count_l = 0 AND old_count_r = 0
+  AND NOT (new_count_l > 0 AND new_count_r = 0)
+  AND (new_count_l > 0 OR new_count_r > 0)",
         )
     };
     ctx.add_cte(final_cte.clone(), final_sql);

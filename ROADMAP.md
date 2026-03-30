@@ -2515,6 +2515,40 @@ cleanup for PG 16+ expression types.
 
 > **SQL coverage cleanup subtotal: ~1–2 days**
 
+### DVM Engine Improvements (Phase 10)
+
+> **In plain terms:** The delta SQL generated for deep multi-table joins
+> (e.g., TPC-H Q05/Q09 with 6 joined tables) computes identical pre-change
+> snapshots redundantly at every reference site, spilling multi-GB temporary
+> files that exceed `temp_file_limit`. Nested semi-joins (Q20) exhibit an
+> O(n²) blowup from fully materializing the right-side pre-change state.
+> These improvements target the intermediate data volume directly in the
+> delta SQL generator, with TPC-H 22/22 DIFFERENTIAL correctness as the
+> measurable gate.
+
+| Item | Description | Effort | Ref |
+|------|-------------|--------|-----|
+| DI-1 | **Named CTE L₀ snapshots.** Emit per-leaf pre-change snapshots as named CTEs (`NOT MATERIALIZED` default; `MATERIALIZED` when reference count ≥ 3); deduplicate 3–10× redundant `EXCEPT ALL` evaluations per leaf. Targets Q05/Q09 temp spill root cause. | 2–3d | [PLAN_DVM_IMPROVEMENTS.md §DI-1](plans/performance/PLAN_DVM_IMPROVEMENTS.md) |
+| DI-2 | **Pre-image read from change buffer + aggregate UPDATE-split.** Replace per-leaf `EXCEPT ALL` with a `NOT EXISTS` anti-join on `pk_hash` + direct `old_*` read. Per-leaf conditional fallback to `EXCEPT ALL` when delta exceeds `max_delta_fraction` for that leaf. Includes aggregate UPDATE-split: the 'D' side of `SUM(CASE WHEN …)` evaluates using `old_*` column values, superseding DI-8’s band-aid. | 3.5–5.5d | [PLAN_DVM_IMPROVEMENTS.md §DI-2](plans/performance/PLAN_DVM_IMPROVEMENTS.md) |
+| DI-3 | **Group-key filtered aggregate old rescan.** Restrict non-algebraic aggregate `EXCEPT ALL` rescans to affected groups via `EXISTS (… IS NOT DISTINCT FROM …)` filter. NULL-safe. Independent quick win. | 0.5–1d | [PLAN_DVM_IMPROVEMENTS.md §DI-3](plans/performance/PLAN_DVM_IMPROVEMENTS.md) |
+| DI-6 | **Lazy semi-join R_old materialization.** Skip `EXCEPT ALL` for unchanged semi-join right children; push down equi-join key as a filter when R_old is needed. Eliminates Q20-type O(n²) blowup. | 1–2d | [PLAN_DVM_IMPROVEMENTS.md §DI-6](plans/performance/PLAN_DVM_IMPROVEMENTS.md) |
+| DI-4 | **Shared R₀ CTE cache.** Cache pre-change snapshot SQL by OpTree node identity to avoid regenerating duplicate inline subqueries for shared subtrees. Depends on DI-1. | 1–2d | [PLAN_DVM_IMPROVEMENTS.md §DI-4](plans/performance/PLAN_DVM_IMPROVEMENTS.md) |
+| DI-5 | **Part 3 correction consolidation.** Consolidate per-node Part 3 correction CTEs for linear inner-join chains into a single term. | 2–3d | [PLAN_DVM_IMPROVEMENTS.md §DI-5](plans/performance/PLAN_DVM_IMPROVEMENTS.md) |
+| DI-7 | **Scan-count-aware strategy selector.** `max_differential_joins` and `max_delta_fraction` per-stream-table options; auto-fallback to FULL refresh when join count or delta-rate threshold is exceeded. Complements DI-2's per-leaf fallback with a coarser per-ST guard at scheduler decision time. | 1–2d | [PLAN_DVM_IMPROVEMENTS.md §DI-7](plans/performance/PLAN_DVM_IMPROVEMENTS.md) |
+| DI-8 | **SUM(CASE WHEN …) algebraic drift fix.** Detect `Expr::Raw("CASE …")` in `is_algebraically_invertible()` and fall back to GROUP_RESCAN. Q14 is unaffected (parsed as `ComplexExpression`, already GROUP_RESCAN). Correctness band-aid superseded by DI-2’s aggregate UPDATE-split. | ~0.5d | [PLAN_DVM_IMPROVEMENTS.md §DI-8](plans/performance/PLAN_DVM_IMPROVEMENTS.md) |
+| DI-9 | **Scheduler skips IMMEDIATE-mode tables.** Raise `scheduler_interval_ms` GUC cap to 600,000 ms; return early from refresh-due check for `refresh_mode = IMMEDIATE` (verified safe: IMMEDIATE drains TABLE-source buffers synchronously; downstream CALCULATED tables detected via `has_stream_table_source_changes()` independently). | 0.5d | [PLAN_DVM_IMPROVEMENTS.md §DI-9](plans/performance/PLAN_DVM_IMPROVEMENTS.md) |
+| DI-10 | **SF=1 benchmark validation gate.** Add `bench-tpch-sf1` justfile target (`TPCH_SF=1 TPCH_BENCH=1`). Gate v0.13.0 release on 22/22 queries at SF=1. CI: manual dispatch only (60–180 min runtime, 4h timeout). | ~0.5d | [PLAN_DVM_IMPROVEMENTS.md §DI-10](plans/performance/PLAN_DVM_IMPROVEMENTS.md) |
+
+> **DI-2 promoted from v1.x:** CDC `old_*` column capture was completed as
+> part of the typed-column CDC rewrite (already in production). DI-2 scope
+> includes both the join-level pre-image capture (`NOT EXISTS` anti-join) and
+> an aggregate UPDATE-split that uses `old_*` values for the 'D' side of
+> SUM(CASE WHEN …), superseding DI-8's GROUP_RESCAN band-aid.
+
+> **Implementation order:** DI-8 → DI-9 → DI-1 → DI-3 → DI-2 → DI-6 → DI-4 → DI-5 → DI-7 → DI-10
+
+> **DVM improvements subtotal: ~2–3 weeks** (DI-8/DI-9 are small independent fixes; DI-1–DI-7 are the core engine work; DI-10 is a validation run)
+
 ### Regression-Free Testing Initiative (Q2 2026)
 
 > Tracking: [TESTING_GAPS_2_IMPLEMENTATION_PROPOSAL.md](plans/testing/TESTING_GAPS_2_IMPLEMENTATION_PROPOSAL.md)
@@ -2531,7 +2565,7 @@ Target: reduce regression escape rate from ~15% to <5%.
 | P5 | Failure recovery & schema evolution: 6 failure recovery tests (FR-1..6 in `e2e_failure_recovery_tests.rs`) + 5 schema evolution tests (SE-1..5 in `e2e_ddl_event_tests.rs`) | ✅ Done (2026-03-28) |
 | P6 | MERGE template unit tests: 8 pure-Rust tests — `determine_refresh_action` (×5) + `build_is_distinct_clause` boundary (×3) in `src/refresh.rs` | ✅ Done (2026-03-28) |
 
-> **v0.13.0 total: ~15–23 weeks** (Scalability: 6–8w, Partitioning: 5–8w, MERGE Profiling: 1–3w, dbt: 2–3.5d, Multi-tenant: 2–3w, TPC-H harness: ~1d, SQL cleanup: ~1–2d)
+> **v0.13.0 total: ~15–23 weeks** (Scalability: 6–8w, Partitioning: 5–8w, MERGE Profiling: 1–3w, dbt: 2–3.5d, Multi-tenant: 2–3w, TPC-H harness: ~1d, SQL cleanup: ~1–2d, DVM improvements: ~2–3w)
 
 **Exit criteria:**
 - [x] A-2: Columnar change tracking bitmask skips irrelevant rows; key column classification ✅, `__pgt_key_changed` annotation ✅, P5 value-only fast path ✅, `DiffResult.has_key_changed` signal propagation ✅, MERGE value-only UPDATE optimization ✅, upgrade script ✅ ✅ Done
@@ -2552,6 +2586,14 @@ Target: reduce regression escape rate from ~15% to <5%.
 - [x] SQL-PG16-1: `IS JSON` predicate accepted in DIFFERENTIAL defining queries; E2E tests in `e2e_expression_tests.rs` confirm correct delta behaviour ✅ Done
 - [x] SQL-PG16-2: `JSON_OBJECT`, `JSON_ARRAY`, `JSON_OBJECTAGG`, `JSON_ARRAYAGG` accepted in DIFFERENTIAL defining queries; E2E tests in `e2e_expression_tests.rs` confirm correct delta behaviour ✅ Done
 - [x] `scripts/check_upgrade_completeness.sh` passes (all catalog changes in `sql/pg_trickle--0.12.0--0.13.0.sql`) ✅ Done — 58 functions, 8 new columns, all covered
+- [ ] DI-8: `is_algebraically_invertible()` detects `Expr::Raw("CASE …")` and returns `false` for `SUM(CASE WHEN …)` (Q14 unaffected — `ComplexExpression`); Q12 passes DIFFERENTIAL correctness; removed from `DIFFERENTIAL_SKIP_ALLOWLIST`
+- [ ] DI-9: `scheduler_interval_ms` cap raised to 600,000 ms; scheduler skips IMMEDIATE-mode tables (verified safe for CALCULATED dependants); zero lock-timeout events in DIFF+IMM comparison test
+- [ ] DI-1: Named CTE L₀ snapshots implemented (`NOT MATERIALIZED` default, `MATERIALIZED` when ref ≥ 3); Q05/Q09 pass DIFFERENTIAL correctness with `temp_file_limit = '4GB'`
+- [ ] DI-2: `NOT EXISTS` anti-join replaces `EXCEPT ALL` in `build_pre_change_snapshot_sql()`; per-leaf conditional `EXCEPT ALL` fallback when delta > threshold; aggregate UPDATE-split uses `old_*` for 'D' side, DI-8 band-aid removed; temp file reduction verified on Q05/Q09
+- [ ] DI-3: Non-algebraic aggregate old rescan filtered via `EXISTS (… IS NOT DISTINCT FROM …)` to affected groups; NULL-safe
+- [ ] DI-6: Semi-join R_old lazy materialization with key push-down; Q20 DIFF latency below 1000ms at SF=0.01
+- [ ] DI-4/5/7: R₀ cache, Part 3 consolidation, strategy selector + max_delta_fraction complete
+- [ ] DI-10: `bench-tpch-sf1` target added; 22/22 queries pass DIFFERENTIAL correctness at SF=1 (manual dispatch CI, 4h timeout)
 - [ ] Extension upgrade path tested (`0.12.0 → 0.13.0`)
 
 ---

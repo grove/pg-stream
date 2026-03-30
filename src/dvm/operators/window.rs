@@ -159,6 +159,13 @@ pub fn diff_window(ctx: &mut DiffContext, op: &OpTree) -> Result<DiffResult, PgT
     all_output_cols.extend(wf_aliases.iter().cloned());
     all_output_cols.extend(aux_cols.iter().cloned());
 
+    // Determine which output columns actually exist in the ST storage
+    // table. When a Window is wrapped by an outer Project that strips
+    // some columns (e.g., DISTINCT ON rewrite strips __pgt_rn), the
+    // window function aliases won't exist in the ST. We must use NULL
+    // for those columns when reading old ST rows.
+    let st_stored_cols: Option<Vec<String>> = ctx.st_user_columns.clone();
+
     let partition_cols: Vec<String> = partition_by.iter().map(|e| e.to_sql()).collect();
 
     // ── CTE 1: Find changed partition keys ─────────────────────────────
@@ -196,9 +203,45 @@ pub fn diff_window(ctx: &mut DiffContext, op: &OpTree) -> Result<DiffResult, PgT
 
     // ── CTE 2: Old ST rows for changed partitions (DELETE actions) ─────
     let old_rows_cte = ctx.next_cte_name("win_old");
+    // Only SELECT columns from the ST that actually exist there. For
+    // window aliases stripped by an outer Project (e.g., __pgt_rn from
+    // DISTINCT ON rewrite), emit a typed NULL instead of st."col" to
+    // avoid both "column does not exist" errors and UNION ALL type
+    // mismatches (untyped NULL defaults to text, but window functions
+    // return bigint / numeric / double precision).
+    let wf_return_types: std::collections::HashMap<String, &str> = window_exprs
+        .iter()
+        .map(|w| {
+            let ret_type = match w.func_name.to_lowercase().as_str() {
+                "row_number" | "rank" | "dense_rank" | "ntile" | "count" => "bigint",
+                "percent_rank" | "cume_dist" => "double precision",
+                _ => "bigint", // safe default for most window functions
+            };
+            (w.alias.clone(), ret_type)
+        })
+        .collect();
     let all_cols_st = all_output_cols
         .iter()
-        .map(|c| format!("st.{}", quote_ident(c)))
+        .map(|c| {
+            // Auxiliary columns from the child diff (e.g. __pgt_count from
+            // an Aggregate) always exist in the ST storage table (they are
+            // added during CREATE/ALTER). Read them directly instead of
+            // checking st_stored_cols, which only reflects user-visible
+            // output_columns() and omits internal __pgt_* columns.
+            if aux_cols.contains(c) {
+                return format!("st.{}", quote_ident(c));
+            }
+            let col_exists_in_st = st_stored_cols
+                .as_ref()
+                .map(|cols| cols.contains(c))
+                .unwrap_or(true);
+            if col_exists_in_st {
+                format!("st.{}", quote_ident(c))
+            } else {
+                let cast_type = wf_return_types.get(c).copied().unwrap_or("bigint");
+                format!("NULL::{cast_type} AS {}", quote_ident(c))
+            }
+        })
         .collect::<Vec<_>>()
         .join(", ");
 
@@ -394,13 +437,16 @@ pub fn diff_window(ctx: &mut DiffContext, op: &OpTree) -> Result<DiffResult, PgT
     let all_cols_name = col_list(&all_output_cols);
 
     let final_sql = format!(
-        "-- Delete old window results for changed partitions\n\
-         SELECT \"__pgt_row_id\", 'D' AS \"__pgt_action\", {all_cols_name}\n\
-         FROM {old_rows_cte}\n\
-         UNION ALL\n\
-         -- Insert recomputed window results\n\
+        "-- Insert recomputed window results (listed first so that\n\
+         -- PostgreSQL infers correct column types for the UNION ALL;\n\
+         -- old_rows may contain NULL placeholders for window columns\n\
+         -- stripped by an outer Project, which default to type text)\n\
          SELECT \"__pgt_row_id\", 'I' AS \"__pgt_action\", {all_cols_name}\n\
-         FROM {recomputed_cte}",
+         FROM {recomputed_cte}\n\
+         UNION ALL\n\
+         -- Delete old window results for changed partitions\n\
+         SELECT \"__pgt_row_id\", 'D' AS \"__pgt_action\", {all_cols_name}\n\
+         FROM {old_rows_cte}",
     );
     ctx.add_cte(final_cte.clone(), final_sql);
 

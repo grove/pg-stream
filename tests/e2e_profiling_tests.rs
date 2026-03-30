@@ -35,7 +35,7 @@ async fn test_explain_delta_simple_returns_plan() {
     .await;
 
     let plan = db
-        .query_text("SELECT line FROM pgtrickle.explain_delta('public.prof_simple_st')")
+        .query_text("SELECT explain_delta FROM pgtrickle.explain_delta('public.prof_simple_st')")
         .await;
 
     assert!(
@@ -77,7 +77,7 @@ async fn test_explain_delta_join_query() {
         .await;
 
     let plan = db
-        .query_text("SELECT line FROM pgtrickle.explain_delta('public.prof_join_st')")
+        .query_text("SELECT explain_delta FROM pgtrickle.explain_delta('public.prof_join_st')")
         .await;
 
     assert!(
@@ -116,7 +116,9 @@ async fn test_explain_delta_json_format() {
 
     // JSON format returns a single row containing the JSON plan.
     let plan_json = db
-        .query_text("SELECT line FROM pgtrickle.explain_delta('public.prof_json_st', 'json')")
+        .query_text(
+            "SELECT explain_delta FROM pgtrickle.explain_delta('public.prof_json_st', 'json')",
+        )
         .await;
 
     assert!(
@@ -137,7 +139,9 @@ async fn test_explain_delta_nonexistent_st_errors() {
     let db = E2eDb::new().await.with_extension().await;
 
     let result = db
-        .try_execute("SELECT line FROM pgtrickle.explain_delta('public.nonexistent_st_xyz')")
+        .try_execute(
+            "SELECT explain_delta FROM pgtrickle.explain_delta('public.nonexistent_st_xyz')",
+        )
         .await;
 
     assert!(
@@ -162,7 +166,9 @@ async fn test_explain_delta_invalid_format_errors() {
     .await;
 
     let result = db
-        .try_execute("SELECT line FROM pgtrickle.explain_delta('public.prof_fmt_st', 'csv')")
+        .try_execute(
+            "SELECT explain_delta FROM pgtrickle.explain_delta('public.prof_fmt_st', 'csv')",
+        )
         .await;
 
     assert!(

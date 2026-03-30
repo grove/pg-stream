@@ -116,6 +116,16 @@ pub fn diff_filter(ctx: &mut DiffContext, op: &OpTree) -> Result<DiffResult, PgT
         OpTree::LateralSubquery { .. } | OpTree::LateralFunction { .. }
     );
 
+    // When the child is a Window, DELETE rows from the old_rows CTE have
+    // NULL-padded window function columns (columns stripped by an outer
+    // Project, e.g., __pgt_rn for DISTINCT ON). The filter predicate
+    // references these window columns (e.g., `__pgt_rn = 1`), causing
+    // `NULL = 1` to evaluate to false, blocking ALL DELETE rows.
+    // DELETE rows represent rows currently in the ST that must be removed
+    // when the partition's result changes. They already satisfied the
+    // filter when first inserted, so bypassing is correct.
+    let is_window_child = matches!(unwrap_transparent(child), OpTree::Window { .. });
+
     let sql = if is_having && has_st {
         let st_table = ctx.st_qualified_name.as_deref().unwrap();
         format!(
@@ -141,7 +151,7 @@ pub fn diff_filter(ctx: &mut DiffContext, op: &OpTree) -> Result<DiffResult, PgT
             predicate = predicate_sql,
             st_table = st_table,
         )
-    } else if is_lateral_child {
+    } else if is_lateral_child || is_window_child {
         format!(
             "SELECT __pgt_row_id, __pgt_action, {cols}\n\
              FROM {child_cte}\n\

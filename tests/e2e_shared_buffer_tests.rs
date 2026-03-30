@@ -79,6 +79,7 @@ async fn test_d4_fanout_10_sts_shared_buffer() {
             "SELECT count(*) FROM pg_class c
              JOIN pg_namespace n ON n.oid = c.relnamespace
              WHERE n.nspname = 'pgtrickle_changes'
+               AND c.relkind IN ('r', 'p')
                AND c.relname LIKE 'changes_%'
                AND c.relname NOT LIKE 'changes_pgt_%'",
         )
@@ -370,10 +371,8 @@ async fn test_d4_drop_st_reduces_consumer_count() {
 async fn test_perf2_buffer_partitioning_on_creates_partitioned() {
     let db = E2eDb::new().await.with_extension().await;
 
-    // Enable buffer partitioning.
-    db.execute("SET pg_trickle.buffer_partitioning = 'on'")
-        .await;
-
+    // Enable buffer partitioning + create ST on the SAME connection so
+    // the session-level SET is visible to the create_stream_table call.
     db.execute(
         "CREATE TABLE perf2_src (
             id   SERIAL PRIMARY KEY,
@@ -385,12 +384,12 @@ async fn test_perf2_buffer_partitioning_on_creates_partitioned() {
     db.execute("INSERT INTO perf2_src (grp, val) VALUES ('a', 10), ('b', 20), ('c', 30)")
         .await;
 
-    db.create_st(
-        "perf2_sum",
-        "SELECT grp, SUM(val) AS total FROM perf2_src GROUP BY grp",
-        "1m",
-        "DIFFERENTIAL",
-    )
+    db.execute_seq(&[
+        "SET pg_trickle.buffer_partitioning = 'on'",
+        "SELECT pgtrickle.create_stream_table('perf2_sum', \
+         $$SELECT grp, SUM(val) AS total FROM perf2_src GROUP BY grp$$, \
+         '1m', 'DIFFERENTIAL')",
+    ])
     .await;
 
     // Full refresh.
@@ -425,10 +424,6 @@ async fn test_perf2_buffer_partitioning_on_creates_partitioned() {
 async fn test_perf2_auto_mode_starts_unpartitioned() {
     let db = E2eDb::new().await.with_extension().await;
 
-    // Enable auto mode.
-    db.execute("SET pg_trickle.buffer_partitioning = 'auto'")
-        .await;
-
     db.execute(
         "CREATE TABLE perf2_auto_src (
             id   SERIAL PRIMARY KEY,
@@ -439,12 +434,14 @@ async fn test_perf2_auto_mode_starts_unpartitioned() {
     db.execute("INSERT INTO perf2_auto_src (val) VALUES (1), (2), (3)")
         .await;
 
-    db.create_st(
-        "perf2_auto_cnt",
-        "SELECT COUNT(*) AS cnt FROM perf2_auto_src",
-        "1m",
-        "DIFFERENTIAL",
-    )
+    // Enable auto mode + create ST on the SAME connection.
+    // Use a short schedule (< 30s) so auto mode does NOT partition at creation time.
+    db.execute_seq(&[
+        "SET pg_trickle.buffer_partitioning = 'auto'",
+        "SELECT pgtrickle.create_stream_table('perf2_auto_cnt', \
+         $$SELECT COUNT(*) AS cnt FROM perf2_auto_src$$, \
+         '10s', 'DIFFERENTIAL')",
+    ])
     .await;
 
     db.refresh_st("perf2_auto_cnt").await;
@@ -477,11 +474,6 @@ async fn test_perf2_auto_mode_starts_unpartitioned() {
 async fn test_perf2_auto_mode_promotes_on_high_throughput() {
     let db = E2eDb::new().await.with_extension().await;
 
-    // Set auto mode + low threshold so we can trigger promotion easily.
-    db.execute("SET pg_trickle.buffer_partitioning = 'auto'")
-        .await;
-    db.execute("SET pg_trickle.compact_threshold = 50").await;
-
     db.execute(
         "CREATE TABLE perf2_promo_src (
             id   SERIAL PRIMARY KEY,
@@ -492,16 +484,24 @@ async fn test_perf2_auto_mode_promotes_on_high_throughput() {
     db.execute("INSERT INTO perf2_promo_src (val) VALUES (1)")
         .await;
 
-    db.create_st(
-        "perf2_promo_cnt",
-        "SELECT COUNT(*) AS cnt FROM perf2_promo_src",
-        "1m",
-        "DIFFERENTIAL",
-    )
+    // Set auto mode + low threshold + create ST on the SAME connection.
+    // Use a short schedule (< 30s) so auto mode does NOT partition at creation time —
+    // we want to test runtime promotion via compact_threshold.
+    db.execute_seq(&[
+        "SET pg_trickle.buffer_partitioning = 'auto'",
+        "SET pg_trickle.compact_threshold = 50",
+        "SELECT pgtrickle.create_stream_table('perf2_promo_cnt', \
+         $$SELECT COUNT(*) AS cnt FROM perf2_promo_src$$, \
+         '10s', 'DIFFERENTIAL')",
+    ])
     .await;
 
-    // Full refresh to establish baseline.
-    db.refresh_st("perf2_promo_cnt").await;
+    // Full refresh to establish baseline (needs auto mode visible).
+    db.execute_seq(&[
+        "SET pg_trickle.buffer_partitioning = 'auto'",
+        "SELECT pgtrickle.refresh_stream_table('perf2_promo_cnt')",
+    ])
+    .await;
 
     // Verify buffer starts unpartitioned.
     let is_part_before: bool = db
@@ -519,8 +519,13 @@ async fn test_perf2_auto_mode_promotes_on_high_throughput() {
     )
     .await;
 
-    // Differential refresh — this should trigger auto-promotion.
-    db.refresh_st("perf2_promo_cnt").await;
+    // Differential refresh with auto mode + low threshold on same connection.
+    db.execute_seq(&[
+        "SET pg_trickle.buffer_partitioning = 'auto'",
+        "SET pg_trickle.compact_threshold = 50",
+        "SELECT pgtrickle.refresh_stream_table('perf2_promo_cnt')",
+    ])
+    .await;
 
     // Verify buffer was promoted to partitioned.
     let is_part_after: bool = db
@@ -539,7 +544,11 @@ async fn test_perf2_auto_mode_promotes_on_high_throughput() {
     // partitioned buffer.
     db.execute("INSERT INTO perf2_promo_src (val) VALUES (999)")
         .await;
-    db.refresh_st("perf2_promo_cnt").await;
+    db.execute_seq(&[
+        "SET pg_trickle.buffer_partitioning = 'auto'",
+        "SELECT pgtrickle.refresh_stream_table('perf2_promo_cnt')",
+    ])
+    .await;
 
     let cnt_after: i64 = db.query_scalar("SELECT cnt FROM perf2_promo_cnt").await;
     assert_eq!(cnt_after, 102, "post-promotion differential refresh");

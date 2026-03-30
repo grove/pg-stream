@@ -698,6 +698,28 @@ impl E2eDb {
         self.query_scalar(&format!("SHOW {setting}")).await
     }
 
+    /// SET a GUC and immediately SHOW it on the **same** connection.
+    ///
+    /// Session-level SET is visible only on the connection that ran it; with
+    /// a connection pool the subsequent SHOW may hit a different backend.
+    /// This helper guarantees both statements share a single connection.
+    pub async fn set_and_show_setting(&self, set_sql: &str, setting: &str) -> String {
+        let mut conn = self
+            .pool
+            .acquire()
+            .await
+            .expect("Failed to acquire connection for set_and_show_setting");
+        sqlx::query(set_sql)
+            .execute(&mut *conn)
+            .await
+            .unwrap_or_else(|e| panic!("SET failed: {e}\nSQL: {set_sql}"));
+        let result: (String,) = sqlx::query_as(&format!("SHOW {setting}"))
+            .fetch_one(&mut *conn)
+            .await
+            .unwrap_or_else(|e| panic!("SHOW {setting} failed: {e}"));
+        result.0
+    }
+
     /// Wait until `SHOW <setting>` reports the expected value.
     pub async fn wait_for_setting(&self, setting: &str, expected: &str) {
         for _ in 0..10 {
@@ -998,11 +1020,65 @@ impl E2eDb {
             )
         };
         let matches: bool = self.query_scalar(&sql).await;
-        assert!(
-            matches,
-            "ST '{}' contents do not match defining query:\n  {}",
-            st_table, defining_query,
-        );
+        if !matches {
+            // Dump the actual ST contents and expected query result for
+            // diagnostic purposes before panicking.
+            let st_rows: Vec<(String,)> = sqlx::query_as(&format!(
+                "SELECT row_to_json(t)::text FROM (SELECT {raw_cols} FROM {st_relation}) t"
+            ))
+            .fetch_all(&self.pool)
+            .await
+            .unwrap_or_default();
+            let dq_rows: Vec<(String,)> = sqlx::query_as(&format!(
+                "SELECT row_to_json(t)::text FROM ({defining_query}) t"
+            ))
+            .fetch_all(&self.pool)
+            .await
+            .unwrap_or_default();
+            let extra_in_st: Vec<(String,)> = sqlx::query_as(&format!(
+                "SELECT row_to_json(t)::text FROM (SELECT {raw_cols} FROM {st_relation} EXCEPT ALL ({defining_query})) t"
+            ))
+            .fetch_all(&self.pool)
+            .await
+            .unwrap_or_default();
+            let missing_from_st: Vec<(String,)> = sqlx::query_as(&format!(
+                "SELECT row_to_json(t)::text FROM (({defining_query}) EXCEPT ALL SELECT {raw_cols} FROM {st_relation}) t"
+            ))
+            .fetch_all(&self.pool)
+            .await
+            .unwrap_or_default();
+            panic!(
+                "ST '{}' contents do not match defining query:\n  {}\n\
+                 ST rows ({}):\n{}\n\
+                 Query rows ({}):\n{}\n\
+                 Extra in ST:\n{}\n\
+                 Missing from ST:\n{}",
+                st_table,
+                defining_query,
+                st_rows.len(),
+                st_rows
+                    .iter()
+                    .map(|(r,)| format!("    {r}"))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+                dq_rows.len(),
+                dq_rows
+                    .iter()
+                    .map(|(r,)| format!("    {r}"))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+                extra_in_st
+                    .iter()
+                    .map(|(r,)| format!("    {r}"))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+                missing_from_st
+                    .iter()
+                    .map(|(r,)| format!("    {r}"))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            );
+        }
     }
 
     // ── Infrastructure Query Helpers ───────────────────────────────────

@@ -2547,6 +2547,23 @@ fn create_stream_table_impl(
         {
             pgrx::debug1!("[pg_trickle] Failed to record initial last_full_ms: {}", e);
         }
+
+        // G12-ERM-1: Record the effective refresh mode for the initial
+        // population so monitoring and tests can observe the mode from
+        // the very first cycle without waiting for a scheduler refresh.
+        let initial_eff_mode = if vq.topk_info.is_some() {
+            "TOP_K"
+        } else {
+            refresh_mode.as_str()
+        };
+        if let Err(e) = StreamTableMeta::update_effective_refresh_mode(pgt_id, initial_eff_mode) {
+            pgrx::debug1!(
+                "[pg_trickle] Failed to set initial effective_refresh_mode for {}.{}: {}",
+                schema,
+                table_name,
+                e
+            );
+        }
     }
 
     // Pre-warm delta SQL + MERGE template cache for DIFFERENTIAL mode,
@@ -3098,6 +3115,19 @@ fn drop_stream_table_impl_inner(
     // Delete catalog entries (cascade handles pgt_dependencies)
     StreamTableMeta::delete(st.pgt_id)?;
 
+    // Remove this ST's pgt_id from the tracked_by_pgt_ids arrays in
+    // pgt_change_tracking so consumer counts stay accurate after drop.
+    for dep in &deps {
+        if dep.source_type == "TABLE" {
+            let _ = Spi::run_with_args(
+                "UPDATE pgtrickle.pgt_change_tracking \
+                 SET tracked_by_pgt_ids = array_remove(tracked_by_pgt_ids, $1) \
+                 WHERE source_relid = $2",
+                &[st.pgt_id.into(), dep.source_relid.into()],
+            );
+        }
+    }
+
     // Clean up CDC resources (triggers, WAL slots, publications) for
     // sources no longer tracked by any ST. For IMMEDIATE-mode STs, clean
     // up IVM triggers instead.
@@ -3470,6 +3500,14 @@ fn execute_manual_refresh(
                 None,
                 false,
             );
+            // G12-ERM-1: Persist the effective refresh mode for manual
+            // refreshes, mirroring the scheduler path.  Without this,
+            // effective_refresh_mode stays NULL after every manual refresh,
+            // which breaks diagnostics and test assertions.
+            let eff_mode = crate::refresh::take_effective_mode();
+            if !eff_mode.is_empty() {
+                let _ = StreamTableMeta::update_effective_refresh_mode(st.pgt_id, eff_mode);
+            }
         }
         Err(e) => {
             let _ = RefreshRecord::complete(
@@ -4243,15 +4281,32 @@ fn explain_delta_impl(name: &str, format: &str) -> Result<Vec<String>, PgTrickle
          SELECT * FROM ({delta_sql}) __pgt_explain_d"
     );
 
+    // For JSON/XML formats, PostgreSQL returns typed columns (json/xml)
+    // which are not directly compatible with pgrx's String retrieval.
+    let is_typed_format = fmt_kw == "JSON" || fmt_kw == "XML";
+
     let rows: Vec<String> = Spi::connect(|client| {
         let result = client
             .select(&explain_sql, None, &[])
             .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
         let mut lines = Vec::new();
         for row in result {
-            let line: Option<String> = row
-                .get(1)
-                .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
+            let line: Option<String> = if is_typed_format {
+                // JSON returns json type (Oid 114), XML returns xml type.
+                // Use pgrx::Json to extract, then convert to String.
+                match row.get::<pgrx::Json>(1) {
+                    Ok(Some(json_val)) => Some(json_val.0.to_string()),
+                    Ok(None) => None,
+                    Err(_) => {
+                        // Fall back to trying as xml/text
+                        row.get::<String>(1)
+                            .map_err(|e| PgTrickleError::SpiError(e.to_string()))?
+                    }
+                }
+            } else {
+                row.get(1)
+                    .map_err(|e| PgTrickleError::SpiError(e.to_string()))?
+            };
             if let Some(l) = line {
                 lines.push(l);
             }
@@ -4331,7 +4386,7 @@ fn shared_buffer_stats_impl() -> Vec<(i64, String, i32, String, i32, Option<Stri
     let change_schema = "pgtrickle_changes";
 
     let query = "\
-        SELECT ct.source_relid, \
+        SELECT ct.source_relid::bigint AS source_relid, \
                format('%I.%I', n.nspname, c.relname) AS source_table, \
                array_length(ct.tracked_by_pgt_ids, 1) AS consumer_count, \
                ct.tracked_by_pgt_ids \
@@ -4365,9 +4420,9 @@ fn shared_buffer_stats_impl() -> Vec<(i64, String, i32, String, i32, Option<Stri
                     "SELECT string_agg(format('%I.%I', st.pgt_schema, st.pgt_name), ', ' \
                      ORDER BY st.pgt_name) \
                      FROM pgtrickle.pgt_stream_tables st \
-                     WHERE st.pgt_id = ANY( \
-                       (SELECT tracked_by_pgt_ids FROM pgtrickle.pgt_change_tracking \
-                        WHERE source_relid = {source_oid}))",
+                     WHERE st.pgt_id IN ( \
+                       SELECT unnest(tracked_by_pgt_ids) FROM pgtrickle.pgt_change_tracking \
+                        WHERE source_relid = {source_oid})",
                 ))
                 .unwrap_or(None)
                 .unwrap_or_default();

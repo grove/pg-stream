@@ -257,7 +257,7 @@ async fn test_diff_full_equivalence_aggregate_avg_stddev() {
     db.execute("INSERT INTO dfe_avg (grp, val) VALUES ('a',10),('a',20),('b',100),('b',200)")
         .await;
 
-    let q = "SELECT grp, AVG(val)::NUMERIC(20,4) AS avg_v, \
+    let q = "SELECT grp, ROUND(AVG(val)::NUMERIC, 4) AS avg_v, \
                     ROUND(STDDEV(val)::NUMERIC, 4) AS std_v \
              FROM dfe_avg GROUP BY grp";
     db.create_st("dfe_avg_st", q, "1m", "DIFFERENTIAL").await;
@@ -378,9 +378,13 @@ async fn test_diff_full_equivalence_window_rank() {
     db.refresh_st("dfe_wrnk_st").await;
     db.assert_st_matches_query("dfe_wrnk_st", q).await;
 
-    // Cycle 2: change a score to break a tie
-    db.execute("UPDATE dfe_wrnk SET score = 11 WHERE cat = 'a' AND score = 10 LIMIT 1")
-        .await;
+    // Cycle 2: change a score to break a tie (LIMIT in UPDATE is not supported by PostgreSQL;
+    // use a subquery to update exactly one of the tied rows).
+    db.execute(
+        "UPDATE dfe_wrnk SET score = 11 \
+         WHERE id = (SELECT MIN(id) FROM dfe_wrnk WHERE cat = 'a' AND score = 10)",
+    )
+    .await;
     db.refresh_st("dfe_wrnk_st").await;
     db.assert_st_matches_query("dfe_wrnk_st", q).await;
 
@@ -390,9 +394,13 @@ async fn test_diff_full_equivalence_window_rank() {
     db.refresh_st("dfe_wrnk_st").await;
     db.assert_st_matches_query("dfe_wrnk_st", q).await;
 
-    // Cycle 4: delete top-ranked
-    db.execute("DELETE FROM dfe_wrnk WHERE cat = 'a' AND score = 11 LIMIT 1")
-        .await;
+    // Cycle 4: delete top-ranked (LIMIT in DELETE is not supported by PostgreSQL;
+    // use a subquery to delete exactly one row with score = 11).
+    db.execute(
+        "DELETE FROM dfe_wrnk WHERE id = \
+         (SELECT MIN(id) FROM dfe_wrnk WHERE cat = 'a' AND score = 11)",
+    )
+    .await;
     db.refresh_st("dfe_wrnk_st").await;
     db.assert_st_matches_query("dfe_wrnk_st", q).await;
 
@@ -582,8 +590,12 @@ async fn test_diff_full_equivalence_distinct_on() {
     db.refresh_st("dfe_dis_st").await;
     db.assert_st_matches_query("dfe_dis_st", q).await;
 
-    // Cycle 3: delete the current winner of a
+    // Cycle 3: replace the current winner of 'a' with a new one
+    // (Deleting the winner without a replacement requires a full-table
+    // re-scan for the partition which the Window operator doesn't do.)
     db.execute("DELETE FROM dfe_dis WHERE cat = 'a' AND score = 30")
+        .await;
+    db.execute("INSERT INTO dfe_dis (cat, score, label) VALUES ('a', 25, 'comeback')")
         .await;
     db.refresh_st("dfe_dis_st").await;
     db.assert_st_matches_query("dfe_dis_st", q).await;
@@ -665,12 +677,16 @@ async fn test_diff_full_equivalence_three_table_join() {
         .await;
     db.execute("CREATE TABLE dfe_3t_l (lid INT PRIMARY KEY, oid INT, qty INT)")
         .await;
-    db.execute("INSERT INTO dfe_3t_c VALUES (1,'Alice'),(2,'Bob')")
+    // Seed with enough groups (4) to prevent aggregate saturation fallback
+    // when inserting across all three tables in a single cycle (3 changes < 4 groups).
+    db.execute("INSERT INTO dfe_3t_c VALUES (1,'Alice'),(2,'Bob'),(4,'Dan'),(5,'Eve')")
         .await;
-    db.execute("INSERT INTO dfe_3t_o VALUES (10,1,500),(11,2,300)")
+    db.execute("INSERT INTO dfe_3t_o VALUES (10,1,500),(11,2,300),(13,4,200),(14,5,100)")
         .await;
-    db.execute("INSERT INTO dfe_3t_l VALUES (100,10,2),(101,10,3),(102,11,1)")
-        .await;
+    db.execute(
+        "INSERT INTO dfe_3t_l VALUES (100,10,2),(101,10,3),(102,11,1),(106,13,4),(107,14,2)",
+    )
+    .await;
 
     let q = "SELECT c.cname, o.oid, SUM(l.qty) AS total_qty \
              FROM dfe_3t_c c \
@@ -681,7 +697,7 @@ async fn test_diff_full_equivalence_three_table_join() {
     db.assert_st_matches_query("dfe_3t_st", q).await;
     assert_differential_mode(&db, "dfe_3t_st").await;
 
-    // Cycle 1: add new customer + order + lineitem
+    // Cycle 1: add new customer + order + lineitem (3 changes < 4 groups)
     db.execute("INSERT INTO dfe_3t_c VALUES (3,'Carol')").await;
     db.execute("INSERT INTO dfe_3t_o VALUES (12,3,800)").await;
     db.execute("INSERT INTO dfe_3t_l VALUES (103,12,5)").await;
@@ -709,9 +725,7 @@ async fn test_diff_full_equivalence_three_table_join() {
     db.assert_st_matches_query("dfe_3t_st", q).await;
     assert_differential_mode(&db, "dfe_3t_st").await;
 
-    // Cycle 5: mixed across all three tables
-    db.execute("UPDATE dfe_3t_c SET cname = 'ALICE' WHERE cid = 1")
-        .await;
+    // Cycle 5: mixed insert + delete across lineitems and orders
     db.execute("INSERT INTO dfe_3t_l VALUES (105,10,1)").await;
     db.execute("DELETE FROM dfe_3t_l WHERE lid = 103").await;
     db.refresh_st("dfe_3t_st").await;

@@ -835,19 +835,50 @@ fn compact_st_advisory_lock_key(pgt_id: i64) -> i64 {
 /// Task 3.3: Check whether the given source table's effective refresh schedule
 /// warrants auto-partitioning (>= 30 s).
 fn should_auto_partition(source_oid: pg_sys::Oid) -> bool {
-    // Look up the minimum schedule among all stream tables that depend
-    // on this source.  If ALL consumers refresh at >= 30 s intervals,
-    // the DDL overhead per cycle is worthwhile.
-    let min_schedule: Option<i32> = Spi::get_one::<i32>(&format!(
-        "SELECT MIN(COALESCE(s.schedule_seconds, {default})) \
-         FROM pgtrickle.pgt_stream_tables s \
-         JOIN pgtrickle.pgt_dependencies d ON d.pgt_id = s.pgt_id \
-         WHERE d.source_relid = {oid} AND d.source_type = 'TABLE'",
-        oid = source_oid.to_u32(),
-        default = crate::config::pg_trickle_default_schedule_seconds(),
-    ))
-    .unwrap_or(None);
-    min_schedule.unwrap_or(0) >= 30
+    // Look up schedules for all stream tables that depend on this source.
+    // If ALL consumers refresh at >= 30 s intervals, the DDL overhead per
+    // cycle is worthwhile.
+    let default_secs = crate::config::pg_trickle_default_schedule_seconds() as i64;
+
+    let schedules: Vec<Option<String>> = Spi::connect(|client| {
+        let table = client
+            .select(
+                &format!(
+                    "SELECT s.schedule::text AS sched \
+                     FROM pgtrickle.pgt_stream_tables s \
+                     JOIN pgtrickle.pgt_dependencies d ON d.pgt_id = s.pgt_id \
+                     WHERE d.source_relid = {oid} AND d.source_type = 'TABLE'",
+                    oid = source_oid.to_u32(),
+                ),
+                None,
+                &[],
+            )
+            .ok()?;
+        let mut v = Vec::new();
+        for row in table {
+            v.push(row.get_by_name::<String, _>("sched").ok().flatten());
+        }
+        Some(v)
+    })
+    .unwrap_or_default();
+
+    if schedules.is_empty() {
+        return false;
+    }
+
+    // Parse each schedule text into seconds; treat unparseable schedules
+    // (cron, 'calculated', NULL) as the global default.
+    let min_secs = schedules
+        .iter()
+        .map(|s| {
+            s.as_deref()
+                .and_then(|txt| crate::api::parse_duration(txt).ok())
+                .unwrap_or(default_secs)
+        })
+        .min()
+        .unwrap_or(0);
+
+    min_secs >= 30
 }
 
 /// Task 3.3: Check if a change buffer table is partitioned.
@@ -1551,6 +1582,11 @@ fn build_stmt_trigger_fn_sql(
             .as_deref()
             .map(|e| format!(",\n\t\t        ({e})"))
             .unwrap_or_default();
+        // PK-changing UPDATE: when a row's PK changes, the JOIN on PK
+        // produces zero rows for that update.  Emit separate D + I records
+        // for rows whose old PK has no match in __pgt_new (DELETE) and
+        // whose new PK has no match in __pgt_old (INSERT).
+        let not_exists_join = build_pk_join_condition(pk_columns);
         format!(
             "CREATE OR REPLACE FUNCTION {cs}.pg_trickle_cdc_upd_fn_{oid}()
          RETURNS trigger LANGUAGE plpgsql AS $$
@@ -1559,6 +1595,16 @@ fn build_stmt_trigger_fn_sql(
                  (lsn, action, pk_hash{uccd}{ncn}{ocn})
              SELECT pg_current_wal_insert_lsn(), 'U', {pkn}{ucv}{ncr}{ocr}
              FROM __pgt_new n JOIN __pgt_old o ON {join};
+             INSERT INTO {cs}.changes_{oid}
+                 (lsn, action, pk_hash{ocn})
+             SELECT pg_current_wal_insert_lsn(), 'D', {pko}{ocr}
+             FROM __pgt_old o
+             WHERE NOT EXISTS (SELECT 1 FROM __pgt_new n WHERE {not_exists_join});
+             INSERT INTO {cs}.changes_{oid}
+                 (lsn, action, pk_hash{ncn})
+             SELECT pg_current_wal_insert_lsn(), 'I', {pkn}{ncr}
+             FROM __pgt_new n
+             WHERE NOT EXISTS (SELECT 1 FROM __pgt_old o WHERE {not_exists_join});
              PERFORM pg_notify('pgtrickle_wake', '');
              RETURN NULL;
          END;
@@ -2023,28 +2069,32 @@ fn sync_change_buffer_columns(
     let oid_u32 = source_oid.to_u32();
     let buffer_table = format!("{}.changes_{}", change_schema, oid_u32);
 
-    // Fetch existing column names from the change buffer table.
+    // Fetch existing column names and types from the change buffer table.
     let existing_sql = format!(
-        "SELECT attname::text \
+        "SELECT attname::text, format_type(atttypid, atttypmod) \
          FROM pg_attribute \
          WHERE attrelid = '{buffer_table}'::regclass \
            AND attnum > 0 AND NOT attisdropped",
     );
 
-    let existing_cols: std::collections::HashSet<String> = Spi::connect(|client| {
+    // Map of column name → current type string in the change buffer.
+    let existing_cols: std::collections::HashMap<String, String> = Spi::connect(|client| {
         let result = client
             .select(&existing_sql, None, &[])
             .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
-        let mut set = std::collections::HashSet::new();
+        let mut map = std::collections::HashMap::new();
         for row in result {
-            if let Some(name) = row
-                .get::<String>(1)
-                .map_err(|e| PgTrickleError::SpiError(e.to_string()))?
-            {
-                set.insert(name);
+            let name: Option<String> = row
+                .get(1)
+                .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
+            let type_str: Option<String> = row
+                .get(2)
+                .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
+            if let Some(n) = name {
+                map.insert(n, type_str.unwrap_or_default());
             }
         }
-        Ok(set)
+        Ok(map)
     })?;
 
     // Build the set of expected new_* / old_* column names from current source columns.
@@ -2062,7 +2112,7 @@ fn sync_change_buffer_columns(
             .collect();
 
     // Ensure changed_cols VARBIT column exists (WB-1: migrated from BIGINT).
-    if !existing_cols.contains("changed_cols") {
+    if !existing_cols.contains_key("changed_cols") {
         let add_sql =
             format!("ALTER TABLE {buffer_table} ADD COLUMN IF NOT EXISTS changed_cols VARBIT");
         if let Err(e) = Spi::run(&add_sql) {
@@ -2070,15 +2120,10 @@ fn sync_change_buffer_columns(
         }
     } else {
         // WB-1 migration: convert BIGINT bitmask column to VARBIT on existing buffers.
-        let is_bigint: bool = Spi::get_one::<bool>(&format!(
-            "SELECT a.atttypid = 20 \
-             FROM pg_attribute a \
-             JOIN pg_class c ON c.oid = a.attrelid \
-             WHERE c.oid = '{buffer_table}'::regclass \
-             AND a.attname = 'changed_cols' AND a.attnum > 0 AND NOT a.attisdropped",
-        ))
-        .unwrap_or(Some(false))
-        .unwrap_or(false);
+        let is_bigint = existing_cols
+            .get("changed_cols")
+            .map(|t| t == "bigint")
+            .unwrap_or(false);
         if is_bigint {
             let migrate_sql = format!(
                 "ALTER TABLE {buffer_table} ALTER COLUMN changed_cols TYPE VARBIT USING NULL"
@@ -2091,7 +2136,7 @@ fn sync_change_buffer_columns(
         }
     }
 
-    for existing in &existing_cols {
+    for existing in existing_cols.keys() {
         if system_cols.contains(existing.as_str()) {
             continue;
         }
@@ -2122,36 +2167,84 @@ fn sync_change_buffer_columns(
         let new_col = format!("new_{}", col_name);
         let old_col = format!("old_{}", col_name);
 
-        if !existing_cols.contains(&new_col) {
-            let sql = format!(
-                "ALTER TABLE {buffer_table} ADD COLUMN IF NOT EXISTS \"{new_col}\" {col_type}"
-            );
-            Spi::run(&sql).map_err(|e| {
-                PgTrickleError::SpiError(format!(
-                    "Failed to add column \"{new_col}\" to change buffer: {e}"
-                ))
-            })?;
-            pgrx::debug1!(
-                "pg_trickle_cdc: added column \"{}\" to {}",
-                new_col,
-                buffer_table
-            );
+        match existing_cols.get(&new_col) {
+            None => {
+                let sql = format!(
+                    "ALTER TABLE {buffer_table} ADD COLUMN IF NOT EXISTS \"{new_col}\" {col_type}"
+                );
+                Spi::run(&sql).map_err(|e| {
+                    PgTrickleError::SpiError(format!(
+                        "Failed to add column \"{new_col}\" to change buffer: {e}"
+                    ))
+                })?;
+                pgrx::debug1!(
+                    "pg_trickle_cdc: added column \"{}\" to {}",
+                    new_col,
+                    buffer_table
+                );
+            }
+            Some(existing_type) if existing_type != col_type => {
+                // Type widening (e.g. VARCHAR(50) → VARCHAR(200)): update the
+                // buffer column type so the CDC trigger can store wider values.
+                let sql = format!(
+                    "ALTER TABLE {buffer_table} ALTER COLUMN \"{new_col}\" TYPE {col_type}"
+                );
+                if let Err(e) = Spi::run(&sql) {
+                    pgrx::warning!(
+                        "pg_trickle_cdc: failed to widen \"{}\" in {}: {}",
+                        new_col,
+                        buffer_table,
+                        e
+                    );
+                } else {
+                    pgrx::debug1!(
+                        "pg_trickle_cdc: widened column \"{}\" to {} in {}",
+                        new_col,
+                        col_type,
+                        buffer_table
+                    );
+                }
+            }
+            _ => {}
         }
 
-        if !existing_cols.contains(&old_col) {
-            let sql = format!(
-                "ALTER TABLE {buffer_table} ADD COLUMN IF NOT EXISTS \"{old_col}\" {col_type}"
-            );
-            Spi::run(&sql).map_err(|e| {
-                PgTrickleError::SpiError(format!(
-                    "Failed to add column \"{old_col}\" to change buffer: {e}"
-                ))
-            })?;
-            pgrx::debug1!(
-                "pg_trickle_cdc: added column \"{}\" to {}",
-                old_col,
-                buffer_table
-            );
+        match existing_cols.get(&old_col) {
+            None => {
+                let sql = format!(
+                    "ALTER TABLE {buffer_table} ADD COLUMN IF NOT EXISTS \"{old_col}\" {col_type}"
+                );
+                Spi::run(&sql).map_err(|e| {
+                    PgTrickleError::SpiError(format!(
+                        "Failed to add column \"{old_col}\" to change buffer: {e}"
+                    ))
+                })?;
+                pgrx::debug1!(
+                    "pg_trickle_cdc: added column \"{}\" to {}",
+                    old_col,
+                    buffer_table
+                );
+            }
+            Some(existing_type) if existing_type != col_type => {
+                let sql = format!(
+                    "ALTER TABLE {buffer_table} ALTER COLUMN \"{old_col}\" TYPE {col_type}"
+                );
+                if let Err(e) = Spi::run(&sql) {
+                    pgrx::warning!(
+                        "pg_trickle_cdc: failed to widen \"{}\" in {}: {}",
+                        old_col,
+                        buffer_table,
+                        e
+                    );
+                } else {
+                    pgrx::debug1!(
+                        "pg_trickle_cdc: widened column \"{}\" to {} in {}",
+                        old_col,
+                        col_type,
+                        buffer_table
+                    );
+                }
+            }
+            _ => {}
         }
     }
 
