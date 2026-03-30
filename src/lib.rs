@@ -262,6 +262,7 @@ CREATE TABLE IF NOT EXISTS pgtrickle.pgt_stream_tables (
     scc_id          INT,
     last_fixpoint_iterations INT,
     max_differential_joins   INT,
+    max_delta_fraction       DOUBLE PRECISION,
     pooler_compatibility_mode BOOLEAN NOT NULL DEFAULT FALSE,
     refresh_tier    TEXT NOT NULL DEFAULT 'hot'
                      CHECK (refresh_tier IN ('hot', 'warm', 'cold', 'frozen')),
