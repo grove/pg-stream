@@ -77,6 +77,8 @@ CREATE TABLE IF NOT EXISTS pgtrickle.pgt_stream_tables (
     blown_at        TIMESTAMPTZ,
     blow_reason     TEXT,
     st_partition_key TEXT,
+    max_differential_joins INT,
+    max_delta_fraction DOUBLE PRECISION,
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at      TIMESTAMPTZ NOT NULL DEFAULT now()
 );
