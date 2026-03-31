@@ -8,7 +8,7 @@ For future plans and release milestones, see [ROADMAP.md](ROADMAP.md).
 ## Table of Contents
 
 <!-- TOC start -->
-- [0.13.0 — Unreleased](#0130--unreleased)
+- [0.13.0 — 2026-03-31](#0130--2026-03-31)
 - [0.12.0 — 2026-03-28](#0120--2026-03-28)
 - [0.11.0 — 2026-03-26](#0110--2026-03-26)
 - [0.10.0 — 2026-03-25](#0100--2026-03-25)
@@ -31,7 +31,7 @@ For future plans and release milestones, see [ROADMAP.md](ROADMAP.md).
 
 ---
 
-## [0.13.0] — Unreleased
+## [0.13.0] — 2026-03-31
 
 0.13.0 is the **Scalability Foundations** release. It makes pg_trickle
 significantly more efficient for wide-table and multi-consumer workloads,

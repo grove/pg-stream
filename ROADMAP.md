@@ -1,8 +1,8 @@
 # pg_trickle — Project Roadmap
 
-> **Last updated:** 2026-03-28
-> **Latest release:** 0.12.0 (2026-03-28)
-> **Current milestone:** v0.13.0 — Scalability Foundations, Partitioning Enhancements, MERGE Profiling & Multi-Tenant Scheduling
+> **Last updated:** 2026-03-31
+> **Latest release:** 0.13.0 (2026-03-31)
+> **Current milestone:** v0.14.0 — Tiered Scheduling, PG Backward Compatibility, UNLOGGED Buffers & Diagnostics
 
 For a concise description of what pg_trickle is and why it exists, read
 [ESSENCE.md](ESSENCE.md) — it explains the core problem (full `REFRESH
@@ -50,9 +50,6 @@ last resort. All 13 design phases are complete. This roadmap tracks the path
 from the v0.1.x series to 1.0 and beyond.
 
 ```
-                                                                                                                                                    We are here
-                                                                                                                                                         │
-                                                                                                                                                         ▼
                                                                    ┌────────┐ ┌────────┐ ┌────────┐ ┌────────┐ ┌────────┐ ┌────────┐ ┌────────┐ ┌────────┐ ┌────────┐ ┌────────┐
                                                                    │ 0.1.x  │ │ 0.2.0  │ │ 0.2.1  │ │ 0.2.2  │ │ 0.2.3  │ │ 0.3.0  │ │ 0.4.0  │ │ 0.5.0  │ │ 0.6.0  │ │ 0.7.0  │
                                                                    │Released│─│Released│─│Released│─│Released│─│Released│─│Released│─│Released│─│Released│─│Released│─│Released│
@@ -61,10 +58,12 @@ from the v0.1.x series to 1.0 and beyond.
                                                                      │
                                                                      └─ ┌────────┐ ┌────────┐ ┌─────────┐ ┌─────────┐ ┌─────────┐ ┌─────────┐
                                                                         │ 0.8.0  │ │ 0.9.0  │ │ 0.10.0  │ │ 0.11.0  │ │ 0.12.0  │ │ 0.13.0  │
-                                                                        │Released│─│Released│─│Released │─│Released │─│Released │─│Scalabil.│
-                                                                        │ ✅      │ │ ✅      │ │ ✅       │ │ ✅       │ │ ✅       │ │Partition│
+                                                                        │Released│─│Released│─│Released │─│Released │─│Released │─│Released │
+                                                                        │ ✅      │ │ ✅      │ │ ✅       │ │ ✅       │ │ ✅       │ │ ✅       │
                                                                         └────────┘ └────────┘ └─────────┘ └─────────┘ └─────────┘ └─────────┘
+         We are here
               │
+              ▼
               └─ ┌─────────┐ ┌─────────┐ ┌────────┐ ┌────────┐
                  │ 0.14.0  │ │ 0.15.0  │ │ 1.0.0  │ │ 1.x+   │
                  │Perf.Opt │─│DDL,Test │─│Stable  │─│Scale & │
@@ -2392,6 +2391,8 @@ large design changes; all build on existing infrastructure.
 
 ## v0.13.0 — Scalability Foundations, Partitioning Enhancements, MERGE Profiling & Multi-Tenant Scheduling
 
+**Status: Released (2026-03-31).**
+
 **Goal:** Deliver the scalability foundations deferred from v0.12.0 —
 columnar change tracking and shared change buffers — alongside the
 partitioning enhancements that build on v0.11.0's RANGE partitioning spike,
@@ -2596,7 +2597,7 @@ Target: reduce regression escape rate from ~15% to <5%.
 - [x] DI-4/5/7: R₀ cache (subset of DI-1), Part 3 threshold raised from 3→5, strategy selector + max_delta_fraction complete ✅ Done
 - [x] DI-10: `bench-tpch-sf1` target added; 22/22 queries pass at SF=0.01 (3 cycles, zero drift) ✅ Done
 - [x] DI-11: Predicate pushdown enabled with scalar-subquery guard; deep-join L₀ threshold (4 scans); deep-join planner hints (5+ total scans); 22/22 TPC-H DIFFERENTIAL ✅ Done
-- [ ] Extension upgrade path tested (`0.12.0 → 0.13.0`)
+- [x] Extension upgrade path tested (`0.12.0 → 0.13.0`) ✅ Done
 
 ---
 
