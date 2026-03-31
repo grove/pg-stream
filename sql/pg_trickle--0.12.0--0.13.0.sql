@@ -211,10 +211,13 @@ LANGUAGE c /* Rust */
 AS 'MODULE_PATHNAME', 'dedup_stats_fn_wrapper';
 
 -- ── A1-1c: ALTER partition_by support ─────────────────────────────────────
--- Drop the old signature and recreate with the partition_by parameter.
--- This is idempotent: if the user already has the new signature from
--- the 0.11.0→0.12.0 upgrade path, DROP IF EXISTS + CREATE is safe.
+-- Drop all historical overloads and recreate with the full 0.13.0 signature.
+-- The 0.12.0 archive has an 11-param version; older upgrade paths may have
+-- left a 14-param or 15-param overload. All are replaced by the 17-param
+-- signature that includes max_differential_joins and max_delta_fraction.
+DROP FUNCTION IF EXISTS pgtrickle."alter_stream_table"(TEXT, TEXT, TEXT, TEXT, TEXT, TEXT, TEXT, TEXT, bool, bool, TEXT);
 DROP FUNCTION IF EXISTS pgtrickle."alter_stream_table"(TEXT, TEXT, TEXT, TEXT, TEXT, TEXT, TEXT, TEXT, bool, bool, TEXT, TEXT, bigint, INT);
+DROP FUNCTION IF EXISTS pgtrickle."alter_stream_table"(TEXT, TEXT, TEXT, TEXT, TEXT, TEXT, TEXT, TEXT, bool, bool, TEXT, TEXT, bigint, INT, TEXT);
 CREATE FUNCTION pgtrickle."alter_stream_table"(
         "name" TEXT,
         "query" TEXT DEFAULT NULL,
@@ -230,7 +233,9 @@ CREATE FUNCTION pgtrickle."alter_stream_table"(
         "fuse" TEXT DEFAULT NULL,
         "fuse_ceiling" bigint DEFAULT NULL,
         "fuse_sensitivity" INT DEFAULT NULL,
-        "partition_by" TEXT DEFAULT NULL
+        "partition_by" TEXT DEFAULT NULL,
+        "max_differential_joins" INT DEFAULT NULL,
+        "max_delta_fraction" double precision DEFAULT NULL
 ) RETURNS void
 LANGUAGE c /* Rust */
 AS 'MODULE_PATHNAME', 'alter_stream_table_wrapper';
