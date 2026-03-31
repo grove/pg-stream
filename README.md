@@ -52,139 +52,6 @@ We also do not think the use of AI should lower the standard for trust. If anyth
 - **Crash-safe** — row-level locks prevent concurrent refreshes; crash recovery marks in-flight refreshes as failed and resumes normal operation.
 - **Observable** — built-in monitoring views, refresh history, slot health checks, staleness reporting, SCC status, watermark status, `NOTIFY`-based alerting, and dedicated helper functions such as `health_check`, `change_buffer_sizes`, `dependency_tree`, `refresh_timeline`, `trigger_inventory`, `list_sources`, `diamond_groups`, and `pgt_scc_status`.
 
-## Performance
-
-pg_trickle is designed for low-latency, high-throughput incremental view maintenance. Differential refresh processes only changed rows — not the entire base table — yielding significant speedups over full recomputation.
-
-### Differential vs Full Refresh
-
-Benchmarked at 1% change rate (10 cycles, Docker-hosted PostgreSQL 18.3):
-
-| Query Type | Rows | FULL (ms) | DIFFERENTIAL (ms) | Speedup |
-|---|---|---|---|---|
-| Table scan | 100K | 461 | 40 | **11.6x** |
-| Filter (WHERE) | 10K | 26 | 9 | **2.9x** |
-| Aggregate (GROUP BY) | 100K | 31 | 52 | 0.6x |
-| Join (INNER JOIN) | 100K | 673 | 42 | **15.9x** |
-| Join + Aggregate | 100K | 52 | 63 | 0.8x |
-
-Aggregate queries with few output groups (5 regions from 100K rows) are faster with FULL refresh because the aggregate re-scan is cheap. Differential shines on queries that produce many output rows (scans, joins, filtered projections), where FULL must TRUNCATE + re-insert the entire result set. Speedup scales with table size and inversely with change rate — at 50% churn, the two modes converge.
-
-### Zero-Change Latency
-
-When no data has changed, the scheduler's per-cycle overhead is minimal:
-
-| Metric | Value |
-|---|---|
-| Average | 3.2 ms |
-| Max | 5.1 ms |
-| Target | < 10 ms |
-
-### Where Time Is Spent
-
-Rust-side delta SQL generation takes **< 1%** of total refresh time (sub-microsecond to ~50 µs depending on operator complexity). PostgreSQL's MERGE execution dominates at **70–97%** of wall-clock time — the extension gets out of the way and lets the database do what it does best.
-
-### DAG Propagation
-
-Changes propagate through multi-level stream table DAGs efficiently:
-
-| Topology | Stream Tables | Propagation Time |
-|---|---|---|
-| Linear chain (depth 10) | 10 | ~820 ms |
-| Wide DAG (3 levels × 20 wide) | 60 | ~2,430 ms |
-| Diamond (4-way fan-out + join) | 5 | ~200 ms |
-
-PARALLEL refresh mode processes independent branches concurrently, reducing wall-clock time for wide DAGs.
-
-### IMMEDIATE Mode
-
-For use cases that require read-your-writes consistency, IMMEDIATE mode maintains the stream table **within the same transaction** as the DML — no scheduler, no change buffers, no additional latency. The delta is computed from PostgreSQL's transition tables and applied inline.
-
-### Change Buffer Compaction
-
-High-churn tables benefit from automatic compaction of CDC change buffers, which collapses cancelling INSERT/DELETE pairs and sequential changes to the same row, reducing delta scan overhead by **50–90%**.
-
-### Write-Path Overhead
-
-Incremental view maintenance is not free on the write side. CDC triggers add overhead to every INSERT, UPDATE, and DELETE on source tables. The trade-off is intentional: atomic, transactional change tracking with zero data loss, in exchange for modest write-side cost.
-
-**Per-row trigger overhead: 20–55 µs.** At typical OLTP write rates (< 1,000 writes/sec per source), this adds **< 5%** to DML latency — well below network round-trip time.
-
-**Write amplification** (measured via [E2E CDC overhead benchmarks](docs/BENCHMARK.md)):
-
-| Operation | Write Amplification |
-|---|---|
-| Single-row INSERT | ~2.0x |
-| Bulk INSERT (10K rows) | ~2.1x |
-| Bulk UPDATE (10K rows) | ~2.2x |
-| Bulk DELETE (10K rows) | ~2.3x |
-
-Several layers reduce this cost automatically:
-
-- **Hybrid CDC** — triggers bootstrap change capture with zero config; when `wal_level = logical` is available, the system transitions to WAL-based capture for lower write-side overhead (~5 µs/row). Controlled by `pg_trickle.cdc_mode` (default: `auto`).
-- **Columnar change tracking** — CDC records only the columns referenced by the defining query, using a VARBIT bitmask. UPDATEs that touch only unreferenced columns are skipped entirely, reducing delta volume by **50–90%** for wide tables.
-- **Delta predicate pushdown** — WHERE predicates from the defining query are injected into change buffer scans, filtering irrelevant changes at read time (**5–10x** delta volume reduction for selective queries).
-- **Event-driven scheduler wake** — CDC triggers emit `pg_notify()` to wake the scheduler immediately instead of polling, reducing propagation latency from ~515 ms to ~15 ms median.
-- **Adaptive FULL fallback** — when the change ratio exceeds a threshold (default: 50%), the engine automatically switches to FULL refresh for that cycle, avoiding the case where differential is slower than recomputation.
-
-For write-heavy workloads where trigger overhead is a concern, FULL refresh mode bypasses CDC entirely — no triggers are installed, and each refresh re-executes the full query.
-
-### TPC-H Validation (22 queries, SF=0.01)
-
-pg_trickle is validated against the full TPC-H benchmark suite — all 22 standard queries across all three refresh modes. The test suite runs 15 test scenarios and passes completely:
-
-| Test | Queries | Result |
-|---|---|---|
-| Differential correctness | 22/22 | ✅ pass |
-| Immediate correctness | 22/22 | ✅ pass |
-| Full correctness | 22/22 | ✅ pass |
-| Differential == Immediate | 22/22 | ✅ identical results |
-| Full == Differential | 22/22 | ✅ identical results |
-| Rollback correctness | INSERT / UPDATE / DELETE | ✅ pass |
-| Savepoint rollback | INSERT + DELETE | ✅ pass |
-| Single-row mutations | 3 queries | ✅ pass |
-| Combined-delete regression (q07, q08, q09) | 3 queries | ✅ pass |
-
-**Sustained churn (T1-C, 7 stream tables, 50 cycles, SF=0.01):**
-
-| Metric | Value |
-|---|---|
-| Avg cycle time | 150.7 ms |
-| Min / Max | 115.9 / 537.9 ms |
-| Drift detected | 0 |
-| Refresh failures | 0 |
-
-**Per-query FULL vs DIFFERENTIAL latency (SF=0.01, T1-B, avg over 3 cycles):**
-
-| Query | Tier | FULL (ms) | DIFF (ms) | Speedup |
-|---|---|---|---|---|
-| q02 | T1 | 24.6 | 16.9 | 1.45x |
-| q21 | T1 | 12.4 | 12.1 | 1.02x |
-| q13 | T1 | 9.4 | 18.3 | 0.51x |
-| q11 | T1 | 11.0 | 9.0 | 1.22x |
-| q08 | T1 | 18.0 | 43.7 | 0.41x |
-| q01 | T2 | 13.3 | 19.4 | 0.69x |
-| q05 | T2 | 15.0 | 202.5 | 0.07x |
-| q07 | T2 | 15.2 | 33.5 | 0.45x |
-| q09 | T2 | 15.6 | 129.5 | 0.12x |
-| q16 | T2 | 11.5 | 8.6 | 1.33x |
-| q22 | T2 | 10.4 | 17.0 | 0.61x |
-| q03 | T3 | 8.2 | 7.6 | 1.08x |
-| q04 | T3 | 12.0 | 20.5 | 0.58x |
-| q06 | T3 | 9.0 | 11.1 | 0.81x |
-| q10 | T3 | 9.6 | 8.4 | 1.13x |
-| q12 | T3 | 11.0 | 19.6 | 0.56x |
-| q14 | T3 | 10.6 | 21.2 | 0.50x |
-| q15 | T3 | 14.9 | 18.3 | 0.82x |
-| q17 | T3 | 11.5 | 51.4 | 0.22x |
-| q18 | T3 | 10.0 | 8.4 | 1.19x |
-| q19 | T3 | 12.3 | 29.8 | 0.41x |
-| q20 | T3 | 13.4 | 5663.0 | 0.00x |
-
-> **Note:** SF=0.01 is a very small dataset (1,500 orders). At this scale, FULL refresh is competitive because base table scans are cheap. q20 (a correlated subquery) is a known differential outlier — at higher scale factors where table scans dominate, differential speedups grow substantially. The `ADAPTIVE` fallback mode automatically selects FULL when the change ratio exceeds the threshold, covering the q20-class case.
-
-For full benchmark methodology and how to run your own benchmarks, see [docs/BENCHMARK.md](docs/BENCHMARK.md).
-
 ## SQL Support
 
 Every operator listed here works in `DIFFERENTIAL` mode (incremental delta computation) unless noted otherwise. `FULL` mode always works — it re-runs the entire query on each refresh.
@@ -242,6 +109,157 @@ Every operator listed here works in `DIFFERENTIAL` mode (incremental delta compu
 | **Ordering** | `LIMIT` / `OFFSET` (without ORDER BY) | ❌ Rejected | Not supported — stream tables materialize the full result set |
 
 See [docs/DVM_OPERATORS.md](docs/DVM_OPERATORS.md) for the full differentiation rules and CTE tiers.
+
+## Performance
+
+pg_trickle is designed for low-latency, high-throughput incremental view maintenance. Differential refresh processes only changed rows — not the entire base table — yielding significant speedups over full recomputation.
+
+### Differential vs Full Refresh
+
+Benchmarked at 1% change rate (10 cycles, Docker-hosted PostgreSQL 18.3):
+
+| Query Type | Rows | FULL (ms) | DIFFERENTIAL (ms) | Speedup |
+|---|---|---|---|---|
+| Table scan | 100K | 461 | 40 | **11.6x** |
+| Filter (WHERE) | 10K | 26 | 9 | **2.9x** |
+| Aggregate (GROUP BY) | 100K | 31 | 52 | 0.6x |
+| Join (INNER JOIN) | 100K | 673 | 42 | **15.9x** |
+| Join + Aggregate | 100K | 52 | 63 | 0.8x |
+
+Aggregate queries with few output groups (5 regions from 100K rows) are faster with FULL refresh because the aggregate re-scan is cheap. Differential shines on queries that produce many output rows (scans, joins, filtered projections), where FULL must TRUNCATE + re-insert the entire result set. Speedup scales with table size and inversely with change rate — at 50% churn, the two modes converge.
+
+**Tip:** For aggregate queries where FULL is consistently faster, set `refresh_mode = 'full'` explicitly (`ALTER STREAM TABLE ... SET refresh_mode = 'full'`). Alternatively, rely on the adaptive fallback — when the change ratio exceeds `pg_trickle.adaptive_full_threshold` (default: 50%), the engine switches to FULL automatically for that cycle.
+
+### Zero-Change Latency
+
+When no data has changed, the scheduler's per-cycle overhead is minimal:
+
+| Metric | Value |
+|---|---|
+| Average | 3.2 ms |
+| Max | 5.1 ms |
+| Target | < 10 ms |
+
+**Tip:** For tables that change rarely, assign them to the **Cold** or **Frozen** tier (`pg_trickle.tiered_scheduling = on`) to reduce polling frequency without removing the stream table. Frozen tables are skipped by the scheduler entirely until manually refreshed or explicitly thawed.
+
+### Where Time Is Spent
+
+Rust-side delta SQL generation takes **< 1%** of total refresh time (sub-microsecond to ~50 µs depending on operator complexity). PostgreSQL's MERGE execution dominates at **70–97%** of wall-clock time — the extension gets out of the way and lets the database do what it does best.
+
+**Tip:** Since MERGE dominates, standard PostgreSQL tuning applies: ensure the stream table has an index on its primary key (created automatically) and that source tables have indexes on any JOIN or WHERE columns in the defining query. Increasing `work_mem` and `maintenance_work_mem` can also reduce sort and hash costs within the MERGE plan.
+
+### DAG Propagation
+
+Changes propagate through multi-level stream table DAGs efficiently:
+
+| Topology | Stream Tables | Propagation Time |
+|---|---|---|
+| Linear chain (depth 10) | 10 | ~820 ms |
+| Wide DAG (3 levels × 20 wide) | 60 | ~2,430 ms |
+| Diamond (4-way fan-out + join) | 5 | ~200 ms |
+
+PARALLEL refresh mode processes independent branches concurrently, reducing wall-clock time for wide DAGs.
+
+**Tips:** Enable `PARALLEL` refresh mode (`ALTER STREAM TABLE ... SET refresh_mode = 'parallel'`) to process independent DAG branches concurrently. For deep linear chains (> 5 levels), consider consolidating intermediate steps into a single defining query to reduce propagation hops and transaction overhead.
+
+### IMMEDIATE Mode
+
+For use cases that require read-your-writes consistency, IMMEDIATE mode maintains the stream table **within the same transaction** as the DML — no scheduler, no change buffers, no additional latency. The delta is computed from PostgreSQL's transition tables and applied inline.
+
+### Change Buffer Compaction
+
+High-churn tables benefit from automatic compaction of CDC change buffers, which collapses cancelling INSERT/DELETE pairs and sequential changes to the same row, reducing delta scan overhead by **50–90%**.
+
+**Tip:** Compaction is most effective when refreshes are batched. Increasing `refresh_interval` gives the compactor more time to accumulate and collapse changes between cycles, amplifying the reduction. For workloads with periodic bulk writes (e.g., hourly ETL), align `refresh_interval` with the load cadence so the compactor runs after each batch settles.
+
+### Write-Path Overhead
+
+Incremental view maintenance is not free on the write side. CDC triggers add overhead to every INSERT, UPDATE, and DELETE on source tables. The trade-off is intentional: atomic, transactional change tracking with zero data loss, in exchange for modest write-side cost.
+
+**Per-row trigger overhead: 20–55 µs.** At typical OLTP write rates (< 1,000 writes/sec per source), this adds **< 5%** to DML latency — well below network round-trip time.
+
+**Write amplification** (measured via [E2E CDC overhead benchmarks](docs/BENCHMARK.md)):
+
+| Operation | Write Amplification |
+|---|---|
+| Single-row INSERT | ~2.0x |
+| Bulk INSERT (10K rows) | ~2.1x |
+| Bulk UPDATE (10K rows) | ~2.2x |
+| Bulk DELETE (10K rows) | ~2.3x |
+
+Several layers reduce this cost automatically:
+
+- **Hybrid CDC** — triggers bootstrap change capture with zero config; when `wal_level = logical` is available, the system transitions to WAL-based capture for lower write-side overhead (~5 µs/row). Controlled by `pg_trickle.cdc_mode` (default: `auto`).
+- **Columnar change tracking** — CDC records only the columns referenced by the defining query, using a VARBIT bitmask. UPDATEs that touch only unreferenced columns are skipped entirely, reducing delta volume by **50–90%** for wide tables.
+- **Delta predicate pushdown** — WHERE predicates from the defining query are injected into change buffer scans, filtering irrelevant changes at read time (**5–10x** delta volume reduction for selective queries).
+- **Event-driven scheduler wake** — CDC triggers emit `pg_notify()` to wake the scheduler immediately instead of polling, reducing propagation latency from ~515 ms to ~15 ms median.
+- **Adaptive FULL fallback** — when the change ratio exceeds a threshold (default: 50%), the engine automatically switches to FULL refresh for that cycle, avoiding the case where differential is slower than recomputation.
+
+For write-heavy workloads where trigger overhead is a concern, FULL refresh mode bypasses CDC entirely — no triggers are installed, and each refresh re-executes the full query.
+
+**If overhead is still a concern:**
+
+- **Force WAL-based CDC** — if `wal_level = logical` is confirmed available on your instance, set `pg_trickle.cdc_mode = 'wal'` to bypass trigger overhead entirely, dropping per-row cost from 20–55 µs to ~5 µs.
+- **Batch writes** — prefer multi-row `INSERT` or `COPY` over single-row statements. Per-row trigger cost is constant, so batching amortizes it across fewer transactions and reduces change buffer pressure.
+- **Narrow the defining query** — referencing fewer source columns lets columnar filtering discard more UPDATE events at capture time. UPDATEs that touch only unreferenced columns are skipped entirely, with no entry written to the change buffer.
+- **Increase `refresh_interval`** — less frequent refreshes allow the compactor to collapse more cancelling changes per cycle, reducing the total delta volume the engine must process.
+- **Switch to FULL refresh** — `ALTER STREAM TABLE ... SET refresh_mode = 'full'` removes all CDC triggers on the source table. Each refresh re-executes the full query; no change buffers, no trigger overhead.
+
+### TPC-H Validation (22 queries, SF=0.01)
+
+pg_trickle is validated against the full TPC-H benchmark suite — all 22 standard queries across all three refresh modes. The test suite runs 15 test scenarios and passes completely:
+
+| Test | Queries | Result |
+|---|---|---|
+| Differential correctness | 22/22 | ✅ pass |
+| Immediate correctness | 22/22 | ✅ pass |
+| Full correctness | 22/22 | ✅ pass |
+| Differential == Immediate | 22/22 | ✅ identical results |
+| Full == Differential | 22/22 | ✅ identical results |
+| Rollback correctness | INSERT / UPDATE / DELETE | ✅ pass |
+| Savepoint rollback | INSERT + DELETE | ✅ pass |
+| Single-row mutations | 3 queries | ✅ pass |
+| Combined-delete regression (q07, q08, q09) | 3 queries | ✅ pass |
+
+**Sustained churn (T1-C, 7 stream tables, 50 cycles, SF=0.01):**
+
+| Metric | Value |
+|---|---|
+| Avg cycle time | 150.7 ms |
+| Min / Max | 115.9 / 537.9 ms |
+| Drift detected | 0 |
+| Refresh failures | 0 |
+
+**Per-query FULL vs DIFFERENTIAL latency (SF=0.01, T1-B, avg over 3 cycles):**
+
+| Query | Tier | FULL (ms) | DIFF (ms) | Speedup |
+|---|---|---|---|---|
+| q02 | T1 | 24.6 | 16.9 | 1.45x |
+| q21 | T1 | 12.4 | 12.1 | 1.02x |
+| q13 | T1 | 9.4 | 18.3 | 0.51x |
+| q11 | T1 | 11.0 | 9.0 | 1.22x |
+| q08 | T1 | 18.0 | 43.7 | 0.41x |
+| q01 | T2 | 13.3 | 19.4 | 0.69x |
+| q05 | T2 | 15.0 | 202.5 | 0.07x |
+| q07 | T2 | 15.2 | 33.5 | 0.45x |
+| q09 | T2 | 15.6 | 129.5 | 0.12x |
+| q16 | T2 | 11.5 | 8.6 | 1.33x |
+| q22 | T2 | 10.4 | 17.0 | 0.61x |
+| q03 | T3 | 8.2 | 7.6 | 1.08x |
+| q04 | T3 | 12.0 | 20.5 | 0.58x |
+| q06 | T3 | 9.0 | 11.1 | 0.81x |
+| q10 | T3 | 9.6 | 8.4 | 1.13x |
+| q12 | T3 | 11.0 | 19.6 | 0.56x |
+| q14 | T3 | 10.6 | 21.2 | 0.50x |
+| q15 | T3 | 14.9 | 18.3 | 0.82x |
+| q17 | T3 | 11.5 | 51.4 | 0.22x |
+| q18 | T3 | 10.0 | 8.4 | 1.19x |
+| q19 | T3 | 12.3 | 29.8 | 0.41x |
+| q20 | T3 | 13.4 | 5663.0 | 0.00x |
+
+> **Note:** SF=0.01 is a very small dataset (1,500 orders). At this scale, FULL refresh is competitive because base table scans are cheap. q20 (a correlated subquery) is a known differential outlier — at higher scale factors where table scans dominate, differential speedups grow substantially. The `ADAPTIVE` fallback mode automatically selects FULL when the change ratio exceeds the threshold, covering the q20-class case.
+
+For full benchmark methodology and how to run your own benchmarks, see [docs/BENCHMARK.md](docs/BENCHMARK.md).
 
 ## Quick Start
 
