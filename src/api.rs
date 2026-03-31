@@ -3286,9 +3286,9 @@ fn resume_stream_table_impl(name: &str) -> Result<(), PgTrickleError> {
     let (schema, table_name) = parse_qualified_name(name)?;
     let st = StreamTableMeta::get_by_name(&schema, &table_name)?;
 
-    if st.status != StStatus::Suspended {
+    if st.status != StStatus::Suspended && st.status != StStatus::Error {
         return Err(PgTrickleError::InvalidArgument(format!(
-            "stream table {}.{} is not suspended (current status: {})",
+            "stream table {}.{} is not suspended or in error state (current status: {})",
             schema,
             table_name,
             st.status.as_str(),

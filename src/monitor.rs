@@ -55,6 +55,8 @@ pub enum AlertEvent {
     AppendOnlyReverted,
     /// FUSE: Periodic reminder that a fuse is still blown.
     FuseBlownReminder,
+    /// G-7: Stream table skipped because its tier is Frozen.
+    FrozenTierSkip,
 }
 
 impl AlertEvent {
@@ -71,6 +73,7 @@ impl AlertEvent {
             AlertEvent::SchedulerFallingBehind => "scheduler_falling_behind",
             AlertEvent::AppendOnlyReverted => "append_only_reverted",
             AlertEvent::FuseBlownReminder => "fuse_blown_reminder",
+            AlertEvent::FrozenTierSkip => "frozen_tier_skip",
         }
     }
 }
@@ -2175,6 +2178,7 @@ mod tests {
             AlertEvent::FuseBlownReminder.as_str(),
             "fuse_blown_reminder"
         );
+        assert_eq!(AlertEvent::FrozenTierSkip.as_str(), "frozen_tier_skip");
     }
 
     #[test]
@@ -2197,6 +2201,7 @@ mod tests {
             AlertEvent::SchedulerFallingBehind,
             AlertEvent::AppendOnlyReverted,
             AlertEvent::FuseBlownReminder,
+            AlertEvent::FrozenTierSkip,
         ];
         // All as_str() values should be distinct
         let strs: Vec<&str> = variants.iter().map(|v| v.as_str()).collect();

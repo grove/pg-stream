@@ -1570,9 +1570,27 @@ fn parallel_dispatch_tick(
                             job_id,
                             retry_policy.backoff_ms(retry.attempts - 1),
                         );
+                    } else {
+                        // Retry budget exhausted — unblock downstream units
+                        // so the wave can complete. Without this, downstreams
+                        // remain permanently blocked because the failed unit
+                        // never sets succeeded=true and remaining_upstreams
+                        // is never decremented.
+                        log!(
+                            "pg_trickle: parallel dispatch — job {} retries exhausted, unblocking downstreams",
+                            job_id,
+                        );
+                        if let Some(us) = state.unit_states.get_mut(&unit_id) {
+                            us.succeeded = true;
+                        }
+                        for ds_id in eu_dag.get_downstream_units(unit_id) {
+                            if let Some(ds_state) = state.unit_states.get_mut(&ds_id) {
+                                ds_state.remaining_upstreams =
+                                    ds_state.remaining_upstreams.saturating_sub(1);
+                            }
+                        }
                     }
                 }
-                // Downstream units remain blocked (remaining_upstreams > 0).
             }
             JobStatus::PermanentFailed | JobStatus::Cancelled => {
                 if let Some(rpid) = root_pgt_id {
@@ -3345,6 +3363,7 @@ fn check_schedule(st: &StreamTableMeta, _dag: &StDag) -> bool {
     if config::pg_trickle_tiered_scheduling() {
         let tier = RefreshTier::from_sql_str(&st.refresh_tier);
         if tier == RefreshTier::Frozen {
+            emit_frozen_tier_skip(st);
             return false;
         }
     }
@@ -3477,6 +3496,31 @@ fn emit_stale_alert_if_needed(st: &StreamTableMeta) {
                     st.pooler_compatibility_mode,
                 );
             }
+        }
+    }
+}
+
+/// Emit a one-per-~60s reminder that a stream table is frozen and being
+/// skipped by the scheduler.  Throttled the same way as
+/// `emit_fuse_blown_reminder` — using `last_refresh_at` age modulo.
+fn emit_frozen_tier_skip(st: &StreamTableMeta) {
+    let since_last = Spi::get_one_with_args::<f64>(
+        "SELECT EXTRACT(EPOCH FROM (now() - COALESCE(last_refresh_at, created_at)))::float8 \
+         FROM pgtrickle.pgt_stream_tables WHERE pgt_id = $1",
+        &[st.pgt_id.into()],
+    )
+    .unwrap_or(None);
+
+    if let Some(secs) = since_last {
+        let interval = 60.0_f64;
+        if secs >= interval && (secs % interval) < 1.0 {
+            monitor::emit_alert(
+                monitor::AlertEvent::FrozenTierSkip,
+                &st.pgt_schema,
+                &st.pgt_name,
+                &format!(r#""frozen_seconds":{:.0}"#, secs),
+                st.pooler_compatibility_mode,
+            );
         }
     }
 }
