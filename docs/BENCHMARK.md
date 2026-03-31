@@ -635,3 +635,46 @@ cargo test --test e2e_cdc_write_overhead_tests --features pg18 -- --ignored --no
 3. **Concurrent writer safety**: The concurrent scenario should complete without deadlocks or errors, and the write amplification should be similar to the serial bulk INSERT case.
 
 4. **DELETE overhead**: DELETE triggers tend to be slightly more expensive than INSERT triggers because the trigger must capture the `OLD` row values.
+
+---
+
+## CI Benchmark Workflows
+
+All benchmark jobs run only on weekly schedule and `workflow_dispatch` — never on PR or push — to avoid blocking the merge gate with long-running tests.
+
+### `e2e-benchmarks.yml` — E2E Benchmark Tracking
+
+Produces the numbers in `README.md` and this document. Each job posts a summary table to the GitHub Actions run page and uploads artifacts at **90-day retention**. Manual dispatch accepts a `job` input (`refresh` \| `latency` \| `cdc` \| `tpch` \| `all`) to re-run a single job.
+
+| Job | Test(s) | README Section | Timeout | `just` command |
+|-----|---------|---------------|---------|----------------|
+| `bench-refresh` | `bench_full_matrix` | Differential vs Full Refresh | 60 min | `just test-bench-e2e-fast` |
+| `bench-latency` | `bench_no_data_refresh_latency` | Zero-Change Latency | 20 min | `just test-bench-e2e-fast` |
+| `bench-cdc` | `bench_cdc_trigger_overhead` | Write-Path Overhead | 30 min | `just test-bench-e2e-fast` |
+| `bench-tpch` | `test_tpch_performance_comparison` | TPC-H per-query table | 30 min | `just bench-tpch-fast` |
+
+### `ci.yml` — Benchmark Jobs
+
+Criterion micro-benchmarks and DAG topology benchmarks. Run on the **daily** schedule and `workflow_dispatch`.
+
+| Job | Test Suite | What It Measures | Timeout | `just` command |
+|-----|-----------|-----------------|---------|----------------|
+| `benchmarks` | `benches/refresh_bench.rs`, `benches/diff_operators.rs` | In-process Rust: query building, delta SQL generation (sub-µs) | 20 min | `just bench` |
+| `dag-bench-calc` | `e2e_dag_bench_tests` (excl. `par*`) | DAG propagation latency + throughput, CALCULATED mode | 30 min | `just test-dag-bench-fast` |
+| `dag-bench-parallel` | `e2e_dag_bench_tests` (`par*`) | DAG propagation with 4–8 parallel workers | 120 min | `just test-dag-bench-fast` |
+
+### `benchmarks.yml` — Bencher Integration (opt-in)
+
+Disabled by default (no scheduled trigger). Re-enable by restoring `push`/`pull_request` triggers and adding a `BENCHER_API_TOKEN` secret. When active, it annotates PRs with regressions detected via Student’s t-test at a 99% upper confidence boundary.
+
+| Job | Test Suite | What It Measures | Tracking |
+|-----|-----------|-----------------|----------|
+| `benchmark` | `benches/refresh_bench.rs`, `benches/diff_operators.rs` | Same as `ci.yml` `benchmarks` job | Bencher (regression alert on PR) |
+
+### Artifact Retention Summary
+
+| Workflow | Artifact | Retention |
+|----------|----------|-----------|
+| `e2e-benchmarks.yml` | `bench-{refresh,latency,cdc,tpch}-results` (stdout + JSON) | **90 days** |
+| `ci.yml` `benchmarks` | `benchmark-results` (Criterion HTML + JSON) | 7 days |
+| `benchmarks.yml` | `criterion-results` (Criterion HTML + JSON) | 7 days |

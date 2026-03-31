@@ -182,6 +182,10 @@ light-eligible; 10 files (~90 tests) require the full E2E image.
 | Benchmarks | ❌ | ❌ | ✅ | ✅ |
 | DAG bench (calc/throughput) | ❌ | ❌ | ✅ | ✅ |
 | DAG bench (parallel workers) | ❌ | ❌ | ✅ | ✅ |
+| E2E bench — refresh matrix | ❌ | ❌ | Weekly (Sun) | ✅ |
+| E2E bench — zero-change latency | ❌ | ❌ | Weekly (Sun) | ✅ |
+| E2E bench — CDC overhead | ❌ | ❌ | Weekly (Sun) | ✅ |
+| E2E bench — TPC-H FULL vs DIFF | ❌ | ❌ | Weekly (Sun) | ✅ |
 | dbt integration | ❌ | ❌ | ✅ | ✅ |
 | CNPG smoke test | ❌ | ❌ | ✅ | ✅ |
 

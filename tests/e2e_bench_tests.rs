@@ -167,7 +167,7 @@ fn query_scenarios() -> Vec<QueryScenario> {
         QueryScenario {
             name: "window",
             query: "SELECT id, region, amount, \
-                    ROW_NUMBER() OVER (PARTITION BY region ORDER BY amount DESC) AS rn \
+                    ROW_NUMBER() OVER (PARTITION BY region ORDER BY amount DESC, id) AS rn \
                     FROM src",
             needs_dim: false,
         },
@@ -813,6 +813,15 @@ async fn bench_lateral_10k_1pct() {
     let scenarios = query_scenarios();
     let s = &scenarios[6]; // lateral
     let results = run_benchmark(s, 10_000, 0.01).await;
+    print_results_table(&results);
+}
+
+#[tokio::test]
+#[ignore]
+async fn bench_lateral_100k_1pct() {
+    let scenarios = query_scenarios();
+    let s = &scenarios[6]; // lateral
+    let results = run_benchmark(s, 100_000, 0.01).await;
     print_results_table(&results);
 }
 

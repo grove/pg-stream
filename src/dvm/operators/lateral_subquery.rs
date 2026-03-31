@@ -147,7 +147,7 @@ pub fn diff_lateral_subquery(
         correlation_predicates,
     );
 
-    let changed_sources_sql = if let Some(inner_branch) = inner_change_branch {
+    let changed_sources_sql = if let Some(inner_branch) = &inner_change_branch {
         format!(
             "SELECT DISTINCT \"__pgt_row_id\", \"__pgt_action\", {child_col_list}\n\
              FROM {child_delta}\n\
@@ -164,6 +164,7 @@ pub fn diff_lateral_subquery(
             child_delta = child_result.cte_name,
         )
     };
+    let inner_change_branch_present = inner_change_branch.is_some();
     ctx.add_cte(changed_sources_cte.clone(), changed_sources_sql);
 
     // ── CTE 2: Re-execute subquery for inserted/updated source rows ────
@@ -215,41 +216,156 @@ pub fn diff_lateral_subquery(
         format!("{} ({col_alias_list})", quote_ident(alias))
     };
 
-    // Build the LATERAL clause: use LEFT JOIN LATERAL or comma syntax
-    let (lateral_clause, action_filter_prefix) = if *is_left_join {
-        (
-            format!(
-                "FROM {changed_sources_cte} AS {outer_alias_q}\n\
-                 LEFT JOIN LATERAL ({subquery_sql}) AS {sub_alias_clause} ON true",
-                outer_alias_q = quote_ident(&outer_alias),
-            ),
-            format!(
-                "{outer_alias_q}.\"__pgt_action\" = 'I'",
-                outer_alias_q = quote_ident(&outer_alias),
-            ),
-        )
-    } else {
-        (
-            format!(
-                "FROM {changed_sources_cte} AS {outer_alias_q},\n\
-                      LATERAL ({subquery_sql}) AS {sub_alias_clause}",
-                outer_alias_q = quote_ident(&outer_alias),
-            ),
-            format!(
-                "{outer_alias_q}.\"__pgt_action\" = 'I'",
-                outer_alias_q = quote_ident(&outer_alias),
-            ),
-        )
-    };
+    // ── P2-7: Pre-compute LATERAL results per correlation group ────────
+    //
+    // When correlation predicates are available (self-referencing LATERAL
+    // with scoped inner branch), the LATERAL subquery result depends only
+    // on the correlation columns for many common patterns (aggregates,
+    // scalar subqueries). Pre-computing the LATERAL for each distinct
+    // correlation group and JOINing avoids O(N × L) nested loop execution
+    // without Memoize on CTE scans (PostgreSQL doesn't add Memoize for
+    // CTEs), reducing cost to O(G × L + N) where G = distinct groups.
+    //
+    // The pre-computation uses the outer alias so that column references
+    // in the subquery_sql (e.g. `s.region`) resolve correctly.
+    let use_precomp = inner_change_branch_present && !correlation_predicates.is_empty();
 
-    let expand_sql = format!(
-        "SELECT {row_id_expr} AS \"__pgt_row_id\",\n\
-                {child_col_refs_str},\n\
-                {sub_col_refs_str}\n\
-         {lateral_clause}\n\
-         WHERE {action_filter_prefix}",
-    );
-    ctx.add_cte(expand_cte.clone(), expand_sql);
+    if use_precomp {
+        // Determine the outer column names used in correlation predicates.
+        // These columns fully determine the LATERAL subquery result for
+        // the common aggregate pattern.
+        let corr_outer_cols: Vec<String> = {
+            let mut cols: Vec<String> = correlation_predicates
+                .iter()
+                .map(|p| p.outer_col.clone())
+                .collect();
+            cols.sort();
+            cols.dedup();
+            cols
+        };
+
+        let outer_alias_q = quote_ident(&outer_alias);
+        let corr_col_refs: Vec<String> = corr_outer_cols
+            .iter()
+            .map(|c| format!("{outer_alias_q}.{}", quote_ident(c)))
+            .collect();
+        let corr_col_list = corr_col_refs.join(", ");
+
+        // CTE: distinct correlation groups from changed_sources
+        let groups_cte = ctx.next_cte_name("lat_sq_groups");
+        let groups_sql = format!(
+            "SELECT DISTINCT {corr_col_list}\n\
+             FROM {changed_sources_cte} {outer_alias_q}\n\
+             WHERE {outer_alias_q}.\"__pgt_action\" = 'I'",
+        );
+        ctx.add_cte(groups_cte.clone(), groups_sql);
+
+        // CTE: pre-computed LATERAL results per group.
+        // The groups CTE is aliased with the outer alias so that
+        // subquery_sql references (e.g. `s.region`) resolve correctly.
+        let precomp_cte = ctx.next_cte_name("lat_sq_precomp");
+        let precomp_lateral = if *is_left_join {
+            format!(
+                "FROM {groups_cte} AS {outer_alias_q}\n\
+                 LEFT JOIN LATERAL ({subquery_sql}) AS {sub_alias_clause} ON true",
+            )
+        } else {
+            format!(
+                "FROM {groups_cte} AS {outer_alias_q},\n\
+                      LATERAL ({subquery_sql}) AS {sub_alias_clause}",
+            )
+        };
+        let precomp_sub_refs: Vec<String> = sub_cols
+            .iter()
+            .map(|c| format!("{}.{}", quote_ident(alias), quote_ident(c)))
+            .collect();
+        let precomp_sql = format!(
+            "SELECT {corr_col_list}, {sub_refs}\n\
+             {precomp_lateral}",
+            sub_refs = precomp_sub_refs.join(", "),
+        );
+        ctx.add_cte(precomp_cte.clone(), precomp_sql);
+
+        // Build the expand CTE as a JOIN with the pre-computed results
+        // instead of a row-by-row LATERAL evaluation.
+        let join_type = if *is_left_join { "LEFT JOIN" } else { "JOIN" };
+        let corr_join_cond: Vec<String> = corr_outer_cols
+            .iter()
+            .map(|c| {
+                let qc = quote_ident(c);
+                format!(
+                    "{outer_alias_q}.{qc} IS NOT DISTINCT FROM {pc}.{qc}",
+                    pc = quote_ident(&format!("__pgt_pc_{}", alias)),
+                )
+            })
+            .collect();
+        let pc_alias = quote_ident(&format!("__pgt_pc_{}", alias));
+        let pc_sub_refs: Vec<String> = sub_cols
+            .iter()
+            .map(|c| format!("{pc_alias}.{}", quote_ident(c)))
+            .collect();
+
+        // Rebuild hash_exprs using the pre-computed sub-column references
+        let hash_exprs_precomp: Vec<String> = child_cols
+            .iter()
+            .map(|c| format!("{outer_alias_q}.{}::TEXT", quote_ident(c)))
+            .chain(
+                sub_cols
+                    .iter()
+                    .map(|c| format!("{pc_alias}.{}::TEXT", quote_ident(c))),
+            )
+            .collect();
+        let row_id_expr_precomp = build_hash_expr(&hash_exprs_precomp);
+
+        let expand_sql = format!(
+            "SELECT {row_id_expr_precomp} AS \"__pgt_row_id\",\n\
+                    {child_col_refs_str},\n\
+                    {pc_sub_refs_str}\n\
+             FROM {changed_sources_cte} AS {outer_alias_q}\n\
+             {join_type} {precomp_cte} AS {pc_alias}\n\
+               ON {corr_join_cond_str}\n\
+             WHERE {outer_alias_q}.\"__pgt_action\" = 'I'",
+            pc_sub_refs_str = pc_sub_refs.join(", "),
+            corr_join_cond_str = corr_join_cond.join(" AND "),
+        );
+        ctx.add_cte(expand_cte.clone(), expand_sql);
+    } else {
+        // Standard path: evaluate LATERAL per row (efficient for small deltas)
+        let (lateral_clause, action_filter_prefix) = if *is_left_join {
+            (
+                format!(
+                    "FROM {changed_sources_cte} AS {outer_alias_q}\n\
+                     LEFT JOIN LATERAL ({subquery_sql}) AS {sub_alias_clause} ON true",
+                    outer_alias_q = quote_ident(&outer_alias),
+                ),
+                format!(
+                    "{outer_alias_q}.\"__pgt_action\" = 'I'",
+                    outer_alias_q = quote_ident(&outer_alias),
+                ),
+            )
+        } else {
+            (
+                format!(
+                    "FROM {changed_sources_cte} AS {outer_alias_q},\n\
+                          LATERAL ({subquery_sql}) AS {sub_alias_clause}",
+                    outer_alias_q = quote_ident(&outer_alias),
+                ),
+                format!(
+                    "{outer_alias_q}.\"__pgt_action\" = 'I'",
+                    outer_alias_q = quote_ident(&outer_alias),
+                ),
+            )
+        };
+
+        let expand_sql = format!(
+            "SELECT {row_id_expr} AS \"__pgt_row_id\",\n\
+                    {child_col_refs_str},\n\
+                    {sub_col_refs_str}\n\
+             {lateral_clause}\n\
+             WHERE {action_filter_prefix}",
+        );
+        ctx.add_cte(expand_cte.clone(), expand_sql);
+    }
 
     // ── CTE 3: Old ST rows for changed source rows (DELETE actions) ────
     let old_rows_cte = ctx.next_cte_name("lat_sq_old");
@@ -310,7 +426,75 @@ pub fn diff_lateral_subquery(
     // so it's available for reference.
     let has_absent_cols = col_in_st.iter().any(|&b| !b);
 
-    let old_rows_sql = if has_absent_cols {
+    // ── P2-8: Optimize old_rows for self-referencing laterals ─────────
+    //
+    // When the inner branch is present, changed_sources can be very large
+    // (all outer rows). The EXISTS semi-join on a materialized CTE uses a
+    // Nested Loop plan: O(N × M). Instead, extract DISTINCT child column
+    // values into a separate CTE and use INNER JOIN, which PostgreSQL can
+    // execute as a Hash Join: O(N + M).
+    let old_rows_sql = if inner_change_branch_present {
+        let keys_cte = ctx.next_cte_name("lat_sq_keys");
+        let key_col_refs: Vec<String> = child_cols
+            .iter()
+            .enumerate()
+            .filter_map(|(i, c)| {
+                if col_in_st[i] {
+                    Some(format!("cs.{}", quote_ident(c)))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        let key_col_refs_str = key_col_refs.join(", ");
+        let keys_sql = format!(
+            "SELECT DISTINCT {key_col_refs_str}\n\
+             FROM {changed_sources_cte} cs",
+        );
+        ctx.add_cte(keys_cte.clone(), keys_sql);
+
+        // Build JOIN condition between ST and keys CTE.
+        // Use IS NOT DISTINCT FROM for null-safety. PostgreSQL 14+ can
+        // use Hash Join with this operator, so it doesn't prevent good
+        // plans. The keys CTE gives PostgreSQL a separate relation to
+        // hash, enabling O(N+M) execution instead of O(N×M) EXISTS.
+        let key_join_parts: Vec<String> = child_cols
+            .iter()
+            .enumerate()
+            .zip(st_child_cols.iter())
+            .filter_map(|((i, child_c), st_c)| {
+                if col_in_st[i] {
+                    let qc_child = quote_ident(child_c);
+                    let qc_st = quote_ident(st_c);
+                    Some(format!("st.{qc_st} IS NOT DISTINCT FROM ck.{qc_child}"))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        let key_join_cond = if key_join_parts.is_empty() {
+            "TRUE".to_string()
+        } else {
+            key_join_parts.join(" AND ")
+        };
+
+        if has_absent_cols {
+            format!(
+                "SELECT \"__pgt_row_id\", {all_cols_name} FROM {expand_cte} WHERE FALSE\n\
+                 UNION ALL\n\
+                 SELECT st.\"__pgt_row_id\", {all_cols_st}\n\
+                 FROM {st_table} st\n\
+                 JOIN {keys_cte} ck ON {key_join_cond}",
+                all_cols_name = col_list(&all_output_cols),
+            )
+        } else {
+            format!(
+                "SELECT st.\"__pgt_row_id\", {all_cols_st}\n\
+                 FROM {st_table} st\n\
+                 JOIN {keys_cte} ck ON {key_join_cond}",
+            )
+        }
+    } else if has_absent_cols {
         format!(
             "SELECT \"__pgt_row_id\", {all_cols_name} FROM {expand_cte} WHERE FALSE\n\
              UNION ALL\n\

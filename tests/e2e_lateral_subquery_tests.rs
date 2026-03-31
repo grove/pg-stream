@@ -506,3 +506,110 @@ async fn test_lateral_with_nulls() {
 
     db.assert_st_matches_query("lat_null_st", q).await;
 }
+
+/// Self-referencing LATERAL: when an INSERT changes the inner aggregate
+/// result (MAX), ALL existing outer rows in that partition must update.
+#[tokio::test]
+async fn test_lateral_subquery_self_ref_inner_aggregate_change() {
+    let db = E2eDb::new().await.with_extension().await;
+
+    db.execute(
+        "CREATE TABLE lat_self (id INT PRIMARY KEY, region TEXT NOT NULL, amount INT NOT NULL, score INT NOT NULL)",
+    )
+    .await;
+    db.execute(
+        "INSERT INTO lat_self VALUES (1,'west',100,50),(2,'west',200,60),(3,'east',300,70),(4,'east',400,80)",
+    )
+    .await;
+
+    let q = "SELECT s.id, s.region, s.amount, l.top_score \
+             FROM lat_self s, \
+             LATERAL (SELECT MAX(score) AS top_score FROM lat_self s2 WHERE s2.region = s.region) l";
+
+    db.create_st("lat_self_agg", q, "1m", "DIFFERENTIAL").await;
+    db.assert_st_matches_query("lat_self_agg", q).await;
+
+    // Initial: west top_score=60, east top_score=80
+    let west_top: i32 = db
+        .query_scalar("SELECT top_score FROM public.lat_self_agg WHERE id = 1")
+        .await;
+    assert_eq!(west_top, 60);
+
+    // Insert a row that changes MAX(score) for 'west' from 60 to 99
+    db.execute("INSERT INTO lat_self VALUES (5, 'west', 500, 99)")
+        .await;
+    db.refresh_st("lat_self_agg").await;
+    db.assert_st_matches_query("lat_self_agg", q).await;
+
+    // ALL west rows (including previously-existing id=1,2) must now show top_score=99
+    let west_top_after: i32 = db
+        .query_scalar("SELECT top_score FROM public.lat_self_agg WHERE id = 1")
+        .await;
+    assert_eq!(
+        west_top_after, 99,
+        "existing west row must update top_score"
+    );
+
+    // East rows should be unchanged
+    let east_top: i32 = db
+        .query_scalar("SELECT top_score FROM public.lat_self_agg WHERE id = 3")
+        .await;
+    assert_eq!(east_top, 80);
+
+    assert_eq!(db.count("public.lat_self_agg").await, 5);
+}
+
+/// Self-referencing LATERAL with multiple DML cycles — reproduces the
+/// bench_full_matrix 100K failure pattern where UPDATE + DELETE + INSERT
+/// accumulate stale top_score values across cycles.
+#[tokio::test]
+async fn test_lateral_subquery_self_ref_multi_cycle() {
+    let db = E2eDb::new().await.with_extension().await;
+
+    db.execute(
+        "CREATE TABLE lat_mc (id SERIAL PRIMARY KEY, region TEXT NOT NULL, amount INT NOT NULL, score INT NOT NULL)",
+    )
+    .await;
+    // 10K rows, 5 regions, score 0-99 — same pattern as bench
+    db.execute(
+        "INSERT INTO lat_mc (region, amount, score) \
+         SELECT CASE (i%5) WHEN 0 THEN 'north' WHEN 1 THEN 'south' \
+                WHEN 2 THEN 'east' WHEN 3 THEN 'west' ELSE 'central' END, \
+                (i*17+13)%10000, (i*31+7)%100 \
+         FROM generate_series(1,10000) s(i)",
+    )
+    .await;
+
+    let q = "SELECT s.id, s.region, s.amount, l.top_score \
+             FROM lat_mc s, \
+             LATERAL (SELECT MAX(score) AS top_score FROM lat_mc s2 WHERE s2.region = s.region) l";
+
+    db.create_st("lat_mc_st", q, "1m", "DIFFERENTIAL").await;
+    db.assert_st_matches_query("lat_mc_st", q).await;
+
+    // Run 12 cycles of mixed DML (matching benchmark: 2 warmup + 10 measured)
+    for _cycle in 1..=12 {
+        // 1% change rate: 100 changes = 70 updates + 15 deletes + 15 inserts
+        db.execute(
+            "UPDATE lat_mc SET amount = amount + 1 \
+             WHERE id IN (SELECT id FROM lat_mc ORDER BY random() LIMIT 70)",
+        )
+        .await;
+        db.execute(
+            "DELETE FROM lat_mc \
+             WHERE id IN (SELECT id FROM lat_mc ORDER BY random() LIMIT 15)",
+        )
+        .await;
+        db.execute(
+            "INSERT INTO lat_mc (region, amount, score) \
+             SELECT CASE (i%5) WHEN 0 THEN 'north' WHEN 1 THEN 'south' \
+                    WHEN 2 THEN 'east' WHEN 3 THEN 'west' ELSE 'central' END, \
+                    (random()*10000)::int, (random()*100)::int \
+             FROM generate_series(1,15) s(i)",
+        )
+        .await;
+
+        db.refresh_st("lat_mc_st").await;
+        db.assert_st_matches_query("lat_mc_st", q).await;
+    }
+}

@@ -1,0 +1,350 @@
+# =============================================================================
+# E2E Benchmark Tracking Workflow
+#
+# Runs the E2E benchmark suite that produces the performance numbers in
+# README.md and docs/BENCHMARK.md, preserving historical results as artifacts
+# and posting a summary table to the GitHub Actions run page.
+#
+# Jobs:
+#   bench-refresh    — bench_full_matrix (scan/filter/agg/join × 10K/100K × 1%/10%/50%)
+#   bench-latency    — bench_no_data_refresh_latency (zero-change overhead)
+#   bench-cdc        — bench_cdc_trigger_overhead (per-row trigger + write amplification)
+#   bench-tpch       — TPC-H per-query FULL vs DIFFERENTIAL (SF=0.01)
+#
+# Triggers:
+#   Weekly Sunday 02:00 UTC — automated historical tracking
+#   workflow_dispatch       — manual run; optionally filter to a single job
+#
+# Artifacts (90-day retention):
+#   bench-refresh-results  — JSON + stdout per run
+#   bench-latency-results
+#   bench-cdc-results
+#   bench-tpch-results
+# =============================================================================
+name: E2E Benchmarks
+
+on:
+  schedule:
+    - cron: '0 2 * * 0'   # Weekly, Sunday 02:00 UTC
+  workflow_dispatch:
+    inputs:
+      job:
+        description: 'Run a specific job only (refresh | latency | cdc | tpch | all)'
+        required: false
+        default: 'all'
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false   # Never cancel an in-progress bench run
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  PG_VERSION: "18"
+  PGS_BENCH_JSON_DIR: target/bench_results
+
+# ── Shared setup step logic is repeated per-job intentionally (no needs:
+#    chain) so that jobs can be run independently via workflow_dispatch. ──
+
+jobs:
+  # ── Differential vs Full Refresh — main README table ──────────────────
+  bench-refresh:
+    name: Bench — refresh matrix (scan/filter/agg/join)
+    runs-on: ubuntu-latest
+    if: >
+      github.event_name == 'schedule' ||
+      inputs.job == 'all' ||
+      inputs.job == 'refresh'
+    timeout-minutes: 60
+    continue-on-error: true
+    steps:
+      - name: Free up disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+               "/usr/local/share/boost" "$AGENT_TOOLSDIRECTORY"
+          docker system prune -af
+
+      - uses: actions/checkout@v5
+
+      - name: Setup pgrx environment
+        uses: ./.github/actions/setup-pgrx
+
+      - name: Restore Docker image cache (postgres:18.3)
+        uses: actions/cache@v5
+        with:
+          path: /tmp/docker-images/postgres-18.3.tar
+          key: docker-postgres-18.3
+
+      - name: Load or pull postgres:18.3
+        run: |
+          if [ -f /tmp/docker-images/postgres-18.3.tar ]; then
+            docker load --input /tmp/docker-images/postgres-18.3.tar
+          else
+            docker pull postgres:18.3
+            mkdir -p /tmp/docker-images
+            docker save postgres:18.3 --output /tmp/docker-images/postgres-18.3.tar
+          fi
+
+      - name: Build E2E Docker image
+        run: ./tests/build_e2e_image.sh
+
+      - name: Run bench_full_matrix
+        run: |
+          mkdir -p target/bench_results
+          cargo nextest run --profile ci \
+            --test e2e_bench_tests \
+            --features pg18 \
+            --run-ignored ignored-only \
+            --no-capture \
+            -E 'test(bench_full_matrix)' \
+            2>&1 | tee target/bench_results/refresh-stdout.txt
+
+      - name: Post summary
+        if: always()
+        run: |
+          echo "## Refresh Matrix Benchmark" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          grep -E '^\[BENCH_CYCLE\]|^\||\+--|╔|║|╚|Summary|FULL|INCR' \
+            target/bench_results/refresh-stdout.txt \
+            >> "$GITHUB_STEP_SUMMARY" || true
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "**Run date:** $(date -u '+%Y-%m-%d %H:%M UTC')" >> "$GITHUB_STEP_SUMMARY"
+          echo "**Commit:** ${{ github.sha }}" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload results
+        uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: bench-refresh-results
+          retention-days: 90
+          if-no-files-found: ignore
+          path: |
+            target/bench_results/refresh-stdout.txt
+            target/bench_results/*.json
+
+  # ── Zero-change refresh latency ─────────────────────────────────────────
+  bench-latency:
+    name: Bench — zero-change latency
+    runs-on: ubuntu-latest
+    if: >
+      github.event_name == 'schedule' ||
+      inputs.job == 'all' ||
+      inputs.job == 'latency'
+    timeout-minutes: 20
+    continue-on-error: true
+    steps:
+      - name: Free up disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+               "/usr/local/share/boost" "$AGENT_TOOLSDIRECTORY"
+          docker system prune -af
+
+      - uses: actions/checkout@v5
+
+      - name: Setup pgrx environment
+        uses: ./.github/actions/setup-pgrx
+
+      - name: Restore Docker image cache (postgres:18.3)
+        uses: actions/cache@v5
+        with:
+          path: /tmp/docker-images/postgres-18.3.tar
+          key: docker-postgres-18.3
+
+      - name: Load or pull postgres:18.3
+        run: |
+          if [ -f /tmp/docker-images/postgres-18.3.tar ]; then
+            docker load --input /tmp/docker-images/postgres-18.3.tar
+          else
+            docker pull postgres:18.3
+            mkdir -p /tmp/docker-images
+            docker save postgres:18.3 --output /tmp/docker-images/postgres-18.3.tar
+          fi
+
+      - name: Build E2E Docker image
+        run: ./tests/build_e2e_image.sh
+
+      - name: Run bench_no_data_refresh_latency
+        run: |
+          mkdir -p target/bench_results
+          cargo nextest run --profile ci \
+            --test e2e_bench_tests \
+            --features pg18 \
+            --run-ignored ignored-only \
+            --no-capture \
+            -E 'test(bench_no_data_refresh_latency)' \
+            2>&1 | tee target/bench_results/latency-stdout.txt
+
+      - name: Post summary
+        if: always()
+        run: |
+          echo "## Zero-Change Latency Benchmark" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          grep -E 'NO_DATA|Avg:|Max:|Target:|PASS|SLOW|[┌├└│]' \
+            target/bench_results/latency-stdout.txt \
+            >> "$GITHUB_STEP_SUMMARY" || true
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "**Run date:** $(date -u '+%Y-%m-%d %H:%M UTC')" >> "$GITHUB_STEP_SUMMARY"
+          echo "**Commit:** ${{ github.sha }}" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload results
+        uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: bench-latency-results
+          retention-days: 90
+          if-no-files-found: ignore
+          path: target/bench_results/latency-stdout.txt
+
+  # ── CDC trigger overhead + write amplification ──────────────────────────
+  bench-cdc:
+    name: Bench — CDC trigger overhead
+    runs-on: ubuntu-latest
+    if: >
+      github.event_name == 'schedule' ||
+      inputs.job == 'all' ||
+      inputs.job == 'cdc'
+    timeout-minutes: 30
+    continue-on-error: true
+    steps:
+      - name: Free up disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+               "/usr/local/share/boost" "$AGENT_TOOLSDIRECTORY"
+          docker system prune -af
+
+      - uses: actions/checkout@v5
+
+      - name: Setup pgrx environment
+        uses: ./.github/actions/setup-pgrx
+
+      - name: Restore Docker image cache (postgres:18.3)
+        uses: actions/cache@v5
+        with:
+          path: /tmp/docker-images/postgres-18.3.tar
+          key: docker-postgres-18.3
+
+      - name: Load or pull postgres:18.3
+        run: |
+          if [ -f /tmp/docker-images/postgres-18.3.tar ]; then
+            docker load --input /tmp/docker-images/postgres-18.3.tar
+          else
+            docker pull postgres:18.3
+            mkdir -p /tmp/docker-images
+            docker save postgres:18.3 --output /tmp/docker-images/postgres-18.3.tar
+          fi
+
+      - name: Build E2E Docker image
+        run: ./tests/build_e2e_image.sh
+
+      - name: Run bench_cdc_trigger_overhead
+        run: |
+          mkdir -p target/bench_results
+          cargo nextest run --profile ci \
+            --test e2e_bench_tests \
+            --features pg18 \
+            --run-ignored ignored-only \
+            --no-capture \
+            -E 'test(bench_cdc_trigger_overhead)' \
+            2>&1 | tee target/bench_results/cdc-stdout.txt
+
+      - name: Post summary
+        if: always()
+        run: |
+          echo "## CDC Trigger Overhead Benchmark" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          grep -E '\[CDC|overhead|amplif|µs|INSERT|UPDATE|DELETE|[┌├└│┬┼┴]|\+--' \
+            target/bench_results/cdc-stdout.txt \
+            >> "$GITHUB_STEP_SUMMARY" || true
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "**Run date:** $(date -u '+%Y-%m-%d %H:%M UTC')" >> "$GITHUB_STEP_SUMMARY"
+          echo "**Commit:** ${{ github.sha }}" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload results
+        uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: bench-cdc-results
+          retention-days: 90
+          if-no-files-found: ignore
+          path: target/bench_results/cdc-stdout.txt
+
+  # ── TPC-H per-query FULL vs DIFFERENTIAL (SF=0.01) ─────────────────────
+  bench-tpch:
+    name: Bench — TPC-H FULL vs DIFF (SF=0.01)
+    runs-on: ubuntu-latest
+    if: >
+      github.event_name == 'schedule' ||
+      inputs.job == 'all' ||
+      inputs.job == 'tpch'
+    timeout-minutes: 30
+    continue-on-error: true
+    steps:
+      - name: Free up disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+               "/usr/local/share/boost" "$AGENT_TOOLSDIRECTORY"
+          docker system prune -af
+
+      - uses: actions/checkout@v5
+
+      - name: Setup pgrx environment
+        uses: ./.github/actions/setup-pgrx
+
+      - name: Restore Docker image cache (postgres:18.3)
+        uses: actions/cache@v5
+        with:
+          path: /tmp/docker-images/postgres-18.3.tar
+          key: docker-postgres-18.3
+
+      - name: Load or pull postgres:18.3
+        run: |
+          if [ -f /tmp/docker-images/postgres-18.3.tar ]; then
+            docker load --input /tmp/docker-images/postgres-18.3.tar
+          else
+            docker pull postgres:18.3
+            mkdir -p /tmp/docker-images
+            docker save postgres:18.3 --output /tmp/docker-images/postgres-18.3.tar
+          fi
+
+      - name: Build E2E Docker image
+        run: ./tests/build_e2e_image.sh
+
+      - name: Run TPC-H performance comparison
+        env:
+          TPCH_BENCH: "1"
+        run: |
+          mkdir -p target/bench_results
+          cargo nextest run --profile ci \
+            --test e2e_tpch_tests \
+            --features pg18 \
+            --run-ignored ignored-only \
+            --no-capture \
+            -E 'test(test_tpch_performance_comparison)' \
+            2>&1 | tee target/bench_results/tpch-stdout.txt
+
+      - name: Post summary
+        if: always()
+        run: |
+          echo "## TPC-H FULL vs DIFFERENTIAL (SF=0.01)" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          grep -E '\[TPCH_BENCH\]|^\|' \
+            target/bench_results/tpch-stdout.txt \
+            >> "$GITHUB_STEP_SUMMARY" || true
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "**Run date:** $(date -u '+%Y-%m-%d %H:%M UTC')" >> "$GITHUB_STEP_SUMMARY"
+          echo "**Commit:** ${{ github.sha }}" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload results
+        uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: bench-tpch-results
+          retention-days: 90
+          if-no-files-found: ignore
+          path: target/bench_results/tpch-stdout.txt
