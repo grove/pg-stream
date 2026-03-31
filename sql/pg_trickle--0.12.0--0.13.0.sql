@@ -240,6 +240,64 @@ CREATE FUNCTION pgtrickle."alter_stream_table"(
 LANGUAGE c /* Rust */
 AS 'MODULE_PATHNAME', 'alter_stream_table_wrapper';
 
+-- ── Stream table creation functions: add max_differential_joins / max_delta_fraction ──
+-- These two parameters were added in 0.13.0 to all three create_stream_table
+-- variants. Using CREATE OR REPLACE so the upgrade is idempotent.
+
+CREATE OR REPLACE FUNCTION pgtrickle."create_stream_table"(
+        "name" TEXT,
+        "query" TEXT,
+        "schedule" TEXT DEFAULT 'calculated',
+        "refresh_mode" TEXT DEFAULT 'AUTO',
+        "initialize" bool DEFAULT true,
+        "diamond_consistency" TEXT DEFAULT NULL,
+        "diamond_schedule_policy" TEXT DEFAULT NULL,
+        "cdc_mode" TEXT DEFAULT NULL,
+        "append_only" bool DEFAULT false,
+        "pooler_compatibility_mode" bool DEFAULT false,
+        "partition_by" TEXT DEFAULT NULL,
+        "max_differential_joins" INT DEFAULT NULL,
+        "max_delta_fraction" double precision DEFAULT NULL
+) RETURNS void
+LANGUAGE c
+AS 'MODULE_PATHNAME', 'create_stream_table_wrapper';
+
+CREATE OR REPLACE FUNCTION pgtrickle."create_stream_table_if_not_exists"(
+        "name" TEXT,
+        "query" TEXT,
+        "schedule" TEXT DEFAULT 'calculated',
+        "refresh_mode" TEXT DEFAULT 'AUTO',
+        "initialize" bool DEFAULT true,
+        "diamond_consistency" TEXT DEFAULT NULL,
+        "diamond_schedule_policy" TEXT DEFAULT NULL,
+        "cdc_mode" TEXT DEFAULT NULL,
+        "append_only" bool DEFAULT false,
+        "pooler_compatibility_mode" bool DEFAULT false,
+        "partition_by" TEXT DEFAULT NULL,
+        "max_differential_joins" INT DEFAULT NULL,
+        "max_delta_fraction" double precision DEFAULT NULL
+) RETURNS void
+LANGUAGE c
+AS 'MODULE_PATHNAME', 'create_stream_table_if_not_exists_wrapper';
+
+CREATE OR REPLACE FUNCTION pgtrickle."create_or_replace_stream_table"(
+        "name" TEXT,
+        "query" TEXT,
+        "schedule" TEXT DEFAULT 'calculated',
+        "refresh_mode" TEXT DEFAULT 'AUTO',
+        "initialize" bool DEFAULT true,
+        "diamond_consistency" TEXT DEFAULT NULL,
+        "diamond_schedule_policy" TEXT DEFAULT NULL,
+        "cdc_mode" TEXT DEFAULT NULL,
+        "append_only" bool DEFAULT false,
+        "pooler_compatibility_mode" bool DEFAULT false,
+        "partition_by" TEXT DEFAULT NULL,
+        "max_differential_joins" INT DEFAULT NULL,
+        "max_delta_fraction" double precision DEFAULT NULL
+) RETURNS void
+LANGUAGE c
+AS 'MODULE_PATHNAME', 'create_or_replace_stream_table_wrapper';
+
 -- ── D-4: Shared change buffer observability ───────────────────────────────
 CREATE FUNCTION pgtrickle."shared_buffer_stats"() RETURNS TABLE (
         "source_oid" bigint,
