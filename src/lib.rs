@@ -276,8 +276,6 @@ CREATE TABLE IF NOT EXISTS pgtrickle.pgt_stream_tables (
     blown_at        TIMESTAMPTZ,
     blow_reason     TEXT,
     st_partition_key TEXT,
-    max_differential_joins INT,
-    max_delta_fraction DOUBLE PRECISION,
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at      TIMESTAMPTZ NOT NULL DEFAULT now()
 );
@@ -311,7 +309,7 @@ CREATE TABLE IF NOT EXISTS pgtrickle.pgt_refresh_history (
     start_time      TIMESTAMPTZ NOT NULL,
     end_time        TIMESTAMPTZ,
     action          TEXT NOT NULL
-                     CHECK (action IN ('NO_DATA', 'FULL', 'DIFFERENTIAL', 'DIFFERENTIAL', 'REINITIALIZE', 'SKIP')),
+                     CHECK (action IN ('NO_DATA', 'FULL', 'DIFFERENTIAL', 'REINITIALIZE', 'SKIP')),
     rows_inserted   BIGINT DEFAULT 0,
     rows_deleted    BIGINT DEFAULT 0,
     delta_row_count BIGINT DEFAULT 0,
