@@ -62,11 +62,11 @@ Benchmarked at 1% change rate (10 cycles, Docker-hosted PostgreSQL 18.3):
 
 | Query Type | Rows | FULL (ms) | DIFFERENTIAL (ms) | Speedup |
 |---|---|---|---|---|
-| Table scan | 100K | 493 | 29 | **17.0x** |
-| Filter (WHERE) | 10K | 22 | 8 | **2.6x** |
-| Aggregate (GROUP BY) | 100K | 30 | 41 | 0.7x |
-| Join (INNER JOIN) | 100K | 643 | 43 | **14.9x** |
-| Join + Aggregate | 100K | 47 | 64 | 0.7x |
+| Table scan | 100K | 461 | 40 | **11.6x** |
+| Filter (WHERE) | 10K | 26 | 9 | **2.9x** |
+| Aggregate (GROUP BY) | 100K | 31 | 52 | 0.6x |
+| Join (INNER JOIN) | 100K | 673 | 42 | **15.9x** |
+| Join + Aggregate | 100K | 52 | 63 | 0.8x |
 
 Aggregate queries with few output groups (5 regions from 100K rows) are faster with FULL refresh because the aggregate re-scan is cheap. Differential shines on queries that produce many output rows (scans, joins, filtered projections), where FULL must TRUNCATE + re-insert the entire result set. Speedup scales with table size and inversely with change rate — at 50% churn, the two modes converge.
 
