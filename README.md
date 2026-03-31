@@ -358,11 +358,6 @@ SELECT pgtrickle.drop_stream_table('regional_totals');
 | [docs/DVM_OPERATORS.md](docs/DVM_OPERATORS.md) | Supported operators and differentiation rules |
 | [docs/CONFIGURATION.md](docs/CONFIGURATION.md) | GUC variables and tuning guide |
 | [ROADMAP.md](ROADMAP.md) | Release milestones and future plans (current milestone: v0.13.0) |
-
-### Deep-Dive Tutorials
-
-| Tutorial | Description |
-|---|---|
 | [What Happens on INSERT](docs/tutorials/WHAT_HAPPENS_ON_INSERT.md) | Full 7-phase lifecycle of a single INSERT through the pipeline |
 | [What Happens on UPDATE](docs/tutorials/WHAT_HAPPENS_ON_UPDATE.md) | D+I split, group key changes, net-effect for multiple UPDATEs |
 | [What Happens on DELETE](docs/tutorials/WHAT_HAPPENS_ON_DELETE.md) | Reference counting, group deletion, INSERT+DELETE cancellation |
