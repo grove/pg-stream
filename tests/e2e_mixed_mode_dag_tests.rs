@@ -372,6 +372,7 @@ async fn test_mixed_immediate_leaf() {
 // ═══════════════════════════════════════════════════════════════════════════
 
 /// Configure the scheduler for fast testing (100 ms tick, 1 s min schedule).
+#[cfg(not(feature = "light-e2e"))]
 async fn configure_fast_scheduler(db: &E2eDb) {
     db.execute("ALTER SYSTEM SET pg_trickle.scheduler_interval_ms = 100")
         .await;
@@ -413,6 +414,7 @@ async fn configure_fast_scheduler(db: &E2eDb) {
 ///
 /// This test verifies the fix via the **scheduler path** (auto-refresh), not
 /// manual refresh, because that is where the stall occurs.
+#[cfg(not(feature = "light-e2e"))]
 #[tokio::test]
 async fn test_calculated_diff_leaf_auto_cascades_from_full_upstream() {
     let db = E2eDb::new_on_postgres_db().await.with_extension().await;
@@ -504,6 +506,7 @@ async fn test_calculated_diff_leaf_auto_cascades_from_full_upstream() {
 ///
 /// After the fix, the convergence node detects that left_branch's
 /// `last_refresh_at` is newer than its own and cascades automatically.
+#[cfg(not(feature = "light-e2e"))]
 #[tokio::test]
 async fn test_diamond_convergence_cascades_with_one_active_branch() {
     let db = E2eDb::new_on_postgres_db().await.with_extension().await;
