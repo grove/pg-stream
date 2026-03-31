@@ -2562,6 +2562,21 @@ pub extern "C-unwind" fn pg_trickle_scheduler_main(_arg: pg_sys::Datum) {
                 // Atomic group: check group-level schedule policy.
                 let policy = group_schedule_policy(group);
                 if !is_group_due(group, policy, dag_ref) {
+                    // When the Slowest policy is active, the group waits for all
+                    // members to be due simultaneously.  In asymmetric pipelines
+                    // (e.g. a diamond where only one branch has CDC events on a
+                    // given tick), convergence nodes can accumulate staleness
+                    // indefinitely.  Emit stale-data alerts so operators are
+                    // notified rather than silently waiting.
+                    if policy == DiamondSchedulePolicy::Slowest {
+                        for node in &group.convergence_points {
+                            if let NodeId::StreamTable(id) = node
+                                && let Some(conv_st) = load_st_by_id(*id)
+                            {
+                                emit_stale_alert_if_needed(&conv_st);
+                            }
+                        }
+                    }
                     continue;
                 }
 
@@ -3480,8 +3495,39 @@ fn has_stream_table_source_changes(st: &StreamTableMeta) -> bool {
             if has_new_rows {
                 return true;
             }
+
+            // NS-8 fallback: The change buffer exists but has no new rows.
+            // This happens when a FULL-mode upstream refreshes with zero net
+            // row changes — `capture_full_refresh_diff_to_st_buffer` produces
+            // nothing and the buffer stays empty.  Without this fallback,
+            // CALCULATED downstreams stall indefinitely because they never
+            // detect the "upstream refreshed" signal.
+            //
+            // Compare `last_refresh_at` timestamps: if the upstream has
+            // refreshed more recently than we have, we should re-evaluate.
+            // A NoData run on our side advances our own `last_refresh_at`
+            // past the upstream's, preventing re-triggering until the
+            // upstream refreshes again.
+            let upstream_refreshed_since = Spi::get_one::<bool>(&format!(
+                "SELECT EXISTS ( \
+                   SELECT 1 \
+                   FROM pgtrickle.pgt_stream_tables upstream \
+                   JOIN pgtrickle.pgt_stream_tables us ON us.pgt_id = {my_id} \
+                   WHERE upstream.pgt_relid = {up_relid}::oid \
+                     AND upstream.last_refresh_at \
+                         > COALESCE(us.last_refresh_at, '-infinity'::timestamptz) \
+                 )",
+                my_id = st.pgt_id,
+                up_relid = dep.source_relid.to_u32(),
+            ))
+            .unwrap_or(Some(false))
+            .unwrap_or(false);
+
+            if upstream_refreshed_since {
+                return true;
+            }
         } else {
-            // Fallback: no buffer yet — use timestamp comparison.
+            // No buffer yet — use timestamp comparison.
             let upstream_newer = Spi::get_one::<bool>(&format!(
                 "SELECT EXISTS ( \
                    SELECT 1 \
