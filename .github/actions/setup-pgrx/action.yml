@@ -48,10 +48,12 @@ runs:
       uses: actions/cache@v5
       with:
         path: target
-        key: v2-cargo-build-pgrx0.17-${{ runner.os }}-${{ runner.arch }}-${{ env.ImageOS || 'unknown' }}-${{ hashFiles('**/Cargo.lock') }}
-        restore-keys: |
-          v2-cargo-build-pgrx0.17-${{ runner.os }}-${{ runner.arch }}-${{ env.ImageOS || 'unknown' }}-
-          v2-cargo-build-pgrx0.17-${{ runner.os }}-${{ runner.arch }}-
+        # v3: drop restore-keys fallback. Restoring a stale oversized cache
+        # from a different branch/commit (via the fallback prefix match) was
+        # causing 40+ minute hangs because the target/ dir reaches 30 GB+.
+        # On a cache miss we now compile fresh (15-20 min) rather than
+        # spending longer downloading an irrelevant stale cache.
+        key: v3-cargo-build-pgrx0.17-${{ runner.os }}-${{ runner.arch }}-${{ env.ImageOS || 'unknown' }}-${{ hashFiles('**/Cargo.lock') }}
 
     - name: Cache cargo-pgrx binary
       id: cache-cargo-pgrx
