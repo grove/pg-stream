@@ -195,6 +195,9 @@ async fn create_database(admin_connection_string: &str, db_name: &str) {
 /// pre-installed — no second `CREATE EXTENSION` run is needed.
 ///
 /// The template database must have zero active connections at call time.
+/// Background workers (e.g. the pg_trickle scheduler) may connect to the
+/// template after the extension is installed, so this function terminates
+/// any lingering backends and retries up to 10 times before giving up.
 #[cfg(not(feature = "light-e2e"))]
 async fn create_database_from_template(
     admin_connection_string: &str,
@@ -207,14 +210,37 @@ async fn create_database_from_template(
         .await
         .unwrap_or_else(|e| panic!("Failed to connect for CREATE DATABASE {db_name}: {e}"));
 
-    sqlx::query(&format!(
-        "CREATE DATABASE \"{db_name}\" TEMPLATE \"{template}\""
-    ))
-    .execute(&admin_pool)
-    .await
-    .unwrap_or_else(|e| panic!("Failed to CREATE DATABASE {db_name} from template: {e}"));
+    let create_sql = format!("CREATE DATABASE \"{db_name}\" TEMPLATE \"{template}\"");
+    let terminate_sql = format!(
+        "SELECT pg_terminate_backend(pid) \
+         FROM pg_stat_activity \
+         WHERE datname = '{template}' AND pid <> pg_backend_pid()"
+    );
 
-    admin_pool.close().await;
+    let mut last_err = None;
+    for attempt in 0u64..10 {
+        if attempt > 0 {
+            // Terminate any backends connected to the template DB
+            // (e.g. background workers that auto-connected after extension install).
+            let _ = sqlx::query(&terminate_sql).execute(&admin_pool).await;
+            tokio::time::sleep(std::time::Duration::from_millis(100 * attempt)).await;
+        }
+
+        match sqlx::query(&create_sql).execute(&admin_pool).await {
+            Ok(_) => {
+                admin_pool.close().await;
+                return;
+            }
+            Err(e) => {
+                last_err = Some(e);
+            }
+        }
+    }
+
+    panic!(
+        "Failed to CREATE DATABASE {db_name} from template after 10 attempts: {}",
+        last_err.unwrap()
+    );
 }
 
 /// Install pg_trickle once into a dedicated template database so that each
