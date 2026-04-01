@@ -895,15 +895,6 @@ async fn test_st_on_st_uses_differential_not_full() {
     db.refresh_st_with_retry("ssd_upstream").await;
     db.refresh_st_with_retry("ssd_downstream").await;
 
-    // Record how many COMPLETED refreshes the downstream had before the delta
-    let before_count: i64 = db
-        .query_scalar(
-            "SELECT count(*) FROM pgtrickle.pgt_refresh_history h
-             JOIN pgtrickle.pgt_stream_tables st ON st.pgt_id = h.pgt_id
-             WHERE st.pgt_name = 'ssd_downstream' AND h.status = 'COMPLETED'",
-        )
-        .await;
-
     // Enable fast scheduler
     configure_fast_scheduler(&db).await;
 
@@ -911,32 +902,46 @@ async fn test_st_on_st_uses_differential_not_full() {
     db.execute("INSERT INTO ssd_src (grp, val) VALUES ('a', 40), ('b', 50)")
         .await;
 
-    // Wait for the downstream ST to get a new COMPLETED refresh
+    // Wait for the downstream ST to reflect the new data.
+    //
+    // The scheduler may perform a spurious NO_DATA + DIFFERENTIAL cycle
+    // (triggered by the NS-8 last_refresh_at fallback) before the CDC
+    // changes from the INSERT are actually processed.  Waiting only for
+    // "a new COMPLETED refresh" can break too early on such a spurious
+    // cycle.  Instead, poll until the upstream data has been refreshed
+    // (SUM(total) reflects the new rows) AND the downstream has
+    // propagated it (SUM(doubled) = 2 × SUM(total)).
     let timeout = std::time::Duration::from_secs(60);
     let start = std::time::Instant::now();
     loop {
         if start.elapsed() > timeout {
             panic!(
-                "Timed out waiting for ssd_downstream to receive a scheduler-driven \
-                 refresh after delta INSERT"
+                "Timed out waiting for ssd_downstream to receive correct data \
+                 after delta INSERT (upstream may not have been refreshed)"
             );
         }
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
 
-        let current_count: i64 = db
-            .query_scalar(
-                "SELECT count(*) FROM pgtrickle.pgt_refresh_history h
-                 JOIN pgtrickle.pgt_stream_tables st ON st.pgt_id = h.pgt_id
-                 WHERE st.pgt_name = 'ssd_downstream' AND h.status = 'COMPLETED'",
-            )
+        // grp 'a': 10+20+40 = 70, grp 'b': 30+50 = 80 → total = 150
+        let upstream_total: i64 = db
+            .query_scalar("SELECT COALESCE(SUM(total), 0)::bigint FROM ssd_upstream")
             .await;
-        if current_count > before_count {
+        if upstream_total < 150 {
+            continue; // upstream not refreshed yet
+        }
+
+        // doubled total should be 300 (2 × 150)
+        let downstream_total: i64 = db
+            .query_scalar("SELECT COALESCE(SUM(doubled), 0)::bigint FROM ssd_downstream")
+            .await;
+        if downstream_total >= 300 {
             break;
         }
     }
 
-    // The downstream ST's most recent scheduler-driven refresh must be DIFFERENTIAL.
-    // If the force-FULL regression recurs, this will be 'FULL'.
+    // The downstream ST must have used at least one DIFFERENTIAL refresh
+    // (not FULL) to propagate the upstream changes. Check the most recent
+    // non-NO_DATA refresh — that's the one that carried the actual delta.
     let action: String = db
         .query_scalar(
             "SELECT h.action
@@ -944,6 +949,7 @@ async fn test_st_on_st_uses_differential_not_full() {
              JOIN pgtrickle.pgt_stream_tables st ON st.pgt_id = h.pgt_id
              WHERE st.pgt_name = 'ssd_downstream'
                AND h.status = 'COMPLETED'
+               AND h.action <> 'NO_DATA'
              ORDER BY h.refresh_id DESC
              LIMIT 1",
         )
