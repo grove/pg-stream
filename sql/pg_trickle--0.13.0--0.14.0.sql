@@ -1,0 +1,2 @@
+-- pg_trickle upgrade script: 0.13.0 → 0.14.0
+-- Placeholder — populated during the 0.14.0 release cycle.
