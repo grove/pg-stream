@@ -332,6 +332,54 @@ async fn test_ivm_trigger_functions_security_definer() {
     );
 }
 
+/// R4b: Verify that CDC trigger functions are SECURITY DEFINER with locked search_path.
+#[tokio::test]
+async fn test_cdc_trigger_functions_security_definer() {
+    let db = E2eDb::new().await.with_extension().await;
+
+    db.execute("CREATE TABLE rls_cdc_secdef_src (id INT PRIMARY KEY, val TEXT NOT NULL)")
+        .await;
+    db.execute("INSERT INTO rls_cdc_secdef_src VALUES (1, 'a')")
+        .await;
+
+    // DIFFERENTIAL mode creates the statement-level CDC triggers
+    db.create_st(
+        "rls_cdc_secdef_st",
+        "SELECT id, val FROM rls_cdc_secdef_src",
+        "1m",
+        "DIFFERENTIAL",
+    )
+    .await;
+
+    // All pg_trickle_cdc_* functions must be SECURITY DEFINER
+    let secdef_count: i64 = db
+        .query_scalar(
+            "SELECT count(*) FROM pg_proc \
+             WHERE proname LIKE 'pg_trickle_cdc_%' \
+             AND prosecdef = true",
+        )
+        .await;
+    assert!(
+        secdef_count > 0,
+        "CDC trigger functions should be SECURITY DEFINER (prosecdef = true), found {secdef_count}"
+    );
+
+    // All of them must also have a locked search_path
+    let without_search_path: i64 = db
+        .query_scalar(
+            "SELECT count(*) FROM pg_proc \
+             WHERE proname LIKE 'pg_trickle_cdc_%' \
+             AND prosecdef = true \
+             AND NOT (proconfig @> ARRAY['search_path=pg_catalog, pgtrickle, pgtrickle_changes, public'])",
+        )
+        .await;
+    assert_eq!(
+        without_search_path, 0,
+        "all CDC SECURITY DEFINER functions must have a locked search_path, \
+         found {without_search_path} without it"
+    );
+}
+
 // ══════════════════════════════════════════════════════════════════════
 // R10 — ENABLE/DISABLE RLS on source table triggers reinit
 // ══════════════════════════════════════════════════════════════════════
