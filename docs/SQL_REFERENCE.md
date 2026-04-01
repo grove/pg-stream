@@ -1717,6 +1717,32 @@ SELECT pgtrickle.pg_trickle_hash_multi(ARRAY['key1', 'key2']);
 
 ---
 
+## Operator Support Matrix — Summary
+
+pg_trickle supports 60+ SQL constructs across three refresh modes. The table below summarises broad categories. For the **complete per-operator matrix** (including notes on caveats, auxiliary columns and strategies), see **[DVM_OPERATORS.md](DVM_OPERATORS.md)**.
+
+| Category | FULL | DIFFERENTIAL | IMMEDIATE | Notes |
+|---|:---:|:---:|:---:|---|
+| Basic SELECT / WHERE / DISTINCT | ✅ | ✅ | ✅ | |
+| Joins (INNER, LEFT, RIGHT, FULL, CROSS, LATERAL) | ✅ | ✅ | ✅ | Hybrid delta strategy |
+| Subqueries (EXISTS, IN, NOT EXISTS, NOT IN, scalar) | ✅ | ✅ | ✅ | |
+| Set operations (UNION ALL, INTERSECT, EXCEPT) | ✅ | ✅ | ✅ | |
+| Algebraic aggregates (COUNT, SUM, AVG, STDDEV, …) | ✅ | ✅ | ✅ | Fully invertible delta |
+| Semi-algebraic aggregates (MIN, MAX) | ✅ | ✅ | ✅ | Group rescan on ambiguous delete |
+| Group-rescan aggregates (STRING_AGG, ARRAY_AGG, …) | ✅ | ⚠️ | ⚠️ | Warning emitted at creation time |
+| Window functions (ROW_NUMBER, RANK, LAG, LEAD, …) | ✅ | ✅ | ✅ | Partition-scoped recompute |
+| CTEs (non-recursive and WITH RECURSIVE) | ✅ | ✅ | ✅ | Semi-naive / DRed strategies |
+| TopK (ORDER BY … LIMIT) | ✅ | ✅ | ✅ | Scoped recomputation |
+| LATERAL / set-returning functions / JSON_TABLE | ✅ | ✅ | ✅ | Row-scoped re-execution |
+| ST-to-ST dependencies | ✅ | ✅ | ✅ | Differential via change buffers |
+| VOLATILE functions | ✅ | ❌ | ❌ | Rejected at creation time |
+
+**Legend:** ✅ fully supported — ⚠️ supported with caveats — ❌ not supported
+
+> For details on each operator's delta strategy, auxiliary columns, and known limitations, see the full [Operator Support Matrix](DVM_OPERATORS.md#operator-support-matrix).
+
+---
+
 ## Expression Support
 
 pgtrickle's DVM parser supports a wide range of SQL expressions in defining queries. All expressions work in both `FULL` and `DIFFERENTIAL` modes.

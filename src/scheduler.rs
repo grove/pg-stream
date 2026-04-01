@@ -4642,7 +4642,25 @@ fn execute_scheduled_refresh(
                 );
             }
 
-            // Increment error count only for errors that should count
+            // ERR-1b: On permanent failure, immediately set ERROR status with
+            // the error message. One permanent failure is enough — it will not
+            // self-heal. Skip the consecutive_errors increment path.
+            if !is_retryable {
+                let error_msg = e.to_string();
+                let _ = StreamTableMeta::set_error_state(st.pgt_id, &error_msg);
+
+                log!(
+                    "pg_trickle: permanent error for {}.{} ({}): {} — set status to ERROR",
+                    st.pgt_schema,
+                    st.pgt_name,
+                    action.as_str(),
+                    error_msg,
+                );
+
+                return RefreshOutcome::PermanentFailure;
+            }
+
+            // Increment error count only for retryable errors that should count
             if counts {
                 match StreamTableMeta::increment_errors(st.pgt_id) {
                     Ok(count) if count >= config::pg_trickle_max_consecutive_errors() => {
@@ -4664,16 +4682,11 @@ fn execute_scheduled_refresh(
                     }
                     _ => {
                         log!(
-                            "pg_trickle: refresh failed for {}.{} ({}): {} [{}]",
+                            "pg_trickle: refresh failed for {}.{} ({}): {} [will retry]",
                             st.pgt_schema,
                             st.pgt_name,
                             action.as_str(),
                             e,
-                            if is_retryable {
-                                "will retry"
-                            } else {
-                                "permanent"
-                            },
                         );
                     }
                 }
@@ -4686,11 +4699,7 @@ fn execute_scheduled_refresh(
                 );
             }
 
-            if is_retryable {
-                RefreshOutcome::RetryableFailure
-            } else {
-                RefreshOutcome::PermanentFailure
-            }
+            RefreshOutcome::RetryableFailure
         }
     }
 }

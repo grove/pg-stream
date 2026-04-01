@@ -2200,6 +2200,20 @@ impl OpTree {
             .collect()
     }
 
+    /// DIAG-2: Return the names of algebraic aggregates in the tree.
+    /// Used to emit a low-cardinality warning at `create_stream_table` time.
+    pub fn algebraic_aggregate_names(&self) -> Vec<String> {
+        self.aggregate_strategies()
+            .into_iter()
+            .filter(|(_, strategy)| {
+                *strategy == "ALGEBRAIC_INVERTIBLE"
+                    || *strategy == "ALGEBRAIC_VIA_AUX"
+                    || *strategy == "SEMI_ALGEBRAIC"
+            })
+            .map(|(alias, _)| alias)
+            .collect()
+    }
+
     /// Collect `(table_oid, Vec<column_name>)` pairs from all Scan nodes.
     ///
     /// When the same table appears in multiple Scan nodes (self-join), the

@@ -984,6 +984,29 @@ fn validate_and_parse_query(
         }
     }
 
+    // DIAG-2: Warn when algebraic aggregates are used with low-cardinality
+    // GROUP BY columns — the DIFFERENTIAL overhead may not be justified.
+    // (Placeholder — actual check runs after source_relids is computed below.)
+    let diag2_info: Option<(Vec<String>, Vec<String>, i32)> = {
+        let threshold = crate::config::pg_trickle_agg_diff_cardinality_threshold();
+        if threshold > 0 {
+            if let Some(ref pr) = parsed_tree {
+                let alg_names = pr.tree.algebraic_aggregate_names();
+                if !alg_names.is_empty() {
+                    pr.tree
+                        .group_by_columns()
+                        .map(|gc| (alg_names, gc, threshold))
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    };
+
     let needs_pgt_count = parsed_tree
         .as_ref()
         .is_some_and(|pr| pr.tree.needs_pgt_count());
@@ -996,6 +1019,26 @@ fn validate_and_parse_query(
 
     // Extract source dependencies
     let source_relids = normalize_source_relations(extract_source_relations(q)?);
+
+    // DIAG-2: Now that source_relids is available, emit the low-cardinality warning.
+    if let Some((alg_names, group_cols, threshold)) = diag2_info {
+        let estimated_groups = estimate_group_cardinality(&source_relids, &group_cols);
+        if let Some(est) = estimated_groups
+            && est > 0
+            && est < threshold as i64
+        {
+            pgrx::warning!(
+                "pg_trickle: DIFFERENTIAL mode with algebraic aggregates [{}] \
+                 and estimated GROUP BY cardinality {} (below threshold {}). \
+                 Consider refresh_mode='full' or 'auto' for low-cardinality \
+                 groupings. Adjust pg_trickle.agg_diff_cardinality_threshold \
+                 to tune this warning.",
+                alg_names.join(", "),
+                est,
+                threshold,
+            );
+        }
+    }
 
     // EC-06: Detect keyless sources
     let has_keyless_source = source_relids.iter().any(|(oid, source_type)| {
@@ -3118,6 +3161,19 @@ fn alter_stream_table_impl(
     shmem::signal_dag_invalidation(st.pgt_id);
     // G8.1: Notify other backends to flush delta/MERGE template caches.
     shmem::bump_cache_generation();
+
+    // ERR-1c: Clear error state when a pipeline-regenerating alter succeeds.
+    // This lets ALTER STREAM TABLE with a fixed query reset an ERROR table.
+    if st.status == StStatus::Error {
+        let _ = StreamTableMeta::clear_error_state(st.pgt_id);
+        let _ = StreamTableMeta::update_status(st.pgt_id, StStatus::Active);
+        Spi::run_with_args(
+            "UPDATE pgtrickle.pgt_stream_tables SET consecutive_errors = 0, updated_at = now() WHERE pgt_id = $1",
+            &[st.pgt_id.into()],
+        )
+        .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
+    }
+
     Ok(())
 }
 
@@ -3297,7 +3353,8 @@ fn resume_stream_table_impl(name: &str) -> Result<(), PgTrickleError> {
 
     Spi::run_with_args(
         "UPDATE pgtrickle.pgt_stream_tables \
-         SET status = 'ACTIVE', consecutive_errors = 0, updated_at = now() \
+         SET status = 'ACTIVE', consecutive_errors = 0, \
+         last_error_message = NULL, last_error_at = NULL, updated_at = now() \
          WHERE pgt_id = $1",
         &[st.pgt_id.into()],
     )
@@ -3348,12 +3405,17 @@ fn refresh_stream_table_impl(name: &str) -> Result<(), PgTrickleError> {
     let (schema, table_name) = parse_qualified_name(name)?;
     let st = StreamTableMeta::get_by_name(&schema, &table_name)?;
 
-    // Phase 10: Check if ST is suspended — refuse manual refresh
-    if st.status == StStatus::Suspended {
+    // Phase 10: Check if ST is suspended or in error — refuse manual refresh
+    if st.status == StStatus::Suspended || st.status == StStatus::Error {
         return Err(PgTrickleError::InvalidArgument(format!(
-            "stream table {}.{} is suspended; use pgtrickle.resume_stream_table('{}') first",
+            "stream table {}.{} is {} ; use pgtrickle.resume_stream_table('{}') first",
             schema,
             table_name,
+            if st.status == StStatus::Suspended {
+                "suspended"
+            } else {
+                "in error state"
+            },
             if schema == "public" {
                 table_name.clone()
             } else {
@@ -6516,6 +6578,78 @@ fn normalize_source_relations(
         .collect()
 }
 
+/// DIAG-2: Estimate the GROUP BY cardinality from pg_stats.n_distinct.
+///
+/// Queries `pg_stats` for the GROUP BY columns on any source table. Returns
+/// the minimum `n_distinct` value across all matched columns (conservative
+/// estimate of group count). Returns `None` if no statistics are available.
+fn estimate_group_cardinality(
+    source_relids: &[(pg_sys::Oid, String)],
+    group_cols: &[String],
+) -> Option<i64> {
+    if group_cols.is_empty() || source_relids.is_empty() {
+        return None;
+    }
+
+    let mut min_distinct: Option<i64> = None;
+
+    for (oid, _) in source_relids {
+        // Look up schema.table_name for this OID.
+        let schema_table: Option<(String, String)> = Spi::connect(|client| {
+            let tbl = client
+                .select(
+                    "SELECT n.nspname::text, c.relname::text \
+                     FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
+                     WHERE c.oid = $1",
+                    None,
+                    &[(*oid).into()],
+                )
+                .ok()?;
+            if tbl.is_empty() {
+                return None;
+            }
+            let schema = tbl.get::<String>(1).ok()??;
+            let name = tbl.get::<String>(2).ok()??;
+            Some((schema, name))
+        });
+
+        if let Some((schema, table_name)) = schema_table {
+            for col in group_cols {
+                let n_distinct: Option<f32> = Spi::get_one_with_args::<f32>(
+                    "SELECT n_distinct FROM pg_stats \
+                     WHERE schemaname = $1 AND tablename = $2 AND attname = $3",
+                    &[
+                        schema.clone().into(),
+                        table_name.clone().into(),
+                        col.clone().into(),
+                    ],
+                )
+                .unwrap_or(None);
+
+                if let Some(nd) = n_distinct {
+                    // In pg_stats, n_distinct > 0 means absolute count,
+                    // n_distinct < 0 means fraction of reltuples (e.g. -0.5 = 50%).
+                    let effective = if nd > 0.0 {
+                        nd as i64
+                    } else {
+                        // Estimate using reltuples.
+                        let reltuples: f32 = Spi::get_one_with_args::<f32>(
+                            "SELECT reltuples FROM pg_class WHERE oid = $1",
+                            &[(*oid).into()],
+                        )
+                        .unwrap_or(Some(0.0))
+                        .unwrap_or(0.0);
+                        ((-nd) * reltuples).max(1.0) as i64
+                    };
+                    min_distinct = Some(min_distinct.map_or(effective, |m: i64| m.min(effective)));
+                }
+            }
+        }
+    }
+
+    min_distinct
+}
+
 /// Check for cycles after adding the proposed dependency edges.
 ///
 /// Loads the existing DAG from the catalog, adds the proposed edges,
@@ -8072,6 +8206,8 @@ mod tests {
             st_partition_key: None,
             max_differential_joins: None,
             max_delta_fraction: None,
+            last_error_message: None,
+            last_error_at: None,
         }
     }
 

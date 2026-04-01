@@ -108,6 +108,12 @@ pub struct StreamTableMeta {
     /// estimated base table size, the scheduler falls back to FULL refresh.
     /// `None` means no limit.
     pub max_delta_fraction: Option<f64>,
+    /// ERR-1: Last error message from a permanent refresh failure.
+    /// `None` means no error has occurred (or it was cleared).
+    pub last_error_message: Option<String>,
+    /// ERR-1: Timestamp of the last permanent refresh failure.
+    /// `None` means no error has occurred (or it was cleared).
+    pub last_error_at: Option<TimestampWithTimeZone>,
 }
 
 /// CDC mode for a source dependency — tracks whether change capture uses
@@ -284,7 +290,8 @@ impl StreamTableMeta {
                      COALESCE(fuse_mode, 'off') AS fuse_mode, \
                      COALESCE(fuse_state, 'armed') AS fuse_state, \
                      fuse_ceiling, fuse_sensitivity, blown_at, blow_reason, \
-                     st_partition_key, max_differential_joins, max_delta_fraction \
+                     st_partition_key, max_differential_joins, max_delta_fraction, \
+                     last_error_message, last_error_at \
                      FROM pgtrickle.pgt_stream_tables \
                      WHERE pgt_schema = $1 AND pgt_name = $2",
                     None,
@@ -316,7 +323,8 @@ impl StreamTableMeta {
                      COALESCE(fuse_mode, 'off') AS fuse_mode, \
                      COALESCE(fuse_state, 'armed') AS fuse_state, \
                      fuse_ceiling, fuse_sensitivity, blown_at, blow_reason, \
-                     st_partition_key, max_differential_joins, max_delta_fraction \
+                     st_partition_key, max_differential_joins, max_delta_fraction, \
+                     last_error_message, last_error_at \
                      FROM pgtrickle.pgt_stream_tables \
                      WHERE pgt_relid = $1",
                     None,
@@ -353,7 +361,8 @@ impl StreamTableMeta {
                      COALESCE(fuse_mode, 'off') AS fuse_mode, \
                      COALESCE(fuse_state, 'armed') AS fuse_state, \
                      fuse_ceiling, fuse_sensitivity, blown_at, blow_reason, \
-                     st_partition_key, max_differential_joins, max_delta_fraction \
+                     st_partition_key, max_differential_joins, max_delta_fraction, \
+                     last_error_message, last_error_at \
                      FROM pgtrickle.pgt_stream_tables \
                      WHERE pgt_id = $1",
                     None,
@@ -385,7 +394,8 @@ impl StreamTableMeta {
                      COALESCE(fuse_mode, 'off') AS fuse_mode, \
                      COALESCE(fuse_state, 'armed') AS fuse_state, \
                      fuse_ceiling, fuse_sensitivity, blown_at, blow_reason, \
-                     st_partition_key, max_differential_joins, max_delta_fraction \
+                     st_partition_key, max_differential_joins, max_delta_fraction, \
+                     last_error_message, last_error_at \
                      FROM pgtrickle.pgt_stream_tables",
                     None,
                     &[],
@@ -421,7 +431,8 @@ impl StreamTableMeta {
                      COALESCE(fuse_mode, 'off') AS fuse_mode, \
                      COALESCE(fuse_state, 'armed') AS fuse_state, \
                      fuse_ceiling, fuse_sensitivity, blown_at, blow_reason, \
-                     st_partition_key, max_differential_joins, max_delta_fraction \
+                     st_partition_key, max_differential_joins, max_delta_fraction, \
+                     last_error_message, last_error_at \
                      FROM pgtrickle.pgt_stream_tables \
                      WHERE status = 'ACTIVE'",
                     None,
@@ -500,7 +511,9 @@ impl StreamTableMeta {
             "UPDATE pgtrickle.pgt_stream_tables \
              SET data_timestamp = $1, is_populated = true, \
              last_refresh_at = now(), consecutive_errors = 0, \
-             status = 'ACTIVE', needs_reinit = false, updated_at = now() \
+             status = 'ACTIVE', needs_reinit = false, \
+             last_error_message = NULL, last_error_at = NULL, \
+             updated_at = now() \
              WHERE pgt_id = $2",
             &[data_ts.into(), pgt_id.into()],
         )
@@ -523,7 +536,9 @@ impl StreamTableMeta {
             "UPDATE pgtrickle.pgt_stream_tables \
              SET is_populated = true, \
              last_refresh_at = now(), consecutive_errors = 0, \
-             status = 'ACTIVE', updated_at = now() \
+             status = 'ACTIVE', \
+             last_error_message = NULL, last_error_at = NULL, \
+             updated_at = now() \
              WHERE pgt_id = $1",
             &[pgt_id.into()],
         )
@@ -575,6 +590,7 @@ impl StreamTableMeta {
              SET data_timestamp = now(), is_populated = true, \
              last_refresh_at = now(), consecutive_errors = 0, \
              status = 'ACTIVE', needs_reinit = false, \
+             last_error_message = NULL, last_error_at = NULL, \
              frontier = $3, updated_at = now() \
              WHERE pgt_id = $1 \
              RETURNING data_timestamp",
@@ -633,6 +649,31 @@ impl StreamTableMeta {
         )
         .map_err(|e: pgrx::spi::SpiError| PgTrickleError::SpiError(e.to_string()))?
         .ok_or_else(|| PgTrickleError::NotFound(format!("pgt_id={}", pgt_id)))
+    }
+
+    /// ERR-1b: Set status to ERROR with an error message and timestamp.
+    /// Used for permanent failures that should not be retried.
+    pub fn set_error_state(pgt_id: i64, error_message: &str) -> Result<(), PgTrickleError> {
+        Spi::run_with_args(
+            "UPDATE pgtrickle.pgt_stream_tables \
+             SET status = 'ERROR', last_error_message = $1, last_error_at = now(), \
+             updated_at = now() \
+             WHERE pgt_id = $2",
+            &[error_message.into(), pgt_id.into()],
+        )
+        .map_err(|e: pgrx::spi::SpiError| PgTrickleError::SpiError(e.to_string()))
+    }
+
+    /// ERR-1c: Clear error state (null out last_error_message and last_error_at).
+    /// Called when a pipeline-regenerating API call succeeds.
+    pub fn clear_error_state(pgt_id: i64) -> Result<(), PgTrickleError> {
+        Spi::run_with_args(
+            "UPDATE pgtrickle.pgt_stream_tables \
+             SET last_error_message = NULL, last_error_at = NULL, updated_at = now() \
+             WHERE pgt_id = $1",
+            &[pgt_id.into()],
+        )
+        .map_err(|e: pgrx::spi::SpiError| PgTrickleError::SpiError(e.to_string()))
     }
 
     /// Delete a stream table record from the catalog.
@@ -1012,6 +1053,8 @@ impl StreamTableMeta {
         let st_partition_key = table.get::<String>(37).map_err(map_spi)?;
         let max_differential_joins = table.get::<i32>(38).map_err(map_spi)?;
         let max_delta_fraction = table.get::<f64>(39).map_err(map_spi)?;
+        let last_error_message = table.get::<String>(40).map_err(map_spi)?;
+        let last_error_at = table.get::<TimestampWithTimeZone>(41).map_err(map_spi)?;
 
         Ok(StreamTableMeta {
             pgt_id,
@@ -1053,6 +1096,8 @@ impl StreamTableMeta {
             st_partition_key,
             max_differential_joins,
             max_delta_fraction,
+            last_error_message,
+            last_error_at,
         })
     }
 
@@ -1158,6 +1203,8 @@ impl StreamTableMeta {
         let st_partition_key = row.get::<String>(37).map_err(map_spi)?;
         let max_differential_joins = row.get::<i32>(38).map_err(map_spi)?;
         let max_delta_fraction = row.get::<f64>(39).map_err(map_spi)?;
+        let last_error_message = row.get::<String>(40).map_err(map_spi)?;
+        let last_error_at = row.get::<TimestampWithTimeZone>(41).map_err(map_spi)?;
 
         Ok(StreamTableMeta {
             pgt_id,
@@ -1199,6 +1246,8 @@ impl StreamTableMeta {
             st_partition_key,
             max_differential_joins,
             max_delta_fraction,
+            last_error_message,
+            last_error_at,
         })
     }
 }

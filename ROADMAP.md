@@ -2607,6 +2607,13 @@ Target: reduce regression escape rate from ~15% to <5%.
 **Goal:** Advance tiered refresh scheduling with manual tier assignment
 and deliver opt-in UNLOGGED change buffers for reduced WAL amplification.
 
+### Quick Polish & Error State Circuit Breaker (Phase 1 + 1b) — ✅ Done
+
+- **C4:** `pg_trickle.planner_aggressive` GUC consolidates `merge_planner_hints` + `merge_work_mem_mb`. Old GUCs deprecated.
+- **DIAG-2:** Creation-time WARNING for group-rescan and low-cardinality algebraic aggregates. `agg_diff_cardinality_threshold` GUC added.
+- **DOC-OPM:** Operator support matrix summary table linked from `SQL_REFERENCE.md`.
+- **ERR-1:** Permanent failures immediately set `ERROR` status with `last_error_message`/`last_error_at`. API calls clear error state. E2E test pending.
+
 ### Tiered Refresh Scheduling (C-1)
 
 > Items from [PLAN_NEW_STUFF.md](plans/performance/PLAN_NEW_STUFF.md) Wave 3. Read risk

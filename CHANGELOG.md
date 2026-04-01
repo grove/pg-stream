@@ -8,7 +8,7 @@ For future plans and release milestones, see [ROADMAP.md](ROADMAP.md).
 ## Table of Contents
 
 <!-- TOC start -->
-- [Unreleased](#unreleased)
+- [Unreleased (0.14.0)](#unreleased-0140)
 - [0.13.0 — 2026-03-31](#0130--2026-03-31)
 - [0.12.0 — 2026-03-28](#0120--2026-03-28)
 - [0.11.0 — 2026-03-26](#0110--2026-03-26)
@@ -32,7 +32,58 @@ For future plans and release milestones, see [ROADMAP.md](ROADMAP.md).
 
 ---
 
-## [Unreleased]
+## [Unreleased] — 0.14.0
+
+### Added
+
+- **C4: `pg_trickle.planner_aggressive` GUC** — Consolidated boolean switch
+  that replaces the separate `merge_planner_hints` and `merge_work_mem_mb`
+  GUCs. When `true` (default), all planner hints for MERGE execution are
+  enabled. The old GUCs are still accepted but deprecated; they are ignored
+  at runtime in favor of `planner_aggressive`.
+
+- **DIAG-2: Aggregate cardinality warning at creation time** — When creating
+  a stream table with algebraic aggregates (SUM, COUNT, AVG) in DIFFERENTIAL
+  mode, a WARNING is emitted if the estimated GROUP BY cardinality (from
+  `pg_stats.n_distinct`) is below the configurable threshold
+  `pg_trickle.agg_diff_cardinality_threshold` (default: 1000). This helps
+  users identify cases where FULL or AUTO mode may be more efficient.
+
+- **DIAG-2: `pg_trickle.agg_diff_cardinality_threshold` GUC** — Configurable
+  threshold for the algebraic aggregate cardinality warning. Set to 0 to
+  disable the warning.
+
+- **DOC-OPM: Operator support matrix summary in SQL_REFERENCE.md** — Added
+  a summary table of the 60+ operator support matrix with a prominent link
+  to the full `DVM_OPERATORS.md` matrix, improving discoverability.
+
+- **ERR-1: Error state circuit breaker** — Permanent refresh failures now
+  immediately set the stream table status to `ERROR` with `last_error_message`
+  and `last_error_at` stored in the catalog. Previously, permanent errors
+  would cycle through multiple retries before reaching SUSPENDED. Now a single
+  permanent failure (e.g. `function max(jsonb) does not exist`) stops the
+  retry loop immediately.
+
+- **ERR-1: `last_error_message` and `last_error_at` catalog columns** — New
+  nullable columns on `pgt_stream_tables` that store the error message and
+  timestamp of the last permanent failure. Visible in the
+  `pgtrickle.stream_tables_info` view via `st.*`.
+
+### Changed
+
+- **ERR-1c: API calls clear error state** — `alter_stream_table`,
+  `create_or_replace_stream_table`, `resume_stream_table`, and successful
+  refresh completions now clear `last_error_message` and `last_error_at`,
+  allowing recovery from ERROR state.
+
+- **ERR-1: `refresh_stream_table` rejects ERROR status** — Manual refresh
+  now rejects stream tables in ERROR state (same as SUSPENDED). Use
+  `resume_stream_table` to clear the error first.
+
+### Deprecated
+
+- **`pg_trickle.merge_planner_hints`** — Use `pg_trickle.planner_aggressive`
+  instead. The GUC is still accepted but ignored at runtime.
 
 ---
 

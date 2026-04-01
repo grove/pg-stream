@@ -5102,6 +5102,8 @@ mod tests {
             st_partition_key: None,
             max_differential_joins: None,
             max_delta_fraction: None,
+            last_error_message: None,
+            last_error_at: None,
         }
     }
 

@@ -411,7 +411,8 @@ SELECT pg_catalog.pg_extension_config_dump('pgtrickle.pgt_watermark_groups', '')
 
 extension_sql!(
     r#"
--- Status overview view
+-- Status overview view (ERR-1d: last_error_message and last_error_at are
+-- included via st.* from pgt_stream_tables)
 CREATE OR REPLACE VIEW pgtrickle.stream_tables_info AS
 SELECT st.*,
        now() - st.last_refresh_at AS staleness,
