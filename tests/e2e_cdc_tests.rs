@@ -959,13 +959,8 @@ async fn test_sec2_unprivileged_dml_captured_by_immediate_cdc() {
     db.execute("INSERT INTO sec2_src VALUES (1, 'a'), (2, 'b')")
         .await;
 
-    db.create_st(
-        "sec2_st",
-        "SELECT id, val FROM sec2_src",
-        "1m",
-        "IMMEDIATE",
-    )
-    .await;
+    db.create_st("sec2_st", "SELECT id, val FROM sec2_src", "1m", "IMMEDIATE")
+        .await;
 
     assert_eq!(db.count("public.sec2_st").await, 2, "initial: 2 rows");
 
