@@ -191,7 +191,9 @@ pub fn create_change_trigger(
     // WAKE-1: PERFORM pg_notify wakes the scheduler immediately.
     let truncate_fn_sql = format!(
         "CREATE OR REPLACE FUNCTION {change_schema}.pg_trickle_cdc_truncate_fn_{oid}()
-         RETURNS trigger LANGUAGE plpgsql SECURITY DEFINER AS $$
+         RETURNS trigger LANGUAGE plpgsql
+         SECURITY DEFINER
+         SET search_path = pg_catalog, pgtrickle, pgtrickle_changes, public AS $$
          BEGIN
              INSERT INTO {change_schema}.changes_{oid}
                  (lsn, action)
@@ -1448,7 +1450,9 @@ fn build_row_trigger_fn_sql(
     // how many rows are affected. Cost is negligible (~0.5 µs).
     format!(
         "CREATE OR REPLACE FUNCTION {cs}.pg_trickle_cdc_fn_{oid}()
-         RETURNS trigger LANGUAGE plpgsql SECURITY DEFINER AS $$
+         RETURNS trigger LANGUAGE plpgsql
+         SECURITY DEFINER
+         SET search_path = pg_catalog, pgtrickle, pgtrickle_changes, public AS $$
          BEGIN
              IF TG_OP = 'INSERT' THEN
                  INSERT INTO {cs}.changes_{oid}
@@ -1533,7 +1537,9 @@ fn build_stmt_trigger_fn_sql(
     // WAKE-1: PERFORM pg_notify wakes the scheduler immediately.
     let ins_fn = format!(
         "CREATE OR REPLACE FUNCTION {cs}.pg_trickle_cdc_ins_fn_{oid}()
-         RETURNS trigger LANGUAGE plpgsql SECURITY DEFINER AS $$
+         RETURNS trigger LANGUAGE plpgsql
+         SECURITY DEFINER
+         SET search_path = pg_catalog, pgtrickle, pgtrickle_changes, public AS $$
          BEGIN
              INSERT INTO {cs}.changes_{oid}
                  (lsn, action, pk_hash{ncn})
@@ -1553,7 +1559,9 @@ fn build_stmt_trigger_fn_sql(
         // Keyless table: no PK join possible — model UPDATE as DELETE+INSERT.
         format!(
             "CREATE OR REPLACE FUNCTION {cs}.pg_trickle_cdc_upd_fn_{oid}()
-         RETURNS trigger LANGUAGE plpgsql SECURITY DEFINER AS $$
+         RETURNS trigger LANGUAGE plpgsql
+         SECURITY DEFINER
+         SET search_path = pg_catalog, pgtrickle, pgtrickle_changes, public AS $$
          BEGIN
              INSERT INTO {cs}.changes_{oid}
                  (lsn, action, pk_hash{ocn})
@@ -1589,7 +1597,9 @@ fn build_stmt_trigger_fn_sql(
         let not_exists_join = build_pk_join_condition(pk_columns);
         format!(
             "CREATE OR REPLACE FUNCTION {cs}.pg_trickle_cdc_upd_fn_{oid}()
-         RETURNS trigger LANGUAGE plpgsql SECURITY DEFINER AS $$
+         RETURNS trigger LANGUAGE plpgsql
+         SECURITY DEFINER
+         SET search_path = pg_catalog, pgtrickle, pgtrickle_changes, public AS $$
          BEGIN
              INSERT INTO {cs}.changes_{oid}
                  (lsn, action, pk_hash{uccd}{ncn}{ocn})
@@ -1618,7 +1628,9 @@ fn build_stmt_trigger_fn_sql(
     // WAKE-1: PERFORM pg_notify wakes the scheduler immediately.
     let del_fn = format!(
         "CREATE OR REPLACE FUNCTION {cs}.pg_trickle_cdc_del_fn_{oid}()
-         RETURNS trigger LANGUAGE plpgsql SECURITY DEFINER AS $$
+         RETURNS trigger LANGUAGE plpgsql
+         SECURITY DEFINER
+         SET search_path = pg_catalog, pgtrickle, pgtrickle_changes, public AS $$
          BEGIN
              INSERT INTO {cs}.changes_{oid}
                  (lsn, action, pk_hash{ocn})
