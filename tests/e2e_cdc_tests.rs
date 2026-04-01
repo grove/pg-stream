@@ -823,3 +823,210 @@ async fn test_f15_select_star_falls_back_to_full_capture() {
         );
     }
 }
+
+// ── SECURITY DEFINER privilege tests ──────────────────────────────────
+
+/// SEC-1: CDC triggers must fire successfully when DML is performed by a
+/// non-privileged role that has no access to the pgtrickle_changes schema.
+///
+/// This is the runtime proof that SECURITY DEFINER + SET search_path work
+/// correctly on the statement-level CDC trigger functions. Without
+/// SECURITY DEFINER the trigger executes as the invoking user and fails
+/// with "permission denied for schema pgtrickle_changes".
+///
+/// Covers: pg_trickle_cdc_ins_fn, pg_trickle_cdc_upd_fn,
+///         pg_trickle_cdc_del_fn, pg_trickle_cdc_truncate_fn
+#[tokio::test]
+async fn test_sec1_unprivileged_dml_captured_by_differential_cdc() {
+    let db = E2eDb::new().await.with_extension().await;
+
+    db.execute("CREATE TABLE sec1_src (id INT PRIMARY KEY, val TEXT NOT NULL)")
+        .await;
+    db.execute("INSERT INTO sec1_src VALUES (1, 'a'), (2, 'b'), (3, 'c')")
+        .await;
+
+    db.create_st(
+        "sec1_st",
+        "SELECT id, val FROM sec1_src",
+        "1m",
+        "DIFFERENTIAL",
+    )
+    .await;
+    db.refresh_st("sec1_st").await;
+
+    assert_eq!(db.count("public.sec1_st").await, 3, "initial: 3 rows");
+
+    // Create a role with DML on the source table only — no pgtrickle_changes access.
+    db.execute("CREATE ROLE sec1_writer LOGIN PASSWORD 'x'")
+        .await;
+    db.execute("GRANT USAGE ON SCHEMA public TO sec1_writer")
+        .await;
+    db.execute("GRANT SELECT, INSERT, UPDATE, DELETE, TRUNCATE ON public.sec1_src TO sec1_writer")
+        .await;
+
+    // INSERT as unprivileged user — trigger must not raise permission denied.
+    {
+        let mut txn = db.pool.begin().await.unwrap();
+        sqlx::query("SET LOCAL ROLE sec1_writer")
+            .execute(&mut *txn)
+            .await
+            .unwrap_or_else(|e| panic!("SET ROLE failed: {e}"));
+        sqlx::query("INSERT INTO public.sec1_src VALUES (4, 'd')")
+            .execute(&mut *txn)
+            .await
+            .unwrap_or_else(|e| panic!("INSERT as sec1_writer failed: {e}"));
+        txn.commit().await.unwrap();
+    }
+
+    db.refresh_st("sec1_st").await;
+    assert_eq!(db.count("public.sec1_st").await, 4, "after INSERT: 4 rows");
+
+    // UPDATE as unprivileged user.
+    {
+        let mut txn = db.pool.begin().await.unwrap();
+        sqlx::query("SET LOCAL ROLE sec1_writer")
+            .execute(&mut *txn)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE public.sec1_src SET val = 'updated' WHERE id = 1")
+            .execute(&mut *txn)
+            .await
+            .unwrap_or_else(|e| panic!("UPDATE as sec1_writer failed: {e}"));
+        txn.commit().await.unwrap();
+    }
+
+    db.refresh_st("sec1_st").await;
+    let updated_val: String = db
+        .query_scalar("SELECT val FROM public.sec1_st WHERE id = 1")
+        .await;
+    assert_eq!(
+        updated_val, "updated",
+        "UPDATE must be reflected in stream table"
+    );
+
+    // DELETE as unprivileged user.
+    {
+        let mut txn = db.pool.begin().await.unwrap();
+        sqlx::query("SET LOCAL ROLE sec1_writer")
+            .execute(&mut *txn)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM public.sec1_src WHERE id = 2")
+            .execute(&mut *txn)
+            .await
+            .unwrap_or_else(|e| panic!("DELETE as sec1_writer failed: {e}"));
+        txn.commit().await.unwrap();
+    }
+
+    db.refresh_st("sec1_st").await;
+    assert_eq!(db.count("public.sec1_st").await, 3, "after DELETE: 3 rows");
+    let deleted: bool = db
+        .query_scalar("SELECT EXISTS(SELECT 1 FROM public.sec1_st WHERE id = 2)")
+        .await;
+    assert!(!deleted, "deleted row must not appear in stream table");
+
+    // TRUNCATE as unprivileged user — hits the separate truncate trigger function.
+    {
+        let mut txn = db.pool.begin().await.unwrap();
+        sqlx::query("SET LOCAL ROLE sec1_writer")
+            .execute(&mut *txn)
+            .await
+            .unwrap();
+        sqlx::query("TRUNCATE public.sec1_src")
+            .execute(&mut *txn)
+            .await
+            .unwrap_or_else(|e| panic!("TRUNCATE as sec1_writer failed: {e}"));
+        txn.commit().await.unwrap();
+    }
+
+    db.refresh_st("sec1_st").await;
+    assert_eq!(
+        db.count("public.sec1_st").await,
+        0,
+        "after TRUNCATE: stream table must be empty"
+    );
+}
+
+/// SEC-2: CDC triggers must fire successfully when DML is performed by a
+/// non-privileged role against an IMMEDIATE-mode stream table (row-level
+/// trigger pg_trickle_cdc_fn).
+#[tokio::test]
+async fn test_sec2_unprivileged_dml_captured_by_immediate_cdc() {
+    let db = E2eDb::new().await.with_extension().await;
+
+    db.execute("CREATE TABLE sec2_src (id INT PRIMARY KEY, val TEXT NOT NULL)")
+        .await;
+    db.execute("INSERT INTO sec2_src VALUES (1, 'a'), (2, 'b')")
+        .await;
+
+    db.create_st("sec2_st", "SELECT id, val FROM sec2_src", "1m", "IMMEDIATE")
+        .await;
+
+    assert_eq!(db.count("public.sec2_st").await, 2, "initial: 2 rows");
+
+    // Create a role with DML on the source table only.
+    db.execute("CREATE ROLE sec2_writer LOGIN PASSWORD 'x'")
+        .await;
+    db.execute("GRANT USAGE ON SCHEMA public TO sec2_writer")
+        .await;
+    db.execute("GRANT SELECT, INSERT, UPDATE, DELETE ON public.sec2_src TO sec2_writer")
+        .await;
+
+    // INSERT as unprivileged user.
+    {
+        let mut txn = db.pool.begin().await.unwrap();
+        sqlx::query("SET LOCAL ROLE sec2_writer")
+            .execute(&mut *txn)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO public.sec2_src VALUES (3, 'c')")
+            .execute(&mut *txn)
+            .await
+            .unwrap_or_else(|e| panic!("INSERT as sec2_writer failed: {e}"));
+        txn.commit().await.unwrap();
+    }
+
+    db.refresh_st("sec2_st").await;
+    assert_eq!(db.count("public.sec2_st").await, 3, "after INSERT: 3 rows");
+
+    // UPDATE as unprivileged user.
+    {
+        let mut txn = db.pool.begin().await.unwrap();
+        sqlx::query("SET LOCAL ROLE sec2_writer")
+            .execute(&mut *txn)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE public.sec2_src SET val = 'updated' WHERE id = 1")
+            .execute(&mut *txn)
+            .await
+            .unwrap_or_else(|e| panic!("UPDATE as sec2_writer failed: {e}"));
+        txn.commit().await.unwrap();
+    }
+
+    db.refresh_st("sec2_st").await;
+    let val: String = db
+        .query_scalar("SELECT val FROM public.sec2_st WHERE id = 1")
+        .await;
+    assert_eq!(val, "updated", "UPDATE must be reflected in stream table");
+
+    // DELETE as unprivileged user.
+    {
+        let mut txn = db.pool.begin().await.unwrap();
+        sqlx::query("SET LOCAL ROLE sec2_writer")
+            .execute(&mut *txn)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM public.sec2_src WHERE id = 2")
+            .execute(&mut *txn)
+            .await
+            .unwrap_or_else(|e| panic!("DELETE as sec2_writer failed: {e}"));
+        txn.commit().await.unwrap();
+    }
+
+    db.refresh_st("sec2_st").await;
+    assert_eq!(db.count("public.sec2_st").await, 2, "after DELETE: 2 rows");
+    let gone: bool = db
+        .query_scalar("SELECT EXISTS(SELECT 1 FROM public.sec2_st WHERE id = 2)")
+        .await;
+    assert!(!gone, "deleted row must not appear in stream table");
+}
