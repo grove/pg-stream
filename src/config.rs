@@ -446,6 +446,24 @@ pub static PGS_AGG_DIFF_CARDINALITY_THRESHOLD: GucSetting<i32> = GucSetting::<i3
 /// bounded per coordinator by `max_concurrent_refreshes`.
 pub static PGS_PER_DATABASE_WORKER_QUOTA: GucSetting<i32> = GucSetting::<i32>::new(0);
 
+/// D-1a: Create new change buffer tables as UNLOGGED.
+///
+/// When `true`, newly created change buffer tables (`pgtrickle_changes.changes_*`)
+/// are created with `CREATE UNLOGGED TABLE` instead of `CREATE TABLE`. This
+/// eliminates WAL writes for trigger-inserted CDC rows, reducing WAL
+/// amplification by ~30%.
+///
+/// **Trade-off:** UNLOGGED tables are truncated on crash recovery and are
+/// not replicated to standbys. After a crash or standby restart, affected
+/// stream tables will automatically receive a FULL refresh on the next
+/// scheduler cycle to resynchronize.
+///
+/// Existing change buffer tables are not retroactively altered. Use
+/// `pgtrickle.convert_buffers_to_unlogged()` to convert existing buffers.
+///
+/// Default `false` — change buffers remain WAL-logged and crash-safe.
+pub static PGS_UNLOGGED_BUFFERS: GucSetting<bool> = GucSetting::<bool>::new(false);
+
 /// Register all GUC variables. Called from `_PG_init()`.
 pub fn register_gucs() {
     GucRegistry::define_bool_guc(
@@ -993,6 +1011,20 @@ pub fn register_gucs() {
         GucContext::Suset,
         GucFlags::default(),
     );
+
+    // D-1a: UNLOGGED change buffers.
+    GucRegistry::define_bool_guc(
+        c"pg_trickle.unlogged_buffers",
+        c"Create new change buffer tables as UNLOGGED to reduce WAL amplification.",
+        c"When true, new change buffer tables are UNLOGGED (no WAL writes). \
+           Reduces CDC WAL amplification by ~30% but buffers are lost on crash. \
+           After crash, affected stream tables receive an automatic FULL refresh. \
+           Existing buffers are not changed; use pgtrickle.convert_buffers_to_unlogged() \
+           to convert them. Default: false (crash-safe, WAL-logged).",
+        &PGS_UNLOGGED_BUFFERS,
+        GucContext::Suset,
+        GucFlags::default(),
+    );
 }
 
 // ── Convenience accessors ──────────────────────────────────────────────────
@@ -1278,6 +1310,11 @@ pub fn pg_trickle_event_driven_wake() -> bool {
 /// WAKE-1: Returns the debounce interval in milliseconds.
 pub fn pg_trickle_wake_debounce_ms() -> i32 {
     PGS_WAKE_DEBOUNCE_MS.get()
+}
+
+/// D-1a: Returns whether new change buffer tables should be created UNLOGGED.
+pub fn pg_trickle_unlogged_buffers() -> bool {
+    PGS_UNLOGGED_BUFFERS.get()
 }
 
 #[cfg(test)]

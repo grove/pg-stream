@@ -367,8 +367,16 @@ pub fn create_change_buffer_table(
         ""
     };
 
+    // D-1a: When unlogged_buffers GUC is enabled, create buffer as UNLOGGED
+    // to eliminate WAL writes for CDC trigger inserts.
+    let unlogged_kw = if crate::config::pg_trickle_unlogged_buffers() {
+        "UNLOGGED "
+    } else {
+        ""
+    };
+
     let sql = format!(
-        "CREATE TABLE IF NOT EXISTS {schema}.changes_{oid} (\
+        "CREATE {unlogged_kw}TABLE IF NOT EXISTS {schema}.changes_{oid} (\
             change_id   BIGSERIAL,\
             lsn         PG_LSN NOT NULL,\
             action      CHAR(1) NOT NULL\
@@ -461,8 +469,15 @@ pub fn create_st_change_buffer_table(
         .collect::<Vec<_>>()
         .join("");
 
+    // D-1a: When unlogged_buffers GUC is enabled, create buffer as UNLOGGED.
+    let unlogged_kw = if crate::config::pg_trickle_unlogged_buffers() {
+        "UNLOGGED "
+    } else {
+        ""
+    };
+
     let sql = format!(
-        "CREATE TABLE IF NOT EXISTS {schema}.changes_pgt_{id} (\
+        "CREATE {unlogged_kw}TABLE IF NOT EXISTS {schema}.changes_pgt_{id} (\
             change_id   BIGSERIAL,\
             lsn         PG_LSN NOT NULL,\
             action      CHAR(1) NOT NULL,\

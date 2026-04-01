@@ -879,6 +879,44 @@ SET pg_trickle.max_grouping_set_branches = 128;
 
 ---
 
+### pg_trickle.unlogged_buffers
+
+Create new change buffer tables as `UNLOGGED` to reduce WAL amplification
+from CDC trigger inserts.
+
+| Value | Behaviour |
+|-------|----------|
+| `false` | **(Default)** Change buffers are WAL-logged. Crash-safe — no data loss on crash recovery. |
+| `true` | New change buffers are created as `UNLOGGED`. Eliminates WAL writes for trigger-inserted rows, reducing WAL amplification by ~30%. **Trade-off:** buffers are truncated on crash recovery; affected stream tables automatically receive a FULL refresh on the next scheduler cycle. |
+
+**Default:** `false`
+**Context:** `SUSET` (superuser session-level)
+
+```sql
+-- Enable UNLOGGED buffers for new stream tables
+SET pg_trickle.unlogged_buffers = true;
+```
+
+> **Crash recovery:** After a PostgreSQL crash or standby restart, UNLOGGED
+> buffer tables are automatically truncated by PostgreSQL. The pg_trickle
+> scheduler detects this condition and enqueues a FULL refresh for each
+> affected stream table on the next tick. During the window between crash
+> recovery and FULL refresh completion, stream table data may be stale.
+
+> **Standby replicas:** UNLOGGED tables are not replicated to standbys.
+> Stream tables on read replicas will be stale after any standby restart
+> until the next FULL refresh completes on the primary.
+
+> **Converting existing buffers:** This GUC only affects *newly created*
+> change buffer tables. To convert existing logged buffers, use:
+> ```sql
+> SELECT pgtrickle.convert_buffers_to_unlogged();
+> ```
+> This function acquires `ACCESS EXCLUSIVE` lock on each buffer table.
+> Run it during a low-traffic maintenance window.
+
+---
+
 ### pg_trickle.max_parse_depth
 
 Maximum recursion depth for the query parser's tree visitors (G13-SD).

@@ -13,6 +13,19 @@
 --   ERR-1b: Permanent failure immediately sets ERROR status (Rust-side).
 --   ERR-1c: alter/create_or_replace/refresh clear error state (Rust-side).
 --   ERR-1d: Columns visible in stream_tables_info view via st.*.
+--
+-- Phase 2 — Manual Tiered Scheduling:
+--   C-1a/b: refresh_tier column + ALTER ... SET (tier=...) already exist (v0.11).
+--   C-1c:   Scheduler tier multipliers + frozen skip (already in Rust since v0.12).
+--   C-1b:   Added NOTICE on tier demotion from hot to cold/frozen (Rust-side).
+--           No catalog DDL required.
+--
+-- Phase 3 — UNLOGGED Change Buffers:
+--   D-1a:   pg_trickle.unlogged_buffers GUC (Rust-side, no catalog DDL).
+--   D-1b:   Crash recovery detection for UNLOGGED buffers (Rust-side).
+--   D-1c:   pgtrickle.convert_buffers_to_unlogged() function (Rust #[pg_extern]).
+--           No SQL DDL required — function is automatically available after
+--           extension update via ALTER EXTENSION pg_trickle UPDATE.
 
 -- ── ERR-1a: Error state columns (idempotent) ─────────────────────────────
 

@@ -2614,40 +2614,19 @@ and deliver opt-in UNLOGGED change buffers for reduced WAL amplification.
 - **DOC-OPM:** Operator support matrix summary table linked from `SQL_REFERENCE.md`.
 - **ERR-1:** Permanent failures immediately set `ERROR` status with `last_error_message`/`last_error_at`. API calls clear error state. E2E test pending.
 
-### Tiered Refresh Scheduling (C-1)
+### Manual Tiered Scheduling (Phase 2 — C-1) — ✅ Done
 
-> Items from [PLAN_NEW_STUFF.md](plans/performance/PLAN_NEW_STUFF.md) Wave 3. Read risk
-> analyses before implementing — particularly C-1's read-tracking pitfall.
+Tiered scheduling infrastructure was already in place since v0.11/v0.12 (`refresh_tier` column, `RefreshTier` enum, `ALTER ... SET (tier=...)`, scheduler multipliers). Phase 2 verified completeness and added:
 
-| Item | Description | Effort | Ref |
-|------|-------------|--------|-----|
-| C-1 | Tiered Refresh Scheduling — Hot/Warm/Cold/Frozen tier classification; lazy refresh for Cold/Frozen STs; configurable per-ST tier override; 80% scheduler-CPU reduction in large deployments | 3–4 wk | [PLAN_NEW_STUFF.md §C-1](plans/performance/PLAN_NEW_STUFF.md) |
+- **C-1b:** NOTICE on tier demotion from Hot to Cold/Frozen, alerting operators to the effective interval change.
+- **C-1c:** Scheduler tier-aware multipliers confirmed: Hot ×1, Warm ×2, Cold ×10, Frozen = skip. Gated by `pg_trickle.tiered_scheduling` (default `true` since v0.12.0).
 
-> ⚠️ C-1: Do **not** use raw `pg_stat_user_tables` `seq_scan`/`idx_scan` counters for tier
-> classification — pg_trickle's own internal refresh reads inflate these counters, causing
-> actively-refreshed-but-unread STs to appear Warm. Use delta-based read tracking or
-> expose explicit per-ST tier overrides only. See PLAN_NEW_STUFF.md §C-1 risk analysis.
+### UNLOGGED Change Buffers (Phase 3 — D-1) — ✅ Done
 
-> **Retraction consideration (C-1):** The auto-classification goal (80% scheduler-CPU
-> reduction) cannot be achieved with `pg_stat_user_tables` as the signal. Scope v0.14.0
-> to **manual-only tier assignment** (`ALTER STREAM TABLE … SET (tier = 'hot')`) only;
-> drop the Hot/Warm/Cold/Frozen auto-classification and the lazy-refresh trigger path.
-> Auto-classification requiring a custom `ExecutorStart/End` hook can be revisited
-> post-1.0. The effort estimate should drop from 3–4 wk to ~1 wk for the manual-only scope.
-
-> **Tiered scheduling subtotal: ~1–4 weeks**
-
-### UNLOGGED Change Buffers — Opt-In (D-1)
-
-| Item | Description | Effort | Ref |
-|------|-------------|--------|-----|
-| D-1 | UNLOGGED Change Buffers — create change buffers as `UNLOGGED` to reduce CDC WAL amplification; `pg_trickle.unlogged_buffers` GUC (default `false`, opt-in); crash recovery and standby promotion trigger FULL refresh | 1–2 wk | [PLAN_NEW_STUFF.md §D-1](plans/performance/PLAN_NEW_STUFF.md) |
-
-> Default flipped to `false` (opt-in only) to avoid forced FULL
-> refreshes on all stream tables for users who have not explicitly accepted the
-> crash/standby tradeoff.
-
-> **D-1 subtotal: ~1–2 weeks**
+- **D-1a:** `pg_trickle.unlogged_buffers` GUC (default `false`). New change buffer tables created as `UNLOGGED` when enabled, reducing WAL amplification by ~30%.
+- **D-1b:** Crash recovery detection — scheduler detects UNLOGGED buffers emptied by crash (postmaster restart after last refresh) and auto-enqueues FULL refresh.
+- **D-1c:** `pgtrickle.convert_buffers_to_unlogged()` utility function for converting existing logged buffers. Documents lock-window warning.
+- **D-1e:** Documentation in `CONFIGURATION.md` and `SQL_REFERENCE.md`.
 
 ### Documentation: Best-Practice Patterns Guide (G16-PAT)
 

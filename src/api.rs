@@ -3084,6 +3084,28 @@ fn alter_stream_table_impl(
             )));
         }
         let normalized = tier_str.to_lowercase();
+
+        // C-1b: Emit NOTICE when demoting from Hot to Cold or Frozen so
+        // operators are aware their configured interval will be multiplied.
+        let old_tier = RefreshTier::from_sql_str(&st.refresh_tier);
+        let new_tier = RefreshTier::from_sql_str(&normalized);
+        if old_tier == RefreshTier::Hot
+            && matches!(new_tier, RefreshTier::Cold | RefreshTier::Frozen)
+        {
+            let msg = match new_tier {
+                RefreshTier::Cold => format!(
+                    "stream table {}.{} demoted from hot to cold — effective refresh interval is now 10× the configured schedule",
+                    st.pgt_schema, st.pgt_name
+                ),
+                RefreshTier::Frozen => format!(
+                    "stream table {}.{} demoted from hot to frozen — refresh is suspended until the tier is changed back",
+                    st.pgt_schema, st.pgt_name
+                ),
+                _ => unreachable!(),
+            };
+            pgrx::notice!("{}", msg);
+        }
+
         StreamTableMeta::update_refresh_tier(st.pgt_id, &normalized)?;
     }
 
@@ -7510,6 +7532,87 @@ fn find_top_level_keyword(sql: &str, keyword: &str) -> Option<usize> {
 
 /// Restore stream tables from catalog entries after pg_restore.
 ///
+/// D-1c: Convert all existing logged change buffer tables to UNLOGGED.
+///
+/// Iterates all `pgtrickle_changes.changes_*` tables and converts any that
+/// are currently WAL-logged (`relpersistence = 'p'`) to UNLOGGED (`'u'`).
+/// Each conversion acquires `ACCESS EXCLUSIVE` lock on the buffer table,
+/// so this function should be run during a low-traffic maintenance window.
+///
+/// Returns the number of buffer tables converted.
+///
+/// **Warning:** After conversion, buffer contents will be lost on crash
+/// recovery. The scheduler will automatically schedule a FULL refresh for
+/// affected stream tables after a crash (see D-1b).
+#[pg_extern(schema = "pgtrickle")]
+fn convert_buffers_to_unlogged() -> Result<i64, PgTrickleError> {
+    let change_schema = crate::config::pg_trickle_change_buffer_schema();
+
+    // Find all logged buffer tables in the change schema.
+    let logged_buffers: Vec<String> = Spi::connect(|client| {
+        let table = client
+            .select(
+                &format!(
+                    "SELECT c.relname::text \
+                     FROM pg_class c \
+                     JOIN pg_namespace n ON n.oid = c.relnamespace \
+                     WHERE n.nspname = '{schema}' \
+                       AND c.relname LIKE 'changes\\_%' \
+                       AND c.relpersistence = 'p' \
+                       AND c.relkind IN ('r', 'p')",
+                    schema = change_schema,
+                ),
+                None,
+                &[],
+            )
+            .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
+
+        let mut names = Vec::new();
+        for row in table {
+            if let Some(name) = row.get::<String>(1).ok().flatten() {
+                names.push(name);
+            }
+        }
+        Ok::<_, PgTrickleError>(names)
+    })?;
+
+    if logged_buffers.is_empty() {
+        pgrx::notice!("no logged change buffer tables found — nothing to convert");
+        return Ok(0);
+    }
+
+    let mut converted = 0i64;
+    for table_name in &logged_buffers {
+        let sql = format!(
+            "ALTER TABLE {schema}.{table} SET UNLOGGED",
+            schema = change_schema,
+            table = table_name,
+        );
+        match Spi::run(&sql) {
+            Ok(()) => {
+                converted += 1;
+                pgrx::notice!("converted {}.{} to UNLOGGED", change_schema, table_name,);
+            }
+            Err(e) => {
+                pgrx::warning!(
+                    "failed to convert {}.{} to UNLOGGED: {}",
+                    change_schema,
+                    table_name,
+                    e,
+                );
+            }
+        }
+    }
+
+    pgrx::notice!(
+        "converted {} of {} change buffer tables to UNLOGGED",
+        converted,
+        logged_buffers.len(),
+    );
+
+    Ok(converted)
+}
+
 /// During a `pg_restore`, `pg_dump` will restore the base storage tables and
 /// the `pgtrickle.pgt_stream_tables` catalog, but the necessary CDC triggers
 /// and internal wiring will be missing. This function re-establishes them.

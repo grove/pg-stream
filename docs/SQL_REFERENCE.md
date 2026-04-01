@@ -3444,6 +3444,34 @@ SELECT * FROM pgtrickle.shared_buffer_stats();
 
 ---
 
+## UNLOGGED Change Buffers (v0.14.0)
+
+### `pgtrickle.convert_buffers_to_unlogged()`
+
+Converts all existing logged change buffer tables to `UNLOGGED`. This
+eliminates WAL writes for trigger-inserted CDC rows, reducing WAL
+amplification by ~30%.
+
+**Returns:** `bigint` — the number of buffer tables converted.
+
+```sql
+SELECT pgtrickle.convert_buffers_to_unlogged();
+-- convert_buffers_to_unlogged
+-- ----------------------------
+--                            5
+```
+
+> **Warning:** Each conversion acquires `ACCESS EXCLUSIVE` lock on the buffer
+> table. Run this function during a low-traffic maintenance window to minimize
+> lock contention.
+
+> **After conversion:** Buffer contents will be lost on crash recovery. The
+> scheduler automatically detects this and enqueues a FULL refresh for
+> affected stream tables. See [`pg_trickle.unlogged_buffers`](CONFIGURATION.md#pg_trickleunlogged_buffers)
+> for the full trade-off discussion.
+
+---
+
 ## dbt Integration (v0.13.0)
 
 The `dbt-pgtrickle` package exposes two new `config(...)` keys added in

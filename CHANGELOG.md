@@ -69,6 +69,25 @@ For future plans and release milestones, see [ROADMAP.md](ROADMAP.md).
   timestamp of the last permanent failure. Visible in the
   `pgtrickle.stream_tables_info` view via `st.*`.
 
+- **C-1b: Tier demotion NOTICE** — `ALTER STREAM TABLE ... SET (tier = 'cold')`
+  and `SET (tier = 'frozen')` now emit a NOTICE when demoting from Hot tier,
+  alerting operators that the effective refresh interval has changed (10×
+  multiplier for Cold, suspended for Frozen).
+
+- **D-1a: `pg_trickle.unlogged_buffers` GUC** — When `true`, newly created
+  change buffer tables are `UNLOGGED`, eliminating WAL writes for CDC trigger
+  inserts and reducing WAL amplification by ~30%. Default `false` (crash-safe).
+
+- **D-1b: Crash recovery detection for UNLOGGED buffers** — The scheduler
+  detects when an UNLOGGED buffer was truncated by crash recovery (empty
+  buffer + postmaster restart after last refresh) and automatically enqueues
+  a FULL refresh to resynchronize the stream table.
+
+- **D-1c: `pgtrickle.convert_buffers_to_unlogged()` utility** — Converts all
+  existing logged change buffer tables to `UNLOGGED`. Returns the count of
+  converted tables. Acquires `ACCESS EXCLUSIVE` lock per table — run during
+  low-traffic windows.
+
 ### Changed
 
 - **ERR-1c: API calls clear error state** — `alter_stream_table`,
