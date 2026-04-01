@@ -3824,9 +3824,57 @@ fn execute_manual_full_refresh(
         frontier.set_st_source(*upstream_pgt_id, lsn.clone(), data_ts.clone());
     }
 
-    StreamTableMeta::store_frontier_and_complete_refresh(st.pgt_id, &frontier, 0)?;
+    // Detect no-op FULL refresh: check if any upstream ST source has a
+    // data_timestamp newer than ours.  If not, the TRUNCATE+INSERT above
+    // reproduced identical data, so we must NOT bump data_timestamp —
+    // otherwise downstream CALCULATED stream tables see a false "upstream
+    // changed" signal and their own data_timestamp drifts on every no-op
+    // cycle.
+    //
+    // This uses catalog data_timestamps (stable, not affected by change
+    // buffer cleanup) rather than frontier LSN comparisons (which become
+    // unreliable when buffer rows are consumed and MAX(lsn) falls back to
+    // pg_current_wal_lsn()).
+    let has_upstream_st_change = Spi::get_one::<bool>(&format!(
+        "SELECT EXISTS( \
+           SELECT 1 \
+           FROM pgtrickle.pgt_dependencies dep \
+           JOIN pgtrickle.pgt_stream_tables upstream \
+                ON upstream.pgt_relid = dep.source_relid \
+           WHERE dep.pgt_id = {pgt_id} \
+             AND dep.source_type = 'STREAM_TABLE' \
+             AND upstream.data_timestamp > COALESCE( \
+                   (SELECT data_timestamp \
+                    FROM pgtrickle.pgt_stream_tables \
+                    WHERE pgt_id = {pgt_id}), \
+                   '-infinity'::timestamptz) \
+         )",
+        pgt_id = st.pgt_id,
+    ))
+    .unwrap_or(Some(false))
+    .unwrap_or(false);
 
-    pgrx::info!("Stream table {}.{} refreshed (FULL)", schema, table_name);
+    // Also check WAL-based sources: if any slot position advanced
+    // beyond the previous frontier, data changed.
+    let prev_frontier = st.frontier.clone().unwrap_or_default();
+    let has_wal_change = slot_positions
+        .iter()
+        .any(|(oid, lsn)| prev_frontier.get_lsn(*oid) != *lsn);
+
+    if has_upstream_st_change || has_wal_change || prev_frontier.is_empty() {
+        StreamTableMeta::store_frontier_and_complete_refresh(st.pgt_id, &frontier, 0)?;
+        pgrx::info!("Stream table {}.{} refreshed (FULL)", schema, table_name);
+    } else {
+        // No upstream changes — store frontier but preserve data_timestamp.
+        StreamTableMeta::store_frontier(st.pgt_id, &frontier)?;
+        StreamTableMeta::update_after_no_data_refresh(st.pgt_id)?;
+        pgrx::info!(
+            "Stream table {}.{} refreshed (FULL, no-op — data_timestamp preserved)",
+            schema,
+            table_name
+        );
+    }
+
     Ok(())
 }
 
