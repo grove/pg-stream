@@ -368,7 +368,7 @@ async fn test_staleness_uses_last_refresh_at_not_data_timestamp() {
         )
         .await;
     assert!(
-        staleness_secs < 300.0,
+        staleness_secs < 120.0,
         "staleness ({staleness_secs:.1}s) should reflect last_refresh_at (~60s ago), \
          not data_timestamp (~7200s ago)"
     );
@@ -432,6 +432,165 @@ async fn test_stale_null_without_schedule() {
     assert!(
         stale.is_none(),
         "stale should be NULL for a stream table without a schedule"
+    );
+}
+
+#[tokio::test]
+async fn test_stale_null_when_last_refresh_at_is_null() {
+    // A scheduled table that has never been refreshed (last_refresh_at IS NULL)
+    // should have stale = NULL, not false. stream_tables_info computes
+    // EXTRACT(EPOCH FROM (now() - NULL)) which is NULL, so the comparison
+    // evaluates to NULL — correctly indicating "unknown" rather than "not stale".
+    let db = TestDb::with_catalog().await;
+
+    db.execute("CREATE TABLE never_refreshed (id INT)").await;
+    let oid: i32 = db
+        .query_scalar("SELECT 'never_refreshed'::regclass::oid::int")
+        .await;
+
+    db.execute(&format!(
+        "INSERT INTO pgtrickle.pgt_stream_tables \
+         (pgt_relid, pgt_name, pgt_schema, defining_query, schedule, \
+          refresh_mode, status, is_populated) \
+         VALUES ({}, 'never_st', 'public', 'SELECT * FROM never_refreshed', \
+                 '5m', 'FULL', 'INITIALIZING', false)",
+        oid
+    ))
+    .await;
+
+    let stale: Option<bool> = db
+        .query_scalar_opt(
+            "SELECT stale FROM pgtrickle.stream_tables_info WHERE pgt_name = 'never_st'",
+        )
+        .await;
+    assert!(
+        stale.is_none(),
+        "stale should be NULL for a scheduled table that has never been refreshed \
+         (last_refresh_at IS NULL)"
+    );
+
+    let staleness: Option<f64> = db
+        .query_scalar_opt(
+            "SELECT EXTRACT(EPOCH FROM staleness) \
+             FROM pgtrickle.stream_tables_info WHERE pgt_name = 'never_st'",
+        )
+        .await;
+    assert!(
+        staleness.is_none(),
+        "staleness should be NULL when last_refresh_at is NULL"
+    );
+}
+
+// ── pg_stat_stream_tables View ────────────────────────────────────────────
+
+#[tokio::test]
+async fn test_pg_stat_stream_tables_stale_true_when_overdue() {
+    let db = TestDb::with_catalog().await;
+
+    db.execute("CREATE TABLE pgstat_stale_src (id INT)").await;
+    let oid: i32 = db
+        .query_scalar("SELECT 'pgstat_stale_src'::regclass::oid::int")
+        .await;
+
+    db.execute(&format!(
+        "INSERT INTO pgtrickle.pgt_stream_tables \
+         (pgt_relid, pgt_name, pgt_schema, defining_query, schedule, \
+          refresh_mode, status, is_populated, last_refresh_at) \
+         VALUES ({}, 'pgstat_stale_st', 'public', 'SELECT * FROM pgstat_stale_src', \
+                 '5m', 'FULL', 'ACTIVE', true, now() - interval '10 minutes')",
+        oid
+    ))
+    .await;
+
+    let stale: bool = db
+        .query_scalar(
+            "SELECT stale FROM pgtrickle.pg_stat_stream_tables \
+             WHERE pgt_name = 'pgstat_stale_st'",
+        )
+        .await;
+    assert!(
+        stale,
+        "pg_stat_stream_tables.stale should be true when last_refresh_at exceeds schedule"
+    );
+}
+
+#[tokio::test]
+async fn test_pg_stat_stream_tables_nodata_not_stale() {
+    // Regression: old data_timestamp + recent last_refresh_at must not be stale
+    // in pg_stat_stream_tables (same fix as stream_tables_info).
+    let db = TestDb::with_catalog().await;
+
+    db.execute("CREATE TABLE pgstat_nodata_src (id INT)").await;
+    let oid: i32 = db
+        .query_scalar("SELECT 'pgstat_nodata_src'::regclass::oid::int")
+        .await;
+
+    db.execute(&format!(
+        "INSERT INTO pgtrickle.pgt_stream_tables \
+         (pgt_relid, pgt_name, pgt_schema, defining_query, schedule, \
+          refresh_mode, status, is_populated, data_timestamp, last_refresh_at) \
+         VALUES ({}, 'pgstat_nodata_st', 'public', 'SELECT * FROM pgstat_nodata_src', \
+                 '5m', 'FULL', 'ACTIVE', true, \
+                 now() - interval '2 hours', now() - interval '1 minute')",
+        oid
+    ))
+    .await;
+
+    let stale: bool = db
+        .query_scalar(
+            "SELECT stale FROM pgtrickle.pg_stat_stream_tables \
+             WHERE pgt_name = 'pgstat_nodata_st'",
+        )
+        .await;
+    assert!(
+        !stale,
+        "pg_stat_stream_tables.stale should be false when last_refresh_at is recent, \
+         even if data_timestamp is hours old (NO_DATA pass scenario)"
+    );
+
+    let staleness_secs: f64 = db
+        .query_scalar(
+            "SELECT EXTRACT(EPOCH FROM staleness) \
+             FROM pgtrickle.pg_stat_stream_tables WHERE pgt_name = 'pgstat_nodata_st'",
+        )
+        .await;
+    assert!(
+        staleness_secs < 120.0,
+        "pg_stat_stream_tables.staleness ({staleness_secs:.1}s) should reflect \
+         last_refresh_at (~60s ago), not data_timestamp (~7200s ago)"
+    );
+}
+
+#[tokio::test]
+async fn test_pg_stat_stream_tables_stale_null_when_never_refreshed() {
+    // last_refresh_at IS NULL (explicit guard in pg_stat_stream_tables CASE WHEN)
+    // should yield stale = NULL, not false.
+    let db = TestDb::with_catalog().await;
+
+    db.execute("CREATE TABLE pgstat_null_src (id INT)").await;
+    let oid: i32 = db
+        .query_scalar("SELECT 'pgstat_null_src'::regclass::oid::int")
+        .await;
+
+    db.execute(&format!(
+        "INSERT INTO pgtrickle.pgt_stream_tables \
+         (pgt_relid, pgt_name, pgt_schema, defining_query, schedule, \
+          refresh_mode, status, is_populated) \
+         VALUES ({}, 'pgstat_null_st', 'public', 'SELECT * FROM pgstat_null_src', \
+                 '5m', 'FULL', 'INITIALIZING', false)",
+        oid
+    ))
+    .await;
+
+    let stale: Option<bool> = db
+        .query_scalar_opt(
+            "SELECT stale FROM pgtrickle.pg_stat_stream_tables \
+             WHERE pgt_name = 'pgstat_null_st'",
+        )
+        .await;
+    assert!(
+        stale.is_none(),
+        "pg_stat_stream_tables.stale should be NULL when last_refresh_at has never been set"
     );
 }
 

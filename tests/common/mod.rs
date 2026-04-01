@@ -142,6 +142,55 @@ SELECT st.*,
        END AS stale
 FROM pgtrickle.pgt_stream_tables st;
 
+CREATE OR REPLACE VIEW pgtrickle.pg_stat_stream_tables AS
+SELECT
+    st.pgt_id,
+    st.pgt_schema,
+    st.pgt_name,
+    st.status,
+    st.refresh_mode,
+    st.is_populated,
+    st.data_timestamp,
+    st.schedule,
+    now() - st.last_refresh_at AS staleness,
+    CASE WHEN st.schedule IS NOT NULL AND st.last_refresh_at IS NOT NULL
+              AND st.schedule !~ '[\s@]'
+         THEN EXTRACT(EPOCH FROM (now() - st.last_refresh_at)) >
+              pgtrickle.parse_duration_seconds(st.schedule)
+         ELSE NULL::boolean
+    END AS stale,
+    st.consecutive_errors,
+    st.needs_reinit,
+    st.last_refresh_at,
+    COALESCE(stats.total_refreshes, 0) AS total_refreshes,
+    COALESCE(stats.successful_refreshes, 0) AS successful_refreshes,
+    COALESCE(stats.failed_refreshes, 0) AS failed_refreshes,
+    COALESCE(stats.total_rows_inserted, 0) AS total_rows_inserted,
+    COALESCE(stats.total_rows_deleted, 0) AS total_rows_deleted,
+    stats.avg_duration_ms,
+    stats.last_action,
+    stats.last_status
+FROM pgtrickle.pgt_stream_tables st
+LEFT JOIN LATERAL (
+    SELECT
+        count(*)::bigint AS total_refreshes,
+        count(*) FILTER (WHERE h.status = 'COMPLETED')::bigint AS successful_refreshes,
+        count(*) FILTER (WHERE h.status = 'FAILED')::bigint AS failed_refreshes,
+        COALESCE(sum(h.rows_inserted), 0)::bigint AS total_rows_inserted,
+        COALESCE(sum(h.rows_deleted), 0)::bigint AS total_rows_deleted,
+        CASE WHEN count(*) FILTER (WHERE h.end_time IS NOT NULL) > 0
+             THEN avg(EXTRACT(EPOCH FROM (h.end_time - h.start_time)) * 1000)
+                  FILTER (WHERE h.end_time IS NOT NULL)
+             ELSE NULL
+        END::float8 AS avg_duration_ms,
+        (SELECT h2.action FROM pgtrickle.pgt_refresh_history h2
+         WHERE h2.pgt_id = st.pgt_id ORDER BY h2.refresh_id DESC LIMIT 1) AS last_action,
+        (SELECT h2.status FROM pgtrickle.pgt_refresh_history h2
+         WHERE h2.pgt_id = st.pgt_id ORDER BY h2.refresh_id DESC LIMIT 1) AS last_status
+    FROM pgtrickle.pgt_refresh_history h
+    WHERE h.pgt_id = st.pgt_id
+) stats ON true;
+
 CREATE OR REPLACE VIEW pgtrickle.quick_health AS
 SELECT
     (SELECT count(*) FROM pgtrickle.pgt_stream_tables)::bigint

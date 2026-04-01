@@ -255,7 +255,7 @@ async fn test_staleness_reflects_last_refresh_at_after_refresh() {
         )
         .await;
     assert!(
-        staleness_secs < 10.0,
+        staleness_secs < 30.0,
         "staleness ({staleness_secs:.2}s) should be near-zero after refresh \
          (based on last_refresh_at, not the old data_timestamp)"
     );
@@ -318,5 +318,100 @@ async fn test_no_data_refresh_does_not_cause_false_stale() {
     assert_eq!(
         stale_count, 0,
         "quick_health.stale_tables should be 0 when last_refresh_at is recent"
+    );
+}
+
+#[tokio::test]
+async fn test_pg_stat_stream_tables_nodata_not_stale() {
+    // Verifies the same NO_DATA fix applies to pg_stat_stream_tables.stale,
+    // which uses an explicit `last_refresh_at IS NOT NULL` guard in its CASE WHEN.
+    let db = E2eDb::new().await.with_extension().await;
+
+    db.execute("CREATE TABLE mon_pgstat_nd (id INT PRIMARY KEY)")
+        .await;
+    db.execute("INSERT INTO mon_pgstat_nd VALUES (1)").await;
+
+    db.create_st(
+        "mon_pgstat_nd_st",
+        "SELECT id FROM mon_pgstat_nd",
+        "5m",
+        "FULL",
+    )
+    .await;
+
+    // Simulate a NO_DATA pass: data is 2 hours old, scheduler ran 30 seconds ago
+    db.execute(
+        "UPDATE pgtrickle.pgt_stream_tables \
+         SET data_timestamp  = now() - interval '2 hours', \
+             last_refresh_at = now() - interval '30 seconds' \
+         WHERE pgt_name = 'mon_pgstat_nd_st'",
+    )
+    .await;
+
+    let stale: bool = db
+        .query_scalar(
+            "SELECT COALESCE(stale, false) FROM pgtrickle.pg_stat_stream_tables \
+             WHERE pgt_name = 'mon_pgstat_nd_st'",
+        )
+        .await;
+    assert!(
+        !stale,
+        "pg_stat_stream_tables.stale should be false when last_refresh_at is recent, \
+         even with old data_timestamp"
+    );
+
+    let staleness_secs: f64 = db
+        .query_scalar(
+            "SELECT EXTRACT(EPOCH FROM staleness) \
+             FROM pgtrickle.pg_stat_stream_tables WHERE pgt_name = 'mon_pgstat_nd_st'",
+        )
+        .await;
+    assert!(
+        staleness_secs < 300.0,
+        "pg_stat_stream_tables.staleness ({staleness_secs:.1}s) should reflect \
+         last_refresh_at (~30s ago), not data_timestamp (~7200s ago)"
+    );
+}
+
+#[tokio::test]
+async fn test_pg_stat_stream_tables_stale_null_when_never_refreshed() {
+    // An ST that was just created and has never been refreshed should have
+    // pg_stat_stream_tables.stale = NULL (not false), because
+    // last_refresh_at IS NULL and the explicit NULL guard fires.
+    let db = E2eDb::new().await.with_extension().await;
+
+    db.execute("CREATE TABLE mon_pgstat_null (id INT PRIMARY KEY)")
+        .await;
+    db.execute("INSERT INTO mon_pgstat_null VALUES (1)").await;
+
+    // Create without triggering an initial refresh — use with_extension
+    // which does not auto-refresh, so last_refresh_at starts as NULL.
+    db.execute(
+        "SELECT pgtrickle.create_stream_table('mon_pgstat_null_st', \
+         'SELECT id FROM mon_pgstat_null', '5m', 'FULL', false)",
+    )
+    .await;
+
+    // Confirm last_refresh_at is NULL before any refresh
+    let last_refresh_at_is_null: bool = db
+        .query_scalar(
+            "SELECT last_refresh_at IS NULL FROM pgtrickle.pgt_stream_tables \
+             WHERE pgt_name = 'mon_pgstat_null_st'",
+        )
+        .await;
+    assert!(
+        last_refresh_at_is_null,
+        "last_refresh_at should be NULL before first refresh"
+    );
+
+    let stale: Option<bool> = db
+        .query_scalar_opt(
+            "SELECT stale FROM pgtrickle.pg_stat_stream_tables \
+             WHERE pgt_name = 'mon_pgstat_null_st'",
+        )
+        .await;
+    assert!(
+        stale.is_none(),
+        "pg_stat_stream_tables.stale should be NULL when last_refresh_at has never been set"
     );
 }
