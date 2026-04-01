@@ -139,6 +139,15 @@ For future plans and release milestones, see [ROADMAP.md](ROADMAP.md).
   now rejects stream tables in ERROR state (same as SUSPENDED). Use
   `resume_stream_table` to clear the error first.
 
+### Fixed
+
+- **FIX-STST-DIFF: DIFFERENTIAL manual refresh for ST-on-ST path** — Manual
+  `refresh_stream_table()` calls on calculated stream tables (reading from
+  another stream table) now use true DIFFERENTIAL refresh via the
+  `changes_pgt_` change buffers, matching the scheduler path. Previously,
+  manual refresh unconditionally fell back to FULL refresh for any stream
+  table with ST sources.
+
 ### Deprecated
 
 - **`pg_trickle.merge_planner_hints`** — Use `pg_trickle.planner_aggressive`

@@ -3973,13 +3973,6 @@ fn execute_manual_differential_refresh(
 ) -> Result<(), PgTrickleError> {
     // If the ST has never been refreshed (frontier is None), fall back to
     // a FULL refresh to establish the baseline frontier.
-    //
-    // NOTE: we check `st.frontier.is_none()` rather than
-    // `prev_frontier.is_empty()` because STs whose sources are other stream
-    // tables (not raw tables) produce frontiers with `sources = {}` — those
-    // frontiers are non-default but still "empty" in the WAL-source sense.
-    // Without this distinction the first manual refresh would ALWAYS be a
-    // full refresh for ST-on-ST, bumping data_timestamp on every call.
     if st.frontier.is_none() {
         pgrx::info!(
             "Stream table {}.{}: no previous frontier, performing FULL refresh first",
@@ -3991,39 +3984,47 @@ fn execute_manual_differential_refresh(
 
     let prev_frontier = st.frontier.clone().unwrap_or_default();
 
-    // For STs whose sources are all STREAM_TABLEs (frontier.sources is empty
-    // because there are no WAL change buffers to track), always do a FULL
-    // refresh so the data is guaranteed correct. The background scheduler
-    // may have done a partial FULL refresh (some upstream STs not yet
-    // refreshed) which cannot be detected reliably by comparing timestamps
-    // or change buffer LSNs alone.
+    // If the frontier exists but tracks zero sources, the ST was populated
+    // via FULL but never differentially refreshed. Fall back to FULL to
+    // establish proper source tracking.
     if prev_frontier.is_empty() {
         return execute_manual_full_refresh(st, schema, table_name, source_oids);
     }
 
     refresh::poll_foreign_table_sources_for_st(st)?;
 
-    // Mixed-dependency guard: if ANY upstream is a STREAM_TABLE, always do
-    // a FULL refresh.  The background scheduler may race with manual
-    // refreshes of upstream STs, producing a FULL refresh of this ST from
-    // partially-updated upstream data. Because the scheduler's frontier
-    // captures the latest change buffer LSN at the time of its refresh,
-    // there is no reliable after-the-fact signal to distinguish "scheduler
-    // correctly consumed all changes" from "scheduler read stale upstream
-    // data."  Unconditionally re-running the FULL refresh guarantees that
-    // the manual refresh always returns correct data.
-    {
-        let deps = StDependency::get_for_st(st.pgt_id).unwrap_or_default();
-        let has_st_source = deps.iter().any(|dep| dep.source_type == "STREAM_TABLE");
-        if has_st_source {
-            return execute_manual_full_refresh(st, schema, table_name, source_oids);
-        }
-    }
-
-    // Get current WAL positions (reuses source_oids from caller — G-N3)
+    // Get current WAL positions for non-ST sources (reuses source_oids — G-N3)
     let slot_positions = cdc::get_slot_positions(source_oids)?;
     let data_ts = get_data_timestamp_str();
-    let new_frontier = version::compute_new_frontier(&slot_positions, &data_ts);
+    let mut new_frontier = version::compute_new_frontier(&slot_positions, &data_ts);
+
+    // FIX-STST-DIFF: Collect ST source LSN positions from their change
+    // buffers, matching the scheduler's approach. This enables DIFFERENTIAL
+    // refresh for manual calls on STs that read from other stream tables.
+    let change_schema = crate::config::pg_trickle_change_buffer_schema();
+    let deps = StDependency::get_for_st(st.pgt_id).unwrap_or_default();
+    for dep in &deps {
+        if dep.source_type != "STREAM_TABLE" {
+            continue;
+        }
+        let upstream_pgt_id = match StreamTableMeta::pgt_id_for_relid(dep.source_relid) {
+            Some(id) => id,
+            None => continue,
+        };
+        if !cdc::has_st_change_buffer(upstream_pgt_id, &change_schema) {
+            continue;
+        }
+        // Read max LSN from the upstream ST change buffer (same as scheduler).
+        let lsn = Spi::get_one::<String>(&format!(
+            "SELECT COALESCE(MAX(lsn)::text, pg_current_wal_lsn()::text) \
+             FROM \"{schema}\".changes_pgt_{id}",
+            schema = change_schema,
+            id = upstream_pgt_id,
+        ))
+        .unwrap_or(None)
+        .unwrap_or_else(|| "0/0".to_string());
+        new_frontier.set_st_source(upstream_pgt_id, lsn, data_ts.clone());
+    }
 
     // Execute the differential refresh via the DVM engine
     let (rows_inserted, rows_deleted) =

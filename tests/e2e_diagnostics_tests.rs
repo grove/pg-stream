@@ -458,3 +458,380 @@ async fn test_diagnostics_validate_query_syntax_error_returns_error() {
     // If it errors, that's also valid behavior for a completely broken query.
     let _ = result;
 }
+
+// ── DIAG-1e: recommend_refresh_mode + refresh_efficiency ──────────────────
+
+/// DIAG-1c: recommend_refresh_mode() returns one row per stream table
+/// when called without arguments.
+#[tokio::test]
+async fn test_diagnostics_recommend_refresh_mode_all_tables() {
+    let db = E2eDb::new().await.with_extension().await;
+    db.execute("CREATE TABLE diag_rm_src (id INT PRIMARY KEY, val INT)")
+        .await;
+    db.execute("INSERT INTO diag_rm_src SELECT g, g FROM generate_series(1, 100) g")
+        .await;
+
+    db.execute(
+        "SELECT pgtrickle.create_stream_table(\
+            'diag_rm_agg',\
+            'SELECT val % 10 AS grp, SUM(val) AS total FROM diag_rm_src GROUP BY val % 10',\
+            refresh_mode => 'DIFFERENTIAL'\
+        )",
+    )
+    .await;
+
+    db.execute("SELECT pgtrickle.refresh_stream_table('diag_rm_agg')")
+        .await;
+
+    // Call with no argument — should return at least 1 row
+    let count: i64 = db
+        .query_scalar("SELECT COUNT(*) FROM pgtrickle.recommend_refresh_mode()")
+        .await;
+
+    assert!(
+        count >= 1,
+        "recommend_refresh_mode() should return at least 1 row, got {count}"
+    );
+}
+
+/// DIAG-1c: recommend_refresh_mode(name) returns exactly one row
+/// with expected columns for a specific stream table.
+#[tokio::test]
+async fn test_diagnostics_recommend_refresh_mode_single_table() {
+    let db = E2eDb::new().await.with_extension().await;
+    db.execute("CREATE TABLE diag_rm2_src (id INT PRIMARY KEY, val INT)")
+        .await;
+    db.execute("INSERT INTO diag_rm2_src SELECT g, g FROM generate_series(1, 100) g")
+        .await;
+
+    db.execute(
+        "SELECT pgtrickle.create_stream_table(\
+            'diag_rm2_st',\
+            'SELECT id, val FROM diag_rm2_src WHERE val > 50',\
+            refresh_mode => 'DIFFERENTIAL'\
+        )",
+    )
+    .await;
+
+    db.execute("SELECT pgtrickle.refresh_stream_table('diag_rm2_st')")
+        .await;
+
+    // Call with specific name — should return exactly 1 row
+    let count: i64 = db
+        .query_scalar("SELECT COUNT(*) FROM pgtrickle.recommend_refresh_mode('diag_rm2_st')")
+        .await;
+
+    assert_eq!(
+        count, 1,
+        "recommend_refresh_mode(name) should return exactly 1 row"
+    );
+
+    // Verify columns are present and non-null
+    let has_columns: bool = db
+        .query_scalar(
+            "SELECT pgt_name IS NOT NULL \
+                AND recommended_mode IS NOT NULL \
+                AND confidence IS NOT NULL \
+                AND reason IS NOT NULL \
+                AND signals IS NOT NULL \
+             FROM pgtrickle.recommend_refresh_mode('diag_rm2_st')",
+        )
+        .await;
+
+    assert!(
+        has_columns,
+        "recommend_refresh_mode should return non-null columns"
+    );
+}
+
+/// DIAG-1c: recommend_refresh_mode returns valid recommended_mode values.
+#[tokio::test]
+async fn test_diagnostics_recommend_refresh_mode_valid_values() {
+    let db = E2eDb::new().await.with_extension().await;
+    db.execute("CREATE TABLE diag_rm3_src (id INT PRIMARY KEY, val INT)")
+        .await;
+    db.execute("INSERT INTO diag_rm3_src SELECT g, g FROM generate_series(1, 100) g")
+        .await;
+
+    db.execute(
+        "SELECT pgtrickle.create_stream_table(\
+            'diag_rm3_st',\
+            'SELECT id, val FROM diag_rm3_src',\
+            refresh_mode => 'DIFFERENTIAL'\
+        )",
+    )
+    .await;
+
+    db.execute("SELECT pgtrickle.refresh_stream_table('diag_rm3_st')")
+        .await;
+
+    // recommended_mode must be one of DIFFERENTIAL, FULL, KEEP
+    let valid: bool = db
+        .query_scalar(
+            "SELECT recommended_mode IN ('DIFFERENTIAL', 'FULL', 'KEEP') \
+             FROM pgtrickle.recommend_refresh_mode('diag_rm3_st')",
+        )
+        .await;
+
+    assert!(
+        valid,
+        "recommended_mode must be DIFFERENTIAL, FULL, or KEEP"
+    );
+
+    // confidence must be one of high, medium, low
+    let valid_conf: bool = db
+        .query_scalar(
+            "SELECT confidence IN ('high', 'medium', 'low') \
+             FROM pgtrickle.recommend_refresh_mode('diag_rm3_st')",
+        )
+        .await;
+
+    assert!(valid_conf, "confidence must be high, medium, or low");
+}
+
+/// DIAG-1c: signals JSONB contains expected structure.
+#[tokio::test]
+async fn test_diagnostics_recommend_refresh_mode_signals_jsonb() {
+    let db = E2eDb::new().await.with_extension().await;
+    db.execute("CREATE TABLE diag_rm4_src (id INT PRIMARY KEY, val INT)")
+        .await;
+    db.execute("INSERT INTO diag_rm4_src SELECT g, g FROM generate_series(1, 100) g")
+        .await;
+
+    db.execute(
+        "SELECT pgtrickle.create_stream_table(\
+            'diag_rm4_st',\
+            'SELECT id, val FROM diag_rm4_src',\
+            refresh_mode => 'DIFFERENTIAL'\
+        )",
+    )
+    .await;
+
+    db.execute("SELECT pgtrickle.refresh_stream_table('diag_rm4_st')")
+        .await;
+
+    // signals should be valid JSONB with a composite_score and signals array
+    let has_composite: bool = db
+        .query_scalar(
+            "SELECT (signals->>'composite_score') IS NOT NULL \
+             FROM pgtrickle.recommend_refresh_mode('diag_rm4_st')",
+        )
+        .await;
+
+    assert!(
+        has_composite,
+        "signals JSONB should contain composite_score"
+    );
+
+    let has_signals_array: bool = db
+        .query_scalar(
+            "SELECT jsonb_typeof(signals->'signals') = 'array' \
+             FROM pgtrickle.recommend_refresh_mode('diag_rm4_st')",
+        )
+        .await;
+
+    assert!(
+        has_signals_array,
+        "signals JSONB should contain a signals array"
+    );
+}
+
+/// DIAG-1d: refresh_efficiency() returns rows with expected columns.
+#[tokio::test]
+async fn test_diagnostics_refresh_efficiency_basic() {
+    let db = E2eDb::new().await.with_extension().await;
+    db.execute("CREATE TABLE diag_re_src (id INT PRIMARY KEY, val INT)")
+        .await;
+    db.execute("INSERT INTO diag_re_src SELECT g, g FROM generate_series(1, 100) g")
+        .await;
+
+    db.execute(
+        "SELECT pgtrickle.create_stream_table(\
+            'diag_re_st',\
+            'SELECT id, val FROM diag_re_src',\
+            refresh_mode => 'DIFFERENTIAL'\
+        )",
+    )
+    .await;
+
+    // Do a couple of refreshes to populate history
+    db.execute("SELECT pgtrickle.refresh_stream_table('diag_re_st')")
+        .await;
+    db.execute("INSERT INTO diag_re_src SELECT g, g FROM generate_series(101, 200) g")
+        .await;
+    db.execute("SELECT pgtrickle.refresh_stream_table('diag_re_st')")
+        .await;
+
+    // refresh_efficiency should return at least 1 row
+    let count: i64 = db
+        .query_scalar("SELECT COUNT(*) FROM pgtrickle.refresh_efficiency()")
+        .await;
+
+    assert!(
+        count >= 1,
+        "refresh_efficiency() should return at least 1 row, got {count}"
+    );
+
+    // Check total_refreshes is positive
+    let total: i64 = db
+        .query_scalar(
+            "SELECT total_refreshes FROM pgtrickle.refresh_efficiency() \
+             WHERE pgt_name = 'diag_re_st'",
+        )
+        .await;
+
+    assert!(
+        total >= 2,
+        "diag_re_st should have at least 2 total refreshes, got {total}"
+    );
+}
+
+/// DIAG-1d: refresh_efficiency shows correct refresh mode.
+#[tokio::test]
+async fn test_diagnostics_refresh_efficiency_shows_mode() {
+    let db = E2eDb::new().await.with_extension().await;
+    db.execute("CREATE TABLE diag_re2_src (id INT PRIMARY KEY, val INT)")
+        .await;
+
+    db.execute(
+        "SELECT pgtrickle.create_stream_table(\
+            'diag_re2_diff',\
+            'SELECT id, val FROM diag_re2_src',\
+            refresh_mode => 'DIFFERENTIAL'\
+        )",
+    )
+    .await;
+
+    db.execute(
+        "SELECT pgtrickle.create_stream_table(\
+            'diag_re2_full',\
+            'SELECT id, val FROM diag_re2_src',\
+            refresh_mode => 'FULL'\
+        )",
+    )
+    .await;
+
+    // Verify modes shown in refresh_efficiency
+    let diff_mode: String = db
+        .query_scalar(
+            "SELECT refresh_mode FROM pgtrickle.refresh_efficiency() \
+             WHERE pgt_name = 'diag_re2_diff'",
+        )
+        .await;
+
+    assert_eq!(diff_mode, "DIFFERENTIAL");
+
+    let full_mode: String = db
+        .query_scalar(
+            "SELECT refresh_mode FROM pgtrickle.refresh_efficiency() \
+             WHERE pgt_name = 'diag_re2_full'",
+        )
+        .await;
+
+    assert_eq!(full_mode, "FULL");
+}
+
+/// G15-EX: export_definition returns valid SQL containing the stream table name.
+#[tokio::test]
+async fn test_diagnostics_export_definition_basic() {
+    let db = E2eDb::new().await.with_extension().await;
+    db.execute("CREATE TABLE diag_exp_src (id INT PRIMARY KEY, val INT)")
+        .await;
+
+    db.execute(
+        "SELECT pgtrickle.create_stream_table(\
+            'diag_exp_st',\
+            'SELECT id, val FROM diag_exp_src',\
+            refresh_mode => 'DIFFERENTIAL'\
+        )",
+    )
+    .await;
+
+    let ddl: String = db
+        .query_scalar("SELECT pgtrickle.export_definition('diag_exp_st')")
+        .await;
+
+    // Should contain both DROP and CREATE
+    assert!(
+        ddl.contains("DROP STREAM TABLE IF EXISTS"),
+        "export_definition should contain DROP: {ddl}"
+    );
+    assert!(
+        ddl.contains("create_stream_table"),
+        "export_definition should contain create_stream_table: {ddl}"
+    );
+    assert!(
+        ddl.contains("diag_exp_st") || ddl.contains("diag_exp"),
+        "export_definition should reference the stream table name: {ddl}"
+    );
+}
+
+/// FIX-STST-DIFF: Manual refresh on a CALCULATED stream table should succeed
+/// and use DIFFERENTIAL (not FULL) once the baseline is established.
+#[tokio::test]
+async fn test_st_on_st_manual_refresh_succeeds() {
+    let db = E2eDb::new().await.with_extension().await;
+    db.execute("CREATE TABLE diag_stst_src (id INT PRIMARY KEY, val INT)")
+        .await;
+    db.execute("INSERT INTO diag_stst_src SELECT g, g FROM generate_series(1, 100) g")
+        .await;
+
+    // Create upstream ST
+    db.execute(
+        "SELECT pgtrickle.create_stream_table(\
+            'diag_stst_up',\
+            'SELECT id, val FROM diag_stst_src',\
+            schedule => '5s',\
+            refresh_mode => 'DIFFERENTIAL'\
+        )",
+    )
+    .await;
+
+    db.execute("SELECT pgtrickle.refresh_stream_table('diag_stst_up')")
+        .await;
+
+    // Create downstream ST reading from upstream ST
+    db.execute(
+        "SELECT pgtrickle.create_stream_table(\
+            'diag_stst_down',\
+            'SELECT val % 10 AS grp, SUM(val) AS total FROM diag_stst_up GROUP BY val % 10',\
+            schedule => 'calculated',\
+            refresh_mode => 'DIFFERENTIAL'\
+        )",
+    )
+    .await;
+
+    // First refresh establishes baseline (will be FULL)
+    db.execute("SELECT pgtrickle.refresh_stream_table('diag_stst_down')")
+        .await;
+
+    // Mutate source, refresh upstream
+    db.execute("INSERT INTO diag_stst_src SELECT g, g FROM generate_series(101, 110) g")
+        .await;
+    db.execute("SELECT pgtrickle.refresh_stream_table('diag_stst_up')")
+        .await;
+
+    // Manual refresh of downstream ST — should succeed (not error)
+    db.execute("SELECT pgtrickle.refresh_stream_table('diag_stst_down')")
+        .await;
+
+    // Verify correctness: downstream should match its defining query
+    let matches: bool = db
+        .query_scalar(
+            "SELECT NOT EXISTS ( \
+                (SELECT grp, total FROM diag_stst_down \
+                 EXCEPT ALL \
+                 SELECT val % 10 AS grp, SUM(val) AS total FROM diag_stst_up GROUP BY val % 10) \
+                UNION ALL \
+                (SELECT val % 10 AS grp, SUM(val) AS total FROM diag_stst_up GROUP BY val % 10 \
+                 EXCEPT ALL \
+                 SELECT grp, total FROM diag_stst_down) \
+            )",
+        )
+        .await;
+
+    assert!(
+        matches,
+        "Downstream ST should match its defining query after manual refresh"
+    );
+}

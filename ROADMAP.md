@@ -2670,7 +2670,7 @@ Tiered scheduling infrastructure was already in place since v0.11/v0.12 (`refres
 | ~~DIAG-1b~~ | ~~SPI data-gathering layer~~ | — | ✅ Done |
 | ~~DIAG-1c~~ | ~~`pgtrickle.recommend_refresh_mode()` SQL function~~ | — | ✅ Done |
 | ~~DIAG-1d~~ | ~~`pgtrickle.refresh_efficiency()` function~~ | — | ✅ Done |
-| DIAG-1e | E2E integration tests; upgrade migration | 0.5–1d | [PLAN_DIAGNOSTICS_FUNCTION.md](plans/performance/PLAN_DIAGNOSTICS_FUNCTION.md) §6 D-5 |
+| ~~DIAG-1e~~ | ~~E2E integration tests; upgrade migration~~ | — | ✅ Done |
 | ~~DIAG-1f~~ | ~~Documentation: SQL_REFERENCE.md additions~~ | — | ✅ Done |
 
 > The function synthesises 7 weighted signals (historical change ratio 0.30,
@@ -2762,7 +2762,7 @@ Tiered scheduling infrastructure was already in place since v0.11/v0.12 (`refres
 
 | Item | Description | Effort | Ref |
 |------|-------------|--------|-----|
-| FIX-STST-DIFF | **DIFFERENTIAL manual refresh for ST-on-ST.** In `execute_manual_differential_refresh` (`src/api.rs`), replace the unconditional FULL fallback for `has_st_source` with a proper change-buffer delta path: read rows from `changes_pgt_{upstream_pgt_id}` beyond the stored frontier LSN, run DVM differential SQL, advance the frontier. Matches the scheduler path exactly. Fixes `test_st_on_st_uses_differential_not_full`. | ~1–2d | — |
+| ~~FIX-STST-DIFF~~ | ~~**DIFFERENTIAL manual refresh for ST-on-ST.** In `execute_manual_differential_refresh` (`src/api.rs`), replace the unconditional FULL fallback for `has_st_source` with a proper change-buffer delta path: read rows from `changes_pgt_{upstream_pgt_id}` beyond the stored frontier LSN, run DVM differential SQL, advance the frontier. Matches the scheduler path exactly. Fixes `test_st_on_st_uses_differential_not_full`.~~ | — | ✅ Done |
 
 > **FIX-STST-DIFF subtotal: ~1–2 days**
 
