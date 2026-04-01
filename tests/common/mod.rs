@@ -133,14 +133,44 @@ END; $$;
 
 CREATE OR REPLACE VIEW pgtrickle.stream_tables_info AS
 SELECT st.*,
-       now() - st.data_timestamp AS staleness,
+       now() - st.last_refresh_at AS staleness,
        CASE WHEN st.schedule IS NOT NULL
                  AND st.schedule !~ '[\s@]'
-            THEN EXTRACT(EPOCH FROM (now() - st.data_timestamp)) >
+            THEN EXTRACT(EPOCH FROM (now() - st.last_refresh_at)) >
                  pgtrickle.parse_duration_seconds(st.schedule)
             ELSE NULL::boolean
        END AS stale
 FROM pgtrickle.pgt_stream_tables st;
+
+CREATE OR REPLACE VIEW pgtrickle.quick_health AS
+SELECT
+    (SELECT count(*) FROM pgtrickle.pgt_stream_tables)::bigint
+        AS total_stream_tables,
+    (SELECT count(*) FROM pgtrickle.pgt_stream_tables
+     WHERE status = 'ERROR' OR consecutive_errors > 0)::bigint
+        AS error_tables,
+    (SELECT count(*) FROM pgtrickle.pgt_stream_tables
+     WHERE schedule IS NOT NULL
+       AND schedule !~ '[\s@]'
+       AND last_refresh_at IS NOT NULL
+       AND EXTRACT(EPOCH FROM (now() - last_refresh_at)) >
+           pgtrickle.parse_duration_seconds(schedule))::bigint
+        AS stale_tables,
+    (SELECT count(*) > 0 FROM pg_stat_activity
+     WHERE backend_type = 'pg_trickle scheduler')
+        AS scheduler_running,
+    CASE
+        WHEN (SELECT count(*) FROM pgtrickle.pgt_stream_tables) = 0 THEN 'EMPTY'
+        WHEN (SELECT count(*) FROM pgtrickle.pgt_stream_tables WHERE status = 'SUSPENDED') > 0 THEN 'CRITICAL'
+        WHEN (SELECT count(*) FROM pgtrickle.pgt_stream_tables WHERE status = 'ERROR' OR consecutive_errors > 0) > 0 THEN 'WARNING'
+        WHEN (SELECT count(*) FROM pgtrickle.pgt_stream_tables
+              WHERE schedule IS NOT NULL
+                AND schedule !~ '[\s@]'
+                AND last_refresh_at IS NOT NULL
+                AND EXTRACT(EPOCH FROM (now() - last_refresh_at)) >
+                    pgtrickle.parse_duration_seconds(schedule)) > 0 THEN 'WARNING'
+        ELSE 'OK'
+    END AS status;
 "#;
 
 /// A test database backed by a Testcontainers PostgreSQL 18.3 instance.
