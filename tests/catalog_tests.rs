@@ -302,11 +302,11 @@ async fn test_stream_tables_info_view() {
         .query_scalar("SELECT 'view_source'::regclass::oid::int")
         .await;
 
-    // Insert with a data timestamp in the past
+    // Insert with last_refresh_at in the past — this is the staleness clock
     db.execute(&format!(
         "INSERT INTO pgtrickle.pgt_stream_tables \
          (pgt_relid, pgt_name, pgt_schema, defining_query, schedule, \
-          refresh_mode, status, is_populated, data_timestamp) \
+          refresh_mode, status, is_populated, last_refresh_at) \
          VALUES ({}, 'view_st', 'public', 'SELECT * FROM view_source', \
                  '5m', 'FULL', 'ACTIVE', true, now() - interval '10 minutes')",
         oid
@@ -319,8 +319,230 @@ async fn test_stream_tables_info_view() {
         .await;
     assert!(
         stale,
-        "10-minute old data with 5-minute target should be stale"
+        "last_refresh_at 10 minutes ago with 5-minute schedule should be stale"
     );
+}
+
+#[tokio::test]
+async fn test_staleness_uses_last_refresh_at_not_data_timestamp() {
+    // Regression test: a table that was checked recently (NO_DATA pass) but whose
+    // data_timestamp is old should NOT be considered stale. Before this fix,
+    // staleness was computed from data_timestamp, causing false stale signals for
+    // idle-but-healthy tables.
+    let db = TestDb::with_catalog().await;
+
+    db.execute("CREATE TABLE nodata_source (id INT)").await;
+    let oid: i32 = db
+        .query_scalar("SELECT 'nodata_source'::regclass::oid::int")
+        .await;
+
+    // data_timestamp is old (simulates a table with no recent writes),
+    // but last_refresh_at is recent (scheduler ran successfully with NO_DATA).
+    db.execute(&format!(
+        "INSERT INTO pgtrickle.pgt_stream_tables \
+         (pgt_relid, pgt_name, pgt_schema, defining_query, schedule, \
+          refresh_mode, status, is_populated, data_timestamp, last_refresh_at) \
+         VALUES ({}, 'nodata_st', 'public', 'SELECT * FROM nodata_source', \
+                 '5m', 'FULL', 'ACTIVE', true, \
+                 now() - interval '2 hours', \
+                 now() - interval '1 minute')",
+        oid
+    ))
+    .await;
+
+    let stale: bool = db
+        .query_scalar(
+            "SELECT stale FROM pgtrickle.stream_tables_info WHERE pgt_name = 'nodata_st'",
+        )
+        .await;
+    assert!(
+        !stale,
+        "old data_timestamp with recent last_refresh_at should NOT be stale \
+         (scheduler ran on schedule, just no new data)"
+    );
+
+    let staleness_secs: f64 = db
+        .query_scalar(
+            "SELECT EXTRACT(EPOCH FROM staleness) \
+             FROM pgtrickle.stream_tables_info WHERE pgt_name = 'nodata_st'",
+        )
+        .await;
+    assert!(
+        staleness_secs < 300.0,
+        "staleness ({staleness_secs:.1}s) should reflect last_refresh_at (~60s ago), \
+         not data_timestamp (~7200s ago)"
+    );
+}
+
+#[tokio::test]
+async fn test_stale_false_when_last_refresh_at_is_recent() {
+    let db = TestDb::with_catalog().await;
+
+    db.execute("CREATE TABLE fresh_source (id INT)").await;
+    let oid: i32 = db
+        .query_scalar("SELECT 'fresh_source'::regclass::oid::int")
+        .await;
+
+    db.execute(&format!(
+        "INSERT INTO pgtrickle.pgt_stream_tables \
+         (pgt_relid, pgt_name, pgt_schema, defining_query, schedule, \
+          refresh_mode, status, is_populated, last_refresh_at) \
+         VALUES ({}, 'fresh_st', 'public', 'SELECT * FROM fresh_source', \
+                 '5m', 'FULL', 'ACTIVE', true, now() - interval '1 minute')",
+        oid
+    ))
+    .await;
+
+    let stale: bool = db
+        .query_scalar(
+            "SELECT stale FROM pgtrickle.stream_tables_info WHERE pgt_name = 'fresh_st'",
+        )
+        .await;
+    assert!(
+        !stale,
+        "last_refresh_at 1 minute ago with 5-minute schedule should not be stale"
+    );
+}
+
+#[tokio::test]
+async fn test_stale_null_without_schedule() {
+    // stale should be NULL when no schedule is set (not a scheduled ST)
+    let db = TestDb::with_catalog().await;
+
+    db.execute("CREATE TABLE unsched_source (id INT)").await;
+    let oid: i32 = db
+        .query_scalar("SELECT 'unsched_source'::regclass::oid::int")
+        .await;
+
+    db.execute(&format!(
+        "INSERT INTO pgtrickle.pgt_stream_tables \
+         (pgt_relid, pgt_name, pgt_schema, defining_query, \
+          refresh_mode, status, is_populated, last_refresh_at) \
+         VALUES ({}, 'unsched_st', 'public', 'SELECT * FROM unsched_source', \
+                 'FULL', 'ACTIVE', true, now() - interval '1 hour')",
+        oid
+    ))
+    .await;
+
+    let stale: Option<bool> = db
+        .query_scalar_opt(
+            "SELECT stale FROM pgtrickle.stream_tables_info WHERE pgt_name = 'unsched_st'",
+        )
+        .await;
+    assert!(
+        stale.is_none(),
+        "stale should be NULL for a stream table without a schedule"
+    );
+}
+
+// ── quick_health View ─────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn test_quick_health_stale_count_uses_last_refresh_at() {
+    // Verifies that quick_health.stale_tables counts tables based on
+    // last_refresh_at, not data_timestamp.
+    let db = TestDb::with_catalog().await;
+
+    db.execute("CREATE TABLE qh_src1 (id INT)").await;
+    db.execute("CREATE TABLE qh_src2 (id INT)").await;
+    let oid1: i32 = db
+        .query_scalar("SELECT 'qh_src1'::regclass::oid::int")
+        .await;
+    let oid2: i32 = db
+        .query_scalar("SELECT 'qh_src2'::regclass::oid::int")
+        .await;
+
+    // Table 1: last_refresh_at is stale (10 min ago, schedule 5m) — old data too
+    db.execute(&format!(
+        "INSERT INTO pgtrickle.pgt_stream_tables \
+         (pgt_relid, pgt_name, pgt_schema, defining_query, schedule, \
+          refresh_mode, status, is_populated, data_timestamp, last_refresh_at) \
+         VALUES ({}, 'qh_stale', 'public', 'SELECT * FROM qh_src1', \
+                 '5m', 'FULL', 'ACTIVE', true, \
+                 now() - interval '2 hours', now() - interval '10 minutes')",
+        oid1
+    ))
+    .await;
+
+    // Table 2: last_refresh_at is recent (1 min ago, schedule 5m) but data is old —
+    // this simulates a NO_DATA refresh pass and should NOT count as stale.
+    db.execute(&format!(
+        "INSERT INTO pgtrickle.pgt_stream_tables \
+         (pgt_relid, pgt_name, pgt_schema, defining_query, schedule, \
+          refresh_mode, status, is_populated, data_timestamp, last_refresh_at) \
+         VALUES ({}, 'qh_nodata', 'public', 'SELECT * FROM qh_src2', \
+                 '5m', 'FULL', 'ACTIVE', true, \
+                 now() - interval '2 hours', now() - interval '1 minute')",
+        oid2
+    ))
+    .await;
+
+    let stale_count: i64 = db
+        .query_scalar("SELECT stale_tables FROM pgtrickle.quick_health")
+        .await;
+    assert_eq!(
+        stale_count, 1,
+        "only the table with stale last_refresh_at should be counted; \
+         old data_timestamp alone must not trigger stale count"
+    );
+}
+
+#[tokio::test]
+async fn test_quick_health_status_ok_when_no_stale_tables() {
+    let db = TestDb::with_catalog().await;
+
+    db.execute("CREATE TABLE qh_ok_src (id INT)").await;
+    let oid: i32 = db
+        .query_scalar("SELECT 'qh_ok_src'::regclass::oid::int")
+        .await;
+
+    db.execute(&format!(
+        "INSERT INTO pgtrickle.pgt_stream_tables \
+         (pgt_relid, pgt_name, pgt_schema, defining_query, schedule, \
+          refresh_mode, status, is_populated, last_refresh_at) \
+         VALUES ({}, 'qh_ok_st', 'public', 'SELECT * FROM qh_ok_src', \
+                 '5m', 'FULL', 'ACTIVE', true, now() - interval '1 minute')",
+        oid
+    ))
+    .await;
+
+    let status: String = db
+        .query_scalar("SELECT status FROM pgtrickle.quick_health")
+        .await;
+    assert_eq!(status, "OK", "health status should be OK when no tables are stale");
+}
+
+#[tokio::test]
+async fn test_quick_health_status_warning_when_stale() {
+    let db = TestDb::with_catalog().await;
+
+    db.execute("CREATE TABLE qh_warn_src (id INT)").await;
+    let oid: i32 = db
+        .query_scalar("SELECT 'qh_warn_src'::regclass::oid::int")
+        .await;
+
+    db.execute(&format!(
+        "INSERT INTO pgtrickle.pgt_stream_tables \
+         (pgt_relid, pgt_name, pgt_schema, defining_query, schedule, \
+          refresh_mode, status, is_populated, last_refresh_at) \
+         VALUES ({}, 'qh_warn_st', 'public', 'SELECT * FROM qh_warn_src', \
+                 '5m', 'FULL', 'ACTIVE', true, now() - interval '10 minutes')",
+        oid
+    ))
+    .await;
+
+    let status: String = db
+        .query_scalar("SELECT status FROM pgtrickle.quick_health")
+        .await;
+    assert_eq!(
+        status, "WARNING",
+        "health status should be WARNING when a scheduled table has stale last_refresh_at"
+    );
+
+    let stale_count: i64 = db
+        .query_scalar("SELECT stale_tables FROM pgtrickle.quick_health")
+        .await;
+    assert_eq!(stale_count, 1);
 }
 
 // ── CDC Tracking Table ─────────────────────────────────────────────────────

@@ -219,3 +219,104 @@ async fn test_refresh_history_records() {
     let count = db.count("public.mon_hist_st").await;
     assert_eq!(count, 4, "ST should have all 4 rows after refreshes");
 }
+
+#[tokio::test]
+async fn test_staleness_reflects_last_refresh_at_after_refresh() {
+    // Verify that staleness in stream_tables_info is based on last_refresh_at
+    // by checking that it resets to near-zero right after a manual refresh,
+    // regardless of how old data_timestamp was before.
+    let db = E2eDb::new().await.with_extension().await;
+
+    db.execute("CREATE TABLE mon_lrat (id INT PRIMARY KEY)")
+        .await;
+    db.execute("INSERT INTO mon_lrat VALUES (1)").await;
+
+    db.create_st("mon_lrat_st", "SELECT id FROM mon_lrat", "1m", "FULL")
+        .await;
+
+    // Wind back data_timestamp to simulate old data, but leave last_refresh_at alone
+    db.execute(
+        "UPDATE pgtrickle.pgt_stream_tables \
+         SET data_timestamp = now() - interval '2 hours' \
+         WHERE pgt_name = 'mon_lrat_st'",
+    )
+    .await;
+
+    // Perform a refresh — this updates last_refresh_at to now()
+    db.execute("INSERT INTO mon_lrat VALUES (2)").await;
+    db.refresh_st("mon_lrat_st").await;
+
+    // staleness should be small (< 10 seconds) because last_refresh_at was just updated,
+    // even though data_timestamp was artificially set 2 hours in the past before the refresh.
+    let staleness_secs: f64 = db
+        .query_scalar(
+            "SELECT EXTRACT(EPOCH FROM staleness) \
+             FROM pgtrickle.stream_tables_info WHERE pgt_name = 'mon_lrat_st'",
+        )
+        .await;
+    assert!(
+        staleness_secs < 10.0,
+        "staleness ({staleness_secs:.2}s) should be near-zero after refresh \
+         (based on last_refresh_at, not the old data_timestamp)"
+    );
+
+    let stale: bool = db
+        .query_scalar(
+            "SELECT COALESCE(stale, false) FROM pgtrickle.stream_tables_info \
+             WHERE pgt_name = 'mon_lrat_st'",
+        )
+        .await;
+    assert!(
+        !stale,
+        "should not be stale right after refresh even with an old data_timestamp"
+    );
+}
+
+#[tokio::test]
+async fn test_no_data_refresh_does_not_cause_false_stale() {
+    // Regression test: simulates a NO_DATA scheduler pass by directly advancing
+    // last_refresh_at without changing data_timestamp. The table should not be
+    // marked stale, because the scheduler ran on schedule.
+    let db = E2eDb::new().await.with_extension().await;
+
+    db.execute("CREATE TABLE mon_nodata (id INT PRIMARY KEY)")
+        .await;
+    db.execute("INSERT INTO mon_nodata VALUES (1)").await;
+
+    db.create_st(
+        "mon_nodata_st",
+        "SELECT id FROM mon_nodata",
+        "5m",
+        "FULL",
+    )
+    .await;
+
+    // Simulate: data hasn't changed in 2 hours, but the scheduler checked 30 seconds ago
+    db.execute(
+        "UPDATE pgtrickle.pgt_stream_tables \
+         SET data_timestamp    = now() - interval '2 hours', \
+             last_refresh_at   = now() - interval '30 seconds' \
+         WHERE pgt_name = 'mon_nodata_st'",
+    )
+    .await;
+
+    let stale: bool = db
+        .query_scalar(
+            "SELECT COALESCE(stale, false) FROM pgtrickle.stream_tables_info \
+             WHERE pgt_name = 'mon_nodata_st'",
+        )
+        .await;
+    assert!(
+        !stale,
+        "table with recent last_refresh_at should not be stale, \
+         even if data_timestamp is 2 hours old (NO_DATA pass scenario)"
+    );
+
+    let stale_count: i64 = db
+        .query_scalar("SELECT stale_tables FROM pgtrickle.quick_health")
+        .await;
+    assert_eq!(
+        stale_count, 0,
+        "quick_health.stale_tables should be 0 when last_refresh_at is recent"
+    );
+}
