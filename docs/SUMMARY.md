@@ -19,6 +19,9 @@
 # Integrations
 
 - [dbt-pgtrickle](integrations/dbt.md)
+- [CloudNativePG / Kubernetes](integrations/cloudnativepg.md)
+- [Prometheus & Grafana](integrations/prometheus.md)
+- [PgBouncer & Connection Poolers](integrations/pgbouncer.md)
 
 ---
 
@@ -39,6 +42,12 @@
 - [Row-Level Security (RLS)](tutorials/ROW_LEVEL_SECURITY.md)
 - [Partitioned Tables](tutorials/PARTITIONED_TABLES.md)
 - [Foreign Table Sources](tutorials/FOREIGN_TABLE_SOURCES.md)
+- [Migrating from Materialized Views](tutorials/MIGRATING_FROM_MATERIALIZED_VIEWS.md)
+- [Fuse Circuit Breaker](tutorials/FUSE_CIRCUIT_BREAKER.md)
+- [Tiered Scheduling](tutorials/TIERED_SCHEDULING.md)
+- [Circular Dependencies](tutorials/CIRCULAR_DEPENDENCIES.md)
+- [Monitoring & Alerting](tutorials/MONITORING_AND_ALERTING.md)
+- [ETL & Bulk Load Patterns](tutorials/ETL_BULK_LOAD.md)
 
 ---
 
@@ -56,6 +65,6 @@
 
 - [DBSP Comparison](research/DBSP_COMPARISON.md)
 - [Prior Art](research/PRIOR_ART.md)
-- [Custom SQL Syntax](../plans/sql/REPORT_CUSTOM_SQL_SYNTAX.md)
+- [Custom SQL Syntax](research/CUSTOM_SQL_SYNTAX.md)
 - [pg_ivm Comparison](research/PG_IVM_COMPARISON.md)
 - [Triggers vs Replication](research/TRIGGERS_VS_REPLICATION.md)

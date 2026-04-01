@@ -6,7 +6,7 @@
 |---|---|
 | PostgreSQL | 18.x |
 
-> **Building from source** additionally requires Rust 1.82+ and pgrx 0.17.x.
+> **Building from source** additionally requires Rust 1.85+ (edition 2024) and pgrx 0.17.x.
 > Pre-built release artifacts only need a running PostgreSQL 18.x instance.
 
 ---
@@ -218,39 +218,6 @@ SELECT extname, extversion FROM pg_extension WHERE extname = 'pg_trickle';
 
 -- Or get a full status overview (includes version, scheduler state, stream table count)
 SELECT * FROM pgtrickle.pgt_status();
-```
-
-### Inspecting the installation
-
-```sql
--- Check the installed version
-SELECT extversion FROM pg_extension WHERE extname = 'pg_trickle';
-
--- Check which schemas were created
-SELECT schema_name
-FROM information_schema.schemata
-WHERE schema_name IN ('pgtrickle', 'pgtrickle_changes');
-
--- Check all registered GUC variables
-SHOW pg_trickle.enabled;
-SHOW pg_trickle.scheduler_interval_ms;
-SHOW pg_trickle.max_concurrent_refreshes;
-
--- Check the scheduler background worker is running
-SELECT * FROM pgtrickle.pgt_status();
-
--- List all stream tables
-SELECT pgt_schema, pgt_name, status, refresh_mode, is_populated
-FROM pgtrickle.pgt_stream_tables;
-
--- Check that the shared library loaded correctly
-SELECT * FROM pg_extension WHERE extname = 'pg_trickle';
-
--- Verify the catalog tables exist
-SELECT tablename
-FROM pg_tables
-WHERE schemaname = 'pgtrickle'
-ORDER BY tablename;
 ```
 
 ### Quick functional test

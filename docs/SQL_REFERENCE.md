@@ -15,6 +15,7 @@ Complete reference for all SQL functions, views, and catalog tables provided by 
     - [pgtrickle.drop\_stream\_table](#pgtrickledrop_stream_table)
     - [pgtrickle.resume\_stream\_table](#pgtrickleresume_stream_table)
     - [pgtrickle.refresh\_stream\_table](#pgtricklerefresh_stream_table)
+    - [pgtrickle.repair\_stream\_table](#pgtricklerepair_stream_table)
   - [Status & Monitoring](#status--monitoring)
     - [pgtrickle.pgt\_status](#pgtricklepgt_status)
     - [pgtrickle.health\_check](#pgtricklehealth_check)
@@ -22,11 +23,16 @@ Complete reference for all SQL functions, views, and catalog tables provided by 
     - [pgtrickle.st\_refresh\_stats](#pgtricklest_refresh_stats)
     - [pgtrickle.get\_refresh\_history](#pgtrickleget_refresh_history)
     - [pgtrickle.get\_staleness](#pgtrickleget_staleness)
+    - [pgtrickle.explain\_refresh\_mode](#pgtrickleexplain_refresh_mode)
   - [CDC Diagnostics](#cdc-diagnostics)
     - [pgtrickle.slot\_health](#pgtrickleslot_health)
     - [pgtrickle.check\_cdc\_health](#pgtricklecheck_cdc_health)
     - [pgtrickle.change\_buffer\_sizes](#pgtricklechange_buffer_sizes)
     - [pgtrickle.trigger\_inventory](#pgtrickletrigger_inventory)
+    - [pgtrickle.worker\_pool\_status](#pgtrickleworker_pool_status)
+    - [pgtrickle.parallel\_job\_status](#pgtrickleparallel_job_status)
+    - [pgtrickle.fuse\_status](#pgtricklefuse_status)
+    - [pgtrickle.reset\_fuse](#pgtricklereset_fuse)
   - [Dependency & Inspection](#dependency--inspection)
     - [pgtrickle.dependency\_tree](#pgtrickledependency_tree)
     - [pgtrickle.diamond\_groups](#pgtricklediamond_groups)
@@ -81,6 +87,8 @@ Complete reference for all SQL functions, views, and catalog tables provided by 
   - [pgtrickle.pgt\_refresh\_groups](#pgtricklepgt_refresh_groups)
 - [Delta SQL Profiling (v0.13.0)](#delta-sql-profiling-v0130)
   - [pgtrickle.explain\_delta](#pgtrickleexplain_delta)
+  - [pgtrickle.dedup\_stats](#pgtricklededup_stats)
+  - [pgtrickle.shared\_buffer\_stats](#pgtrickleshared_buffer_stats)
 - [dbt Integration (v0.13.0)](#dbt-integration-v0130)
   - [partition\_by config](#partition_by-config)
   - [fuse config](#fuse-config)
@@ -959,6 +967,37 @@ SELECT pgtrickle.refresh_stream_table('order_totals');
 
 ---
 
+### pgtrickle.repair_stream_table
+
+Repair a stream table by reinstalling any missing CDC triggers, validating
+catalog entries, and reconciling change buffer state.
+
+```sql
+pgtrickle.repair_stream_table(name text) → void
+```
+
+**Parameters:**
+
+| Parameter | Type | Description |
+|---|---|---|
+| `name` | `text` | Name of the stream table to repair. |
+
+**Example:**
+
+```sql
+-- Reinstall missing CDC triggers after a point-in-time recovery
+SELECT pgtrickle.repair_stream_table('order_totals');
+```
+
+**Notes:**
+- Inspects all source tables in the stream table's dependency graph and reinstalls any missing or disabled CDC triggers.
+- Validates that the stream table's catalog entry, storage table, and change buffer tables are consistent.
+- Useful after `pg_basebackup` or PITR restores where triggers may not have been captured in the backup.
+- Use `pgtrickle.trigger_inventory()` first to identify which triggers are missing.
+- Safe to call on a healthy stream table — it is a no-op if everything is intact.
+
+---
+
 ### Status & Monitoring
 
 Query the state of stream tables, view refresh statistics, and diagnose problems.
@@ -1135,6 +1174,40 @@ Returns `NULL` if the ST has never been refreshed.
 SELECT pgtrickle.get_staleness('order_totals');
 -- Returns: 12.345  (seconds since last refresh)
 ```
+
+---
+
+### pgtrickle.explain_refresh_mode
+
+> **Added in v0.11.0**
+
+Explain the configured vs. effective refresh mode for a stream table, including the reason for any downgrade (e.g., AUTO choosing FULL).
+
+```sql
+pgtrickle.explain_refresh_mode(name text) → TABLE(
+    configured_mode  text,
+    effective_mode   text,
+    downgrade_reason text
+)
+```
+
+**Columns:**
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `configured_mode` | `text` | The refresh mode set on the stream table (e.g., `DIFFERENTIAL`, `AUTO`, `FULL`, `IMMEDIATE`) |
+| `effective_mode` | `text` | The mode actually used on the most recent refresh. NULL for IMMEDIATE mode (handled by triggers) |
+| `downgrade_reason` | `text` | Human-readable explanation when `effective_mode` differs from `configured_mode`, or informational note for IMMEDIATE / APPEND_ONLY |
+
+**Example:**
+
+```sql
+SELECT * FROM pgtrickle.explain_refresh_mode('public.orders_summary');
+```
+
+| configured_mode | effective_mode | downgrade_reason |
+|---|---|---|
+| AUTO | FULL | The most recent refresh used FULL mode. Possible causes: defining query contains a CTE or unsupported operator, adaptive change-ratio threshold was exceeded, or aggregate saturation occurred. Check pgtrickle.pgt_refresh_history for details. |
 
 ---
 
@@ -1328,6 +1401,88 @@ SELECT source_table, trigger_type, trigger_name
 FROM pgtrickle.trigger_inventory()
 WHERE NOT present OR NOT enabled;
 ```
+
+---
+
+### pgtrickle.fuse_status
+
+Return the circuit-breaker (fuse) state for every stream table that has a
+fuse configured.
+
+```sql
+pgtrickle.fuse_status() → SETOF record(
+    name           text,         -- stream table name
+    fuse_mode      text,         -- 'off', 'on', or 'auto'
+    fuse_state     text,         -- 'armed' or 'blown'
+    fuse_ceiling   bigint,       -- change-count threshold
+    fuse_sensitivity int,        -- consecutive over-ceiling cycles before blow
+    blown_at       timestamptz,  -- when the fuse last blew (NULL if armed)
+    blow_reason    text          -- reason the fuse blew (NULL if armed)
+)
+```
+
+**Example:**
+
+```sql
+-- Check all fuse-enabled stream tables
+SELECT name, fuse_mode, fuse_state, fuse_ceiling, blown_at
+FROM pgtrickle.fuse_status();
+
+-- Find blown fuses
+SELECT name, blow_reason, blown_at
+FROM pgtrickle.fuse_status()
+WHERE fuse_state = 'blown';
+```
+
+**Notes:**
+- Returns one row per stream table where `fuse_mode != 'off'`.
+- A blown fuse suspends differential refreshes until cleared with `pgtrickle.reset_fuse()`.
+- A `pgtrickle_alert` NOTIFY with event `fuse_blown` is emitted when the fuse trips.
+- See [Configuration — fuse_default_ceiling](CONFIGURATION.md#pg_tricklefuse_default_ceiling) for global defaults.
+
+---
+
+### pgtrickle.reset_fuse
+
+Clear a blown circuit-breaker fuse and resume scheduling for the stream table.
+
+```sql
+pgtrickle.reset_fuse(name text, action text DEFAULT 'apply') → void
+```
+
+**Parameters:**
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `name` | `text` | — | Name of the stream table whose fuse to reset. |
+| `action` | `text` | `'apply'` | How to handle the pending changes that caused the fuse to blow. |
+
+**Actions:**
+
+| Action | Behavior |
+|--------|----------|
+| `'apply'` | Process all pending changes normally and resume scheduling. |
+| `'reinitialize'` | Drop and repopulate the stream table from scratch (full refresh from defining query). |
+| `'skip_changes'` | Discard the pending changes that triggered the fuse and resume from the current frontier. |
+
+**Example:**
+
+```sql
+-- After investigating a bulk load, apply the changes:
+SELECT pgtrickle.reset_fuse('category_summary', action => 'apply');
+
+-- Or skip the oversized batch entirely:
+SELECT pgtrickle.reset_fuse('category_summary', action => 'skip_changes');
+
+-- Or rebuild from scratch:
+SELECT pgtrickle.reset_fuse('category_summary', action => 'reinitialize');
+```
+
+**Notes:**
+- Errors if the stream table's fuse is not in `'blown'` state.
+- After reset, the fuse returns to `'armed'` state and the scheduler resumes normal operation.
+- Use `pgtrickle.fuse_status()` to inspect the fuse state before resetting.
+- The `'skip_changes'` action advances the frontier past the pending changes without applying them — use only when you are certain the changes should be discarded.
 
 ---
 

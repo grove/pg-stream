@@ -6,11 +6,11 @@ This document explains how the database-level refresh benchmarks work and how to
 
 ## Overview
 
-The benchmark suite in `tests/e2e_bench_tests.rs` measures **wall-clock refresh time** for **FULL** vs **INCREMENTAL** mode across a matrix of table sizes, change rates, and query complexities. Each benchmark spawns an isolated PostgreSQL 18.x container via Testcontainers, ensuring reproducible and interference-free measurements.
+The benchmark suite in `tests/e2e_bench_tests.rs` measures **wall-clock refresh time** for **FULL** vs **DIFFERENTIAL** mode across a matrix of table sizes, change rates, and query complexities. Each benchmark spawns an isolated PostgreSQL 18.x container via Testcontainers, ensuring reproducible and interference-free measurements.
 
 The core question the benchmarks answer:
 
-> **How much faster is an INCREMENTAL refresh compared to a FULL refresh, given a specific workload?**
+> **How much faster is an DIFFERENTIAL refresh compared to a FULL refresh, given a specific workload?**
 
 ---
 
@@ -124,13 +124,13 @@ Each change cycle applies a realistic mix of operations:
    d. Record refresh_ms and ST row count
 8. Drop the FULL-mode ST
 
-── INCREMENTAL mode ──
+── DIFFERENTIAL mode ──
 9. Reset source table to same starting state
-10. Create a Stream Table in INCREMENTAL refresh mode
+10. Create a Stream Table in DIFFERENTIAL refresh mode
 11. For each of 3 cycles:
     a. Apply random DML (same parameters)
     b. ANALYZE
-    c. Time the INCREMENTAL refresh (delta query + MERGE)
+    c. Time the DIFFERENTIAL refresh (delta query + MERGE)
     d. Record refresh_ms and ST row count
 
 12. Print results table and summary
@@ -153,9 +153,9 @@ Both modes start from the same data to ensure a fair comparison. The 3-cycle des
 ║ aggregate  │    10000 │     1% │ FULL        │     1 │       22.1 │               5 ║
 ║ aggregate  │    10000 │     1% │ FULL        │     2 │        4.8 │               5 ║
 ║ aggregate  │    10000 │     1% │ FULL        │     3 │        5.3 │               5 ║
-║ aggregate  │    10000 │     1% │ INCREMENTAL │     1 │        8.4 │               5 ║
-║ aggregate  │    10000 │     1% │ INCREMENTAL │     2 │        4.4 │               5 ║
-║ aggregate  │    10000 │     1% │ INCREMENTAL │     3 │        4.6 │               5 ║
+║ aggregate  │    10000 │     1% │ DIFFERENTIAL │     1 │        8.4 │               5 ║
+║ aggregate  │    10000 │     1% │ DIFFERENTIAL │     2 │        4.4 │               5 ║
+║ aggregate  │    10000 │     1% │ DIFFERENTIAL │     3 │        4.6 │               5 ║
 ╚════════════╧══════════╧════════╧═════════════╧═══════╧════════════╧═════════════════╝
 ```
 
@@ -164,7 +164,7 @@ Both modes start from the same data to ensure a fair comparison. The 3-cycle des
 | **Scenario** | Query complexity level (scan, filter, aggregate, join, join_agg) |
 | **Rows** | Number of rows in the base table |
 | **Chg %** | Percentage of rows changed per cycle |
-| **Mode** | FULL (truncate + recompute) or INCREMENTAL (delta + merge) |
+| **Mode** | FULL (truncate + recompute) or DIFFERENTIAL (delta + merge) |
 | **Cycle** | Which of the 3 measurement rounds (cycle 1 often includes warm-up) |
 | **Refresh ms** | Wall-clock time for the refresh operation |
 | **ST Rows** | Row count in the Stream Table after refresh (sanity check) |
@@ -175,13 +175,13 @@ Both modes start from the same data to ensure a fair comparison. The 3-cycle des
 ┌─────────────────────────────────────────────────────────────────────────┐
 │                        Summary (avg ms per cycle)                       │
 ├────────────┬──────────┬────────┬─────────────────┬──────────────────────┤
-│ Scenario   │ Rows     │ Chg %  │ FULL avg ms     │ INCREMENTAL avg ms   │
+│ Scenario   │ Rows     │ Chg %  │ FULL avg ms     │ DIFFERENTIAL avg ms   │
 ├────────────┼──────────┼────────┼─────────────────┼──────────────────────┤
 │ aggregate  │    10000 │     1% │       10.7       │        5.8 (  1.8x) │
 └────────────┴──────────┴────────┴─────────────────┴──────────────────────┘
 ```
 
-The **Speedup** value in parentheses is `FULL avg / INCREMENTAL avg` — how many times faster the incremental refresh is compared to a full refresh.
+The **Speedup** value in parentheses is `FULL avg / DIFFERENTIAL avg` — how many times faster the incremental refresh is compared to a full refresh.
 
 ---
 
@@ -200,24 +200,24 @@ The **Speedup** value in parentheses is `FULL avg / INCREMENTAL avg` — how man
 
 | Speedup | Interpretation |
 |---------|---------------|
-| **> 10x** | Strong win for INCREMENTAL — typical at low change rates on larger tables |
-| **5–10x** | Clear advantage for INCREMENTAL |
-| **2–5x** | Moderate advantage — INCREMENTAL is the right choice |
+| **> 10x** | Strong win for DIFFERENTIAL — typical at low change rates on larger tables |
+| **5–10x** | Clear advantage for DIFFERENTIAL |
+| **2–5x** | Moderate advantage — DIFFERENTIAL is the right choice |
 | **1–2x** | Marginal gain — either mode is acceptable |
 | **~1x** | Break-even — change rate is too high for incremental to help |
-| **< 1x** | INCREMENTAL is slower — would indicate overhead exceeds savings (investigate) |
+| **< 1x** | DIFFERENTIAL is slower — would indicate overhead exceeds savings (investigate) |
 
 ### Key Patterns to Look For
 
-1. **Scaling with table size**: For the same change rate, speedup should increase with table size. FULL must re-process all rows; INCREMENTAL processes only the delta.
+1. **Scaling with table size**: For the same change rate, speedup should increase with table size. FULL must re-process all rows; DIFFERENTIAL processes only the delta.
 
-2. **Degradation with change rate**: As change rate rises from 1% → 50%, speedup should decrease. At 50%, INCREMENTAL processes half the table which approaches FULL cost.
+2. **Degradation with change rate**: As change rate rises from 1% → 50%, speedup should decrease. At 50%, DIFFERENTIAL processes half the table which approaches FULL cost.
 
-3. **Query complexity amplifies speedup**: Aggregate and join queries benefit more from INCREMENTAL because they avoid expensive re-computation. A join_agg at 1% changes should show higher speedup than a simple scan at the same parameters.
+3. **Query complexity amplifies speedup**: Aggregate and join queries benefit more from DIFFERENTIAL because they avoid expensive re-computation. A join_agg at 1% changes should show higher speedup than a simple scan at the same parameters.
 
 4. **Cycle 1 warm-up**: The first cycle in each mode may be slower due to PostgreSQL plan cache population. Use cycles 2–3 for the steadiest numbers.
 
-5. **ST Rows consistency**: The ST row count should be similar between FULL and INCREMENTAL for the same scenario (accounting for random DML). Large discrepancies indicate a correctness issue.
+5. **ST Rows consistency**: The ST row count should be similar between FULL and DIFFERENTIAL for the same scenario (accounting for random DML). Large discrepancies indicate a correctness issue.
 
 ---
 

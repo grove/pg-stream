@@ -4,8 +4,9 @@
 
 | Version | Supported |
 |---------|-----------|
-| 0.1.x (current pre-release) | ✅ |
+| 0.13.x (current pre-release) | ✅ |
 
+During pre-1.0 development, only the latest minor version receives security fixes.
 Once v1.0.0 is released, the two most recent minor versions will receive security fixes.
 
 ## Reporting a Vulnerability

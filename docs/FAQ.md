@@ -549,10 +549,13 @@ SELECT pgtrickle.refresh_stream_table('order_totals');
 
 This runs a synchronous refresh in your current session and returns when complete. It works even when the background scheduler is disabled (`pg_trickle.enabled = false`), making it useful for testing, debugging, or one-off data refreshes.
 
-To force a full refresh regardless of the stream table's configured mode:
+To force a full refresh regardless of the stream table's configured mode, temporarily change the refresh mode:
 
 ```sql
-SELECT pgtrickle.refresh_stream_table('order_totals', force_full => true);
+SELECT pgtrickle.alter_stream_table('order_totals', refresh_mode => 'FULL');
+SELECT pgtrickle.refresh_stream_table('order_totals');
+-- Switch back to the original mode when done:
+SELECT pgtrickle.alter_stream_table('order_totals', refresh_mode => 'DIFFERENTIAL');
 ```
 
 ---
@@ -1440,9 +1443,11 @@ PostgreSQL event triggers fire on `CREATE OR REPLACE VIEW`, so pg_trickle detect
 
 If a stream table's defining query calls a user-defined function (e.g., `SELECT my_func(amount) FROM orders`) and that function is altered or dropped:
 
-- **ALTER FUNCTION** (changing the body): pg_trickle does **not** detect this automatically — PostgreSQL does not fire DDL event triggers for function body changes. The stream table continues refreshing with the new function behavior. If this is intentional, no action is needed. If you want a full rebase to the new logic, run a manual full refresh:
+- **ALTER FUNCTION** (changing the body): pg_trickle does **not** detect this automatically — PostgreSQL does not fire DDL event triggers for function body changes. The stream table continues refreshing with the new function behavior. If this is intentional, no action is needed. If you want a full rebase to the new logic, temporarily switch to FULL mode and refresh:
   ```sql
-  SELECT pgtrickle.refresh_stream_table('my_st', force_full => true);
+  SELECT pgtrickle.alter_stream_table('my_st', refresh_mode => 'FULL');
+  SELECT pgtrickle.refresh_stream_table('my_st');
+  SELECT pgtrickle.alter_stream_table('my_st', refresh_mode => 'DIFFERENTIAL');
   ```
 - **DROP FUNCTION**: The next refresh fails because the function no longer exists. The stream table enters ERROR status. Recreate the function or drop and recreate the stream table.
 

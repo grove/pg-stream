@@ -151,7 +151,7 @@ pg_trickle uses a **hybrid CDC** architecture that starts with triggers and opti
 #### Trigger Mode (default)
 
 1. **Trigger Management** — Creates `AFTER INSERT OR UPDATE OR DELETE` row-level triggers (`pg_trickle_cdc_<oid>`) on each tracked source table. Each trigger fires a PL/pgSQL function (`pg_trickle_cdc_fn_<oid>()`) that writes changes to the buffer table.
-2. **Change Buffering** — Decoded changes are written to per-source change buffer tables in the `pgtrickle_changes` schema. Each row captures the LSN (`pg_current_wal_lsn()`), transaction ID, action type (I/U/D), and the new/old row data as JSONB via `to_jsonb()`.
+2. **Change Buffering** — Decoded changes are written to per-source change buffer tables in the `pgtrickle_changes` schema. Each row captures the LSN (`pg_current_wal_lsn()`), transaction ID, action type (I/U/D), and the new/old row data as typed columns (`new_<col> TYPE`, `old_<col> TYPE`) — native PostgreSQL types, not JSONB.
 3. **Cleanup** — Consumed changes are deleted after each successful refresh via `delete_consumed_changes()`, bounded by the upper LSN to prevent unbounded scans.
 4. **Lifecycle** — Triggers and trigger functions are automatically created when a source table is first tracked and dropped when the last stream table referencing a source is removed.
 
@@ -638,7 +638,7 @@ Runtime behavior is controlled by a growing set of GUC (Grand Unified Configurat
  Change Buffer Table
    Base tables:   pgtrickle_changes.changes_<oid>
    ST sources:    pgtrickle_changes.changes_pgt_<pgt_id>
-   Columns: change_id, lsn, xid, action (I/D), row_data (jsonb)
+   Columns: change_id, lsn, action (I/U/D), pk_hash, new_<col>, old_<col> (typed)
            │
            ▼
  DVM Engine: generate delta SQL from operator tree

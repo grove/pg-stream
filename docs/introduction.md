@@ -78,6 +78,21 @@ falls back to triggers.
 - **[Architecture](ARCHITECTURE.md)** — how the engine works internally
 - **[Configuration](CONFIGURATION.md)** — GUC variables and tuning
 
+### Tutorials
+
+- **[Fuse Circuit Breaker](tutorials/fuse-circuit-breaker.md)** — protect stream tables from bulk-change storms
+- **[Tiered Scheduling](tutorials/tiered-scheduling.md)** — configure multi-tier refresh cadences
+- **[Migrating from Materialized Views](tutorials/migrating-from-matviews.md)** — step-by-step migration guide
+- **[Circular Dependencies](tutorials/circular-dependencies.md)** — handle SCCs in your DAG
+- **[Monitoring & Alerting](tutorials/monitoring-alerting.md)** — set up observability for stream tables
+- **[ETL Bulk Load Patterns](tutorials/etl-bulk-load.md)** — safely load large batches without overwhelming CDC
+
+### Integrations
+
+- **[CloudNativePG](integrations/cloudnativepg.md)** — deploy pg_trickle on Kubernetes
+- **[Prometheus & Grafana](integrations/prometheus-grafana.md)** — metrics and dashboards
+- **[PgBouncer](integrations/pgbouncer.md)** — connection pooling configuration
+
 ---
 
 ## Source & releases

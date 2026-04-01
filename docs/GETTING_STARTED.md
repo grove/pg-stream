@@ -321,7 +321,7 @@ That single function call did a lot of work atomically (all in one transaction):
 4. **Created a change buffer table** in the `pgtrickle_changes` schema — this is where the triggers write captured changes
 5. **Ran an initial full refresh** — executed the recursive query against the current data and populated the storage table
 6. **Registered the stream table** in pg_trickle's catalog with a 1-second refresh schedule
-> **TRUNCATE caveat:** Row-level triggers do not fire on `TRUNCATE`. If you `TRUNCATE` a base table, the change is not captured incrementally — the stream table will become stale. Use `DELETE FROM table` instead, or call `pgtrickle.refresh_stream_table('department_tree', full => true)` after a TRUNCATE to force a full recompute.
+> **TRUNCATE caveat:** Row-level triggers do not fire on `TRUNCATE`. If you `TRUNCATE` a base table, the change is not captured incrementally — the stream table will become stale. Use `DELETE FROM table` instead, or call `pgtrickle.refresh_stream_table('department_tree')` after a TRUNCATE. If the stream table uses DIFFERENTIAL mode, temporarily switch to FULL for a full recompute: `pgtrickle.alter_stream_table('department_tree', refresh_mode => 'FULL')`, refresh, then switch back.
 Query it immediately — it's already populated:
 
 ```sql
@@ -1131,7 +1131,7 @@ SELECT name, status, last_error, last_refresh_at, staleness FROM pgtrickle.pgt_s
 A `status` of `ERROR` means the last refresh failed. `last_error` contains the message. Fix the underlying issue (e.g., a dropped column referenced in the query) then call:
 
 ```sql
-SELECT pgtrickle.refresh_stream_table('your_table', full => true);
+SELECT pgtrickle.refresh_stream_table('your_table');
 ```
 
 For a broader health check:
