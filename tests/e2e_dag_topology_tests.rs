@@ -12,6 +12,34 @@ use e2e::E2eDb;
 use e2e::property_support::{SeededRng, TraceConfig, TrackedIds, assert_st_query_invariants};
 
 // ═══════════════════════════════════════════════════════════════════════════
+// Scheduler Suppression
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Disable the background scheduler for the current test database.
+///
+/// Tests that perform manual refreshes in topological order can race with the
+/// scheduler, which may consume CDC changes out of order and produce stale
+/// results. This helper disables the scheduler per-database without affecting
+/// other parallel tests.
+async fn disable_scheduler(db: &E2eDb) {
+    db.execute(
+        "DO $$ BEGIN \
+           EXECUTE format('ALTER DATABASE %I SET pg_trickle.enabled = off', current_database()); \
+         END $$",
+    )
+    .await;
+    db.execute(
+        "SELECT pg_terminate_backend(pid) \
+         FROM pg_stat_activity \
+         WHERE datname = current_database() \
+           AND backend_type = 'pg_trickle scheduler' \
+           AND pid <> pg_backend_pid()",
+    )
+    .await;
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 // Test 5.1 — Wide fan-out: 1 base → 4 leaf STs
 // ═══════════════════════════════════════════════════════════════════════════
 
@@ -123,6 +151,7 @@ async fn test_fanout_4_leaves() {
 #[tokio::test]
 async fn test_fanout_then_converge() {
     let db = E2eDb::new().await.with_extension().await;
+    disable_scheduler(&db).await;
 
     db.execute(
         "CREATE TABLE foc_src (
@@ -217,6 +246,7 @@ async fn test_fanout_then_converge() {
 #[tokio::test]
 async fn test_deep_linear_5_layers() {
     let db = E2eDb::new().await.with_extension().await;
+    disable_scheduler(&db).await;
 
     db.execute(
         "CREATE TABLE d5_src (
@@ -339,6 +369,7 @@ async fn test_deep_linear_5_layers() {
 #[tokio::test]
 async fn test_multi_source_diamond() {
     let db = E2eDb::new().await.with_extension().await;
+    disable_scheduler(&db).await;
 
     db.execute(
         "CREATE TABLE msd_left (
@@ -650,6 +681,7 @@ async fn test_prop_deep_chain_small_trace() {
 
 async fn run_deep_chain_trace(seed: u64, config: &TraceConfig) {
     let db = E2eDb::new().await.with_extension().await;
+    disable_scheduler(&db).await;
     let mut rng = SeededRng::new(seed);
     let mut ids = TrackedIds::new();
 

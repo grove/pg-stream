@@ -10,6 +10,29 @@ mod e2e;
 
 use e2e::E2eDb;
 
+/// Disable the background scheduler for the current test database.
+///
+/// Trigger tests verify exact audit trail entries from manual refreshes.
+/// A concurrent scheduler refresh can consume CDC changes before the manual
+/// refresh, causing missing trigger invocations or extra trigger fires.
+async fn disable_scheduler(db: &E2eDb) {
+    db.execute(
+        "DO $$ BEGIN \
+           EXECUTE format('ALTER DATABASE %I SET pg_trickle.enabled = off', current_database()); \
+         END $$",
+    )
+    .await;
+    db.execute(
+        "SELECT pg_terminate_backend(pid) \
+         FROM pg_stat_activity \
+         WHERE datname = current_database() \
+           AND backend_type = 'pg_trickle scheduler' \
+           AND pid <> pg_backend_pid()",
+    )
+    .await;
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+}
+
 // ── Helper: create an audit trigger setup ──────────────────────────────
 //
 // Creates an audit log table and an AFTER trigger on the given stream table
@@ -65,6 +88,7 @@ fn audit_trigger_sql(st_name: &str) -> Vec<String> {
 #[tokio::test]
 async fn test_explicit_dml_insert() {
     let db = E2eDb::new().await.with_extension().await;
+    disable_scheduler(&db).await;
 
     // Source table
     db.execute("CREATE TABLE src_ins (id INT PRIMARY KEY, val TEXT)")
@@ -129,6 +153,7 @@ async fn test_explicit_dml_insert() {
 #[tokio::test]
 async fn test_explicit_dml_update() {
     let db = E2eDb::new().await.with_extension().await;
+    disable_scheduler(&db).await;
 
     db.execute("CREATE TABLE src_upd (id INT PRIMARY KEY, val TEXT)")
         .await;
@@ -186,6 +211,7 @@ async fn test_explicit_dml_update() {
 #[tokio::test]
 async fn test_explicit_dml_delete() {
     let db = E2eDb::new().await.with_extension().await;
+    disable_scheduler(&db).await;
 
     db.execute("CREATE TABLE src_del (id INT PRIMARY KEY, val TEXT)")
         .await;
@@ -242,6 +268,7 @@ async fn test_explicit_dml_delete() {
 #[tokio::test]
 async fn test_explicit_dml_no_op_skip() {
     let db = E2eDb::new().await.with_extension().await;
+    disable_scheduler(&db).await;
 
     // Use an aggregate ST so that source row changes may not change the aggregate.
     db.execute("CREATE TABLE src_agg (id INT PRIMARY KEY, grp TEXT, amount INT)")
@@ -327,6 +354,7 @@ async fn test_explicit_dml_no_op_skip() {
 #[tokio::test]
 async fn test_no_trigger_uses_merge() {
     let db = E2eDb::new().await.with_extension().await;
+    disable_scheduler(&db).await;
 
     db.execute("CREATE TABLE src_merge (id INT PRIMARY KEY, val TEXT)")
         .await;
@@ -358,6 +386,7 @@ async fn test_no_trigger_uses_merge() {
 #[tokio::test]
 async fn test_trigger_audit_trail() {
     let db = E2eDb::new().await.with_extension().await;
+    disable_scheduler(&db).await;
 
     db.execute("CREATE TABLE src_audit (id INT PRIMARY KEY, val TEXT)")
         .await;
@@ -415,6 +444,7 @@ async fn test_trigger_audit_trail() {
 #[tokio::test]
 async fn test_guc_off_suppresses_triggers() {
     let db = E2eDb::new().await.with_extension().await;
+    disable_scheduler(&db).await;
 
     db.execute("CREATE TABLE src_guc_off (id INT PRIMARY KEY, val TEXT)")
         .await;
@@ -437,14 +467,17 @@ async fn test_guc_off_suppresses_triggers() {
     }
     db.execute("TRUNCATE audit_log").await;
 
-    // Set GUC to 'off' globally — session-level SET is unreliable with
-    // connection pools (the refresh may run on a different connection).
-    db.alter_system_set_and_wait("pg_trickle.user_triggers", "'off'", "off")
-        .await;
-
-    // Modify source and refresh
+    // Modify source
     db.execute("INSERT INTO src_guc_off VALUES (2, 'b')").await;
-    db.refresh_st("st_guc_off").await;
+
+    // Set GUC to 'off' and refresh on the SAME connection so the
+    // session-level SET is visible to the refresh function.
+    // This avoids ALTER SYSTEM which is global and races with parallel tests.
+    db.execute_seq(&[
+        "SET pg_trickle.user_triggers = 'off'",
+        "SELECT pgtrickle.refresh_stream_table('st_guc_off')",
+    ])
+    .await;
 
     // ST should have the data
     let count: i64 = db.count("st_guc_off").await;
@@ -457,10 +490,6 @@ async fn test_guc_off_suppresses_triggers() {
         "Audit log should be empty when GUC is 'off', got {} entries",
         audit_count
     );
-
-    // Reset to default so other tests are not affected.
-    db.alter_system_reset_and_wait("pg_trickle.user_triggers", "auto")
-        .await;
 }
 
 // ── GUC: auto detects triggers ─────────────────────────────────────────
@@ -468,6 +497,7 @@ async fn test_guc_off_suppresses_triggers() {
 #[tokio::test]
 async fn test_guc_auto_detects_triggers() {
     let db = E2eDb::new().await.with_extension().await;
+    disable_scheduler(&db).await;
 
     db.execute("CREATE TABLE src_guc_auto (id INT PRIMARY KEY, val TEXT)")
         .await;
@@ -514,6 +544,7 @@ async fn test_guc_auto_detects_triggers() {
 #[tokio::test]
 async fn test_guc_on_alias_detects_triggers() {
     let db = E2eDb::new().await.with_extension().await;
+    disable_scheduler(&db).await;
 
     db.execute("CREATE TABLE src_guc_on (id INT PRIMARY KEY, val TEXT)")
         .await;
@@ -534,12 +565,14 @@ async fn test_guc_on_alias_detects_triggers() {
     }
     db.execute("TRUNCATE audit_log").await;
 
-    // Use ALTER SYSTEM SET so the value is visible across all pool connections.
-    db.alter_system_set_and_wait("pg_trickle.user_triggers", "'on'", "on")
-        .await;
-
+    // Set GUC to deprecated 'on' alias and refresh on the SAME connection.
+    // 'on' is treated as 'auto' — should still detect triggers.
     db.execute("INSERT INTO src_guc_on VALUES (2, 'b')").await;
-    db.refresh_st("st_guc_on").await;
+    db.execute_seq(&[
+        "SET pg_trickle.user_triggers = 'on'",
+        "SELECT pgtrickle.refresh_stream_table('st_guc_on')",
+    ])
+    .await;
 
     let insert_count: i64 = db
         .query_scalar("SELECT count(*) FROM audit_log WHERE op = 'INSERT'")
@@ -549,10 +582,6 @@ async fn test_guc_on_alias_detects_triggers() {
         "Deprecated 'on' alias should still detect trigger and fire it, got {} INSERT entries",
         insert_count
     );
-
-    // Reset to default so other tests are not affected.
-    db.alter_system_reset_and_wait("pg_trickle.user_triggers", "auto")
-        .await;
 }
 
 // ── FULL refresh suppresses row-level triggers ─────────────────────────
@@ -560,6 +589,7 @@ async fn test_guc_on_alias_detects_triggers() {
 #[tokio::test]
 async fn test_full_refresh_suppresses_triggers() {
     let db = E2eDb::new().await.with_extension().await;
+    disable_scheduler(&db).await;
 
     db.execute("CREATE TABLE src_full (id INT PRIMARY KEY, val TEXT)")
         .await;
@@ -598,6 +628,7 @@ async fn test_full_refresh_suppresses_triggers() {
 #[tokio::test]
 async fn test_before_trigger_modifies_new() {
     let db = E2eDb::new().await.with_extension().await;
+    disable_scheduler(&db).await;
 
     db.execute("CREATE TABLE src_before (id INT PRIMARY KEY, val TEXT)")
         .await;

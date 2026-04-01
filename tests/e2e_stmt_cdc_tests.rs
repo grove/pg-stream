@@ -14,6 +14,25 @@ mod e2e;
 
 use e2e::E2eDb;
 
+/// Disable the background scheduler for the current test database.
+async fn disable_scheduler(db: &E2eDb) {
+    db.execute(
+        "DO $$ BEGIN \
+           EXECUTE format('ALTER DATABASE %I SET pg_trickle.enabled = off', current_database()); \
+         END $$",
+    )
+    .await;
+    db.execute(
+        "SELECT pg_terminate_backend(pid) \
+         FROM pg_stat_activity \
+         WHERE datname = current_database() \
+           AND backend_type = 'pg_trickle scheduler' \
+           AND pid <> pg_backend_pid()",
+    )
+    .await;
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+}
+
 // ── Helper ────────────────────────────────────────────────────────────────
 
 /// Return the `tgtype & 1` value for the named trigger (0 = STATEMENT, 1 = ROW).
@@ -49,6 +68,7 @@ async fn trigger_old_table(db: &E2eDb, trigger_name: &str) -> String {
 #[tokio::test]
 async fn test_stmt_cdc_default_trigger_is_statement_level() {
     let db = E2eDb::new().await.with_extension().await;
+    disable_scheduler(&db).await;
 
     db.execute("CREATE TABLE stmt_type_src (id INT PRIMARY KEY, val TEXT)")
         .await;
@@ -124,6 +144,7 @@ async fn test_stmt_cdc_default_trigger_is_statement_level() {
 #[tokio::test]
 async fn test_stmt_cdc_bulk_insert_all_rows_captured() {
     let db = E2eDb::new().await.with_extension().await;
+    disable_scheduler(&db).await;
 
     db.execute("CREATE TABLE bulk_ins (id INT PRIMARY KEY, val TEXT)")
         .await;
@@ -171,6 +192,7 @@ async fn test_stmt_cdc_bulk_insert_all_rows_captured() {
 #[tokio::test]
 async fn test_stmt_cdc_bulk_update_keyed_table() {
     let db = E2eDb::new().await.with_extension().await;
+    disable_scheduler(&db).await;
 
     db.execute("CREATE TABLE bulk_upd (id INT PRIMARY KEY, val TEXT)")
         .await;
@@ -235,6 +257,7 @@ async fn test_stmt_cdc_bulk_update_keyed_table() {
 #[tokio::test]
 async fn test_stmt_cdc_bulk_delete_keyed_table() {
     let db = E2eDb::new().await.with_extension().await;
+    disable_scheduler(&db).await;
 
     db.execute("CREATE TABLE bulk_del (id INT PRIMARY KEY, val TEXT)")
         .await;
@@ -285,6 +308,7 @@ async fn test_stmt_cdc_bulk_delete_keyed_table() {
 #[tokio::test]
 async fn test_stmt_cdc_keyless_update_captured_as_delete_plus_insert() {
     let db = E2eDb::new().await.with_extension().await;
+    disable_scheduler(&db).await;
 
     // Keyless table — no PRIMARY KEY.
     db.execute("CREATE TABLE keyless_upd (val TEXT)").await;
@@ -333,19 +357,17 @@ async fn test_stmt_cdc_keyless_update_captured_as_delete_plus_insert() {
 #[tokio::test]
 async fn test_stmt_cdc_row_mode_guc_creates_row_level_trigger() {
     let db = E2eDb::new().await.with_extension().await;
-
-    // Switch to row-level trigger mode globally.
-    db.alter_system_set_and_wait("pg_trickle.cdc_trigger_mode", "'row'", "row")
-        .await;
+    disable_scheduler(&db).await;
 
     db.execute("CREATE TABLE row_mode_src (id INT PRIMARY KEY, val TEXT)")
         .await;
-    db.create_st(
-        "row_mode_st",
-        "SELECT id, val FROM row_mode_src",
-        "1m",
-        "DIFFERENTIAL",
-    )
+
+    // Switch to row-level trigger mode for this session and create the ST
+    // on the same connection so the GUC is visible to create_stream_table.
+    db.execute_seq(&[
+        "SET pg_trickle.cdc_trigger_mode = 'row'",
+        "SELECT pgtrickle.create_stream_table('row_mode_st', $$SELECT id, val FROM row_mode_src$$, '1m', 'DIFFERENTIAL')",
+    ])
     .await;
 
     let source_oid = db.table_oid("row_mode_src").await;
@@ -373,16 +395,16 @@ async fn test_stmt_cdc_row_mode_guc_creates_row_level_trigger() {
     // DML still works correctly in row mode.
     db.execute("INSERT INTO row_mode_src VALUES (1, 'x'), (2, 'y')")
         .await;
-    db.refresh_st("row_mode_st").await;
+    db.execute_seq(&[
+        "SET pg_trickle.cdc_trigger_mode = 'row'",
+        "SELECT pgtrickle.refresh_stream_table('row_mode_st')",
+    ])
+    .await;
     assert_eq!(
         db.count("public.row_mode_st").await,
         2,
         "Row-level trigger should still capture DML correctly"
     );
-
-    // Restore the default so subsequent tests in the container are unaffected.
-    db.alter_system_reset_and_wait("pg_trickle.cdc_trigger_mode", "statement")
-        .await;
 }
 
 /// `pgtrickle.rebuild_cdc_triggers()` replaces an existing row-level trigger
@@ -392,19 +414,15 @@ async fn test_stmt_cdc_row_mode_guc_creates_row_level_trigger() {
 #[tokio::test]
 async fn test_stmt_cdc_rebuild_cdc_triggers_migrates_to_statement() {
     let db = E2eDb::new().await.with_extension().await;
+    disable_scheduler(&db).await;
 
     // 1. Initially create the stream table with row-level triggers.
-    db.alter_system_set_and_wait("pg_trickle.cdc_trigger_mode", "'row'", "row")
-        .await;
-
     db.execute("CREATE TABLE rebuild_src (id INT PRIMARY KEY, val TEXT)")
         .await;
-    db.create_st(
-        "rebuild_st",
-        "SELECT id, val FROM rebuild_src",
-        "1m",
-        "DIFFERENTIAL",
-    )
+    db.execute_seq(&[
+        "SET pg_trickle.cdc_trigger_mode = 'row'",
+        "SELECT pgtrickle.create_stream_table('rebuild_st', 'SELECT id, val FROM rebuild_src', schedule := '1m', refresh_mode := 'DIFFERENTIAL')",
+    ])
     .await;
 
     let source_oid = db.table_oid("rebuild_src").await;
@@ -420,9 +438,11 @@ async fn test_stmt_cdc_rebuild_cdc_triggers_migrates_to_statement() {
     );
 
     // 2. Switch to statement mode and call rebuild_cdc_triggers().
-    db.alter_system_set_and_wait("pg_trickle.cdc_trigger_mode", "'statement'", "statement")
-        .await;
-    db.execute("SELECT pgtrickle.rebuild_cdc_triggers()").await;
+    db.execute_seq(&[
+        "SET pg_trickle.cdc_trigger_mode = 'statement'",
+        "SELECT pgtrickle.rebuild_cdc_triggers()",
+    ])
+    .await;
 
     // 3. Per-event statement-level triggers should now exist.
     assert_eq!(
@@ -465,6 +485,7 @@ async fn test_stmt_cdc_rebuild_cdc_triggers_migrates_to_statement() {
 #[tokio::test]
 async fn test_stmt_cdc_mixed_dml_in_transaction() {
     let db = E2eDb::new().await.with_extension().await;
+    disable_scheduler(&db).await;
 
     db.execute("CREATE TABLE mixed_dml (id INT PRIMARY KEY, val TEXT)")
         .await;
