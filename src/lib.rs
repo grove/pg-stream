@@ -414,10 +414,10 @@ extension_sql!(
 -- Status overview view
 CREATE OR REPLACE VIEW pgtrickle.stream_tables_info AS
 SELECT st.*,
-       now() - st.data_timestamp AS staleness,
+       now() - st.last_refresh_at AS staleness,
        CASE WHEN st.schedule IS NOT NULL
                  AND st.schedule !~ '[\s@]'
-            THEN EXTRACT(EPOCH FROM (now() - st.data_timestamp)) >
+            THEN EXTRACT(EPOCH FROM (now() - st.last_refresh_at)) >
                  pgtrickle.parse_duration_seconds(st.schedule)
             ELSE NULL::boolean
        END AS stale,
@@ -474,10 +474,10 @@ SELECT
     st.is_populated,
     st.data_timestamp,
     st.schedule,
-    now() - st.data_timestamp AS staleness,
-    CASE WHEN st.schedule IS NOT NULL AND st.data_timestamp IS NOT NULL
+    now() - st.last_refresh_at AS staleness,
+    CASE WHEN st.schedule IS NOT NULL AND st.last_refresh_at IS NOT NULL
               AND st.schedule !~ '[\s@]'
-         THEN EXTRACT(EPOCH FROM (now() - st.data_timestamp)) >
+         THEN EXTRACT(EPOCH FROM (now() - st.last_refresh_at)) >
               pgtrickle.parse_duration_seconds(st.schedule)
          ELSE NULL::boolean
     END AS stale,
@@ -561,8 +561,8 @@ SELECT
     (SELECT count(*) FROM pgtrickle.pgt_stream_tables
      WHERE schedule IS NOT NULL
        AND schedule !~ '[\s@]'
-       AND data_timestamp IS NOT NULL
-       AND EXTRACT(EPOCH FROM (now() - data_timestamp)) >
+       AND last_refresh_at IS NOT NULL
+       AND EXTRACT(EPOCH FROM (now() - last_refresh_at)) >
            pgtrickle.parse_duration_seconds(schedule))::bigint
         AS stale_tables,
     (SELECT count(*) > 0 FROM pg_stat_activity
@@ -575,8 +575,8 @@ SELECT
         WHEN (SELECT count(*) FROM pgtrickle.pgt_stream_tables
               WHERE schedule IS NOT NULL
                 AND schedule !~ '[\s@]'
-                AND data_timestamp IS NOT NULL
-                AND EXTRACT(EPOCH FROM (now() - data_timestamp)) >
+                AND last_refresh_at IS NOT NULL
+                AND EXTRACT(EPOCH FROM (now() - last_refresh_at)) >
                     pgtrickle.parse_duration_seconds(schedule)) > 0 THEN 'WARNING'
         ELSE 'OK'
     END AS status;
