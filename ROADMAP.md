@@ -2752,7 +2752,36 @@ and deliver opt-in UNLOGGED change buffers for reduced WAL amplification.
 
 > **DIAG-2 subtotal: ~2–4 hours**
 
-> **v0.14.0 total: ~2–6 weeks + ~1wk patterns guide + ~2–4 days stability tests + ~3.5–7 days diagnostics + ~1–2d export API + ~16–20h CLI + ~0.5d docs + ~2–4h aggregate warning**
+### DIFFERENTIAL Refresh for Manual ST-on-ST Path (FIX-STST-DIFF)
+
+> **Background:** When a stream table reads from another stream table
+> (`calculated` schedule), the scheduler propagates changes via a per-ST
+> change buffer (`pgtrickle_changes.changes_pgt_{id}`) and performs a true
+> DIFFERENTIAL DVM refresh against that buffer. The manual
+> `pgtrickle.refresh_stream_table()` path does not: it currently falls back
+> to an unconditional `TRUNCATE + INSERT` (FULL refresh) for every call.
+>
+> This was introduced as a correctness fix in v0.13.0 (PR #371) to close a
+> scheduler race where the previous no-op guard could leave stale data in
+> place. The FULL fallback is correct but inefficient — it pays a full table
+> scan of all upstream STs even when only a small delta is present.
+>
+> **What needs to happen:** Wire `execute_manual_differential_refresh` to
+> use the same `changes_pgt_` change buffers the scheduler already writes.
+> When a manual refresh is requested for a `calculated` ST that has a stored
+> frontier, check each upstream ST's change buffer for rows with
+> `lsn > frontier.get_st_lsn(upstream_pgt_id)`. If new rows exist, apply
+> the DVM delta SQL (same as `execute_differential_refresh`). If no rows
+> exist beyond the frontier, return a true no-op. This also fixes the
+> pre-existing `test_st_on_st_uses_differential_not_full` E2E failure.
+
+| Item | Description | Effort | Ref |
+|------|-------------|--------|-----|
+| FIX-STST-DIFF | **DIFFERENTIAL manual refresh for ST-on-ST.** In `execute_manual_differential_refresh` (`src/api.rs`), replace the unconditional FULL fallback for `has_st_source` with a proper change-buffer delta path: read rows from `changes_pgt_{upstream_pgt_id}` beyond the stored frontier LSN, run DVM differential SQL, advance the frontier. Matches the scheduler path exactly. Fixes `test_st_on_st_uses_differential_not_full`. | ~1–2d | — |
+
+> **FIX-STST-DIFF subtotal: ~1–2 days**
+
+> **v0.14.0 total: ~2–6 weeks + ~1wk patterns guide + ~2–4 days stability tests + ~3.5–7 days diagnostics + ~1–2d export API + ~16–20h CLI + ~0.5d docs + ~2–4h aggregate warning + ~1–2d ST-on-ST diff manual path**
 
 **Exit criteria:**
 - [ ] C-1: Tier classification uses delta-based read tracking; Cold STs skip refresh correctly
@@ -2767,6 +2796,7 @@ and deliver opt-in UNLOGGED change buffers for reduced WAL amplification.
 - [ ] C4: `merge_planner_hints` and `merge_work_mem_mb` consolidated into `planner_aggressive`; old GUCs emit deprecation notice
 - [ ] DOC-PDC: Pre-deployment checklist published in `docs/PRE_DEPLOYMENT.md`; linked from GETTING_STARTED and INSTALL
 - [ ] DOC-OPM: Operator mode support matrix summary and link added to SQL_REFERENCE.md
+- [ ] FIX-STST-DIFF: Manual `refresh_stream_table()` on a `calculated` ST uses DIFFERENTIAL via `changes_pgt_` buffers when a frontier is present; `test_st_on_st_uses_differential_not_full` passes
 - [ ] Extension upgrade path tested (`0.13.0 → 0.14.0`)
 
 ---
