@@ -1384,9 +1384,10 @@ mod tests {
         let result = diff_scan(&mut ctx, &tree).unwrap();
         let sql = ctx.build_with_query(&result.cte_name);
 
-        // Should use MAX() to aggregate column values (identical rows
-        // have the same content, so MAX picks the correct value).
-        assert_sql_contains(&sql, "MAX(");
+        // Should use array_agg(col)[1] to pick a representative value
+        // for each content-hash group (works for all types, including
+        // jsonb which lacks a comparison operator needed by MAX).
+        assert_sql_contains(&sql, "array_agg(");
     }
 
     // ── P2-5 / WB-1: changed_cols VARBIT mask ──────────────────────
