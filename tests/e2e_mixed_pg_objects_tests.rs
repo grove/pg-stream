@@ -2013,3 +2013,199 @@ async fn test_mixed_view_joining_two_independent_sts() {
         "Eve should appear after both STs are refreshed"
     );
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// DDL EVOLUTION: schema changes on source tables used through views
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// ALTER TABLE ADD COLUMN on a source table used through a view → ST.
+/// The ST should remain functional — new column is irrelevant to its query.
+#[tokio::test]
+async fn test_mixed_alter_table_add_column_through_view() {
+    let db = E2eDb::new().await.with_extension().await;
+
+    db.execute("CREATE TABLE ma_evolve (id INT PRIMARY KEY, val INT NOT NULL)")
+        .await;
+    db.execute("INSERT INTO ma_evolve VALUES (1, 10), (2, 20)")
+        .await;
+
+    db.execute("CREATE VIEW ma_v_evolve AS SELECT id, val FROM ma_evolve")
+        .await;
+
+    db.create_st(
+        "ma_st_evolve",
+        "SELECT id, val FROM ma_v_evolve",
+        "1m",
+        "DIFFERENTIAL",
+    )
+    .await;
+
+    assert_eq!(db.count("public.ma_st_evolve").await, 2);
+
+    // Add a new column to the base table — must disable DDL guard first
+    // (pg_trickle blocks column-affecting DDL by default to protect STs)
+    db.execute_seq(&[
+        "SET pg_trickle.block_source_ddl = false",
+        "ALTER TABLE ma_evolve ADD COLUMN extra TEXT DEFAULT 'n/a'",
+        "SET pg_trickle.block_source_ddl = true",
+    ])
+    .await;
+
+    // Insert using the new schema
+    db.execute("INSERT INTO ma_evolve (id, val, extra) VALUES (3, 30, 'new')")
+        .await;
+    db.refresh_st("ma_st_evolve").await;
+
+    assert_eq!(db.count("public.ma_st_evolve").await, 3);
+    db.assert_st_matches_query("ma_st_evolve", "SELECT id, val FROM ma_v_evolve")
+        .await;
+}
+
+/// DROP COLUMN on a source table — if the dropped column is NOT used by
+/// the view/ST, the ST should remain functional.
+#[tokio::test]
+async fn test_mixed_alter_table_drop_unused_column() {
+    let db = E2eDb::new().await.with_extension().await;
+
+    db.execute("CREATE TABLE ma_dropcol (id INT PRIMARY KEY, val INT NOT NULL, unused TEXT)")
+        .await;
+    db.execute("INSERT INTO ma_dropcol VALUES (1, 10, 'x'), (2, 20, 'y')")
+        .await;
+
+    db.execute("CREATE VIEW ma_v_dropcol AS SELECT id, val FROM ma_dropcol")
+        .await;
+
+    db.create_st(
+        "ma_st_dropcol",
+        "SELECT id, val FROM ma_v_dropcol",
+        "1m",
+        "DIFFERENTIAL",
+    )
+    .await;
+
+    assert_eq!(db.count("public.ma_st_dropcol").await, 2);
+
+    // Drop the unused column — must disable DDL guard first
+    db.execute_seq(&[
+        "SET pg_trickle.block_source_ddl = false",
+        "ALTER TABLE ma_dropcol DROP COLUMN unused",
+        "SET pg_trickle.block_source_ddl = true",
+    ])
+    .await;
+
+    // ST should still work
+    db.execute("INSERT INTO ma_dropcol (id, val) VALUES (3, 30)")
+        .await;
+    db.refresh_st("ma_st_dropcol").await;
+
+    assert_eq!(db.count("public.ma_st_dropcol").await, 3);
+    db.assert_st_matches_query("ma_st_dropcol", "SELECT id, val FROM ma_v_dropcol")
+        .await;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// TRANSACTION SEMANTICS: multi-statement transaction through views
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Multiple DML statements in a single transaction on a base table that
+/// feeds through a view into an ST. Only the committed state should be
+/// visible after refresh.
+#[tokio::test]
+async fn test_mixed_transaction_atomicity_through_view() {
+    let db = E2eDb::new().await.with_extension().await;
+
+    db.execute("CREATE TABLE mt_tx (id INT PRIMARY KEY, val INT NOT NULL)")
+        .await;
+    db.execute("INSERT INTO mt_tx VALUES (1, 10), (2, 20), (3, 30)")
+        .await;
+
+    db.execute("CREATE VIEW mt_v_tx AS SELECT id, val FROM mt_tx")
+        .await;
+
+    db.create_st(
+        "mt_st_tx",
+        "SELECT id, val FROM mt_v_tx",
+        "1m",
+        "DIFFERENTIAL",
+    )
+    .await;
+
+    assert_eq!(db.count("public.mt_st_tx").await, 3);
+
+    // Execute multiple DML operations in a single transaction
+    db.execute_seq(&[
+        "BEGIN",
+        "INSERT INTO mt_tx VALUES (4, 40)",
+        "UPDATE mt_tx SET val = 99 WHERE id = 1",
+        "DELETE FROM mt_tx WHERE id = 2",
+        "COMMIT",
+    ])
+    .await;
+
+    db.refresh_st("mt_st_tx").await;
+
+    // Should reflect the atomic transaction: 3 rows (1 deleted, 1 added)
+    assert_eq!(db.count("public.mt_st_tx").await, 3);
+
+    let val_1: i32 = db
+        .query_scalar("SELECT val FROM public.mt_st_tx WHERE id = 1")
+        .await;
+    assert_eq!(val_1, 99, "UPDATE in transaction should be reflected");
+
+    let has_2: bool = db
+        .query_scalar("SELECT EXISTS(SELECT 1 FROM public.mt_st_tx WHERE id = 2)")
+        .await;
+    assert!(!has_2, "DELETE in transaction should be reflected");
+
+    let has_4: bool = db
+        .query_scalar("SELECT EXISTS(SELECT 1 FROM public.mt_st_tx WHERE id = 4)")
+        .await;
+    assert!(has_4, "INSERT in transaction should be reflected");
+
+    db.assert_st_matches_query("mt_st_tx", "SELECT id, val FROM mt_v_tx")
+        .await;
+}
+
+/// Rolled-back transaction should have no effect on the ST.
+#[tokio::test]
+async fn test_mixed_rolled_back_transaction_no_effect() {
+    let db = E2eDb::new().await.with_extension().await;
+
+    db.execute("CREATE TABLE mt_rb (id INT PRIMARY KEY, val INT NOT NULL)")
+        .await;
+    db.execute("INSERT INTO mt_rb VALUES (1, 10), (2, 20)")
+        .await;
+
+    db.execute("CREATE VIEW mt_v_rb AS SELECT id, val FROM mt_rb")
+        .await;
+
+    db.create_st(
+        "mt_st_rb",
+        "SELECT id, val FROM mt_v_rb",
+        "1m",
+        "DIFFERENTIAL",
+    )
+    .await;
+
+    assert_eq!(db.count("public.mt_st_rb").await, 2);
+
+    // Run a transaction, then rollback
+    db.execute_seq(&[
+        "BEGIN",
+        "INSERT INTO mt_rb VALUES (3, 30)",
+        "DELETE FROM mt_rb WHERE id = 1",
+        "ROLLBACK",
+    ])
+    .await;
+
+    db.refresh_st("mt_st_rb").await;
+
+    // Nothing should have changed
+    assert_eq!(
+        db.count("public.mt_st_rb").await,
+        2,
+        "Rolled-back transaction should not affect ST"
+    );
+    db.assert_st_matches_query("mt_st_rb", "SELECT id, val FROM mt_v_rb")
+        .await;
+}
