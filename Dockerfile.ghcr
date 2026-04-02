@@ -64,17 +64,19 @@ FROM build-env AS build-deps
 
 WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
+COPY pgtrickle-tui/Cargo.toml pgtrickle-tui/Cargo.toml
 
 # Minimal stubs so cargo can compile deps without the full source tree.
 # These stubs will be replaced in the build stage below.
-RUN mkdir -p src/bin src/dvm/operators benches && \
+RUN mkdir -p src/bin src/dvm/operators benches pgtrickle-tui/src && \
     echo '#![allow(warnings)] fn main() {}' > src/bin/pgrx_embed.rs && \
     echo '#![allow(warnings)]' > src/lib.rs && \
     echo '' > src/dvm/mod.rs && \
     echo '' > src/dvm/operators/mod.rs && \
     echo '' > src/ivm.rs && \
     echo 'fn main() {}' > benches/refresh_bench.rs && \
-    echo 'fn main() {}' > benches/diff_operators.rs
+    echo 'fn main() {}' > benches/diff_operators.rs && \
+    echo 'fn main() {}' > pgtrickle-tui/src/main.rs
 
 # Pre-fetch dependencies. Docker caches this layer independently.
 # If only src/ changes on the next build, this layer is skipped, saving 10–15 min.
@@ -89,14 +91,16 @@ WORKDIR /build
 
 # Copy source code and configuration
 COPY Cargo.toml Cargo.lock ./
+COPY pgtrickle-tui/Cargo.toml pgtrickle-tui/Cargo.toml
 COPY src/ src/
 COPY pg_trickle.control ./
 
-# Create placeholder bench files (required by Cargo.toml but not needed for
-# extension package)
-RUN mkdir -p benches && \
+# Create placeholder bench and workspace member files (required by Cargo.toml
+# but not needed for extension package)
+RUN mkdir -p benches pgtrickle-tui/src && \
     echo 'fn main() {}' > benches/diff_operators.rs && \
-    echo 'fn main() {}' > benches/refresh_bench.rs
+    echo 'fn main() {}' > benches/refresh_bench.rs && \
+    echo 'fn main() {}' > pgtrickle-tui/src/main.rs
 
 # Compile the extension. Cargo will automatically use cached dependencies
 # from the build-deps stage's `cargo fetch` (stored in /root/.cargo).

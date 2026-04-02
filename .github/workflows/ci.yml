@@ -710,10 +710,10 @@ jobs:
           key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
 
       - name: Build E2E Docker image
-        run: just build-e2e-image
+        run: ./tests/build_e2e_image.sh
 
       - name: Run soak test (10 min)
-        run: SOAK_DURATION_SECS=600 just test-soak
+        run: SOAK_DURATION_SECS=600 ./scripts/run_e2e_tests.sh --test e2e_soak_tests --run-ignored all --no-capture
         timeout-minutes: 20
 
   # ── G17-MDB: Multi-Database Scheduler Isolation Test ──────────────────
@@ -740,10 +740,10 @@ jobs:
           key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
 
       - name: Build E2E Docker image
-        run: just build-e2e-image
+        run: ./tests/build_e2e_image.sh
 
       - name: Run multi-database isolation test
-        run: just test-mdb
+        run: ./scripts/run_e2e_tests.sh --test e2e_mdb_tests --run-ignored all --no-capture
 
       - name: Verify extension image layout
         run: |
