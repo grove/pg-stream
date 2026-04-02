@@ -158,39 +158,50 @@ impl PgTrickleError {
 
 /// F29 (G8.6): Classify an SPI error message for retry eligibility.
 ///
-/// Heuristic: looks for PostgreSQL SQLSTATE patterns in the error string.
-/// Only truly transient errors are retryable:
-/// - Serialization failure (40001)
-/// - Deadlock detected (40P01)
-/// - Lock not available (55P03)
-/// - Connection/statement errors
+/// Heuristic: looks for patterns in the human-readable error message text
+/// returned by pgrx from PostgreSQL SPI. SQLSTATE codes are NOT included in
+/// the SPI error string, so all patterns here are text-based rather than
+/// code-based.
 ///
-/// Non-retryable patterns:
-/// - Permission denied (42501, 42xxx)
-/// - Constraint violation (23xxx)
-/// - Division by zero (22012)
-/// - Undefined table/column (42P01, 42703)
-/// - Syntax error (42601)
+/// Non-retryable (permanent) errors:
+/// - Permission denied
+/// - Schema errors: column/relation/function does not exist, syntax error
+/// - Constraint violations
+/// - Division by zero / data exceptions
+/// - Duplicate objects
+///
+/// Retryable (transient) errors:
+/// - Serialization failures
+/// - Deadlocks
+/// - Lock timeouts
+/// - Connection errors
 ///
 /// If no pattern matches, defaults to retryable (safe for unknown errors).
 fn classify_spi_error_retryable(msg: &str) -> bool {
     let msg_lower = msg.to_lowercase();
 
-    // Non-retryable patterns (permission, constraint, data errors)
+    // Non-retryable patterns — text as it appears in PostgreSQL error messages.
+    // SQLSTATE codes (42703, 42p01, ...) do NOT appear in pgrx SPI error strings,
+    // so all matches are against the human-readable message text.
     let non_retryable_patterns = [
+        // Schema / object errors — permanent until schema is fixed
+        "does not exist", // column X does not exist, relation X does not exist, etc.
+        "syntax error",   // SQL syntax error — permanent until query is fixed
+        "column of relation", // column-level schema error
+        // Permission errors
         "permission denied",
         "insufficient_privilege",
-        "42501", // insufficient_privilege
-        "42000", // syntax_error_or_access_rule_violation
-        "42601", // syntax_error
-        "42p01", // undefined_table
-        "42703", // undefined_column
-        "23",    // integrity_constraint_violation class
-        "22012", // division_by_zero
-        "22",    // data_exception class
-        "2200",  // data_exception subclass
-        "42p07", // duplicate_table
-        "42710", // duplicate_object
+        // Constraint / data errors
+        "unique constraint",
+        "foreign key constraint",
+        "not-null constraint",
+        "check constraint",
+        "violates", // "violates unique constraint", "violates check constraint"
+        "division by zero",
+        // Duplicate object errors
+        "already exists",
+        // Dead legacy SQLSTATE code patterns (not in message text, kept as comments):
+        // "42501", "42000", "42601", "42p01", "42703", "23xxx", "22xxx"
     ];
 
     for pat in &non_retryable_patterns {
@@ -203,9 +214,6 @@ fn classify_spi_error_retryable(msg: &str) -> bool {
     let retryable_patterns = [
         "serialization",
         "deadlock",
-        "40001", // serialization_failure
-        "40p01", // deadlock_detected
-        "55p03", // lock_not_available
         "could not obtain lock",
         "canceling statement due to lock timeout",
         "connection",
@@ -416,12 +424,29 @@ mod tests {
     fn test_retryable_errors() {
         assert!(PgTrickleError::LockTimeout("x".into()).is_retryable());
         assert!(PgTrickleError::ReplicationSlotError("x".into()).is_retryable());
-        // F29: SpiError is now conditionally retryable based on SQLSTATE
+        // Transient errors — retryable
         assert!(PgTrickleError::SpiError("connection lost".into()).is_retryable());
-        assert!(PgTrickleError::SpiError("serialization failure 40001".into()).is_retryable());
-        assert!(!PgTrickleError::SpiError("permission denied for table foo".into()).is_retryable());
-        assert!(!PgTrickleError::SpiError("23505 unique constraint".into()).is_retryable());
+        assert!(PgTrickleError::SpiError("serialization failure".into()).is_retryable());
+        assert!(PgTrickleError::SpiError("deadlock detected".into()).is_retryable());
+        assert!(PgTrickleError::SpiError("could not obtain lock".into()).is_retryable());
         assert!(PgTrickleError::RefreshSkipped("x".into()).is_retryable());
+
+        // Permanent schema errors — NOT retryable (human-readable PG messages)
+        assert!(
+            !PgTrickleError::SpiError(r#"column "extra" of relation "src" does not exist"#.into())
+                .is_retryable()
+        );
+        assert!(
+            !PgTrickleError::SpiError(r#"relation "missing_table" does not exist"#.into())
+                .is_retryable()
+        );
+        assert!(
+            !PgTrickleError::SpiError(r#"syntax error at or near "SELEC""#.into()).is_retryable()
+        );
+        assert!(!PgTrickleError::SpiError("permission denied for table foo".into()).is_retryable());
+        assert!(!PgTrickleError::SpiError("unique constraint violated".into()).is_retryable());
+        assert!(!PgTrickleError::SpiError("violates not-null constraint".into()).is_retryable());
+        assert!(!PgTrickleError::SpiError("division by zero".into()).is_retryable());
 
         // F34: SpiPermissionError is never retryable
         assert!(!PgTrickleError::SpiPermissionError("x".into()).is_retryable());
@@ -449,28 +474,38 @@ mod tests {
 
     #[test]
     fn test_classify_spi_error_retryable() {
-        // F29: SQLSTATE-based retry classification
-        // Non-retryable patterns
+        // Non-retryable: permanent schema errors (human-readable PG message text)
         assert!(!classify_spi_error_retryable(
             "permission denied for table orders"
         ));
         assert!(!classify_spi_error_retryable(
-            "ERROR: 42501 insufficient_privilege"
+            r#"column "extra" of relation "src" does not exist"#
         ));
         assert!(!classify_spi_error_retryable(
-            "23505: duplicate key value violates unique constraint"
+            r#"relation "missing_table" does not exist"#
         ));
-        assert!(!classify_spi_error_retryable("22012 division_by_zero"));
-        assert!(!classify_spi_error_retryable("42P01: undefined_table"));
+        assert!(!classify_spi_error_retryable(
+            r#"syntax error at or near "SELEC""#
+        ));
+        assert!(!classify_spi_error_retryable(
+            "violates unique constraint \"orders_pkey\""
+        ));
+        assert!(!classify_spi_error_retryable("division by zero"));
+        assert!(!classify_spi_error_retryable("already exists"));
 
-        // Retryable patterns
-        assert!(classify_spi_error_retryable(
-            "40001: could not serialize access"
+        // Non-retryable: old SQLSTATE-in-message style still works where present
+        assert!(!classify_spi_error_retryable(
+            "ERROR: 42501 insufficient_privilege"
         ));
+
+        // Retryable: transient errors
+        assert!(classify_spi_error_retryable("serialization failure"));
         assert!(classify_spi_error_retryable("deadlock detected"));
-        assert!(classify_spi_error_retryable("55P03: lock_not_available"));
         assert!(classify_spi_error_retryable(
             "server closed the connection unexpectedly"
+        ));
+        assert!(classify_spi_error_retryable(
+            "could not obtain lock on relation"
         ));
 
         // Unknown error: default retryable
