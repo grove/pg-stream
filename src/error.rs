@@ -177,7 +177,7 @@ impl PgTrickleError {
 /// - Connection errors
 ///
 /// If no pattern matches, defaults to retryable (safe for unknown errors).
-fn classify_spi_error_retryable(msg: &str) -> bool {
+pub fn classify_spi_error_retryable(msg: &str) -> bool {
     let msg_lower = msg.to_lowercase();
 
     // Non-retryable patterns — text as it appears in PostgreSQL error messages.

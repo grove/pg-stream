@@ -572,24 +572,73 @@ pub extern "C-unwind" fn pg_trickle_refresh_worker_main(_arg: pg_sys::Datum) {
     }
 
     // Execute the unit.
-    let outcome = BackgroundWorker::transaction(AssertUnwindSafe(|| -> RefreshOutcome {
-        match job.unit_kind.as_str() {
-            "singleton" => execute_worker_singleton(&job),
-            "atomic_group" => execute_worker_atomic_group(&job, false),
-            "repeatable_read_group" => execute_worker_atomic_group(&job, true),
-            "immediate_closure" => execute_worker_immediate_closure(&job),
-            "cyclic_scc" => execute_worker_cyclic_scc(&job),
-            "fused_chain" => execute_worker_fused_chain(&job),
-            _ => {
-                warning!(
-                    "pg_trickle refresh worker: unknown unit_kind '{}' for job {}",
-                    job.unit_kind,
-                    job_id,
-                );
-                RefreshOutcome::PermanentFailure
+    //
+    // ERR-1d: Wrap in catch_unwind so that PostgreSQL ERRORs (which pgrx
+    // converts to Rust panics via longjmp) don't kill the worker before we
+    // can record the failure. When the refresh triggers a PG ERROR (e.g.
+    // "column X does not exist"), the BackgroundWorker::transaction's
+    // PgTryBuilder rethrows the caught panic, aborting the transaction.
+    // Without catch_unwind, the panic propagates to #[pg_guard] and the
+    // worker exits — leaving the job stuck in RUNNING and the ST never
+    // transitioning to ERROR.
+    let outcome = std::panic::catch_unwind(AssertUnwindSafe(|| {
+        BackgroundWorker::transaction(AssertUnwindSafe(|| -> RefreshOutcome {
+            match job.unit_kind.as_str() {
+                "singleton" => execute_worker_singleton(&job),
+                "atomic_group" => execute_worker_atomic_group(&job, false),
+                "repeatable_read_group" => execute_worker_atomic_group(&job, true),
+                "immediate_closure" => execute_worker_immediate_closure(&job),
+                "cyclic_scc" => execute_worker_cyclic_scc(&job),
+                "fused_chain" => execute_worker_fused_chain(&job),
+                _ => {
+                    warning!(
+                        "pg_trickle refresh worker: unknown unit_kind '{}' for job {}",
+                        job.unit_kind,
+                        job_id,
+                    );
+                    RefreshOutcome::PermanentFailure
+                }
             }
-        }
+        }))
     }));
+
+    let outcome = match outcome {
+        Ok(o) => (o, None),
+        Err(panic_payload) => {
+            // ERR-1d: The refresh transaction panicked (PG ERROR). Extract
+            // the error message from the panic payload and treat this as a
+            // permanent failure. The original transaction was rolled back by
+            // PostgreSQL, so we record the failure in a fresh transaction.
+            let error_msg = extract_panic_message(&panic_payload);
+
+            log!(
+                "pg_trickle refresh worker: job {} panicked (PG ERROR): {}",
+                job_id,
+                error_msg,
+            );
+
+            // Determine if this is a retryable or permanent error.
+            let is_retryable = crate::error::classify_spi_error_retryable(&error_msg);
+
+            // Set error state on member STs in a fresh transaction.
+            if !is_retryable {
+                BackgroundWorker::transaction(AssertUnwindSafe(|| {
+                    for &pgt_id in &job.member_pgt_ids {
+                        let _ = StreamTableMeta::set_error_state(pgt_id, &error_msg);
+                    }
+                }));
+            }
+
+            let outcome = if is_retryable {
+                RefreshOutcome::RetryableFailure
+            } else {
+                RefreshOutcome::PermanentFailure
+            };
+            (outcome, Some(error_msg))
+        }
+    };
+
+    let (outcome, panic_error_msg) = outcome;
 
     // Persist outcome to the job table
     let (status, retryable) = match outcome {
@@ -599,7 +648,7 @@ pub extern "C-unwind" fn pg_trickle_refresh_worker_main(_arg: pg_sys::Datum) {
     };
 
     BackgroundWorker::transaction(AssertUnwindSafe(|| {
-        let _ = SchedulerJob::complete(job_id, status, None, retryable);
+        let _ = SchedulerJob::complete(job_id, status, panic_error_msg.as_deref(), retryable);
     }));
 
     log!(
@@ -611,6 +660,29 @@ pub extern "C-unwind" fn pg_trickle_refresh_worker_main(_arg: pg_sys::Datum) {
 
     // Release the cluster-wide worker token
     shmem::release_worker_token();
+}
+
+/// ERR-1d: Extract a human-readable error message from a caught panic payload.
+///
+/// Panics from PostgreSQL ERRORs are represented as `CaughtError` in pgrx.
+/// We try to downcast to known types; if that fails, we produce a generic message.
+fn extract_panic_message(payload: &Box<dyn std::any::Any + Send>) -> String {
+    use pgrx::pg_sys::panic::CaughtError;
+
+    if let Some(caught) = payload.downcast_ref::<CaughtError>() {
+        return match caught {
+            CaughtError::PostgresError(ereport)
+            | CaughtError::ErrorReport(ereport)
+            | CaughtError::RustPanic { ereport, .. } => ereport.message().to_string(),
+        };
+    }
+    if let Some(msg) = payload.downcast_ref::<&str>() {
+        return msg.to_string();
+    }
+    if let Some(msg) = payload.downcast_ref::<String>() {
+        return msg.clone();
+    }
+    "unknown error (panic payload could not be decoded)".to_string()
 }
 
 /// Parse the worker's bgw_extra string: "db_name\0job_id".
@@ -1611,6 +1683,28 @@ fn parallel_dispatch_tick(
                     "pg_trickle: parallel dispatch — job {} failed permanently",
                     job_id,
                 );
+
+                // ERR-1d: Ensure ERROR status is set on member STs for permanent
+                // failures. The worker may have already set this via the
+                // catch_unwind path, but this is a safety net in case the
+                // worker died before completing the error-state UPDATE.
+                if job.status == JobStatus::PermanentFailed {
+                    let unit = eu_dag.units().find(|u| u.id == unit_id);
+                    if let Some(unit) = unit {
+                        let error_detail = job
+                            .outcome_detail
+                            .as_deref()
+                            .unwrap_or("Refresh failed permanently");
+                        for &pgt_id in &unit.member_pgt_ids {
+                            // Only set ERROR if not already in ERROR state.
+                            if let Some(st) = load_st_by_id(pgt_id)
+                                && st.status != StStatus::Error
+                            {
+                                let _ = StreamTableMeta::set_error_state(pgt_id, error_detail);
+                            }
+                        }
+                    }
+                }
 
                 // Mark this unit as "succeeded" so the wave can complete.
                 // The refresh itself already recorded the failure in
