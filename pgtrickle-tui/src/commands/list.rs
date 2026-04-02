@@ -29,16 +29,16 @@ pub async fn execute(client: &Client, args: &ListArgs) -> Result<(), CliError> {
     let rows = client
         .query(
             "SELECT
-                name::text,
-                schema_name::text,
-                status::text,
-                refresh_mode::text,
-                is_populated,
-                consecutive_errors,
-                schedule::text,
-                staleness::text
-             FROM pgtrickle.pgt_status()
-             ORDER BY schema_name, name",
+                s.pgt_name::text,
+                s.pgt_schema::text,
+                s.status::text,
+                s.refresh_mode::text,
+                s.is_populated,
+                COALESCE(s.consecutive_errors, 0)::bigint,
+                s.schedule::text,
+                s.staleness_secs
+             FROM pgtrickle.st_refresh_stats() s
+             ORDER BY s.pgt_schema, s.pgt_name",
             &[],
         )
         .await
@@ -46,15 +46,18 @@ pub async fn execute(client: &Client, args: &ListArgs) -> Result<(), CliError> {
 
     let items: Vec<StreamTableRow> = rows
         .iter()
-        .map(|row| StreamTableRow {
-            name: row.get(0),
-            schema: row.get(1),
-            status: row.get(2),
-            refresh_mode: row.get(3),
-            is_populated: row.get(4),
-            consecutive_errors: row.get(5),
-            schedule: row.get(6),
-            staleness: row.get(7),
+        .map(|row| {
+            let staleness_secs: Option<f64> = row.get(7);
+            StreamTableRow {
+                name: row.get(0),
+                schema: row.get(1),
+                status: row.get(2),
+                refresh_mode: row.get(3),
+                is_populated: row.get(4),
+                consecutive_errors: row.get(5),
+                schedule: row.get(6),
+                staleness: staleness_secs.map(|s| format!("{s:.1}s")),
+            }
         })
         .collect();
 
