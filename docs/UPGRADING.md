@@ -424,6 +424,64 @@ All columns use `ADD COLUMN IF NOT EXISTS` for idempotent upgrades.
 
 **No breaking changes.** All v0.12.0 functions, views, and event triggers continue to work as before.
 
+### 0.13.0 → 0.14.0
+
+**Two new catalog columns** added to `pgtrickle.pgt_stream_tables`:
+
+| Column | Type | Default | Purpose |
+|--------|------|---------|--------|
+| `last_error_message` | `TEXT` | `NULL` | Error message from the last permanent refresh failure |
+| `last_error_at` | `TIMESTAMPTZ` | `NULL` | Timestamp of the last permanent refresh failure |
+
+**Updated function signature** (return type gained new columns):
+
+- `pgtrickle.st_refresh_stats()` — gains `consecutive_errors`, `schedule`,
+  `refresh_tier`, and `last_error_message` columns. The upgrade script
+  drops and recreates the function. No behavior change for existing callers
+  that ignore unknown columns.
+
+**New SQL functions** (available immediately after `ALTER EXTENSION ... UPDATE`):
+
+| Function | Purpose |
+|----------|---------|
+| `pgtrickle.recommend_refresh_mode(name)` | Workload-based refresh mode recommendation with confidence level |
+| `pgtrickle.refresh_efficiency(name)` | Per-table FULL vs. DIFFERENTIAL performance metrics |
+| `pgtrickle.export_definition(name)` | Export stream table as reproducible DROP+CREATE+ALTER DDL |
+| `pgtrickle.convert_buffers_to_unlogged()` | Convert logged change buffers to UNLOGGED |
+
+**New GUC variables:**
+
+| GUC | Default | Purpose |
+|-----|---------|---------|
+| `pg_trickle.planner_aggressive` | `true` | Consolidated switch replacing `merge_planner_hints` + `merge_work_mem_mb` |
+| `pg_trickle.unlogged_buffers` | `false` | Create new change buffers as UNLOGGED (reduces WAL by ~30%) |
+| `pg_trickle.agg_diff_cardinality_threshold` | `1000` | Warn at creation time when GROUP BY cardinality is below this |
+
+**Deprecated GUCs** (still accepted but ignored at runtime):
+
+- `pg_trickle.merge_planner_hints` → use `pg_trickle.planner_aggressive`
+- `pg_trickle.merge_work_mem_mb` → use `pg_trickle.planner_aggressive`
+
+**Behavioral notes:**
+
+- **Error-state circuit breaker:** A single permanent refresh failure (e.g.
+  a function that doesn't exist for the column type) now immediately sets the
+  stream table status to `ERROR` with a message stored in `last_error_message`.
+  The scheduler skips `ERROR` tables. Use `pgtrickle.resume_stream_table(name)`
+  followed by `pgtrickle.alter_stream_table(name, query => ...)` to recover.
+- **Tiered scheduling NOTICE:** Demoting a stream table from `hot` to `cold`
+  or `frozen` now emits a NOTICE so operators are aware the effective refresh
+  interval has changed (10× for cold, suspended for frozen).
+- **SECURITY DEFINER triggers:** All CDC trigger functions now run with
+  `SECURITY DEFINER` and an explicit `SET search_path`, hardening against
+  privilege-escalation attacks. This is applied automatically on upgrade —
+  no manual action needed.
+- **TUI binary:** A `pgtrickle` command-line tool is now included in the
+  package. See [TUI.md](TUI.md) for usage.
+
+**No breaking changes.** All v0.13.0 functions, views, and event triggers
+continue to work as before.
+
 ---
 
 ## Supported Upgrade Paths
@@ -448,9 +506,10 @@ automatically when you run `ALTER EXTENSION pg_trickle UPDATE`.
 | 0.10.0 | 0.11.0 | `pg_trickle--0.10.0--0.11.0.sql` |
 | 0.11.0 | 0.12.0 | `pg_trickle--0.11.0--0.12.0.sql` |
 | 0.12.0 | 0.13.0 | `pg_trickle--0.12.0--0.13.0.sql` |
+| 0.13.0 | 0.14.0 | `pg_trickle--0.13.0--0.14.0.sql` |
 
-That means any installation currently on 0.1.3 through 0.12.0 can upgrade to
-0.13.0 in one step after the new binaries are installed and PostgreSQL has been
+That means any installation currently on 0.1.3 through 0.13.0 can upgrade to
+0.14.0 in one step after the new binaries are installed and PostgreSQL has been
 restarted.
 
 ---

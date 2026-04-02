@@ -8,7 +8,8 @@ For future plans and release milestones, see [ROADMAP.md](ROADMAP.md).
 ## Table of Contents
 
 <!-- TOC start -->
-- [Unreleased (0.14.0)](#unreleased-0140)
+- [Unreleased](#unreleased)
+- [0.14.0 — 2026-04-02](#0140--2026-04-02)
 - [0.13.0 — 2026-03-31](#0130--2026-03-31)
 - [0.12.0 — 2026-03-28](#0120--2026-03-28)
 - [0.11.0 — 2026-03-26](#0110--2026-03-26)
@@ -32,180 +33,204 @@ For future plans and release milestones, see [ROADMAP.md](ROADMAP.md).
 
 ---
 
-## [Unreleased] — 0.14.0
+## [Unreleased]
 
-### Added
+<!-- Next release notes go here -->
 
-- **C4: `pg_trickle.planner_aggressive` GUC** — Consolidated boolean switch
-  that replaces the separate `merge_planner_hints` and `merge_work_mem_mb`
-  GUCs. When `true` (default), all planner hints for MERGE execution are
-  enabled. The old GUCs are still accepted but deprecated; they are ignored
-  at runtime in favor of `planner_aggressive`.
+---
 
-- **DIAG-2: Aggregate cardinality warning at creation time** — When creating
-  a stream table with algebraic aggregates (SUM, COUNT, AVG) in DIFFERENTIAL
-  mode, a WARNING is emitted if the estimated GROUP BY cardinality (from
-  `pg_stats.n_distinct`) is below the configurable threshold
-  `pg_trickle.agg_diff_cardinality_threshold` (default: 1000). This helps
-  users identify cases where FULL or AUTO mode may be more efficient.
+## [0.14.0] — 2026-04-02
 
-- **DIAG-2: `pg_trickle.agg_diff_cardinality_threshold` GUC** — Configurable
-  threshold for the algebraic aggregate cardinality warning. Set to 0 to
-  disable the warning.
+0.14.0 is the **Tiered Scheduling, Diagnostics & TUI** release. It gives you
+fine-grained control over how often each stream table refreshes, adds tools
+that recommend the best refresh strategy for your workload, introduces a
+full-screen terminal dashboard for managing stream tables without SQL, and
+includes important security and reliability fixes.
 
-- **DOC-OPM: Operator support matrix summary in SQL_REFERENCE.md** — Added
-  a summary table of the 60+ operator support matrix with a prominent link
-  to the full `DVM_OPERATORS.md` matrix, improving discoverability.
+### Terminal Dashboard (TUI)
 
-- **ERR-1: Error state circuit breaker** — Permanent refresh failures now
-  immediately set the stream table status to `ERROR` with `last_error_message`
-  and `last_error_at` stored in the catalog. Previously, permanent errors
-  would cycle through multiple retries before reaching SUSPENDED. Now a single
-  permanent failure (e.g. `function max(jsonb) does not exist`) stops the
-  retry loop immediately.
+A new `pgtrickle` command-line tool lets you monitor and manage stream tables
+from a terminal — no SQL required. Run it with no arguments to launch a
+live-updating full-screen dashboard (think `htop` for stream tables), or use
+one-shot subcommands like `pgtrickle list`, `pgtrickle status`, or
+`pgtrickle refresh` for scripting and CI.
 
-- **ERR-1: `last_error_message` and `last_error_at` catalog columns** — New
-  nullable columns on `pgt_stream_tables` that store the error message and
-  timestamp of the last permanent failure. Visible in the
-  `pgtrickle.stream_tables_info` view via `st.*`.
+The interactive dashboard includes:
 
-- **C-1b: Tier demotion NOTICE** — `ALTER STREAM TABLE ... SET (tier = 'cold')`
-  and `SET (tier = 'frozen')` now emit a NOTICE when demoting from Hot tier,
-  alerting operators that the effective refresh interval has changed (10×
-  multiplier for Cold, suspended for Frozen).
+- **Live overview** — stream table statuses, refresh timing, and issue counts
+  update every 2 seconds, with color-coded health indicators.
+- **Dependency graph** — see how stream tables relate to each other in an
+  ASCII tree view.
+- **Diagnostics** — view refresh mode recommendations with confidence levels.
+- **CDC health** — monitor change buffer sizes with warnings when they grow
+  too large.
+- **Alert feed** — real-time notification display with severity levels.
+- **Issue detection** — automatically spots broken dependency chains, growing
+  buffers, blown fuses, and stale data, with a persistent badge showing the
+  issue count from any view.
+- **Watch mode** — `pgtrickle watch` provides continuous non-interactive
+  output suitable for log aggregation.
+- **Output formats** — all CLI subcommands support `--format json`,
+  `--format csv`, and human-readable table output.
 
-- **D-1a: `pg_trickle.unlogged_buffers` GUC** — When `true`, newly created
-  change buffer tables are `UNLOGGED`, eliminating WAL writes for CDC trigger
-  inserts and reducing WAL amplification by ~30%. Default `false` (crash-safe).
+See [docs/TUI.md](docs/TUI.md) for the full user guide.
 
-- **D-1b: Crash recovery detection for UNLOGGED buffers** — The scheduler
-  detects when an UNLOGGED buffer was truncated by crash recovery (empty
-  buffer + postmaster restart after last refresh) and automatically enqueues
-  a FULL refresh to resynchronize the stream table.
+### Tiered Refresh Scheduling
 
-- **D-1c: `pgtrickle.convert_buffers_to_unlogged()` utility** — Converts all
-  existing logged change buffer tables to `UNLOGGED`. Returns the count of
-  converted tables. Acquires `ACCESS EXCLUSIVE` lock per table — run during
-  low-traffic windows.
+Stream tables can now be assigned to refresh tiers — **hot**, **warm**,
+**cold**, or **frozen** — to control how frequently they refresh:
 
-- **DIAG-1: `pgtrickle.recommend_refresh_mode()` function** — Analyzes stream
-  table workload characteristics and recommends the optimal refresh mode (FULL
-  vs DIFFERENTIAL). Evaluates seven weighted signals — change ratio, empirical
-  timing, query complexity, target size, index coverage, and latency variance
-  — and returns a composite recommendation with confidence level and detailed
-  signal breakdown in JSONB.
+- **Hot** (default) — refreshes at the configured interval.
+- **Warm** — refreshes at 2× the interval.
+- **Cold** — refreshes at 10× the interval, ideal for infrequently accessed
+  reports.
+- **Frozen** — pauses automatic refresh entirely until promoted back.
 
-- **DIAG-1d: `pgtrickle.refresh_efficiency()` function** — Per-table refresh
-  efficiency metrics: FULL vs DIFFERENTIAL counts, average timing, change ratios,
-  and speedup factor. Suitable for monitoring dashboards and Grafana alerts.
+Assign a tier with
+`ALTER STREAM TABLE ... SET (tier = 'cold')`. A NOTICE is emitted when
+demoting from Hot to Cold or Frozen so operators are aware of the change in
+refresh frequency.
 
-- **G15-EX: `pgtrickle.export_definition()` function** — Exports a stream
-  table's full configuration as reproducible DDL (`DROP` + `CREATE` +
-  `ALTER` statements), including schedule, refresh mode, CDC mode, partition
-  key, fuse settings, and all other options.
+### Smarter Refresh Recommendations
 
-- **G17-SOAK: Long-running stability soak test** — Configurable soak test
-  (`tests/e2e_soak_tests.rs`) that validates zero worker crashes, zero
-  ERROR states, stable RSS memory, and correctness under sustained mixed
-  DML workload. Default 10 minutes; configurable via `SOAK_DURATION_SECS`.
-  Includes `just test-soak` and `just test-soak-short` justfile targets
-  and CI job (schedule + manual dispatch).
+Two new diagnostic functions help you choose the most efficient refresh
+strategy for each stream table:
 
-- **G17-MDB: Multi-database isolation test** — Validates that two databases
-  in the same PostgreSQL cluster run pg_trickle independently: catalog
-  isolation, shared-memory independence, concurrent mutations with
-  correctness verification. `just test-mdb` justfile target and CI job.
+- **`pgtrickle.recommend_refresh_mode(name)`** — analyzes seven workload
+  signals (change frequency, timing history, query complexity, table size,
+  index coverage, and latency patterns) and recommends FULL or DIFFERENTIAL
+  mode with a confidence level and plain-language explanation. Useful when
+  you're unsure which mode will be faster for a particular table.
 
-- **G16-PAT: Best-practice patterns guide** — New `docs/PATTERNS.md` with
-  6 patterns: Bronze/Silver/Gold materialization, event sourcing, SCD
-  type-1 and type-2, high-fan-out topology, real-time dashboards, and
-  tiered refresh strategies. Each pattern includes SQL examples,
-  anti-patterns, and refresh mode recommendations.
+- **`pgtrickle.refresh_efficiency(name)`** — shows per-table refresh
+  performance: how many FULL vs. DIFFERENTIAL refreshes have run, average
+  timing for each, and the speedup factor. Good for monitoring dashboards
+  and alerting.
 
-- **DOC-PDC: Pre-deployment checklist** — New `docs/PRE_DEPLOYMENT.md` with
-  10-point checklist for production deployments: PostgreSQL version,
-  `shared_preload_libraries`, WAL configuration, PgBouncer compatibility,
-  recommended GUCs, resource planning, monitoring, and a validation script.
-  Cross-linked from GETTING_STARTED.md and INSTALL.md.
+A new tutorial — [Tuning Refresh Mode](docs/tutorials/tuning-refresh-mode.md)
+— walks through the process step by step.
 
-- **E3-TUI: `pgtrickle` TUI binary (Phase T1 — skeleton & CLI mode)** —
-  New `pgtrickle-tui` workspace member crate with a `pgtrickle` binary.
-  Implements one-shot CLI subcommands: `list`, `status`, `refresh`, `create`,
-  `drop`, `alter`, `export`, `diag`, `cdc`, `graph`, `config`, `health`,
-  and `completions` (bash/zsh/fish/PowerShell). Supports `--format json`,
-  `--format csv`, and human-readable table output. Connection via `--url`,
-  libpq environment variables (`PGHOST`/`PGPORT`/etc.), or defaults.
+### Reduced Write Overhead with UNLOGGED Buffers
 
-- **E3-TUI: Interactive TUI dashboard (Phase T2–T8)** —
-  Running `pgtrickle` with no subcommand launches a full-screen interactive
-  dashboard built with ratatui. Features implemented:
-  - **Dashboard (F1):** Live-updating stream table list with status ribbon,
-    wide-layout split-pane with issues sidebar and DAG mini-map, adaptive
-    layout at ≥140×35. EFF column shows cascade staleness. Filter applied
-    with `/`. Errors sort to top. Sparklines for selected ST refresh duration.
-  - **Detail view (F2):** Properties, refresh statistics, efficiency data
-    (diff/full counts, speedup), recent refreshes panel, cascade staleness
-    indicator, upstream health section for cascade-stale tables.
-  - **Dependency graph (F3):** ASCII tree visualization with status coloring.
-  - **Refresh log (F4):** Color-coded scrollable timeline.
-  - **Diagnostics (F5):** Mode recommendation table with confidence levels.
-  - **CDC health (F6):** Buffer sizes with color-coded warnings, trigger
-    inventory table showing source tables, trigger names, and events.
-  - **Configuration (F7):** GUC parameter browser.
-  - **Health checks (F18):** Overall system health summary (HEALTHY/DEGRADED/
-    WARNINGS) with severity-colored check results.
-  - **Alert feed (F8):** Real-time severity-tagged alert display via
-    LISTEN/NOTIFY on `pg_trickle_alert` channel with JSON payload parsing.
-  - **Workers view (F13):** Parallel worker pool status and job queue.
-  - **Fuse panel (F14):** Circuit breaker / fuse status per stream table
-    with detail panel showing reset instructions for blown fuses.
-  - **Watermarks view (F15):** Watermark groups and source gating status.
-  - **Delta SQL inspector (F16):** Links to `pgtrickle explain` CLI.
-  - **Issues view (F20):** DAG issue detection — broken dependency chains,
-    growing buffers, blown fuses, stale data. Severity summary and sorted
-    issue table with blast radius.
-  - **Cascade staleness (F21):** Automatic DAG traversal marks downstream
-    tables of ERROR nodes as cascade-stale. Visible in dashboard EFF column,
-    detail view, and issue badge.
-  - **Help overlay (F12):** Context-sensitive keybinding reference (`?`)
-    with per-view tips.
-  - **Watch mode (F19):** `pgtrickle watch` non-interactive continuous output
-    with `--compact`, `--no-color`, `--append`, `--filter` flags.
-  - **Navigation:** Number keys (0–9) and letter keys (w/f/m/d/g/i) switch
-    views; `j`/`k`/arrows navigate; Enter drills into detail; Esc goes back;
-    `/` opens filter input; `Ctrl+R` force poll; `q`/Ctrl+C quits.
-  - **Issue badge:** Header bar shows `⚠ N` issue count visible from every view.
-  - **Async polling:** Background 2-second polling with reconnection on failure,
-    force-poll via Ctrl+R.
-  - **Header/footer bars:** Connection status, poll timing, view tabs.
-  - **New CLI subcommands:** `workers`, `fuse`, `watermarks`, `explain`
-    (with `--analyze`, `--operators`, `--dedup`), and `watch`.
-  - **Documentation:** `docs/TUI.md` user guide.
+Enable `pg_trickle.unlogged_buffers = true` and newly created change buffer
+tables will skip write-ahead logging, reducing WAL volume by roughly 30%.
+This is ideal for workloads where you can tolerate a full re-sync after a
+crash (the extension detects the crash and re-syncs automatically).
 
-### Changed
+A utility function — `pgtrickle.convert_buffers_to_unlogged()` — converts
+existing buffers in one call. Run it during a maintenance window since it
+briefly locks each buffer table.
 
-- **ERR-1c: API calls clear error state** — `alter_stream_table`,
-  `create_or_replace_stream_table`, `resume_stream_table`, and successful
-  refresh completions now clear `last_error_message` and `last_error_at`,
-  allowing recovery from ERROR state.
+### Instant Error Detection
 
-- **ERR-1: `refresh_stream_table` rejects ERROR status** — Manual refresh
-  now rejects stream tables in ERROR state (same as SUSPENDED). Use
-  `resume_stream_table` to clear the error first.
+Previously, when a stream table's refresh hit a permanent error (for example,
+a function that doesn't exist for the column type), the extension would retry
+several times before giving up. Now it recognizes permanent errors immediately,
+sets the stream table status to **ERROR** with a clear error message, and
+stops retrying. You can see the error at a glance in the `stream_tables_info`
+view or the TUI dashboard, and fix it by altering the stream table's query.
 
-### Fixed
+### Security Hardening
 
-- **FIX-STST-DIFF: DIFFERENTIAL manual refresh for ST-on-ST path** — Manual
-  `refresh_stream_table()` calls on calculated stream tables (reading from
-  another stream table) now use true DIFFERENTIAL refresh via the
-  `changes_pgt_` change buffers, matching the scheduler path. Previously,
-  manual refresh unconditionally fell back to FULL refresh for any stream
-  table with ST sources.
+- **CDC trigger functions now use `SECURITY DEFINER`** — change-data-capture
+  trigger functions run with the privileges of the extension owner rather
+  than the current user, preventing privilege escalation through modified
+  search paths.
+- **Explicit `SET search_path`** — all CDC trigger functions now set
+  `search_path` to `pgtrickle_changes, pg_catalog` to prevent search-path
+  manipulation attacks.
+
+### Other Improvements
+
+- **Export definitions** — `pgtrickle.export_definition(name)` exports a
+  stream table's full configuration as reproducible SQL (`DROP` + `CREATE` +
+  `ALTER` statements), making it easy to version-control or migrate stream
+  table definitions between environments.
+
+- **Creation-time warnings** — when creating a stream table with aggregates
+  like `MIN`, `MAX`, or `STRING_AGG` in DIFFERENTIAL mode, a warning now
+  suggests that FULL or AUTO mode may be more efficient. For algebraic
+  aggregates (`SUM`/`COUNT`/`AVG`), the warning only appears when the
+  estimated number of groups is below a configurable threshold.
+
+- **Simplified settings** — the `merge_planner_hints` and `merge_work_mem_mb`
+  settings have been consolidated into a single `planner_aggressive` switch.
+  The old setting names still work but are ignored in favor of the new one.
+
+- **GHCR Docker image** — a multi-architecture Docker image
+  (`ghcr.io/grove/pg_trickle`) with PostgreSQL 18.3 and pg_trickle
+  pre-installed is now published automatically on each release.
+
+- **Pre-deployment checklist** — new [PRE_DEPLOYMENT.md](docs/PRE_DEPLOYMENT.md)
+  with a 10-point checklist for production deployments.
+
+- **Best-practice patterns guide** — new [PATTERNS.md](docs/PATTERNS.md) with
+  6 common patterns: Bronze/Silver/Gold materialization, event sourcing,
+  slowly-changing dimensions, high-fan-out topology, real-time dashboards,
+  and tiered refresh strategies.
+
+- **Keyless dedup fix** — replaced `MAX(col)` with `array_agg(col)[1]` for
+  deduplicating keyless scan results, which is more correct for non-orderable
+  types.
+
+### Bug Fixes
+
+- **ST-on-ST differential refresh** — manually refreshing a stream table that
+  reads from another stream table now uses true incremental (DIFFERENTIAL)
+  refresh instead of falling back to a full re-scan. This matches the behavior
+  of the automatic scheduler and is significantly faster for large tables.
+
+- **Staleness tracking** — the staleness indicator now uses the actual last
+  refresh time instead of an internal data timestamp, making the
+  `pg_stat_stream_tables` view more accurate.
+
+### Testing & Reliability
+
+- **Soak test** — a new long-running stability test validates zero worker
+  crashes, zero ERROR states, and stable memory usage under sustained mixed
+  workload (configurable duration, default 10 minutes).
+
+- **Multi-database isolation test** — verifies that two databases in the same
+  PostgreSQL cluster run pg_trickle independently without interference.
+
+- **140 TUI tests** — comprehensive unit, snapshot, and interaction tests for
+  the terminal dashboard.
+
+- **23 mixed-object E2E tests** — validates stream tables alongside regular
+  PostgreSQL views, materialized views, and other objects.
+
+- **Scheduler race fixes** — eliminated flaky test failures caused by
+  scheduler timing races and GUC leak between tests.
+
+### New SQL Functions
+
+| Function | Purpose |
+|----------|---------|
+| `pgtrickle.recommend_refresh_mode(name)` | Workload-based refresh mode recommendation |
+| `pgtrickle.refresh_efficiency(name)` | Per-table refresh performance metrics |
+| `pgtrickle.export_definition(name)` | Export stream table as reproducible DDL |
+| `pgtrickle.convert_buffers_to_unlogged()` | Convert logged change buffers to UNLOGGED |
+
+### New Settings
+
+| Setting | Default | Purpose |
+|---------|---------|---------|
+| `pg_trickle.planner_aggressive` | `true` | Consolidated switch for MERGE planner hints |
+| `pg_trickle.unlogged_buffers` | `false` | Create new change buffers as UNLOGGED |
+| `pg_trickle.agg_diff_cardinality_threshold` | `1000` | Warn about DIFFERENTIAL mode below this group count |
 
 ### Deprecated
 
 - **`pg_trickle.merge_planner_hints`** — Use `pg_trickle.planner_aggressive`
-  instead. The GUC is still accepted but ignored at runtime.
+  instead. Still accepted but ignored at runtime.
+- **`pg_trickle.merge_work_mem_mb`** — Same; use `planner_aggressive` instead.
+
+### Upgrading
+
+Run `ALTER EXTENSION pg_trickle UPDATE;` after installing the new binaries.
+The upgrade adds new catalog columns, functions, and the TUI workspace member.
+No breaking changes — everything from v0.13.0 continues to work. See
+[UPGRADING.md](docs/UPGRADING.md) for details.
 
 ---
 

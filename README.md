@@ -503,7 +503,7 @@ just test-all            # All of the above + pgrx tests
 just bench               # Criterion benchmarks
 ```
 
-**Test counts:** ~1,660 unit tests + integration tests + ~1,130 E2E tests.
+**Test counts:** ~1,670 unit tests + integration tests + ~1,340 E2E tests + ~140 TUI tests.
 
 ## Contributors
 

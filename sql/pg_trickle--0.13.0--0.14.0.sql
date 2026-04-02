@@ -78,3 +78,57 @@ CREATE FUNCTION pgtrickle."st_refresh_stats"() RETURNS TABLE (
 STRICT
 LANGUAGE c /* Rust */
 AS 'MODULE_PATHNAME', 'st_refresh_stats_wrapper';
+
+-- ── New functions (Phases 3–5): explicit registration required ──────────────
+-- Although these functions are implemented as #[pg_extern] in Rust, PostgreSQL
+-- does NOT automatically register new shared-library functions during
+-- ALTER EXTENSION UPDATE. They must be explicitly CREATE'd here so they are
+-- visible after `ALTER EXTENSION pg_trickle UPDATE`.
+
+-- D-1c: convert_buffers_to_unlogged()
+CREATE  FUNCTION pgtrickle."convert_buffers_to_unlogged"() RETURNS bigint
+STRICT
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'convert_buffers_to_unlogged_wrapper';
+
+-- G15-EX: export_definition()
+CREATE  FUNCTION pgtrickle."export_definition"(
+        "st_name" TEXT
+) RETURNS TEXT
+STRICT
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'export_definition_wrapper';
+
+-- DIAG-1c: recommend_refresh_mode()
+CREATE  FUNCTION pgtrickle."recommend_refresh_mode"(
+        "st_name" TEXT DEFAULT NULL
+) RETURNS TABLE (
+        "pgt_schema" TEXT,
+        "pgt_name" TEXT,
+        "current_mode" TEXT,
+        "effective_mode" TEXT,
+        "recommended_mode" TEXT,
+        "confidence" TEXT,
+        "reason" TEXT,
+        "signals" jsonb
+)
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'recommend_refresh_mode_wrapper';
+
+-- DIAG-1d: refresh_efficiency()
+CREATE  FUNCTION pgtrickle."refresh_efficiency"() RETURNS TABLE (
+        "pgt_schema" TEXT,
+        "pgt_name" TEXT,
+        "refresh_mode" TEXT,
+        "total_refreshes" bigint,
+        "diff_count" bigint,
+        "full_count" bigint,
+        "avg_diff_ms" double precision,
+        "avg_full_ms" double precision,
+        "avg_change_ratio" double precision,
+        "diff_speedup" TEXT,
+        "last_refresh_at" TEXT
+)
+STRICT
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'refresh_efficiency_wrapper';

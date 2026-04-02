@@ -48,6 +48,7 @@
 - [Migrating from Materialized Views](tutorials/MIGRATING_FROM_MATERIALIZED_VIEWS.md)
 - [Fuse Circuit Breaker](tutorials/FUSE_CIRCUIT_BREAKER.md)
 - [Tiered Scheduling](tutorials/TIERED_SCHEDULING.md)
+- [Tuning Refresh Mode](tutorials/tuning-refresh-mode.md)
 - [Circular Dependencies](tutorials/CIRCULAR_DEPENDENCIES.md)
 - [Monitoring & Alerting](tutorials/MONITORING_AND_ALERTING.md)
 - [ETL & Bulk Load Patterns](tutorials/ETL_BULK_LOAD.md)

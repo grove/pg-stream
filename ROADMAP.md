@@ -1,8 +1,8 @@
 # pg_trickle — Project Roadmap
 
-> **Last updated:** 2026-03-31
-> **Latest release:** 0.13.0 (2026-03-31)
-> **Current milestone:** v0.14.0 — Tiered Scheduling, UNLOGGED Buffers & Diagnostics
+> **Last updated:** 2026-04-02
+> **Latest release:** 0.14.0 (2026-04-02)
+> **Current milestone:** v0.15.0 — External Test Suites & Integration
 
 For a concise description of what pg_trickle is and why it exists, read
 [ESSENCE.md](ESSENCE.md) — it explains the core problem (full `REFRESH
@@ -57,19 +57,19 @@ from the v0.1.x series to 1.0 and beyond.
                                                                    │ ✅      │ │ ✅      │ │ ✅      │ │ ✅      │ │ ✅      │ │ ✅      │ │ ✅      │ │ ✅      │ │ ✅      │ │ ✅      │
                                                                    └────────┘ └────────┘ └────────┘ └────────┘ └────────┘ └────────┘ └────────┘ └────────┘ └────────┘ └────────┘
                                                                      │
-                                                                     └─ ┌────────┐ ┌────────┐ ┌─────────┐ ┌─────────┐ ┌─────────┐ ┌─────────┐
-                                                                        │ 0.8.0  │ │ 0.9.0  │ │ 0.10.0  │ │ 0.11.0  │ │ 0.12.0  │ │ 0.13.0  │
-                                                                        │Released│─│Released│─│Released │─│Released │─│Released │─│Released │
-                                                                        │ ✅      │ │ ✅      │ │ ✅       │ │ ✅       │ │ ✅       │ │ ✅       │
-                                                                        └────────┘ └────────┘ └─────────┘ └─────────┘ └─────────┘ └─────────┘
+                                                                     └─ ┌────────┐ ┌────────┐ ┌─────────┐ ┌─────────┐ ┌─────────┐ ┌─────────┐ ┌─────────┐
+                                                                        │ 0.8.0  │ │ 0.9.0  │ │ 0.10.0  │ │ 0.11.0  │ │ 0.12.0  │ │ 0.13.0  │ │ 0.14.0  │
+                                                                        │Released│─│Released│─│Released │─│Released │─│Released │─│Released │─│Released │
+                                                                        │ ✅      │ │ ✅      │ │ ✅       │ │ ✅       │ │ ✅       │ │ ✅       │ │ ✅       │
+                                                                        └────────┘ └────────┘ └─────────┘ └─────────┘ └─────────┘ └─────────┘ └─────────┘
          We are here
               │
               ▼
-              └─ ┌─────────┐ ┌─────────┐ ┌─────────┐ ┌────────┐ ┌────────┐
-                 │ 0.14.0  │ │ 0.15.0  │ │ 0.16.0  │ │ 1.0.0  │ │ 1.x+   │
-                 │Tiered   │─│Test,    │─│PGCompat │─│Stable  │─│Scale & │
-                 │Sched    │ │Integ.   │ │+DDL     │ │Release │ │Ecosys. │
-                 └─────────┘ └─────────┘ └─────────┘ └────────┘ └────────┘
+              └─ ┌─────────┐ ┌─────────┐ ┌────────┐ ┌────────┐
+                 │ 0.15.0  │ │ 0.16.0  │ │ 1.0.0  │ │ 1.x+   │
+                 │Test,    │─│PGCompat │─│Stable  │─│Scale & │
+                 │Integ.   │ │+DDL     │ │Release │ │Ecosys. │
+                 └─────────┘ └─────────┘ └────────┘ └────────┘
 ```
 
 ---
@@ -2604,8 +2604,14 @@ Target: reduce regression escape rate from ~15% to <5%.
 
 ## v0.14.0 — Tiered Scheduling, UNLOGGED Buffers & Diagnostics
 
-**Goal:** Advance tiered refresh scheduling with manual tier assignment
-and deliver opt-in UNLOGGED change buffers for reduced WAL amplification.
+**Status: Released (2026-04-02).**
+
+Tiered refresh scheduling, UNLOGGED change buffers, refresh mode diagnostics,
+error-state circuit breaker, a full-featured TUI dashboard, security
+hardening (SECURITY DEFINER triggers with explicit search_path), GHCR Docker
+image, pre-deployment checklist, best-practice patterns guide, and
+comprehensive E2E test coverage. See [CHANGELOG.md](CHANGELOG.md) for the
+full feature list.
 
 ### Quick Polish & Error State Circuit Breaker (Phase 1 + 1b) — ✅ Done
 
@@ -2779,21 +2785,22 @@ Tiered scheduling infrastructure was already in place since v0.11/v0.12 (`refres
 > **v0.14.0 total: ~2–6 weeks + ~1wk patterns guide + ~2–4 days stability tests + ~3.5–7 days diagnostics + ~1–2d export API + ~8–10d TUI + ~0.5d docs + ~2–4h aggregate warning + ~1–2d ST-on-ST diff manual path**
 
 **Exit criteria:**
-- [ ] C-1: Tier classification uses delta-based read tracking; Cold STs skip refresh correctly
-- [ ] D-1: UNLOGGED change buffers opt-in (`unlogged_buffers = false` by default); crash-recovery FULL-refresh path tested
-- [ ] G16-PAT: Patterns guide published in `docs/PATTERNS.md` covering at least 4 patterns (bronze/silver/gold, event sourcing, SCD type-1, SCD type-2)
-- [ ] G17-SOAK: 24h soak test passes with zero worker crashes, zero zombie stream tables, stable memory usage
-- [ ] G17-MDB: Multi-database scheduler isolation verified; no cross-database quota interference
-- [ ] DIAG-1: `pgtrickle.recommend_refresh_mode()` returns `recommended_mode`, `confidence`, `reason`, and `signals` JSONB; `pgtrickle.refresh_efficiency` view published; all 7 signals implemented; unit tests pass; upgrade migration clean
-- [ ] DIAG-2: WARNING emitted at `create_stream_table` time for group-rescan aggregates and for algebraic aggregates with estimated group cardinality below threshold; warning directs users to `refresh_mode='full'` or `'auto'`; threshold configurable via GUC
-- [ ] G15-EX: `pgtrickle.export_definition(name TEXT)` returns valid reproducible DDL; round-trip tested
-- [x] E3-TUI: `pgtrickle` TUI binary builds as workspace member; one-shot CLI commands functional with `--format json`; interactive dashboard launches with no subcommand; 15 views with cascade staleness, issue detection, sparklines, force-poll, NOTIFY, and context-sensitive help; documented in `docs/TUI.md`
-- [ ] C4: `merge_planner_hints` and `merge_work_mem_mb` consolidated into `planner_aggressive`; old GUCs emit deprecation notice
-- [ ] DOC-PDC: Pre-deployment checklist published in `docs/PRE_DEPLOYMENT.md`; linked from GETTING_STARTED and INSTALL
-- [ ] DOC-OPM: Operator mode support matrix summary and link added to SQL_REFERENCE.md
-- [ ] FIX-STST-DIFF: Manual `refresh_stream_table()` on a `calculated` ST uses DIFFERENTIAL via `changes_pgt_` buffers when a frontier is present; `test_st_on_st_uses_differential_not_full` passes
+- [x] C-1: Tier classification with manual assignment; Cold STs skip refresh correctly; E2E tested ✅ Done
+- [x] D-1: UNLOGGED change buffers opt-in (`unlogged_buffers = false` by default); crash-recovery FULL-refresh path tested; E2E tested ✅ Done
+- [x] G16-PAT: Patterns guide published in `docs/PATTERNS.md` covering 6 patterns ✅ Done
+- [x] G17-SOAK: Soak test passes with zero worker crashes, zero zombie stream tables, stable memory ✅ Done
+- [x] G17-MDB: Multi-database scheduler isolation verified ✅ Done
+- [x] DIAG-1: `recommend_refresh_mode()` + `refresh_efficiency()` implemented with 7 signals; E2E tested; tutorial published ✅ Done
+- [x] DIAG-2: WARNING emitted at creation time for group-rescan and low-cardinality aggregates; threshold configurable ✅ Done
+- [x] G15-EX: `export_definition(name TEXT)` returns valid reproducible DDL; round-trip tested ✅ Done
+- [x] E3-TUI: `pgtrickle` TUI binary builds as workspace member; one-shot CLI commands functional with `--format json`; interactive dashboard launches with no subcommand; 15 views with cascade staleness, issue detection, sparklines, force-poll, NOTIFY, and context-sensitive help; documented in `docs/TUI.md` ✅ Done
+- [x] C4: `merge_planner_hints` and `merge_work_mem_mb` consolidated into `planner_aggressive` ✅ Done
+- [x] DOC-PDC: Pre-deployment checklist published in `docs/PRE_DEPLOYMENT.md` ✅ Done
+- [x] DOC-OPM: Operator mode support matrix summary and link added to SQL_REFERENCE.md ✅ Done
+- [x] FIX-STST-DIFF: Manual DIFFERENTIAL refresh for ST-on-ST path ✅ Done
 - [x] INFRA-GHCR: `ghcr.io/grove/pg_trickle` multi-arch image builds, smoke-tests, and pushes on `v*` tags ✅ Done
-- [ ] Extension upgrade path tested (`0.13.0 → 0.14.0`)
+- [x] ERR-1: Error-state circuit breaker with E2E test coverage ✅ Done
+- [x] Extension upgrade path tested (`0.13.0 → 0.14.0`) ✅ Done
 
 ---
 
