@@ -73,3 +73,84 @@ impl Default for Theme {
         Self::default_dark()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_default_theme_is_default_dark() {
+        let theme = Theme::default();
+        assert_eq!(theme.name, "default");
+    }
+
+    #[test]
+    fn test_status_style_active() {
+        let theme = Theme::default_dark();
+        let style = theme.status_style("ACTIVE");
+        assert_eq!(style.fg, Some(Color::Green));
+    }
+
+    #[test]
+    fn test_status_style_error() {
+        let theme = Theme::default_dark();
+        let style = theme.status_style("ERROR");
+        assert_eq!(style.fg, Some(Color::Red));
+    }
+
+    #[test]
+    fn test_status_style_suspended() {
+        let theme = Theme::default_dark();
+        let style = theme.status_style("SUSPENDED");
+        assert_eq!(style.fg, Some(Color::Yellow));
+    }
+
+    #[test]
+    fn test_status_style_paused() {
+        let theme = Theme::default_dark();
+        let style = theme.status_style("PAUSED");
+        assert_eq!(style.fg, Some(Color::DarkGray));
+    }
+
+    #[test]
+    fn test_status_style_frozen() {
+        let theme = Theme::default_dark();
+        let style = theme.status_style("FROZEN");
+        assert_eq!(style.fg, Some(Color::DarkGray));
+    }
+
+    #[test]
+    fn test_status_style_unknown() {
+        let theme = Theme::default_dark();
+        let style = theme.status_style("UNKNOWN");
+        assert_eq!(style, Style::default());
+    }
+
+    #[test]
+    fn test_severity_style_critical() {
+        let theme = Theme::default_dark();
+        let style = theme.severity_style("critical");
+        assert_eq!(style.fg, Some(Color::Red));
+    }
+
+    #[test]
+    fn test_severity_style_warning() {
+        let theme = Theme::default_dark();
+        let style = theme.severity_style("warning");
+        assert_eq!(style.fg, Some(Color::Yellow));
+    }
+
+    #[test]
+    fn test_severity_style_ok() {
+        let theme = Theme::default_dark();
+        let style = theme.severity_style("ok");
+        assert_eq!(style.fg, Some(Color::Green));
+    }
+
+    #[test]
+    fn test_severity_style_unknown() {
+        let theme = Theme::default_dark();
+        let style = theme.severity_style("info");
+        assert_eq!(style, Style::default());
+    }
+}

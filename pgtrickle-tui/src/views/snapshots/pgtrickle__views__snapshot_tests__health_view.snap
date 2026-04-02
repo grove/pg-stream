@@ -1,0 +1,28 @@
+---
+source: pgtrickle-tui/src/views/mod.rs
+expression: output
+---
+┌ System Health Overview ──────────────────────────────────────────────────────┐
+│ ✗ DEGRADED   5 stream tables  3 checks (1 critical, 1 warnings)              │
+└──────────────────────────────────────────────────────────────────────────────┘
+┌ Health Checks ───────────────────────────────────────────────────────────────┐
+│Check              Severity    Detail                                         │
+│                                                                              │
+│extension_version  ✓ ok        pg_trickle 0.13.0                              │
+│cdc_lag            ⚠ warning   Buffer lag on orders > 1MB                     │
+│fuse_blown         ✗ critical  Circuit breaker triggered on revenue_daily     │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+└──────────────────────────────────────────────────────────────────────────────┘

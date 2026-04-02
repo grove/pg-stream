@@ -1,0 +1,28 @@
+---
+source: pgtrickle-tui/src/views/mod.rs
+expression: output
+---
+┌ Fuse & Circuit Breaker (1 blown, 2 total) ───────────────────────────────────────────────────────┐
+│Stream Table           Fuse State     Errors     Last Error                   Blown At            │
+│                                                                                                  │
+│revenue_daily          ✗ BLOWN        5          division by zero             2026-04-01 11:58:00 │
+│orders_live            ✓ OK           0          -                            -                   │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+└──────────────────────────────────────────────────────────────────────────────────────────────────┘
+┌ Fuse Detail ─────────────────────────────────────────────────────────────────────────────────────┐
+│ Table: revenue_daily                                                                             │
+│ State: BLOWN                                                                                     │
+│ Consecutive Errors: 5                                                                            │
+│ Last Error: division by zero                                                                     │
+│ Blown At: 2026-04-01 11:58:00                                                                    │
+│                                                                                                  │
+│ To reset: SELECT pgtrickle.reset_fuse('<table>');                                                │
+│                                                                                                  │
+└──────────────────────────────────────────────────────────────────────────────────────────────────┘

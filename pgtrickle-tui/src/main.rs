@@ -6,6 +6,8 @@ mod error;
 mod output;
 mod poller;
 mod state;
+#[cfg(test)]
+mod test_fixtures;
 mod theme;
 mod views;
 

@@ -1,0 +1,28 @@
+---
+source: pgtrickle-tui/src/views/mod.rs
+expression: output
+---
+┌ Configuration (2 params) ────────────────────────────────────────────────────────────────────────┐
+│Parameter                           Value           Unit     Description                          │
+│pg_trickle.enabled                  on                       Enable pg_trickle background workers │
+│pg_trickle.poll_interval            2               s        Background poll interval             │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+└──────────────────────────────────────────────────────────────────────────────────────────────────┘

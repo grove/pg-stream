@@ -1,0 +1,28 @@
+---
+source: pgtrickle-tui/src/views/mod.rs
+expression: output
+---
+┌ Issue Summary ───────────────────────────────────────────────────────────────────────────────────┐
+│ 0 critical  2 warnings  0 info  5 total issues                                                   │
+└──────────────────────────────────────────────────────────────────────────────────────────────────┘
+┌ DAG Issues (5) ──────────────────────────────────────────────────────────────────────────────────┐
+│Sev          Category       Table                Summary                                Blast     │
+│                                                                                                  │
+│ℹ error      Broken Chain   revenue_daily        revenue_daily in ERROR — 1 downstream  2         │
+│ℹ error      Broken Chain   broken_view          broken_view in SUSPENDED — 1 downstrea 2         │
+│ℹ error      Blown Fuse     revenue_daily        revenue_daily — 5 consecutive errors   1         │
+│⚠ warning    Buffer Growth  revenue_daily        sales: 2.4 MB (50000 rows)             1         │
+│⚠ warning    Stale Data     customer_agg         customer_agg — staleness: 120s         1         │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+└──────────────────────────────────────────────────────────────────────────────────────────────────┘

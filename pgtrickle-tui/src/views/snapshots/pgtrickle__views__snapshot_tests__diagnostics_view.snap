@@ -1,0 +1,28 @@
+---
+source: pgtrickle-tui/src/views/mod.rs
+expression: output
+---
+┌ Diagnostics (2) ─────────────────────────────────────────────────────────────────────────────────┐
+│Schema       Name          Current       Recommended   Confidence   Reason                        │
+│public       orders_live   DIFF          KEEP          high         Already optimal               │
+│public       inventory_sna FULL          DIFF          medium       Table supports differential   │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+└──────────────────────────────────────────────────────────────────────────────────────────────────┘

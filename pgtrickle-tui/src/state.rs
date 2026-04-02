@@ -380,3 +380,342 @@ pub struct Issue {
     pub affected_table: Option<String>,
     pub blast_radius: usize,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_fixtures;
+
+    // ── Counter helpers ──────────────────────────────────────────────
+
+    #[test]
+    fn test_active_count_with_mixed_statuses() {
+        let state = test_fixtures::sample_state();
+        // orders_live, inventory_snap, customer_agg are ACTIVE
+        assert_eq!(state.active_count(), 3);
+    }
+
+    #[test]
+    fn test_error_count_includes_error_and_suspended() {
+        let state = test_fixtures::sample_state();
+        // revenue_daily=ERROR, broken_view=SUSPENDED
+        assert_eq!(state.error_count(), 2);
+    }
+
+    #[test]
+    fn test_stale_count() {
+        let state = test_fixtures::sample_state();
+        // customer_agg is stale, revenue_daily is stale (error_stream_table sets stale=true)
+        assert_eq!(state.stale_count(), 2);
+    }
+
+    #[test]
+    fn test_cascade_stale_count() {
+        let state = test_fixtures::sample_state();
+        // customer_agg is downstream of revenue_daily (ERROR), so cascade-stale
+        assert!(state.cascade_stale_count() >= 1);
+    }
+
+    #[test]
+    fn test_critical_health_count() {
+        let state = test_fixtures::sample_state();
+        // One critical health check: fuse_blown
+        assert_eq!(state.critical_health_count(), 1);
+    }
+
+    #[test]
+    fn test_issue_count() {
+        let state = test_fixtures::sample_state();
+        // Should have issues from ERROR/SUSPENDED tables, buffer growth, blown fuse, stale data
+        assert!(state.issue_count() > 0);
+    }
+
+    #[test]
+    fn test_empty_state_counters() {
+        let state = test_fixtures::empty_state();
+        assert_eq!(state.active_count(), 0);
+        assert_eq!(state.error_count(), 0);
+        assert_eq!(state.stale_count(), 0);
+        assert_eq!(state.cascade_stale_count(), 0);
+        assert_eq!(state.critical_health_count(), 0);
+        assert_eq!(state.issue_count(), 0);
+    }
+
+    // ── Cascade staleness ────────────────────────────────────────────
+
+    #[test]
+    fn test_cascade_staleness_marks_downstream() {
+        let mut state = AppState {
+            stream_tables: vec![
+                StreamTableInfo {
+                    name: "parent".to_string(),
+                    status: "ERROR".to_string(),
+                    ..test_fixtures::stream_table("parent", "ERROR")
+                },
+                test_fixtures::stream_table("child", "ACTIVE"),
+            ],
+            dag_edges: vec![
+                DagEdge {
+                    tree_line: "parent".to_string(),
+                    node: "parent".to_string(),
+                    node_type: "stream_table".to_string(),
+                    depth: 0,
+                    status: Some("ERROR".to_string()),
+                    refresh_mode: Some("DIFF".to_string()),
+                },
+                DagEdge {
+                    tree_line: "└── child".to_string(),
+                    node: "child".to_string(),
+                    node_type: "stream_table".to_string(),
+                    depth: 1,
+                    status: Some("ACTIVE".to_string()),
+                    refresh_mode: Some("DIFF".to_string()),
+                },
+            ],
+            ..AppState::default()
+        };
+
+        state.compute_cascade_staleness();
+
+        assert!(
+            !state.stream_tables[0].cascade_stale,
+            "error node itself is not cascade-stale"
+        );
+        assert!(
+            state.stream_tables[1].cascade_stale,
+            "child of error node should be cascade-stale"
+        );
+    }
+
+    #[test]
+    fn test_cascade_staleness_clears_when_no_errors() {
+        let mut state = AppState {
+            stream_tables: vec![
+                test_fixtures::stream_table("a", "ACTIVE"),
+                test_fixtures::stream_table("b", "ACTIVE"),
+            ],
+            dag_edges: vec![
+                DagEdge {
+                    tree_line: "a".to_string(),
+                    node: "a".to_string(),
+                    node_type: "stream_table".to_string(),
+                    depth: 0,
+                    status: Some("ACTIVE".to_string()),
+                    refresh_mode: None,
+                },
+                DagEdge {
+                    tree_line: "└── b".to_string(),
+                    node: "b".to_string(),
+                    node_type: "stream_table".to_string(),
+                    depth: 1,
+                    status: Some("ACTIVE".to_string()),
+                    refresh_mode: None,
+                },
+            ],
+            ..AppState::default()
+        };
+
+        // Pre-set cascade_stale to true, should be cleared
+        state.stream_tables[1].cascade_stale = true;
+        state.compute_cascade_staleness();
+
+        assert!(!state.stream_tables[0].cascade_stale);
+        assert!(!state.stream_tables[1].cascade_stale);
+    }
+
+    #[test]
+    fn test_cascade_staleness_deep_chain() {
+        let mut state = AppState {
+            stream_tables: vec![
+                test_fixtures::stream_table("root", "ERROR"),
+                test_fixtures::stream_table("mid", "ACTIVE"),
+                test_fixtures::stream_table("leaf", "ACTIVE"),
+            ],
+            dag_edges: vec![
+                DagEdge {
+                    tree_line: "root".to_string(),
+                    node: "root".to_string(),
+                    node_type: "stream_table".to_string(),
+                    depth: 0,
+                    status: Some("ERROR".to_string()),
+                    refresh_mode: None,
+                },
+                DagEdge {
+                    tree_line: "├── mid".to_string(),
+                    node: "mid".to_string(),
+                    node_type: "stream_table".to_string(),
+                    depth: 1,
+                    status: Some("ACTIVE".to_string()),
+                    refresh_mode: None,
+                },
+                DagEdge {
+                    tree_line: "│   └── leaf".to_string(),
+                    node: "leaf".to_string(),
+                    node_type: "stream_table".to_string(),
+                    depth: 2,
+                    status: Some("ACTIVE".to_string()),
+                    refresh_mode: None,
+                },
+            ],
+            ..AppState::default()
+        };
+
+        state.compute_cascade_staleness();
+
+        assert!(!state.stream_tables[0].cascade_stale);
+        assert!(state.stream_tables[1].cascade_stale);
+        assert!(state.stream_tables[2].cascade_stale);
+    }
+
+    // ── Issue detection ──────────────────────────────────────────────
+
+    #[test]
+    fn test_detect_issues_broken_chain() {
+        let mut state = AppState {
+            stream_tables: vec![test_fixtures::error_stream_table("broken", "syntax error")],
+            ..AppState::default()
+        };
+
+        state.detect_issues();
+
+        let broken = state.issues.iter().find(|i| i.category == "Broken Chain");
+        assert!(broken.is_some());
+        assert_eq!(broken.unwrap().severity, "error");
+        assert!(broken.unwrap().summary.contains("broken"));
+    }
+
+    #[test]
+    fn test_detect_issues_buffer_growth() {
+        let mut state = AppState {
+            cdc_buffers: vec![CdcBuffer {
+                stream_table: "big_table".to_string(),
+                source_table: "orders".to_string(),
+                cdc_mode: "TRIGGER".to_string(),
+                pending_rows: 100_000,
+                buffer_bytes: 5_000_000,
+            }],
+            ..AppState::default()
+        };
+
+        state.detect_issues();
+
+        let buf = state.issues.iter().find(|i| i.category == "Buffer Growth");
+        assert!(buf.is_some());
+        assert_eq!(buf.unwrap().severity, "warning");
+    }
+
+    #[test]
+    fn test_detect_issues_blown_fuse() {
+        let mut state = AppState {
+            fuses: vec![FuseInfo {
+                stream_table: "fused".to_string(),
+                fuse_state: "BLOWN".to_string(),
+                consecutive_errors: 10,
+                last_error: Some("timeout".to_string()),
+                blown_at: Some("2026-04-01".to_string()),
+            }],
+            ..AppState::default()
+        };
+
+        state.detect_issues();
+
+        let fuse = state.issues.iter().find(|i| i.category == "Blown Fuse");
+        assert!(fuse.is_some());
+        assert_eq!(fuse.unwrap().severity, "error");
+    }
+
+    #[test]
+    fn test_detect_issues_stale_data() {
+        let mut state = AppState {
+            stream_tables: vec![test_fixtures::stale_stream_table("slow_table")],
+            ..AppState::default()
+        };
+
+        state.detect_issues();
+
+        let stale = state.issues.iter().find(|i| i.category == "Stale Data");
+        assert!(stale.is_some());
+        assert_eq!(stale.unwrap().severity, "warning");
+    }
+
+    #[test]
+    fn test_detect_issues_no_issues_when_healthy() {
+        let mut state = AppState {
+            stream_tables: vec![test_fixtures::stream_table("healthy", "ACTIVE")],
+            ..AppState::default()
+        };
+
+        state.detect_issues();
+        assert!(state.issues.is_empty());
+    }
+
+    #[test]
+    fn test_detect_issues_sorting_errors_before_warnings() {
+        let mut state = AppState {
+            stream_tables: vec![
+                test_fixtures::stale_stream_table("stale_one"),
+                test_fixtures::error_stream_table("broken_one", "fail"),
+            ],
+            fuses: vec![FuseInfo {
+                stream_table: "broken_one".to_string(),
+                fuse_state: "BLOWN".to_string(),
+                consecutive_errors: 5,
+                last_error: Some("fail".to_string()),
+                blown_at: None,
+            }],
+            ..AppState::default()
+        };
+
+        state.detect_issues();
+
+        // Errors should come before warnings
+        let first_error_idx = state
+            .issues
+            .iter()
+            .position(|i| i.severity == "error")
+            .unwrap_or(usize::MAX);
+        let first_warning_idx = state
+            .issues
+            .iter()
+            .position(|i| i.severity == "warning")
+            .unwrap_or(usize::MAX);
+        assert!(first_error_idx < first_warning_idx);
+    }
+
+    #[test]
+    fn test_detect_issues_buffer_below_threshold_no_issue() {
+        let mut state = AppState {
+            cdc_buffers: vec![CdcBuffer {
+                stream_table: "small".to_string(),
+                source_table: "src".to_string(),
+                cdc_mode: "TRIGGER".to_string(),
+                pending_rows: 10,
+                buffer_bytes: 500_000,
+            }],
+            ..AppState::default()
+        };
+
+        state.detect_issues();
+        assert!(
+            state.issues.is_empty(),
+            "buffer under 1MB should not create an issue"
+        );
+    }
+
+    #[test]
+    fn test_detect_issues_fuse_ok_no_issue() {
+        let mut state = AppState {
+            fuses: vec![FuseInfo {
+                stream_table: "ok_fuse".to_string(),
+                fuse_state: "OK".to_string(),
+                consecutive_errors: 0,
+                last_error: None,
+                blown_at: None,
+            }],
+            ..AppState::default()
+        };
+
+        state.detect_issues();
+        assert!(state.issues.is_empty());
+    }
+}

@@ -1,0 +1,34 @@
+---
+source: pgtrickle-tui/src/views/mod.rs
+expression: output
+---
+┌ Help — Health Checks — press ? or Esc to close ──────────────────────────────┐
+│ Navigation                             Actions                               │
+│                                                                              │
+│  1        Dashboard                     r        Refresh selected            │
+│  2        Detail view                   R        Refresh all                 │
+│  3        Dependency graph              Ctrl+R   Force poll now              │
+│  4        Refresh log                   /        Filter tables               │
+│  5        Diagnostics                   :        Command palette             │
+│  6        CDC health                    ?        Toggle help                 │
+│  7        Configuration                 q        Quit                        │
+│  0        Health checks                 Ctrl+C   Quit                        │
+│  9        Alerts                                                             │
+│  w        Workers & job queue          Health Checks Tips                    │
+│  f        Fuse & circuit breaker                                             │
+│  m        Watermarks & gating           Overall system health summary        │
+│  d        Delta SQL inspector           Critical issues need attention       │
+│  g        Graph view                                                         │
+│  i        Issues                                                             │
+│                                                                              │
+│  j / ↓    Move down                                                          │
+│  k / ↑    Move up                                                            │
+│  Enter    Drill into detail                                                  │
+│  Esc      Back / close overlay                                               │
+│  Tab      Next pane                                                          │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+└──────────────────────────────────────────────────────────────────────────────┘

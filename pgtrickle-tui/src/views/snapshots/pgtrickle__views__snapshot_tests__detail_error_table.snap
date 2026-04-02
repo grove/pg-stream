@@ -1,0 +1,44 @@
+---
+source: pgtrickle-tui/src/views/mod.rs
+expression: output
+---
+┌ revenue_daily — Properties ──────────────────────────────────────────────────┐
+│ Name:     public.revenue_daily                                               │
+│ Status:   ERROR    Effective: ✗ error                                        │
+│ Mode:     DIFF                                                               │
+│ Schedule: 5s                                                                 │
+│ Stale:    yes  Staleness: -                                                  │
+│ Tier:     hot  Populated: yes                                                │
+│                                                                              │
+│                                                                              │
+└──────────────────────────────────────────────────────────────────────────────┘
+┌ Refresh Statistics ──────────────────────────────────────────────────────────┐
+│ Total refreshes:  10                                                         │
+│ Failed refreshes: 3                                                          │
+│ Avg duration:     5.0 ms                                                     │
+│ Last refresh:     2026-04-01 12:00:00                                        │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+└──────────────────────────────────────────────────────────────────────────────┘
+┌ Recent Refreshes ────────────────────────────────────────────────────────────┐
+│2026-04-01 11:59:55  DIFF  error  1ms                                         │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+└──────────────────────────────────────────────────────────────────────────────┘
+┌ Error Details & Upstream Health ─────────────────────────────────────────────┐
+│ Last Error:                                                                  │
+│ division by zero                                                             │
+│                                                                              │
+│ Consecutive errors: 3                                                        │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+└──────────────────────────────────────────────────────────────────────────────┘

@@ -110,3 +110,150 @@ pub enum OutputFormat {
     /// CSV output
     Csv,
 }
+
+#[cfg(test)]
+mod tests {
+    use clap::Parser;
+
+    use super::*;
+
+    #[test]
+    fn test_no_subcommand_parses() {
+        let cli = Cli::try_parse_from(["pgtrickle"]).unwrap();
+        assert!(cli.command.is_none());
+    }
+
+    #[test]
+    fn test_list_subcommand() {
+        let cli = Cli::try_parse_from(["pgtrickle", "list"]).unwrap();
+        assert!(matches!(cli.command, Some(Commands::List(_))));
+    }
+
+    #[test]
+    fn test_status_subcommand() {
+        let cli = Cli::try_parse_from(["pgtrickle", "status", "my_table"]).unwrap();
+        assert!(matches!(cli.command, Some(Commands::Status(_))));
+    }
+
+    #[test]
+    fn test_refresh_subcommand() {
+        let cli = Cli::try_parse_from(["pgtrickle", "refresh", "my_table"]).unwrap();
+        assert!(matches!(cli.command, Some(Commands::Refresh(_))));
+    }
+
+    #[test]
+    fn test_create_subcommand() {
+        let cli = Cli::try_parse_from(["pgtrickle", "create", "my_table", "SELECT 1"]).unwrap();
+        assert!(matches!(cli.command, Some(Commands::Create(_))));
+    }
+
+    #[test]
+    fn test_drop_subcommand() {
+        let cli = Cli::try_parse_from(["pgtrickle", "drop", "my_table"]).unwrap();
+        assert!(matches!(cli.command, Some(Commands::Drop(_))));
+    }
+
+    #[test]
+    fn test_health_subcommand() {
+        let cli = Cli::try_parse_from(["pgtrickle", "health"]).unwrap();
+        assert!(matches!(cli.command, Some(Commands::Health(_))));
+    }
+
+    #[test]
+    fn test_diag_subcommand() {
+        let cli = Cli::try_parse_from(["pgtrickle", "diag"]).unwrap();
+        assert!(matches!(cli.command, Some(Commands::Diag(_))));
+    }
+
+    #[test]
+    fn test_graph_subcommand() {
+        let cli = Cli::try_parse_from(["pgtrickle", "graph"]).unwrap();
+        assert!(matches!(cli.command, Some(Commands::Graph(_))));
+    }
+
+    #[test]
+    fn test_workers_subcommand() {
+        let cli = Cli::try_parse_from(["pgtrickle", "workers"]).unwrap();
+        assert!(matches!(cli.command, Some(Commands::Workers(_))));
+    }
+
+    #[test]
+    fn test_fuse_subcommand() {
+        let cli = Cli::try_parse_from(["pgtrickle", "fuse"]).unwrap();
+        assert!(matches!(cli.command, Some(Commands::Fuse(_))));
+    }
+
+    #[test]
+    fn test_watermarks_subcommand() {
+        let cli = Cli::try_parse_from(["pgtrickle", "watermarks"]).unwrap();
+        assert!(matches!(cli.command, Some(Commands::Watermarks(_))));
+    }
+
+    #[test]
+    fn test_cdc_subcommand() {
+        let cli = Cli::try_parse_from(["pgtrickle", "cdc"]).unwrap();
+        assert!(matches!(cli.command, Some(Commands::Cdc(_))));
+    }
+
+    #[test]
+    fn test_config_subcommand() {
+        let cli = Cli::try_parse_from(["pgtrickle", "config"]).unwrap();
+        assert!(matches!(cli.command, Some(Commands::Config(_))));
+    }
+
+    #[test]
+    fn test_connection_args_url() {
+        let cli = Cli::try_parse_from(["pgtrickle", "--url", "postgres://user:pass@host:5432/db"])
+            .unwrap();
+        assert_eq!(
+            cli.connection.url.as_deref(),
+            Some("postgres://user:pass@host:5432/db")
+        );
+    }
+
+    #[test]
+    fn test_connection_args_individual() {
+        let cli = Cli::try_parse_from([
+            "pgtrickle",
+            "--host",
+            "myhost",
+            "--port",
+            "5433",
+            "--dbname",
+            "mydb",
+            "--user",
+            "admin",
+            "--password",
+            "secret",
+        ])
+        .unwrap();
+        assert_eq!(cli.connection.host.as_deref(), Some("myhost"));
+        assert_eq!(cli.connection.port, Some(5433));
+        assert_eq!(cli.connection.dbname.as_deref(), Some("mydb"));
+        assert_eq!(cli.connection.user.as_deref(), Some("admin"));
+        assert_eq!(cli.connection.password.as_deref(), Some("secret"));
+    }
+
+    #[test]
+    fn test_connection_args_defaults() {
+        let cli = Cli::try_parse_from(["pgtrickle"]).unwrap();
+        assert!(cli.connection.url.is_none());
+        assert!(cli.connection.host.is_none());
+        assert!(cli.connection.port.is_none());
+        assert!(cli.connection.dbname.is_none());
+        assert!(cli.connection.user.is_none());
+        assert!(cli.connection.password.is_none());
+    }
+
+    #[test]
+    fn test_invalid_subcommand_fails() {
+        let result = Cli::try_parse_from(["pgtrickle", "nonexistent"]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_output_format_default_is_table() {
+        let f = OutputFormat::default();
+        assert!(matches!(f, OutputFormat::Table));
+    }
+}

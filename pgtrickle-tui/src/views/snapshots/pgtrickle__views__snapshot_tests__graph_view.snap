@@ -1,0 +1,28 @@
+---
+source: pgtrickle-tui/src/views/mod.rs
+expression: output
+---
+┌ Dependency Graph (6 nodes) ──────────────────────────────────────────────────┐
+│orders (source)                                                               │
+│├── orders_live                                                               │
+││   └── revenue_daily                                                         │
+││       └── customer_agg                                                      │
+│inventory (source)                                                            │
+│└── inventory_snap                                                            │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+└──────────────────────────────────────────────────────────────────────────────┘
