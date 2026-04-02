@@ -283,13 +283,8 @@ async fn test_no_data_refresh_does_not_cause_false_stale() {
         .await;
     db.execute("INSERT INTO mon_nodata VALUES (1)").await;
 
-    db.create_st(
-        "mon_nodata_st",
-        "SELECT id FROM mon_nodata",
-        "5m",
-        "FULL",
-    )
-    .await;
+    db.create_st("mon_nodata_st", "SELECT id FROM mon_nodata", "5m", "FULL")
+        .await;
 
     // Simulate: data hasn't changed in 2 hours, but the scheduler checked 30 seconds ago
     db.execute(
