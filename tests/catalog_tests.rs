@@ -351,9 +351,7 @@ async fn test_staleness_uses_last_refresh_at_not_data_timestamp() {
     .await;
 
     let stale: bool = db
-        .query_scalar(
-            "SELECT stale FROM pgtrickle.stream_tables_info WHERE pgt_name = 'nodata_st'",
-        )
+        .query_scalar("SELECT stale FROM pgtrickle.stream_tables_info WHERE pgt_name = 'nodata_st'")
         .await;
     assert!(
         !stale,
@@ -394,9 +392,7 @@ async fn test_stale_false_when_last_refresh_at_is_recent() {
     .await;
 
     let stale: bool = db
-        .query_scalar(
-            "SELECT stale FROM pgtrickle.stream_tables_info WHERE pgt_name = 'fresh_st'",
-        )
+        .query_scalar("SELECT stale FROM pgtrickle.stream_tables_info WHERE pgt_name = 'fresh_st'")
         .await;
     assert!(
         !stale,
@@ -668,7 +664,10 @@ async fn test_quick_health_status_ok_when_no_stale_tables() {
     let status: String = db
         .query_scalar("SELECT status FROM pgtrickle.quick_health")
         .await;
-    assert_eq!(status, "OK", "health status should be OK when no tables are stale");
+    assert_eq!(
+        status, "OK",
+        "health status should be OK when no tables are stale"
+    );
 }
 
 #[tokio::test]

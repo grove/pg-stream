@@ -102,6 +102,7 @@ LIGHT_E2E_TESTS=(
     e2e_dag_concurrent_tests
     e2e_scalar_subquery_tests
     e2e_partition_tests
+    e2e_mixed_pg_objects_tests
 )
 
 usage() {
