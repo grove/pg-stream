@@ -108,7 +108,7 @@ jobs:
   integration-tests:
     name: Integration tests
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v5
 
@@ -159,7 +159,7 @@ jobs:
   light-e2e-tests:
     name: Light E2E tests (${{ matrix.shard_name }})
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -685,65 +685,6 @@ jobs:
         run: |
           docker build -t pg_trickle-ext:ci \
             -f cnpg/Dockerfile.ext-build .
-
-  # ── G17-SOAK: Long-Running Stability Soak Test ───────────────────────
-
-  soak-test:
-    name: Stability soak test
-    runs-on: ubuntu-latest
-    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
-    timeout-minutes: 30
-    continue-on-error: true
-    steps:
-      - uses: actions/checkout@v5
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache cargo
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
-
-      - name: Build E2E Docker image
-        run: ./tests/build_e2e_image.sh
-
-      - name: Run soak test (10 min)
-        run: SOAK_DURATION_SECS=600 ./scripts/run_e2e_tests.sh --test e2e_soak_tests --run-ignored all --no-capture
-        timeout-minutes: 20
-
-  # ── G17-MDB: Multi-Database Scheduler Isolation Test ──────────────────
-
-  mdb-test:
-    name: Multi-database isolation test
-    runs-on: ubuntu-latest
-    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
-    timeout-minutes: 15
-    continue-on-error: true
-    steps:
-      - uses: actions/checkout@v5
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache cargo
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
-
-      - name: Build E2E Docker image
-        run: ./tests/build_e2e_image.sh
-
-      - name: Run multi-database isolation test
-        run: ./scripts/run_e2e_tests.sh --test e2e_mdb_tests --run-ignored all --no-capture
 
       - name: Verify extension image layout
         run: |

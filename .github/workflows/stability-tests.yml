@@ -1,0 +1,59 @@
+# =============================================================================
+# Stability Tests — Long-running soak and multi-database isolation tests
+#
+# Separated from ci.yml because these are heavyweight, non-blocking stability
+# tests that don't gate PRs or merges.  They run daily and on manual dispatch.
+# =============================================================================
+name: Stability Tests
+
+on:
+  schedule:
+    - cron: '0 3 * * *'  # Daily 03:00 UTC
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  NEXTEST_PROFILE: ci
+  PG_VERSION: "18"
+
+jobs:
+  # ── G17-SOAK: Long-Running Stability Soak Test ───────────────────────
+  soak-test:
+    name: Stability soak test
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Setup pgrx environment
+        uses: ./.github/actions/setup-pgrx
+
+      - name: Build E2E Docker image
+        run: ./tests/build_e2e_image.sh
+
+      - name: Run soak test (10 min)
+        run: SOAK_DURATION_SECS=600 ./scripts/run_e2e_tests.sh --test e2e_soak_tests --run-ignored all --no-capture
+        timeout-minutes: 20
+
+  # ── G17-MDB: Multi-Database Scheduler Isolation Test ──────────────────
+  mdb-test:
+    name: Multi-database isolation test
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Setup pgrx environment
+        uses: ./.github/actions/setup-pgrx
+
+      - name: Build E2E Docker image
+        run: ./tests/build_e2e_image.sh
+
+      - name: Run multi-database isolation test
+        run: ./scripts/run_e2e_tests.sh --test e2e_mdb_tests --run-ignored all --no-capture

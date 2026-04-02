@@ -128,7 +128,10 @@ async fn refresh_for_mode(db: &E2eDb, st_name: &str, mode: ScheduleMode) {
 /// Wait for an entire chain of STs to be refreshed by the scheduler.
 ///
 /// For manual mode, refreshes each ST in order (topological).
-/// For scheduler modes, waits for the leaf ST to auto-refresh.
+/// For scheduler modes, waits for each ST in topological order to ensure
+/// changes propagate through the chain.  Waiting only for the leaf is racy:
+/// the scheduler might refresh the leaf with stale upstream data if the
+/// parent hasn't been refreshed yet in the current cycle.
 async fn refresh_chain_for_mode(db: &E2eDb, st_names: &[&str], mode: ScheduleMode) {
     match mode {
         ScheduleMode::Manual => {
@@ -137,17 +140,14 @@ async fn refresh_chain_for_mode(db: &E2eDb, st_names: &[&str], mode: ScheduleMod
             }
         }
         ScheduleMode::Serial | ScheduleMode::Parallel => {
-            // The scheduler handles topological ordering; just wait for the
-            // leaf to be refreshed.
-            if let Some(leaf) = st_names.last() {
+            // Wait for each ST in topological order so that downstream STs
+            // observe the refreshed upstream data.
+            for name in st_names {
                 let refreshed = db
-                    .wait_for_auto_refresh(leaf, Duration::from_secs(90))
+                    .wait_for_auto_refresh(name, Duration::from_secs(90))
                     .await;
                 if !refreshed {
-                    // Fallback: refresh the full chain manually
-                    for name in st_names {
-                        db.refresh_st_with_retry(name).await;
-                    }
+                    db.refresh_st_with_retry(name).await;
                 }
             }
         }

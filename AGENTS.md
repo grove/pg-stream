@@ -188,8 +188,11 @@ light-eligible; 10 files (~90 tests) require the full E2E image.
 | E2E bench — TPC-H FULL vs DIFF | ❌ | ❌ | Weekly (Sun) | ✅ |
 | dbt integration | ❌ | ❌ | ✅ | ✅ |
 | CNPG smoke test | ❌ | ❌ | ✅ | ✅ |
-| Soak test (G17-SOAK) | ❌ | ❌ | ✅ | ✅ |
-| Multi-database (G17-MDB) | ❌ | ❌ | ✅ | ✅ |
+| Soak test (G17-SOAK)¹ | ❌ | ❌ | ✅ | ✅ |
+| Multi-database (G17-MDB)¹ | ❌ | ❌ | ✅ | ✅ |
+
+¹ Soak and multi-database tests run in the separate `stability-tests.yml`
+workflow, not in ci.yml.
 
 > **Note:** Full E2E and TPC-H tests are **skipped on PRs** (the Docker build
 > is ~20 min). Light E2E tests run on every PR using `cargo pgrx package` +
