@@ -606,3 +606,170 @@ async fn run_autorefresh_trace(seed: u64, config: &TraceConfig) {
         settle_auto_invariants(&db, seed, cycle, "auto", Duration::from_secs(60)).await;
     }
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Test 4.7 — Auto-refresh through view upstream chain
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// base → user view → ST₁ (1s schedule) → ST₂ (calculated schedule).
+/// Insert into base, verify the scheduler propagates through the view
+/// to ST₂ without manual intervention. This covers the gap where all
+/// previous auto-refresh tests used direct ST-on-ST chains only.
+#[tokio::test]
+async fn test_autorefresh_view_upstream_chain() {
+    let db = E2eDb::new_on_postgres_db().await.with_extension().await;
+    configure_fast_scheduler(&db).await;
+
+    db.execute(
+        "CREATE TABLE arv_orders (
+            id SERIAL PRIMARY KEY,
+            product TEXT NOT NULL,
+            qty INT NOT NULL
+        )",
+    )
+    .await;
+    db.execute(
+        "INSERT INTO arv_orders (product, qty) VALUES
+         ('Widget', 10), ('Gadget', 5), ('Widget', 20)",
+    )
+    .await;
+
+    // User view: filter positive quantities
+    db.execute(
+        "CREATE VIEW arv_v_orders AS
+         SELECT id, product, qty FROM arv_orders WHERE qty > 0",
+    )
+    .await;
+
+    // ST₁: aggregate by product through the view (1s schedule)
+    db.create_st(
+        "arv_st_summary",
+        "SELECT product, SUM(qty) AS total_qty, COUNT(*) AS order_count
+         FROM arv_v_orders GROUP BY product",
+        "1s",
+        "DIFFERENTIAL",
+    )
+    .await;
+
+    // ST₂: filter high-volume products (ST-on-ST, calculated schedule)
+    db.execute(
+        "SELECT pgtrickle.create_stream_table(
+            'arv_st_high_volume',
+            $$SELECT product, total_qty FROM arv_st_summary WHERE total_qty >= 20$$,
+            'calculated',
+            'DIFFERENTIAL'
+        )",
+    )
+    .await;
+
+    // Wait for initial stabilization
+    wait_for_refresh_cycle(&db, "arv_st_high_volume", Duration::from_secs(30)).await;
+
+    // Only Widget qualifies (30 >= 20)
+    assert_eq!(db.count("public.arv_st_high_volume").await, 1);
+
+    // Insert more Gadgets to push them over the threshold
+    db.execute("INSERT INTO arv_orders (product, qty) VALUES ('Gadget', 25)")
+        .await;
+
+    // Wait for auto-refresh to propagate: base → view → ST₁ → ST₂
+    let refreshed = db
+        .wait_for_auto_refresh("arv_st_high_volume", Duration::from_secs(60))
+        .await;
+    assert!(
+        refreshed,
+        "Auto-refresh should propagate base change through view to ST₂"
+    );
+
+    // Both products should now qualify
+    db.assert_st_matches_query(
+        "arv_st_summary",
+        "SELECT product, SUM(qty) AS total_qty, COUNT(*) AS order_count
+         FROM arv_v_orders GROUP BY product",
+    )
+    .await;
+    db.assert_st_matches_query(
+        "arv_st_high_volume",
+        "SELECT product, total_qty FROM arv_st_summary WHERE total_qty >= 20",
+    )
+    .await;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Test 4.8 — Auto-refresh diamond with a view branch
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Diamond: base → view → ST₁(SUM) + base → ST₂(COUNT) → ST₃(JOIN).
+/// The scheduler must correctly handle the view-inlined branch alongside
+/// the direct-table branch in the same diamond DAG.
+#[tokio::test]
+async fn test_autorefresh_diamond_with_view_branch() {
+    let db = E2eDb::new_on_postgres_db().await.with_extension().await;
+    configure_fast_scheduler(&db).await;
+
+    db.execute(
+        "CREATE TABLE ardv_src (
+            id SERIAL PRIMARY KEY,
+            category TEXT NOT NULL,
+            amount INT NOT NULL
+        )",
+    )
+    .await;
+    db.execute("INSERT INTO ardv_src (category, amount) VALUES ('x', 10), ('x', 20), ('y', 30)")
+        .await;
+
+    // Branch A: through a view (SUM)
+    db.execute(
+        "CREATE VIEW ardv_v_src AS
+         SELECT id, category, amount FROM ardv_src WHERE amount > 0",
+    )
+    .await;
+    db.create_st(
+        "ardv_branch_a",
+        "SELECT category, SUM(amount) AS total FROM ardv_v_src GROUP BY category",
+        "1s",
+        "DIFFERENTIAL",
+    )
+    .await;
+
+    // Branch B: direct from table (COUNT)
+    db.create_st(
+        "ardv_branch_b",
+        "SELECT category, COUNT(*) AS cnt FROM ardv_src GROUP BY category",
+        "1s",
+        "DIFFERENTIAL",
+    )
+    .await;
+
+    // ST₃: join both branches (calculated schedule)
+    db.execute(
+        "SELECT pgtrickle.create_stream_table(
+            'ardv_joined',
+            $$SELECT a.category, a.total, b.cnt
+              FROM ardv_branch_a a JOIN ardv_branch_b b ON a.category = b.category$$,
+            'calculated',
+            'DIFFERENTIAL'
+        )",
+    )
+    .await;
+
+    // Wait for initial stabilization
+    wait_for_refresh_cycle(&db, "ardv_joined", Duration::from_secs(30)).await;
+
+    // x: total=30, cnt=2; y: total=30, cnt=1
+    assert_eq!(db.count("public.ardv_joined").await, 2);
+
+    // Add data
+    db.execute("INSERT INTO ardv_src (category, amount) VALUES ('x', 40), ('z', 100)")
+        .await;
+
+    let refreshed = db
+        .wait_for_auto_refresh("ardv_joined", Duration::from_secs(60))
+        .await;
+    assert!(refreshed, "Diamond join ST should auto-refresh");
+
+    // Verify correctness — the joined result should match a direct query
+    let expected_q = "SELECT category, SUM(amount) AS total, COUNT(*) AS cnt \
+                      FROM ardv_src WHERE amount > 0 GROUP BY category";
+    db.assert_st_matches_query("ardv_joined", expected_q).await;
+}

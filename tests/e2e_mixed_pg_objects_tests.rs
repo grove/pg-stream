@@ -1660,3 +1660,356 @@ async fn test_mixed_parallel_sts_from_same_view() {
     )
     .await;
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// UPSERT: INSERT ... ON CONFLICT through views into stream tables
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// INSERT ... ON CONFLICT DO UPDATE on a base table that feeds a view → ST.
+/// The upsert should generate proper CDC events that propagate.
+#[tokio::test]
+async fn test_mixed_upsert_on_conflict_through_view() {
+    let db = E2eDb::new().await.with_extension().await;
+
+    db.execute(
+        "CREATE TABLE mu_kv (
+            key TEXT PRIMARY KEY,
+            value INT NOT NULL,
+            updated_at TIMESTAMPTZ DEFAULT now()
+        )",
+    )
+    .await;
+    db.execute("INSERT INTO mu_kv (key, value) VALUES ('a', 1), ('b', 2), ('c', 3)")
+        .await;
+
+    db.execute("CREATE VIEW mu_v_kv AS SELECT key, value FROM mu_kv")
+        .await;
+
+    db.create_st(
+        "mu_st_kv",
+        "SELECT key, value FROM mu_v_kv",
+        "1m",
+        "DIFFERENTIAL",
+    )
+    .await;
+
+    assert_eq!(db.count("public.mu_st_kv").await, 3);
+
+    // Upsert: update existing key, insert new key
+    db.execute(
+        "INSERT INTO mu_kv (key, value) VALUES ('a', 10), ('d', 4)
+         ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+    )
+    .await;
+    db.refresh_st("mu_st_kv").await;
+
+    assert_eq!(
+        db.count("public.mu_st_kv").await,
+        4,
+        "Should have 4 keys after upsert (a updated, d inserted)"
+    );
+
+    let val_a: i32 = db
+        .query_scalar("SELECT value FROM public.mu_st_kv WHERE key = 'a'")
+        .await;
+    assert_eq!(val_a, 10, "Key 'a' should be updated to 10 by upsert");
+
+    // Bulk upsert: update all existing + add new
+    db.execute(
+        "INSERT INTO mu_kv (key, value)
+         VALUES ('a', 100), ('b', 200), ('c', 300), ('d', 400), ('e', 5)
+         ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+    )
+    .await;
+    db.refresh_st("mu_st_kv").await;
+
+    assert_eq!(db.count("public.mu_st_kv").await, 5);
+    db.assert_st_matches_query("mu_st_kv", "SELECT key, value FROM mu_v_kv")
+        .await;
+}
+
+/// INSERT ... ON CONFLICT DO NOTHING — skipped rows should not affect ST.
+#[tokio::test]
+async fn test_mixed_upsert_on_conflict_do_nothing() {
+    let db = E2eDb::new().await.with_extension().await;
+
+    db.execute("CREATE TABLE mu_skip (id INT PRIMARY KEY, val TEXT NOT NULL)")
+        .await;
+    db.execute("INSERT INTO mu_skip VALUES (1, 'first'), (2, 'second')")
+        .await;
+
+    db.create_st(
+        "mu_st_skip",
+        "SELECT id, val FROM mu_skip",
+        "1m",
+        "DIFFERENTIAL",
+    )
+    .await;
+
+    assert_eq!(db.count("public.mu_st_skip").await, 2);
+
+    // ON CONFLICT DO NOTHING: id=1 conflicts (skipped), id=3 is new
+    db.execute(
+        "INSERT INTO mu_skip VALUES (1, 'conflict'), (3, 'third')
+         ON CONFLICT DO NOTHING",
+    )
+    .await;
+    db.refresh_st("mu_st_skip").await;
+
+    assert_eq!(db.count("public.mu_st_skip").await, 3);
+
+    // Verify id=1 was NOT updated
+    let val_1: String = db
+        .query_scalar("SELECT val FROM public.mu_st_skip WHERE id = 1")
+        .await;
+    assert_eq!(
+        val_1, "first",
+        "ON CONFLICT DO NOTHING should not update existing row"
+    );
+
+    db.assert_st_matches_query("mu_st_skip", "SELECT id, val FROM mu_skip")
+        .await;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// BULK INSERT: generate_series bulk loads through views into stream tables
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Bulk insert via generate_series into a base table → view → ST.
+/// Tests that CDC handles large batch inserts correctly.
+#[tokio::test]
+async fn test_mixed_bulk_insert_through_view() {
+    let db = E2eDb::new().await.with_extension().await;
+
+    db.execute(
+        "CREATE TABLE mb_bulk (id INT PRIMARY KEY, category TEXT NOT NULL, val INT NOT NULL)",
+    )
+    .await;
+
+    db.execute("CREATE VIEW mb_v_bulk AS SELECT id, category, val FROM mb_bulk WHERE val > 0")
+        .await;
+
+    db.create_st(
+        "mb_st_bulk",
+        "SELECT category, COUNT(*) AS cnt, SUM(val) AS total
+         FROM mb_v_bulk GROUP BY category",
+        "1m",
+        "DIFFERENTIAL",
+    )
+    .await;
+
+    // Initially empty
+    assert_eq!(db.count("public.mb_st_bulk").await, 0);
+
+    // Bulk insert 1000 rows across 3 categories
+    db.execute(
+        "INSERT INTO mb_bulk
+         SELECT g,
+                CASE WHEN g % 3 = 0 THEN 'A' WHEN g % 3 = 1 THEN 'B' ELSE 'C' END,
+                g
+         FROM generate_series(1, 1000) g",
+    )
+    .await;
+    db.refresh_st("mb_st_bulk").await;
+
+    assert_eq!(
+        db.count("public.mb_st_bulk").await,
+        3,
+        "Should have 3 categories after bulk insert"
+    );
+
+    db.assert_st_matches_query(
+        "mb_st_bulk",
+        "SELECT category, COUNT(*) AS cnt, SUM(val) AS total
+         FROM mb_v_bulk GROUP BY category",
+    )
+    .await;
+
+    // Bulk delete half the rows
+    db.execute("DELETE FROM mb_bulk WHERE id > 500").await;
+    db.refresh_st("mb_st_bulk").await;
+
+    db.assert_st_matches_query(
+        "mb_st_bulk",
+        "SELECT category, COUNT(*) AS cnt, SUM(val) AS total
+         FROM mb_v_bulk GROUP BY category",
+    )
+    .await;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// PARTITIONED TABLE → VIEW → STREAM TABLE
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Partitioned table → view → ST (DIFFERENTIAL).
+/// Inserts into different partitions all propagate through the view.
+#[tokio::test]
+async fn test_mixed_partitioned_table_through_view() {
+    let db = E2eDb::new().await.with_extension().await;
+
+    // Create LIST-partitioned table
+    db.execute(
+        "CREATE TABLE mp_sales (
+            id SERIAL,
+            region TEXT NOT NULL,
+            amount NUMERIC(10,2) NOT NULL,
+            PRIMARY KEY (id, region)
+        ) PARTITION BY LIST (region)",
+    )
+    .await;
+    db.execute("CREATE TABLE mp_sales_east PARTITION OF mp_sales FOR VALUES IN ('East')")
+        .await;
+    db.execute("CREATE TABLE mp_sales_west PARTITION OF mp_sales FOR VALUES IN ('West')")
+        .await;
+    db.execute("CREATE TABLE mp_sales_north PARTITION OF mp_sales FOR VALUES IN ('North')")
+        .await;
+
+    db.execute(
+        "INSERT INTO mp_sales (region, amount) VALUES
+         ('East', 100), ('East', 200), ('West', 300), ('North', 50)",
+    )
+    .await;
+
+    // View filters high-value sales
+    db.execute(
+        "CREATE VIEW mp_v_big_sales AS
+         SELECT id, region, amount FROM mp_sales WHERE amount >= 100",
+    )
+    .await;
+
+    db.create_st(
+        "mp_st_big_sales",
+        "SELECT region, COUNT(*) AS sale_count, SUM(amount) AS total
+         FROM mp_v_big_sales GROUP BY region",
+        "1m",
+        "DIFFERENTIAL",
+    )
+    .await;
+
+    // East: 2 sales (100, 200), West: 1 sale (300) → 2 regions
+    assert_eq!(db.count("public.mp_st_big_sales").await, 2);
+
+    // Insert into different partitions
+    db.execute("INSERT INTO mp_sales (region, amount) VALUES ('North', 500), ('West', 150)")
+        .await;
+    db.refresh_st("mp_st_big_sales").await;
+
+    // Now all 3 regions have big sales
+    assert_eq!(
+        db.count("public.mp_st_big_sales").await,
+        3,
+        "All three partitions should contribute to the ST"
+    );
+
+    db.assert_st_matches_query(
+        "mp_st_big_sales",
+        "SELECT region, COUNT(*) AS sale_count, SUM(amount) AS total
+         FROM mp_v_big_sales GROUP BY region",
+    )
+    .await;
+
+    // Delete from one partition
+    db.execute("DELETE FROM mp_sales WHERE region = 'North' AND amount < 200")
+        .await;
+    db.refresh_st("mp_st_big_sales").await;
+
+    db.assert_st_matches_query(
+        "mp_st_big_sales",
+        "SELECT region, COUNT(*) AS sale_count, SUM(amount) AS total
+         FROM mp_v_big_sales GROUP BY region",
+    )
+    .await;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// VIEW JOINING TWO STREAM TABLES (downstream consumer pattern)
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Two independent STs from different base tables. A user view joins them.
+/// Verify the view always reflects the latest refreshed state of both STs.
+#[tokio::test]
+async fn test_mixed_view_joining_two_independent_sts() {
+    let db = E2eDb::new().await.with_extension().await;
+
+    db.execute(
+        "CREATE TABLE mj2_employees (id SERIAL PRIMARY KEY, name TEXT NOT NULL, dept_id INT NOT NULL)",
+    )
+    .await;
+    db.execute(
+        "CREATE TABLE mj2_departments (id SERIAL PRIMARY KEY, dept_name TEXT NOT NULL, floor INT NOT NULL)",
+    )
+    .await;
+
+    db.execute("INSERT INTO mj2_employees VALUES (1, 'Alice', 1), (2, 'Bob', 2), (3, 'Carol', 1)")
+        .await;
+    db.execute("INSERT INTO mj2_departments VALUES (1, 'Engineering', 3), (2, 'Marketing', 5)")
+        .await;
+
+    // Two independent STs
+    db.create_st(
+        "mj2_st_emps",
+        "SELECT id, name, dept_id FROM mj2_employees",
+        "1m",
+        "DIFFERENTIAL",
+    )
+    .await;
+    db.create_st(
+        "mj2_st_depts",
+        "SELECT id AS dept_id, dept_name, floor FROM mj2_departments",
+        "1m",
+        "DIFFERENTIAL",
+    )
+    .await;
+
+    // User creates a view joining both STs
+    db.execute(
+        "CREATE VIEW mj2_v_directory AS
+         SELECT e.name, d.dept_name, d.floor
+         FROM mj2_st_emps e
+         JOIN mj2_st_depts d ON e.dept_id = d.dept_id",
+    )
+    .await;
+
+    let count: i64 = db
+        .query_scalar("SELECT count(*) FROM mj2_v_directory")
+        .await;
+    assert_eq!(count, 3);
+
+    // Add employee, refresh only employee ST
+    db.execute("INSERT INTO mj2_employees VALUES (4, 'Dave', 2)")
+        .await;
+    db.refresh_st("mj2_st_emps").await;
+
+    let count_after: i64 = db
+        .query_scalar("SELECT count(*) FROM mj2_v_directory")
+        .await;
+    assert_eq!(
+        count_after, 4,
+        "New employee should appear in view immediately after ST refresh"
+    );
+
+    // Add department, refresh only department ST
+    db.execute("INSERT INTO mj2_departments VALUES (3, 'Sales', 1)")
+        .await;
+    db.execute("INSERT INTO mj2_employees VALUES (5, 'Eve', 3)")
+        .await;
+    db.refresh_st("mj2_st_depts").await;
+    // Eve is in employee table but ST not refreshed yet — should NOT appear
+    let count_partial: i64 = db
+        .query_scalar("SELECT count(*) FROM mj2_v_directory")
+        .await;
+    assert_eq!(
+        count_partial, 4,
+        "Eve should NOT appear until employee ST is refreshed"
+    );
+
+    // Now refresh employee ST too
+    db.refresh_st("mj2_st_emps").await;
+    let count_final: i64 = db
+        .query_scalar("SELECT count(*) FROM mj2_v_directory")
+        .await;
+    assert_eq!(
+        count_final, 5,
+        "Eve should appear after both STs are refreshed"
+    );
+}
