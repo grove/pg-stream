@@ -45,3 +45,36 @@ ALTER TABLE pgtrickle.pgt_stream_tables
 
 ALTER TABLE pgtrickle.pgt_stream_tables
     ADD COLUMN IF NOT EXISTS last_error_at TIMESTAMPTZ;
+
+-- ── ERR-1d: Recreate st_refresh_stats() with new columns ────────────────
+-- The return type changed (added consecutive_errors, schedule, refresh_tier,
+-- last_error_message), so we must drop the old signature and let pgrx
+-- re-create it with the new one.
+
+DROP FUNCTION IF EXISTS pgtrickle."st_refresh_stats"();
+
+CREATE FUNCTION pgtrickle."st_refresh_stats"() RETURNS TABLE (
+        "pgt_name" TEXT,
+        "pgt_schema" TEXT,
+        "status" TEXT,
+        "refresh_mode" TEXT,
+        "is_populated" bool,
+        "total_refreshes" bigint,
+        "successful_refreshes" bigint,
+        "failed_refreshes" bigint,
+        "total_rows_inserted" bigint,
+        "total_rows_deleted" bigint,
+        "avg_duration_ms" double precision,
+        "last_refresh_action" TEXT,
+        "last_refresh_status" TEXT,
+        "last_refresh_at" timestamp with time zone,
+        "staleness_secs" double precision,
+        "stale" bool,
+        "consecutive_errors" INT,
+        "schedule" TEXT,
+        "refresh_tier" TEXT,
+        "last_error_message" TEXT
+)
+STRICT
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'st_refresh_stats_wrapper';
