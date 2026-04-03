@@ -1,0 +1,7 @@
+-- pg_trickle 0.14.0 -> 0.15.0 upgrade script
+--
+-- v0.15.0: External Test Suites & Integration
+--
+-- Placeholder: DDL changes will be added here as features are implemented.
+--
+-- No schema changes in this upgrade step as of initial development cycle open.
