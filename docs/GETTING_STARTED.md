@@ -1238,6 +1238,8 @@ so deployments are always idempotent.
 - **[ARCHITECTURE.md](ARCHITECTURE.md)** — Deep dive into the system architecture and data flow
 - **[DVM_OPERATORS.md](DVM_OPERATORS.md)** — How each SQL operator is differentiated for incremental maintenance
 - **[CONFIGURATION.md](CONFIGURATION.md)** — GUC variables for tuning schedule, concurrency, and cleanup behavior
+- **[Flyway & Liquibase Integration](integrations/flyway-liquibase.md)** — Migration patterns for Flyway and Liquibase
+- **[ORM Integration](integrations/orm.md)** — SQLAlchemy and Django ORM patterns for stream tables
 - **[What Happens on INSERT](tutorials/WHAT_HAPPENS_ON_INSERT.md)** — Detailed trace of a single INSERT through the entire pipeline
 - **[What Happens on UPDATE](tutorials/WHAT_HAPPENS_ON_UPDATE.md)** — How UPDATEs are split into D+I, group key changes, and net-effect computation
 - **[What Happens on DELETE](tutorials/WHAT_HAPPENS_ON_DELETE.md)** — Reference counting, group deletion, and INSERT+DELETE cancellation
