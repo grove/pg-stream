@@ -39,6 +39,17 @@ pub static PGS_MAX_CONCURRENT_REFRESHES: GucSetting<i32> = GucSetting::<i32>::ne
 /// Set to 1.0 to always fall back (effectively forcing FULL mode).
 pub static PGS_DIFFERENTIAL_MAX_CHANGE_RATIO: GucSetting<f64> = GucSetting::<f64>::new(0.15);
 
+/// PH-E1: Maximum estimated delta result rows before falling back to FULL refresh.
+///
+/// Before executing the MERGE, the refresh executor runs a capped
+/// `SELECT count(*) FROM (delta_query LIMIT N+1)` to estimate the output
+/// cardinality. If the count reaches this limit, a NOTICE is emitted and
+/// the refresh downgrades to FULL to avoid OOM or excessive temp-file spills.
+///
+/// Set to 0 to disable the estimation check (default).
+/// Recommended range: 50_000–500_000 depending on available memory.
+pub static PGS_MAX_DELTA_ESTIMATE_ROWS: GucSetting<i32> = GucSetting::<i32>::new(0);
+
 /// Whether to use TRUNCATE instead of DELETE for change buffer cleanup
 /// when the entire buffer is consumed by a refresh.
 ///
@@ -631,6 +642,21 @@ pub fn register_gucs() {
         GucFlags::default(),
     );
 
+    // PH-E1: Delta estimated output cardinality threshold.
+    GucRegistry::define_int_guc(
+        c"pg_trickle.max_delta_estimate_rows",
+        c"Max estimated delta output rows before falling back to FULL (0 = disabled).",
+        c"Before executing the MERGE, runs a capped COUNT on the delta subquery. \
+           If the count reaches this limit, the refresh downgrades to FULL with a NOTICE \
+           to prevent OOM or excessive temp-file spills from unexpectedly large deltas. \
+           Set to 0 to disable the estimation check. Recommended: 50000–500000.",
+        &PGS_MAX_DELTA_ESTIMATE_ROWS,
+        0,          // min (0 = disabled)
+        10_000_000, // max
+        GucContext::Suset,
+        GucFlags::default(),
+    );
+
     GucRegistry::define_bool_guc(
         c"pg_trickle.cleanup_use_truncate",
         c"Use TRUNCATE for change buffer cleanup when all rows are consumed.",
@@ -1175,6 +1201,12 @@ pub fn pg_trickle_max_consecutive_errors() -> i32 {
 /// Returns the max change ratio for adaptive FULL fallback.
 pub fn pg_trickle_differential_max_change_ratio() -> f64 {
     PGS_DIFFERENTIAL_MAX_CHANGE_RATIO.get()
+}
+
+/// PH-E1: Returns the max estimated delta output rows before FULL fallback.
+/// Returns 0 when disabled.
+pub fn pg_trickle_max_delta_estimate_rows() -> i32 {
+    PGS_MAX_DELTA_ESTIMATE_ROWS.get()
 }
 
 /// Returns the change buffer schema name.
