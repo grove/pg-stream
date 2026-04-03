@@ -1692,11 +1692,47 @@ SELECT * FROM pgtrickle.explain_st('order_totals');
 
 | property | value |
 |---|---|
-| Defining Query | SELECT region, SUM(amount) ... |
-| Refresh Mode | DIFFERENTIAL |
-| Operator Tree | Aggregate → Scan(orders) |
-| Source Tables | orders (oid=16384) |
-| DVM Supported | Yes |
+| pgt_name | public.order_totals |
+| defining_query | SELECT region, SUM(amount) ... |
+| refresh_mode | DIFFERENTIAL |
+| status | active |
+| is_populated | true |
+| dvm_supported | true |
+| operator_tree | Aggregate → Scan(orders) |
+| output_columns | region, total |
+| source_oids | 16384 |
+| delta_query | WITH ... SELECT ... |
+| frontier | {"orders": "0/15A3B80"} |
+| amplification_stats | {"samples":10,"min":1.0,...} |
+| refresh_timing_stats | {"samples":10,"min_ms":12.3,...} |
+| source_partitions | [{"source":"public.orders",...}] |
+| dependency_graph_dot | digraph dependency_subgraph { ... } |
+
+#### Output Fields
+
+| Property | Description |
+|---|---|
+| `pgt_name` | Fully-qualified stream table name |
+| `defining_query` | The SQL query that defines the stream table |
+| `refresh_mode` | `DIFFERENTIAL`, `FULL`, or `IMMEDIATE` |
+| `status` | Current status (`active`, `suspended`, etc.) |
+| `is_populated` | Whether the stream table has been initially populated |
+| `dvm_supported` | Whether the defining query supports differential view maintenance |
+| `operator_tree` | Debug representation of the DVM operator tree |
+| `output_columns` | Comma-separated list of output column names |
+| `source_oids` | Comma-separated list of source table OIDs |
+| `aggregate_strategies` | Per-aggregate maintenance strategies (JSON, if aggregates present) |
+| `delta_query` | The generated delta SQL used for DIFFERENTIAL refresh |
+| `frontier` | Current LSN/watermark frontier (JSON) |
+| `amplification_stats` | Delta amplification ratio statistics over the last 20 refreshes (JSON) |
+| `refresh_timing_stats` | Refresh duration statistics over the last 20 completed refreshes (JSON). Fields: `samples`, `min_ms`, `max_ms`, `avg_ms`, `latest_ms`, `latest_action` |
+| `source_partitions` | Partition info for partitioned source tables (JSON array). Fields per entry: `source`, `partition_key`, `partitions` |
+| `dependency_graph_dot` | Dependency sub-graph in [DOT format](https://graphviz.org/doc/info/lang.html). Shows immediate upstream sources (ellipses for base tables, boxes for stream tables) and downstream dependents. Paste into a Graphviz renderer to visualize. |
+
+> **Note:** Properties are only included when data is available. For example,
+> `source_partitions` only appears when at least one source table is
+> partitioned, and `refresh_timing_stats` only appears after at least one
+> completed refresh.
 
 ---
 

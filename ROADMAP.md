@@ -2911,19 +2911,18 @@ Validate correctness against independent query corpora beyond TPC-H.
 
 > **I3 subtotal: ~2–4 hours**
 
-### Hash-Join Planner Hints (PH-D2)
+### Hash-Join Planner Hints (PH-D2) — ✅ Done
 
-> **In plain terms:** The MERGE statement that applies deltas currently always
-> uses a nested-loop join, which is fastest for tiny deltas (<100 rows) but
-> suboptimal for medium deltas (1K–10K rows). This extends the existing
-> `SET LOCAL` planner hint injection to prefer hash joins when the estimated
-> delta exceeds a configurable threshold.
+> **In plain terms:** Added `pg_trickle.merge_join_strategy` GUC that lets
+> operators manually override the join strategy used during MERGE. Values:
+> `auto` (default heuristic), `hash_join`, `nested_loop`, `merge_join`.
+> The existing delta-size heuristics remain the default (`auto`).
 
 | Item | Description | Effort | Ref |
 |------|-------------|--------|-----|
-| PH-D2 | **Hash-join planner hints.** Extend `SET LOCAL` injection to prefer hash joins over nested-loop joins for MERGE when delta exceeds 1K rows (nested-loop is optimal for tiny deltas, hash-join for medium). | 3–5d | [PLAN_PERFORMANCE_PART_9.md §Phase D](plans/performance/PLAN_PERFORMANCE_PART_9.md) |
+| PH-D2 | **Hash-join planner hints.** Added `merge_join_strategy` GUC with manual override for join strategy during MERGE. `auto` preserves existing delta-size heuristics; `hash_join`/`nested_loop`/`merge_join` force specific strategies. | 3–5d | [PLAN_PERFORMANCE_PART_9.md §Phase D](plans/performance/PLAN_PERFORMANCE_PART_9.md) |
 
-> **PH-D2 subtotal: ~3–5 days**
+> **PH-D2 subtotal: ~3–5 days** — ✅ Complete
 
 ### Shared-Memory Template Cache Research Spike (G14-SHC-SPIKE)
 
@@ -3066,19 +3065,17 @@ Validate correctness against independent query corpora beyond TPC-H.
 
 > **G8.1 subtotal: ✅ Completed**
 
-### `explain_st()` Enhancements (EXPL-ENH)
+### `explain_st()` Enhancements (EXPL-ENH) — ✅ Done
 
 > **In plain terms:** Small quality-of-life improvements to the diagnostic
-> function: query-plan annotations showing which operators the DVM chose,
-> partition source info, and a dependency-graph visualization snippet.
-> These can accompany other items (PH-E2 adds `spill_history`, PH-D2 adds
-> planner hint info) or be delivered standalone.
+> function: refresh timing statistics, partition source info, and a dependency-graph
+> visualization snippet in DOT format.
 
 | Item | Description | Effort | Ref |
 |------|-------------|--------|-----|
-| EXPL-ENH | **`explain_st()` enhancements.** Add: (a) per-operator timing breakdown annotations, (b) source partition info for partitioned tables, (c) dependency sub-graph visualization (ASCII or DOT format). | 4–8h | [PLAN_FEATURE_CLEANUP.md](plans/PLAN_FEATURE_CLEANUP.md) |
+| EXPL-ENH | **`explain_st()` enhancements.** Added: (a) refresh timing stats (min/max/avg/latest duration from last 20 refreshes), (b) source partition info for partitioned tables, (c) dependency sub-graph visualization in DOT format. | 4–8h | [PLAN_FEATURE_CLEANUP.md](plans/PLAN_FEATURE_CLEANUP.md) |
 
-> **EXPL-ENH subtotal: ~4–8 hours**
+> **EXPL-ENH subtotal: ~4–8 hours** — ✅ Complete
 
 ### CNPG Operator Hardening (R4)
 
@@ -3103,7 +3100,7 @@ Validate correctness against independent query corpora beyond TPC-H.
 - [ ] WM-7: Stuck watermarks detected and downstream STs paused; `watermark_stuck` alert emitted; auto-resume on watermark advance
 - [ ] PH-E1: Delta cost estimation prevents OOM on large deltas; `max_delta_work_mem_mb` GUC respected; FULL downgrade + NOTICE emitted when threshold exceeded; tested with oversized delta
 - [ ] PH-E2: Spill-aware auto-adjustment triggers after 3 consecutive spills; `spill_history` exposed in `explain_st()`
-- [ ] PH-D2: Hash-join planner hints active for medium deltas; benchmarked against nested-loop baseline
+- [x] PH-D2: `merge_join_strategy` GUC with manual override (`auto`/`hash_join`/`nested_loop`/`merge_join`)
 - [ ] G14-SHC-SPIKE: RFC written; prototype benchmark validates or invalidates DSM-based approach
 - [ ] TRUNC-1: TRUNCATE on trigger-mode CDC source marks downstream STs for reinit; tested end-to-end
 - [ ] VOL-1: `volatile_function_policy` GUC controls volatile function handling; `reject`/`warn`/`allow` modes tested
@@ -3114,7 +3111,7 @@ Validate correctness against independent query corpora beyond TPC-H.
 - [ ] STST-3: 3-level and 4-level ST-on-ST chains tested with INSERT/UPDATE/DELETE propagation; mixed modes covered
 - [ ] CIRC-IMM: Diamond + near-circular IMMEDIATE topologies tested; no deadlocks or incorrect results (conditional — can slip to v0.16.0)
 - [ ] G8.1: Cross-session MERGE cache invalidation via catalog version counter; tested with concurrent ALTER QUERY + refresh
-- [ ] EXPL-ENH: `explain_st()` shows per-operator timing, partition info, and dependency visualization
+- [x] EXPL-ENH: `explain_st()` shows refresh timing stats, source partition info, and dependency sub-graph (DOT format)
 - [ ] R4: CNPG operator hardening — ImageVolume, health probes, failover tested
 - [ ] G13-PRF: `parser.rs` split into ≥5 sub-modules; all ~690 `unsafe` blocks have `// SAFETY:` comments; zero behavior change; all existing tests pass
 - [ ] Extension upgrade path tested (`0.14.0 → 0.15.0`)

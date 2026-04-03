@@ -48,6 +48,18 @@ For future plans and release milestones, see [ROADMAP.md](ROADMAP.md).
   with `name`, `status`, and `pgt_id` per definition. Atomic: entire batch rolls back on
   any error.
 
+- **EXPL-ENH:** `pgtrickle.explain_st()` now includes refresh timing statistics
+  (`refresh_timing_stats` — min/max/avg/latest duration from last 20 refreshes),
+  source partition info (`source_partitions` — partition key and child count for
+  partitioned source tables), and a dependency sub-graph in DOT format
+  (`dependency_graph_dot` — immediate upstream/downstream nodes, renderable by Graphviz).
+
+- **PH-D2:** `pg_trickle.merge_join_strategy` GUC — manual override for the join
+  strategy used during MERGE execution. Values: `auto` (default, delta-size heuristics),
+  `hash_join` (force hash joins + raised work_mem), `nested_loop` (force nested-loop
+  joins), `merge_join` (force merge joins). Useful for workloads with consistent delta
+  sizes where the heuristic is unnecessary overhead.
+
 ### Changed
 
 - **TRUNC-1:** Documented existing TRUNCATE capture behavior in `docs/SQL_REFERENCE.md`.

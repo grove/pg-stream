@@ -24,6 +24,7 @@ Complete reference for all pg_trickle GUC (Grand Unified Configuration) variable
   - [Refresh Performance](#refresh-performance)
     - [pg\_trickle.differential\_max\_change\_ratio](#pg_trickledifferential_max_change_ratio)
     - [pg\_trickle.planner\_aggressive](#pg_trickleplanner_aggressive)
+    - [pg\_trickle.merge\_join\_strategy](#pg_tricklemerge_join_strategy)
     - [pg\_trickle.merge\_planner\_hints](#pg_tricklemerge_planner_hints) *(deprecated)*
     - [pg\_trickle.merge\_work\_mem\_mb](#pg_tricklemerge_work_mem_mb)
     - [pg\_trickle.merge\_seqscan\_threshold](#pg_tricklemerge_seqscan_threshold)
@@ -455,6 +456,42 @@ When enabled, the refresh executor estimates the delta size and applies optimize
 ```sql
 -- Disable all planner hints
 SET pg_trickle.planner_aggressive = false;
+```
+
+---
+
+### pg_trickle.merge_join_strategy
+
+*Added in v0.15.0.* Manual override for the join strategy used during MERGE execution.
+
+| Property | Value |
+|---|---|
+| Type | `text` |
+| Default | `'auto'` |
+| Values | `auto`, `hash_join`, `nested_loop`, `merge_join` |
+| Context | `SUSET` |
+| Restart Required | No |
+
+Controls which join strategy the refresh executor hints to PostgreSQL via `SET LOCAL` during differential refresh. Requires [`planner_aggressive`](#pg_trickleplanner_aggressive) to be enabled.
+
+| Value | Behaviour |
+|---|---|
+| `auto` (default) | Delta-size heuristics choose: nested-loop for tiny deltas, hash-join for larger ones |
+| `hash_join` | Always disable nested-loop joins and raise `work_mem` — best for medium-to-large deltas |
+| `nested_loop` | Always disable hash-join and merge-join — best for very small deltas against indexed tables |
+| `merge_join` | Always disable hash-join and nested-loop — useful if data is pre-sorted |
+
+**Tuning Guidance:**
+- **Most workloads**: Leave at `auto` — the built-in heuristic performs well.
+- **Consistently large deltas** (1K+ rows): Setting to `hash_join` avoids heuristic overhead.
+- **Troubleshooting**: If refresh is slow, try different strategies and compare with [`explain_st()`](SQL_REFERENCE.md#pgtrickleexplain_st).
+
+```sql
+-- Force hash joins for all MERGE operations
+SET pg_trickle.merge_join_strategy = 'hash_join';
+
+-- Revert to automatic heuristics
+SET pg_trickle.merge_join_strategy = 'auto';
 ```
 
 ---

@@ -17,4 +17,12 @@
 --   Already implemented via shared-memory CACHE_GENERATION counter.
 --   No catalog schema changes needed.
 --
+-- EXPL-ENH: explain_st() enhancements
+--   New output properties (refresh_timing_stats, source_partitions,
+--   dependency_graph_dot) added to existing explain_st() function.
+--   No DDL changes needed — function signature unchanged.
+--
+-- PH-D2: merge_join_strategy GUC
+--   Registered via pgrx GUC infrastructure (auto-available after upgrade).
+--
 -- No catalog schema changes in this upgrade step.
