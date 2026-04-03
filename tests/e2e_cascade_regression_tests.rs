@@ -981,3 +981,598 @@ async fn test_st_on_st_uses_differential_not_full() {
         "Expected grp 'b' doubled = 160, got {doubled_b}"
     );
 }
+
+// ── STST-3: Multi-Level ST-on-ST Testing ─────────────────────────────────────
+
+/// STST-3: DELETE on a base table propagates correctly through a three-layer
+/// DIFFERENTIAL cascade.
+#[tokio::test]
+async fn test_three_layer_cascade_delete_propagates() {
+    let db = E2eDb::new().await.with_extension().await;
+
+    db.execute(
+        "CREATE TABLE stst3_del_src (
+            id       SERIAL PRIMARY KEY,
+            category TEXT NOT NULL,
+            price    NUMERIC(10,2) NOT NULL
+        )",
+    )
+    .await;
+    db.execute(
+        "INSERT INTO stst3_del_src (category, price) VALUES
+            ('A', 10), ('A', 20), ('B', 30), ('C', 50)",
+    )
+    .await;
+
+    // Layer 1
+    db.create_st(
+        "stst3_del_l1",
+        "SELECT category, COUNT(*) AS cnt, SUM(price) AS total
+         FROM stst3_del_src GROUP BY category",
+        "1m",
+        "DIFFERENTIAL",
+    )
+    .await;
+
+    // Layer 2
+    db.execute(
+        "SELECT pgtrickle.create_stream_table(
+            'stst3_del_l2',
+            $$SELECT category, total,
+                     CASE WHEN total > 25 THEN true ELSE false END AS is_big
+              FROM stst3_del_l1$$,
+            'calculated',
+            'DIFFERENTIAL'
+        )",
+    )
+    .await;
+
+    // Layer 3
+    db.execute(
+        "SELECT pgtrickle.create_stream_table(
+            'stst3_del_l3',
+            $$SELECT category, total FROM stst3_del_l2 WHERE is_big = true$$,
+            'calculated',
+            'DIFFERENTIAL'
+        )",
+    )
+    .await;
+
+    // Initial: A=30 (big), B=30 (big), C=50 (big) → 3 rows
+    assert_eq!(db.count("public.stst3_del_l3").await, 3);
+
+    // Delete all rows for category A → A total drops to 0 (removed by GROUP BY)
+    db.execute("DELETE FROM stst3_del_src WHERE category = 'A'")
+        .await;
+
+    db.refresh_st_with_retry("stst3_del_l1").await;
+    db.refresh_st_with_retry("stst3_del_l2").await;
+    db.refresh_st_with_retry("stst3_del_l3").await;
+
+    // A should be gone entirely
+    assert_eq!(
+        db.count("public.stst3_del_l3").await,
+        2,
+        "Only B(30) and C(50) should remain after deleting all A rows"
+    );
+
+    let a_exists: bool = db
+        .query_scalar("SELECT EXISTS(SELECT 1 FROM stst3_del_l3 WHERE category = 'A')")
+        .await;
+    assert!(!a_exists, "Category A should be gone from layer 3");
+
+    db.assert_st_matches_query(
+        "stst3_del_l3",
+        "SELECT category, total FROM stst3_del_l2 WHERE is_big = true",
+    )
+    .await;
+}
+
+/// STST-3: Four-layer cascade propagates INSERT correctly through all levels.
+#[tokio::test]
+async fn test_four_layer_cascade_insert_propagates() {
+    let db = E2eDb::new().await.with_extension().await;
+
+    db.execute(
+        "CREATE TABLE stst3_4l_src (
+            id  SERIAL PRIMARY KEY,
+            grp TEXT NOT NULL,
+            val INT NOT NULL
+        )",
+    )
+    .await;
+    db.execute(
+        "INSERT INTO stst3_4l_src (grp, val) VALUES
+            ('x', 10), ('x', 20), ('y', 30)",
+    )
+    .await;
+
+    // Layer 1: aggregate
+    db.create_st(
+        "stst3_4l_l1",
+        "SELECT grp, SUM(val) AS total FROM stst3_4l_src GROUP BY grp",
+        "1m",
+        "DIFFERENTIAL",
+    )
+    .await;
+
+    // Layer 2: add label
+    db.execute(
+        "SELECT pgtrickle.create_stream_table(
+            'stst3_4l_l2',
+            $$SELECT grp, total, total * 2 AS doubled FROM stst3_4l_l1$$,
+            'calculated',
+            'DIFFERENTIAL'
+        )",
+    )
+    .await;
+
+    // Layer 3: filter
+    db.execute(
+        "SELECT pgtrickle.create_stream_table(
+            'stst3_4l_l3',
+            $$SELECT grp, doubled FROM stst3_4l_l2 WHERE doubled > 50$$,
+            'calculated',
+            'DIFFERENTIAL'
+        )",
+    )
+    .await;
+
+    // Layer 4: final projection
+    db.execute(
+        "SELECT pgtrickle.create_stream_table(
+            'stst3_4l_l4',
+            $$SELECT grp, doubled AS final_val FROM stst3_4l_l3$$,
+            'calculated',
+            'DIFFERENTIAL'
+        )",
+    )
+    .await;
+
+    // Initial: x total=30, doubled=60 (>50, passes); y total=30, doubled=60 (>50, passes)
+    assert_eq!(
+        db.count("public.stst3_4l_l4").await,
+        2,
+        "x(60) and y(60) both pass the doubled>50 filter"
+    );
+
+    // Insert: new group z with val=100 → total=100, doubled=200
+    db.execute("INSERT INTO stst3_4l_src (grp, val) VALUES ('z', 100)")
+        .await;
+
+    // Refresh all 4 layers
+    db.refresh_st_with_retry("stst3_4l_l1").await;
+    db.refresh_st_with_retry("stst3_4l_l2").await;
+    db.refresh_st_with_retry("stst3_4l_l3").await;
+    db.refresh_st_with_retry("stst3_4l_l4").await;
+
+    assert_eq!(
+        db.count("public.stst3_4l_l4").await,
+        3,
+        "x(60), y(60), z(200) should all be in layer 4"
+    );
+
+    let z_val: i64 = db
+        .query_scalar("SELECT final_val FROM stst3_4l_l4 WHERE grp = 'z'")
+        .await;
+    assert_eq!(z_val, 200, "z: total=100, doubled=200");
+
+    db.assert_st_matches_query(
+        "stst3_4l_l4",
+        "SELECT grp, doubled AS final_val FROM stst3_4l_l3",
+    )
+    .await;
+}
+
+/// STST-3: Four-layer cascade propagates DELETE through all levels, including
+/// a delete that removes a group entirely.
+#[tokio::test]
+async fn test_four_layer_cascade_delete_propagates() {
+    let db = E2eDb::new().await.with_extension().await;
+
+    db.execute(
+        "CREATE TABLE stst3_4ld_src (
+            id  SERIAL PRIMARY KEY,
+            grp TEXT NOT NULL,
+            val INT NOT NULL
+        )",
+    )
+    .await;
+    db.execute(
+        "INSERT INTO stst3_4ld_src (grp, val) VALUES
+            ('a', 50), ('b', 60), ('c', 70)",
+    )
+    .await;
+
+    db.create_st(
+        "stst3_4ld_l1",
+        "SELECT grp, SUM(val) AS total FROM stst3_4ld_src GROUP BY grp",
+        "1m",
+        "DIFFERENTIAL",
+    )
+    .await;
+
+    db.execute(
+        "SELECT pgtrickle.create_stream_table(
+            'stst3_4ld_l2',
+            $$SELECT grp, total, total + 10 AS adjusted FROM stst3_4ld_l1$$,
+            'calculated',
+            'DIFFERENTIAL'
+        )",
+    )
+    .await;
+
+    db.execute(
+        "SELECT pgtrickle.create_stream_table(
+            'stst3_4ld_l3',
+            $$SELECT grp, adjusted FROM stst3_4ld_l2 WHERE adjusted >= 70$$,
+            'calculated',
+            'DIFFERENTIAL'
+        )",
+    )
+    .await;
+
+    db.execute(
+        "SELECT pgtrickle.create_stream_table(
+            'stst3_4ld_l4',
+            $$SELECT grp FROM stst3_4ld_l3$$,
+            'calculated',
+            'DIFFERENTIAL'
+        )",
+    )
+    .await;
+
+    // Initial: a=50+10=60 (excluded), b=60+10=70 (included), c=70+10=80 (included)
+    assert_eq!(db.count("public.stst3_4ld_l4").await, 2);
+
+    // Delete c entirely
+    db.execute("DELETE FROM stst3_4ld_src WHERE grp = 'c'")
+        .await;
+
+    db.refresh_st_with_retry("stst3_4ld_l1").await;
+    db.refresh_st_with_retry("stst3_4ld_l2").await;
+    db.refresh_st_with_retry("stst3_4ld_l3").await;
+    db.refresh_st_with_retry("stst3_4ld_l4").await;
+
+    assert_eq!(
+        db.count("public.stst3_4ld_l4").await,
+        1,
+        "Only b(70) should remain after deleting c"
+    );
+
+    let b_exists: bool = db
+        .query_scalar("SELECT EXISTS(SELECT 1 FROM stst3_4ld_l4 WHERE grp = 'b')")
+        .await;
+    assert!(b_exists, "Group b should still be present");
+
+    db.assert_st_matches_query("stst3_4ld_l4", "SELECT grp FROM stst3_4ld_l3")
+        .await;
+}
+
+/// STST-3: Mixed refresh modes — DIFFERENTIAL at some levels, FULL at others.
+/// Verifies correctness when a FULL-mode ST is between two DIFFERENTIAL STs.
+#[tokio::test]
+async fn test_mixed_refresh_modes_in_cascade() {
+    let db = E2eDb::new().await.with_extension().await;
+
+    db.execute(
+        "CREATE TABLE stst3_mix_src (
+            id  SERIAL PRIMARY KEY,
+            grp TEXT NOT NULL,
+            val INT NOT NULL
+        )",
+    )
+    .await;
+    db.execute(
+        "INSERT INTO stst3_mix_src (grp, val) VALUES
+            ('a', 10), ('a', 20), ('b', 30)",
+    )
+    .await;
+
+    // Layer 1: DIFFERENTIAL
+    db.create_st(
+        "stst3_mix_l1",
+        "SELECT grp, SUM(val) AS total FROM stst3_mix_src GROUP BY grp",
+        "1m",
+        "DIFFERENTIAL",
+    )
+    .await;
+
+    // Layer 2: FULL (intentionally different mode)
+    db.execute(
+        "SELECT pgtrickle.create_stream_table(
+            'stst3_mix_l2',
+            $$SELECT grp, total * 3 AS tripled FROM stst3_mix_l1$$,
+            'calculated',
+            'FULL'
+        )",
+    )
+    .await;
+
+    // Layer 3: DIFFERENTIAL (back to differential after a FULL layer)
+    db.execute(
+        "SELECT pgtrickle.create_stream_table(
+            'stst3_mix_l3',
+            $$SELECT grp, tripled FROM stst3_mix_l2 WHERE tripled > 50$$,
+            'calculated',
+            'DIFFERENTIAL'
+        )",
+    )
+    .await;
+
+    // Initial: a=30*3=90 (>50), b=30*3=90 (>50)
+    assert_eq!(db.count("public.stst3_mix_l3").await, 2);
+
+    // Insert: make group c with small value (won't pass filter)
+    db.execute("INSERT INTO stst3_mix_src (grp, val) VALUES ('c', 5)")
+        .await;
+    // Update: increase b so tripled changes
+    db.execute("UPDATE stst3_mix_src SET val = 100 WHERE grp = 'b' AND val = 30")
+        .await;
+
+    db.refresh_st_with_retry("stst3_mix_l1").await;
+    db.refresh_st_with_retry("stst3_mix_l2").await;
+    db.refresh_st_with_retry("stst3_mix_l3").await;
+
+    // a: 30*3=90 (>50, still in); b: 100*3=300 (>50, in); c: 5*3=15 (<50, out)
+    assert_eq!(
+        db.count("public.stst3_mix_l3").await,
+        2,
+        "a(90) and b(300) pass; c(15) does not"
+    );
+
+    let b_tripled: i64 = db
+        .query_scalar("SELECT tripled FROM stst3_mix_l3 WHERE grp = 'b'")
+        .await;
+    assert_eq!(b_tripled, 300, "b: 100*3=300");
+
+    db.assert_st_matches_query(
+        "stst3_mix_l3",
+        "SELECT grp, tripled FROM stst3_mix_l2 WHERE tripled > 50",
+    )
+    .await;
+}
+
+/// STST-3: Concurrent DML at multiple levels — INSERT into base table while
+/// an intermediate ST also has pending changes from a previous cycle.
+#[tokio::test]
+async fn test_cascade_concurrent_dml_at_multiple_levels() {
+    let db = E2eDb::new().await.with_extension().await;
+
+    db.execute(
+        "CREATE TABLE stst3_conc_src (
+            id  SERIAL PRIMARY KEY,
+            grp TEXT NOT NULL,
+            val INT NOT NULL
+        )",
+    )
+    .await;
+    db.execute("INSERT INTO stst3_conc_src (grp, val) VALUES ('a', 10), ('b', 20)")
+        .await;
+
+    db.create_st(
+        "stst3_conc_l1",
+        "SELECT grp, SUM(val) AS total FROM stst3_conc_src GROUP BY grp",
+        "1m",
+        "DIFFERENTIAL",
+    )
+    .await;
+
+    db.execute(
+        "SELECT pgtrickle.create_stream_table(
+            'stst3_conc_l2',
+            $$SELECT grp, total FROM stst3_conc_l1$$,
+            'calculated',
+            'DIFFERENTIAL'
+        )",
+    )
+    .await;
+
+    db.execute(
+        "SELECT pgtrickle.create_stream_table(
+            'stst3_conc_l3',
+            $$SELECT grp, total FROM stst3_conc_l2$$,
+            'calculated',
+            'DIFFERENTIAL'
+        )",
+    )
+    .await;
+
+    // Step 1: Refresh only L1 (L2, L3 still stale from initial)
+    db.execute("INSERT INTO stst3_conc_src (grp, val) VALUES ('a', 30)")
+        .await;
+    db.refresh_st_with_retry("stst3_conc_l1").await;
+    // L1 now has a=40, b=20 but L2/L3 still see old data
+
+    // Step 2: More DML before L2/L3 have caught up
+    db.execute("INSERT INTO stst3_conc_src (grp, val) VALUES ('b', 80)")
+        .await;
+
+    // Refresh all in order — L1 picks up second insert, L2 catches up to both
+    db.refresh_st_with_retry("stst3_conc_l1").await;
+    db.refresh_st_with_retry("stst3_conc_l2").await;
+    db.refresh_st_with_retry("stst3_conc_l3").await;
+
+    // a: 10+30 = 40, b: 20+80 = 100
+    let a_total: i64 = db
+        .query_scalar("SELECT total FROM stst3_conc_l3 WHERE grp = 'a'")
+        .await;
+    assert_eq!(a_total, 40, "a: 10+30 = 40");
+
+    let b_total: i64 = db
+        .query_scalar("SELECT total FROM stst3_conc_l3 WHERE grp = 'b'")
+        .await;
+    assert_eq!(b_total, 100, "b: 20+80 = 100");
+
+    db.assert_st_matches_query("stst3_conc_l3", "SELECT grp, total FROM stst3_conc_l2")
+        .await;
+}
+
+/// STST-3: DROP of an intermediate-level ST and verify downstream behavior.
+/// After dropping the intermediate ST, the downstream should error on refresh.
+#[tokio::test]
+async fn test_drop_intermediate_st_in_cascade() {
+    let db = E2eDb::new().await.with_extension().await;
+
+    db.execute(
+        "CREATE TABLE stst3_drop_src (
+            id  SERIAL PRIMARY KEY,
+            grp TEXT NOT NULL,
+            val INT NOT NULL
+        )",
+    )
+    .await;
+    db.execute("INSERT INTO stst3_drop_src (grp, val) VALUES ('a', 10)")
+        .await;
+
+    db.create_st(
+        "stst3_drop_l1",
+        "SELECT grp, SUM(val) AS total FROM stst3_drop_src GROUP BY grp",
+        "1m",
+        "DIFFERENTIAL",
+    )
+    .await;
+
+    db.execute(
+        "SELECT pgtrickle.create_stream_table(
+            'stst3_drop_l2',
+            $$SELECT grp, total FROM stst3_drop_l1$$,
+            'calculated',
+            'DIFFERENTIAL'
+        )",
+    )
+    .await;
+
+    db.execute(
+        "SELECT pgtrickle.create_stream_table(
+            'stst3_drop_l3',
+            $$SELECT grp, total FROM stst3_drop_l2$$,
+            'calculated',
+            'DIFFERENTIAL'
+        )",
+    )
+    .await;
+
+    // Verify initial data flows through all 3 layers
+    assert_eq!(db.count("public.stst3_drop_l3").await, 1);
+
+    // Drop the intermediate ST (L2)
+    db.execute("SELECT pgtrickle.drop_stream_table('stst3_drop_l2', cascade => true)")
+        .await;
+
+    // L3 should also be dropped by CASCADE
+    let l3_exists: bool = db
+        .query_scalar(
+            "SELECT EXISTS(
+                SELECT 1 FROM pgtrickle.pgt_stream_tables
+                WHERE pgt_name = 'stst3_drop_l3'
+            )",
+        )
+        .await;
+    assert!(
+        !l3_exists,
+        "L3 should be dropped by CASCADE when L2 is dropped"
+    );
+
+    // L1 should still exist
+    let l1_exists: bool = db
+        .query_scalar(
+            "SELECT EXISTS(
+                SELECT 1 FROM pgtrickle.pgt_stream_tables
+                WHERE pgt_name = 'stst3_drop_l1'
+            )",
+        )
+        .await;
+    assert!(l1_exists, "L1 should still exist after dropping L2");
+}
+
+/// STST-3: UPDATE on base table propagates through a four-layer DIFFERENTIAL
+/// cascade with correct intermediate values at each level.
+#[tokio::test]
+async fn test_four_layer_cascade_update_propagates() {
+    let db = E2eDb::new().await.with_extension().await;
+
+    db.execute(
+        "CREATE TABLE stst3_4lu_src (
+            id  SERIAL PRIMARY KEY,
+            grp TEXT NOT NULL,
+            val INT NOT NULL
+        )",
+    )
+    .await;
+    db.execute(
+        "INSERT INTO stst3_4lu_src (grp, val) VALUES
+            ('p', 10), ('p', 20), ('q', 50)",
+    )
+    .await;
+
+    db.create_st(
+        "stst3_4lu_l1",
+        "SELECT grp, SUM(val) AS total FROM stst3_4lu_src GROUP BY grp",
+        "1m",
+        "DIFFERENTIAL",
+    )
+    .await;
+
+    db.execute(
+        "SELECT pgtrickle.create_stream_table(
+            'stst3_4lu_l2',
+            $$SELECT grp, total, total * 2 AS doubled FROM stst3_4lu_l1$$,
+            'calculated',
+            'DIFFERENTIAL'
+        )",
+    )
+    .await;
+
+    db.execute(
+        "SELECT pgtrickle.create_stream_table(
+            'stst3_4lu_l3',
+            $$SELECT grp, doubled + 5 AS adjusted FROM stst3_4lu_l2$$,
+            'calculated',
+            'DIFFERENTIAL'
+        )",
+    )
+    .await;
+
+    db.execute(
+        "SELECT pgtrickle.create_stream_table(
+            'stst3_4lu_l4',
+            $$SELECT grp, adjusted FROM stst3_4lu_l3 WHERE adjusted > 100$$,
+            'calculated',
+            'DIFFERENTIAL'
+        )",
+    )
+    .await;
+
+    // Initial: p=30, doubled=60, adjusted=65 (<100, excluded);
+    //          q=50, doubled=100, adjusted=105 (>100, included)
+    assert_eq!(db.count("public.stst3_4lu_l4").await, 1);
+
+    // Update: increase p's val so it qualifies
+    db.execute("UPDATE stst3_4lu_src SET val = 80 WHERE grp = 'p' AND val = 10")
+        .await;
+
+    db.refresh_st_with_retry("stst3_4lu_l1").await;
+    db.refresh_st_with_retry("stst3_4lu_l2").await;
+    db.refresh_st_with_retry("stst3_4lu_l3").await;
+    db.refresh_st_with_retry("stst3_4lu_l4").await;
+
+    // p: 80+20=100, doubled=200, adjusted=205 (>100, now included)
+    // q: 50, doubled=100, adjusted=105 (>100, still included)
+    assert_eq!(
+        db.count("public.stst3_4lu_l4").await,
+        2,
+        "Both p(205) and q(105) should pass the filter after update"
+    );
+
+    let p_adjusted: i64 = db
+        .query_scalar("SELECT adjusted FROM stst3_4lu_l4 WHERE grp = 'p'")
+        .await;
+    assert_eq!(p_adjusted, 205, "p: (80+20)*2+5 = 205");
+
+    db.assert_st_matches_query(
+        "stst3_4lu_l4",
+        "SELECT grp, adjusted FROM stst3_4lu_l3 WHERE adjusted > 100",
+    )
+    .await;
+}
