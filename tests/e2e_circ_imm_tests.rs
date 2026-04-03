@@ -154,12 +154,12 @@ async fn test_diamond_immediate_both_branches_update() {
         .await;
 
     // Both branches auto-refresh (IMMEDIATE)
-    let doubled: i64 = db
+    let doubled: i32 = db
         .query_scalar("SELECT doubled FROM circ_diamu_b WHERE id = 1")
         .await;
     assert_eq!(doubled, 1000, "B: 500*2=1000");
 
-    let shifted: i64 = db
+    let shifted: i32 = db
         .query_scalar("SELECT shifted FROM circ_diamu_c WHERE id = 1")
         .await;
     assert_eq!(shifted, 550, "C: 500+50=550");
@@ -669,7 +669,7 @@ async fn test_diamond_immediate_mixed_dml_sequence() {
         .await;
     assert_eq!(b_val_2, 999, "id=2 should have updated val=999");
 
-    let c_val_2: i64 = db
+    let c_val_2: i32 = db
         .query_scalar("SELECT c_val FROM circ_mix_d WHERE id = 2")
         .await;
     assert_eq!(c_val_2, 9990, "id=2 C branch: 999*10=9990");
