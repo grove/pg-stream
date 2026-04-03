@@ -22,9 +22,141 @@ pub async fn poll_all(client: &Client, state: &mut AppState) {
     poll_watermarks(client, state).await;
     poll_triggers(client, state).await;
 
+    // New SQL API polls — each gracefully handles function-not-found
+    poll_dedup_stats(client, state).await;
+    poll_cdc_health(client, state).await;
+    poll_quick_health(client, state).await;
+    poll_source_gates(client, state).await;
+    poll_watermark_status(client, state).await;
+
     // Post-poll computations (client-side, no DB queries)
     state.compute_cascade_staleness();
     state.detect_issues();
+}
+
+/// Execute a write action on the database. Returns a result message.
+pub async fn execute_action(client: &Client, action: &ActionRequest) -> ActionResult {
+    let result = match action {
+        ActionRequest::RefreshTable(name) => {
+            client
+                .execute(
+                    "SELECT pgtrickle.refresh_stream_table($1)",
+                    &[name],
+                )
+                .await
+                .map(|_| format!("Refreshed {name}"))
+        }
+        ActionRequest::RefreshAll => {
+            client
+                .execute("SELECT pgtrickle.refresh_all_stream_tables()", &[])
+                .await
+                .map(|_| "Refreshed all stream tables".to_string())
+        }
+        ActionRequest::PauseTable(name) => {
+            client
+                .execute(
+                    "SELECT pgtrickle.alter_stream_table($1, status => 'paused')",
+                    &[name],
+                )
+                .await
+                .map(|_| format!("Paused {name}"))
+        }
+        ActionRequest::ResumeTable(name) => {
+            client
+                .execute(
+                    "SELECT pgtrickle.alter_stream_table($1, status => 'active')",
+                    &[name],
+                )
+                .await
+                .map(|_| format!("Resumed {name}"))
+        }
+        ActionRequest::ResetFuse(name, strategy) => {
+            client
+                .execute(
+                    "SELECT pgtrickle.reset_fuse($1, $2)",
+                    &[name, strategy],
+                )
+                .await
+                .map(|_| format!("Reset fuse for {name} (strategy: {strategy})"))
+        }
+        ActionRequest::RepairTable(name) => {
+            client
+                .execute(
+                    "SELECT pgtrickle.repair_stream_table($1)",
+                    &[name],
+                )
+                .await
+                .map(|_| format!("Repaired {name}"))
+        }
+        ActionRequest::GateSource(name) => {
+            client
+                .execute("SELECT pgtrickle.gate_source($1)", &[name])
+                .await
+                .map(|_| format!("Gated source {name}"))
+        }
+        ActionRequest::UngateSource(name) => {
+            client
+                .execute("SELECT pgtrickle.ungate_source($1)", &[name])
+                .await
+                .map(|_| format!("Ungated source {name}"))
+        }
+        ActionRequest::FetchDeltaSql(name) => {
+            match client
+                .query_one("SELECT pgtrickle.explain_delta($1)", &[name])
+                .await
+            {
+                Ok(row) => {
+                    let sql: String = row.get(0);
+                    Ok(sql)
+                }
+                Err(e) => Err(e),
+            }
+        }
+        ActionRequest::FetchDdl(name) => {
+            match client
+                .query_one("SELECT pgtrickle.export_definition($1)", &[name])
+                .await
+            {
+                Ok(row) => {
+                    let ddl: String = row.get(0);
+                    Ok(ddl)
+                }
+                Err(e) => Err(e),
+            }
+        }
+        ActionRequest::ValidateQuery(query) => {
+            match client
+                .query(
+                    "SELECT check_name::text, result::text, severity::text FROM pgtrickle.validate_query($1)",
+                    &[query],
+                )
+                .await
+            {
+                Ok(rows) => {
+                    let mut result = String::new();
+                    for row in &rows {
+                        let check: String = row.get(0);
+                        let res: String = row.get(1);
+                        let sev: String = row.get(2);
+                        result.push_str(&format!("[{sev}] {check}: {res}\n"));
+                    }
+                    Ok(result)
+                }
+                Err(e) => Err(e),
+            }
+        }
+    };
+
+    match result {
+        Ok(msg) => ActionResult {
+            success: true,
+            message: msg,
+        },
+        Err(e) => ActionResult {
+            success: false,
+            message: format!("Error: {e}"),
+        },
+    }
 }
 
 async fn poll_stream_tables(client: &Client, state: &mut AppState) {
@@ -178,7 +310,8 @@ async fn poll_diagnostics(client: &Client, state: &mut AppState) {
     let result = client
         .query(
             "SELECT pgt_schema::text, pgt_name::text, current_mode::text,
-                    recommended_mode::text, confidence::text, reason::text
+                    recommended_mode::text, confidence::text, reason::text,
+                    signals::text
              FROM pgtrickle.recommend_refresh_mode(NULL)
              ORDER BY pgt_schema, pgt_name",
             &[],
@@ -188,13 +321,23 @@ async fn poll_diagnostics(client: &Client, state: &mut AppState) {
     if let Ok(rows) = result {
         state.diagnostics = rows
             .iter()
-            .map(|row| DiagRecommendation {
-                schema: row.get(0),
-                name: row.get(1),
-                current_mode: row.get(2),
-                recommended_mode: row.get(3),
-                confidence: row.get(4),
-                reason: row.get(5),
+            .map(|row| {
+                let signals_text: Option<String> = row.get(6);
+                let signals =
+                    signals_text.and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok());
+                let name: String = row.get(1);
+                if let Some(ref sig) = signals {
+                    state.diag_signals.insert(name.clone(), sig.clone());
+                }
+                DiagRecommendation {
+                    schema: row.get(0),
+                    name,
+                    current_mode: row.get(2),
+                    recommended_mode: row.get(3),
+                    confidence: row.get(4),
+                    reason: row.get(5),
+                    signals,
+                }
             })
             .collect();
     }
@@ -397,5 +540,167 @@ async fn poll_triggers(client: &Client, state: &mut AppState) {
                 firing_events: row.get(2),
             })
             .collect();
+    }
+}
+
+// ── New SQL API polls (graceful degradation on function-not-found) ──
+
+async fn poll_dedup_stats(client: &Client, state: &mut AppState) {
+    let result = client
+        .query(
+            "SELECT total_diff_refreshes, dedup_needed, dedup_ratio_pct
+             FROM pgtrickle.dedup_stats()",
+            &[],
+        )
+        .await;
+
+    match result {
+        Ok(rows) if !rows.is_empty() => {
+            let row = &rows[0];
+            state.dedup_stats = Some(DedupStats {
+                total_diff_refreshes: row.get(0),
+                dedup_needed: row.get(1),
+                dedup_ratio_pct: row.get(2),
+            });
+            state.record_poll_success();
+        }
+        Ok(_) => {
+            state.record_poll_success();
+        }
+        Err(_) => {
+            // Function may not exist in older versions — graceful degradation
+            state.dedup_stats = None;
+            state.record_poll_failure();
+        }
+    }
+}
+
+async fn poll_cdc_health(client: &Client, state: &mut AppState) {
+    let result = client
+        .query(
+            "SELECT source_table::text, cdc_mode::text, slot_name::text,
+                    lag_bytes, confirmed_lsn::text, alert::text
+             FROM pgtrickle.check_cdc_health()
+             ORDER BY COALESCE(lag_bytes, 0) DESC",
+            &[],
+        )
+        .await;
+
+    match result {
+        Ok(rows) => {
+            state.cdc_health = rows
+                .iter()
+                .map(|row| CdcHealthEntry {
+                    source_table: row.get(0),
+                    cdc_mode: row.get(1),
+                    slot_name: row.get(2),
+                    lag_bytes: row.get(3),
+                    confirmed_lsn: row.get(4),
+                    alert: row.get(5),
+                })
+                .collect();
+            state.record_poll_success();
+        }
+        Err(_) => {
+            state.cdc_health = vec![];
+            state.record_poll_failure();
+        }
+    }
+}
+
+async fn poll_quick_health(client: &Client, state: &mut AppState) {
+    let result = client
+        .query(
+            "SELECT total_stream_tables, error_tables, stale_tables,
+                    scheduler_running, status::text
+             FROM pgtrickle.quick_health",
+            &[],
+        )
+        .await;
+
+    match result {
+        Ok(rows) if !rows.is_empty() => {
+            let row = &rows[0];
+            state.quick_health = Some(QuickHealth {
+                total_stream_tables: row.get(0),
+                error_tables: row.get(1),
+                stale_tables: row.get(2),
+                scheduler_running: row.get(3),
+                status: row.get(4),
+            });
+            state.record_poll_success();
+        }
+        Ok(_) => {
+            state.record_poll_success();
+        }
+        Err(_) => {
+            state.quick_health = None;
+            state.record_poll_failure();
+        }
+    }
+}
+
+async fn poll_source_gates(client: &Client, state: &mut AppState) {
+    let result = client
+        .query(
+            "SELECT source_table::text, schema_name::text, gated,
+                    gated_at::text, gate_duration::text,
+                    affected_stream_tables::text
+             FROM pgtrickle.bootstrap_gate_status()
+             ORDER BY gated DESC, source_table",
+            &[],
+        )
+        .await;
+
+    match result {
+        Ok(rows) => {
+            state.source_gates = rows
+                .iter()
+                .map(|row| SourceGate {
+                    source_table: row.get(0),
+                    schema_name: row.get(1),
+                    gated: row.get(2),
+                    gated_at: row.get(3),
+                    gate_duration: row.get(4),
+                    affected_stream_tables: row.get(5),
+                })
+                .collect();
+            state.record_poll_success();
+        }
+        Err(_) => {
+            state.source_gates = vec![];
+            state.record_poll_failure();
+        }
+    }
+}
+
+async fn poll_watermark_status(client: &Client, state: &mut AppState) {
+    let result = client
+        .query(
+            "SELECT group_name::text, lag_secs, aligned,
+                    sources_with_watermark, sources_total
+             FROM pgtrickle.watermark_status()",
+            &[],
+        )
+        .await;
+
+    match result {
+        Ok(rows) => {
+            state.watermark_alignment = rows
+                .iter()
+                .map(|row| WatermarkAlignment {
+                    group_name: row.get(0),
+                    lag_secs: row.get(1),
+                    aligned: row.get(2),
+                    sources_with_watermark: row.get(3),
+                    sources_total: row.get(4),
+                })
+                .collect();
+            state.record_poll_success();
+        }
+        Err(_) => {
+            state.watermark_alignment = vec![];
+            state.record_poll_failure();
+        }
     }
 }

@@ -165,6 +165,7 @@ pub fn sample_state() -> AppState {
                 recommended_mode: "KEEP".to_string(),
                 confidence: "high".to_string(),
                 reason: "Already optimal".to_string(),
+                signals: None,
             },
             DiagRecommendation {
                 schema: "public".to_string(),
@@ -173,6 +174,7 @@ pub fn sample_state() -> AppState {
                 recommended_mode: "DIFF".to_string(),
                 confidence: "medium".to_string(),
                 reason: "Table supports differential".to_string(),
+                signals: None,
             },
         ],
         efficiency: vec![RefreshEfficiency {
@@ -262,6 +264,16 @@ pub fn sample_state() -> AppState {
         sparkline_data: std::collections::HashMap::new(),
         issues: vec![],
         error_message: None,
+        diag_signals: std::collections::HashMap::new(),
+        dedup_stats: None,
+        cdc_health: vec![],
+        quick_health: None,
+        source_gates: vec![],
+        watermark_alignment: vec![],
+        delta_sql_cache: std::collections::HashMap::new(),
+        ddl_cache: std::collections::HashMap::new(),
+        poll_failure_count: 0,
+        poll_total_count: 0,
     };
 
     state.compute_cascade_staleness();

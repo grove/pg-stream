@@ -41,6 +41,49 @@ pub struct ConnectionArgs {
     /// Database password
     #[arg(long, env = "PGPASSWORD", hide_env_values = true)]
     pub password: Option<String>,
+
+    /// Poll interval in seconds (default: 2, range: 1–300)
+    #[arg(long, default_value = "2", env = "PGTRICKLE_POLL_INTERVAL",
+          value_parser = clap::value_parser!(u64).range(1..=300))]
+    pub interval: u64,
+
+    /// SSL mode: disable, prefer, require (default: prefer)
+    #[arg(long, default_value = "prefer", env = "PGSSLMODE")]
+    pub sslmode: SslMode,
+
+    /// Path to custom SSL root certificate
+    #[arg(long, env = "PGSSLROOTCERT")]
+    pub sslrootcert: Option<String>,
+
+    /// Light or dark theme (default: dark)
+    #[arg(long, default_value = "dark", env = "PGTRICKLE_THEME")]
+    pub theme: ThemeChoice,
+
+    /// Enable mouse support (may interfere with terminal copy/paste)
+    #[arg(long, env = "PGTRICKLE_MOUSE")]
+    pub mouse: bool,
+
+    /// Emit terminal bell on critical alerts
+    #[arg(long, env = "PGTRICKLE_BELL")]
+    pub bell: bool,
+}
+
+#[derive(Clone, Copy, ValueEnum, Default, PartialEq, Eq)]
+pub enum SslMode {
+    /// No TLS
+    Disable,
+    /// Try TLS, fall back to plaintext
+    #[default]
+    Prefer,
+    /// Require TLS (fail if unavailable)
+    Require,
+}
+
+#[derive(Clone, Copy, ValueEnum, Default, PartialEq, Eq)]
+pub enum ThemeChoice {
+    #[default]
+    Dark,
+    Light,
 }
 
 #[derive(Subcommand)]

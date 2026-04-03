@@ -5,6 +5,9 @@ pub enum CliError {
     #[error("connection failed: {0}")]
     Connection(#[from] tokio_postgres::Error),
 
+    #[error("connection failed: {0}")]
+    ConnectionMsg(String),
+
     #[error("not found: {0}")]
     NotFound(String),
 

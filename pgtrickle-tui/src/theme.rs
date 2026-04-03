@@ -22,7 +22,7 @@ pub struct Theme {
 impl Theme {
     pub fn default_dark() -> Self {
         Self {
-            name: "default",
+            name: "dark",
             active: Style::default().fg(Color::Green),
             error: Style::default().fg(Color::Red),
             suspended: Style::default().fg(Color::Yellow),
@@ -45,6 +45,34 @@ impl Theme {
                 .bg(Color::DarkGray)
                 .add_modifier(Modifier::BOLD),
             dim: Style::default().fg(Color::DarkGray),
+        }
+    }
+
+    pub fn light() -> Self {
+        Self {
+            name: "light",
+            active: Style::default().fg(Color::Green),
+            error: Style::default().fg(Color::Red),
+            suspended: Style::default().fg(Color::Yellow),
+            paused: Style::default().fg(Color::Gray),
+            selected: Style::default()
+                .bg(Color::LightBlue)
+                .add_modifier(Modifier::BOLD),
+            header: Style::default()
+                .fg(Color::Blue)
+                .add_modifier(Modifier::BOLD),
+            border: Style::default().fg(Color::Gray),
+            warning: Style::default().fg(Color::Yellow),
+            ok: Style::default().fg(Color::Green),
+            title: Style::default()
+                .fg(Color::Black)
+                .add_modifier(Modifier::BOLD),
+            footer: Style::default().fg(Color::Gray),
+            footer_active: Style::default()
+                .fg(Color::Black)
+                .bg(Color::LightBlue)
+                .add_modifier(Modifier::BOLD),
+            dim: Style::default().fg(Color::Gray),
         }
     }
 
@@ -81,7 +109,7 @@ mod tests {
     #[test]
     fn test_default_theme_is_default_dark() {
         let theme = Theme::default();
-        assert_eq!(theme.name, "default");
+        assert_eq!(theme.name, "dark");
     }
 
     #[test]

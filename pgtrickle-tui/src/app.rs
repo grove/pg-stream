@@ -9,15 +9,17 @@ use crossterm::terminal::{
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui::style::Modifier;
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use tokio::sync::mpsc;
 use tokio::time::interval;
 
-use crate::cli::ConnectionArgs;
+use crate::cli::{ConnectionArgs, ThemeChoice};
 use crate::error::CliError;
-use crate::state::AppState;
+use crate::state::{
+    ActionRequest, ActionResult, AppState, ConfirmDialog, SortMode, Toast, ToastStyle,
+};
 use crate::theme::Theme;
 use crate::views;
 
@@ -101,6 +103,13 @@ const ALL_VIEWS: [View; 14] = [
 enum PollMsg {
     StateUpdate(Box<AppState>),
     Error(String),
+    ActionResult(ActionResult),
+    /// Delta SQL fetched on demand
+    DeltaSql(String, String), // (table_name, sql)
+    /// DDL fetched on demand
+    Ddl(String, String), // (table_name, ddl)
+    /// Reconnected after connection loss
+    Reconnected,
 }
 
 struct App {
@@ -115,13 +124,113 @@ struct App {
     should_quit: bool,
     /// Channel to request a force poll
     force_poll_tx: Option<mpsc::Sender<()>>,
+    /// Channel to send write actions to the poller
+    action_tx: Option<mpsc::Sender<ActionRequest>>,
+    /// Toast notification (most recent)
+    toast: Option<Toast>,
+    /// Confirmation dialog
+    confirming: Option<ConfirmDialog>,
+    /// Sort mode for dashboard
+    sort_mode: SortMode,
+    sort_ascending: bool,
+    /// Command palette state
+    command_palette: Option<CommandPalette>,
+    /// Configurable poll interval (seconds)
+    poll_interval: u64,
+    /// Mouse enabled
+    mouse_enabled: bool,
+    /// Bell enabled
+    bell_enabled: bool,
+    /// Last bell time
+    last_bell: std::time::Instant,
+    /// Watermarks sub-tab (0=groups, 1=gates)
+    watermarks_tab: usize,
+    /// DDL overlay text
+    ddl_overlay: Option<String>,
+    /// Validate overlay text
+    validate_overlay: Option<String>,
+}
+
+/// Simple command palette for `:` mode.
+struct CommandPalette {
+    input: String,
+    suggestions: Vec<CommandSuggestion>,
+    selected_suggestion: usize,
+}
+
+struct CommandSuggestion {
+    command: String,
+    description: String,
+}
+
+impl CommandPalette {
+    fn new() -> Self {
+        Self {
+            input: String::new(),
+            suggestions: Vec::new(),
+            selected_suggestion: 0,
+        }
+    }
+
+    fn update_suggestions(&mut self, stream_table_names: &[String]) {
+        let input = self.input.to_lowercase();
+        let mut suggestions = Vec::new();
+
+        // Built-in commands
+        let commands = [
+            ("refresh", "Trigger manual refresh for a stream table"),
+            ("refresh all", "Refresh all active stream tables"),
+            ("pause", "Pause a stream table"),
+            ("resume", "Resume a paused stream table"),
+            ("repair", "Repair stream table CDC triggers"),
+            ("fuse reset", "Reset blown fuse for a stream table"),
+            ("validate", "Validate a SQL query for DVM compatibility"),
+            ("export", "Show DDL for a stream table"),
+            ("quit", "Exit pgtrickle"),
+        ];
+
+        for (cmd, desc) in &commands {
+            if cmd.contains(&input) || input.is_empty() {
+                suggestions.push(CommandSuggestion {
+                    command: cmd.to_string(),
+                    description: desc.to_string(),
+                });
+            }
+        }
+
+        // Add stream table name completions for table-specific commands
+        if input.starts_with("refresh ")
+            || input.starts_with("pause ")
+            || input.starts_with("resume ")
+            || input.starts_with("repair ")
+            || input.starts_with("export ")
+        {
+            let parts: Vec<&str> = input.splitn(2, ' ').collect();
+            let prefix = parts.get(1).unwrap_or(&"");
+            let cmd_word = parts[0];
+            suggestions.clear();
+            for name in stream_table_names {
+                if name.to_lowercase().contains(prefix) {
+                    suggestions.push(CommandSuggestion {
+                        command: format!("{cmd_word} {name}"),
+                        description: format!("→ {name}"),
+                    });
+                }
+            }
+        }
+
+        self.suggestions = suggestions;
+        if self.selected_suggestion >= self.suggestions.len() {
+            self.selected_suggestion = 0;
+        }
+    }
 }
 
 impl App {
-    fn new() -> Self {
+    fn new(poll_interval: u64, theme: Theme, mouse: bool, bell: bool) -> Self {
         Self {
             state: AppState::default(),
-            theme: Theme::default_dark(),
+            theme,
             current_view: View::Dashboard,
             selected: 0,
             show_help: false,
@@ -130,6 +239,19 @@ impl App {
             entering_filter: false,
             should_quit: false,
             force_poll_tx: None,
+            action_tx: None,
+            toast: None,
+            confirming: None,
+            sort_mode: SortMode::StatusSeverity,
+            sort_ascending: true,
+            command_palette: None,
+            poll_interval,
+            mouse_enabled: mouse,
+            bell_enabled: bell,
+            last_bell: std::time::Instant::now(),
+            watermarks_tab: 0,
+            ddl_overlay: None,
+            validate_overlay: None,
         }
     }
 
@@ -154,24 +276,52 @@ impl App {
             .collect()
     }
 
-    /// Get filtered stream tables in the same sorted order the Dashboard uses.
+    /// Get filtered stream tables in the sorted order based on current sort mode.
     fn filtered_sorted_stream_tables(&self) -> Vec<usize> {
         let mut indices = self.filtered_stream_tables();
+        let ascending = self.sort_ascending;
         indices.sort_by(|&a, &b| {
             let sa = &self.state.stream_tables[a];
             let sb = &self.state.stream_tables[b];
-            let ord = |st: &crate::state::StreamTableInfo| -> u8 {
-                if st.status == "ERROR" || st.status == "SUSPENDED" {
-                    0
-                } else if st.cascade_stale {
-                    1
-                } else if st.stale {
-                    2
-                } else {
-                    3
+            let cmp = match self.sort_mode {
+                SortMode::StatusSeverity => {
+                    let ord = |st: &crate::state::StreamTableInfo| -> u8 {
+                        if st.status == "ERROR" || st.status == "SUSPENDED" {
+                            0
+                        } else if st.cascade_stale {
+                            1
+                        } else if st.stale {
+                            2
+                        } else {
+                            3
+                        }
+                    };
+                    ord(sa).cmp(&ord(sb)).then_with(|| sa.name.cmp(&sb.name))
+                }
+                SortMode::Name => sa.name.cmp(&sb.name),
+                SortMode::AvgDuration => {
+                    let da = sa.avg_duration_ms.unwrap_or(0.0);
+                    let db = sb.avg_duration_ms.unwrap_or(0.0);
+                    db.partial_cmp(&da).unwrap_or(std::cmp::Ordering::Equal)
+                }
+                SortMode::LastRefresh => {
+                    let la = sa.last_refresh_at.as_deref().unwrap_or("");
+                    let lb = sb.last_refresh_at.as_deref().unwrap_or("");
+                    la.cmp(lb)
+                }
+                SortMode::TotalRefreshes => sb.total_refreshes.cmp(&sa.total_refreshes),
+                SortMode::Staleness => {
+                    let parse_staleness = |s: &Option<String>| -> f64 {
+                        s.as_deref()
+                            .and_then(|v| v.trim_end_matches('s').parse::<f64>().ok())
+                            .unwrap_or(0.0)
+                    };
+                    let sta = parse_staleness(&sa.staleness);
+                    let stb = parse_staleness(&sb.staleness);
+                    stb.partial_cmp(&sta).unwrap_or(std::cmp::Ordering::Equal)
                 }
             };
-            ord(sa).cmp(&ord(sb)).then_with(|| sa.name.cmp(&sb.name))
+            if ascending { cmp } else { cmp.reverse() }
         });
         indices
     }
@@ -228,12 +378,24 @@ pub async fn run(connection: &ConnectionArgs) -> Result<(), CliError> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen)?;
+
+    if connection.mouse {
+        execute!(stdout, crossterm::event::EnableMouseCapture)?;
+    }
+
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
     let result = run_app(&mut terminal, connection).await;
 
     // Restore terminal
+    if connection.mouse {
+        execute!(
+            terminal.backend_mut(),
+            crossterm::event::DisableMouseCapture
+        )
+        .ok();
+    }
     disable_raw_mode().ok();
     execute!(terminal.backend_mut(), LeaveAlternateScreen).ok();
     terminal.show_cursor().ok();
@@ -245,7 +407,16 @@ async fn run_app(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     connection: &ConnectionArgs,
 ) -> Result<(), CliError> {
-    let mut app = App::new();
+    let theme = match connection.theme {
+        ThemeChoice::Dark => Theme::default_dark(),
+        ThemeChoice::Light => Theme::light(),
+    };
+    let mut app = App::new(
+        connection.interval,
+        theme,
+        connection.mouse,
+        connection.bell,
+    );
 
     // Channel for state updates from poller
     let (tx, mut rx) = mpsc::channel::<PollMsg>(4);
@@ -254,10 +425,15 @@ async fn run_app(
     let (force_tx, force_rx) = mpsc::channel::<()>(1);
     app.force_poll_tx = Some(force_tx);
 
-    // Spawn background poller
+    // Channel for write actions (UI → poller)
+    let (action_tx, action_rx) = mpsc::channel::<ActionRequest>(8);
+    app.action_tx = Some(action_tx);
+
+    // Spawn background poller with reconnect support
     let conn_args = connection.clone();
+    let poll_interval = connection.interval;
     tokio::spawn(async move {
-        poller_task(conn_args, tx, force_rx).await;
+        poller_task(conn_args, tx, force_rx, action_rx, poll_interval).await;
     });
 
     // Spawn LISTEN/NOTIFY listener for real-time alerts
@@ -272,10 +448,14 @@ async fn run_app(
         terminal.draw(|frame| draw_ui(frame, &app))?;
 
         // Handle events with a short poll timeout so we pick up async state updates
-        if event::poll(Duration::from_millis(50))?
-            && let Event::Key(key) = event::read()?
-        {
-            handle_key(&mut app, key);
+        if event::poll(Duration::from_millis(50))? {
+            match event::read()? {
+                Event::Key(key) => handle_key(&mut app, key),
+                Event::Mouse(mouse) if app.mouse_enabled => {
+                    handle_mouse(&mut app, mouse);
+                }
+                _ => {}
+            }
         }
 
         // Drain state updates from poller
@@ -284,23 +464,61 @@ async fn run_app(
                 PollMsg::StateUpdate(new_state) => {
                     // Preserve alerts from LISTEN/NOTIFY (state polls don't include them)
                     let alerts = std::mem::take(&mut app.state.alerts);
+                    // Preserve caches
+                    let delta_sql_cache = std::mem::take(&mut app.state.delta_sql_cache);
+                    let ddl_cache = std::mem::take(&mut app.state.ddl_cache);
                     app.state = *new_state;
                     app.state.alerts = alerts;
+                    app.state.delta_sql_cache = delta_sql_cache;
+                    app.state.ddl_cache = ddl_cache;
+                    app.state.poll_interval_ms = app.poll_interval * 1000;
                     app.clamp_selection();
                 }
                 PollMsg::Error(e) => {
                     app.state.error_message = Some(e);
                     app.state.connected = false;
                 }
+                PollMsg::ActionResult(result) => {
+                    if result.success {
+                        app.toast = Some(Toast::success(&result.message));
+                    } else {
+                        app.toast = Some(Toast::error(&result.message));
+                    }
+                }
+                PollMsg::DeltaSql(name, sql) => {
+                    app.state.delta_sql_cache.insert(name, sql);
+                }
+                PollMsg::Ddl(name, ddl) => {
+                    app.state.ddl_cache.insert(name.clone(), ddl.clone());
+                    app.ddl_overlay = Some(ddl);
+                }
+                PollMsg::Reconnected => {
+                    app.toast = Some(Toast::success("Reconnected to database"));
+                }
             }
         }
 
         // Drain real-time LISTEN/NOTIFY alerts
         while let Ok(alert) = alert_rx.try_recv() {
+            // Bell on critical alerts
+            if app.bell_enabled
+                && alert.severity == "critical"
+                && app.last_bell.elapsed() > Duration::from_secs(10)
+            {
+                print!("\x07");
+                app.last_bell = std::time::Instant::now();
+            }
             app.state.alerts.push(alert);
             // Keep last 200 alerts
             if app.state.alerts.len() > 200 {
                 app.state.alerts.remove(0);
+            }
+        }
+
+        // Expire toast
+        if let Some(ref toast) = app.toast {
+            if toast.is_expired() {
+                app.toast = None;
             }
         }
 
@@ -310,55 +528,233 @@ async fn run_app(
     }
 }
 
+/// Exponential backoff for reconnect.
+struct Backoff {
+    attempt: u32,
+    max_delay_secs: u64,
+}
+
+impl Backoff {
+    fn new(max_delay_secs: u64) -> Self {
+        Self {
+            attempt: 0,
+            max_delay_secs,
+        }
+    }
+
+    fn next_delay(&mut self) -> Duration {
+        let secs = (1u64 << self.attempt.min(4)).min(self.max_delay_secs);
+        self.attempt += 1;
+        Duration::from_secs(secs)
+    }
+
+    fn reset(&mut self) {
+        self.attempt = 0;
+    }
+}
+
 async fn poller_task(
     conn_args: ConnectionArgs,
     tx: mpsc::Sender<PollMsg>,
     mut force_rx: mpsc::Receiver<()>,
+    mut action_rx: mpsc::Receiver<ActionRequest>,
+    poll_interval_secs: u64,
 ) {
-    // Try to connect; retry on failure
-    let client = loop {
-        match crate::connection::connect(&conn_args).await {
-            Ok(c) => break c,
-            Err(e) => {
-                let _ = tx.send(PollMsg::Error(format!("Connecting: {e}"))).await;
-                tokio::time::sleep(Duration::from_secs(3)).await;
-                if tx.is_closed() {
-                    return;
-                }
-            }
-        }
-    };
-
-    let mut tick = interval(Duration::from_secs(2));
+    let mut backoff = Backoff::new(15);
 
     loop {
-        // Wait for either a tick or a force poll request
-        tokio::select! {
-            _ = tick.tick() => {}
-            _ = force_rx.recv() => {}
-        }
-
-        if tx.is_closed() {
-            return;
-        }
-
-        let mut state = AppState {
-            poll_interval_ms: 2000,
-            ..AppState::default()
+        // Connect (or reconnect)
+        let client = loop {
+            match crate::connection::connect(&conn_args).await {
+                Ok(c) => {
+                    backoff.reset();
+                    break c;
+                }
+                Err(e) => {
+                    let _ = tx.send(PollMsg::Error(format!("Connecting: {e}"))).await;
+                    let delay = backoff.next_delay();
+                    tokio::time::sleep(delay).await;
+                    if tx.is_closed() {
+                        return;
+                    }
+                }
+            }
         };
-        crate::poller::poll_all(&client, &mut state).await;
 
-        if tx
-            .send(PollMsg::StateUpdate(Box::new(state)))
-            .await
-            .is_err()
-        {
+        // Signal reconnected (except first connect)
+        if backoff.attempt > 0 {
+            let _ = tx.send(PollMsg::Reconnected).await;
+        }
+
+        let mut tick = interval(Duration::from_secs(poll_interval_secs));
+
+        // Inner poll loop — breaks on connection error
+        loop {
+            tokio::select! {
+                _ = tick.tick() => {}
+                _ = force_rx.recv() => {}
+                action = action_rx.recv() => {
+                    if let Some(action) = action {
+                        let result = crate::poller::execute_action(&client, &action).await;
+                        // For fetch actions, send specialized messages
+                        match &action {
+                            ActionRequest::FetchDeltaSql(name) if result.success => {
+                                let _ = tx.send(PollMsg::DeltaSql(name.clone(), result.message)).await;
+                                continue;
+                            }
+                            ActionRequest::FetchDdl(name) if result.success => {
+                                let _ = tx.send(PollMsg::Ddl(name.clone(), result.message)).await;
+                                continue;
+                            }
+                            _ => {}
+                        }
+                        let _ = tx.send(PollMsg::ActionResult(result)).await;
+                        // Force immediate re-poll after write actions
+                        continue;
+                    }
+                }
+            }
+
+            if tx.is_closed() {
+                return;
+            }
+
+            let mut state = AppState {
+                poll_interval_ms: poll_interval_secs * 1000,
+                ..AppState::default()
+            };
+            crate::poller::poll_all(&client, &mut state).await;
+
+            // Detect connection loss
+            if state.all_polls_failed() {
+                let _ = tx.send(PollMsg::Error("Connection lost".to_string())).await;
+                break; // → outer reconnect loop
+            }
+
+            if tx
+                .send(PollMsg::StateUpdate(Box::new(state)))
+                .await
+                .is_err()
+            {
+                return;
+            }
+        }
+
+        // Backoff before reconnecting
+        let delay = backoff.next_delay();
+        tokio::time::sleep(delay).await;
+        if tx.is_closed() {
             return;
         }
     }
 }
 
 fn handle_key(app: &mut App, key: KeyEvent) {
+    // Command palette mode
+    if let Some(ref mut palette) = app.command_palette {
+        match key.code {
+            KeyCode::Esc => {
+                app.command_palette = None;
+            }
+            KeyCode::Enter => {
+                let input = palette.input.clone();
+                app.command_palette = None;
+                execute_palette_command(app, &input);
+            }
+            KeyCode::Backspace => {
+                palette.input.pop();
+                let names: Vec<String> = app
+                    .state
+                    .stream_tables
+                    .iter()
+                    .map(|s| s.name.clone())
+                    .collect();
+                palette.update_suggestions(&names);
+            }
+            KeyCode::Char(c) => {
+                palette.input.push(c);
+                let names: Vec<String> = app
+                    .state
+                    .stream_tables
+                    .iter()
+                    .map(|s| s.name.clone())
+                    .collect();
+                palette.update_suggestions(&names);
+            }
+            KeyCode::Tab => {
+                if !palette.suggestions.is_empty() {
+                    palette.input = palette.suggestions[palette.selected_suggestion]
+                        .command
+                        .clone();
+                    let names: Vec<String> = app
+                        .state
+                        .stream_tables
+                        .iter()
+                        .map(|s| s.name.clone())
+                        .collect();
+                    palette.update_suggestions(&names);
+                }
+            }
+            KeyCode::Down => {
+                if !palette.suggestions.is_empty() {
+                    palette.selected_suggestion =
+                        (palette.selected_suggestion + 1) % palette.suggestions.len();
+                }
+            }
+            KeyCode::Up => {
+                if !palette.suggestions.is_empty() {
+                    palette.selected_suggestion = palette
+                        .selected_suggestion
+                        .checked_sub(1)
+                        .unwrap_or(palette.suggestions.len() - 1);
+                }
+            }
+            _ => {}
+        }
+        return;
+    }
+
+    // Confirmation dialog mode
+    if let Some(dialog) = app.confirming.take() {
+        match key.code {
+            KeyCode::Char('y') | KeyCode::Char('Y') => {
+                if let Some(ref tx) = app.action_tx {
+                    let _ = tx.try_send(dialog.action);
+                }
+            }
+            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                app.toast = Some(Toast::info("Cancelled"));
+            }
+            _ => {
+                // Put it back — only y/n/Esc accepted
+                app.confirming = Some(dialog);
+            }
+        }
+        return;
+    }
+
+    // DDL overlay mode
+    if app.ddl_overlay.is_some() {
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => {
+                app.ddl_overlay = None;
+            }
+            _ => {}
+        }
+        return;
+    }
+
+    // Validate overlay mode
+    if app.validate_overlay.is_some() {
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => {
+                app.validate_overlay = None;
+            }
+            _ => {}
+        }
+        return;
+    }
+
     // Filter input mode
     if app.entering_filter {
         match key.code {
@@ -408,6 +804,11 @@ fn handle_key(app: &mut App, key: KeyEvent) {
             if let Some(ref tx) = app.force_poll_tx {
                 let _ = tx.try_send(());
             }
+            app.toast = Some(Toast::info("Force poll requested"));
+        }
+        KeyCode::Char('e') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            // Ctrl+E: export current view to JSON
+            export_current_view(app);
         }
         KeyCode::Char('q') => {
             app.should_quit = true;
@@ -419,6 +820,125 @@ fn handle_key(app: &mut App, key: KeyEvent) {
             app.entering_filter = true;
             app.filter_input.clear();
         }
+        KeyCode::Char(':') => {
+            // Open command palette
+            let mut palette = CommandPalette::new();
+            let names: Vec<String> = app
+                .state
+                .stream_tables
+                .iter()
+                .map(|s| s.name.clone())
+                .collect();
+            palette.update_suggestions(&names);
+            app.command_palette = Some(palette);
+        }
+
+        // ── Write actions ────────────────────────────────────────
+        KeyCode::Char('r') if matches!(app.current_view, View::Dashboard | View::Detail) => {
+            // Refresh selected stream table
+            if let Some(idx) = app.selected_stream_table_index() {
+                let name = app.state.stream_tables[idx].name.clone();
+                if let Some(ref tx) = app.action_tx {
+                    let _ = tx.try_send(ActionRequest::RefreshTable(name.clone()));
+                }
+                app.toast = Some(Toast::info(format!("Refreshing {name}…")));
+            }
+        }
+        KeyCode::Char('R') if app.current_view == View::Dashboard => {
+            // Refresh all — requires confirmation
+            let count = app.state.active_count();
+            app.confirming = Some(ConfirmDialog {
+                message: format!("Refresh all {count} active tables?"),
+                action: ActionRequest::RefreshAll,
+            });
+        }
+        KeyCode::Char('p') if matches!(app.current_view, View::Dashboard | View::Detail) => {
+            // Pause selected
+            if let Some(idx) = app.selected_stream_table_index() {
+                let name = app.state.stream_tables[idx].name.clone();
+                app.confirming = Some(ConfirmDialog {
+                    message: format!("Pause {name}?"),
+                    action: ActionRequest::PauseTable(name),
+                });
+            }
+        }
+        KeyCode::Char('P') if matches!(app.current_view, View::Dashboard | View::Detail) => {
+            // Resume selected
+            if let Some(idx) = app.selected_stream_table_index() {
+                let name = app.state.stream_tables[idx].name.clone();
+                if let Some(ref tx) = app.action_tx {
+                    let _ = tx.try_send(ActionRequest::ResumeTable(name));
+                }
+            }
+        }
+        KeyCode::Char('A') if app.current_view == View::Fuse => {
+            // Re-arm fuse for selected
+            if let Some(fuse) = app.state.fuses.get(app.selected) {
+                let name = fuse.stream_table.clone();
+                app.confirming = Some(ConfirmDialog {
+                    message: format!("Re-arm fuse for {name}?"),
+                    action: ActionRequest::ResetFuse(name, "rearm".to_string()),
+                });
+            }
+        }
+        KeyCode::Char('e') if app.current_view == View::Detail => {
+            // Export DDL overlay
+            if let Some(idx) = app.selected_stream_table_index() {
+                let name = app.state.stream_tables[idx].name.clone();
+                if let Some(ddl) = app.state.ddl_cache.get(&name) {
+                    app.ddl_overlay = Some(ddl.clone());
+                } else if let Some(ref tx) = app.action_tx {
+                    let _ = tx.try_send(ActionRequest::FetchDdl(name));
+                }
+            }
+        }
+        KeyCode::Char('g') if app.current_view == View::Watermarks && app.watermarks_tab == 1 => {
+            // Gate/ungate source
+            if let Some(gate) = app.state.source_gates.get(app.selected) {
+                let source = gate.source_table.clone();
+                if gate.gated {
+                    // Ungate — no confirmation needed
+                    if let Some(ref tx) = app.action_tx {
+                        let _ = tx.try_send(ActionRequest::UngateSource(source));
+                    }
+                } else {
+                    // Gate — requires confirmation
+                    app.confirming = Some(ConfirmDialog {
+                        message: format!(
+                            "Gate source {source}? This will block downstream refreshes."
+                        ),
+                        action: ActionRequest::GateSource(source),
+                    });
+                }
+            }
+        }
+
+        // ── Sort ─────────────────────────────────────────────────
+        KeyCode::Char('s') if app.current_view == View::Dashboard => {
+            app.sort_mode = app.sort_mode.next();
+            app.toast = Some(Toast::info(format!("Sort: {}", app.sort_mode.label())));
+        }
+        KeyCode::Char('S') if app.current_view == View::Dashboard => {
+            app.sort_ascending = !app.sort_ascending;
+            let dir = if app.sort_ascending { "▲" } else { "▼" };
+            app.toast = Some(Toast::info(format!("Sort direction: {dir}")));
+        }
+
+        // ── Theme toggle ─────────────────────────────────────────
+        KeyCode::Char('t') => {
+            app.theme = if app.theme.name == "dark" {
+                Theme::light()
+            } else {
+                Theme::default_dark()
+            };
+        }
+
+        // ── Watermarks sub-tab ───────────────────────────────────
+        KeyCode::Tab if app.current_view == View::Watermarks => {
+            app.watermarks_tab = (app.watermarks_tab + 1) % 2;
+            app.selected = 0;
+        }
+
         // View switching via number keys
         KeyCode::Char('1') => switch_view(app, View::Dashboard),
         KeyCode::Char('2') => switch_view(app, View::Detail),
@@ -440,6 +960,16 @@ fn handle_key(app: &mut App, key: KeyEvent) {
         // Navigation
         KeyCode::Char('j') | KeyCode::Down => app.move_down(),
         KeyCode::Char('k') | KeyCode::Up => app.move_up(),
+        KeyCode::PageDown => {
+            for _ in 0..20 {
+                app.move_down();
+            }
+        }
+        KeyCode::PageUp => {
+            for _ in 0..20 {
+                app.move_up();
+            }
+        }
         KeyCode::Enter => {
             // Drill from dashboard to detail
             if app.current_view == View::Dashboard {
@@ -461,6 +991,144 @@ fn handle_key(app: &mut App, key: KeyEvent) {
             }
         }
         _ => {}
+    }
+}
+
+fn handle_mouse(app: &mut App, mouse: crossterm::event::MouseEvent) {
+    use crossterm::event::MouseEventKind;
+    match mouse.kind {
+        MouseEventKind::ScrollDown => app.move_down(),
+        MouseEventKind::ScrollUp => app.move_up(),
+        _ => {}
+    }
+}
+
+fn execute_palette_command(app: &mut App, input: &str) {
+    let parts: Vec<&str> = input.trim().splitn(2, ' ').collect();
+    let cmd = parts.first().map(|s| s.to_lowercase()).unwrap_or_default();
+    let arg = parts.get(1).map(|s| s.trim().to_string());
+
+    match cmd.as_str() {
+        "quit" | "q" => {
+            app.should_quit = true;
+        }
+        "refresh" => {
+            if let Some(name) = arg {
+                if name == "all" {
+                    let count = app.state.active_count();
+                    app.confirming = Some(ConfirmDialog {
+                        message: format!("Refresh all {count} active tables?"),
+                        action: ActionRequest::RefreshAll,
+                    });
+                } else if let Some(ref tx) = app.action_tx {
+                    let _ = tx.try_send(ActionRequest::RefreshTable(name.clone()));
+                    app.toast = Some(Toast::info(format!("Refreshing {name}…")));
+                }
+            } else {
+                app.toast = Some(Toast::error("Usage: refresh <name> or refresh all"));
+            }
+        }
+        "pause" => {
+            if let Some(name) = arg {
+                app.confirming = Some(ConfirmDialog {
+                    message: format!("Pause {name}?"),
+                    action: ActionRequest::PauseTable(name),
+                });
+            } else {
+                app.toast = Some(Toast::error("Usage: pause <name>"));
+            }
+        }
+        "resume" => {
+            if let Some(name) = arg {
+                if let Some(ref tx) = app.action_tx {
+                    let _ = tx.try_send(ActionRequest::ResumeTable(name));
+                }
+            } else {
+                app.toast = Some(Toast::error("Usage: resume <name>"));
+            }
+        }
+        "repair" => {
+            if let Some(name) = arg {
+                app.confirming = Some(ConfirmDialog {
+                    message: format!("Repair CDC triggers for {name}?"),
+                    action: ActionRequest::RepairTable(name),
+                });
+            } else {
+                app.toast = Some(Toast::error("Usage: repair <name>"));
+            }
+        }
+        "fuse" => {
+            // fuse reset <name>
+            if let Some(rest) = arg {
+                let fuse_parts: Vec<&str> = rest.splitn(2, ' ').collect();
+                if fuse_parts.first().map(|s| *s == "reset").unwrap_or(false) {
+                    if let Some(name) = fuse_parts.get(1) {
+                        app.confirming = Some(ConfirmDialog {
+                            message: format!("Reset fuse for {name}?"),
+                            action: ActionRequest::ResetFuse(name.to_string(), "rearm".to_string()),
+                        });
+                    } else {
+                        app.toast = Some(Toast::error("Usage: fuse reset <name>"));
+                    }
+                }
+            }
+        }
+        "export" => {
+            if let Some(name) = arg {
+                if let Some(ref tx) = app.action_tx {
+                    let _ = tx.try_send(ActionRequest::FetchDdl(name));
+                }
+            } else {
+                app.toast = Some(Toast::error("Usage: export <name>"));
+            }
+        }
+        "validate" => {
+            if let Some(query) = arg {
+                if let Some(ref tx) = app.action_tx {
+                    let _ = tx.try_send(ActionRequest::ValidateQuery(query));
+                }
+            } else {
+                app.toast = Some(Toast::error("Usage: validate <SQL query>"));
+            }
+        }
+        _ => {
+            app.toast = Some(Toast::error(format!("Unknown command: {cmd}")));
+        }
+    }
+}
+
+fn export_current_view(app: &mut App) {
+    let json = match app.current_view {
+        View::Dashboard => serde_json::to_string_pretty(&app.state.stream_tables),
+        View::Health => serde_json::to_string_pretty(&app.state.health_checks),
+        View::Cdc => serde_json::to_string_pretty(&app.state.cdc_buffers),
+        View::Config => serde_json::to_string_pretty(&app.state.guc_params),
+        View::Diagnostics => serde_json::to_string_pretty(&app.state.diagnostics),
+        View::Workers => serde_json::to_string_pretty(&app.state.workers),
+        View::Fuse => serde_json::to_string_pretty(&app.state.fuses),
+        View::Watermarks => serde_json::to_string_pretty(&app.state.watermark_groups),
+        _ => {
+            app.toast = Some(Toast::info("Export not available for this view"));
+            return;
+        }
+    };
+
+    match json {
+        Ok(data) => {
+            let ts = chrono::Utc::now().format("%Y%m%d_%H%M%S");
+            let path = format!("/tmp/pgtrickle_export_{ts}.json");
+            match std::fs::write(&path, &data) {
+                Ok(()) => {
+                    app.toast = Some(Toast::success(format!("Exported to {path}")));
+                }
+                Err(e) => {
+                    app.toast = Some(Toast::error(format!("Export failed: {e}")));
+                }
+            }
+        }
+        Err(e) => {
+            app.toast = Some(Toast::error(format!("Serialization error: {e}")));
+        }
     }
 }
 
@@ -502,6 +1170,69 @@ fn draw_ui(frame: &mut ratatui::Frame, app: &App) {
         frame.render_widget(ratatui::widgets::Clear, overlay);
         views::help::render(frame, overlay, &app.theme, app.current_view);
     }
+
+    // Command palette overlay
+    if let Some(ref palette) = app.command_palette {
+        let palette_height = (palette.suggestions.len() as u16 + 2).min(8);
+        let palette_area = Rect {
+            x: size.x + 1,
+            y: size.height.saturating_sub(palette_height + 1),
+            width: size.width.saturating_sub(2),
+            height: palette_height,
+        };
+        frame.render_widget(ratatui::widgets::Clear, palette_area);
+
+        let mut lines = vec![Line::from(vec![
+            Span::styled(" : ", app.theme.title),
+            Span::raw(&palette.input),
+            Span::styled("█", app.theme.title),
+        ])];
+
+        for (i, suggestion) in palette.suggestions.iter().take(6).enumerate() {
+            let style = if i == palette.selected_suggestion {
+                app.theme.selected
+            } else {
+                app.theme.dim
+            };
+            let prefix = if i == palette.selected_suggestion {
+                "▸ "
+            } else {
+                "  "
+            };
+            lines.push(Line::from(vec![
+                Span::styled(prefix, style),
+                Span::styled(&suggestion.command, style),
+                Span::styled(format!("  {}", suggestion.description), app.theme.dim),
+            ]));
+        }
+
+        let block = ratatui::widgets::Block::default()
+            .borders(ratatui::widgets::Borders::ALL)
+            .border_style(app.theme.border);
+        frame.render_widget(Paragraph::new(lines).block(block), palette_area);
+    }
+
+    // DDL overlay
+    if let Some(ref ddl) = app.ddl_overlay {
+        let overlay = centered_rect(80, 80, size);
+        frame.render_widget(ratatui::widgets::Clear, overlay);
+        let block = ratatui::widgets::Block::default()
+            .title(" Export DDL (Esc to close) ")
+            .borders(ratatui::widgets::Borders::ALL)
+            .border_style(app.theme.border);
+        frame.render_widget(Paragraph::new(ddl.as_str()).block(block), overlay);
+    }
+
+    // Validate overlay
+    if let Some(ref results) = app.validate_overlay {
+        let overlay = centered_rect(80, 60, size);
+        frame.render_widget(ratatui::widgets::Clear, overlay);
+        let block = ratatui::widgets::Block::default()
+            .title(" Query Validation (Esc to close) ")
+            .borders(ratatui::widgets::Borders::ALL)
+            .border_style(app.theme.border);
+        frame.render_widget(Paragraph::new(results.as_str()).block(block), overlay);
+    }
 }
 
 fn draw_header(frame: &mut ratatui::Frame, area: Rect, app: &App) {
@@ -537,12 +1268,24 @@ fn draw_header(frame: &mut ratatui::Frame, area: Rect, app: &App) {
         Span::raw("")
     };
 
+    // Scheduler indicator from quick_health
+    let scheduler_span = match &app.state.quick_health {
+        Some(qh) if qh.scheduler_running => Span::styled(" ⚙ scheduler ", app.theme.active),
+        Some(_) => Span::styled(" ✗ scheduler stopped ", app.theme.error),
+        None => Span::raw(""),
+    };
+
+    // Poll interval indicator
+    let interval_span = Span::styled(format!(" ⏱ {}s ", app.poll_interval), app.theme.dim);
+
     let header = Line::from(vec![
         Span::styled(" pg_trickle ", app.theme.title),
         view_label,
         Span::raw(" "),
         conn_status,
         Span::raw(" "),
+        scheduler_span,
+        interval_span,
         issue_badge,
         Span::raw(" "),
         right,
@@ -619,6 +1362,32 @@ fn render_view(frame: &mut ratatui::Frame, area: Rect, app: &App) {
 }
 
 fn draw_footer(frame: &mut ratatui::Frame, area: Rect, app: &App) {
+    // Confirmation dialog takes priority
+    if let Some(ref dialog) = app.confirming {
+        let line = Line::from(vec![
+            Span::styled(" ⚠ ", app.theme.warning),
+            Span::styled(&dialog.message, app.theme.warning),
+            Span::styled(" [y/n] ", app.theme.title),
+        ]);
+        frame.render_widget(Paragraph::new(line), area);
+        return;
+    }
+
+    // Toast takes priority over normal footer
+    if let Some(ref toast) = app.toast {
+        let (icon, style) = match toast.style {
+            ToastStyle::Success => ("✓ ", app.theme.active),
+            ToastStyle::Error => ("✗ ", app.theme.error),
+            ToastStyle::Info => ("● ", Style::default().fg(Color::Cyan)),
+        };
+        let line = Line::from(vec![
+            Span::styled(format!(" {icon}"), style),
+            Span::styled(&toast.message, style),
+        ]);
+        frame.render_widget(Paragraph::new(line), area);
+        return;
+    }
+
     let mut spans = vec![];
 
     if app.entering_filter {
@@ -791,7 +1560,7 @@ mod tests {
     }
 
     fn app_with_data() -> App {
-        let mut app = App::new();
+        let mut app = App::new(2, Theme::default_dark(), false, false);
         app.state = test_fixtures::sample_state();
         app
     }
@@ -800,104 +1569,104 @@ mod tests {
 
     #[test]
     fn test_initial_view_is_dashboard() {
-        let app = App::new();
+        let app = App::new(2, Theme::default_dark(), false, false);
         assert_eq!(app.current_view, View::Dashboard);
     }
 
     #[test]
     fn test_switch_to_detail_via_key_2() {
-        let mut app = App::new();
+        let mut app = App::new(2, Theme::default_dark(), false, false);
         handle_key(&mut app, key(KeyCode::Char('2')));
         assert_eq!(app.current_view, View::Detail);
     }
 
     #[test]
     fn test_switch_to_graph_via_key_3() {
-        let mut app = App::new();
+        let mut app = App::new(2, Theme::default_dark(), false, false);
         handle_key(&mut app, key(KeyCode::Char('3')));
         assert_eq!(app.current_view, View::Graph);
     }
 
     #[test]
     fn test_switch_to_refresh_log_via_key_4() {
-        let mut app = App::new();
+        let mut app = App::new(2, Theme::default_dark(), false, false);
         handle_key(&mut app, key(KeyCode::Char('4')));
         assert_eq!(app.current_view, View::RefreshLog);
     }
 
     #[test]
     fn test_switch_to_diagnostics_via_key_5() {
-        let mut app = App::new();
+        let mut app = App::new(2, Theme::default_dark(), false, false);
         handle_key(&mut app, key(KeyCode::Char('5')));
         assert_eq!(app.current_view, View::Diagnostics);
     }
 
     #[test]
     fn test_switch_to_cdc_via_key_6() {
-        let mut app = App::new();
+        let mut app = App::new(2, Theme::default_dark(), false, false);
         handle_key(&mut app, key(KeyCode::Char('6')));
         assert_eq!(app.current_view, View::Cdc);
     }
 
     #[test]
     fn test_switch_to_config_via_key_7() {
-        let mut app = App::new();
+        let mut app = App::new(2, Theme::default_dark(), false, false);
         handle_key(&mut app, key(KeyCode::Char('7')));
         assert_eq!(app.current_view, View::Config);
     }
 
     #[test]
     fn test_switch_to_health_via_key_8() {
-        let mut app = App::new();
+        let mut app = App::new(2, Theme::default_dark(), false, false);
         handle_key(&mut app, key(KeyCode::Char('8')));
         assert_eq!(app.current_view, View::Health);
     }
 
     #[test]
     fn test_switch_to_alerts_via_key_9() {
-        let mut app = App::new();
+        let mut app = App::new(2, Theme::default_dark(), false, false);
         handle_key(&mut app, key(KeyCode::Char('9')));
         assert_eq!(app.current_view, View::Alerts);
     }
 
     #[test]
     fn test_switch_to_workers_via_w() {
-        let mut app = App::new();
+        let mut app = App::new(2, Theme::default_dark(), false, false);
         handle_key(&mut app, key(KeyCode::Char('w')));
         assert_eq!(app.current_view, View::Workers);
     }
 
     #[test]
     fn test_switch_to_fuse_via_f() {
-        let mut app = App::new();
+        let mut app = App::new(2, Theme::default_dark(), false, false);
         handle_key(&mut app, key(KeyCode::Char('f')));
         assert_eq!(app.current_view, View::Fuse);
     }
 
     #[test]
     fn test_switch_to_watermarks_via_m() {
-        let mut app = App::new();
+        let mut app = App::new(2, Theme::default_dark(), false, false);
         handle_key(&mut app, key(KeyCode::Char('m')));
         assert_eq!(app.current_view, View::Watermarks);
     }
 
     #[test]
     fn test_switch_to_delta_inspector_via_d() {
-        let mut app = App::new();
+        let mut app = App::new(2, Theme::default_dark(), false, false);
         handle_key(&mut app, key(KeyCode::Char('d')));
         assert_eq!(app.current_view, View::DeltaInspector);
     }
 
     #[test]
     fn test_switch_to_graph_via_g() {
-        let mut app = App::new();
+        let mut app = App::new(2, Theme::default_dark(), false, false);
         handle_key(&mut app, key(KeyCode::Char('g')));
         assert_eq!(app.current_view, View::Graph);
     }
 
     #[test]
     fn test_switch_to_issues_via_i() {
-        let mut app = App::new();
+        let mut app = App::new(2, Theme::default_dark(), false, false);
         handle_key(&mut app, key(KeyCode::Char('i')));
         assert_eq!(app.current_view, View::Issues);
     }
@@ -906,7 +1675,7 @@ mod tests {
 
     #[test]
     fn test_esc_returns_to_dashboard() {
-        let mut app = App::new();
+        let mut app = App::new(2, Theme::default_dark(), false, false);
         handle_key(&mut app, key(KeyCode::Char('5')));
         assert_eq!(app.current_view, View::Diagnostics);
         handle_key(&mut app, key(KeyCode::Esc));
@@ -915,7 +1684,7 @@ mod tests {
 
     #[test]
     fn test_esc_clears_filter() {
-        let mut app = App::new();
+        let mut app = App::new(2, Theme::default_dark(), false, false);
         app.filter = Some("test".to_string());
         handle_key(&mut app, key(KeyCode::Esc));
         assert!(app.filter.is_none());
@@ -925,14 +1694,14 @@ mod tests {
 
     #[test]
     fn test_enter_drills_to_detail() {
-        let mut app = App::new();
+        let mut app = App::new(2, Theme::default_dark(), false, false);
         handle_key(&mut app, key(KeyCode::Enter));
         assert_eq!(app.current_view, View::Detail);
     }
 
     #[test]
     fn test_enter_does_nothing_on_detail() {
-        let mut app = App::new();
+        let mut app = App::new(2, Theme::default_dark(), false, false);
         app.current_view = View::Detail;
         handle_key(&mut app, key(KeyCode::Enter));
         assert_eq!(app.current_view, View::Detail);
@@ -1008,14 +1777,14 @@ mod tests {
 
     #[test]
     fn test_quit_via_q() {
-        let mut app = App::new();
+        let mut app = App::new(2, Theme::default_dark(), false, false);
         handle_key(&mut app, key(KeyCode::Char('q')));
         assert!(app.should_quit);
     }
 
     #[test]
     fn test_quit_via_ctrl_c() {
-        let mut app = App::new();
+        let mut app = App::new(2, Theme::default_dark(), false, false);
         handle_key(&mut app, ctrl_key(KeyCode::Char('c')));
         assert!(app.should_quit);
     }
@@ -1024,14 +1793,14 @@ mod tests {
 
     #[test]
     fn test_slash_enters_filter_mode() {
-        let mut app = App::new();
+        let mut app = App::new(2, Theme::default_dark(), false, false);
         handle_key(&mut app, key(KeyCode::Char('/')));
         assert!(app.entering_filter);
     }
 
     #[test]
     fn test_filter_input_accepts_chars() {
-        let mut app = App::new();
+        let mut app = App::new(2, Theme::default_dark(), false, false);
         handle_key(&mut app, key(KeyCode::Char('/')));
         handle_key(&mut app, key(KeyCode::Char('o')));
         handle_key(&mut app, key(KeyCode::Char('r')));
@@ -1041,7 +1810,7 @@ mod tests {
 
     #[test]
     fn test_filter_backspace() {
-        let mut app = App::new();
+        let mut app = App::new(2, Theme::default_dark(), false, false);
         handle_key(&mut app, key(KeyCode::Char('/')));
         handle_key(&mut app, key(KeyCode::Char('a')));
         handle_key(&mut app, key(KeyCode::Char('b')));
@@ -1051,7 +1820,7 @@ mod tests {
 
     #[test]
     fn test_filter_enter_applies_filter() {
-        let mut app = App::new();
+        let mut app = App::new(2, Theme::default_dark(), false, false);
         handle_key(&mut app, key(KeyCode::Char('/')));
         handle_key(&mut app, key(KeyCode::Char('t')));
         handle_key(&mut app, key(KeyCode::Char('e')));
@@ -1062,7 +1831,7 @@ mod tests {
 
     #[test]
     fn test_filter_enter_empty_clears_filter() {
-        let mut app = App::new();
+        let mut app = App::new(2, Theme::default_dark(), false, false);
         app.filter = Some("old".to_string());
         handle_key(&mut app, key(KeyCode::Char('/')));
         handle_key(&mut app, key(KeyCode::Enter));
@@ -1072,7 +1841,7 @@ mod tests {
 
     #[test]
     fn test_filter_esc_cancels() {
-        let mut app = App::new();
+        let mut app = App::new(2, Theme::default_dark(), false, false);
         handle_key(&mut app, key(KeyCode::Char('/')));
         handle_key(&mut app, key(KeyCode::Char('x')));
         handle_key(&mut app, key(KeyCode::Esc));
@@ -1083,7 +1852,7 @@ mod tests {
 
     #[test]
     fn test_filter_mode_ignores_view_keys() {
-        let mut app = App::new();
+        let mut app = App::new(2, Theme::default_dark(), false, false);
         handle_key(&mut app, key(KeyCode::Char('/')));
         handle_key(&mut app, key(KeyCode::Char('5')));
         // Should type '5' into filter, not switch to diagnostics
@@ -1096,7 +1865,7 @@ mod tests {
 
     #[test]
     fn test_help_toggle() {
-        let mut app = App::new();
+        let mut app = App::new(2, Theme::default_dark(), false, false);
         assert!(!app.show_help);
         handle_key(&mut app, key(KeyCode::Char('?')));
         assert!(app.show_help);
@@ -1104,7 +1873,7 @@ mod tests {
 
     #[test]
     fn test_help_dismiss_via_question_mark() {
-        let mut app = App::new();
+        let mut app = App::new(2, Theme::default_dark(), false, false);
         app.show_help = true;
         handle_key(&mut app, key(KeyCode::Char('?')));
         assert!(!app.show_help);
@@ -1112,7 +1881,7 @@ mod tests {
 
     #[test]
     fn test_help_dismiss_via_esc() {
-        let mut app = App::new();
+        let mut app = App::new(2, Theme::default_dark(), false, false);
         app.show_help = true;
         handle_key(&mut app, key(KeyCode::Esc));
         assert!(!app.show_help);
@@ -1120,7 +1889,7 @@ mod tests {
 
     #[test]
     fn test_help_dismiss_via_q() {
-        let mut app = App::new();
+        let mut app = App::new(2, Theme::default_dark(), false, false);
         app.show_help = true;
         handle_key(&mut app, key(KeyCode::Char('q')));
         assert!(!app.show_help);
@@ -1130,7 +1899,7 @@ mod tests {
 
     #[test]
     fn test_help_mode_ignores_view_keys() {
-        let mut app = App::new();
+        let mut app = App::new(2, Theme::default_dark(), false, false);
         app.show_help = true;
         handle_key(&mut app, key(KeyCode::Char('5')));
         assert_eq!(app.current_view, View::Dashboard);
@@ -1222,7 +1991,7 @@ mod tests {
 
     #[test]
     fn test_clamp_selection_empty() {
-        let mut app = App::new();
+        let mut app = App::new(2, Theme::default_dark(), false, false);
         app.selected = 5;
         app.clamp_selection();
         assert_eq!(app.selected, 0);

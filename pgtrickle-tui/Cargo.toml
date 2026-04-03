@@ -27,6 +27,16 @@ thiserror = "2"
 chrono = { version = "0.4", features = ["serde"] }
 futures-util = "0.3"
 
+# TLS support (optional, behind "tls" feature)
+tokio-postgres-rustls = { version = "0.13", optional = true }
+rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"], optional = true }
+rustls-pemfile = { version = "2", optional = true }
+webpki-roots = { version = "0.26", optional = true }
+
+[features]
+default = []
+tls = ["tokio-postgres-rustls", "rustls", "rustls-pemfile", "webpki-roots"]
+
 [dev-dependencies]
 insta = "1"
 testcontainers = "0.27"
