@@ -6,7 +6,14 @@ use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table};
 use crate::state::AppState;
 use crate::theme::Theme;
 
-pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme, selected: usize) {
+pub fn render(
+    frame: &mut Frame,
+    area: Rect,
+    state: &AppState,
+    theme: &Theme,
+    selected: usize,
+    filter: Option<&str>,
+) {
     let has_selection = !state.fuses.is_empty();
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -17,14 +24,22 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme, se
         })
         .split(area);
 
-    render_table(frame, chunks[0], state, theme, selected);
+    render_table(frame, chunks[0], state, theme, selected, filter);
 
     if has_selection && chunks.len() > 1 {
         render_detail(frame, chunks[1], state, theme, selected);
     }
 }
 
-fn render_table(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme, selected: usize) {
+fn render_table(
+    frame: &mut Frame,
+    area: Rect,
+    state: &AppState,
+    theme: &Theme,
+    selected: usize,
+    filter: Option<&str>,
+) {
+    let f = filter.unwrap_or("").to_lowercase();
     let header = Row::new(vec![
         "Stream Table",
         "Fuse State",
@@ -38,25 +53,26 @@ fn render_table(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme, 
     let rows: Vec<Row> = state
         .fuses
         .iter()
+        .filter(|fuse| f.is_empty() || fuse.stream_table.to_lowercase().contains(&f))
         .enumerate()
-        .map(|(i, f)| {
-            let state_style = match f.fuse_state.as_str() {
+        .map(|(i, fuse)| {
+            let state_style = match fuse.fuse_state.as_str() {
                 "BLOWN" => theme.error,
                 "TRIPPED" => theme.warning,
                 "OK" | "HEALTHY" => theme.active,
                 _ => theme.dim,
             };
-            let icon = match f.fuse_state.as_str() {
+            let icon = match fuse.fuse_state.as_str() {
                 "BLOWN" => "✗",
                 "TRIPPED" => "⚠",
                 _ => "✓",
             };
             let row = Row::new(vec![
-                Cell::from(f.stream_table.as_str()),
-                Cell::from(format!("{icon} {}", f.fuse_state)).style(state_style),
-                Cell::from(format!("{}", f.consecutive_errors)),
-                Cell::from(f.last_error.as_deref().unwrap_or("-")),
-                Cell::from(f.blown_at.as_deref().unwrap_or("-")),
+                Cell::from(fuse.stream_table.as_str()),
+                Cell::from(format!("{icon} {}", fuse.fuse_state)).style(state_style),
+                Cell::from(format!("{}", fuse.consecutive_errors)),
+                Cell::from(fuse.last_error.as_deref().unwrap_or("-")),
+                Cell::from(fuse.blown_at.as_deref().unwrap_or("-")),
             ]);
             if i == selected {
                 row.style(theme.selected)

@@ -6,7 +6,14 @@ use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table};
 use crate::state::AppState;
 use crate::theme::Theme;
 
-pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme, selected: usize) {
+pub fn render(
+    frame: &mut Frame,
+    area: Rect,
+    state: &AppState,
+    theme: &Theme,
+    selected: usize,
+    filter: Option<&str>,
+) {
     // If a row is selected and has signals, show signal breakdown below
     let has_signals = state
         .diagnostics
@@ -19,14 +26,22 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme, se
             .direction(Direction::Vertical)
             .constraints([Constraint::Min(8), Constraint::Length(12)])
             .split(area);
-        render_table(frame, chunks[0], state, theme, selected);
+        render_table(frame, chunks[0], state, theme, selected, filter);
         render_signal_breakdown(frame, chunks[1], state, theme, selected);
     } else {
-        render_table(frame, area, state, theme, selected);
+        render_table(frame, area, state, theme, selected, filter);
     }
 }
 
-fn render_table(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme, selected: usize) {
+fn render_table(
+    frame: &mut Frame,
+    area: Rect,
+    state: &AppState,
+    theme: &Theme,
+    selected: usize,
+    filter: Option<&str>,
+) {
+    let f = filter.unwrap_or("").to_lowercase();
     let header = Row::new(
         [
             "Schema",
@@ -44,6 +59,11 @@ fn render_table(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme, 
     let rows: Vec<Row> = state
         .diagnostics
         .iter()
+        .filter(|d| {
+            f.is_empty()
+                || d.name.to_lowercase().contains(&f)
+                || d.schema.to_lowercase().contains(&f)
+        })
         .enumerate()
         .map(|(i, d)| {
             let rec_style = match d.recommended_mode.as_str() {

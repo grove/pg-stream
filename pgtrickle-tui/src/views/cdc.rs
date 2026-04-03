@@ -6,7 +6,14 @@ use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table};
 use crate::state::AppState;
 use crate::theme::Theme;
 
-pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme, selected: usize) {
+pub fn render(
+    frame: &mut Frame,
+    area: Rect,
+    state: &AppState,
+    theme: &Theme,
+    selected: usize,
+    filter: Option<&str>,
+) {
     // Decide layout based on whether we have CDC health or dedup data
     let has_health = !state.cdc_health.is_empty();
     let has_dedup = state.dedup_stats.is_some();
@@ -29,7 +36,7 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme, se
             .split(area);
 
         let mut idx = 0;
-        render_buffers(frame, chunks[idx], state, theme, selected);
+        render_buffers(frame, chunks[idx], state, theme, selected, filter);
         idx += 1;
         if has_health {
             render_cdc_health(frame, chunks[idx], state, theme);
@@ -58,12 +65,20 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme, se
             .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
             .split(area);
 
-        render_buffers(frame, chunks[0], state, theme, selected);
+        render_buffers(frame, chunks[0], state, theme, selected, filter);
         render_triggers(frame, chunks[1], state, theme);
     }
 }
 
-fn render_buffers(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme, selected: usize) {
+fn render_buffers(
+    frame: &mut Frame,
+    area: Rect,
+    state: &AppState,
+    theme: &Theme,
+    selected: usize,
+    filter: Option<&str>,
+) {
+    let f = filter.unwrap_or("").to_lowercase();
     let header = Row::new(
         [
             "Stream Table",
@@ -80,6 +95,11 @@ fn render_buffers(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme
     let rows: Vec<Row> = state
         .cdc_buffers
         .iter()
+        .filter(|buf| {
+            f.is_empty()
+                || buf.stream_table.to_lowercase().contains(&f)
+                || buf.source_table.to_lowercase().contains(&f)
+        })
         .enumerate()
         .map(|(i, buf)| {
             let size_style = if buf.buffer_bytes > 10_000_000 {

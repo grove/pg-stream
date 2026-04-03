@@ -6,7 +6,14 @@ use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table};
 use crate::state::AppState;
 use crate::theme::Theme;
 
-pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme, selected: usize) {
+pub fn render(
+    frame: &mut Frame,
+    area: Rect,
+    state: &AppState,
+    theme: &Theme,
+    selected: usize,
+    filter: Option<&str>,
+) {
     if state.issues.is_empty() {
         let block = Block::default()
             .borders(Borders::ALL)
@@ -25,7 +32,7 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme, se
         .split(area);
 
     render_summary(frame, chunks[0], state, theme);
-    render_table(frame, chunks[1], state, theme, selected);
+    render_table(frame, chunks[1], state, theme, selected, filter);
 }
 
 fn render_summary(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
@@ -69,7 +76,15 @@ fn render_summary(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme
     frame.render_widget(Paragraph::new(line).block(block), area);
 }
 
-fn render_table(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme, selected: usize) {
+fn render_table(
+    frame: &mut Frame,
+    area: Rect,
+    state: &AppState,
+    theme: &Theme,
+    selected: usize,
+    filter: Option<&str>,
+) {
+    let f = filter.unwrap_or("").to_lowercase();
     let header = Row::new(vec!["Sev", "Category", "Table", "Summary", "Blast"])
         .style(theme.header)
         .bottom_margin(1);
@@ -77,6 +92,17 @@ fn render_table(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme, 
     let rows: Vec<Row> = state
         .issues
         .iter()
+        .filter(|issue| {
+            f.is_empty()
+                || issue
+                    .affected_table
+                    .as_deref()
+                    .unwrap_or("")
+                    .to_lowercase()
+                    .contains(&f)
+                || issue.category.to_lowercase().contains(&f)
+                || issue.summary.to_lowercase().contains(&f)
+        })
         .enumerate()
         .map(|(i, issue)| {
             let (icon, sev_style) = match issue.severity.as_str() {

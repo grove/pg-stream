@@ -6,17 +6,32 @@ use ratatui::widgets::{Block, Borders, Cell, Row, Table};
 use crate::state::AppState;
 use crate::theme::Theme;
 
-pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme, selected: usize) {
+pub fn render(
+    frame: &mut Frame,
+    area: Rect,
+    state: &AppState,
+    theme: &Theme,
+    selected: usize,
+    filter: Option<&str>,
+) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
         .split(area);
 
-    render_workers(frame, chunks[0], state, theme, selected);
+    render_workers(frame, chunks[0], state, theme, selected, filter);
     render_job_queue(frame, chunks[1], state, theme);
 }
 
-fn render_workers(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme, selected: usize) {
+fn render_workers(
+    frame: &mut Frame,
+    area: Rect,
+    state: &AppState,
+    theme: &Theme,
+    selected: usize,
+    filter: Option<&str>,
+) {
+    let f = filter.unwrap_or("").to_lowercase();
     let header = Row::new(vec!["Worker", "State", "Table", "Started", "Duration"])
         .style(theme.header)
         .bottom_margin(1);
@@ -24,6 +39,13 @@ fn render_workers(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme
     let rows: Vec<Row> = state
         .workers
         .iter()
+        .filter(|w| {
+            f.is_empty()
+                || w.table_name
+                    .as_deref()
+                    .is_some_and(|n| n.to_lowercase().contains(&f))
+                || w.state.to_lowercase().contains(&f)
+        })
         .enumerate()
         .map(|(i, w)| {
             let state_style = match w.state.as_str() {

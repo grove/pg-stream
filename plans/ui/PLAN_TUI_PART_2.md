@@ -32,7 +32,7 @@ not just observe them.
 | TLS support (`--sslmode`) | P1 | ✅ Implemented (behind `tls` feature flag) |
 | Sort column cycling (`s`/`S`) | P2 | ✅ Implemented |
 | Inline delta SQL fetch | P2 | ✅ Implemented (action + cache + inline view) |
-| Cross-view filter persistence | P2 | Partial (Dashboard/Detail/DeltaInspector) |
+| Cross-view filter persistence | P2 | ✅ Implemented (all 10 list views) |
 | Toast / flash messages | P2 | ✅ Implemented |
 | Parallel polling | P2 | ✅ Implemented (tokio::join! for all 17 queries) |
 | Mouse support (`--mouse`) | P3 | ✅ Implemented (scroll wheel) |

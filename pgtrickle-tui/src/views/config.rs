@@ -6,7 +6,15 @@ use ratatui::widgets::{Block, Borders, Cell, Row, Table};
 use crate::state::AppState;
 use crate::theme::Theme;
 
-pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme, selected: usize) {
+pub fn render(
+    frame: &mut Frame,
+    area: Rect,
+    state: &AppState,
+    theme: &Theme,
+    selected: usize,
+    filter: Option<&str>,
+) {
+    let f = filter.unwrap_or("").to_lowercase();
     let header = Row::new(
         ["Parameter", "Value", "Unit", "Description"]
             .iter()
@@ -17,6 +25,11 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme, se
     let rows: Vec<Row> = state
         .guc_params
         .iter()
+        .filter(|g| {
+            f.is_empty()
+                || g.name.to_lowercase().contains(&f)
+                || g.short_desc.to_lowercase().contains(&f)
+        })
         .enumerate()
         .map(|(i, g)| {
             let style = if i == selected {

@@ -192,7 +192,7 @@ mod snapshot_tests {
     #[test]
     fn test_refresh_log_view() {
         let output = render_to_string(80, 24, |frame, area, state, theme| {
-            super::refresh_log::render(frame, area, state, theme, 0);
+            super::refresh_log::render(frame, area, state, theme, 0, None);
         });
         insta::assert_snapshot!(output);
     }
@@ -202,7 +202,7 @@ mod snapshot_tests {
     #[test]
     fn test_diagnostics_view() {
         let output = render_to_string(100, 24, |frame, area, state, theme| {
-            super::diagnostics::render(frame, area, state, theme, 0);
+            super::diagnostics::render(frame, area, state, theme, 0, None);
         });
         insta::assert_snapshot!(output);
     }
@@ -212,7 +212,7 @@ mod snapshot_tests {
     #[test]
     fn test_cdc_view() {
         let output = render_to_string(100, 24, |frame, area, state, theme| {
-            super::cdc::render(frame, area, state, theme, 0);
+            super::cdc::render(frame, area, state, theme, 0, None);
         });
         insta::assert_snapshot!(output);
     }
@@ -222,7 +222,7 @@ mod snapshot_tests {
     #[test]
     fn test_config_view() {
         let output = render_to_string(100, 24, |frame, area, state, theme| {
-            super::config::render(frame, area, state, theme, 0);
+            super::config::render(frame, area, state, theme, 0, None);
         });
         insta::assert_snapshot!(output);
     }
@@ -232,7 +232,7 @@ mod snapshot_tests {
     #[test]
     fn test_health_view() {
         let output = render_to_string(80, 24, |frame, area, state, theme| {
-            super::health::render(frame, area, state, theme, 0);
+            super::health::render(frame, area, state, theme, 0, None);
         });
         insta::assert_snapshot!(output);
     }
@@ -276,7 +276,7 @@ mod snapshot_tests {
     #[test]
     fn test_workers_view() {
         let output = render_to_string(100, 24, |frame, area, state, theme| {
-            super::workers::render(frame, area, state, theme, 0);
+            super::workers::render(frame, area, state, theme, 0, None);
         });
         insta::assert_snapshot!(output);
     }
@@ -286,7 +286,7 @@ mod snapshot_tests {
     #[test]
     fn test_fuse_view() {
         let output = render_to_string(100, 24, |frame, area, state, theme| {
-            super::fuse::render(frame, area, state, theme, 0);
+            super::fuse::render(frame, area, state, theme, 0, None);
         });
         insta::assert_snapshot!(output);
     }
@@ -324,7 +324,7 @@ mod snapshot_tests {
     #[test]
     fn test_issues_view() {
         let output = render_to_string(100, 24, |frame, area, state, theme| {
-            super::issues::render(frame, area, state, theme, 0);
+            super::issues::render(frame, area, state, theme, 0, None);
         });
         insta::assert_snapshot!(output);
     }
@@ -332,7 +332,7 @@ mod snapshot_tests {
     #[test]
     fn test_issues_view_empty() {
         let output = render_empty_to_string(80, 24, |frame, area, state, theme| {
-            super::issues::render(frame, area, state, theme, 0);
+            super::issues::render(frame, area, state, theme, 0, None);
         });
         insta::assert_snapshot!(output);
     }

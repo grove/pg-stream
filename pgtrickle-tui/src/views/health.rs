@@ -6,14 +6,21 @@ use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table};
 use crate::state::AppState;
 use crate::theme::Theme;
 
-pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme, selected: usize) {
+pub fn render(
+    frame: &mut Frame,
+    area: Rect,
+    state: &AppState,
+    theme: &Theme,
+    selected: usize,
+    filter: Option<&str>,
+) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(3), Constraint::Min(5)])
         .split(area);
 
     render_overall(frame, chunks[0], state, theme);
-    render_checks(frame, chunks[1], state, theme, selected);
+    render_checks(frame, chunks[1], state, theme, selected, filter);
 }
 
 fn render_overall(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
@@ -53,7 +60,15 @@ fn render_overall(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme
     frame.render_widget(Paragraph::new(line).block(block), area);
 }
 
-fn render_checks(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme, selected: usize) {
+fn render_checks(
+    frame: &mut Frame,
+    area: Rect,
+    state: &AppState,
+    theme: &Theme,
+    selected: usize,
+    filter: Option<&str>,
+) {
+    let f = filter.unwrap_or("").to_lowercase();
     let header = Row::new(vec!["Check", "Severity", "Detail"])
         .style(theme.header)
         .bottom_margin(1);
@@ -61,6 +76,11 @@ fn render_checks(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme,
     let rows: Vec<Row> = state
         .health_checks
         .iter()
+        .filter(|h| {
+            f.is_empty()
+                || h.check_name.to_lowercase().contains(&f)
+                || h.detail.to_lowercase().contains(&f)
+        })
         .enumerate()
         .map(|(i, h)| {
             let sev_style = theme.severity_style(&h.severity);

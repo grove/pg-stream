@@ -120,6 +120,7 @@ fn context_help(view: View) -> Vec<&'static str> {
         View::DeltaInspector => vec![
             ":explain <name> to fetch delta SQL",
             "Shows cached SQL inline when loaded",
+            "Tab to switch Delta SQL / Auxiliary Columns",
         ],
         View::Diagnostics => vec![
             "Signal breakdown shown for selected",

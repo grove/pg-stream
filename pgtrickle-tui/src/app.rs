@@ -198,6 +198,7 @@ impl CommandPalette {
             ("fuse reset", "Reset blown fuse for a stream table"),
             ("validate", "Validate a SQL query for DVM compatibility"),
             ("export", "Show DDL for a stream table"),
+            ("explain", "Fetch delta SQL for a stream table"),
             ("quit", "Exit pgtrickle"),
         ];
 
@@ -216,6 +217,7 @@ impl CommandPalette {
             || input.starts_with("resume ")
             || input.starts_with("repair ")
             || input.starts_with("export ")
+            || input.starts_with("explain ")
         {
             let parts: Vec<&str> = input.splitn(2, ' ').collect();
             let prefix = parts.get(1).unwrap_or(&"");
@@ -360,17 +362,127 @@ impl App {
                 self.filtered_stream_tables().len()
             }
             View::Graph => self.state.dag_edges.len(),
-            View::RefreshLog => self.state.refresh_log.len(),
-            View::Diagnostics => self.state.diagnostics.len(),
-            View::Cdc => self.state.cdc_buffers.len(),
-            View::Config => self.state.guc_params.len(),
-            View::Health => self.state.health_checks.len(),
+            View::RefreshLog => self.filtered_refresh_log_len(),
+            View::Diagnostics => self.filtered_diagnostics_len(),
+            View::Cdc => self.filtered_cdc_len(),
+            View::Config => self.filtered_config_len(),
+            View::Health => self.filtered_health_len(),
             View::Alerts => self.state.alerts.len(),
-            View::Workers => self.state.workers.len(),
-            View::Fuse => self.state.fuses.len(),
+            View::Workers => self.filtered_workers_len(),
+            View::Fuse => self.filtered_fuse_len(),
             View::Watermarks => self.state.watermark_groups.len(),
-            View::Issues => self.state.issues.len(),
+            View::Issues => self.filtered_issues_len(),
         }
+    }
+
+    // ── Cross-view filter helpers ────────────────────────────────
+
+    fn filter_matches(&self, haystack: &str) -> bool {
+        match &self.filter {
+            None => true,
+            Some(f) => haystack.to_lowercase().contains(&f.to_lowercase()),
+        }
+    }
+
+    fn filtered_refresh_log_len(&self) -> usize {
+        if self.filter.is_none() {
+            return self.state.refresh_log.len();
+        }
+        self.state
+            .refresh_log
+            .iter()
+            .filter(|e| self.filter_matches(&e.st_name))
+            .count()
+    }
+
+    fn filtered_diagnostics_len(&self) -> usize {
+        if self.filter.is_none() {
+            return self.state.diagnostics.len();
+        }
+        self.state
+            .diagnostics
+            .iter()
+            .filter(|d| self.filter_matches(&d.name) || self.filter_matches(&d.schema))
+            .count()
+    }
+
+    fn filtered_cdc_len(&self) -> usize {
+        if self.filter.is_none() {
+            return self.state.cdc_buffers.len();
+        }
+        self.state
+            .cdc_buffers
+            .iter()
+            .filter(|b| {
+                self.filter_matches(&b.stream_table) || self.filter_matches(&b.source_table)
+            })
+            .count()
+    }
+
+    fn filtered_config_len(&self) -> usize {
+        if self.filter.is_none() {
+            return self.state.guc_params.len();
+        }
+        self.state
+            .guc_params
+            .iter()
+            .filter(|g| self.filter_matches(&g.name) || self.filter_matches(&g.short_desc))
+            .count()
+    }
+
+    fn filtered_health_len(&self) -> usize {
+        if self.filter.is_none() {
+            return self.state.health_checks.len();
+        }
+        self.state
+            .health_checks
+            .iter()
+            .filter(|h| self.filter_matches(&h.check_name) || self.filter_matches(&h.detail))
+            .count()
+    }
+
+    fn filtered_workers_len(&self) -> usize {
+        if self.filter.is_none() {
+            return self.state.workers.len();
+        }
+        self.state
+            .workers
+            .iter()
+            .filter(|w| {
+                w.table_name
+                    .as_deref()
+                    .is_some_and(|n| self.filter_matches(n))
+                    || self.filter_matches(&w.state)
+            })
+            .count()
+    }
+
+    fn filtered_fuse_len(&self) -> usize {
+        if self.filter.is_none() {
+            return self.state.fuses.len();
+        }
+        self.state
+            .fuses
+            .iter()
+            .filter(|f| self.filter_matches(&f.stream_table))
+            .count()
+    }
+
+    fn filtered_issues_len(&self) -> usize {
+        if self.filter.is_none() {
+            return self.state.issues.len();
+        }
+        self.state
+            .issues
+            .iter()
+            .filter(|i| {
+                i.affected_table
+                    .as_deref()
+                    .is_some_and(|t| self.filter_matches(t))
+                    || self.filter_matches(&i.category)
+                    || self.filter_matches(&i.summary)
+            })
+            .count()
     }
 
     fn move_down(&mut self) {
@@ -1118,8 +1230,18 @@ fn handle_key(app: &mut App, key: KeyEvent) {
         KeyCode::Char('g') => switch_view(app, View::Graph),
         KeyCode::Char('i') => switch_view(app, View::Issues),
         // Navigation
-        KeyCode::Char('j') | KeyCode::Down => app.move_down(),
-        KeyCode::Char('k') | KeyCode::Up => app.move_up(),
+        KeyCode::Char('j') | KeyCode::Down => {
+            app.move_down();
+            if app.current_view == View::Detail {
+                fetch_detail_data(app);
+            }
+        }
+        KeyCode::Char('k') | KeyCode::Up => {
+            app.move_up();
+            if app.current_view == View::Detail {
+                fetch_detail_data(app);
+            }
+        }
         KeyCode::PageDown => {
             for _ in 0..20 {
                 app.move_down();
@@ -1250,6 +1372,16 @@ fn execute_palette_command(app: &mut App, input: &str) {
                 }
             } else {
                 app.toast = Some(Toast::error("Usage: validate <SQL query>"));
+            }
+        }
+        "explain" => {
+            if let Some(name) = arg {
+                if let Some(ref tx) = app.action_tx {
+                    let _ = tx.try_send(ActionRequest::FetchDeltaSql(name.clone()));
+                    app.toast = Some(Toast::info(format!("Fetching delta SQL for {name}…")));
+                }
+            } else {
+                app.toast = Some(Toast::error("Usage: explain <name>"));
             }
         }
         _ => {
@@ -1512,15 +1644,11 @@ fn draw_body(frame: &mut ratatui::Frame, area: Rect, app: &App) {
 }
 
 fn render_view(frame: &mut ratatui::Frame, area: Rect, app: &App) {
+    let filter = app.filter.as_deref();
     match app.current_view {
-        View::Dashboard => views::dashboard::render(
-            frame,
-            area,
-            &app.state,
-            &app.theme,
-            app.selected,
-            app.filter.as_deref(),
-        ),
+        View::Dashboard => {
+            views::dashboard::render(frame, area, &app.state, &app.theme, app.selected, filter)
+        }
         View::Detail => views::detail::render(
             frame,
             area,
@@ -1530,17 +1658,25 @@ fn render_view(frame: &mut ratatui::Frame, area: Rect, app: &App) {
         ),
         View::Graph => views::graph::render(frame, area, &app.state, &app.theme, app.selected),
         View::RefreshLog => {
-            views::refresh_log::render(frame, area, &app.state, &app.theme, app.selected)
+            views::refresh_log::render(frame, area, &app.state, &app.theme, app.selected, filter)
         }
         View::Diagnostics => {
-            views::diagnostics::render(frame, area, &app.state, &app.theme, app.selected)
+            views::diagnostics::render(frame, area, &app.state, &app.theme, app.selected, filter)
         }
-        View::Cdc => views::cdc::render(frame, area, &app.state, &app.theme, app.selected),
-        View::Config => views::config::render(frame, area, &app.state, &app.theme, app.selected),
-        View::Health => views::health::render(frame, area, &app.state, &app.theme, app.selected),
+        View::Cdc => views::cdc::render(frame, area, &app.state, &app.theme, app.selected, filter),
+        View::Config => {
+            views::config::render(frame, area, &app.state, &app.theme, app.selected, filter)
+        }
+        View::Health => {
+            views::health::render(frame, area, &app.state, &app.theme, app.selected, filter)
+        }
         View::Alerts => views::alert::render(frame, area, &app.state, &app.theme),
-        View::Workers => views::workers::render(frame, area, &app.state, &app.theme, app.selected),
-        View::Fuse => views::fuse::render(frame, area, &app.state, &app.theme, app.selected),
+        View::Workers => {
+            views::workers::render(frame, area, &app.state, &app.theme, app.selected, filter)
+        }
+        View::Fuse => {
+            views::fuse::render(frame, area, &app.state, &app.theme, app.selected, filter)
+        }
         View::Watermarks => views::watermarks::render(
             frame,
             area,
@@ -1557,7 +1693,9 @@ fn render_view(frame: &mut ratatui::Frame, area: Rect, app: &App) {
             app.selected_stream_table_index(),
             app.delta_inspector_tab,
         ),
-        View::Issues => views::issues::render(frame, area, &app.state, &app.theme, app.selected),
+        View::Issues => {
+            views::issues::render(frame, area, &app.state, &app.theme, app.selected, filter)
+        }
     }
 }
 

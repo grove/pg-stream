@@ -7,10 +7,19 @@ use ratatui::widgets::{Block, Borders, Paragraph};
 use crate::state::AppState;
 use crate::theme::Theme;
 
-pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme, selected: usize) {
+pub fn render(
+    frame: &mut Frame,
+    area: Rect,
+    state: &AppState,
+    theme: &Theme,
+    selected: usize,
+    filter: Option<&str>,
+) {
+    let f = filter.unwrap_or("").to_lowercase();
     let lines: Vec<Line> = state
         .refresh_log
         .iter()
+        .filter(|entry| f.is_empty() || entry.st_name.to_lowercase().contains(&f))
         .enumerate()
         .map(|(i, entry)| {
             let style = if i == selected {
