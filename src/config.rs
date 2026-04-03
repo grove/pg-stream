@@ -446,6 +446,40 @@ pub static PGS_AGG_DIFF_CARDINALITY_THRESHOLD: GucSetting<i32> = GucSetting::<i3
 /// bounded per coordinator by `max_concurrent_refreshes`.
 pub static PGS_PER_DATABASE_WORKER_QUOTA: GucSetting<i32> = GucSetting::<i32>::new(0);
 
+/// VOL-1: Volatile function policy for DIFFERENTIAL/IMMEDIATE mode.
+///
+/// Controls how volatile functions in defining queries are handled:
+/// - `"reject"` (default): Error — volatile functions are rejected.
+/// - `"warn"`: Allow creation with a WARNING.
+/// - `"allow"`: Allow silently.
+pub static PGS_VOLATILE_FUNCTION_POLICY: GucSetting<Option<std::ffi::CString>> =
+    GucSetting::<Option<std::ffi::CString>>::new(Some(c"reject"));
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VolatileFunctionPolicy {
+    Reject,
+    Warn,
+    Allow,
+}
+
+impl VolatileFunctionPolicy {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            VolatileFunctionPolicy::Reject => "reject",
+            VolatileFunctionPolicy::Warn => "warn",
+            VolatileFunctionPolicy::Allow => "allow",
+        }
+    }
+}
+
+fn normalize_volatile_function_policy(value: Option<String>) -> VolatileFunctionPolicy {
+    match value.as_deref().map(str::to_ascii_lowercase).as_deref() {
+        Some("warn") => VolatileFunctionPolicy::Warn,
+        Some("allow") => VolatileFunctionPolicy::Allow,
+        _ => VolatileFunctionPolicy::Reject,
+    }
+}
+
 /// D-1a: Create new change buffer tables as UNLOGGED.
 ///
 /// When `true`, newly created change buffer tables (`pgtrickle_changes.changes_*`)
@@ -1012,6 +1046,19 @@ pub fn register_gucs() {
         GucFlags::default(),
     );
 
+    // VOL-1: Volatile function policy.
+    GucRegistry::define_string_guc(
+        c"pg_trickle.volatile_function_policy",
+        c"Volatile function policy: reject (default), warn, or allow.",
+        c"'reject' (default) errors on volatile functions in DIFFERENTIAL/IMMEDIATE queries. \
+           'warn' emits a WARNING but allows creation. \
+           'allow' permits volatile functions silently. Volatile functions produce different \
+           values on each evaluation, which may break delta computation.",
+        &PGS_VOLATILE_FUNCTION_POLICY,
+        GucContext::Suset,
+        GucFlags::default(),
+    );
+
     // D-1a: UNLOGGED change buffers.
     GucRegistry::define_bool_guc(
         c"pg_trickle.unlogged_buffers",
@@ -1312,6 +1359,15 @@ pub fn pg_trickle_wake_debounce_ms() -> i32 {
     PGS_WAKE_DEBOUNCE_MS.get()
 }
 
+/// VOL-1: Returns the volatile function handling policy.
+pub fn pg_trickle_volatile_function_policy() -> VolatileFunctionPolicy {
+    normalize_volatile_function_policy(
+        PGS_VOLATILE_FUNCTION_POLICY
+            .get()
+            .and_then(|cs| cs.to_str().ok().map(str::to_owned)),
+    )
+}
+
 /// D-1a: Returns whether new change buffer tables should be created UNLOGGED.
 pub fn pg_trickle_unlogged_buffers() -> bool {
     PGS_UNLOGGED_BUFFERS.get()
@@ -1320,9 +1376,9 @@ pub fn pg_trickle_unlogged_buffers() -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        CdcTriggerMode, ParallelRefreshMode, UserTriggersMode, normalize_cdc_trigger_mode,
-        normalize_parallel_refresh_mode, normalize_recursive_max_depth,
-        normalize_user_triggers_mode, threshold_mb_to_bytes,
+        CdcTriggerMode, ParallelRefreshMode, UserTriggersMode, VolatileFunctionPolicy,
+        normalize_cdc_trigger_mode, normalize_parallel_refresh_mode, normalize_recursive_max_depth,
+        normalize_user_triggers_mode, normalize_volatile_function_policy, threshold_mb_to_bytes,
     };
 
     #[test]
@@ -1497,5 +1553,62 @@ mod tests {
             normalize_cdc_trigger_mode(Some(CdcTriggerMode::Statement.as_str().to_string())),
             CdcTriggerMode::Statement
         );
+    }
+
+    #[test]
+    fn test_normalize_volatile_function_policy_defaults_to_reject() {
+        assert_eq!(
+            normalize_volatile_function_policy(None),
+            VolatileFunctionPolicy::Reject
+        );
+        assert_eq!(
+            normalize_volatile_function_policy(Some("reject".to_string())),
+            VolatileFunctionPolicy::Reject
+        );
+        assert_eq!(
+            normalize_volatile_function_policy(Some("unexpected".to_string())),
+            VolatileFunctionPolicy::Reject
+        );
+    }
+
+    #[test]
+    fn test_normalize_volatile_function_policy_accepts_warn_and_allow() {
+        assert_eq!(
+            normalize_volatile_function_policy(Some("warn".to_string())),
+            VolatileFunctionPolicy::Warn
+        );
+        assert_eq!(
+            normalize_volatile_function_policy(Some("WARN".to_string())),
+            VolatileFunctionPolicy::Warn
+        );
+        assert_eq!(
+            normalize_volatile_function_policy(Some("allow".to_string())),
+            VolatileFunctionPolicy::Allow
+        );
+        assert_eq!(
+            normalize_volatile_function_policy(Some("ALLOW".to_string())),
+            VolatileFunctionPolicy::Allow
+        );
+    }
+
+    #[test]
+    fn test_volatile_function_policy_as_str() {
+        assert_eq!(VolatileFunctionPolicy::Reject.as_str(), "reject");
+        assert_eq!(VolatileFunctionPolicy::Warn.as_str(), "warn");
+        assert_eq!(VolatileFunctionPolicy::Allow.as_str(), "allow");
+    }
+
+    #[test]
+    fn test_normalize_volatile_function_policy_roundtrip_via_as_str() {
+        for policy in [
+            VolatileFunctionPolicy::Reject,
+            VolatileFunctionPolicy::Warn,
+            VolatileFunctionPolicy::Allow,
+        ] {
+            assert_eq!(
+                normalize_volatile_function_policy(Some(policy.as_str().to_string())),
+                policy
+            );
+        }
     }
 }

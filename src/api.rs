@@ -938,20 +938,37 @@ fn validate_and_parse_query(
         None
     };
 
-    // Volatility check
+    // Volatility check — VOL-1: controlled by volatile_function_policy GUC
     if let Some(ref pr) = parsed_tree {
         let vol = crate::dvm::tree_worst_volatility_with_registry(pr)?;
         match vol {
             'v' => {
-                return Err(PgTrickleError::UnsupportedOperator(
-                    "Defining query contains volatile expressions (e.g., random(), \
-                     clock_timestamp(), or custom volatile operators). Volatile \
-                     functions and operators are not supported in DIFFERENTIAL or \
-                     IMMEDIATE mode because they produce different values on each \
-                     evaluation, breaking delta computation. Use FULL refresh mode \
-                     instead, or replace with a deterministic alternative."
-                        .into(),
-                ));
+                let policy = crate::config::pg_trickle_volatile_function_policy();
+                match policy {
+                    crate::config::VolatileFunctionPolicy::Reject => {
+                        return Err(PgTrickleError::UnsupportedOperator(
+                            "Defining query contains volatile expressions (e.g., random(), \
+                             clock_timestamp(), or custom volatile operators). Volatile \
+                             functions and operators are not supported in DIFFERENTIAL or \
+                             IMMEDIATE mode because they produce different values on each \
+                             evaluation, breaking delta computation. Use FULL refresh mode \
+                             instead, or replace with a deterministic alternative. \
+                             (Override with: SET pg_trickle.volatile_function_policy = 'warn' or 'allow')"
+                                .into(),
+                        ));
+                    }
+                    crate::config::VolatileFunctionPolicy::Warn => {
+                        pgrx::warning!(
+                            "Defining query contains volatile expressions (e.g., random(), \
+                             clock_timestamp()). Volatile functions produce different values \
+                             on each evaluation, which may break delta computation. \
+                             Allowed by pg_trickle.volatile_function_policy = 'warn'."
+                        );
+                    }
+                    crate::config::VolatileFunctionPolicy::Allow => {
+                        // Silent — user explicitly opted in.
+                    }
+                }
             }
             's' => {
                 pgrx::warning!(
