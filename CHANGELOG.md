@@ -9,7 +9,7 @@ For future plans and release milestones, see [ROADMAP.md](ROADMAP.md).
 
 <!-- TOC start -->
 - [Unreleased](#unreleased)
-- [0.15.0 — Unreleased](#0150--unreleased)
+- [0.15.0 — 2026-04-03](#0150--2026-04-03)
 - [0.14.0 — 2026-04-02](#0140--2026-04-02)
 - [0.13.0 — 2026-03-31](#0130--2026-03-31)
 - [0.12.0 — 2026-03-28](#0120--2026-03-28)
@@ -35,6 +35,12 @@ For future plans and release milestones, see [ROADMAP.md](ROADMAP.md).
 ---
 
 ## [Unreleased]
+
+*No changes yet.*
+
+---
+
+## [0.15.0] — 2026-04-03
 
 ### Added
 
@@ -160,14 +166,9 @@ For future plans and release milestones, see [ROADMAP.md](ROADMAP.md).
   query). Updated `docs/SQL_REFERENCE.md` to replace the documented limitation with a
   description of the fix. Unit + TPC-H regression tests already cover this scenario.
 
----
-
-## [0.15.0] — Unreleased
-
-0.15.0 is the **TUI Operational Capability** release. It transforms the
-terminal dashboard from a read-only monitor into a fully interactive tool
-for acting on problems — with write actions, a command palette, and deep
-enrichment across all views.
+- `drop_stream_table()` now accepts an optional `cascade BOOLEAN DEFAULT true` parameter.
+  When `cascade = false`, the function raises an error if dependent stream tables exist
+  (RESTRICT semantics), matching PostgreSQL's own `DROP TABLE` behavior.
 
 ### TUI — Write Actions
 
@@ -265,6 +266,10 @@ history stay current without waiting for the next poll cycle.
   degrade silently on failure, matching the same graceful-degradation
   pattern used for phase-2 poll queries. Only user-triggered commands still
   show error toasts.
+- Fixed `i64` type annotations for `INT4` columns in CIRC-IMM E2E tests
+  (`test_diamond_immediate_both_branches_update`,
+  `test_diamond_immediate_mixed_dml_sequence`). PostgreSQL integer arithmetic
+  returns `INT4`, not `INT8`.
 
 ---
 
