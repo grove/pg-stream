@@ -11,7 +11,7 @@ pub struct ExportArgs {
 
 pub async fn execute(client: &Client, args: &ExportArgs) -> Result<(), CliError> {
     let rows = client
-        .query("SELECT pgtrickle.export_definition($1)", &[&args.name])
+        .query("SELECT pgtrickle.export_definition($1::text)", &[&args.name])
         .await
         .map_err(|e| {
             if let Some(db) = e.as_db_error() {
