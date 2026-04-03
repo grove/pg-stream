@@ -862,6 +862,17 @@ async fn poller_task(
                                 let _ = tx.send(PollMsg::AuxiliaryColumns(name.clone(), result.message)).await;
                                 continue;
                             }
+                            // Silently degrade background enrichment fetches — these are
+                            // auto-triggered and may not exist on older extension versions.
+                            ActionRequest::FetchDiagnoseErrors(_)
+                            | ActionRequest::FetchExplainMode(_)
+                            | ActionRequest::FetchSources(_)
+                            | ActionRequest::FetchRefreshHistory(_)
+                            | ActionRequest::FetchAuxiliaryColumns(_)
+                                if !result.success =>
+                            {
+                                continue;
+                            }
                             _ => {}
                         }
                         let _ = tx.send(PollMsg::ActionResult(result)).await;
