@@ -262,10 +262,14 @@ pub async fn execute_action(client: &Client, action: &ActionRequest) -> ActionRe
             }
         }
         ActionRequest::FetchDdl(name) => {
-            match client
-                .query_one("SELECT pgtrickle.export_definition($1::text)", &[name])
-                .await
-            {
+            // We embed the name directly rather than using a parameter because
+            // tokio-postgres sends OID 0 (unknown) for &String parameters, and
+            // some PostgreSQL builds fail to resolve the overload even with a
+            // ::text cast in the query text.  The name comes from our own
+            // catalog (schema.table) so it is safe to embed.
+            let safe_name = name.replace('\'', "''");
+            let sql = format!("SELECT pgtrickle.export_definition('{safe_name}')");
+            match client.query_one(&*sql, &[]).await {
                 Ok(row) => {
                     let ddl: String = row.get(0);
                     Ok(ddl)
