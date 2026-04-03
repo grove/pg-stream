@@ -406,6 +406,18 @@ async fn test_action_fetch_delta_sql_bare_name_returns_empty() {
 }
 
 #[tokio::test]
+async fn test_action_fetch_ddl_with_schema_returns_ddl() {
+    let db = PgtStubDb::new().await;
+    let result = crate::poller::execute_action(
+        &db.client,
+        &crate::state::ActionRequest::FetchDdl("public.test_table".into()),
+    )
+    .await;
+    assert!(result.success, "FetchDdl should succeed, got: {}", result.message);
+    assert!(!result.message.is_empty(), "FetchDdl should return DDL text");
+}
+
+#[tokio::test]
 async fn test_action_refresh_table_succeeds() {
     let db = PgtStubDb::new().await;
     let result = crate::poller::execute_action(
