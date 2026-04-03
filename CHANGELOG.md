@@ -106,6 +106,14 @@ For future plans and release milestones, see [ROADMAP.md](ROADMAP.md).
   correctness, and sustained churn. Added to CI as `#[ignore]` test suite. Documented
   results in `docs/BENCHMARK.md`.
 
+- **WM-7:** Stuck watermark hold-back mode. New `pg_trickle.watermark_holdback_timeout`
+  GUC (default 0 = disabled) detects watermarks that have not been advanced within the
+  configured timeout. When a stuck watermark is detected, downstream stream tables in
+  the affected watermark group are paused (refresh skipped) and a `pgtrickle_alert`
+  NOTIFY with `watermark_stuck` event is emitted. Auto-resumes when the watermark is
+  advanced, with a `watermark_resumed` event. Protects against silent data staleness
+  from broken ETL pipelines.
+
 ### Changed
 
 - **I2:** Complete documentation review for v0.15.0 readiness. Fixed `CONFIGURATION.md`

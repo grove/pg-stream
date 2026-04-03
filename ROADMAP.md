@@ -2866,20 +2866,18 @@ Validate correctness against independent query corpora beyond TPC-H.
 
 > **G13-PRF subtotal: ~3–4 weeks**
 
-### Watermark Hold-Back Mode (WM-7)
+### Watermark Hold-Back Mode (WM-7) -- ✅ Done
 
 > **In plain terms:** The watermark gating system (shipped in v0.7.0) lets
-> ETL producers signal their progress. But there's no mechanism to pause
-> downstream stream tables when upstream watermarks get stuck — the scheduler
-> just keeps refreshing with stale data. Hold-back mode adds an escalation
-> policy: detect stuck watermarks, pause affected stream tables, and notify
-> operators. Completes the ETL coordination story.
+> ETL producers signal their progress. Hold-back mode adds stuck detection:
+> when a watermark is not advanced within a configurable timeout, downstream
+> stream tables are paused and operators are notified.
 
 | Item | Description | Effort | Ref |
 |------|-------------|--------|-----|
-| WM-7 | **Watermark hold-back mode.** Detect stuck watermarks (no advance within configurable tolerance); pause downstream gated STs; emit `pgtrickle_alert` NOTIFY with category `watermark_stuck`; auto-resume when watermark advances; `watermark_holdback_timeout` GUC. | ~1–2wk | [PLAN_WATERMARK_GATING.md §4.1](plans/sql/PLAN_WATERMARK_GATING.md) |
+| WM-7 | **Watermark hold-back mode.** `watermark_holdback_timeout` GUC detects stuck watermarks; pauses downstream gated STs; emits `pgtrickle_alert` NOTIFY with `watermark_stuck` event; auto-resumes with `watermark_resumed` event when watermark advances. | ✅ Done | [PLAN_WATERMARK_GATING.md §4.1](plans/sql/PLAN_WATERMARK_GATING.md) |
 
-> **WM-7 subtotal: ~1–2 weeks**
+> **WM-7 subtotal: ✅ Done**
 
 ### Delta Cost Estimation (PH-E1) — ✅ Done
 
@@ -3092,7 +3090,7 @@ Validate correctness against independent query corpora beyond TPC-H.
 - [ ] Complete documentation review done
 - [ ] G15-BC: `pgtrickle.bulk_create(definitions JSONB)` creates all STs and CDC triggers atomically; tested with 10+ definitions in a single call
 - [ ] G13-PRF: `parser.rs` split into ≥5 sub-modules; zero behavior change; all existing tests pass
-- [ ] WM-7: Stuck watermarks detected and downstream STs paused; `watermark_stuck` alert emitted; auto-resume on watermark advance
+- [x] WM-7: Stuck watermarks detected and downstream STs paused; `watermark_stuck` alert emitted; auto-resume on watermark advance
 - [x] PH-E1: Delta cost estimation via capped COUNT on delta subquery; `max_delta_estimate_rows` GUC; FULL downgrade + NOTICE when threshold exceeded
 - [ ] PH-E2: Spill-aware auto-adjustment triggers after 3 consecutive spills; `spill_history` exposed in `explain_st()`
 - [x] PH-D2: `merge_join_strategy` GUC with manual override (`auto`/`hash_join`/`nested_loop`/`merge_join`)

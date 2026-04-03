@@ -3276,6 +3276,53 @@ FROM pgtrickle.watermarks()
 ORDER BY watermark;
 ```
 
+### Stuck Watermark Detection (WM-7, v0.15.0)
+
+When `pg_trickle.watermark_holdback_timeout` is set to a positive value
+(seconds), the scheduler periodically checks all watermark sources. If any
+source in a watermark group has not been advanced within the timeout,
+downstream stream tables in that group are **paused** (refresh is skipped)
+and a `pgtrickle_alert` NOTIFY is emitted.
+
+This protects against silent data staleness when an ETL pipeline breaks and
+stops advancing watermarks -- without this guard, stream tables would
+continue refreshing with stale external data.
+
+**Behavior:**
+
+- **Stuck detection**: Every ~60 seconds, the scheduler checks
+  `updated_at` for all watermark sources. If `now() - updated_at >
+  watermark_holdback_timeout`, the source is stuck.
+- **Pause**: Any stream table whose source set overlaps a group containing
+  a stuck source is skipped. A SKIP record with `"stuck"` in the reason
+  is logged to `pgt_refresh_history`.
+- **Alert**: A `pgtrickle_alert` NOTIFY with event `watermark_stuck` is
+  emitted (once per newly-stuck source, not repeated every check cycle).
+- **Auto-resume**: When the stuck watermark is advanced via
+  `advance_watermark()`, the next scheduler check detects the advancement,
+  lifts the pause, and emits a `watermark_resumed` event.
+
+#### Recipe 9 — Stuck Watermark Protection
+
+```sql
+-- Enable stuck-watermark detection with a 10-minute timeout.
+ALTER SYSTEM SET pg_trickle.watermark_holdback_timeout = 600;
+SELECT pg_reload_conf();
+
+-- Listen for alerts in a monitoring process.
+LISTEN pgtrickle_alert;
+
+-- When the ETL pipeline breaks and stops calling advance_watermark(),
+-- the scheduler will start skipping downstream STs after 10 minutes.
+-- You'll receive a NOTIFY payload like:
+--   {"event":"watermark_stuck","group":"order_pipeline","source_oid":16385,"age_secs":620}
+
+-- When the ETL pipeline recovers and advances the watermark:
+SELECT pgtrickle.advance_watermark('orders', '2026-03-02 00:00:00+00');
+-- The scheduler automatically resumes, and you'll receive:
+--   {"event":"watermark_resumed","source_oid":16385}
+```
+
 ---
 
 ## Developer Diagnostics (v0.12.0)

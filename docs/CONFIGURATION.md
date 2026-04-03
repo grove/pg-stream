@@ -54,6 +54,7 @@ Complete reference for all pg_trickle GUC (Grand Unified Configuration) variable
     - [pg\_trickle.matview\_polling](#pg_tricklematview_polling)
     - [pg\_trickle.cdc\_trigger\_mode](#pg_tricklecdc_trigger_mode)
     - [pg\_trickle.tick\_watermark\_enabled](#pg_trickletick_watermark_enabled)
+    - [pg\_trickle.watermark\_holdback\_timeout](#pg_tricklewatermark_holdback_timeout)
     - [pg\_trickle.log\_merge\_sql](#pg_tricklelog_merge_sql)
   - [Guardrails & Diagnostics](#guardrails--diagnostics)
     - [pg\_trickle.fuse\_default\_ceiling](#pg_tricklefuse_default_ceiling)
@@ -1348,6 +1349,45 @@ available LSN.
 ```sql
 -- Disable tick watermark bounding
 SET pg_trickle.tick_watermark_enabled = false;
+```
+
+---
+
+### pg_trickle.watermark_holdback_timeout
+
+Maximum seconds a user-provided watermark may remain un-advanced before
+being considered **stuck**. When a watermark group contains a source whose
+watermark has not been advanced within this timeout, downstream stream
+tables in that group are paused (refresh is skipped) and a
+`pgtrickle_alert` NOTIFY with `watermark_stuck` event is emitted.
+
+When the stuck watermark is advanced again (via `advance_watermark()`), the
+pause is automatically lifted and a `watermark_resumed` event is emitted.
+
+Set to `0` to disable stuck-watermark detection (default). Useful values
+depend on your ETL pipeline cadence -- for a pipeline that loads every 5
+minutes, a timeout of `600` (10 min) gives a safety margin.
+
+| Property | Value |
+|---|---|
+| Type | `integer` |
+| Default | `0` (disabled) |
+| Min | `0` |
+| Max | `86400` (24 hours) |
+| Context | `SUSET` (superuser) |
+| Restart required | No |
+
+```sql
+-- Set stuck-watermark timeout to 10 minutes
+ALTER SYSTEM SET pg_trickle.watermark_holdback_timeout = 600;
+SELECT pg_reload_conf();
+```
+
+**NOTIFY payloads:**
+
+```json
+{"event":"watermark_stuck","group":"order_pipeline","source_oid":16385,"age_secs":620}
+{"event":"watermark_resumed","source_oid":16385}
 ```
 
 ---
