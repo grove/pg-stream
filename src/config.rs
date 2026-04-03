@@ -480,6 +480,48 @@ fn normalize_volatile_function_policy(value: Option<String>) -> VolatileFunction
     }
 }
 
+/// PH-D2: Merge join strategy override.
+///
+/// Controls the join strategy hint applied via `SET LOCAL` during MERGE:
+/// - `"auto"` (default): delta-size heuristics choose the strategy.
+/// - `"hash_join"`: always prefer hash joins (disable nestloop, raise work_mem).
+/// - `"nested_loop"`: always prefer nested loops (disable hashjoin + mergejoin).
+/// - `"merge_join"`: always prefer merge joins (disable hashjoin + nestloop).
+pub static PGS_MERGE_JOIN_STRATEGY: GucSetting<Option<std::ffi::CString>> =
+    GucSetting::<Option<std::ffi::CString>>::new(Some(c"auto"));
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MergeJoinStrategy {
+    /// Delta-size heuristics (existing behaviour).
+    Auto,
+    /// Force hash joins.
+    HashJoin,
+    /// Force nested-loop joins.
+    NestedLoop,
+    /// Force merge joins.
+    MergeJoin,
+}
+
+impl MergeJoinStrategy {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            MergeJoinStrategy::Auto => "auto",
+            MergeJoinStrategy::HashJoin => "hash_join",
+            MergeJoinStrategy::NestedLoop => "nested_loop",
+            MergeJoinStrategy::MergeJoin => "merge_join",
+        }
+    }
+}
+
+fn normalize_merge_join_strategy(value: Option<String>) -> MergeJoinStrategy {
+    match value.as_deref().map(str::to_ascii_lowercase).as_deref() {
+        Some("hash_join") => MergeJoinStrategy::HashJoin,
+        Some("nested_loop") => MergeJoinStrategy::NestedLoop,
+        Some("merge_join") => MergeJoinStrategy::MergeJoin,
+        _ => MergeJoinStrategy::Auto,
+    }
+}
+
 /// D-1a: Create new change buffer tables as UNLOGGED.
 ///
 /// When `true`, newly created change buffer tables (`pgtrickle_changes.changes_*`)
@@ -1059,6 +1101,19 @@ pub fn register_gucs() {
         GucFlags::default(),
     );
 
+    // PH-D2: Merge join strategy override.
+    GucRegistry::define_string_guc(
+        c"pg_trickle.merge_join_strategy",
+        c"Join strategy hint for MERGE: auto (default), hash_join, nested_loop, merge_join.",
+        c"'auto' (default) uses delta-size heuristics to choose between nested-loop and \
+           hash-join hints. 'hash_join' always disables nestloop and raises work_mem. \
+           'nested_loop' always disables hashjoin and mergejoin. \
+           'merge_join' always disables hashjoin and nestloop.",
+        &PGS_MERGE_JOIN_STRATEGY,
+        GucContext::Suset,
+        GucFlags::default(),
+    );
+
     // D-1a: UNLOGGED change buffers.
     GucRegistry::define_bool_guc(
         c"pg_trickle.unlogged_buffers",
@@ -1368,6 +1423,15 @@ pub fn pg_trickle_volatile_function_policy() -> VolatileFunctionPolicy {
     )
 }
 
+/// PH-D2: Returns the merge join strategy override.
+pub fn pg_trickle_merge_join_strategy() -> MergeJoinStrategy {
+    normalize_merge_join_strategy(
+        PGS_MERGE_JOIN_STRATEGY
+            .get()
+            .and_then(|cs| cs.to_str().ok().map(str::to_owned)),
+    )
+}
+
 /// D-1a: Returns whether new change buffer tables should be created UNLOGGED.
 pub fn pg_trickle_unlogged_buffers() -> bool {
     PGS_UNLOGGED_BUFFERS.get()
@@ -1376,8 +1440,9 @@ pub fn pg_trickle_unlogged_buffers() -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        CdcTriggerMode, ParallelRefreshMode, UserTriggersMode, VolatileFunctionPolicy,
-        normalize_cdc_trigger_mode, normalize_parallel_refresh_mode, normalize_recursive_max_depth,
+        CdcTriggerMode, MergeJoinStrategy, ParallelRefreshMode, UserTriggersMode,
+        VolatileFunctionPolicy, normalize_cdc_trigger_mode, normalize_merge_join_strategy,
+        normalize_parallel_refresh_mode, normalize_recursive_max_depth,
         normalize_user_triggers_mode, normalize_volatile_function_policy, threshold_mb_to_bytes,
     };
 
@@ -1608,6 +1673,70 @@ mod tests {
             assert_eq!(
                 normalize_volatile_function_policy(Some(policy.as_str().to_string())),
                 policy
+            );
+        }
+    }
+
+    #[test]
+    fn test_normalize_merge_join_strategy_defaults_to_auto() {
+        assert_eq!(normalize_merge_join_strategy(None), MergeJoinStrategy::Auto);
+        assert_eq!(
+            normalize_merge_join_strategy(Some("auto".to_string())),
+            MergeJoinStrategy::Auto
+        );
+        assert_eq!(
+            normalize_merge_join_strategy(Some("unexpected".to_string())),
+            MergeJoinStrategy::Auto
+        );
+    }
+
+    #[test]
+    fn test_normalize_merge_join_strategy_all_variants() {
+        assert_eq!(
+            normalize_merge_join_strategy(Some("hash_join".to_string())),
+            MergeJoinStrategy::HashJoin
+        );
+        assert_eq!(
+            normalize_merge_join_strategy(Some("HASH_JOIN".to_string())),
+            MergeJoinStrategy::HashJoin
+        );
+        assert_eq!(
+            normalize_merge_join_strategy(Some("nested_loop".to_string())),
+            MergeJoinStrategy::NestedLoop
+        );
+        assert_eq!(
+            normalize_merge_join_strategy(Some("NESTED_LOOP".to_string())),
+            MergeJoinStrategy::NestedLoop
+        );
+        assert_eq!(
+            normalize_merge_join_strategy(Some("merge_join".to_string())),
+            MergeJoinStrategy::MergeJoin
+        );
+        assert_eq!(
+            normalize_merge_join_strategy(Some("MERGE_JOIN".to_string())),
+            MergeJoinStrategy::MergeJoin
+        );
+    }
+
+    #[test]
+    fn test_merge_join_strategy_as_str() {
+        assert_eq!(MergeJoinStrategy::Auto.as_str(), "auto");
+        assert_eq!(MergeJoinStrategy::HashJoin.as_str(), "hash_join");
+        assert_eq!(MergeJoinStrategy::NestedLoop.as_str(), "nested_loop");
+        assert_eq!(MergeJoinStrategy::MergeJoin.as_str(), "merge_join");
+    }
+
+    #[test]
+    fn test_normalize_merge_join_strategy_roundtrip_via_as_str() {
+        for strategy in [
+            MergeJoinStrategy::Auto,
+            MergeJoinStrategy::HashJoin,
+            MergeJoinStrategy::NestedLoop,
+            MergeJoinStrategy::MergeJoin,
+        ] {
+            assert_eq!(
+                normalize_merge_join_strategy(Some(strategy.as_str().to_string())),
+                strategy
             );
         }
     }

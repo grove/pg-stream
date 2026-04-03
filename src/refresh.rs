@@ -669,6 +669,13 @@ fn apply_planner_hints(estimated_delta: i64, st_relid: pg_sys::Oid, scan_count: 
         return;
     }
 
+    // PH-D2: Manual join strategy override — bypass heuristics entirely.
+    let strategy = crate::config::pg_trickle_merge_join_strategy();
+    if strategy != crate::config::MergeJoinStrategy::Auto {
+        apply_fixed_join_strategy(strategy);
+        return;
+    }
+
     // ── Deep-join hints (DI-11) ─────────────────────────────────────
     // For 5+ table joins the delta SQL generates cascading L₀ snapshot
     // CTEs. Without planner guidance, PostgreSQL may choose nested-loop
@@ -773,6 +780,36 @@ fn apply_planner_hints(estimated_delta: i64, st_relid: pg_sys::Oid, scan_count: 
             );
         }
     }
+}
+
+/// PH-D2: Apply a fixed join strategy override via `SET LOCAL` hints.
+fn apply_fixed_join_strategy(strategy: crate::config::MergeJoinStrategy) {
+    let (nestloop, hashjoin, mergejoin, label) = match strategy {
+        crate::config::MergeJoinStrategy::HashJoin => ("off", "on", "on", "hash_join"),
+        crate::config::MergeJoinStrategy::NestedLoop => ("on", "off", "off", "nested_loop"),
+        crate::config::MergeJoinStrategy::MergeJoin => ("off", "off", "on", "merge_join"),
+        crate::config::MergeJoinStrategy::Auto => return,
+    };
+
+    for (param, val) in [
+        ("enable_nestloop", nestloop),
+        ("enable_hashjoin", hashjoin),
+        ("enable_mergejoin", mergejoin),
+    ] {
+        if let Err(e) = Spi::run(&format!("SET LOCAL {param} = {val}")) {
+            pgrx::debug1!("[pg_trickle] PH-D2: failed to SET LOCAL {param}: {}", e);
+        }
+    }
+
+    // For hash_join strategy, also raise work_mem to avoid hash spills.
+    if strategy == crate::config::MergeJoinStrategy::HashJoin {
+        let mb = crate::config::pg_trickle_merge_work_mem_mb();
+        if let Err(e) = Spi::run(&format!("SET LOCAL work_mem = '{mb}MB'")) {
+            pgrx::debug1!("[pg_trickle] PH-D2: failed to SET LOCAL work_mem: {}", e);
+        }
+    }
+
+    pgrx::debug1!("[pg_trickle] PH-D2: fixed join strategy={label} applied",);
 }
 
 // ── ST-to-ST Delta Capture (Phase 8.2/8.3) ─────────────────────────────
