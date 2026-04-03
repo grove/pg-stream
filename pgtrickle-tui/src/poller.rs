@@ -450,7 +450,10 @@ pub async fn execute_action(client: &Client, action: &ActionRequest) -> ActionRe
         },
         Err(e) => ActionResult {
             success: false,
-            message: format!("Error: {e}"),
+            message: e
+                .as_db_error()
+                .map(|db| format!("Error: {}", db.message()))
+                .unwrap_or_else(|| format!("Error: {e}")),
         },
     }
 }
