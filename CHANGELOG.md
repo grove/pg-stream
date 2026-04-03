@@ -60,6 +60,11 @@ For future plans and release milestones, see [ROADMAP.md](ROADMAP.md).
   joins), `merge_join` (force merge joins). Useful for workloads with consistent delta
   sizes where the heuristic is unnecessary overhead.
 
+- **PH-E1:** `pg_trickle.max_delta_estimate_rows` GUC — before executing the MERGE,
+  runs a capped COUNT on the delta subquery. If the output cardinality exceeds the
+  configured limit, emits a NOTICE and falls back to FULL refresh to prevent OOM or
+  excessive temp-file spills. Default: 0 (disabled). Recommended: 50000–500000.
+
 ### Changed
 
 - **TRUNC-1:** Documented existing TRUNCATE capture behavior in `docs/SQL_REFERENCE.md`.
@@ -69,6 +74,11 @@ For future plans and release milestones, see [ROADMAP.md](ROADMAP.md).
 - **G8.1:** Verified cross-session MERGE cache invalidation is already complete via the
   shared-memory `CACHE_GENERATION` counter + per-ST `defining_query_hash` check. No
   additional `catalog_version` column needed.
+
+- **EC-01:** Verified JOIN key change + simultaneous right-side DELETE correctness fix
+  is already implemented via R₀ pre-change snapshot strategy (Part 1a/1b split in delta
+  query). Updated `docs/SQL_REFERENCE.md` to replace the documented limitation with a
+  description of the fix. Unit + TPC-H regression tests already cover this scenario.
 
 ---
 

@@ -25,4 +25,12 @@
 -- PH-D2: merge_join_strategy GUC
 --   Registered via pgrx GUC infrastructure (auto-available after upgrade).
 --
+-- PH-E1: max_delta_estimate_rows GUC
+--   Registered via pgrx GUC infrastructure (auto-available after upgrade).
+--   Pre-flight delta output cardinality estimation before MERGE execution.
+--
+-- EC-01: JOIN key change + DELETE correctness fix
+--   Already implemented in v0.14.0 via R₀ pre-change snapshot strategy.
+--   Documentation updated to replace the known limitation section.
+--
 -- No catalog schema changes in this upgrade step.

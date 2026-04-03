@@ -23,6 +23,7 @@ Complete reference for all pg_trickle GUC (Grand Unified Configuration) variable
     - [pg\_trickle.slot\_lag\_critical\_threshold\_mb](#pg_trickleslot_lag_critical_threshold_mb)
   - [Refresh Performance](#refresh-performance)
     - [pg\_trickle.differential\_max\_change\_ratio](#pg_trickledifferential_max_change_ratio)
+    - [pg\_trickle.max\_delta\_estimate\_rows](#pg_tricklemax_delta_estimate_rows)
     - [pg\_trickle.planner\_aggressive](#pg_trickleplanner_aggressive)
     - [pg\_trickle.merge\_join\_strategy](#pg_tricklemerge_join_strategy)
     - [pg\_trickle.merge\_planner\_hints](#pg_tricklemerge_planner_hints) *(deprecated)*
@@ -404,6 +405,40 @@ SET pg_trickle.differential_max_change_ratio = 0.10;
 
 -- Disable adaptive fallback
 SET pg_trickle.differential_max_change_ratio = 0.0;
+```
+
+---
+
+### pg_trickle.max_delta_estimate_rows
+
+*Added in v0.15.0.* Maximum estimated delta output cardinality before falling back to FULL refresh.
+
+| Property | Value |
+|---|---|
+| Type | `int` |
+| Default | `0` (disabled) |
+| Range | `0` – `10,000,000` |
+| Context | `SUSET` |
+| Restart Required | No |
+
+Before executing the MERGE, the refresh executor extracts the delta subquery and runs a capped `SELECT count(*) FROM (delta LIMIT N+1)`. If the count reaches the configured limit, the refresh emits a `NOTICE` and falls back to FULL refresh to prevent OOM or excessive temp-file spills from unexpectedly large delta output.
+
+This is complementary to [`differential_max_change_ratio`](#pg_trickledifferential_max_change_ratio) which checks *input* change buffer size as a ratio of source table size. `max_delta_estimate_rows` checks *output* cardinality — catching cases where a small number of input changes produce a large delta output after JOINs.
+
+**Special Values:**
+- **`0`** (default): Disable the estimation check entirely.
+
+**Tuning Guidance:**
+- **Servers with 8–16 GB RAM**: Start with `100000` and adjust based on observed refresh behavior.
+- **Large-memory servers** (32+ GB): `500000` or higher.
+- **Complex multi-join queries**: Lower to `50000` since join fan-out can amplify small changes.
+
+```sql
+-- Enable delta output estimation with 100K row limit
+SET pg_trickle.max_delta_estimate_rows = 100000;
+
+-- Disable estimation (default)
+SET pg_trickle.max_delta_estimate_rows = 0;
 ```
 
 ---

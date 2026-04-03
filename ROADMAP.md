@@ -2881,21 +2881,18 @@ Validate correctness against independent query corpora beyond TPC-H.
 
 > **WM-7 subtotal: ~1–2 weeks**
 
-### Delta Cost Estimation (PH-E1)
+### Delta Cost Estimation (PH-E1) — ✅ Done
 
-> **In plain terms:** When a stream table's delta is unexpectedly large (e.g.
-> because a batch load was not gated), the generated delta SQL can consume all
-> available `work_mem` and spill multi-GB temp files. This adds a lightweight
-> pre-flight check: before executing the delta SQL, estimate intermediate
-> cardinality and downgrade to FULL refresh with a `NOTICE` if the estimate
-> exceeds a configurable budget. Prevents OOM and runaway temp-file growth on
-> unexpected large deltas.
+> **In plain terms:** Before executing the MERGE, runs a capped COUNT on the
+> delta subquery to estimate output cardinality. If the count exceeds
+> `pg_trickle.max_delta_estimate_rows`, emits a NOTICE and falls back to FULL
+> refresh to prevent OOM or excessive temp-file spills.
 
 | Item | Description | Effort | Ref |
 |------|-------------|--------|-----|
-| PH-E1 | **Delta cost estimation.** Before executing delta SQL, estimate intermediate cardinality from change buffer row count × join fan-out heuristic. Compare against `pg_trickle.max_delta_work_mem_mb` GUC (default: 2× `work_mem`). If exceeded, downgrade to FULL + emit `NOTICE`. | 1–2 wk | [PLAN_PERFORMANCE_PART_9.md §Phase E](plans/performance/PLAN_PERFORMANCE_PART_9.md) |
+| PH-E1 | **Delta cost estimation.** Capped `SELECT count(*) FROM (delta LIMIT N+1)` before MERGE execution. `max_delta_estimate_rows` GUC (default: 0 = disabled). Falls back to FULL + NOTICE when exceeded. | — | [PLAN_PERFORMANCE_PART_9.md §Phase E](plans/performance/PLAN_PERFORMANCE_PART_9.md) |
 
-> **PH-E1 subtotal: ~1–2 weeks**
+> **PH-E1 subtotal: ✅ Complete**
 
 ### dbt Hub Publication (I3)
 
@@ -3003,22 +3000,20 @@ Validate correctness against independent query corpora beyond TPC-H.
 
 > **E4 subtotal: ~8–12 hours**
 
-### JOIN Key Change + DELETE Correctness Fix (EC-01)
+### JOIN Key Change + DELETE Correctness Fix (EC-01) — ✅ Done (pre-existing)
 
-> **In plain terms:** When a row's join key is updated (`UPDATE orders SET
-> cust_id = 5 WHERE cust_id = 3`) in the same refresh cycle as the old join
-> partner is deleted, the delta query reads `current_right` after all changes
-> are applied — so the DELETE half finds no match and the stream table retains
-> stale data. This is a known data-correctness gap (G1.1 from
-> [GAP_SQL_PHASE_7.md](plans/sql/GAP_SQL_PHASE_7.md)). Option D (document +
-> FULL fallback) was the v0.2.0 decision; EC-01 implements the compensating
-> anti-join fix (Option C) to close it for good.
+> **In plain terms:** The phantom-row-after-DELETE bug was fixed in v0.14.0
+> via the R₀ pre-change snapshot strategy. Part 1 of the JOIN delta is split
+> into 1a (inserts ⋈ R₁) + 1b (deletes ⋈ R₀), ensuring DELETE deltas always
+> find the old join partner. The fix was extended to all join depths via the
+> EC-01B-1 per-leaf CTE strategy, and regression tests (EC-01B-2) cover
+> TPC-H Q07, Q08, Q09.
 
 | Item | Description | Effort | Ref |
 |------|-------------|--------|-----|
-| EC-01 | **Compensating anti-join for JOIN key change + DELETE.** After the MERGE, detect orphaned rows whose join partner no longer exists and emit corrective DELETEs. Closes G1.1 for all refresh modes. | 2–3d | [GAP_SQL_PHASE_7.md §G1.1](plans/sql/GAP_SQL_PHASE_7.md) |
+| EC-01 | **R₀ pre-change snapshot for JOIN key change + DELETE.** Part 1 split into 1a (inserts ⋈ R₁) + 1b (deletes ⋈ R₀). Applied to INNER/LEFT/FULL JOIN. Closes G1.1. | — | [GAP_SQL_PHASE_7.md §G1.1](plans/sql/GAP_SQL_PHASE_7.md) |
 
-> **EC-01 subtotal: ~2–3 days**
+> **EC-01 subtotal: ✅ Complete (implemented in v0.14.0)**
 
 ### Multi-Level ST-on-ST Testing (STST-3)
 
@@ -3098,7 +3093,7 @@ Validate correctness against independent query corpora beyond TPC-H.
 - [ ] G15-BC: `pgtrickle.bulk_create(definitions JSONB)` creates all STs and CDC triggers atomically; tested with 10+ definitions in a single call
 - [ ] G13-PRF: `parser.rs` split into ≥5 sub-modules; zero behavior change; all existing tests pass
 - [ ] WM-7: Stuck watermarks detected and downstream STs paused; `watermark_stuck` alert emitted; auto-resume on watermark advance
-- [ ] PH-E1: Delta cost estimation prevents OOM on large deltas; `max_delta_work_mem_mb` GUC respected; FULL downgrade + NOTICE emitted when threshold exceeded; tested with oversized delta
+- [x] PH-E1: Delta cost estimation via capped COUNT on delta subquery; `max_delta_estimate_rows` GUC; FULL downgrade + NOTICE when threshold exceeded
 - [ ] PH-E2: Spill-aware auto-adjustment triggers after 3 consecutive spills; `spill_history` exposed in `explain_st()`
 - [x] PH-D2: `merge_join_strategy` GUC with manual override (`auto`/`hash_join`/`nested_loop`/`merge_join`)
 - [ ] G14-SHC-SPIKE: RFC written; prototype benchmark validates or invalidates DSM-based approach
@@ -3107,7 +3102,7 @@ Validate correctness against independent query corpora beyond TPC-H.
 - [ ] I3: `dbt-pgtrickle` published on dbt Hub; `packages.yml` package-name install verified
 - [ ] E4: Flyway / Liquibase integration guide published in `docs/`
 - [ ] E5: ORM integration guides (SQLAlchemy, Django) published in `docs/`
-- [ ] EC-01: Compensating anti-join eliminates stale rows after JOIN key change + DELETE; E2E test confirms correctness
+- [x] EC-01: R₀ pre-change snapshot ensures DELETE deltas find old join partners; unit + TPC-H regression tests confirm correctness
 - [ ] STST-3: 3-level and 4-level ST-on-ST chains tested with INSERT/UPDATE/DELETE propagation; mixed modes covered
 - [ ] CIRC-IMM: Diamond + near-circular IMMEDIATE topologies tested; no deadlocks or incorrect results (conditional — can slip to v0.16.0)
 - [ ] G8.1: Cross-session MERGE cache invalidation via catalog version counter; tested with concurrent ALTER QUERY + refresh
