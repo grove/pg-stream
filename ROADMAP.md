@@ -2911,7 +2911,100 @@ Validate correctness against independent query corpora beyond TPC-H.
 
 > **I3 subtotal: ~2–4 hours**
 
-> **v0.15.0 total: ~16–28 hours + ~2–3d bulk create + ~3–4wk parser modularization + ~1–2wk watermark hold-back + ~1–2wk delta cost estimation**
+### Hash-Join Planner Hints (PH-D2)
+
+> **In plain terms:** The MERGE statement that applies deltas currently always
+> uses a nested-loop join, which is fastest for tiny deltas (<100 rows) but
+> suboptimal for medium deltas (1K–10K rows). This extends the existing
+> `SET LOCAL` planner hint injection to prefer hash joins when the estimated
+> delta exceeds a configurable threshold.
+
+| Item | Description | Effort | Ref |
+|------|-------------|--------|-----|
+| PH-D2 | **Hash-join planner hints.** Extend `SET LOCAL` injection to prefer hash joins over nested-loop joins for MERGE when delta exceeds 1K rows (nested-loop is optimal for tiny deltas, hash-join for medium). | 3–5d | [PLAN_PERFORMANCE_PART_9.md §Phase D](plans/performance/PLAN_PERFORMANCE_PART_9.md) |
+
+> **PH-D2 subtotal: ~3–5 days**
+
+### Shared-Memory Template Cache Research Spike (G14-SHC-SPIKE)
+
+> **In plain terms:** Every new database connection that triggers a refresh
+> pays a 15–50ms cold-start cost to regenerate the MERGE SQL template. With
+> PgBouncer in transaction mode, this happens on every refresh cycle. This
+> milestone scopes a research spike only: write an RFC, build a prototype,
+> measure whether DSM-based caching eliminates the cold-start. Full
+> implementation stays in v0.16.0.
+
+| Item | Description | Effort | Ref |
+|------|-------------|--------|-----|
+| G14-SHC-SPIKE | **Shared-memory template cache research spike.** Write an RFC for DSM + lwlock-based MERGE SQL template caching. Build a prototype benchmark to validate cold-start elimination. Full implementation deferred to v0.16.0. | 2–3d | [plans/performance/REPORT_OVERALL_STATUS.md §14](plans/performance/REPORT_OVERALL_STATUS.md) |
+
+> **G14-SHC-SPIKE subtotal: ~2–3 days**
+
+### TRUNCATE Capture for Trigger-Mode CDC (TRUNC-1)
+
+> **In plain terms:** WAL-mode CDC detects TRUNCATE on source tables and
+> marks downstream stream tables for reinitialization. But trigger-mode CDC
+> has no TRUNCATE handler — a `TRUNCATE` silently leaves the stream table
+> stale. Adding a DDL event trigger that catches TRUNCATE and flags affected
+> STs closes this correctness gap.
+
+| Item | Description | Effort | Ref |
+|------|-------------|--------|-----|
+| TRUNC-1 | **TRUNCATE capture for trigger-mode CDC.** Add a DDL event trigger or statement-level trigger that detects TRUNCATE on source tables in trigger CDC mode and marks downstream STs for `needs_reinit`. | 4–6h | [plans/adrs/PLAN_ADRS.md](plans/adrs/PLAN_ADRS.md) ADR-070 |
+
+> **TRUNC-1 subtotal: ~4–6 hours**
+
+### Volatile Function Policy GUC (VOL-1)
+
+> **In plain terms:** Volatile functions (`random()`, `clock_timestamp()`,
+> etc.) are correctly rejected at stream table creation time in DIFFERENTIAL
+> and IMMEDIATE modes. But there’s no way for users to override this — some
+> want volatile functions in FULL mode. Adding a `volatile_function_policy`
+> GUC with `reject`/`warn`/`allow` modes gives operators control.
+
+| Item | Description | Effort | Ref |
+|------|-------------|--------|-----|
+| VOL-1 | **`pg_trickle.volatile_function_policy` GUC.** Add a GUC with values `reject` (default), `warn`, `allow` to control volatile function handling. `reject` preserves current behavior; `warn` emits WARNING but allows creation; `allow` silently permits (user accepts correctness risk). | 3–5h | [plans/sql/PLAN_NON_DETERMINISM.md](plans/sql/PLAN_NON_DETERMINISM.md) |
+
+> **VOL-1 subtotal: ~3–5 hours**
+
+### Spill-Aware Refresh (PH-E2)
+
+> **In plain terms:** After PH-E1 adds pre-flight cost estimation, PH-E2
+> adds post-flight monitoring: track `temp_bytes` from `pg_stat_statements`
+> after each refresh cycle and auto-adjust if spill is excessive.
+
+| Item | Description | Effort | Ref |
+|------|-------------|--------|-----|
+| PH-E2 | **Spill-aware refresh.** Monitor `temp_bytes` from `pg_stat_statements` after each refresh cycle. If spill exceeds threshold 3 consecutive times, automatically increase `per-ST work_mem` override or switch to FULL. Expose in `explain_st()` as `spill_history`. | 1–2 wk | [PLAN_PERFORMANCE_PART_9.md §Phase E](plans/performance/PLAN_PERFORMANCE_PART_9.md) |
+
+> **PH-E2 subtotal: ~1–2 weeks**
+
+### ORM Integration Guides (E5)
+
+> **In plain terms:** Documentation showing how popular ORMs (SQLAlchemy,
+> Django, etc.) interact with stream tables — model definitions, migrations,
+> and freshness checks. Documentation-only work.
+
+| Item | Description | Effort | Ref |
+|------|-------------|--------|-----|
+| E5 | ORM integrations guide (SQLAlchemy, Django, etc.) | 8–12h | [PLAN_ECO_SYSTEM.md §5](plans/ecosystem/PLAN_ECO_SYSTEM.md) |
+
+> **E5 subtotal: ~8–12 hours**
+
+### Flyway / Liquibase Migration Support (E4)
+
+> **In plain terms:** Documentation showing how standard migration frameworks
+> interact with stream tables — CREATE/ALTER/DROP patterns, handling CDC
+> triggers across schema migrations. Documentation-only work.
+
+| Item | Description | Effort | Ref |
+|------|-------------|--------|-----|
+| E4 | Flyway / Liquibase migration support | 8–12h | [PLAN_ECO_SYSTEM.md §5](plans/ecosystem/PLAN_ECO_SYSTEM.md) |
+
+> **E4 subtotal: ~8–12 hours**
+
+> **v0.15.0 total: ~40–70 hours + ~2–3d bulk create + ~3–5d planner hints + ~2–3d cache spike + ~3–4wk parser modularization + ~1–2wk watermark hold-back + ~2–4wk delta cost/spill estimation**
 
 **Exit criteria:**
 - [ ] At least one external test corpus (sqllogictest, JOB, or Nexmark) passes
@@ -2920,7 +3013,14 @@ Validate correctness against independent query corpora beyond TPC-H.
 - [ ] G13-PRF: `parser.rs` split into ≥5 sub-modules; zero behavior change; all existing tests pass
 - [ ] WM-7: Stuck watermarks detected and downstream STs paused; `watermark_stuck` alert emitted; auto-resume on watermark advance
 - [ ] PH-E1: Delta cost estimation prevents OOM on large deltas; `max_delta_work_mem_mb` GUC respected; FULL downgrade + NOTICE emitted when threshold exceeded; tested with oversized delta
+- [ ] PH-E2: Spill-aware auto-adjustment triggers after 3 consecutive spills; `spill_history` exposed in `explain_st()`
+- [ ] PH-D2: Hash-join planner hints active for medium deltas; benchmarked against nested-loop baseline
+- [ ] G14-SHC-SPIKE: RFC written; prototype benchmark validates or invalidates DSM-based approach
+- [ ] TRUNC-1: TRUNCATE on trigger-mode CDC source marks downstream STs for reinit; tested end-to-end
+- [ ] VOL-1: `volatile_function_policy` GUC controls volatile function handling; `reject`/`warn`/`allow` modes tested
 - [ ] I3: `dbt-pgtrickle` published on dbt Hub; `packages.yml` package-name install verified
+- [ ] E4: Flyway / Liquibase integration guide published in `docs/`
+- [ ] E5: ORM integration guides (SQLAlchemy, Django) published in `docs/`
 - [ ] Extension upgrade path tested (`0.14.0 → 0.15.0`)
 
 ---
@@ -3002,9 +3102,9 @@ tables naturally without calling `pgtrickle.create_stream_table()`.
 | Item | Description | Effort | Ref |
 |------|-------------|--------|-----|
 | PH-E1 | **Delta cost estimation.** Before executing delta SQL, estimate intermediate cardinality from change buffer row count × join fan-out heuristic. Compare against `pg_trickle.max_delta_work_mem_mb` GUC (default: 2× `work_mem`). If exceeded, downgrade to FULL + emit `NOTICE`. | 1–2 wk | [PLAN_PERFORMANCE_PART_9.md §Phase E](plans/performance/PLAN_PERFORMANCE_PART_9.md) |
-| PH-E2 | **Spill-aware refresh.** Monitor `temp_bytes` from `pg_stat_statements` after each refresh cycle. If spill exceeds threshold 3 consecutive times, automatically increase `per-ST work_mem` override or switch to FULL. Expose in `explain_st()` as `spill_history`. | 1–2 wk | [PLAN_PERFORMANCE_PART_9.md §Phase E](plans/performance/PLAN_PERFORMANCE_PART_9.md) |
+| PH-E2 | ~~**Spill-aware refresh.** Monitor `temp_bytes` from `pg_stat_statements` after each refresh cycle. If spill exceeds threshold 3 consecutive times, automatically increase `per-ST work_mem` override or switch to FULL. Expose in `explain_st()` as `spill_history`.~~ ➡️ Pulled to v0.15.0 | 1–2 wk | [PLAN_PERFORMANCE_PART_9.md §Phase E](plans/performance/PLAN_PERFORMANCE_PART_9.md) |
 
-> **Memory & I/O budget subtotal: ~1–2 weeks (PH-E1 ➡️ pulled to v0.15.0; PH-E2 remains here)**
+> **Memory & I/O budget subtotal: PH-E1 + PH-E2 ➡️ pulled to v0.15.0**
 
 ### Shared-Memory Template Caching (G14-SHC)
 
@@ -3017,7 +3117,7 @@ tables naturally without calling `pgtrickle.create_stream_table()`.
 
 | Item | Description | Effort | Ref |
 |------|-------------|--------|-----|
-| G14-SHC | **Shared-memory template caching (research spike → implementation).** Evaluate eliminating the per-connection MERGE SQL cold-start (~15–50ms overhead) via PostgreSQL DSM + lwlock. Write an RFC before implementing; validate with a prototype benchmark. | ~2–3wk | [plans/performance/REPORT_OVERALL_STATUS.md §14](plans/performance/REPORT_OVERALL_STATUS.md) |
+| G14-SHC | **Shared-memory template caching (implementation).** Full implementation of DSM + lwlock-based MERGE SQL template caching, building on the G14-SHC-SPIKE RFC from v0.15.0. | ~2–3wk | [plans/performance/REPORT_OVERALL_STATUS.md §14](plans/performance/REPORT_OVERALL_STATUS.md) |
 
 > **G14-SHC subtotal: ~2–3 weeks**
 
@@ -3091,8 +3191,8 @@ These are not gated on 1.0 but represent the longer-term horizon.
 | E1 | dbt full adapter (`dbt-pgtrickle` extending `dbt-postgres`) | 20–30h | [PLAN_DBT_ADAPTER.md](plans/dbt/PLAN_DBT_ADAPTER.md) |
 | E2 | Airflow provider (`apache-airflow-providers-pgtrickle`) | 16–20h | [PLAN_ECO_SYSTEM.md §4](plans/ecosystem/PLAN_ECO_SYSTEM.md) |
 | ~~E3~~ | ~~CLI tool (`pgtrickle`) for management outside SQL~~ ➡️ Pulled to v0.14.0 as TUI (E3-TUI) | 4–6d | [PLAN_TUI.md](plans/ui/PLAN_TUI.md) |
-| E4 | Flyway / Liquibase migration support | 8–12h | [PLAN_ECO_SYSTEM.md §5](plans/ecosystem/PLAN_ECO_SYSTEM.md) |
-| E5 | ORM integrations guide (SQLAlchemy, Django, etc.) | 8–12h | [PLAN_ECO_SYSTEM.md §5](plans/ecosystem/PLAN_ECO_SYSTEM.md) |
+| E4 | ~~Flyway / Liquibase migration support~~ ➡️ Pulled to v0.15.0 | 8–12h | [PLAN_ECO_SYSTEM.md §5](plans/ecosystem/PLAN_ECO_SYSTEM.md) |
+| E5 | ~~ORM integrations guide (SQLAlchemy, Django, etc.)~~ ➡️ Pulled to v0.15.0 | 8–12h | [PLAN_ECO_SYSTEM.md §5](plans/ecosystem/PLAN_ECO_SYSTEM.md) |
 
 ### Scale
 
@@ -3177,7 +3277,7 @@ These are not gated on 1.0 but represent the longer-term horizon.
 | v0.12.0 — Scalability Foundations, Partitioning Enhancements & Correctness | ~18–27 wk + ~6–8 wk scalability + ~5–8 wk partitioning + ~1–3 wk defaults | — | |
 | v0.13.0 — Scalability Foundations, Partitioning Enhancements, MERGE Profiling & Multi-Tenant Scheduling | ~15–23 wk | — | |
 | v0.14.0 — Tiered Scheduling, UNLOGGED Buffers & Diagnostics | ~2–6 wk + ~1 wk patterns + ~2–4d stability + ~3.5–7d diagnostics + ~1–2d export + ~4–6d TUI + ~0.5d docs | — | |
-| v0.15.0 — External Test Suites & Integration | ~16–28h + ~2–3d bulk create + ~3–4wk parser + ~1–2wk watermark + ~1–2wk delta cost estimation | — | |
+| v0.15.0 — External Test Suites & Integration | ~40–70h + ~2–3d bulk create + ~3–5d planner hints + ~2–3d cache spike + ~3–4wk parser + ~1–2wk watermark + ~2–4wk delta cost/spill | — | |
 | v0.16.0 — PG Backward Compatibility & Native DDL Syntax | ~38–56h (PG compat) + ~13–21d (Native DDL) + ~2–3wk MERGE alts + ~2–4wk memory budget + ~2–3wk template cache | — | |
 | v1.0.0 — Stable release | 18–27h | — | |
 | Post-1.0 (ecosystem) | 88–134h | — | |
