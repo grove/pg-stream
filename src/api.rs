@@ -262,6 +262,144 @@ fn create_stream_table_if_not_exists_impl(
     }
 }
 
+/// G15-BC: Create multiple stream tables in a single transaction.
+///
+/// Accepts a JSONB array of stream table definitions. Each element must be
+/// an object with at least `name` and `query` keys; all other keys match
+/// the parameters of [`create_stream_table`] (snake_case).
+///
+/// Returns a JSONB array of results, one per input definition:
+/// ```json
+/// [
+///   {"name": "my_st", "status": "created", "pgt_id": 42},
+///   {"name": "bad_st", "status": "error", "error": "query parse error: …"}
+/// ]
+/// ```
+///
+/// On any error, the entire transaction is rolled back (standard PostgreSQL
+/// transactional semantics).
+#[pg_extern(schema = "pgtrickle")]
+fn bulk_create(definitions: pgrx::JsonB) -> pgrx::JsonB {
+    let result = bulk_create_impl(definitions.0);
+    match result {
+        Ok(results_json) => pgrx::JsonB(results_json),
+        Err(e) => raise_error_with_context(e),
+    }
+}
+
+fn bulk_create_impl(definitions: serde_json::Value) -> Result<serde_json::Value, PgTrickleError> {
+    let defs = definitions.as_array().ok_or_else(|| {
+        PgTrickleError::InvalidArgument(
+            "bulk_create() expects a JSONB array of stream table definitions".into(),
+        )
+    })?;
+
+    if defs.is_empty() {
+        return Err(PgTrickleError::InvalidArgument(
+            "bulk_create() definitions array is empty".into(),
+        ));
+    }
+
+    let mut results = Vec::with_capacity(defs.len());
+
+    for (i, def) in defs.iter().enumerate() {
+        let obj = def.as_object().ok_or_else(|| {
+            PgTrickleError::InvalidArgument(format!(
+                "bulk_create() element [{}] is not a JSON object",
+                i
+            ))
+        })?;
+
+        let name = obj.get("name").and_then(|v| v.as_str()).ok_or_else(|| {
+            PgTrickleError::InvalidArgument(format!(
+                "bulk_create() element [{}] missing required \"name\" string",
+                i
+            ))
+        })?;
+
+        let query = obj.get("query").and_then(|v| v.as_str()).ok_or_else(|| {
+            PgTrickleError::InvalidArgument(format!(
+                "bulk_create() element [{}] \"{}\" missing required \"query\" string",
+                i, name
+            ))
+        })?;
+
+        let schedule = obj.get("schedule").and_then(|v| v.as_str());
+        let refresh_mode = obj
+            .get("refresh_mode")
+            .and_then(|v| v.as_str())
+            .unwrap_or("AUTO");
+        let initialize = obj
+            .get("initialize")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
+        let diamond_consistency = obj.get("diamond_consistency").and_then(|v| v.as_str());
+        let diamond_schedule_policy = obj.get("diamond_schedule_policy").and_then(|v| v.as_str());
+        let cdc_mode = obj.get("cdc_mode").and_then(|v| v.as_str());
+        let append_only = obj
+            .get("append_only")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let pooler_compatibility_mode = obj
+            .get("pooler_compatibility_mode")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let partition_by = obj.get("partition_by").and_then(|v| v.as_str());
+        let max_differential_joins = obj
+            .get("max_differential_joins")
+            .and_then(|v| v.as_i64())
+            .map(|v| v as i32);
+        let max_delta_fraction = obj.get("max_delta_fraction").and_then(|v| v.as_f64());
+
+        match create_stream_table_impl(
+            name,
+            query,
+            schedule,
+            refresh_mode,
+            initialize,
+            diamond_consistency,
+            diamond_schedule_policy,
+            cdc_mode,
+            append_only,
+            pooler_compatibility_mode,
+            partition_by,
+            max_differential_joins,
+            max_delta_fraction,
+        ) {
+            Ok(()) => {
+                // Look up pgt_id for the result
+                let (schema, table_name) =
+                    parse_qualified_name(name).unwrap_or_else(|_| ("public".into(), name.into()));
+                let pgt_id = StreamTableMeta::get_by_name(&schema, &table_name)
+                    .map(|st| st.pgt_id)
+                    .unwrap_or(-1);
+
+                results.push(serde_json::json!({
+                    "name": name,
+                    "status": "created",
+                    "pgt_id": pgt_id,
+                }));
+            }
+            Err(e) => {
+                // Abort the entire batch on error — the transaction will
+                // be rolled back by PostgreSQL. Return immediate error
+                // with context about which definition failed.
+                return Err(PgTrickleError::InvalidArgument(format!(
+                    "bulk_create() failed on element [{}] \"{}\": {}",
+                    i, name, e
+                )));
+            }
+        }
+    }
+
+    pgrx::info!(
+        "pg_trickle: bulk_create created {} stream table(s)",
+        results.len()
+    );
+
+    Ok(serde_json::Value::Array(results))
+}
+
 /// Create or replace a stream table.
 ///
 /// If the stream table does not exist, it is created (identical to
@@ -9215,5 +9353,42 @@ mod tests {
             msg.contains("modulus"),
             "Error should mention modulus: {msg}"
         );
+    }
+
+    // ── G15-BC: bulk_create_impl JSONB validation tests ─────────────
+
+    #[test]
+    fn test_bulk_create_impl_rejects_non_array() {
+        let input = serde_json::json!({"name": "t1", "query": "SELECT 1"});
+        let err = bulk_create_impl(input).unwrap_err();
+        assert!(err.to_string().contains("JSONB array"));
+    }
+
+    #[test]
+    fn test_bulk_create_impl_rejects_empty_array() {
+        let input = serde_json::json!([]);
+        let err = bulk_create_impl(input).unwrap_err();
+        assert!(err.to_string().contains("empty"));
+    }
+
+    #[test]
+    fn test_bulk_create_impl_rejects_non_object_element() {
+        let input = serde_json::json!(["not an object"]);
+        let err = bulk_create_impl(input).unwrap_err();
+        assert!(err.to_string().contains("not a JSON object"));
+    }
+
+    #[test]
+    fn test_bulk_create_impl_rejects_missing_name() {
+        let input = serde_json::json!([{"query": "SELECT 1"}]);
+        let err = bulk_create_impl(input).unwrap_err();
+        assert!(err.to_string().contains("missing required \"name\""));
+    }
+
+    #[test]
+    fn test_bulk_create_impl_rejects_missing_query() {
+        let input = serde_json::json!([{"name": "t1"}]);
+        let err = bulk_create_impl(input).unwrap_err();
+        assert!(err.to_string().contains("missing required \"query\""));
     }
 }
