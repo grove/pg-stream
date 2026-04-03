@@ -222,7 +222,7 @@ RETURNS TABLE (
 $$;
 
 -- ── export_definition() ───────────────────────────────────────────────────
--- Used by: export
+-- Used by: export (CLI command only — TUI now reads pgt_stream_tables directly)
 CREATE OR REPLACE FUNCTION pgtrickle.export_definition(st_name text)
 RETURNS text LANGUAGE sql STABLE AS $$
     SELECT format(
@@ -230,6 +230,24 @@ RETURNS text LANGUAGE sql STABLE AS $$
         st_name
     )
 $$;
+
+-- ── pgt_stream_tables catalog ─────────────────────────────────────────────
+-- Used by: TUI FetchDdl (reads defining_query, schedule, refresh_mode)
+CREATE TABLE IF NOT EXISTS pgtrickle.pgt_stream_tables (
+    pgt_id          bigserial PRIMARY KEY,
+    pgt_relid       oid NOT NULL UNIQUE DEFAULT 0,
+    pgt_name        text NOT NULL,
+    pgt_schema      text NOT NULL,
+    defining_query  text NOT NULL,
+    schedule        text,
+    refresh_mode    text NOT NULL DEFAULT 'DIFFERENTIAL',
+    status          text NOT NULL DEFAULT 'ACTIVE',
+    is_populated    bool NOT NULL DEFAULT true,
+    consecutive_errors int NOT NULL DEFAULT 0
+);
+INSERT INTO pgtrickle.pgt_stream_tables (pgt_name, pgt_schema, defining_query, refresh_mode)
+VALUES ('test_table', 'public', 'SELECT id, val FROM source_table', 'DIFFERENTIAL')
+ON CONFLICT DO NOTHING;
 
 -- ── create_stream_table() ─────────────────────────────────────────────────
 -- Used by: create

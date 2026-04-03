@@ -892,19 +892,6 @@ async fn poller_task(
                                 let _ = tx.send(PollMsg::AuxiliaryColumns(name.clone(), result.message)).await;
                                 continue;
                             }
-                            ActionRequest::FetchDdl(_) if !result.success => {
-                                // export_definition() was added in v0.14.0 — degrade gracefully.
-                                let friendly = if result.message.contains("does not exist") {
-                                    "export_definition() requires pg_trickle ≥ 0.14.0".to_string()
-                                } else {
-                                    result.message.clone()
-                                };
-                                let _ = tx.send(PollMsg::ActionResult(ActionResult {
-                                    success: false,
-                                    message: friendly,
-                                })).await;
-                                continue;
-                            }
                             // Silently degrade background enrichment fetches — these are
                             // auto-triggered and may not exist on older extension versions.
                             ActionRequest::FetchDiagnoseErrors(_)

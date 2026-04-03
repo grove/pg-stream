@@ -262,16 +262,36 @@ pub async fn execute_action(client: &Client, action: &ActionRequest) -> ActionRe
             }
         }
         ActionRequest::FetchDdl(name) => {
-            // We embed the name directly rather than using a parameter because
-            // tokio-postgres sends OID 0 (unknown) for &String parameters, and
-            // some PostgreSQL builds fail to resolve the overload even with a
-            // ::text cast in the query text.  The name comes from our own
-            // catalog (schema.table) so it is safe to embed.
-            let safe_name = name.replace('\'', "''");
-            let sql = format!("SELECT pgtrickle.export_definition('{safe_name}')");
-            match client.query_one(&*sql, &[]).await {
+            // Parse schema.name — name is always schema-qualified by the time it gets here.
+            let (schema, table) = match name.split_once('.') {
+                Some(pair) => pair,
+                None => ("public", name.as_str()),
+            };
+            match client
+                .query_one(
+                    "SELECT defining_query::text, schedule::text, refresh_mode::text
+                       FROM pgtrickle.pgt_stream_tables
+                      WHERE pgt_schema = $1 AND pgt_name = $2",
+                    &[&schema, &table],
+                )
+                .await
+            {
                 Ok(row) => {
-                    let ddl: String = row.get(0);
+                    let query: String = row.get(0);
+                    let schedule: Option<String> = row.get(1);
+                    let refresh_mode: String = row.get(2);
+                    let mut ddl = format!(
+                        "-- Stream table: {name}\n\
+                         DROP STREAM TABLE IF EXISTS {name};\n\n\
+                         SELECT pgtrickle.create_stream_table(\n  name   => '{name}',\n  query  => $pgt$\n{query}\n$pgt$"
+                    );
+                    if let Some(sched) = schedule {
+                        ddl.push_str(&format!(",\n  schedule => '{sched}'"));
+                    }
+                    if refresh_mode != "DIFFERENTIAL" {
+                        ddl.push_str(&format!(",\n  refresh_mode => '{refresh_mode}'"));
+                    }
+                    ddl.push_str("\n);");
                     Ok(ddl)
                 }
                 Err(e) => Err(e),
