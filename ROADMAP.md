@@ -3052,7 +3052,48 @@ Validate correctness against independent query corpora beyond TPC-H.
 
 > **CIRC-IMM subtotal: ~3–5 days (conditional — can slip to v0.16.0)**
 
-> **v0.15.0 total: ~40–70h + ~2–3d bulk create + ~3–5d planner hints + ~2–3d cache spike + ~3–4wk parser + ~1–2wk watermark + ~2–4wk delta cost/spill + ~2–3d EC-01 + ~3–5d ST-on-ST + ~3–5d CIRC-IMM**
+### Cross-Session MERGE Cache Staleness Fix (G8.1)
+
+> **In plain terms:** When session A alters a stream table's defining query,
+> session B's cached MERGE SQL template remains stale until B encounters a
+> refresh error or reconnects. Adding a catalog version counter that is
+> bumped on every ALTER QUERY and checked before each refresh closes this
+> race window.
+
+| Item | Description | Effort | Ref |
+|------|-------------|--------|-----|
+| G8.1 | **Cross-session MERGE cache invalidation.** Add a `catalog_version` counter to `pgt_stream_tables`, bump on ALTER QUERY / DROP / reinit. Before each refresh, compare cached version to catalog; regenerate template on mismatch. | 4–6h | — |
+
+> **G8.1 subtotal: ~4–6 hours**
+
+### `explain_st()` Enhancements (EXPL-ENH)
+
+> **In plain terms:** Small quality-of-life improvements to the diagnostic
+> function: query-plan annotations showing which operators the DVM chose,
+> partition source info, and a dependency-graph visualization snippet.
+> These can accompany other items (PH-E2 adds `spill_history`, PH-D2 adds
+> planner hint info) or be delivered standalone.
+
+| Item | Description | Effort | Ref |
+|------|-------------|--------|-----|
+| EXPL-ENH | **`explain_st()` enhancements.** Add: (a) per-operator timing breakdown annotations, (b) source partition info for partitioned tables, (c) dependency sub-graph visualization (ASCII or DOT format). | 4–8h | [PLAN_FEATURE_CLEANUP.md](plans/PLAN_FEATURE_CLEANUP.md) |
+
+> **EXPL-ENH subtotal: ~4–8 hours**
+
+### CNPG Operator Hardening (R4)
+
+> **In plain terms:** Kubernetes-native improvements for the CloudNativePG
+> integration: adopt K8s 1.33+ native ImageVolume (replacing the init-container
+> workaround), add liveness/readiness probe integration for pg_trickle health,
+> and test failover behavior with stream tables.
+
+| Item | Description | Effort | Ref |
+|------|-------------|--------|-----|
+| R4 | **CNPG operator hardening.** Adopt K8s 1.33+ native ImageVolume, add pg_trickle health to CNPG liveness/readiness probes, test primary→replica failover with active stream tables. | 4–6h | [PLAN_CLOUDNATIVEPG.md](plans/ecosystem/PLAN_CLOUDNATIVEPG.md) |
+
+> **R4 subtotal: ~4–6 hours**
+
+> **v0.15.0 total: ~52–90h + ~2–3d bulk create + ~3–5d planner hints + ~2–3d cache spike + ~3–4wk parser + ~1–2wk watermark + ~2–4wk delta cost/spill + ~2–3d EC-01 + ~3–5d ST-on-ST + ~3–5d CIRC-IMM**
 
 **Exit criteria:**
 - [ ] At least one external test corpus (sqllogictest, JOB, or Nexmark) passes
@@ -3072,6 +3113,9 @@ Validate correctness against independent query corpora beyond TPC-H.
 - [ ] EC-01: Compensating anti-join eliminates stale rows after JOIN key change + DELETE; E2E test confirms correctness
 - [ ] STST-3: 3-level and 4-level ST-on-ST chains tested with INSERT/UPDATE/DELETE propagation; mixed modes covered
 - [ ] CIRC-IMM: Diamond + near-circular IMMEDIATE topologies tested; no deadlocks or incorrect results (conditional — can slip to v0.16.0)
+- [ ] G8.1: Cross-session MERGE cache invalidation via catalog version counter; tested with concurrent ALTER QUERY + refresh
+- [ ] EXPL-ENH: `explain_st()` shows per-operator timing, partition info, and dependency visualization
+- [ ] R4: CNPG operator hardening — ImageVolume, health probes, failover tested
 - [ ] G13-PRF: `parser.rs` split into ≥5 sub-modules; all ~690 `unsafe` blocks have `// SAFETY:` comments; zero behavior change; all existing tests pass
 - [ ] Extension upgrade path tested (`0.14.0 → 0.15.0`)
 
@@ -3211,9 +3255,9 @@ distribution — getting pg_trickle onto package registries.
 | R2 | apt / rpm packaging (Debian/Ubuntu `.deb` + RHEL `.rpm` via PGDG) | 8–12h | [PLAN_PACKAGING.md](plans/infra/PLAN_PACKAGING.md) |
 | R2b | PGXN `release_status` → `"stable"` (flip one field; PGXN testing release ships in v0.7.0) | 30min | [PLAN_PACKAGING.md](plans/infra/PLAN_PACKAGING.md) |
 | R3 | ~~Docker Hub official image~~ → CNPG extension image | ✅ Done | [PLAN_CLOUDNATIVEPG.md](plans/ecosystem/PLAN_CLOUDNATIVEPG.md) |
-| R4 | CNPG operator hardening (K8s 1.33+ native ImageVolume) | 4–6h | [PLAN_CLOUDNATIVEPG.md](plans/ecosystem/PLAN_CLOUDNATIVEPG.md) |
+| R4 | ~~CNPG operator hardening (K8s 1.33+ native ImageVolume)~~ ➡️ Pulled to v0.15.0 | 4–6h | [PLAN_CLOUDNATIVEPG.md](plans/ecosystem/PLAN_CLOUDNATIVEPG.md) |
 
-> **v1.0.0 total: ~18–28 hours**
+> **v1.0.0 total: ~14–22 hours**
 
 **Exit criteria:**
 - [ ] Published on PGXN (stable) and apt/rpm via PGDG
