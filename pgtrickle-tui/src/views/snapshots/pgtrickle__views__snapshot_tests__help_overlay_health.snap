@@ -12,7 +12,7 @@ expression: output
 │  5        Diagnostics                   s / S    Sort / reverse sort         │
 │  6        CDC health                    t        Toggle light/dark theme     │
 │  7        Configuration                 Ctrl+R   Force poll now              │
-│  0        Health checks                 Ctrl+E   Export view to JSON         │
+│  8        Health checks                 Ctrl+E   Export view to JSON         │
 │  9        Alerts                        /        Filter tables               │
 │  w        Workers & job queue           :        Command palette             │
 │  f        Fuse & circuit breaker        ?        Toggle help                 │

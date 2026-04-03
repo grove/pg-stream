@@ -41,8 +41,7 @@ impl Theme {
                 .add_modifier(Modifier::BOLD),
             footer: Style::default().fg(Color::DarkGray),
             footer_active: Style::default()
-                .fg(Color::White)
-                .bg(Color::DarkGray)
+                .add_modifier(Modifier::REVERSED)
                 .add_modifier(Modifier::BOLD),
             dim: Style::default().fg(Color::DarkGray),
         }
@@ -69,8 +68,7 @@ impl Theme {
                 .add_modifier(Modifier::BOLD),
             footer: Style::default().fg(Color::Gray),
             footer_active: Style::default()
-                .fg(Color::Black)
-                .bg(Color::LightBlue)
+                .add_modifier(Modifier::REVERSED)
                 .add_modifier(Modifier::BOLD),
             dim: Style::default().fg(Color::Gray),
         }
