@@ -354,9 +354,9 @@ pub struct CdcHealthEntry {
 
 #[derive(Clone, Serialize)]
 pub struct QuickHealth {
-    pub total_stream_tables: i32,
-    pub error_tables: i32,
-    pub stale_tables: i32,
+    pub total_stream_tables: i64,
+    pub error_tables: i64,
+    pub stale_tables: i64,
     pub scheduler_running: bool,
     pub status: String,
 }
