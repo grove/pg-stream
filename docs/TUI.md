@@ -103,12 +103,12 @@ Press `q` or `Ctrl+C` to exit.
 
 ### Views
 
-There are 13 views. Switch between them by pressing the key shown:
+There are 14 views. Switch between them by pressing the key shown:
 
 | Key | View | What it shows |
 |-----|------|---------------|
 | `1` | **Dashboard** | All stream tables in a sortable list with status, mode, staleness, and last refresh time. A status ribbon at the top summarizes active/error/stale counts. |
-| `2` | **Detail** | Deep dive into the selected stream table: properties (schema, status, mode, schedule, tier), refresh statistics (total, failed, avg duration), and error details. |
+| `2` | **Detail** | Deep dive into the selected stream table: properties (schema, status, mode, schedule, tier, refresh mode explanation), source tables, refresh history, CDC health, and diagnosed errors for error-state tables. |
 | `3` | **Dependencies** | The stream table dependency graph rendered as an ASCII tree. Edges are color-coded by status (green = active, red = error). |
 | `4` | **Refresh Log** | A scrollable timeline of recent refreshes across all tables — timestamp, mode (DIFF/FULL), table name, status, duration, and rows affected. |
 | `5` | **Diagnostics** | Output of `recommend_refresh_mode()` — shows each table's current mode vs. recommended mode with confidence level and reasoning. |
@@ -118,8 +118,9 @@ There are 13 views. Switch between them by pressing the key shown:
 | `9` | **Alerts** | Real-time alert feed from `LISTEN pg_trickle_alert`. Shows timestamp, severity icon, and message for each event. |
 | `w` | **Workers** | Background scheduler worker pool: each worker's state (running/idle), the table it's refreshing, and duration. Below that, the pending job queue with priority and wait time. |
 | `f` | **Fuse** | Circuit breaker status for each stream table: fuse state (ARMED/TRIPPED/BLOWN), consecutive error count, and last error message. |
-| `m` | **Watermarks** | Watermark group alignment: group name, member count, min/max watermarks, and whether the group is gated. |
-| `d` | **Delta Inspector** | Shows the selected stream table's metadata and the CLI commands to inspect its delta SQL, operator tree, and dedup stats. |
+| `m` | **Watermarks** | Watermark group alignment: group name, member count, min/max watermarks, and whether the group is gated. Two tabs: Groups and Gates. |
+| `d` | **Delta Inspector** | Fetches and displays the auto-generated delta SQL for the selected stream table (two tabs: Delta SQL and Auxiliary Columns). Press `e` to show the table's CREATE DDL. |
+| `i` | **Issues** | All detected DAG issues (cycles, orphans, missing sources) sorted by severity and blast radius. |
 
 ### Keyboard Shortcuts
 
@@ -129,37 +130,60 @@ There are 13 views. Switch between them by pressing the key shown:
 |-----|--------|
 | `j` or `↓` | Move selection down |
 | `k` or `↑` | Move selection up |
+| `Page Down` / `Page Up` | Scroll 20 rows |
 | `Home` | Jump to first row |
 | `End` | Jump to last row |
-| `Enter` | Drill into detail (from Dashboard) |
-| `Esc` | Go back to Dashboard / close help / clear filter |
+| `Enter` | Drill into detail (Dashboard → Detail view; Delta Inspector → reload delta SQL) |
+| `Esc` | Go back to Dashboard / close overlay / clear filter |
+| `Tab` | Switch sub-tabs (Delta Inspector: SQL ↔ Auxiliary Columns; Watermarks: Groups ↔ Gates) |
 
-**Actions:**
+**Write actions** (view-specific):
+
+| Key | View | Action |
+|-----|------|--------|
+| `r` | Dashboard, Detail | Refresh selected stream table |
+| `R` | Dashboard | Refresh all active tables (with confirmation) |
+| `p` | Dashboard, Detail | Pause selected (with confirmation) |
+| `P` | Dashboard, Detail | Resume selected |
+| `e` | Detail, Delta Inspector | Show CREATE DDL overlay for selected table |
+| `A` | Fuse | Re-arm fuse for selected (with confirmation) |
+| `g` | Watermarks (Gates tab) | Gate / ungate selected source (confirmation for gate) |
+
+**Global actions:**
 
 | Key | Action |
 |-----|--------|
-| `/` | Open filter input — type to search, `Enter` to apply, `Esc` to cancel |
-| `?` | Toggle help overlay (shows all keybindings) |
+| `/` | Open filter — type to search, `Enter` to apply, `Esc` to cancel |
+| `:` | Open command palette |
+| `s` / `S` | Cycle sort field / reverse sort direction (Dashboard) |
+| `t` | Toggle light/dark theme |
+| `Ctrl+R` | Force an immediate poll |
+| `Ctrl+E` | Export current view to JSON file (`/tmp/pgtrickle_export_*.json`) |
+| `?` | Toggle help overlay |
 | `q` or `Ctrl+C` | Quit |
 
 **View switching:**
 
-Press `1`–`9`, `w`, `f`, `m`, or `d` to jump directly to any view (see table
-above). The current view is highlighted in the footer bar.
+Press `1`–`9`, `w`, `f`, `m`, `d`, `g`, or `i` to jump directly to any view.
+The active view and selected table are shown in both the header bar and the
+footer nav bar.
 
-### Wide Layout
+### Command Palette
 
-When your terminal is at least 140 columns wide and 35 rows tall, the
-Dashboard automatically switches to a wide split-pane layout:
+Press `:` to open the command palette. Tab-completion works on stream table
+names. Available commands:
 
-- **Left pane** — the stream table list (same as standard layout).
-- **Right pane** — an **Issues sidebar** showing error tables and large CDC
-  buffers.
-- **Bottom strip** — a **DAG mini-map** showing the dependency graph at
-  depth ≤ 2.
-
-Resize your terminal below these thresholds and it falls back to the standard
-single-pane layout.
+| Command | Description |
+|---------|-------------|
+| `refresh <name>` | Refresh a stream table (or `refresh all`) |
+| `pause <name>` | Pause a stream table |
+| `resume <name>` | Resume a paused stream table |
+| `repair <name>` | Re-install CDC triggers |
+| `export <name>` | Show CREATE DDL overlay |
+| `explain <name>` | Fetch and display delta SQL for a stream table |
+| `validate <SQL>` | Validate a SQL query against the extension |
+| `fuse reset <name>` | Reset the circuit breaker fuse |
+| `quit` | Exit the TUI |
 
 ### LISTEN/NOTIFY
 
@@ -458,17 +482,19 @@ default) and queries pg_trickle's built-in SQL API functions:
 | View | SQL function(s) |
 |------|-----------------|
 | Dashboard | `pgtrickle.st_refresh_stats()` |
-| Health | `pgtrickle.health_check()` |
-| CDC | `pgtrickle.change_buffer_sizes()` |
+| Detail | `pgtrickle.explain_refresh_mode()`, `pgtrickle.list_sources()`, `pgtrickle.get_refresh_history()`, `pgtrickle.diagnose_errors()` |
 | Dependencies | `pgtrickle.dependency_tree()` |
-| Diagnostics | `pgtrickle.recommend_refresh_mode()` |
-| Efficiency | `pgtrickle.refresh_efficiency()` |
-| Configuration | `pg_settings WHERE name LIKE 'pg_trickle.%'` |
 | Refresh Log | `pgtrickle.refresh_timeline()` |
+| Diagnostics | `pgtrickle.recommend_refresh_mode()` |
+| CDC Health | `pgtrickle.change_buffer_sizes()`, `pgtrickle.check_cdc_health()` |
+| Configuration | `pg_settings WHERE name LIKE 'pg_trickle.%'` |
+| Health Checks | `pgtrickle.health_check()` |
+| Alerts | `LISTEN pg_trickle_alert` (real-time) |
 | Workers | `pgtrickle.worker_pool_status()`, `pgtrickle.parallel_job_status()` |
 | Fuse | `pgtrickle.fuse_status()` |
-| Watermarks | `pgtrickle.watermark_groups()` |
-| Triggers | `pgtrickle.trigger_inventory()` |
+| Watermarks | `pgtrickle.watermark_groups()`, `pgtrickle.source_gate_status()` |
+| Delta Inspector | `pgtrickle.explain_delta()`, `pgtrickle.list_auxiliary_columns()`, `pgtrickle.pgt_stream_tables` (DDL) |
+| Issues | `pgtrickle.dag_issues()` |
 
 In interactive mode, a background task polls all of these every 2 seconds
 and pushes state updates to the rendering loop. A second connection runs
