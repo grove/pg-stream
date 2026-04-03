@@ -70,6 +70,21 @@ For future plans and release milestones, see [ROADMAP.md](ROADMAP.md).
   (DIFFERENTIAL + FULL in same chain), concurrent DML at multiple levels, and
   DROP of intermediate stream tables with CASCADE.
 
+- **CIRC-IMM:** Ten new E2E tests for circular dependencies + IMMEDIATE mode
+  hardening. Diamond topology with IMMEDIATE on both branches (INSERT/UPDATE/DELETE),
+  near-circular topologies with direct + chain path convergence, rapid sequential
+  and mixed DML stress tests, fan-in from multiple sources. No deadlocks found.
+
+- **E4:** Flyway and Liquibase migration integration guide
+  (`docs/integrations/flyway-liquibase.md`). Covers versioned migrations, repeatable
+  migrations, `create_or_replace_stream_table`, `bulk_create`, Liquibase changesets
+  with rollback, preconditions, and CI environment patterns.
+
+- **E5:** ORM integration guides for SQLAlchemy and Django
+  (`docs/integrations/orm.md`). Read-only model patterns, write-blocking safeguards,
+  Django `RunSQL` migrations, DRF viewsets, freshness checking, and eventual
+  consistency handling.
+
 ### Changed
 
 - **I2:** Complete documentation review for v0.15.0 readiness. Fixed `CONFIGURATION.md`

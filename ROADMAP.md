@@ -2986,7 +2986,7 @@ Validate correctness against independent query corpora beyond TPC-H.
 |------|-------------|--------|-----|
 | E5 | ORM integrations guide (SQLAlchemy, Django, etc.) | 8–12h | [PLAN_ECO_SYSTEM.md §5](plans/ecosystem/PLAN_ECO_SYSTEM.md) |
 
-> **E5 subtotal: ~8–12 hours**
+> **E5 subtotal: ✅ Done**
 
 ### Flyway / Liquibase Migration Support (E4)
 
@@ -2998,7 +2998,7 @@ Validate correctness against independent query corpora beyond TPC-H.
 |------|-------------|--------|-----|
 | E4 | Flyway / Liquibase migration support | 8–12h | [PLAN_ECO_SYSTEM.md §5](plans/ecosystem/PLAN_ECO_SYSTEM.md) |
 
-> **E4 subtotal: ~8–12 hours**
+> **E4 subtotal: ✅ Done**
 
 ### JOIN Key Change + DELETE Correctness Fix (EC-01) — ✅ Done (pre-existing)
 
@@ -3044,7 +3044,7 @@ Validate correctness against independent query corpora beyond TPC-H.
 |------|-------------|--------|-----|
 | CIRC-IMM | **Circular-dependency + IMMEDIATE mode hardening.** Test: diamond deps with IMMEDIATE triggers, near-circular topologies, lock ordering under concurrent DML. Add deadlock detection / timeout guard if issues found. | 3–5d | [PLAN_EDGE_CASES.md §EC-30](plans/PLAN_EDGE_CASES.md) · [PLAN_CIRCULAR_REFERENCES.md](plans/sql/PLAN_CIRCULAR_REFERENCES.md) |
 
-> **CIRC-IMM subtotal: ~3–5 days (conditional — can slip to v0.16.0)**
+> **CIRC-IMM subtotal: ✅ Done**
 
 ### Cross-Session MERGE Cache Staleness Fix (G8.1)
 
@@ -3101,11 +3101,11 @@ Validate correctness against independent query corpora beyond TPC-H.
 - [ ] TRUNC-1: TRUNCATE on trigger-mode CDC source marks downstream STs for reinit; tested end-to-end
 - [ ] VOL-1: `volatile_function_policy` GUC controls volatile function handling; `reject`/`warn`/`allow` modes tested
 - [ ] I3: `dbt-pgtrickle` published on dbt Hub; `packages.yml` package-name install verified
-- [ ] E4: Flyway / Liquibase integration guide published in `docs/`
-- [ ] E5: ORM integration guides (SQLAlchemy, Django) published in `docs/`
+- [x] E4: Flyway / Liquibase integration guide published in `docs/integrations/flyway-liquibase.md`
+- [x] E5: ORM integration guides (SQLAlchemy, Django) published in `docs/integrations/orm.md`
 - [x] EC-01: R₀ pre-change snapshot ensures DELETE deltas find old join partners; unit + TPC-H regression tests confirm correctness
 - [x] STST-3: 3-level and 4-level ST-on-ST chains tested with INSERT/UPDATE/DELETE propagation; mixed modes covered
-- [ ] CIRC-IMM: Diamond + near-circular IMMEDIATE topologies tested; no deadlocks or incorrect results (conditional — can slip to v0.16.0)
+- [x] CIRC-IMM: Diamond + near-circular IMMEDIATE topologies tested; no deadlocks or incorrect results
 - [ ] G8.1: Cross-session MERGE cache invalidation via catalog version counter; tested with concurrent ALTER QUERY + refresh
 - [x] EXPL-ENH: `explain_st()` shows refresh timing stats, source partition info, and dependency sub-graph (DOT format)
 - [ ] R4: CNPG operator hardening — ImageVolume, health probes, failover tested
