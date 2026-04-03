@@ -183,9 +183,13 @@ $$;
 
 -- ── explain_delta() ───────────────────────────────────────────────────────
 -- Used by: explain  (returns SETOF text)
-CREATE OR REPLACE FUNCTION pgtrickle.explain_delta(st_name text, format text)
+-- IMPORTANT: The real function requires a schema-qualified name (e.g.
+-- 'public.test_table'). Return empty when given a bare name so tests
+-- catch regressions where the TUI forgets to qualify.
+CREATE OR REPLACE FUNCTION pgtrickle.explain_delta(st_name text, format text DEFAULT 'text')
 RETURNS SETOF text LANGUAGE sql STABLE AS $$
     SELECT 'Seq Scan on test_table  (cost=0.00..0.01 rows=1 width=4)'::text
+    WHERE st_name LIKE '%.%'
 $$;
 
 -- ── recommend_refresh_mode() ──────────────────────────────────────────────
@@ -254,12 +258,114 @@ CREATE OR REPLACE FUNCTION pgtrickle.refresh_stream_table(name text)
 RETURNS void LANGUAGE sql AS $$
     SELECT
 $$;
-
 -- ── refresh_all() ─────────────────────────────────────────────────────────
--- Used by: refresh --all
+-- Used by: CLI refresh --all command
 CREATE OR REPLACE FUNCTION pgtrickle.refresh_all()
 RETURNS void LANGUAGE sql AS $$
     SELECT
+$$;
+-- ── refresh_all_stream_tables() ────────────────────────────────────────────
+-- Used by: TUI RefreshAll action
+CREATE OR REPLACE FUNCTION pgtrickle.refresh_all_stream_tables()
+RETURNS void LANGUAGE sql AS $$
+    SELECT
+$$;
+
+-- ── reset_fuse() ──────────────────────────────────────────────────────────
+-- Used by: TUI fuse reset action
+CREATE OR REPLACE FUNCTION pgtrickle.reset_fuse(name text, strategy text)
+RETURNS void LANGUAGE sql AS $$
+    SELECT
+$$;
+
+-- ── repair_stream_table() ─────────────────────────────────────────────────
+-- Used by: TUI repair action
+CREATE OR REPLACE FUNCTION pgtrickle.repair_stream_table(name text)
+RETURNS void LANGUAGE sql AS $$
+    SELECT
+$$;
+
+-- ── gate_source() / ungate_source() ──────────────────────────────────────
+-- Used by: TUI watermark gate/ungate actions
+CREATE OR REPLACE FUNCTION pgtrickle.gate_source(name text)
+RETURNS void LANGUAGE sql AS $$
+    SELECT
+$$;
+CREATE OR REPLACE FUNCTION pgtrickle.ungate_source(name text)
+RETURNS void LANGUAGE sql AS $$
+    SELECT
+$$;
+
+-- ── validate_query() ──────────────────────────────────────────────────────
+-- Used by: TUI :validate command
+CREATE OR REPLACE FUNCTION pgtrickle.validate_query(query text)
+RETURNS TABLE (check_name text, result text, severity text) LANGUAGE sql STABLE AS $$
+    SELECT 'syntax'::text, 'OK'::text, 'info'::text
+$$;
+
+-- ── diagnose_errors() ─────────────────────────────────────────────────────
+-- Used by: TUI Detail view enrichment
+CREATE OR REPLACE FUNCTION pgtrickle.diagnose_errors(st_name text)
+RETURNS TABLE (event_time text, error_type text, error_message text, remediation text)
+LANGUAGE sql STABLE AS $$
+    SELECT
+        '2026-04-01 12:00:00'::text,
+        'query_error'::text,
+        'division by zero'::text,
+        'Check source data for nulls'::text
+    WHERE st_name LIKE '%.%'
+$$;
+
+-- ── explain_refresh_mode() ────────────────────────────────────────────────
+-- Used by: TUI Detail view enrichment
+CREATE OR REPLACE FUNCTION pgtrickle.explain_refresh_mode(name text)
+RETURNS TABLE (configured_mode text, effective_mode text, downgrade_reason text)
+LANGUAGE sql STABLE AS $$
+    SELECT
+        'AUTO'::text,
+        'DIFFERENTIAL'::text,
+        NULL::text
+    WHERE name LIKE '%.%'
+$$;
+
+-- ── list_sources() ────────────────────────────────────────────────────────
+-- Used by: TUI Detail view enrichment
+CREATE OR REPLACE FUNCTION pgtrickle.list_sources(name text)
+RETURNS TABLE (
+    source_table text, source_oid bigint, source_type text,
+    cdc_mode text, columns_used text
+) LANGUAGE sql STABLE AS $$
+    SELECT
+        'public.source'::text, 12345::bigint, 'table'::text,
+        'trigger'::text, NULL::text
+    WHERE name LIKE '%.%'
+$$;
+
+-- ── get_refresh_history() ─────────────────────────────────────────────────
+-- Used by: TUI Detail view enrichment
+-- Column order must match the SELECT in poller.rs FetchRefreshHistory:
+--   action(0), status(1), rows_inserted(2), rows_deleted(3),
+--   delta_row_count(4), duration_ms(5), was_full_fallback(6),
+--   start_time(7), error_message(8)
+CREATE OR REPLACE FUNCTION pgtrickle.get_refresh_history(name text, max_rows int DEFAULT 20)
+RETURNS TABLE (
+    action text, status text, rows_inserted bigint, rows_deleted bigint,
+    delta_row_count bigint, duration_ms float8, was_full_fallback bool,
+    start_time text, error_message text
+) LANGUAGE sql STABLE AS $$
+    SELECT
+        'REFRESH'::text, 'SUCCESS'::text, 10::bigint, 2::bigint,
+        8::bigint, 42.0::float8, false, '2026-04-01 12:00:00'::text, NULL::text
+    WHERE name LIKE '%.%'
+$$;
+
+-- ── list_auxiliary_columns() ──────────────────────────────────────────────
+-- Used by: TUI Delta Inspector Auxiliary Columns tab
+CREATE OR REPLACE FUNCTION pgtrickle.list_auxiliary_columns(name text)
+RETURNS TABLE (column_name text, data_type text, purpose text)
+LANGUAGE sql STABLE AS $$
+    SELECT '_pgt_id'::text, 'bigint'::text, 'row identity tracking'::text
+    WHERE name LIKE '%.%'
 $$;
 
 -- ── alter_stream_table() ──────────────────────────────────────────────────

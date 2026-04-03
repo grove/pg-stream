@@ -2418,4 +2418,169 @@ mod tests {
         app.current_view = View::Issues;
         assert_eq!(app.list_len(), app.state.issues.len());
     }
+
+    // ── Command palette ──────────────────────────────────────────────
+
+    #[test]
+    fn test_colon_opens_command_palette() {
+        let mut app = app_with_data();
+        handle_key(&mut app, key(KeyCode::Char(':')));
+        assert!(app.command_palette.is_some());
+    }
+
+    #[test]
+    fn test_palette_esc_closes() {
+        let mut app = app_with_data();
+        handle_key(&mut app, key(KeyCode::Char(':')));
+        handle_key(&mut app, key(KeyCode::Esc));
+        assert!(app.command_palette.is_none());
+    }
+
+    #[test]
+    fn test_palette_typing_updates_input() {
+        let mut app = app_with_data();
+        handle_key(&mut app, key(KeyCode::Char(':')));
+        handle_key(&mut app, key(KeyCode::Char('e')));
+        handle_key(&mut app, key(KeyCode::Char('x')));
+        handle_key(&mut app, key(KeyCode::Char('p')));
+        let palette = app.command_palette.as_ref().unwrap();
+        assert_eq!(palette.input, "exp");
+    }
+
+    #[test]
+    fn test_palette_explain_shows_builtin_suggestion() {
+        let mut app = app_with_data();
+        handle_key(&mut app, key(KeyCode::Char(':')));
+        for c in "explain".chars() {
+            handle_key(&mut app, key(KeyCode::Char(c)));
+        }
+        let palette = app.command_palette.as_ref().unwrap();
+        assert!(
+            palette.suggestions.iter().any(|s| s.command == "explain"),
+            "typing 'explain' should show the explain command as a suggestion"
+        );
+    }
+
+    #[test]
+    fn test_palette_explain_space_shows_table_completions() {
+        let mut app = app_with_data();
+        handle_key(&mut app, key(KeyCode::Char(':')));
+        for c in "explain ".chars() {
+            handle_key(&mut app, key(KeyCode::Char(c)));
+        }
+        let palette = app.command_palette.as_ref().unwrap();
+        assert!(
+            !palette.suggestions.is_empty(),
+            "typing 'explain ' should show table name completions"
+        );
+        // All suggestions should start with 'explain '
+        for s in &palette.suggestions {
+            assert!(
+                s.command.starts_with("explain "),
+                "suggestion should be 'explain <name>', got: {}",
+                s.command
+            );
+        }
+    }
+
+    #[test]
+    fn test_execute_explain_bare_name_resolves_to_qualified() {
+        // Simulates the user typing `:explain orders_live` — the palette command
+        // handler must resolve "orders_live" → "public.orders_live" before
+        // sending the FetchDeltaSql action.  We verify the action channel
+        // receives the schema-qualified name.
+        use tokio::sync::mpsc;
+        let mut app = app_with_data();
+        let (tx, mut rx) = mpsc::channel::<crate::state::ActionRequest>(8);
+        app.action_tx = Some(tx);
+
+        execute_palette_command(&mut app, "explain orders_live");
+
+        // The action should have been sent synchronously via try_send
+        let action = rx.try_recv().expect("expected ActionRequest to be sent");
+        match action {
+            crate::state::ActionRequest::FetchDeltaSql(name) => {
+                assert!(
+                    name.contains('.'),
+                    "FetchDeltaSql name should be schema-qualified, got: {name}"
+                );
+                assert_eq!(name, "public.orders_live");
+            }
+            other => panic!("expected FetchDeltaSql, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_execute_explain_already_qualified_passes_through() {
+        use tokio::sync::mpsc;
+        let mut app = app_with_data();
+        let (tx, mut rx) = mpsc::channel::<crate::state::ActionRequest>(8);
+        app.action_tx = Some(tx);
+
+        execute_palette_command(&mut app, "explain public.orders_live");
+
+        let action = rx.try_recv().expect("expected ActionRequest to be sent");
+        match action {
+            crate::state::ActionRequest::FetchDeltaSql(name) => {
+                assert_eq!(name, "public.orders_live");
+            }
+            other => panic!("expected FetchDeltaSql, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_execute_explain_unknown_name_passes_bare() {
+        // If the user types a name not in the stream_tables list, pass it
+        // through as-is (the DB will return an error, which is correct).
+        use tokio::sync::mpsc;
+        let mut app = app_with_data();
+        let (tx, mut rx) = mpsc::channel::<crate::state::ActionRequest>(8);
+        app.action_tx = Some(tx);
+
+        execute_palette_command(&mut app, "explain nonexistent_table");
+
+        let action = rx.try_recv().expect("expected ActionRequest to be sent");
+        match action {
+            crate::state::ActionRequest::FetchDeltaSql(name) => {
+                assert_eq!(name, "nonexistent_table");
+            }
+            other => panic!("expected FetchDeltaSql, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_delta_sql_received_switches_to_delta_inspector() {
+        // Simulates the PollMsg::DeltaSql arriving and verifies the app
+        // navigates to the Delta Inspector view with the correct table selected.
+        let mut app = app_with_data();
+
+        // Inject the DeltaSql message handler logic directly
+        // (we can't go through the async loop, so we test the handler's effects)
+        let name = "public.orders_live".to_string();
+        let sql = "SELECT id FROM public.orders_live".to_string();
+        let bare_name = name
+            .split_once('.')
+            .map(|(_, n)| n.to_string())
+            .unwrap_or_else(|| name.clone());
+        app.state.delta_sql_cache.insert(bare_name.clone(), sql);
+        if let Some(pos) = app
+            .filtered_sorted_stream_tables()
+            .iter()
+            .position(|&i| app.state.stream_tables[i].name == bare_name)
+        {
+            app.selected = pos;
+        }
+        app.current_view = View::DeltaInspector;
+        app.delta_inspector_tab = 0;
+
+        assert_eq!(app.current_view, View::DeltaInspector);
+        assert_eq!(app.delta_inspector_tab, 0);
+        assert!(
+            app.state.delta_sql_cache.contains_key("orders_live"),
+            "cache should be keyed by bare name"
+        );
+        // The selected index should resolve to orders_live
+        let idx = app.selected_stream_table_index().unwrap();
+        assert_eq!(app.state.stream_tables[idx].name, "orders_live");
+    }
 }

@@ -168,7 +168,7 @@ async fn test_cmd_workers_executes() {
 async fn test_cmd_explain_executes() {
     let db = PgtStubDb::new().await;
     let args = commands::explain::ExplainArgs {
-        name: "test_table".into(),
+        name: "public.test_table".into(),
         analyze: false,
         format: OutputFormat::Table,
     };
@@ -181,7 +181,7 @@ async fn test_cmd_explain_executes() {
 async fn test_cmd_explain_analyze_executes() {
     let db = PgtStubDb::new().await;
     let args = commands::explain::ExplainArgs {
-        name: "test_table".into(),
+        name: "public.test_table".into(),
         analyze: true,
         format: OutputFormat::Table,
     };
@@ -354,4 +354,209 @@ async fn test_cmd_workers_json_format() {
     commands::workers::execute(&db.client, &args)
         .await
         .expect("workers --format json: execute() failed");
+}
+
+// ── execute_action — TUI interactive poller path ──────────────────────────
+//
+// These tests exercise crate::poller::execute_action(), which is the code
+// path the TUI uses for write actions and on-demand enrichment fetches.
+// The CLI command tests above exercise a *different* code path
+// (commands/*.rs) and do not catch bugs in the poller action handling.
+
+#[tokio::test]
+async fn test_action_fetch_delta_sql_with_schema_returns_sql() {
+    let db = PgtStubDb::new().await;
+    let result = crate::poller::execute_action(
+        &db.client,
+        &crate::state::ActionRequest::FetchDeltaSql("public.test_table".into()),
+    )
+    .await;
+    assert!(result.success, "FetchDeltaSql with schema should succeed");
+    assert!(
+        !result.message.is_empty(),
+        "FetchDeltaSql should return non-empty SQL"
+    );
+    assert!(
+        result.message.contains("Seq Scan"),
+        "FetchDeltaSql should return plan text, got: {}",
+        result.message
+    );
+}
+
+#[tokio::test]
+async fn test_action_fetch_delta_sql_bare_name_returns_empty() {
+    // The real explain_delta() requires a schema-qualified name.
+    // The stub enforces this: bare names return empty, not an error.
+    // The TUI must qualify names before sending FetchDeltaSql.
+    let db = PgtStubDb::new().await;
+    let result = crate::poller::execute_action(
+        &db.client,
+        &crate::state::ActionRequest::FetchDeltaSql("test_table".into()),
+    )
+    .await;
+    assert!(
+        result.success,
+        "FetchDeltaSql with bare name should not error (returns empty rows)"
+    );
+    assert!(
+        result.message.is_empty(),
+        "FetchDeltaSql with bare name should return empty string (no rows), got: {}",
+        result.message
+    );
+}
+
+#[tokio::test]
+async fn test_action_refresh_table_succeeds() {
+    let db = PgtStubDb::new().await;
+    let result = crate::poller::execute_action(
+        &db.client,
+        &crate::state::ActionRequest::RefreshTable("test_table".into()),
+    )
+    .await;
+    assert!(result.success, "RefreshTable should succeed");
+}
+
+#[tokio::test]
+async fn test_action_refresh_all_succeeds() {
+    let db = PgtStubDb::new().await;
+    let result =
+        crate::poller::execute_action(&db.client, &crate::state::ActionRequest::RefreshAll).await;
+    assert!(result.success, "RefreshAll should succeed");
+}
+
+#[tokio::test]
+async fn test_action_pause_resume_table_succeeds() {
+    let db = PgtStubDb::new().await;
+    let pause = crate::poller::execute_action(
+        &db.client,
+        &crate::state::ActionRequest::PauseTable("test_table".into()),
+    )
+    .await;
+    assert!(pause.success, "PauseTable should succeed");
+
+    let resume = crate::poller::execute_action(
+        &db.client,
+        &crate::state::ActionRequest::ResumeTable("test_table".into()),
+    )
+    .await;
+    assert!(resume.success, "ResumeTable should succeed");
+}
+
+#[tokio::test]
+async fn test_action_reset_fuse_succeeds() {
+    let db = PgtStubDb::new().await;
+    let result = crate::poller::execute_action(
+        &db.client,
+        &crate::state::ActionRequest::ResetFuse("test_table".into(), "rearm".into()),
+    )
+    .await;
+    assert!(result.success, "ResetFuse should succeed");
+}
+
+#[tokio::test]
+async fn test_action_validate_query_returns_results() {
+    let db = PgtStubDb::new().await;
+    let result = crate::poller::execute_action(
+        &db.client,
+        &crate::state::ActionRequest::ValidateQuery("SELECT 1".into()),
+    )
+    .await;
+    assert!(result.success, "ValidateQuery should succeed");
+    assert!(
+        result.message.contains("OK"),
+        "ValidateQuery should return check results, got: {}",
+        result.message
+    );
+}
+
+#[tokio::test]
+async fn test_action_fetch_diagnose_errors_with_schema_returns_data() {
+    let db = PgtStubDb::new().await;
+    let result = crate::poller::execute_action(
+        &db.client,
+        &crate::state::ActionRequest::FetchDiagnoseErrors("public.test_table".into()),
+    )
+    .await;
+    assert!(
+        result.success,
+        "FetchDiagnoseErrors with schema should succeed"
+    );
+    assert!(
+        result.message.contains("division by zero"),
+        "FetchDiagnoseErrors should return error data, got: {}",
+        result.message
+    );
+}
+
+#[tokio::test]
+async fn test_action_fetch_explain_mode_with_schema_returns_data() {
+    let db = PgtStubDb::new().await;
+    let result = crate::poller::execute_action(
+        &db.client,
+        &crate::state::ActionRequest::FetchExplainMode("public.test_table".into()),
+    )
+    .await;
+    assert!(
+        result.success,
+        "FetchExplainMode with schema should succeed"
+    );
+    assert!(
+        result.message.contains("DIFFERENTIAL"),
+        "FetchExplainMode should return mode data, got: {}",
+        result.message
+    );
+}
+
+#[tokio::test]
+async fn test_action_fetch_sources_with_schema_returns_data() {
+    let db = PgtStubDb::new().await;
+    let result = crate::poller::execute_action(
+        &db.client,
+        &crate::state::ActionRequest::FetchSources("public.test_table".into()),
+    )
+    .await;
+    assert!(result.success, "FetchSources with schema should succeed");
+    assert!(
+        result.message.contains("public.source"),
+        "FetchSources should return source data, got: {}",
+        result.message
+    );
+}
+
+#[tokio::test]
+async fn test_action_fetch_refresh_history_with_schema_returns_data() {
+    let db = PgtStubDb::new().await;
+    let result = crate::poller::execute_action(
+        &db.client,
+        &crate::state::ActionRequest::FetchRefreshHistory("public.test_table".into()),
+    )
+    .await;
+    assert!(
+        result.success,
+        "FetchRefreshHistory with schema should succeed"
+    );
+    assert!(
+        result.message.contains("SUCCESS"),
+        "FetchRefreshHistory should return history data, got: {}",
+        result.message
+    );
+}
+
+#[tokio::test]
+async fn test_action_fetch_auxiliary_columns_with_schema_returns_data() {
+    let db = PgtStubDb::new().await;
+    let result = crate::poller::execute_action(
+        &db.client,
+        &crate::state::ActionRequest::FetchAuxiliaryColumns("public.test_table".into()),
+    )
+    .await;
+    assert!(
+        result.success,
+        "FetchAuxiliaryColumns with schema should succeed"
+    );
+    assert!(
+        result.message.contains("_pgt_id"),
+        "FetchAuxiliaryColumns should return column data, got: {}",
+        result.message
+    );
 }
