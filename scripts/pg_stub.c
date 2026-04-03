@@ -196,6 +196,63 @@ uint32_t SPI_gettypeid(void *tupdesc, int fnumber) {
 uint64_t SPI_processed = 0;
 void    *SPI_tuptable  = NULL;
 
+/* ── LWLock stubs ────────────────────────────────────────────────────── */
+/*
+ * pgrx's PgLwLock wrapper calls LWLockAcquire/LWLockRelease.  The symbols
+ * are referenced in the test binary even though unit tests never actually
+ * acquire a lock.  On Linux the dynamic linker resolves all undefined
+ * symbols at load time (RELRO / -z now), so without these stubs the
+ * process exits with "undefined symbol: LWLockAcquire" before any test
+ * runs.
+ */
+int   LWLockAcquire(void *lock, int mode) { (void)lock; (void)mode; return 1; }
+void  LWLockRelease(void *lock)            { (void)lock; }
+void *GetNamedLWLockTranche(const char *name) { (void)name; return NULL; }
+void  RequestNamedLWLockTranche(const char *name, int num_tranches) {
+    (void)name; (void)num_tranches;
+}
+
+/* MainLWLockArray is a global array of LWLocks; the test binary references
+ * its address.  A single NULL pointer is enough so the loader is satisfied. */
+void *MainLWLockArray = NULL;
+
+/* ── Interrupt / signal globals ──────────────────────────────────────── */
+/*
+ * pgrx references InterruptHoldoffCount in generated code.  Unit tests
+ * never trigger interrupts, but the symbol must exist for the loader.
+ */
+int InterruptHoldoffCount = 0;
+
+/* ── Array accumulation ───────────────────────────────────────────────── */
+/*
+ * pgrx-generated code for ARRAY return types references these functions.
+ */
+void *initArrayResult(uint32_t element_type, void *rcontext, int subcontext) {
+    (void)element_type; (void)rcontext; (void)subcontext; return NULL;
+}
+void *accumArrayResult(void *astate, uintptr_t dvalue, int disnull,
+                       uint32_t element_type, void *rcontext) {
+    (void)astate; (void)dvalue; (void)disnull;
+    (void)element_type; (void)rcontext; return NULL;
+}
+uintptr_t makeArrayResult(void *astate, void *rcontext) {
+    (void)astate; (void)rcontext; return 0;
+}
+
+/* ── Query / expression tree walkers ─────────────────────────────────── */
+int expression_tree_walker_impl(void *node, void *walker, void *context,
+                                int flags) {
+    (void)node; (void)walker; (void)context; (void)flags; return 0;
+}
+int query_tree_walker_impl(void *query, void *walker, void *context,
+                           int flags) {
+    (void)query; (void)walker; (void)context; (void)flags; return 0;
+}
+uint32_t exprType(const void *expr) { (void)expr; return 0; }
+
+/* ── jsonb input ──────────────────────────────────────────────────────── */
+uintptr_t jsonb_in(void *fcinfo) { (void)fcinfo; return 0; }
+
 /* ── sigsetjmp stub ──────────────────────────────────────────────────── */
 /*
  * pgrx's PG_exception_stack references sigsetjmp indirectly. On macOS the
