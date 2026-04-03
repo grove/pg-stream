@@ -233,6 +233,13 @@ impl CommandPalette {
             }
         }
 
+        // explain uses schema-qualified names — add those too
+        if input.starts_with("explain ") {
+            let parts: Vec<&str> = input.splitn(2, ' ').collect();
+            let prefix = parts.get(1).unwrap_or(&"");
+            suggestions.retain(|s| s.command.to_lowercase().contains(prefix));
+        }
+
         self.suggestions = suggestions;
         if self.selected_suggestion >= self.suggestions.len() {
             self.selected_suggestion = 0;
@@ -623,7 +630,25 @@ async fn run_app(
                     }
                 }
                 PollMsg::DeltaSql(name, sql) => {
-                    app.state.delta_sql_cache.insert(name, sql);
+                    // Cache by bare name (strip schema prefix if present) so the
+                    // Delta Inspector can look it up via st.name.
+                    let bare_name = name
+                        .split_once('.')
+                        .map(|(_, n)| n.to_string())
+                        .unwrap_or_else(|| name.clone());
+                    app.state.delta_sql_cache.insert(bare_name.clone(), sql);
+                    // Navigate to Delta Inspector so the user can see the result.
+                    // Select the matching stream table first (if found).
+                    if let Some(pos) = app
+                        .filtered_sorted_stream_tables()
+                        .iter()
+                        .position(|&i| app.state.stream_tables[i].name == bare_name)
+                    {
+                        app.selected = pos;
+                    }
+                    app.current_view = View::DeltaInspector;
+                    app.delta_inspector_tab = 0;
+                    app.toast = Some(Toast::success(format!("Delta SQL loaded for {bare_name}")));
                 }
                 PollMsg::Ddl(name, ddl) => {
                     app.state.ddl_cache.insert(name.clone(), ddl.clone());
@@ -1387,9 +1412,20 @@ fn execute_palette_command(app: &mut App, input: &str) {
         }
         "explain" => {
             if let Some(name) = arg {
+                // Resolve to schema-qualified name if user gave bare name
+                let qualified = if name.contains('.') {
+                    name.clone()
+                } else {
+                    app.state
+                        .stream_tables
+                        .iter()
+                        .find(|st| st.name == name)
+                        .map(|st| format!("{}.{}", st.schema, st.name))
+                        .unwrap_or_else(|| name.clone())
+                };
                 if let Some(ref tx) = app.action_tx {
-                    let _ = tx.try_send(ActionRequest::FetchDeltaSql(name.clone()));
-                    app.toast = Some(Toast::info(format!("Fetching delta SQL for {name}…")));
+                    let _ = tx.try_send(ActionRequest::FetchDeltaSql(qualified.clone()));
+                    app.toast = Some(Toast::info(format!("Fetching delta SQL for {qualified}…")));
                 }
             } else {
                 app.toast = Some(Toast::error("Usage: explain <name>"));
