@@ -211,7 +211,7 @@ semantically incorrect results under specific data mutation patterns.
 - ❌ Does not protect against the bug in low-frequency, surgical update scenarios
 - ❌ Relies on the user understanding the documented limitation
 
-**Decision:** Option D for v0.2.0 (document + rely on adaptive FULL fallback). Option C as a future enhancement if customer reports surface.
+**Decision:** ~~Option D for v0.2.0 (document + rely on adaptive FULL fallback). Option C as a future enhancement if customer reports surface.~~ **Implemented in v0.14.0 via R₀ pre-change snapshot strategy:** Part 1 is split into 1a (inserts ⋈ R₁) + 1b (deletes ⋈ R₀). R₀ uses NOT EXISTS anti-join for Scan leaves and CTE caching (DI-1) for join subtrees. Applies to INNER JOIN, LEFT JOIN, and FULL OUTER JOIN. Unit + TPC-H regression tests cover the fix (EC-01, EC-01B-1, EC-01B-2).
 
 ---
 
