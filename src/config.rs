@@ -50,6 +50,14 @@ pub static PGS_DIFFERENTIAL_MAX_CHANGE_RATIO: GucSetting<f64> = GucSetting::<f64
 /// Recommended range: 50_000–500_000 depending on available memory.
 pub static PGS_MAX_DELTA_ESTIMATE_ROWS: GucSetting<i32> = GucSetting::<i32>::new(0);
 
+/// WM-7: Maximum seconds a watermark may remain un-advanced before being
+/// considered "stuck". When a watermark group contains a stuck source,
+/// downstream stream tables in that group are paused (skipped) and a
+/// `pgtrickle_alert` NOTIFY with category `watermark_stuck` is emitted.
+///
+/// Set to 0 to disable stuck-watermark detection (default).
+pub static PGS_WATERMARK_HOLDBACK_TIMEOUT: GucSetting<i32> = GucSetting::<i32>::new(0);
+
 /// Whether to use TRUNCATE instead of DELETE for change buffer cleanup
 /// when the entire buffer is consumed by a refresh.
 ///
@@ -657,6 +665,21 @@ pub fn register_gucs() {
         GucFlags::default(),
     );
 
+    // WM-7: Watermark holdback timeout — seconds before a watermark is "stuck".
+    GucRegistry::define_int_guc(
+        c"pg_trickle.watermark_holdback_timeout",
+        c"Seconds before an un-advanced watermark is considered stuck (0 = disabled).",
+        c"When non-zero, the scheduler periodically checks all watermark sources. \
+           If any source in a watermark group has not advanced within this many seconds, \
+           downstream stream tables in that group are paused and a pgtrickle_alert \
+           notification with category watermark_stuck is emitted. Set to 0 to disable.",
+        &PGS_WATERMARK_HOLDBACK_TIMEOUT,
+        0,      // min (0 = disabled)
+        86_400, // max (24 hours)
+        GucContext::Suset,
+        GucFlags::default(),
+    );
+
     GucRegistry::define_bool_guc(
         c"pg_trickle.cleanup_use_truncate",
         c"Use TRUNCATE for change buffer cleanup when all rows are consumed.",
@@ -1209,6 +1232,11 @@ pub fn pg_trickle_max_delta_estimate_rows() -> i32 {
     PGS_MAX_DELTA_ESTIMATE_ROWS.get()
 }
 
+/// WM-7: Returns the watermark holdback timeout in seconds (0 = disabled).
+pub fn pg_trickle_watermark_holdback_timeout() -> i32 {
+    PGS_WATERMARK_HOLDBACK_TIMEOUT.get()
+}
+
 /// Returns the change buffer schema name.
 pub fn pg_trickle_change_buffer_schema() -> String {
     PGS_CHANGE_BUFFER_SCHEMA
@@ -1472,10 +1500,11 @@ pub fn pg_trickle_unlogged_buffers() -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        CdcTriggerMode, MergeJoinStrategy, ParallelRefreshMode, UserTriggersMode,
-        VolatileFunctionPolicy, normalize_cdc_trigger_mode, normalize_merge_join_strategy,
-        normalize_parallel_refresh_mode, normalize_recursive_max_depth,
-        normalize_user_triggers_mode, normalize_volatile_function_policy, threshold_mb_to_bytes,
+        CdcTriggerMode, MergeJoinStrategy, PGS_WATERMARK_HOLDBACK_TIMEOUT, ParallelRefreshMode,
+        UserTriggersMode, VolatileFunctionPolicy, normalize_cdc_trigger_mode,
+        normalize_merge_join_strategy, normalize_parallel_refresh_mode,
+        normalize_recursive_max_depth, normalize_user_triggers_mode,
+        normalize_volatile_function_policy, threshold_mb_to_bytes,
     };
 
     #[test]
@@ -1771,5 +1800,11 @@ mod tests {
                 strategy
             );
         }
+    }
+
+    #[test]
+    fn test_watermark_holdback_timeout_default_is_disabled() {
+        // The static default is 0 (disabled).
+        assert_eq!(PGS_WATERMARK_HOLDBACK_TIMEOUT.get(), 0);
     }
 }

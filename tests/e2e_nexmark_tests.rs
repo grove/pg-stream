@@ -160,16 +160,11 @@ async fn test_nexmark_differential_correctness() {
             println!("  WARN baseline -- {e}");
             skipped.push((q.name, format!("baseline invariant: {e}")));
             let _ = db
-                .try_execute(&format!(
-                    "SELECT pgtrickle.drop_stream_table('{st_name}')"
-                ))
+                .try_execute(&format!("SELECT pgtrickle.drop_stream_table('{st_name}')"))
                 .await;
             continue;
         }
-        println!(
-            "  baseline -- {:.0}ms",
-            t.elapsed().as_secs_f64() * 1000.0
-        );
+        println!("  baseline -- {:.0}ms", t.elapsed().as_secs_f64() * 1000.0);
 
         // Mutation cycles
         let mut dvm_ok = true;
@@ -202,9 +197,7 @@ async fn test_nexmark_differential_correctness() {
             }
 
             // Assert the invariant
-            if let Err(e) =
-                nexmark::assert_invariant(&db, &st_name, q.sql, q.name, cycle).await
-            {
+            if let Err(e) = nexmark::assert_invariant(&db, &st_name, q.sql, q.name, cycle).await {
                 let msg = e.lines().next().unwrap_or(&e).to_string();
                 println!("  FAIL cycle {cycle} -- {msg}");
                 failed.push((q.name, format!("invariant cycle {cycle}: {msg}")));
@@ -225,9 +218,7 @@ async fn test_nexmark_differential_correctness() {
 
         // Drop stream table to free resources
         let _ = db
-            .try_execute(&format!(
-                "SELECT pgtrickle.drop_stream_table('{st_name}')"
-            ))
+            .try_execute(&format!("SELECT pgtrickle.drop_stream_table('{st_name}')"))
             .await;
     }
 
@@ -337,9 +328,7 @@ async fn test_nexmark_full_correctness() {
                 break;
             }
 
-            if let Err(e) =
-                nexmark::assert_invariant(&db, &st_name, q.sql, q.name, cycle).await
-            {
+            if let Err(e) = nexmark::assert_invariant(&db, &st_name, q.sql, q.name, cycle).await {
                 println!("  FAIL cycle {cycle} -- {e}");
                 failed.push((q.name, format!("invariant cycle {cycle}: {e}")));
                 all_ok = false;
@@ -358,9 +347,7 @@ async fn test_nexmark_full_correctness() {
         }
 
         let _ = db
-            .try_execute(&format!(
-                "SELECT pgtrickle.drop_stream_table('{st_name}')"
-            ))
+            .try_execute(&format!("SELECT pgtrickle.drop_stream_table('{st_name}')"))
             .await;
     }
 

@@ -33,4 +33,8 @@
 --   Already implemented in v0.14.0 via R₀ pre-change snapshot strategy.
 --   Documentation updated to replace the known limitation section.
 --
+-- WM-7: watermark_holdback_timeout GUC
+--   Registered via pgrx GUC infrastructure (auto-available after upgrade).
+--   Detects stuck watermarks and pauses downstream stream tables.
+--
 -- No catalog schema changes in this upgrade step.
