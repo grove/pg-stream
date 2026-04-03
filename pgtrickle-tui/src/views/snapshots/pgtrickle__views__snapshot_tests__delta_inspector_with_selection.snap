@@ -7,9 +7,9 @@ expression: output
 └──────────────────────────────────────────────────────────────────────────────┘
 ┌ Delta SQL  e-Show DDL ───────────────────────────────────────────────────────┐
 │                                                                              │
-│ Loading delta SQL…                                                           │
+│ Fetching delta SQL…                                                          │
 │                                                                              │
-│ Press Enter to fetch, or use the CLI:                                        │
+│ CLI reference:                                                               │
 │                                                                              │
 │   pgtrickle explain orders_live                                              │
 │   pgtrickle explain --analyze                                                │

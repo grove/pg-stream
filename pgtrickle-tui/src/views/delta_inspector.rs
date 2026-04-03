@@ -77,9 +77,9 @@ fn render_delta_sql(
             // SQL not yet fetched — show loading state
             vec![
                 Line::raw(""),
-                Line::styled(" Loading delta SQL…", theme.dim),
+                Line::styled(" Fetching delta SQL…", theme.dim),
                 Line::raw(""),
-                Line::styled(" Press Enter to fetch, or use the CLI:", theme.header),
+                Line::styled(" CLI reference:", theme.header),
                 Line::raw(""),
                 Line::raw(format!("   pgtrickle explain {}", st.name)),
                 Line::raw("   pgtrickle explain --analyze"),
