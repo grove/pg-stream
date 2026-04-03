@@ -3,7 +3,7 @@ source: pgtrickle-tui/src/views/mod.rs
 expression: output
 ---
 ┌──────────────────────────────────────────────────────────────────────────────┐
-│ Delta Inspector — select a stream table on Dashboard                         │
+│ Delta Inspector — select a stream table on Dashboard   [Delta SQL]  Auxiliary│
 └──────────────────────────────────────────────────────────────────────────────┘
 ┌ Delta SQL ───────────────────────────────────────────────────────────────────┐
 │                                                                              │

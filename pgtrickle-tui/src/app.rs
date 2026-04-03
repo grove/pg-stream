@@ -108,6 +108,16 @@ enum PollMsg {
     DeltaSql(String, String), // (table_name, sql)
     /// DDL fetched on demand
     Ddl(String, String), // (table_name, ddl)
+    /// Diagnosed errors fetched on demand
+    DiagnosedErrors(String, String), // (table_name, json)
+    /// Explain refresh mode fetched on demand
+    ExplainMode(String, String), // (table_name, json)
+    /// Source table detail fetched on demand
+    Sources(String, String), // (table_name, json)
+    /// Refresh history fetched on demand
+    RefreshHistory(String, String), // (table_name, json)
+    /// Auxiliary columns fetched on demand
+    AuxiliaryColumns(String, String), // (table_name, json)
     /// Reconnected after connection loss
     Reconnected,
 }
@@ -149,6 +159,8 @@ struct App {
     ddl_overlay: Option<String>,
     /// Validate overlay text
     validate_overlay: Option<String>,
+    /// Delta inspector sub-tab (0=SQL, 1=Auxiliary columns)
+    delta_inspector_tab: usize,
 }
 
 /// Simple command palette for `:` mode.
@@ -252,6 +264,7 @@ impl App {
             watermarks_tab: 0,
             ddl_overlay: None,
             validate_overlay: None,
+            delta_inspector_tab: 0,
         }
     }
 
@@ -467,10 +480,22 @@ async fn run_app(
                     // Preserve caches
                     let delta_sql_cache = std::mem::take(&mut app.state.delta_sql_cache);
                     let ddl_cache = std::mem::take(&mut app.state.ddl_cache);
+                    let diagnosed_errors = std::mem::take(&mut app.state.diagnosed_errors);
+                    let explain_mode_cache = std::mem::take(&mut app.state.explain_mode_cache);
+                    let source_detail_cache = std::mem::take(&mut app.state.source_detail_cache);
+                    let refresh_history_cache =
+                        std::mem::take(&mut app.state.refresh_history_cache);
+                    let auxiliary_columns_cache =
+                        std::mem::take(&mut app.state.auxiliary_columns_cache);
                     app.state = *new_state;
                     app.state.alerts = alerts;
                     app.state.delta_sql_cache = delta_sql_cache;
                     app.state.ddl_cache = ddl_cache;
+                    app.state.diagnosed_errors = diagnosed_errors;
+                    app.state.explain_mode_cache = explain_mode_cache;
+                    app.state.source_detail_cache = source_detail_cache;
+                    app.state.refresh_history_cache = refresh_history_cache;
+                    app.state.auxiliary_columns_cache = auxiliary_columns_cache;
                     app.state.poll_interval_ms = app.poll_interval * 1000;
                     app.clamp_selection();
                 }
@@ -491,6 +516,105 @@ async fn run_app(
                 PollMsg::Ddl(name, ddl) => {
                     app.state.ddl_cache.insert(name.clone(), ddl.clone());
                     app.ddl_overlay = Some(ddl);
+                }
+                PollMsg::DiagnosedErrors(name, json) => {
+                    if let Ok(errors) = serde_json::from_str::<Vec<serde_json::Value>>(&json) {
+                        let parsed: Vec<crate::state::DiagnosedError> = errors
+                            .iter()
+                            .filter_map(|v| {
+                                Some(crate::state::DiagnosedError {
+                                    event_time: v.get("event_time")?.as_str()?.to_string(),
+                                    error_type: v.get("error_type")?.as_str()?.to_string(),
+                                    error_message: v.get("error_message")?.as_str()?.to_string(),
+                                    remediation: v.get("remediation")?.as_str()?.to_string(),
+                                })
+                            })
+                            .collect();
+                        app.state.diagnosed_errors.insert(name, parsed);
+                    }
+                }
+                PollMsg::ExplainMode(name, json) => {
+                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&json)
+                        && let (Some(cm), Some(em)) = (
+                            v.get("configured_mode").and_then(|s| s.as_str()),
+                            v.get("effective_mode").and_then(|s| s.as_str()),
+                        )
+                    {
+                        app.state.explain_mode_cache.insert(
+                            name,
+                            crate::state::ExplainRefreshMode {
+                                configured_mode: cm.to_string(),
+                                effective_mode: em.to_string(),
+                                downgrade_reason: v
+                                    .get("downgrade_reason")
+                                    .and_then(|s| s.as_str())
+                                    .map(|s| s.to_string()),
+                            },
+                        );
+                    }
+                }
+                PollMsg::Sources(name, json) => {
+                    if let Ok(sources) = serde_json::from_str::<Vec<serde_json::Value>>(&json) {
+                        let parsed: Vec<crate::state::SourceTableInfo> = sources
+                            .iter()
+                            .filter_map(|v| {
+                                Some(crate::state::SourceTableInfo {
+                                    source_table: v.get("source_table")?.as_str()?.to_string(),
+                                    source_type: v.get("source_type")?.as_str()?.to_string(),
+                                    cdc_mode: v.get("cdc_mode")?.as_str()?.to_string(),
+                                    columns_used: v
+                                        .get("columns_used")
+                                        .and_then(|s| s.as_str())
+                                        .map(|s| s.to_string()),
+                                })
+                            })
+                            .collect();
+                        app.state.source_detail_cache.insert(name, parsed);
+                    }
+                }
+                PollMsg::RefreshHistory(name, json) => {
+                    if let Ok(entries) = serde_json::from_str::<Vec<serde_json::Value>>(&json) {
+                        let parsed: Vec<crate::state::RefreshHistoryEntry> = entries
+                            .iter()
+                            .filter_map(|v| {
+                                Some(crate::state::RefreshHistoryEntry {
+                                    action: v.get("action")?.as_str()?.to_string(),
+                                    status: v.get("status")?.as_str()?.to_string(),
+                                    rows_inserted: v.get("rows_inserted").and_then(|s| s.as_i64()),
+                                    rows_deleted: v.get("rows_deleted").and_then(|s| s.as_i64()),
+                                    delta_row_count: v
+                                        .get("delta_row_count")
+                                        .and_then(|s| s.as_i64()),
+                                    duration_ms: v.get("duration_ms").and_then(|s| s.as_f64()),
+                                    was_full_fallback: v
+                                        .get("was_full_fallback")
+                                        .and_then(|s| s.as_bool())
+                                        .unwrap_or(false),
+                                    start_time: v.get("start_time")?.as_str()?.to_string(),
+                                    error_message: v
+                                        .get("error_message")
+                                        .and_then(|s| s.as_str())
+                                        .map(|s| s.to_string()),
+                                })
+                            })
+                            .collect();
+                        app.state.refresh_history_cache.insert(name, parsed);
+                    }
+                }
+                PollMsg::AuxiliaryColumns(name, json) => {
+                    if let Ok(cols) = serde_json::from_str::<Vec<serde_json::Value>>(&json) {
+                        let parsed: Vec<crate::state::AuxiliaryColumn> = cols
+                            .iter()
+                            .filter_map(|v| {
+                                Some(crate::state::AuxiliaryColumn {
+                                    column_name: v.get("column_name")?.as_str()?.to_string(),
+                                    data_type: v.get("data_type")?.as_str()?.to_string(),
+                                    purpose: v.get("purpose")?.as_str()?.to_string(),
+                                })
+                            })
+                            .collect();
+                        app.state.auxiliary_columns_cache.insert(name, parsed);
+                    }
                 }
                 PollMsg::Reconnected => {
                     app.toast = Some(Toast::success("Reconnected to database"));
@@ -604,6 +728,26 @@ async fn poller_task(
                             }
                             ActionRequest::FetchDdl(name) if result.success => {
                                 let _ = tx.send(PollMsg::Ddl(name.clone(), result.message)).await;
+                                continue;
+                            }
+                            ActionRequest::FetchDiagnoseErrors(name) if result.success => {
+                                let _ = tx.send(PollMsg::DiagnosedErrors(name.clone(), result.message)).await;
+                                continue;
+                            }
+                            ActionRequest::FetchExplainMode(name) if result.success => {
+                                let _ = tx.send(PollMsg::ExplainMode(name.clone(), result.message)).await;
+                                continue;
+                            }
+                            ActionRequest::FetchSources(name) if result.success => {
+                                let _ = tx.send(PollMsg::Sources(name.clone(), result.message)).await;
+                                continue;
+                            }
+                            ActionRequest::FetchRefreshHistory(name) if result.success => {
+                                let _ = tx.send(PollMsg::RefreshHistory(name.clone(), result.message)).await;
+                                continue;
+                            }
+                            ActionRequest::FetchAuxiliaryColumns(name) if result.success => {
+                                let _ = tx.send(PollMsg::AuxiliaryColumns(name.clone(), result.message)).await;
                                 continue;
                             }
                             _ => {}
@@ -939,6 +1083,22 @@ fn handle_key(app: &mut App, key: KeyEvent) {
             app.selected = 0;
         }
 
+        // ── Delta Inspector sub-tab ──────────────────────────────
+        KeyCode::Tab if app.current_view == View::DeltaInspector => {
+            app.delta_inspector_tab = (app.delta_inspector_tab + 1) % 2;
+            // Trigger auxiliary columns fetch when switching to that tab
+            if app.delta_inspector_tab == 1
+                && let Some(idx) = app.selected_stream_table_index()
+            {
+                let name = app.state.stream_tables[idx].name.clone();
+                if !app.state.auxiliary_columns_cache.contains_key(&name)
+                    && let Some(ref tx) = app.action_tx
+                {
+                    let _ = tx.try_send(ActionRequest::FetchAuxiliaryColumns(name));
+                }
+            }
+        }
+
         // View switching via number keys
         KeyCode::Char('1') => switch_view(app, View::Dashboard),
         KeyCode::Char('2') => switch_view(app, View::Detail),
@@ -974,6 +1134,7 @@ fn handle_key(app: &mut App, key: KeyEvent) {
             // Drill from dashboard to detail
             if app.current_view == View::Dashboard {
                 app.current_view = View::Detail;
+                fetch_detail_data(app);
             }
         }
         KeyCode::Esc => {
@@ -1144,6 +1305,39 @@ fn switch_view(app: &mut App, view: View) {
             app.selected = 0;
         }
         app.clamp_selection();
+
+        // Trigger on-demand fetches for Detail view
+        if view == View::Detail {
+            fetch_detail_data(app);
+        }
+    }
+}
+
+/// Trigger on-demand data fetches for the Detail view of the selected stream table.
+fn fetch_detail_data(app: &App) {
+    if let Some(idx) = app.selected_stream_table_index() {
+        let st = &app.state.stream_tables[idx];
+        let name = st.name.clone();
+        if let Some(ref tx) = app.action_tx {
+            // Fetch explain refresh mode if not cached
+            if !app.state.explain_mode_cache.contains_key(&name) {
+                let _ = tx.try_send(ActionRequest::FetchExplainMode(name.clone()));
+            }
+            // Fetch sources if not cached
+            if !app.state.source_detail_cache.contains_key(&name) {
+                let _ = tx.try_send(ActionRequest::FetchSources(name.clone()));
+            }
+            // Fetch refresh history if not cached
+            if !app.state.refresh_history_cache.contains_key(&name) {
+                let _ = tx.try_send(ActionRequest::FetchRefreshHistory(name.clone()));
+            }
+            // Fetch diagnosed errors for error-state tables
+            if (st.status == "ERROR" || st.consecutive_errors > 0)
+                && !app.state.diagnosed_errors.contains_key(&name)
+            {
+                let _ = tx.try_send(ActionRequest::FetchDiagnoseErrors(name.clone()));
+            }
+        }
     }
 }
 
@@ -1361,6 +1555,7 @@ fn render_view(frame: &mut ratatui::Frame, area: Rect, app: &App) {
             &app.state,
             &app.theme,
             app.selected_stream_table_index(),
+            app.delta_inspector_tab,
         ),
         View::Issues => views::issues::render(frame, area, &app.state, &app.theme, app.selected),
     }

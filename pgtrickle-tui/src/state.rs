@@ -20,6 +20,11 @@ pub enum ActionRequest {
     FetchDeltaSql(String),
     FetchDdl(String),
     ValidateQuery(String),
+    FetchDiagnoseErrors(String),
+    FetchExplainMode(String),
+    FetchSources(String),
+    FetchRefreshHistory(String),
+    FetchAuxiliaryColumns(String),
 }
 
 /// Result from poller → UI thread after executing an action.
@@ -161,6 +166,22 @@ pub struct AppState {
     pub delta_sql_cache: HashMap<String, String>,
     /// DDL cache: st_name -> ddl
     pub ddl_cache: HashMap<String, String>,
+    /// Diagnosed errors cache: st_name -> errors
+    pub diagnosed_errors: HashMap<String, Vec<DiagnosedError>>,
+    /// Shared buffer stats from pgtrickle.shared_buffer_stats()
+    pub shared_buffer_stats: Vec<SharedBufferInfo>,
+    /// Explain refresh mode cache: st_name -> explanation
+    pub explain_mode_cache: HashMap<String, ExplainRefreshMode>,
+    /// Source table detail cache: st_name -> sources
+    pub source_detail_cache: HashMap<String, Vec<SourceTableInfo>>,
+    /// Diamond groups from pgtrickle.diamond_groups()
+    pub diamond_groups: Vec<DiamondGroup>,
+    /// SCC status from pgtrickle.pgt_scc_status()
+    pub scc_groups: Vec<SccGroup>,
+    /// Refresh history cache: st_name -> history entries
+    pub refresh_history_cache: HashMap<String, Vec<RefreshHistoryEntry>>,
+    /// Auxiliary columns cache: st_name -> columns
+    pub auxiliary_columns_cache: HashMap<String, Vec<AuxiliaryColumn>>,
 
     /// Whether all poll sub-queries failed (connection lost detection)
     pub poll_failure_count: usize,
@@ -357,6 +378,77 @@ pub struct WatermarkAlignment {
     pub aligned: bool,
     pub sources_with_watermark: i32,
     pub sources_total: i32,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct DiagnosedError {
+    pub event_time: String,
+    pub error_type: String,
+    pub error_message: String,
+    pub remediation: String,
+}
+
+#[derive(Clone, Serialize)]
+pub struct SharedBufferInfo {
+    pub source_table: String,
+    pub consumer_count: i32,
+    pub consumers: String,
+    pub columns_tracked: i32,
+    pub safe_frontier_lsn: Option<String>,
+    pub buffer_rows: i64,
+    pub is_partitioned: bool,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct ExplainRefreshMode {
+    pub configured_mode: String,
+    pub effective_mode: String,
+    pub downgrade_reason: Option<String>,
+}
+
+#[derive(Clone, Serialize)]
+pub struct SourceTableInfo {
+    pub source_table: String,
+    pub source_type: String,
+    pub cdc_mode: String,
+    pub columns_used: Option<String>,
+}
+
+#[derive(Clone, Serialize)]
+pub struct DiamondGroup {
+    pub group_id: i32,
+    pub member_name: String,
+    pub is_convergence: bool,
+    pub epoch: i64,
+}
+
+#[derive(Clone, Serialize)]
+pub struct SccGroup {
+    pub scc_id: i32,
+    pub member_count: i32,
+    pub members: String,
+    pub last_iterations: i32,
+    pub last_converged_at: Option<String>,
+}
+
+#[derive(Clone, Serialize)]
+pub struct RefreshHistoryEntry {
+    pub action: String,
+    pub status: String,
+    pub rows_inserted: Option<i64>,
+    pub rows_deleted: Option<i64>,
+    pub delta_row_count: Option<i64>,
+    pub duration_ms: Option<f64>,
+    pub was_full_fallback: bool,
+    pub start_time: String,
+    pub error_message: Option<String>,
+}
+
+#[derive(Clone, Serialize)]
+pub struct AuxiliaryColumn {
+    pub column_name: String,
+    pub data_type: String,
+    pub purpose: String,
 }
 
 impl AppState {

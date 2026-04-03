@@ -3,7 +3,7 @@ source: pgtrickle-tui/src/views/mod.rs
 expression: output
 ---
 ┌──────────────────────────────────────────────────────────────────────────────┐
-│ Delta Inspector — public.orders_live                                         │
+│ Delta Inspector — public.orders_live   [Delta SQL]  Auxiliary Columns  Tab to│
 └──────────────────────────────────────────────────────────────────────────────┘
 ┌ Delta SQL ───────────────────────────────────────────────────────────────────┐
 │                                                                              │

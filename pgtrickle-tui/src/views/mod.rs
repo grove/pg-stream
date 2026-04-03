@@ -306,7 +306,7 @@ mod snapshot_tests {
     #[test]
     fn test_delta_inspector_with_selection() {
         let output = render_to_string(80, 24, |frame, area, state, theme| {
-            super::delta_inspector::render(frame, area, state, theme, Some(0));
+            super::delta_inspector::render(frame, area, state, theme, Some(0), 0);
         });
         insta::assert_snapshot!(output);
     }
@@ -314,7 +314,7 @@ mod snapshot_tests {
     #[test]
     fn test_delta_inspector_no_selection() {
         let output = render_to_string(80, 24, |frame, area, state, theme| {
-            super::delta_inspector::render(frame, area, state, theme, None);
+            super::delta_inspector::render(frame, area, state, theme, None, 0);
         });
         insta::assert_snapshot!(output);
     }

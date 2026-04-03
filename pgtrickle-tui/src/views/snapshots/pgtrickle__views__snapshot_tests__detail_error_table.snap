@@ -11,6 +11,8 @@ expression: output
 │ Tier:     hot  Populated: yes                                                │
 │                                                                              │
 │                                                                              │
+│                                                                              │
+│                                                                              │
 └──────────────────────────────────────────────────────────────────────────────┘
 ┌ Refresh Statistics ──────────────────────────────────────────────────────────┐
 │ Total refreshes:  10                                                         │
@@ -35,8 +37,6 @@ expression: output
 │ division by zero                                                             │
 │                                                                              │
 │ Consecutive errors: 3                                                        │
-│                                                                              │
-│                                                                              │
 │                                                                              │
 │                                                                              │
 │                                                                              │

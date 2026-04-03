@@ -40,20 +40,20 @@ not just observe them.
 | Export current view (`Ctrl+E`) | P3 | ✅ Implemented |
 | Notification bell (`--bell`) | P3 | ✅ Implemented |
 | Diagnostics signal breakdown | P1 | ✅ Implemented (signals polled + bar chart view) |
-| Error diagnosis panel | P1 | Polling wired; view rendering deferred |
+| Error diagnosis panel | P1 | ✅ Implemented (on-demand fetch + Detail view panel) |
 | Source gating actions | P1 | ✅ Implemented (gate/ungate actions + Watermarks tab 2) |
 | Dedup stats view | P2 | ✅ Implemented (polling + CDC view rendering) |
-| Shared buffer stats view | P2 | Not started |
-| Explain refresh mode | P2 | Not started |
-| Source table detail | P2 | Not started |
-| Diamond groups & SCC | P2 | Not started |
+| Shared buffer stats view | P2 | ✅ Implemented (polling + CDC view table) |
+| Explain refresh mode | P2 | ✅ Implemented (on-demand fetch + Detail Properties) |
+| Source table detail | P2 | ✅ Implemented (on-demand fetch + Detail Sources section) |
+| Diamond groups & SCC | P2 | ✅ Implemented (polling + Graph/Detail badges) |
 | Quick health in header | P2 | ✅ Implemented (scheduler indicator) |
 | CDC health deep dive | P2 | ✅ Implemented (polling + CDC view + Detail view) |
-| Refresh history detail | P2 | Not started |
+| Refresh history detail | P2 | ✅ Implemented (on-demand fetch + rich Detail history) |
 | Repair action | P2 | ✅ Implemented (command palette + action) |
 | Export DDL inline | P2 | ✅ Implemented (DDL overlay) |
 | Query validation | P2 | ✅ Implemented (validate command) |
-| Auxiliary columns view | P3 | Not started |
+| Auxiliary columns view | P3 | ✅ Implemented (on-demand fetch + Delta Inspector tab) |
 
 ---
 

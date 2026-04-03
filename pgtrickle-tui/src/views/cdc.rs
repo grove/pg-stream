@@ -10,31 +10,46 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme, se
     // Decide layout based on whether we have CDC health or dedup data
     let has_health = !state.cdc_health.is_empty();
     let has_dedup = state.dedup_stats.is_some();
+    let has_sbs = !state.shared_buffer_stats.is_empty();
 
-    if has_health || has_dedup {
-        // 4-section layout: buffers, CDC health, dedup + triggers (split horizontal)
+    if has_health || has_dedup || has_sbs {
+        // Multi-section layout
+        let mut constraints = vec![Constraint::Percentage(30)]; // Buffers
+        if has_health {
+            constraints.push(Constraint::Percentage(25)); // CDC health
+        }
+        if has_sbs {
+            constraints.push(Constraint::Percentage(25)); // Shared buffer stats
+        }
+        constraints.push(Constraint::Percentage(20)); // Dedup + triggers
+
         let chunks = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Percentage(35), // Buffers
-                Constraint::Percentage(30), // CDC health
-                Constraint::Percentage(35), // Dedup + triggers
-            ])
+            .constraints(constraints)
             .split(area);
 
-        render_buffers(frame, chunks[0], state, theme, selected);
-        render_cdc_health(frame, chunks[1], state, theme);
+        let mut idx = 0;
+        render_buffers(frame, chunks[idx], state, theme, selected);
+        idx += 1;
+        if has_health {
+            render_cdc_health(frame, chunks[idx], state, theme);
+            idx += 1;
+        }
+        if has_sbs {
+            render_shared_buffer_stats(frame, chunks[idx], state, theme);
+            idx += 1;
+        }
 
         // Bottom: split horizontally for dedup stats (left) and triggers (right)
         if has_dedup {
             let bottom = Layout::default()
                 .direction(Direction::Horizontal)
                 .constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
-                .split(chunks[2]);
+                .split(chunks[idx]);
             render_dedup_stats(frame, bottom[0], state, theme);
             render_triggers(frame, bottom[1], state, theme);
         } else {
-            render_triggers(frame, chunks[2], state, theme);
+            render_triggers(frame, chunks[idx], state, theme);
         }
     } else {
         // Original 2-section layout
@@ -285,4 +300,58 @@ fn render_dedup_stats(frame: &mut Frame, area: Rect, state: &AppState, theme: &T
         .title(Span::styled(" Dedup Stats ", theme.title));
 
     frame.render_widget(Paragraph::new(lines).block(block), area);
+}
+
+fn render_shared_buffer_stats(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
+    let header = Row::new(
+        [
+            "Source",
+            "Consumers",
+            "Cols",
+            "Frontier LSN",
+            "Buf Rows",
+            "Part",
+        ]
+        .iter()
+        .map(|h| Cell::from(*h).style(theme.header)),
+    )
+    .height(1);
+
+    let rows: Vec<Row> = state
+        .shared_buffer_stats
+        .iter()
+        .map(|s| {
+            Row::new(vec![
+                Cell::from(s.source_table.as_str()),
+                Cell::from(format!("{} ({})", s.consumer_count, s.consumers)),
+                Cell::from(s.columns_tracked.to_string()),
+                Cell::from(s.safe_frontier_lsn.as_deref().unwrap_or("-")),
+                Cell::from(s.buffer_rows.to_string()),
+                Cell::from(if s.is_partitioned { "yes" } else { "no" }),
+            ])
+        })
+        .collect();
+
+    let widths = [
+        Constraint::Min(18),
+        Constraint::Min(25),
+        Constraint::Length(6),
+        Constraint::Length(16),
+        Constraint::Length(10),
+        Constraint::Length(6),
+    ];
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(theme.border)
+        .title(Span::styled(
+            format!(
+                " Shared Buffer Stats ({}) ",
+                state.shared_buffer_stats.len()
+            ),
+            theme.title,
+        ));
+
+    let table = Table::new(rows, widths).header(header).block(block);
+    frame.render_widget(table, area);
 }

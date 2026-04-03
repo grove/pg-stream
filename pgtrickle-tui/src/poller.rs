@@ -25,12 +25,15 @@ pub async fn poll_all(client: &Client, state: &mut AppState) {
     );
 
     // Phase 2: New SQL API polls run in parallel (graceful degradation)
-    let (r_dedup, r_cdc_h, r_qh, r_gates, r_wm_st) = tokio::join!(
+    let (r_dedup, r_cdc_h, r_qh, r_gates, r_wm_st, r_sbs, r_diamond, r_scc) = tokio::join!(
         poll_dedup_stats_query(client),
         poll_cdc_health_query(client),
         poll_quick_health_query(client),
         poll_source_gates_query(client),
         poll_watermark_status_query(client),
+        poll_shared_buffer_stats_query(client),
+        poll_diamond_groups_query(client),
+        poll_scc_status_query(client),
     );
 
     // Apply core results
@@ -137,6 +140,36 @@ pub async fn poll_all(client: &Client, state: &mut AppState) {
         }
         Err(_) => {
             state.watermark_alignment = vec![];
+            state.record_poll_failure();
+        }
+    }
+    match r_sbs {
+        Ok(v) => {
+            state.shared_buffer_stats = v;
+            state.record_poll_success();
+        }
+        Err(_) => {
+            state.shared_buffer_stats = vec![];
+            state.record_poll_failure();
+        }
+    }
+    match r_diamond {
+        Ok(v) => {
+            state.diamond_groups = v;
+            state.record_poll_success();
+        }
+        Err(_) => {
+            state.diamond_groups = vec![];
+            state.record_poll_failure();
+        }
+    }
+    match r_scc {
+        Ok(v) => {
+            state.scc_groups = v;
+            state.record_poll_success();
+        }
+        Err(_) => {
+            state.scc_groups = vec![];
             state.record_poll_failure();
         }
     }
@@ -253,6 +286,153 @@ pub async fn execute_action(client: &Client, action: &ActionRequest) -> ActionRe
                         result.push_str(&format!("[{sev}] {check}: {res}\n"));
                     }
                     Ok(result)
+                }
+                Err(e) => Err(e),
+            }
+        }
+        ActionRequest::FetchDiagnoseErrors(name) => {
+            match client
+                .query(
+                    "SELECT event_time::text, error_type::text, error_message::text, remediation::text
+                     FROM pgtrickle.diagnose_errors($1)
+                     ORDER BY event_time DESC
+                     LIMIT 5",
+                    &[name],
+                )
+                .await
+            {
+                Ok(rows) => {
+                    let json = serde_json::to_string(
+                        &rows
+                            .iter()
+                            .map(|row| {
+                                serde_json::json!({
+                                    "event_time": row.get::<_, String>(0),
+                                    "error_type": row.get::<_, String>(1),
+                                    "error_message": row.get::<_, String>(2),
+                                    "remediation": row.get::<_, String>(3),
+                                })
+                            })
+                            .collect::<Vec<_>>(),
+                    )
+                    .unwrap_or_default();
+                    Ok(json)
+                }
+                Err(e) => Err(e),
+            }
+        }
+        ActionRequest::FetchExplainMode(name) => {
+            match client
+                .query_one(
+                    "SELECT configured_mode::text, effective_mode::text, downgrade_reason::text
+                     FROM pgtrickle.explain_refresh_mode($1)",
+                    &[name],
+                )
+                .await
+            {
+                Ok(row) => {
+                    let json = serde_json::json!({
+                        "configured_mode": row.get::<_, String>(0),
+                        "effective_mode": row.get::<_, String>(1),
+                        "downgrade_reason": row.get::<_, Option<String>>(2),
+                    });
+                    Ok(json.to_string())
+                }
+                Err(e) => Err(e),
+            }
+        }
+        ActionRequest::FetchSources(name) => {
+            match client
+                .query(
+                    "SELECT source_table::text, source_type::text,
+                            cdc_mode::text, columns_used::text
+                     FROM pgtrickle.list_sources($1)
+                     ORDER BY source_table",
+                    &[name],
+                )
+                .await
+            {
+                Ok(rows) => {
+                    let json = serde_json::to_string(
+                        &rows
+                            .iter()
+                            .map(|row| {
+                                serde_json::json!({
+                                    "source_table": row.get::<_, String>(0),
+                                    "source_type": row.get::<_, String>(1),
+                                    "cdc_mode": row.get::<_, String>(2),
+                                    "columns_used": row.get::<_, Option<String>>(3),
+                                })
+                            })
+                            .collect::<Vec<_>>(),
+                    )
+                    .unwrap_or_default();
+                    Ok(json)
+                }
+                Err(e) => Err(e),
+            }
+        }
+        ActionRequest::FetchRefreshHistory(name) => {
+            match client
+                .query(
+                    "SELECT action::text, status::text, rows_inserted, rows_deleted,
+                            delta_row_count, duration_ms, was_full_fallback,
+                            start_time::text, error_message::text
+                     FROM pgtrickle.get_refresh_history($1, 10)
+                     ORDER BY start_time DESC",
+                    &[name],
+                )
+                .await
+            {
+                Ok(rows) => {
+                    let json = serde_json::to_string(
+                        &rows
+                            .iter()
+                            .map(|row| {
+                                serde_json::json!({
+                                    "action": row.get::<_, String>(0),
+                                    "status": row.get::<_, String>(1),
+                                    "rows_inserted": row.get::<_, Option<i64>>(2),
+                                    "rows_deleted": row.get::<_, Option<i64>>(3),
+                                    "delta_row_count": row.get::<_, Option<i64>>(4),
+                                    "duration_ms": row.get::<_, Option<f64>>(5),
+                                    "was_full_fallback": row.get::<_, bool>(6),
+                                    "start_time": row.get::<_, String>(7),
+                                    "error_message": row.get::<_, Option<String>>(8),
+                                })
+                            })
+                            .collect::<Vec<_>>(),
+                    )
+                    .unwrap_or_default();
+                    Ok(json)
+                }
+                Err(e) => Err(e),
+            }
+        }
+        ActionRequest::FetchAuxiliaryColumns(name) => {
+            match client
+                .query(
+                    "SELECT column_name::text, data_type::text, purpose::text
+                     FROM pgtrickle.list_auxiliary_columns($1)",
+                    &[name],
+                )
+                .await
+            {
+                Ok(rows) => {
+                    let json = serde_json::to_string(
+                        &rows
+                            .iter()
+                            .map(|row| {
+                                serde_json::json!({
+                                    "column_name": row.get::<_, String>(0),
+                                    "data_type": row.get::<_, String>(1),
+                                    "purpose": row.get::<_, String>(2),
+                                })
+                            })
+                            .collect::<Vec<_>>(),
+                    )
+                    .unwrap_or_default();
+                    Ok(json)
                 }
                 Err(e) => Err(e),
             }
@@ -741,6 +921,73 @@ async fn poll_watermark_status_query(client: &Client) -> Result<Vec<WatermarkAli
             aligned: row.get(2),
             sources_with_watermark: row.get(3),
             sources_total: row.get(4),
+        })
+        .collect())
+}
+
+async fn poll_shared_buffer_stats_query(client: &Client) -> Result<Vec<SharedBufferInfo>, PgErr> {
+    let rows = client
+        .query(
+            "SELECT source_table::text, consumer_count,
+                    consumers::text, columns_tracked,
+                    safe_frontier_lsn::text, buffer_rows, is_partitioned
+             FROM pgtrickle.shared_buffer_stats()
+             ORDER BY buffer_rows DESC",
+            &[],
+        )
+        .await?;
+    Ok(rows
+        .iter()
+        .map(|row| SharedBufferInfo {
+            source_table: row.get(0),
+            consumer_count: row.get(1),
+            consumers: row.get(2),
+            columns_tracked: row.get(3),
+            safe_frontier_lsn: row.get(4),
+            buffer_rows: row.get(5),
+            is_partitioned: row.get(6),
+        })
+        .collect())
+}
+
+async fn poll_diamond_groups_query(client: &Client) -> Result<Vec<DiamondGroup>, PgErr> {
+    let rows = client
+        .query(
+            "SELECT group_id, member_name::text, is_convergence, epoch
+             FROM pgtrickle.diamond_groups()
+             ORDER BY group_id, member_name",
+            &[],
+        )
+        .await?;
+    Ok(rows
+        .iter()
+        .map(|row| DiamondGroup {
+            group_id: row.get(0),
+            member_name: row.get(1),
+            is_convergence: row.get(2),
+            epoch: row.get(3),
+        })
+        .collect())
+}
+
+async fn poll_scc_status_query(client: &Client) -> Result<Vec<SccGroup>, PgErr> {
+    let rows = client
+        .query(
+            "SELECT scc_id, member_count, members::text,
+                    last_iterations, last_converged_at::text
+             FROM pgtrickle.pgt_scc_status()
+             ORDER BY scc_id",
+            &[],
+        )
+        .await?;
+    Ok(rows
+        .iter()
+        .map(|row| SccGroup {
+            scc_id: row.get(0),
+            member_count: row.get(1),
+            members: row.get(2),
+            last_iterations: row.get(3),
+            last_converged_at: row.get(4),
         })
         .collect())
 }

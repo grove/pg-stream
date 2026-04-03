@@ -1,8 +1,8 @@
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui::style::Modifier;
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, Wrap};
 
 use crate::state::{AppState, StreamTableInfo};
 use crate::theme::Theme;
@@ -25,7 +25,10 @@ pub fn render(
         }
     };
 
-    // Determine whether we have CDC health info for this table's sources
+    let has_sources = state.source_detail_cache.contains_key(&st.name);
+    let has_history = state.refresh_history_cache.contains_key(&st.name);
+    let has_errors = state.diagnosed_errors.contains_key(&st.name)
+        && !state.diagnosed_errors[&st.name].is_empty();
     let has_cdc_health = state.cdc_health.iter().any(|h| {
         state
             .cdc_buffers
@@ -33,38 +36,63 @@ pub fn render(
             .any(|b| b.stream_table == st.name && b.source_table == h.source_table)
     });
 
+    // Build constraints based on available data
+    let mut constraints = vec![Constraint::Length(12)]; // Properties (expanded for explain mode)
+    if has_sources {
+        constraints.push(Constraint::Length(8)); // Sources
+    }
+    constraints.push(Constraint::Length(10)); // Stats + efficiency
+    if has_history {
+        constraints.push(Constraint::Length(10)); // Rich refresh history
+    } else {
+        constraints.push(Constraint::Length(8)); // Basic recent refreshes
+    }
+    if has_cdc_health {
+        constraints.push(Constraint::Length(6)); // CDC source health
+    }
+    if has_errors {
+        constraints.push(Constraint::Length(10)); // Error diagnosis
+    }
+    constraints.push(Constraint::Min(4)); // Error details / upstream health
+
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints(if has_cdc_health {
-            vec![
-                Constraint::Length(10), // Properties
-                Constraint::Length(10), // Refresh stats + efficiency
-                Constraint::Length(8),  // Recent refreshes
-                Constraint::Length(6),  // CDC source health
-                Constraint::Min(4),     // Error details / upstream health
-            ]
-        } else {
-            vec![
-                Constraint::Length(10), // Properties
-                Constraint::Length(10), // Refresh stats + efficiency
-                Constraint::Length(8),  // Recent refreshes
-                Constraint::Min(4),     // Error details / upstream health
-            ]
-        })
+        .constraints(constraints)
         .split(area);
 
-    render_properties(frame, chunks[0], st, theme);
-    render_stats(frame, chunks[1], st, state, theme);
-    render_recent_refreshes(frame, chunks[2], st, state, theme);
-    if has_cdc_health {
-        render_source_health(frame, chunks[3], st, state, theme);
-        render_details(frame, chunks[4], st, state, theme);
-    } else {
-        render_details(frame, chunks[3], st, state, theme);
+    let mut idx = 0;
+    render_properties(frame, chunks[idx], st, state, theme);
+    idx += 1;
+    if has_sources {
+        render_sources(frame, chunks[idx], st, state, theme);
+        idx += 1;
     }
+    render_stats(frame, chunks[idx], st, state, theme);
+    idx += 1;
+    if has_history {
+        render_rich_refresh_history(frame, chunks[idx], st, state, theme);
+    } else {
+        render_recent_refreshes(frame, chunks[idx], st, state, theme);
+    }
+    idx += 1;
+    if has_cdc_health {
+        render_source_health(frame, chunks[idx], st, state, theme);
+        idx += 1;
+    }
+    if has_errors {
+        render_error_diagnosis(frame, chunks[idx], st, state, theme);
+        idx += 1;
+    }
+    render_details(frame, chunks[idx], st, state, theme);
 }
 
-fn render_properties(frame: &mut Frame, area: Rect, st: &StreamTableInfo, theme: &Theme) {
+fn render_properties(
+    frame: &mut Frame,
+    area: Rect,
+    st: &StreamTableInfo,
+    state: &AppState,
+    theme: &Theme,
+) {
     let status_style = theme.status_style(&st.status);
     let stale_style = if st.stale { theme.warning } else { theme.ok };
 
@@ -81,7 +109,7 @@ fn render_properties(frame: &mut Frame, area: Rect, st: &StreamTableInfo, theme:
         theme.ok
     };
 
-    let lines = vec![
+    let mut lines = vec![
         Line::from(vec![
             Span::styled(" Name:     ", theme.header),
             Span::raw(format!("{}.{}", st.schema, st.name)),
@@ -97,6 +125,29 @@ fn render_properties(frame: &mut Frame, area: Rect, st: &StreamTableInfo, theme:
             Span::styled(" Mode:     ", theme.header),
             Span::raw(&st.refresh_mode),
         ]),
+    ];
+
+    // Explain refresh mode (if cached)
+    if let Some(explain) = state.explain_mode_cache.get(&st.name) {
+        let downgraded = explain.configured_mode != explain.effective_mode;
+        let mode_style = if downgraded { theme.warning } else { theme.ok };
+        let mut mode_spans = vec![
+            Span::styled(" Effective: ", theme.header),
+            Span::styled(&explain.effective_mode, mode_style),
+        ];
+        if downgraded {
+            mode_spans.push(Span::styled(" ↓ downgraded", theme.warning));
+        }
+        lines.push(Line::from(mode_spans));
+        if let Some(ref reason) = explain.downgrade_reason {
+            lines.push(Line::from(vec![
+                Span::raw("   → "),
+                Span::styled(reason.as_str(), theme.dim),
+            ]));
+        }
+    }
+
+    lines.extend([
         Line::from(vec![
             Span::styled(" Schedule: ", theme.header),
             Span::raw(st.schedule.as_deref().unwrap_or("-")),
@@ -115,7 +166,45 @@ fn render_properties(frame: &mut Frame, area: Rect, st: &StreamTableInfo, theme:
             Span::styled("Populated: ", theme.header),
             Span::raw(if st.is_populated { "yes" } else { "no" }),
         ]),
-    ];
+    ]);
+
+    // Diamond group badge
+    if let Some(dg) = state
+        .diamond_groups
+        .iter()
+        .find(|d| d.member_name == st.name)
+    {
+        lines.push(Line::from(vec![
+            Span::styled(" Diamond:  ", theme.header),
+            Span::styled(
+                format!("◆ Group {} (epoch {})", dg.group_id, dg.epoch),
+                Style::default().fg(Color::Cyan),
+            ),
+        ]));
+    }
+
+    // SCC group badge
+    if let Some(scc) = state
+        .scc_groups
+        .iter()
+        .find(|s| s.members.contains(&st.name))
+    {
+        let converge_info = scc
+            .last_converged_at
+            .as_deref()
+            .map(|t| format!(", last: {t}"))
+            .unwrap_or_default();
+        lines.push(Line::from(vec![
+            Span::styled(" SCC:      ", theme.header),
+            Span::styled(
+                format!(
+                    "○ Group {} ({} members, {} iterations{})",
+                    scc.scc_id, scc.member_count, scc.last_iterations, converge_info
+                ),
+                Style::default().fg(Color::Magenta),
+            ),
+        ]));
+    }
 
     let block = Block::default()
         .borders(Borders::ALL)
@@ -243,6 +332,184 @@ fn render_recent_refreshes(
         .title(Span::styled(" Recent Refreshes ", theme.title));
 
     let paragraph = Paragraph::new(display).block(block);
+    frame.render_widget(paragraph, area);
+}
+
+fn render_sources(
+    frame: &mut Frame,
+    area: Rect,
+    st: &StreamTableInfo,
+    state: &AppState,
+    theme: &Theme,
+) {
+    let sources = match state.source_detail_cache.get(&st.name) {
+        Some(s) => s,
+        None => return,
+    };
+
+    let header = Row::new(
+        ["Source", "Type", "CDC Mode", "Columns"]
+            .iter()
+            .map(|h| Cell::from(*h).style(theme.header)),
+    )
+    .height(1);
+
+    let rows: Vec<Row> = sources
+        .iter()
+        .map(|s| {
+            Row::new(vec![
+                Cell::from(s.source_table.as_str()),
+                Cell::from(s.source_type.as_str()),
+                Cell::from(s.cdc_mode.as_str()),
+                Cell::from(s.columns_used.as_deref().unwrap_or("-")),
+            ])
+        })
+        .collect();
+
+    let widths = [
+        Constraint::Min(20),
+        Constraint::Length(10),
+        Constraint::Length(10),
+        Constraint::Min(25),
+    ];
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(theme.border)
+        .title(Span::styled(
+            format!(" Sources ({}) ", sources.len()),
+            theme.title,
+        ));
+
+    let table = Table::new(rows, widths).header(header).block(block);
+    frame.render_widget(table, area);
+}
+
+fn render_rich_refresh_history(
+    frame: &mut Frame,
+    area: Rect,
+    st: &StreamTableInfo,
+    state: &AppState,
+    theme: &Theme,
+) {
+    let entries = match state.refresh_history_cache.get(&st.name) {
+        Some(e) => e,
+        None => return,
+    };
+
+    let display: Vec<Line> = entries
+        .iter()
+        .take(7)
+        .map(|e| {
+            let status_style = match e.status.as_str() {
+                "success" | "ok" => theme.ok,
+                "error" | "failed" => theme.error,
+                _ => theme.dim,
+            };
+            let dur = e
+                .duration_ms
+                .map(|ms| format!("{ms:.0}ms"))
+                .unwrap_or_default();
+
+            let mut spans = vec![
+                Span::styled(&e.start_time, theme.dim),
+                Span::raw("  "),
+                Span::styled(&e.action, status_style),
+                Span::raw("  "),
+                Span::raw(dur),
+            ];
+
+            // Row counts
+            if let Some(ins) = e.rows_inserted {
+                spans.push(Span::raw("  "));
+                spans.push(Span::styled(format!("+{ins}"), theme.ok));
+            }
+            if let Some(del) = e.rows_deleted {
+                spans.push(Span::raw(" "));
+                spans.push(Span::styled(format!("-{del}"), theme.error));
+            }
+            if let Some(delta) = e.delta_row_count {
+                spans.push(Span::raw(format!("  ({delta} Δ)")));
+            }
+
+            if e.was_full_fallback {
+                spans.push(Span::styled(" (fallback)", theme.warning));
+            }
+
+            let icon = if e.status == "success" || e.status == "ok" {
+                Span::styled(" ✓", theme.ok)
+            } else {
+                Span::styled(" ✗", theme.error)
+            };
+            spans.push(icon);
+
+            Line::from(spans)
+        })
+        .collect();
+
+    let display = if display.is_empty() {
+        vec![Line::styled(" No refresh history", theme.dim)]
+    } else {
+        display
+    };
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(theme.border)
+        .title(Span::styled(
+            format!(" Recent Refreshes ({}) ", entries.len()),
+            theme.title,
+        ));
+
+    let paragraph = Paragraph::new(display).block(block);
+    frame.render_widget(paragraph, area);
+}
+
+fn render_error_diagnosis(
+    frame: &mut Frame,
+    area: Rect,
+    st: &StreamTableInfo,
+    state: &AppState,
+    theme: &Theme,
+) {
+    let errors = match state.diagnosed_errors.get(&st.name) {
+        Some(e) if !e.is_empty() => e,
+        _ => return,
+    };
+
+    let mut lines = Vec::new();
+    for err in errors.iter().take(5) {
+        let type_style = match err.error_type.as_str() {
+            "user" => Style::default().fg(Color::Cyan),
+            "schema" => Style::default().fg(Color::Yellow),
+            "correctness" => Style::default().fg(Color::Red),
+            "performance" => Style::default().fg(Color::Magenta),
+            "infrastructure" => Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            _ => theme.dim,
+        };
+
+        lines.push(Line::from(vec![
+            Span::raw("  "),
+            Span::styled(&err.event_time, theme.dim),
+            Span::raw("  "),
+            Span::styled(format!("[{}]", err.error_type), type_style),
+            Span::raw("  "),
+            Span::raw(&err.error_message),
+        ]));
+        lines.push(Line::from(vec![
+            Span::raw("           → "),
+            Span::styled(&err.remediation, theme.dim),
+        ]));
+    }
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(theme.border)
+        .title(Span::styled(" Error Diagnosis ", theme.title));
+
+    let paragraph = Paragraph::new(lines)
+        .block(block)
+        .wrap(Wrap { trim: false });
     frame.render_widget(paragraph, area);
 }
 
