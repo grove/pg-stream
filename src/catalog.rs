@@ -2364,6 +2364,108 @@ pub fn check_watermark_alignment(
     Ok((true, None))
 }
 
+/// WM-7: Check whether any watermark in groups overlapping with the given
+/// source OIDs is "stuck" — i.e. its `updated_at` is older than
+/// `now() - holdback_timeout_secs`.
+///
+/// Returns `(is_stuck, reason)`. When `holdback_timeout_secs` is 0,
+/// always returns `(false, None)`.
+pub fn check_watermark_staleness(
+    source_oids: &[pg_sys::Oid],
+    holdback_timeout_secs: i32,
+) -> Result<(bool, Option<String>), PgTrickleError> {
+    if holdback_timeout_secs <= 0 {
+        return Ok((false, None));
+    }
+
+    let groups = get_all_watermark_groups()?;
+    if groups.is_empty() {
+        return Ok((false, None));
+    }
+
+    let source_set: std::collections::HashSet<pg_sys::Oid> = source_oids.iter().copied().collect();
+
+    for group in &groups {
+        let overlapping: Vec<pg_sys::Oid> = group
+            .source_relids
+            .iter()
+            .filter(|oid| source_set.contains(oid))
+            .copied()
+            .collect();
+
+        if overlapping.is_empty() {
+            continue;
+        }
+
+        // Check each overlapping source for staleness.
+        for oid in &overlapping {
+            if let Some(wm) = get_watermark_for_source(*oid)? {
+                let age_secs: Option<f64> = Spi::get_one_with_args(
+                    "SELECT EXTRACT(EPOCH FROM (now() - $1::timestamptz))::float8",
+                    &[wm.updated_at.into()],
+                )
+                .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
+
+                if let Some(age) = age_secs
+                    && age > holdback_timeout_secs as f64
+                {
+                    let reason = format!(
+                        "watermark group '{}' has stuck source OID {} \
+                         (last advanced {:.0}s ago, timeout {}s)",
+                        group.group_name,
+                        oid.to_u32(),
+                        age,
+                        holdback_timeout_secs
+                    );
+                    return Ok((true, Some(reason)));
+                }
+            }
+            // Sources without a watermark are not considered stuck
+            // (they haven't participated in gating yet).
+        }
+    }
+
+    Ok((false, None))
+}
+
+/// WM-7: Find all stuck watermarks across all groups.
+///
+/// Returns a list of `(group_name, source_oid, age_secs)` for each stuck
+/// source. Used by the scheduler's periodic alerting.
+pub fn find_stuck_watermarks(
+    holdback_timeout_secs: i32,
+) -> Result<Vec<(String, u32, f64)>, PgTrickleError> {
+    if holdback_timeout_secs <= 0 {
+        return Ok(Vec::new());
+    }
+
+    let groups = get_all_watermark_groups()?;
+    if groups.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut stuck = Vec::new();
+    for group in &groups {
+        for oid in &group.source_relids {
+            if let Some(wm) = get_watermark_for_source(*oid)? {
+                let age_secs: Option<f64> = Spi::get_one_with_args(
+                    "SELECT EXTRACT(EPOCH FROM (now() - $1::timestamptz))::float8",
+                    &[wm.updated_at.into()],
+                )
+                .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
+
+                if let Some(age) = age_secs
+                    && age > holdback_timeout_secs as f64
+                {
+                    stuck.push((group.group_name.clone(), oid.to_u32(), age));
+                }
+            }
+        }
+    }
+
+    Ok(stuck)
+}
+
 // ── Scheduler Job (Phase 2: parallel refresh) ─────────────────────────────
 
 /// Status of a scheduler job in the parallel refresh pipeline.

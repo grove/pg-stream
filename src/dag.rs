@@ -492,6 +492,22 @@ impl StDag {
         self.nodes.values().collect()
     }
 
+    /// Get a stream table node by its `NodeId`, if it exists.
+    pub fn get_node(&self, id: &NodeId) -> Option<&DagNode> {
+        self.nodes.get(id)
+    }
+
+    /// Human-readable label for any node (ST or base table).
+    pub fn node_label(&self, node: &NodeId) -> String {
+        match self.nodes.get(node) {
+            Some(n) => n.name.clone(),
+            None => match node {
+                NodeId::BaseTable(oid) => format!("base_table(oid={})", oid),
+                NodeId::StreamTable(id) => format!("stream_table(id={})", id),
+            },
+        }
+    }
+
     /// Returns `true` if the given pgt_id is present in the DAG.
     ///
     /// Used by the scheduler to verify that all invalidated pgt_ids are
@@ -923,13 +939,7 @@ impl StDag {
 
     /// Human-readable name for a node.
     fn node_name(&self, node: &NodeId) -> String {
-        match self.nodes.get(node) {
-            Some(n) => n.name.clone(),
-            None => match node {
-                NodeId::BaseTable(oid) => format!("base_table(oid={})", oid),
-                NodeId::StreamTable(id) => format!("stream_table(id={})", id),
-            },
-        }
+        self.node_label(node)
     }
 
     /// Recursively collect all transitive ancestors of `node` (upstream walk).

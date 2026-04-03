@@ -135,7 +135,12 @@ src/
 └── dvm/            # Differential view maintenance engine
     ├── mod.rs
     ├── diff.rs     # Delta application
-    ├── parser.rs   # Query analysis
+    ├── parser/     # Query analysis (modularized, G13-PRF)
+    │   ├── mod.rs        # FFI helpers, macros, entry points, tests
+    │   ├── types.rs      # OpTree, Expr, Column, AggExpr, etc.
+    │   ├── validation.rs # Volatility, IVM support, IMMEDIATE, monotonicity
+    │   ├── rewrites.rs   # SQL rewrite passes (view inlining, grouping sets, etc.)
+    │   └── sublinks.rs   # SubLink extraction from WHERE clauses
     ├── row_id.rs   # Row identity tracking
     └── operators/  # Per-SQL-operator differentiation rules
 ```

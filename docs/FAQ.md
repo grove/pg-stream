@@ -173,7 +173,7 @@ pg_trickle's IMMEDIATE mode is designed as a migration path for pg_ivm users —
 
 **PostgreSQL 18.x** exclusively. pg_trickle uses PostgreSQL 18 features such as enhanced `MERGE` syntax with `NOT MATCHED BY SOURCE` and improved event trigger payloads. These features are not available in earlier versions.
 
-Backward compatibility with PostgreSQL 16–17 is planned for the v0.4.0 release.
+Backward compatibility with PostgreSQL 16–17 is planned for a future release (tracked in the roadmap).
 
 ### Does pg_trickle require `wal_level = logical`?
 

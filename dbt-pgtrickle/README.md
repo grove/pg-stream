@@ -1,7 +1,7 @@
 # dbt-pgtrickle
 
 A [dbt](https://www.getdbt.com/) package that integrates
-[pg_trickle](https://github.com/<org>/pg-trickle) stream tables into your dbt
+[pg_trickle](https://github.com/grove/pg-trickle) stream tables into your dbt
 project via a custom `stream_table` materialization.
 
 No custom Python adapter required — works with the standard `dbt-postgres`
@@ -18,14 +18,31 @@ adapter. Just Jinja SQL macros that call pg_trickle's SQL API.
 
 ## Installation
 
+### From Git (recommended until dbt Hub listing is live)
+
 Add to your `packages.yml`:
 
 ```yaml
 packages:
-  - git: "https://github.com/<org>/pg-trickle.git"
-    revision: v0.1.0
+  - git: "https://github.com/grove/pg-trickle.git"
+    revision: v0.15.0
     subdirectory: "dbt-pgtrickle"
 ```
+
+### From dbt Hub (once published)
+
+After the package is listed on [dbt Hub](https://hub.getdbt.com/), you can
+install by package name:
+
+```yaml
+packages:
+  - package: grove/dbt_pgtrickle
+    version: [">=0.15.0", "<1.0.0"]
+```
+
+> **Note:** dbt Hub listing requires a separate GitHub repository for the
+> package. See [docs/integrations/dbt-hub-submission.md](../docs/integrations/dbt-hub-submission.md)
+> for the submission checklist and steps.
 
 Then run:
 

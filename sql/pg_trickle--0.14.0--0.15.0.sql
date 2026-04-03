@@ -2,6 +2,39 @@
 --
 -- v0.15.0: External Test Suites & Integration
 --
--- Placeholder: DDL changes will be added here as features are implemented.
+-- VOL-1: volatile_function_policy GUC
+--   Registered via pgrx GUC infrastructure (no DDL needed — GUC is
+--   automatically available after extension upgrade).
 --
--- No schema changes in this upgrade step as of initial development cycle open.
+-- TRUNC-1: TRUNCATE capture for trigger-mode CDC
+--   Already implemented in v0.14.0 via CDC TRUNCATE triggers. No schema
+--   changes needed for this release.
+--
+-- G15-BC: bulk_create(definitions JSONB)
+--   Registered via pgrx #[pg_extern] (auto-registered on extension upgrade).
+--
+-- G8.1: Cross-session MERGE cache invalidation
+--   Already implemented via shared-memory CACHE_GENERATION counter.
+--   No catalog schema changes needed.
+--
+-- EXPL-ENH: explain_st() enhancements
+--   New output properties (refresh_timing_stats, source_partitions,
+--   dependency_graph_dot) added to existing explain_st() function.
+--   No DDL changes needed — function signature unchanged.
+--
+-- PH-D2: merge_join_strategy GUC
+--   Registered via pgrx GUC infrastructure (auto-available after upgrade).
+--
+-- PH-E1: max_delta_estimate_rows GUC
+--   Registered via pgrx GUC infrastructure (auto-available after upgrade).
+--   Pre-flight delta output cardinality estimation before MERGE execution.
+--
+-- EC-01: JOIN key change + DELETE correctness fix
+--   Already implemented in v0.14.0 via R₀ pre-change snapshot strategy.
+--   Documentation updated to replace the known limitation section.
+--
+-- WM-7: watermark_holdback_timeout GUC
+--   Registered via pgrx GUC infrastructure (auto-available after upgrade).
+--   Detects stuck watermarks and pauses downstream stream tables.
+--
+-- No catalog schema changes in this upgrade step.

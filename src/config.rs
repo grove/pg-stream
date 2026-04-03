@@ -39,6 +39,46 @@ pub static PGS_MAX_CONCURRENT_REFRESHES: GucSetting<i32> = GucSetting::<i32>::ne
 /// Set to 1.0 to always fall back (effectively forcing FULL mode).
 pub static PGS_DIFFERENTIAL_MAX_CHANGE_RATIO: GucSetting<f64> = GucSetting::<f64>::new(0.15);
 
+/// PH-E1: Maximum estimated delta result rows before falling back to FULL refresh.
+///
+/// Before executing the MERGE, the refresh executor runs a capped
+/// `SELECT count(*) FROM (delta_query LIMIT N+1)` to estimate the output
+/// cardinality. If the count reaches this limit, a NOTICE is emitted and
+/// the refresh downgrades to FULL to avoid OOM or excessive temp-file spills.
+///
+/// Set to 0 to disable the estimation check (default).
+/// Recommended range: 50_000–500_000 depending on available memory.
+pub static PGS_MAX_DELTA_ESTIMATE_ROWS: GucSetting<i32> = GucSetting::<i32>::new(0);
+
+/// WM-7: Maximum seconds a watermark may remain un-advanced before being
+/// considered "stuck". When a watermark group contains a stuck source,
+/// downstream stream tables in that group are paused (skipped) and a
+/// `pgtrickle_alert` NOTIFY with category `watermark_stuck` is emitted.
+///
+/// Set to 0 to disable stuck-watermark detection (default).
+pub static PGS_WATERMARK_HOLDBACK_TIMEOUT: GucSetting<i32> = GucSetting::<i32>::new(0);
+
+/// PH-E2: Temp blocks written threshold for spill detection.
+///
+/// After each differential MERGE, the refresh executor queries
+/// `pg_stat_statements` for `temp_blks_written`. If the value exceeds
+/// this threshold, the refresh is considered a "spill". When
+/// `spill_consecutive_limit` consecutive spills are recorded for the
+/// same stream table, the scheduler forces a FULL refresh on the next
+/// cycle to avoid repeated temp-file overhead.
+///
+/// Set to 0 to disable spill detection (default).
+/// Requires `pg_stat_statements` extension to be installed.
+pub static PGS_SPILL_THRESHOLD_BLOCKS: GucSetting<i32> = GucSetting::<i32>::new(0);
+
+/// PH-E2: Number of consecutive spills before auto-switching to FULL refresh.
+///
+/// When a stream table accumulates this many consecutive differential
+/// refreshes where `temp_blks_written > spill_threshold_blocks`, the
+/// scheduler marks the ST for reinitialization (FULL refresh) on the
+/// next cycle. The counter resets after each non-spilling refresh.
+pub static PGS_SPILL_CONSECUTIVE_LIMIT: GucSetting<i32> = GucSetting::<i32>::new(3);
+
 /// Whether to use TRUNCATE instead of DELETE for change buffer cleanup
 /// when the entire buffer is consumed by a refresh.
 ///
@@ -446,6 +486,82 @@ pub static PGS_AGG_DIFF_CARDINALITY_THRESHOLD: GucSetting<i32> = GucSetting::<i3
 /// bounded per coordinator by `max_concurrent_refreshes`.
 pub static PGS_PER_DATABASE_WORKER_QUOTA: GucSetting<i32> = GucSetting::<i32>::new(0);
 
+/// VOL-1: Volatile function policy for DIFFERENTIAL/IMMEDIATE mode.
+///
+/// Controls how volatile functions in defining queries are handled:
+/// - `"reject"` (default): Error — volatile functions are rejected.
+/// - `"warn"`: Allow creation with a WARNING.
+/// - `"allow"`: Allow silently.
+pub static PGS_VOLATILE_FUNCTION_POLICY: GucSetting<Option<std::ffi::CString>> =
+    GucSetting::<Option<std::ffi::CString>>::new(Some(c"reject"));
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VolatileFunctionPolicy {
+    Reject,
+    Warn,
+    Allow,
+}
+
+impl VolatileFunctionPolicy {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            VolatileFunctionPolicy::Reject => "reject",
+            VolatileFunctionPolicy::Warn => "warn",
+            VolatileFunctionPolicy::Allow => "allow",
+        }
+    }
+}
+
+fn normalize_volatile_function_policy(value: Option<String>) -> VolatileFunctionPolicy {
+    match value.as_deref().map(str::to_ascii_lowercase).as_deref() {
+        Some("warn") => VolatileFunctionPolicy::Warn,
+        Some("allow") => VolatileFunctionPolicy::Allow,
+        _ => VolatileFunctionPolicy::Reject,
+    }
+}
+
+/// PH-D2: Merge join strategy override.
+///
+/// Controls the join strategy hint applied via `SET LOCAL` during MERGE:
+/// - `"auto"` (default): delta-size heuristics choose the strategy.
+/// - `"hash_join"`: always prefer hash joins (disable nestloop, raise work_mem).
+/// - `"nested_loop"`: always prefer nested loops (disable hashjoin + mergejoin).
+/// - `"merge_join"`: always prefer merge joins (disable hashjoin + nestloop).
+pub static PGS_MERGE_JOIN_STRATEGY: GucSetting<Option<std::ffi::CString>> =
+    GucSetting::<Option<std::ffi::CString>>::new(Some(c"auto"));
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MergeJoinStrategy {
+    /// Delta-size heuristics (existing behaviour).
+    Auto,
+    /// Force hash joins.
+    HashJoin,
+    /// Force nested-loop joins.
+    NestedLoop,
+    /// Force merge joins.
+    MergeJoin,
+}
+
+impl MergeJoinStrategy {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            MergeJoinStrategy::Auto => "auto",
+            MergeJoinStrategy::HashJoin => "hash_join",
+            MergeJoinStrategy::NestedLoop => "nested_loop",
+            MergeJoinStrategy::MergeJoin => "merge_join",
+        }
+    }
+}
+
+fn normalize_merge_join_strategy(value: Option<String>) -> MergeJoinStrategy {
+    match value.as_deref().map(str::to_ascii_lowercase).as_deref() {
+        Some("hash_join") => MergeJoinStrategy::HashJoin,
+        Some("nested_loop") => MergeJoinStrategy::NestedLoop,
+        Some("merge_join") => MergeJoinStrategy::MergeJoin,
+        _ => MergeJoinStrategy::Auto,
+    }
+}
+
 /// D-1a: Create new change buffer tables as UNLOGGED.
 ///
 /// When `true`, newly created change buffer tables (`pgtrickle_changes.changes_*`)
@@ -551,6 +667,65 @@ pub fn register_gucs() {
         &PGS_DIFFERENTIAL_MAX_CHANGE_RATIO,
         0.0,  // min
         1.0,  // max
+        GucContext::Suset,
+        GucFlags::default(),
+    );
+
+    // PH-E1: Delta estimated output cardinality threshold.
+    GucRegistry::define_int_guc(
+        c"pg_trickle.max_delta_estimate_rows",
+        c"Max estimated delta output rows before falling back to FULL (0 = disabled).",
+        c"Before executing the MERGE, runs a capped COUNT on the delta subquery. \
+           If the count reaches this limit, the refresh downgrades to FULL with a NOTICE \
+           to prevent OOM or excessive temp-file spills from unexpectedly large deltas. \
+           Set to 0 to disable the estimation check. Recommended: 50000–500000.",
+        &PGS_MAX_DELTA_ESTIMATE_ROWS,
+        0,          // min (0 = disabled)
+        10_000_000, // max
+        GucContext::Suset,
+        GucFlags::default(),
+    );
+
+    // WM-7: Watermark holdback timeout — seconds before a watermark is "stuck".
+    GucRegistry::define_int_guc(
+        c"pg_trickle.watermark_holdback_timeout",
+        c"Seconds before an un-advanced watermark is considered stuck (0 = disabled).",
+        c"When non-zero, the scheduler periodically checks all watermark sources. \
+           If any source in a watermark group has not advanced within this many seconds, \
+           downstream stream tables in that group are paused and a pgtrickle_alert \
+           notification with category watermark_stuck is emitted. Set to 0 to disable.",
+        &PGS_WATERMARK_HOLDBACK_TIMEOUT,
+        0,      // min (0 = disabled)
+        86_400, // max (24 hours)
+        GucContext::Suset,
+        GucFlags::default(),
+    );
+
+    // PH-E2: Spill detection threshold.
+    GucRegistry::define_int_guc(
+        c"pg_trickle.spill_threshold_blocks",
+        c"Temp blocks written threshold for spill detection (0 = disabled).",
+        c"After each differential MERGE, queries pg_stat_statements for temp_blks_written. \
+           If the value exceeds this threshold, the refresh is a spill. After \
+           spill_consecutive_limit consecutive spills, forces FULL refresh. \
+           Requires pg_stat_statements. Set to 0 to disable.",
+        &PGS_SPILL_THRESHOLD_BLOCKS,
+        0,           // min (0 = disabled)
+        100_000_000, // max
+        GucContext::Suset,
+        GucFlags::default(),
+    );
+
+    // PH-E2: Consecutive spill limit before FULL fallback.
+    GucRegistry::define_int_guc(
+        c"pg_trickle.spill_consecutive_limit",
+        c"Consecutive spilling refreshes before auto-switching to FULL (default 3).",
+        c"When a stream table has this many consecutive differential refreshes with \
+           temp_blks_written exceeding spill_threshold_blocks, the scheduler forces \
+           a FULL refresh on the next cycle. Resets after any non-spilling refresh.",
+        &PGS_SPILL_CONSECUTIVE_LIMIT,
+        1,   // min
+        100, // max
         GucContext::Suset,
         GucFlags::default(),
     );
@@ -1012,6 +1187,32 @@ pub fn register_gucs() {
         GucFlags::default(),
     );
 
+    // VOL-1: Volatile function policy.
+    GucRegistry::define_string_guc(
+        c"pg_trickle.volatile_function_policy",
+        c"Volatile function policy: reject (default), warn, or allow.",
+        c"'reject' (default) errors on volatile functions in DIFFERENTIAL/IMMEDIATE queries. \
+           'warn' emits a WARNING but allows creation. \
+           'allow' permits volatile functions silently. Volatile functions produce different \
+           values on each evaluation, which may break delta computation.",
+        &PGS_VOLATILE_FUNCTION_POLICY,
+        GucContext::Suset,
+        GucFlags::default(),
+    );
+
+    // PH-D2: Merge join strategy override.
+    GucRegistry::define_string_guc(
+        c"pg_trickle.merge_join_strategy",
+        c"Join strategy hint for MERGE: auto (default), hash_join, nested_loop, merge_join.",
+        c"'auto' (default) uses delta-size heuristics to choose between nested-loop and \
+           hash-join hints. 'hash_join' always disables nestloop and raises work_mem. \
+           'nested_loop' always disables hashjoin and mergejoin. \
+           'merge_join' always disables hashjoin and nestloop.",
+        &PGS_MERGE_JOIN_STRATEGY,
+        GucContext::Suset,
+        GucFlags::default(),
+    );
+
     // D-1a: UNLOGGED change buffers.
     GucRegistry::define_bool_guc(
         c"pg_trickle.unlogged_buffers",
@@ -1073,6 +1274,27 @@ pub fn pg_trickle_max_consecutive_errors() -> i32 {
 /// Returns the max change ratio for adaptive FULL fallback.
 pub fn pg_trickle_differential_max_change_ratio() -> f64 {
     PGS_DIFFERENTIAL_MAX_CHANGE_RATIO.get()
+}
+
+/// PH-E1: Returns the max estimated delta output rows before FULL fallback.
+/// Returns 0 when disabled.
+pub fn pg_trickle_max_delta_estimate_rows() -> i32 {
+    PGS_MAX_DELTA_ESTIMATE_ROWS.get()
+}
+
+/// WM-7: Returns the watermark holdback timeout in seconds (0 = disabled).
+pub fn pg_trickle_watermark_holdback_timeout() -> i32 {
+    PGS_WATERMARK_HOLDBACK_TIMEOUT.get()
+}
+
+/// PH-E2: Returns the spill detection threshold in temp blocks written (0 = disabled).
+pub fn pg_trickle_spill_threshold_blocks() -> i32 {
+    PGS_SPILL_THRESHOLD_BLOCKS.get()
+}
+
+/// PH-E2: Returns the consecutive spill limit before FULL fallback (default 3).
+pub fn pg_trickle_spill_consecutive_limit() -> i32 {
+    PGS_SPILL_CONSECUTIVE_LIMIT.get()
 }
 
 /// Returns the change buffer schema name.
@@ -1312,6 +1534,24 @@ pub fn pg_trickle_wake_debounce_ms() -> i32 {
     PGS_WAKE_DEBOUNCE_MS.get()
 }
 
+/// VOL-1: Returns the volatile function handling policy.
+pub fn pg_trickle_volatile_function_policy() -> VolatileFunctionPolicy {
+    normalize_volatile_function_policy(
+        PGS_VOLATILE_FUNCTION_POLICY
+            .get()
+            .and_then(|cs| cs.to_str().ok().map(str::to_owned)),
+    )
+}
+
+/// PH-D2: Returns the merge join strategy override.
+pub fn pg_trickle_merge_join_strategy() -> MergeJoinStrategy {
+    normalize_merge_join_strategy(
+        PGS_MERGE_JOIN_STRATEGY
+            .get()
+            .and_then(|cs| cs.to_str().ok().map(str::to_owned)),
+    )
+}
+
 /// D-1a: Returns whether new change buffer tables should be created UNLOGGED.
 pub fn pg_trickle_unlogged_buffers() -> bool {
     PGS_UNLOGGED_BUFFERS.get()
@@ -1320,9 +1560,10 @@ pub fn pg_trickle_unlogged_buffers() -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        CdcTriggerMode, ParallelRefreshMode, UserTriggersMode, normalize_cdc_trigger_mode,
+        CdcTriggerMode, MergeJoinStrategy, ParallelRefreshMode, UserTriggersMode,
+        VolatileFunctionPolicy, normalize_cdc_trigger_mode, normalize_merge_join_strategy,
         normalize_parallel_refresh_mode, normalize_recursive_max_depth,
-        normalize_user_triggers_mode, threshold_mb_to_bytes,
+        normalize_user_triggers_mode, normalize_volatile_function_policy, threshold_mb_to_bytes,
     };
 
     #[test]
@@ -1498,4 +1739,131 @@ mod tests {
             CdcTriggerMode::Statement
         );
     }
+
+    #[test]
+    fn test_normalize_volatile_function_policy_defaults_to_reject() {
+        assert_eq!(
+            normalize_volatile_function_policy(None),
+            VolatileFunctionPolicy::Reject
+        );
+        assert_eq!(
+            normalize_volatile_function_policy(Some("reject".to_string())),
+            VolatileFunctionPolicy::Reject
+        );
+        assert_eq!(
+            normalize_volatile_function_policy(Some("unexpected".to_string())),
+            VolatileFunctionPolicy::Reject
+        );
+    }
+
+    #[test]
+    fn test_normalize_volatile_function_policy_accepts_warn_and_allow() {
+        assert_eq!(
+            normalize_volatile_function_policy(Some("warn".to_string())),
+            VolatileFunctionPolicy::Warn
+        );
+        assert_eq!(
+            normalize_volatile_function_policy(Some("WARN".to_string())),
+            VolatileFunctionPolicy::Warn
+        );
+        assert_eq!(
+            normalize_volatile_function_policy(Some("allow".to_string())),
+            VolatileFunctionPolicy::Allow
+        );
+        assert_eq!(
+            normalize_volatile_function_policy(Some("ALLOW".to_string())),
+            VolatileFunctionPolicy::Allow
+        );
+    }
+
+    #[test]
+    fn test_volatile_function_policy_as_str() {
+        assert_eq!(VolatileFunctionPolicy::Reject.as_str(), "reject");
+        assert_eq!(VolatileFunctionPolicy::Warn.as_str(), "warn");
+        assert_eq!(VolatileFunctionPolicy::Allow.as_str(), "allow");
+    }
+
+    #[test]
+    fn test_normalize_volatile_function_policy_roundtrip_via_as_str() {
+        for policy in [
+            VolatileFunctionPolicy::Reject,
+            VolatileFunctionPolicy::Warn,
+            VolatileFunctionPolicy::Allow,
+        ] {
+            assert_eq!(
+                normalize_volatile_function_policy(Some(policy.as_str().to_string())),
+                policy
+            );
+        }
+    }
+
+    #[test]
+    fn test_normalize_merge_join_strategy_defaults_to_auto() {
+        assert_eq!(normalize_merge_join_strategy(None), MergeJoinStrategy::Auto);
+        assert_eq!(
+            normalize_merge_join_strategy(Some("auto".to_string())),
+            MergeJoinStrategy::Auto
+        );
+        assert_eq!(
+            normalize_merge_join_strategy(Some("unexpected".to_string())),
+            MergeJoinStrategy::Auto
+        );
+    }
+
+    #[test]
+    fn test_normalize_merge_join_strategy_all_variants() {
+        assert_eq!(
+            normalize_merge_join_strategy(Some("hash_join".to_string())),
+            MergeJoinStrategy::HashJoin
+        );
+        assert_eq!(
+            normalize_merge_join_strategy(Some("HASH_JOIN".to_string())),
+            MergeJoinStrategy::HashJoin
+        );
+        assert_eq!(
+            normalize_merge_join_strategy(Some("nested_loop".to_string())),
+            MergeJoinStrategy::NestedLoop
+        );
+        assert_eq!(
+            normalize_merge_join_strategy(Some("NESTED_LOOP".to_string())),
+            MergeJoinStrategy::NestedLoop
+        );
+        assert_eq!(
+            normalize_merge_join_strategy(Some("merge_join".to_string())),
+            MergeJoinStrategy::MergeJoin
+        );
+        assert_eq!(
+            normalize_merge_join_strategy(Some("MERGE_JOIN".to_string())),
+            MergeJoinStrategy::MergeJoin
+        );
+    }
+
+    #[test]
+    fn test_merge_join_strategy_as_str() {
+        assert_eq!(MergeJoinStrategy::Auto.as_str(), "auto");
+        assert_eq!(MergeJoinStrategy::HashJoin.as_str(), "hash_join");
+        assert_eq!(MergeJoinStrategy::NestedLoop.as_str(), "nested_loop");
+        assert_eq!(MergeJoinStrategy::MergeJoin.as_str(), "merge_join");
+    }
+
+    #[test]
+    fn test_normalize_merge_join_strategy_roundtrip_via_as_str() {
+        for strategy in [
+            MergeJoinStrategy::Auto,
+            MergeJoinStrategy::HashJoin,
+            MergeJoinStrategy::NestedLoop,
+            MergeJoinStrategy::MergeJoin,
+        ] {
+            assert_eq!(
+                normalize_merge_join_strategy(Some(strategy.as_str().to_string())),
+                strategy
+            );
+        }
+    }
+
+    // Note: GUC default value tests (PGS_WATERMARK_HOLDBACK_TIMEOUT,
+    // PGS_SPILL_THRESHOLD_BLOCKS, PGS_SPILL_CONSECUTIVE_LIMIT) require a
+    // PostgreSQL backend and are covered by E2E tests.  Calling
+    // `GucSetting::get()` in multi-threaded unit tests triggers pgrx's
+    // "postgres FFI may not be called from multiple threads" guard.
 }

@@ -23,7 +23,9 @@ Complete reference for all pg_trickle GUC (Grand Unified Configuration) variable
     - [pg\_trickle.slot\_lag\_critical\_threshold\_mb](#pg_trickleslot_lag_critical_threshold_mb)
   - [Refresh Performance](#refresh-performance)
     - [pg\_trickle.differential\_max\_change\_ratio](#pg_trickledifferential_max_change_ratio)
+    - [pg\_trickle.max\_delta\_estimate\_rows](#pg_tricklemax_delta_estimate_rows)
     - [pg\_trickle.planner\_aggressive](#pg_trickleplanner_aggressive)
+    - [pg\_trickle.merge\_join\_strategy](#pg_tricklemerge_join_strategy)
     - [pg\_trickle.merge\_planner\_hints](#pg_tricklemerge_planner_hints) *(deprecated)*
     - [pg\_trickle.merge\_work\_mem\_mb](#pg_tricklemerge_work_mem_mb)
     - [pg\_trickle.merge\_seqscan\_threshold](#pg_tricklemerge_seqscan_threshold)
@@ -49,6 +51,18 @@ Complete reference for all pg_trickle GUC (Grand Unified Configuration) variable
   - [Advanced / Internal](#advanced--internal)
     - [pg\_trickle.change\_buffer\_schema](#pg_tricklechange_buffer_schema)
     - [pg\_trickle.foreign\_table\_polling](#pg_trickleforeign_table_polling)
+    - [pg\_trickle.matview\_polling](#pg_tricklematview_polling)
+    - [pg\_trickle.cdc\_trigger\_mode](#pg_tricklecdc_trigger_mode)
+    - [pg\_trickle.tick\_watermark\_enabled](#pg_trickletick_watermark_enabled)
+    - [pg\_trickle.watermark\_holdback\_timeout](#pg_tricklewatermark_holdback_timeout)
+    - [pg\_trickle.spill\_threshold\_blocks](#pg_tricklespill_threshold_blocks)
+    - [pg\_trickle.spill\_consecutive\_limit](#pg_tricklespill_consecutive_limit)
+    - [pg\_trickle.log\_merge\_sql](#pg_tricklelog_merge_sql)
+  - [Guardrails & Diagnostics](#guardrails--diagnostics)
+    - [pg\_trickle.fuse\_default\_ceiling](#pg_tricklefuse_default_ceiling)
+    - [pg\_trickle.delta\_amplification\_threshold](#pg_trickledelta_amplification_threshold)
+    - [pg\_trickle.algebraic\_drift\_reset\_cycles](#pg_tricklealgebraic_drift_reset_cycles)
+    - [pg\_trickle.agg\_diff\_cardinality\_threshold](#pg_trickleagg_diff_cardinality_threshold)
   - [Circular Dependencies](#circular-dependencies)
     - [pg\_trickle.allow\_circular](#pg_trickleallow_circular)
     - [pg\_trickle.max\_fixpoint\_iterations](#pg_tricklemax_fixpoint_iterations)
@@ -65,7 +79,7 @@ Complete reference for all pg_trickle GUC (Grand Unified Configuration) variable
 
 ## Overview
 
-pg_trickle exposes twenty-three configuration variables in the `pg_trickle` namespace. All can be set in `postgresql.conf` or at runtime via `SET` / `ALTER SYSTEM`.
+pg_trickle exposes over forty configuration variables in the `pg_trickle` namespace. All can be set in `postgresql.conf` or at runtime via `SET` / `ALTER SYSTEM`.
 
 **Required `postgresql.conf` settings:**
 
@@ -407,6 +421,40 @@ SET pg_trickle.differential_max_change_ratio = 0.0;
 
 ---
 
+### pg_trickle.max_delta_estimate_rows
+
+*Added in v0.15.0.* Maximum estimated delta output cardinality before falling back to FULL refresh.
+
+| Property | Value |
+|---|---|
+| Type | `int` |
+| Default | `0` (disabled) |
+| Range | `0` – `10,000,000` |
+| Context | `SUSET` |
+| Restart Required | No |
+
+Before executing the MERGE, the refresh executor extracts the delta subquery and runs a capped `SELECT count(*) FROM (delta LIMIT N+1)`. If the count reaches the configured limit, the refresh emits a `NOTICE` and falls back to FULL refresh to prevent OOM or excessive temp-file spills from unexpectedly large delta output.
+
+This is complementary to [`differential_max_change_ratio`](#pg_trickledifferential_max_change_ratio) which checks *input* change buffer size as a ratio of source table size. `max_delta_estimate_rows` checks *output* cardinality — catching cases where a small number of input changes produce a large delta output after JOINs.
+
+**Special Values:**
+- **`0`** (default): Disable the estimation check entirely.
+
+**Tuning Guidance:**
+- **Servers with 8–16 GB RAM**: Start with `100000` and adjust based on observed refresh behavior.
+- **Large-memory servers** (32+ GB): `500000` or higher.
+- **Complex multi-join queries**: Lower to `50000` since join fan-out can amplify small changes.
+
+```sql
+-- Enable delta output estimation with 100K row limit
+SET pg_trickle.max_delta_estimate_rows = 100000;
+
+-- Disable estimation (default)
+SET pg_trickle.max_delta_estimate_rows = 0;
+```
+
+---
+
 ### pg_trickle.cleanup_use_truncate
 
 Use `TRUNCATE` instead of per-row `DELETE` for change buffer cleanup when the entire buffer is consumed by a refresh.
@@ -455,6 +503,42 @@ When enabled, the refresh executor estimates the delta size and applies optimize
 ```sql
 -- Disable all planner hints
 SET pg_trickle.planner_aggressive = false;
+```
+
+---
+
+### pg_trickle.merge_join_strategy
+
+*Added in v0.15.0.* Manual override for the join strategy used during MERGE execution.
+
+| Property | Value |
+|---|---|
+| Type | `text` |
+| Default | `'auto'` |
+| Values | `auto`, `hash_join`, `nested_loop`, `merge_join` |
+| Context | `SUSET` |
+| Restart Required | No |
+
+Controls which join strategy the refresh executor hints to PostgreSQL via `SET LOCAL` during differential refresh. Requires [`planner_aggressive`](#pg_trickleplanner_aggressive) to be enabled.
+
+| Value | Behaviour |
+|---|---|
+| `auto` (default) | Delta-size heuristics choose: nested-loop for tiny deltas, hash-join for larger ones |
+| `hash_join` | Always disable nested-loop joins and raise `work_mem` — best for medium-to-large deltas |
+| `nested_loop` | Always disable hash-join and merge-join — best for very small deltas against indexed tables |
+| `merge_join` | Always disable hash-join and nested-loop — useful if data is pre-sorted |
+
+**Tuning Guidance:**
+- **Most workloads**: Leave at `auto` — the built-in heuristic performs well.
+- **Consistently large deltas** (1K+ rows): Setting to `hash_join` avoids heuristic overhead.
+- **Troubleshooting**: If refresh is slow, try different strategies and compare with [`explain_st()`](SQL_REFERENCE.md#pgtrickleexplain_st).
+
+```sql
+-- Force hash joins for all MERGE operations
+SET pg_trickle.merge_join_strategy = 'hash_join';
+
+-- Revert to automatic heuristics
+SET pg_trickle.merge_join_strategy = 'auto';
 ```
 
 ---
@@ -879,6 +963,36 @@ SET pg_trickle.max_grouping_set_branches = 128;
 
 ---
 
+### pg_trickle.volatile_function_policy
+
+Controls how volatile functions in defining queries are handled for
+DIFFERENTIAL and IMMEDIATE modes.
+
+| Value | Behaviour |
+|-------|----------|
+| `reject` | **(Default)** Volatile functions cause an ERROR at stream table creation time. |
+| `warn` | Volatile functions emit a WARNING but creation proceeds. Delta correctness is not guaranteed. |
+| `allow` | Volatile functions are permitted silently. Use only when you understand that delta computation may produce incorrect results. |
+
+**Default:** `reject`
+**Context:** `SUSET` (superuser session-level)
+
+```sql
+-- Allow volatile functions with a warning
+SET pg_trickle.volatile_function_policy = 'warn';
+
+-- Allow volatile functions silently
+SET pg_trickle.volatile_function_policy = 'allow';
+```
+
+> **Note:** Volatile functions (e.g., `random()`, `clock_timestamp()`) produce
+> different values on each evaluation. In DIFFERENTIAL/IMMEDIATE modes, the
+> delta computation assumes deterministic functions — volatile functions may
+> cause stale or incorrect rows. FULL mode is unaffected since it recomputes
+> from scratch every time.
+
+---
+
 ### pg_trickle.unlogged_buffers
 
 Create new change buffer tables as `UNLOGGED` to reduce WAL amplification
@@ -1161,6 +1275,301 @@ incremental maintenance.
 
 ```sql
 SET pg_trickle.foreign_table_polling = true;
+```
+
+---
+
+### pg_trickle.matview_polling
+
+Enable polling-based CDC for materialized views. When enabled, materialized
+views referenced in defining queries are supported via snapshot-comparison
+(the same mechanism as foreign table polling). A local shadow table stores
+the previous state; `EXCEPT ALL` computes the delta on each refresh cycle.
+
+| Property | Value |
+|---|---|
+| Type | `boolean` |
+| Default | `false` |
+| Context | `SUSET` (superuser) |
+| Restart required | No |
+
+```sql
+SET pg_trickle.matview_polling = true;
+```
+
+---
+
+### pg_trickle.cdc_trigger_mode
+
+Controls the CDC trigger granularity: `statement` (default) or `row`.
+
+`statement` uses statement-level `AFTER` triggers with transition tables
+(`NEW TABLE` / `OLD TABLE`). A single invocation per DML statement processes
+all affected rows in one bulk `INSERT ... SELECT`, giving 50-80% less
+write-side overhead for bulk `UPDATE`/`DELETE`. Single-row DML is unaffected.
+
+`row` uses the legacy per-row trigger approach (pg_trickle < 0.4.0 behavior).
+
+Changing this setting takes effect for newly installed CDC triggers. Call
+`pgtrickle.rebuild_cdc_triggers()` to migrate existing stream tables.
+
+| Property | Value |
+|---|---|
+| Type | `string` |
+| Default | `'statement'` |
+| Valid values | `statement`, `row` |
+| Context | `SUSET` (superuser) |
+| Restart required | No |
+
+```sql
+-- Switch to statement-level triggers (default, recommended)
+SET pg_trickle.cdc_trigger_mode = 'statement';
+
+-- After changing, rebuild existing triggers:
+SELECT pgtrickle.rebuild_cdc_triggers();
+```
+
+---
+
+### pg_trickle.tick_watermark_enabled
+
+Cap CDC consumption to the WAL LSN at scheduler tick start. When enabled
+(default), each scheduler tick captures `pg_current_wal_lsn()` at its start
+and prevents any refresh from consuming WAL changes beyond that LSN. This
+bounds cross-source staleness without requiring user configuration.
+
+Disable only if you need stream tables to always advance to the latest
+available LSN.
+
+| Property | Value |
+|---|---|
+| Type | `boolean` |
+| Default | `true` |
+| Context | `SUSET` (superuser) |
+| Restart required | No |
+
+```sql
+-- Disable tick watermark bounding
+SET pg_trickle.tick_watermark_enabled = false;
+```
+
+---
+
+### pg_trickle.watermark_holdback_timeout
+
+Maximum seconds a user-provided watermark may remain un-advanced before
+being considered **stuck**. When a watermark group contains a source whose
+watermark has not been advanced within this timeout, downstream stream
+tables in that group are paused (refresh is skipped) and a
+`pgtrickle_alert` NOTIFY with `watermark_stuck` event is emitted.
+
+When the stuck watermark is advanced again (via `advance_watermark()`), the
+pause is automatically lifted and a `watermark_resumed` event is emitted.
+
+Set to `0` to disable stuck-watermark detection (default). Useful values
+depend on your ETL pipeline cadence -- for a pipeline that loads every 5
+minutes, a timeout of `600` (10 min) gives a safety margin.
+
+| Property | Value |
+|---|---|
+| Type | `integer` |
+| Default | `0` (disabled) |
+| Min | `0` |
+| Max | `86400` (24 hours) |
+| Context | `SUSET` (superuser) |
+| Restart required | No |
+
+```sql
+-- Set stuck-watermark timeout to 10 minutes
+ALTER SYSTEM SET pg_trickle.watermark_holdback_timeout = 600;
+SELECT pg_reload_conf();
+```
+
+**NOTIFY payloads:**
+
+```json
+{"event":"watermark_stuck","group":"order_pipeline","source_oid":16385,"age_secs":620}
+{"event":"watermark_resumed","source_oid":16385}
+```
+
+---
+
+### pg_trickle.spill_threshold_blocks
+
+Temp blocks written threshold for spill detection. After each differential
+MERGE, pg\_trickle queries `pg_stat_statements` for the `temp_blks_written`
+metric. If the value exceeds this threshold, the refresh is considered a
+**spill**.
+
+After `spill_consecutive_limit` consecutive spills, the scheduler forces a
+FULL refresh for that stream table to prevent repeated expensive
+differential merges.
+
+Requires the `pg_stat_statements` extension to be installed. Set to `0` to
+disable spill detection (default).
+
+| Property | Value |
+|---|---|
+| Type | `integer` |
+| Default | `0` (disabled) |
+| Min | `0` |
+| Max | `100000000` |
+| Context | `SUSET` (superuser) |
+| Restart required | No |
+
+```sql
+-- Enable spill detection: flag > 1000 temp blocks as a spill
+ALTER SYSTEM SET pg_trickle.spill_threshold_blocks = 1000;
+SELECT pg_reload_conf();
+```
+
+---
+
+### pg_trickle.spill_consecutive_limit
+
+Number of consecutive spilling differential refreshes before the scheduler
+automatically forces a FULL refresh. Resets after any non-spilling refresh.
+
+Only effective when `spill_threshold_blocks > 0`.
+
+| Property | Value |
+|---|---|
+| Type | `integer` |
+| Default | `3` |
+| Min | `1` |
+| Max | `100` |
+| Context | `SUSET` (superuser) |
+| Restart required | No |
+
+```sql
+-- Force FULL after 5 consecutive spills (default: 3)
+ALTER SYSTEM SET pg_trickle.spill_consecutive_limit = 5;
+SELECT pg_reload_conf();
+```
+
+---
+
+### pg_trickle.log_merge_sql
+
+Log the generated MERGE SQL template on every refresh cycle. When enabled,
+the MERGE SQL template built during differential refresh is emitted to the
+PostgreSQL server log at `LOG` level.
+
+**Intended for debugging MERGE query generation only. Do not enable in
+production** — the output is verbose and includes the full SQL for every
+refresh.
+
+| Property | Value |
+|---|---|
+| Type | `boolean` |
+| Default | `false` |
+| Context | `SUSET` (superuser) |
+| Restart required | No |
+
+```sql
+SET pg_trickle.log_merge_sql = true;
+```
+
+---
+
+## Guardrails & Diagnostics
+
+These GUCs control safety thresholds and diagnostic warnings.
+
+### pg_trickle.fuse_default_ceiling
+
+Global default change-count ceiling for the fuse circuit breaker. When a
+stream table has `fuse_mode = 'on'` or `'auto'` and no per-ST `fuse_ceiling`,
+this value is used. If pending changes exceed this count, the fuse blows
+and the stream table is suspended (status = `SUSPENDED`).
+
+Set to `0` to disable the global default (per-ST ceilings still apply).
+
+| Property | Value |
+|---|---|
+| Type | `integer` |
+| Default | `0` (disabled) |
+| Range | 0 - 2,000,000,000 |
+| Context | `SUSET` (superuser) |
+| Restart required | No |
+
+```sql
+-- Set global fuse ceiling to 1 million rows
+SET pg_trickle.fuse_default_ceiling = 1000000;
+```
+
+---
+
+### pg_trickle.delta_amplification_threshold
+
+Delta amplification detection threshold (output/input ratio). When a
+`DIFFERENTIAL` refresh produces more than this multiple of the input delta
+rows, a `WARNING` is emitted so operators can identify pathological join
+fan-out or many-to-many amplification.
+
+Set to `0.0` to disable.
+
+| Property | Value |
+|---|---|
+| Type | `float` |
+| Default | `0.0` (disabled) |
+| Range | 0.0 - 100,000.0 |
+| Context | `SUSET` (superuser) |
+| Restart required | No |
+
+```sql
+-- Warn when delta output is 10x the input
+SET pg_trickle.delta_amplification_threshold = 10.0;
+```
+
+---
+
+### pg_trickle.algebraic_drift_reset_cycles
+
+Differential cycles between automatic full recomputes for algebraic
+aggregates. After this many differential refresh cycles, stream tables
+with algebraic aggregates (`AVG`, `STDDEV`, `VAR`) are automatically
+reinitialized to reset accumulated floating-point drift in auxiliary
+columns.
+
+Set to `0` to disable automatic resets.
+
+| Property | Value |
+|---|---|
+| Type | `integer` |
+| Default | `0` (disabled) |
+| Range | 0 - 100,000 |
+| Context | `SUSET` (superuser) |
+| Restart required | No |
+
+```sql
+-- Reset algebraic aggregates every 10,000 cycles
+SET pg_trickle.algebraic_drift_reset_cycles = 10000;
+```
+
+---
+
+### pg_trickle.agg_diff_cardinality_threshold
+
+Estimated `GROUP BY` cardinality threshold for algebraic aggregate warnings.
+At `create_stream_table` time, if the defining query uses algebraic
+aggregates (`SUM`, `COUNT`, `AVG`) in `DIFFERENTIAL` mode and the estimated
+group cardinality is below this threshold, a `WARNING` is emitted suggesting
+`FULL` or `AUTO` mode.
+
+Set to `0` to disable the warning.
+
+| Property | Value |
+|---|---|
+| Type | `integer` |
+| Default | `0` (disabled) |
+| Range | 0 - 100,000,000 |
+| Context | `SUSET` (superuser) |
+| Restart required | No |
+
+```sql
+-- Warn when GROUP BY cardinality is below 100
+SET pg_trickle.agg_diff_cardinality_threshold = 100;
 ```
 
 ---

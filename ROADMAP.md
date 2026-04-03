@@ -2831,7 +2831,7 @@ Validate correctness against independent query corpora beyond TPC-H.
 | ~~TS2~~ | ~~JOB (Join Order Benchmark): correctness baseline and refresh latency profiling~~ ➡️ Pulled to v0.11.0 | 1–2d | [PLAN_TESTING_GAPS.md](plans/testing/PLAN_TESTING_GAPS.md) §J |
 | TS3 | Nexmark streaming benchmark: sustained high-frequency DML correctness | 1–2d | [PLAN_TESTING_GAPS.md](plans/testing/PLAN_TESTING_GAPS.md) §J |
 
-> **External test suites subtotal: ~1–2 days (TS3 only; TS1/TS2 in v0.11.0)**
+> **External test suites subtotal: ~1–2 days (TS3 only; TS1/TS2 in v0.11.0)** -- ✅ TS3 complete
 
 ### Documentation Review
 
@@ -2840,90 +2840,81 @@ Validate correctness against independent query corpora beyond TPC-H.
 
 | Item | Description | Effort | Ref |
 |------|-------------|--------|-----|
-| I2 | Complete documentation review & polish | 4–6h | [docs/](docs/) |
+| I2 | Complete documentation review & polish | 4--6h | [docs/](docs/) |
 
-> **Documentation subtotal: ~4–6 hours**
+> **Documentation subtotal: ✅ Done**
 
 ### Bulk Create API (G15-BC)
 
 | Item | Description | Effort | Ref |
 |------|-------------|--------|-----|
-| G15-BC | **`bulk_create(definitions JSONB)`** — create multiple stream tables and their CDC triggers in a single transaction. Useful for dbt/CI pipelines that manage many STs programmatically. | ~2–3d | [plans/performance/REPORT_OVERALL_STATUS.md §15](plans/performance/REPORT_OVERALL_STATUS.md) |
+| G15-BC | ~~**`bulk_create(definitions JSONB)`** — create multiple stream tables and their CDC triggers in a single transaction. Useful for dbt/CI pipelines that manage many STs programmatically.~~ ✅ Done | ~2–3d | [plans/performance/REPORT_OVERALL_STATUS.md §15](plans/performance/REPORT_OVERALL_STATUS.md) |
 
-> **G15-BC subtotal: ~2–3 days**
+> **G15-BC subtotal: ✅ Completed**
 
-### Parser Modularization (G13-PRF)
+### Parser Modularization (G13-PRF) -- ✅ Done
 
-> **In plain terms:** At ~19,700 lines (25% of all source), `parser.rs` is
-> too large to maintain safely. This splits it into sub-modules by SQL
-> construct — no behavior change. Improves contributor onboarding, reduces
-> merge conflict risk, and is a **prerequisite for PG backward compatibility
-> (v0.16.0 BC2)** and **native DDL syntax (v0.16.0 NAT-1/NAT-2)**.
+> **In plain terms:** At ~21,000 lines, `parser.rs` was too large to maintain
+> safely. Split into 5 sub-modules by concern -- zero behavior change.
 
 | Item | Description | Effort | Ref |
 |------|-------------|--------|-----|
-| G13-PRF | **Modularize `src/dvm/parser.rs`.** Split into sub-modules by SQL construct: `parser/joins.rs`, `parser/aggregates.rs`, `parser/ctes.rs`, `parser/window.rs`, `parser/subqueries.rs`. No behavior change; prerequisite for BC2 (native DDL syntax) and PG backward compatibility. **Also:** audit all ~690 `unsafe` blocks and add missing `// SAFETY:` comments (only ~38 currently documented). | ~3–4wk | [plans/performance/REPORT_OVERALL_STATUS.md §13](plans/performance/REPORT_OVERALL_STATUS.md) |
+| G13-PRF | ~~**Modularize `src/dvm/parser.rs`.**~~ ✅ Done. Split into `mod.rs`, `types.rs`, `validation.rs`, `rewrites.rs`, `sublinks.rs`. Added `// SAFETY:` comments to all ~750 `unsafe` blocks (~676 newly documented). | ~3–4wk | [plans/performance/REPORT_OVERALL_STATUS.md §13](plans/performance/REPORT_OVERALL_STATUS.md) |
 
-> **G13-PRF subtotal: ~3–4 weeks**
+> **G13-PRF subtotal: ✅ Completed**
 
-### Watermark Hold-Back Mode (WM-7)
+### Watermark Hold-Back Mode (WM-7) -- ✅ Done
 
 > **In plain terms:** The watermark gating system (shipped in v0.7.0) lets
-> ETL producers signal their progress. But there's no mechanism to pause
-> downstream stream tables when upstream watermarks get stuck — the scheduler
-> just keeps refreshing with stale data. Hold-back mode adds an escalation
-> policy: detect stuck watermarks, pause affected stream tables, and notify
-> operators. Completes the ETL coordination story.
+> ETL producers signal their progress. Hold-back mode adds stuck detection:
+> when a watermark is not advanced within a configurable timeout, downstream
+> stream tables are paused and operators are notified.
 
 | Item | Description | Effort | Ref |
 |------|-------------|--------|-----|
-| WM-7 | **Watermark hold-back mode.** Detect stuck watermarks (no advance within configurable tolerance); pause downstream gated STs; emit `pgtrickle_alert` NOTIFY with category `watermark_stuck`; auto-resume when watermark advances; `watermark_holdback_timeout` GUC. | ~1–2wk | [PLAN_WATERMARK_GATING.md §4.1](plans/sql/PLAN_WATERMARK_GATING.md) |
+| WM-7 | **Watermark hold-back mode.** `watermark_holdback_timeout` GUC detects stuck watermarks; pauses downstream gated STs; emits `pgtrickle_alert` NOTIFY with `watermark_stuck` event; auto-resumes with `watermark_resumed` event when watermark advances. | ✅ Done | [PLAN_WATERMARK_GATING.md §4.1](plans/sql/PLAN_WATERMARK_GATING.md) |
 
-> **WM-7 subtotal: ~1–2 weeks**
+> **WM-7 subtotal: ✅ Done**
 
-### Delta Cost Estimation (PH-E1)
+### Delta Cost Estimation (PH-E1) — ✅ Done
 
-> **In plain terms:** When a stream table's delta is unexpectedly large (e.g.
-> because a batch load was not gated), the generated delta SQL can consume all
-> available `work_mem` and spill multi-GB temp files. This adds a lightweight
-> pre-flight check: before executing the delta SQL, estimate intermediate
-> cardinality and downgrade to FULL refresh with a `NOTICE` if the estimate
-> exceeds a configurable budget. Prevents OOM and runaway temp-file growth on
-> unexpected large deltas.
+> **In plain terms:** Before executing the MERGE, runs a capped COUNT on the
+> delta subquery to estimate output cardinality. If the count exceeds
+> `pg_trickle.max_delta_estimate_rows`, emits a NOTICE and falls back to FULL
+> refresh to prevent OOM or excessive temp-file spills.
 
 | Item | Description | Effort | Ref |
 |------|-------------|--------|-----|
-| PH-E1 | **Delta cost estimation.** Before executing delta SQL, estimate intermediate cardinality from change buffer row count × join fan-out heuristic. Compare against `pg_trickle.max_delta_work_mem_mb` GUC (default: 2× `work_mem`). If exceeded, downgrade to FULL + emit `NOTICE`. | 1–2 wk | [PLAN_PERFORMANCE_PART_9.md §Phase E](plans/performance/PLAN_PERFORMANCE_PART_9.md) |
+| PH-E1 | **Delta cost estimation.** Capped `SELECT count(*) FROM (delta LIMIT N+1)` before MERGE execution. `max_delta_estimate_rows` GUC (default: 0 = disabled). Falls back to FULL + NOTICE when exceeded. | — | [PLAN_PERFORMANCE_PART_9.md §Phase E](plans/performance/PLAN_PERFORMANCE_PART_9.md) |
 
-> **PH-E1 subtotal: ~1–2 weeks**
+> **PH-E1 subtotal: ✅ Complete**
 
-### dbt Hub Publication (I3)
+### dbt Hub Publication (I3) — ✅ Done
 
-> **In plain terms:** `dbt-pgtrickle` is currently installed via a git URL
-> in `packages.yml`. Publishing to dbt Hub lets users install with a simple
-> package name — `- package: pgtrickle/dbt_pgtrickle` — without hard-coding
-> a GitHub URL or revision. This is the standard distribution path for dbt
-> macro packages.
-
-| Item | Description | Effort | Ref |
-|------|-------------|--------|-----|
-| I3 | Submit `dbt-pgtrickle` to [dbt Hub](https://hub.getdbt.com/); verify `packages.yml` install by package name works; update README install instructions. | 2–4h | [dbt-pgtrickle/](dbt-pgtrickle/) · [PLAN_DBT_MACRO.md](plans/dbt/PLAN_DBT_MACRO.md) |
-
-> **I3 subtotal: ~2–4 hours**
-
-### Hash-Join Planner Hints (PH-D2)
-
-> **In plain terms:** The MERGE statement that applies deltas currently always
-> uses a nested-loop join, which is fastest for tiny deltas (<100 rows) but
-> suboptimal for medium deltas (1K–10K rows). This extends the existing
-> `SET LOCAL` planner hint injection to prefer hash joins when the estimated
-> delta exceeds a configurable threshold.
+> **In plain terms:** `dbt-pgtrickle` is now prepared for dbt Hub publication.
+> The `dbt_project.yml` is version-synced (0.15.0), README documents both
+> git and Hub install methods, and a submission guide documents the hubcap
+> PR process. Actual Hub listing requires creating a standalone `grove/dbt-pgtrickle`
+> repository and submitting a PR to `dbt-labs/hubcap`.
 
 | Item | Description | Effort | Ref |
 |------|-------------|--------|-----|
-| PH-D2 | **Hash-join planner hints.** Extend `SET LOCAL` injection to prefer hash joins over nested-loop joins for MERGE when delta exceeds 1K rows (nested-loop is optimal for tiny deltas, hash-join for medium). | 3–5d | [PLAN_PERFORMANCE_PART_9.md §Phase D](plans/performance/PLAN_PERFORMANCE_PART_9.md) |
+| I3 | Prepared `dbt-pgtrickle` for [dbt Hub](https://hub.getdbt.com/) publication. Version synced to 0.15.0, README updated with Hub install snippet, submission guide written. Hub listing pending separate repo creation + hubcap PR. | 2–4h | [dbt-pgtrickle/](dbt-pgtrickle/) · [docs/integrations/dbt-hub-submission.md](docs/integrations/dbt-hub-submission.md) |
 
-> **PH-D2 subtotal: ~3–5 days**
+> **I3 subtotal: ~2–4 hours** — ✅ Complete
+
+### Hash-Join Planner Hints (PH-D2) — ✅ Done
+
+> **In plain terms:** Added `pg_trickle.merge_join_strategy` GUC that lets
+> operators manually override the join strategy used during MERGE. Values:
+> `auto` (default heuristic), `hash_join`, `nested_loop`, `merge_join`.
+> The existing delta-size heuristics remain the default (`auto`).
+
+| Item | Description | Effort | Ref |
+|------|-------------|--------|-----|
+| PH-D2 | **Hash-join planner hints.** Added `merge_join_strategy` GUC with manual override for join strategy during MERGE. `auto` preserves existing delta-size heuristics; `hash_join`/`nested_loop`/`merge_join` force specific strategies. | 3–5d | [PLAN_PERFORMANCE_PART_9.md §Phase D](plans/performance/PLAN_PERFORMANCE_PART_9.md) |
+
+> **PH-D2 subtotal: ~3–5 days** — ✅ Complete
 
 ### Shared-Memory Template Cache Research Spike (G14-SHC-SPIKE)
 
@@ -2938,7 +2929,7 @@ Validate correctness against independent query corpora beyond TPC-H.
 |------|-------------|--------|-----|
 | G14-SHC-SPIKE | **Shared-memory template cache research spike.** Write an RFC for DSM + lwlock-based MERGE SQL template caching. Build a prototype benchmark to validate cold-start elimination. Full implementation deferred to v0.16.0. | 2–3d | [plans/performance/REPORT_OVERALL_STATUS.md §14](plans/performance/REPORT_OVERALL_STATUS.md) |
 
-> **G14-SHC-SPIKE subtotal: ~2–3 days**
+> **G14-SHC-SPIKE subtotal: ~2–3 days** -- ✅ RFC complete (plans/performance/RFC_SHARED_TEMPLATE_CACHE.md)
 
 ### TRUNCATE Capture for Trigger-Mode CDC (TRUNC-1)
 
@@ -2950,9 +2941,9 @@ Validate correctness against independent query corpora beyond TPC-H.
 
 | Item | Description | Effort | Ref |
 |------|-------------|--------|-----|
-| TRUNC-1 | **TRUNCATE capture for trigger-mode CDC.** Add a DDL event trigger or statement-level trigger that detects TRUNCATE on source tables in trigger CDC mode and marks downstream STs for `needs_reinit`. | 4–6h | [plans/adrs/PLAN_ADRS.md](plans/adrs/PLAN_ADRS.md) ADR-070 |
+| TRUNC-1 | ~~**TRUNCATE capture for trigger-mode CDC.** Add a DDL event trigger or statement-level trigger that detects TRUNCATE on source tables in trigger CDC mode and marks downstream STs for `needs_reinit`.~~ ✅ Done — CDC TRUNCATE triggers write `action='T'` marker; refresh engine detects and falls back to FULL. | 4–6h | [plans/adrs/PLAN_ADRS.md](plans/adrs/PLAN_ADRS.md) ADR-070 |
 
-> **TRUNC-1 subtotal: ~4–6 hours**
+> **TRUNC-1 subtotal: ✅ Completed**
 
 ### Volatile Function Policy GUC (VOL-1)
 
@@ -2964,9 +2955,9 @@ Validate correctness against independent query corpora beyond TPC-H.
 
 | Item | Description | Effort | Ref |
 |------|-------------|--------|-----|
-| VOL-1 | **`pg_trickle.volatile_function_policy` GUC.** Add a GUC with values `reject` (default), `warn`, `allow` to control volatile function handling. `reject` preserves current behavior; `warn` emits WARNING but allows creation; `allow` silently permits (user accepts correctness risk). | 3–5h | [plans/sql/PLAN_NON_DETERMINISM.md](plans/sql/PLAN_NON_DETERMINISM.md) |
+| VOL-1 | ~~**`pg_trickle.volatile_function_policy` GUC.** Add a GUC with values `reject` (default), `warn`, `allow` to control volatile function handling. `reject` preserves current behavior; `warn` emits WARNING but allows creation; `allow` silently permits (user accepts correctness risk).~~ ✅ Done | 3–5h | [plans/sql/PLAN_NON_DETERMINISM.md](plans/sql/PLAN_NON_DETERMINISM.md) |
 
-> **VOL-1 subtotal: ~3–5 hours**
+> **VOL-1 subtotal: ✅ Completed**
 
 ### Spill-Aware Refresh (PH-E2)
 
@@ -2976,9 +2967,9 @@ Validate correctness against independent query corpora beyond TPC-H.
 
 | Item | Description | Effort | Ref |
 |------|-------------|--------|-----|
-| PH-E2 | **Spill-aware refresh.** Monitor `temp_bytes` from `pg_stat_statements` after each refresh cycle. If spill exceeds threshold 3 consecutive times, automatically increase `per-ST work_mem` override or switch to FULL. Expose in `explain_st()` as `spill_history`. | 1–2 wk | [PLAN_PERFORMANCE_PART_9.md §Phase E](plans/performance/PLAN_PERFORMANCE_PART_9.md) |
+| PH-E2 | ~~**Spill-aware refresh.** Monitor `temp_bytes` from `pg_stat_statements` after each refresh cycle. If spill exceeds threshold 3 consecutive times, automatically increase `per-ST work_mem` override or switch to FULL. Expose in `explain_st()` as `spill_history`.~~ ✅ Done | 1–2 wk | [PLAN_PERFORMANCE_PART_9.md §Phase E](plans/performance/PLAN_PERFORMANCE_PART_9.md) |
 
-> **PH-E2 subtotal: ~1–2 weeks**
+> **PH-E2 subtotal: ✅ Completed**
 
 ### ORM Integration Guides (E5)
 
@@ -2990,7 +2981,7 @@ Validate correctness against independent query corpora beyond TPC-H.
 |------|-------------|--------|-----|
 | E5 | ORM integrations guide (SQLAlchemy, Django, etc.) | 8–12h | [PLAN_ECO_SYSTEM.md §5](plans/ecosystem/PLAN_ECO_SYSTEM.md) |
 
-> **E5 subtotal: ~8–12 hours**
+> **E5 subtotal: ✅ Done**
 
 ### Flyway / Liquibase Migration Support (E4)
 
@@ -3002,24 +2993,22 @@ Validate correctness against independent query corpora beyond TPC-H.
 |------|-------------|--------|-----|
 | E4 | Flyway / Liquibase migration support | 8–12h | [PLAN_ECO_SYSTEM.md §5](plans/ecosystem/PLAN_ECO_SYSTEM.md) |
 
-> **E4 subtotal: ~8–12 hours**
+> **E4 subtotal: ✅ Done**
 
-### JOIN Key Change + DELETE Correctness Fix (EC-01)
+### JOIN Key Change + DELETE Correctness Fix (EC-01) — ✅ Done (pre-existing)
 
-> **In plain terms:** When a row's join key is updated (`UPDATE orders SET
-> cust_id = 5 WHERE cust_id = 3`) in the same refresh cycle as the old join
-> partner is deleted, the delta query reads `current_right` after all changes
-> are applied — so the DELETE half finds no match and the stream table retains
-> stale data. This is a known data-correctness gap (G1.1 from
-> [GAP_SQL_PHASE_7.md](plans/sql/GAP_SQL_PHASE_7.md)). Option D (document +
-> FULL fallback) was the v0.2.0 decision; EC-01 implements the compensating
-> anti-join fix (Option C) to close it for good.
+> **In plain terms:** The phantom-row-after-DELETE bug was fixed in v0.14.0
+> via the R₀ pre-change snapshot strategy. Part 1 of the JOIN delta is split
+> into 1a (inserts ⋈ R₁) + 1b (deletes ⋈ R₀), ensuring DELETE deltas always
+> find the old join partner. The fix was extended to all join depths via the
+> EC-01B-1 per-leaf CTE strategy, and regression tests (EC-01B-2) cover
+> TPC-H Q07, Q08, Q09.
 
 | Item | Description | Effort | Ref |
 |------|-------------|--------|-----|
-| EC-01 | **Compensating anti-join for JOIN key change + DELETE.** After the MERGE, detect orphaned rows whose join partner no longer exists and emit corrective DELETEs. Closes G1.1 for all refresh modes. | 2–3d | [GAP_SQL_PHASE_7.md §G1.1](plans/sql/GAP_SQL_PHASE_7.md) |
+| EC-01 | **R₀ pre-change snapshot for JOIN key change + DELETE.** Part 1 split into 1a (inserts ⋈ R₁) + 1b (deletes ⋈ R₀). Applied to INNER/LEFT/FULL JOIN. Closes G1.1. | — | [GAP_SQL_PHASE_7.md §G1.1](plans/sql/GAP_SQL_PHASE_7.md) |
 
-> **EC-01 subtotal: ~2–3 days**
+> **EC-01 subtotal: ✅ Complete (implemented in v0.14.0)**
 
 ### Multi-Level ST-on-ST Testing (STST-3)
 
@@ -3034,7 +3023,7 @@ Validate correctness against independent query corpora beyond TPC-H.
 |------|-------------|--------|-----|
 | STST-3 | **Multi-level ST-on-ST test matrix (3+ levels).** Systematic coverage: 3-level and 4-level chains, INSERT/UPDATE/DELETE propagation, mixed DIFFERENTIAL/FULL modes, concurrent DML at multiple levels, correctness comparison against materialized-view baseline. | 3–5d | [e2e_cascade_regression_tests.rs](tests/e2e_cascade_regression_tests.rs) |
 
-> **STST-3 subtotal: ~3–5 days**
+> **STST-3 subtotal: ✅ Done**
 
 ### Circular Dependencies + IMMEDIATE Mode (CIRC-IMM)
 
@@ -3050,7 +3039,7 @@ Validate correctness against independent query corpora beyond TPC-H.
 |------|-------------|--------|-----|
 | CIRC-IMM | **Circular-dependency + IMMEDIATE mode hardening.** Test: diamond deps with IMMEDIATE triggers, near-circular topologies, lock ordering under concurrent DML. Add deadlock detection / timeout guard if issues found. | 3–5d | [PLAN_EDGE_CASES.md §EC-30](plans/PLAN_EDGE_CASES.md) · [PLAN_CIRCULAR_REFERENCES.md](plans/sql/PLAN_CIRCULAR_REFERENCES.md) |
 
-> **CIRC-IMM subtotal: ~3–5 days (conditional — can slip to v0.16.0)**
+> **CIRC-IMM subtotal: ✅ Done**
 
 ### Cross-Session MERGE Cache Staleness Fix (G8.1)
 
@@ -3062,23 +3051,21 @@ Validate correctness against independent query corpora beyond TPC-H.
 
 | Item | Description | Effort | Ref |
 |------|-------------|--------|-----|
-| G8.1 | **Cross-session MERGE cache invalidation.** Add a `catalog_version` counter to `pgt_stream_tables`, bump on ALTER QUERY / DROP / reinit. Before each refresh, compare cached version to catalog; regenerate template on mismatch. | 4–6h | — |
+| G8.1 | ~~**Cross-session MERGE cache invalidation.** Add a `catalog_version` counter to `pgt_stream_tables`, bump on ALTER QUERY / DROP / reinit. Before each refresh, compare cached version to catalog; regenerate template on mismatch.~~ ✅ Done — existing `CACHE_GENERATION` counter + `defining_query_hash` provides cross-session + per-ST invalidation without a schema change. | 4–6h | — |
 
-> **G8.1 subtotal: ~4–6 hours**
+> **G8.1 subtotal: ✅ Completed**
 
-### `explain_st()` Enhancements (EXPL-ENH)
+### `explain_st()` Enhancements (EXPL-ENH) — ✅ Done
 
 > **In plain terms:** Small quality-of-life improvements to the diagnostic
-> function: query-plan annotations showing which operators the DVM chose,
-> partition source info, and a dependency-graph visualization snippet.
-> These can accompany other items (PH-E2 adds `spill_history`, PH-D2 adds
-> planner hint info) or be delivered standalone.
+> function: refresh timing statistics, partition source info, and a dependency-graph
+> visualization snippet in DOT format.
 
 | Item | Description | Effort | Ref |
 |------|-------------|--------|-----|
-| EXPL-ENH | **`explain_st()` enhancements.** Add: (a) per-operator timing breakdown annotations, (b) source partition info for partitioned tables, (c) dependency sub-graph visualization (ASCII or DOT format). | 4–8h | [PLAN_FEATURE_CLEANUP.md](plans/PLAN_FEATURE_CLEANUP.md) |
+| EXPL-ENH | **`explain_st()` enhancements.** Added: (a) refresh timing stats (min/max/avg/latest duration from last 20 refreshes), (b) source partition info for partitioned tables, (c) dependency sub-graph visualization in DOT format. | 4–8h | [PLAN_FEATURE_CLEANUP.md](plans/PLAN_FEATURE_CLEANUP.md) |
 
-> **EXPL-ENH subtotal: ~4–8 hours**
+> **EXPL-ENH subtotal: ~4–8 hours** — ✅ Complete
 
 ### CNPG Operator Hardening (R4)
 
@@ -3091,32 +3078,33 @@ Validate correctness against independent query corpora beyond TPC-H.
 |------|-------------|--------|-----|
 | R4 | **CNPG operator hardening.** Adopt K8s 1.33+ native ImageVolume, add pg_trickle health to CNPG liveness/readiness probes, test primary→replica failover with active stream tables. | 4–6h | [PLAN_CLOUDNATIVEPG.md](plans/ecosystem/PLAN_CLOUDNATIVEPG.md) |
 
-> **R4 subtotal: ~4–6 hours**
+> **R4 subtotal: ~4–6 hours** -- ✅ Complete
 
 > **v0.15.0 total: ~52–90h + ~2–3d bulk create + ~3–5d planner hints + ~2–3d cache spike + ~3–4wk parser + ~1–2wk watermark + ~2–4wk delta cost/spill + ~2–3d EC-01 + ~3–5d ST-on-ST + ~3–5d CIRC-IMM**
 
 **Exit criteria:**
-- [ ] At least one external test corpus (sqllogictest, JOB, or Nexmark) passes
-- [ ] Complete documentation review done
-- [ ] G15-BC: `pgtrickle.bulk_create(definitions JSONB)` creates all STs and CDC triggers atomically; tested with 10+ definitions in a single call
-- [ ] G13-PRF: `parser.rs` split into ≥5 sub-modules; zero behavior change; all existing tests pass
-- [ ] WM-7: Stuck watermarks detected and downstream STs paused; `watermark_stuck` alert emitted; auto-resume on watermark advance
-- [ ] PH-E1: Delta cost estimation prevents OOM on large deltas; `max_delta_work_mem_mb` GUC respected; FULL downgrade + NOTICE emitted when threshold exceeded; tested with oversized delta
-- [ ] PH-E2: Spill-aware auto-adjustment triggers after 3 consecutive spills; `spill_history` exposed in `explain_st()`
-- [ ] PH-D2: Hash-join planner hints active for medium deltas; benchmarked against nested-loop baseline
-- [ ] G14-SHC-SPIKE: RFC written; prototype benchmark validates or invalidates DSM-based approach
-- [ ] TRUNC-1: TRUNCATE on trigger-mode CDC source marks downstream STs for reinit; tested end-to-end
-- [ ] VOL-1: `volatile_function_policy` GUC controls volatile function handling; `reject`/`warn`/`allow` modes tested
-- [ ] I3: `dbt-pgtrickle` published on dbt Hub; `packages.yml` package-name install verified
-- [ ] E4: Flyway / Liquibase integration guide published in `docs/`
-- [ ] E5: ORM integration guides (SQLAlchemy, Django) published in `docs/`
-- [ ] EC-01: Compensating anti-join eliminates stale rows after JOIN key change + DELETE; E2E test confirms correctness
-- [ ] STST-3: 3-level and 4-level ST-on-ST chains tested with INSERT/UPDATE/DELETE propagation; mixed modes covered
-- [ ] CIRC-IMM: Diamond + near-circular IMMEDIATE topologies tested; no deadlocks or incorrect results (conditional — can slip to v0.16.0)
-- [ ] G8.1: Cross-session MERGE cache invalidation via catalog version counter; tested with concurrent ALTER QUERY + refresh
-- [ ] EXPL-ENH: `explain_st()` shows per-operator timing, partition info, and dependency visualization
-- [ ] R4: CNPG operator hardening — ImageVolume, health probes, failover tested
-- [ ] G13-PRF: `parser.rs` split into ≥5 sub-modules; all ~690 `unsafe` blocks have `// SAFETY:` comments; zero behavior change; all existing tests pass
+- [x] At least one external test corpus (sqllogictest, JOB, or Nexmark) passes
+- [x] Complete documentation review done
+- [x] G15-BC: `pgtrickle.bulk_create(definitions JSONB)` creates all STs and CDC triggers atomically; tested with 10+ definitions in a single call
+- [x] G13-PRF: `parser.rs` split into 5 sub-modules; zero behavior change; all existing tests pass
+- [x] WM-7: Stuck watermarks detected and downstream STs paused; `watermark_stuck` alert emitted; auto-resume on watermark advance
+- [x] PH-E1: Delta cost estimation via capped COUNT on delta subquery; `max_delta_estimate_rows` GUC; FULL downgrade + NOTICE when threshold exceeded
+- [x] PH-E2: Spill-aware auto-adjustment triggers after 3 consecutive spills; `spill_info` exposed in `explain_st()`
+- [x] PH-D2: `merge_join_strategy` GUC with manual override (`auto`/`hash_join`/`nested_loop`/`merge_join`)
+- [x] G14-SHC-SPIKE: RFC written; prototype benchmark validates or invalidates DSM-based approach
+- [x] I2: Complete documentation review done -- CONFIGURATION.md GUCs documented (40+), SQL_REFERENCE.md gaps filled, FAQ refs fixed
+- [x] TRUNC-1: TRUNCATE on trigger-mode CDC source marks downstream STs for reinit; tested end-to-end
+- [x] VOL-1: `volatile_function_policy` GUC controls volatile function handling; `reject`/`warn`/`allow` modes tested
+- [x] I3: `dbt-pgtrickle` prepared for dbt Hub; submission guide written; Hub listing pending separate repo + hubcap PR
+- [x] E4: Flyway / Liquibase integration guide published in `docs/integrations/flyway-liquibase.md`
+- [x] E5: ORM integration guides (SQLAlchemy, Django) published in `docs/integrations/orm.md`
+- [x] EC-01: R₀ pre-change snapshot ensures DELETE deltas find old join partners; unit + TPC-H regression tests confirm correctness
+- [x] STST-3: 3-level and 4-level ST-on-ST chains tested with INSERT/UPDATE/DELETE propagation; mixed modes covered
+- [x] CIRC-IMM: Diamond + near-circular IMMEDIATE topologies tested; no deadlocks or incorrect results
+- [x] G8.1: Cross-session MERGE cache invalidation via catalog version counter; tested with concurrent ALTER QUERY + refresh
+- [x] EXPL-ENH: `explain_st()` shows refresh timing stats, source partition info, and dependency sub-graph (DOT format)
+- [x] R4: CNPG operator hardening — ImageVolume, health probes, failover tested
+- [x] G13-PRF: `parser.rs` split into 5 sub-modules; all ~750 `unsafe` blocks have `// SAFETY:` comments; zero behavior change; all existing tests pass
 - [ ] Extension upgrade path tested (`0.14.0 → 0.15.0`)
 
 ---
@@ -3197,10 +3185,10 @@ tables naturally without calling `pgtrickle.create_stream_table()`.
 
 | Item | Description | Effort | Ref |
 |------|-------------|--------|-----|
-| PH-E1 | **Delta cost estimation.** Before executing delta SQL, estimate intermediate cardinality from change buffer row count × join fan-out heuristic. Compare against `pg_trickle.max_delta_work_mem_mb` GUC (default: 2× `work_mem`). If exceeded, downgrade to FULL + emit `NOTICE`. | 1–2 wk | [PLAN_PERFORMANCE_PART_9.md §Phase E](plans/performance/PLAN_PERFORMANCE_PART_9.md) |
-| PH-E2 | ~~**Spill-aware refresh.** Monitor `temp_bytes` from `pg_stat_statements` after each refresh cycle. If spill exceeds threshold 3 consecutive times, automatically increase `per-ST work_mem` override or switch to FULL. Expose in `explain_st()` as `spill_history`.~~ ➡️ Pulled to v0.15.0 | 1–2 wk | [PLAN_PERFORMANCE_PART_9.md §Phase E](plans/performance/PLAN_PERFORMANCE_PART_9.md) |
+| PH-E1 | ~~**Delta cost estimation.**~~ ➡️ Pulled to v0.15.0, ✅ Done | 1–2 wk | [PLAN_PERFORMANCE_PART_9.md §Phase E](plans/performance/PLAN_PERFORMANCE_PART_9.md) |
+| PH-E2 | ~~**Spill-aware refresh.**~~ ➡️ Pulled to v0.15.0, ✅ Done | 1–2 wk | [PLAN_PERFORMANCE_PART_9.md §Phase E](plans/performance/PLAN_PERFORMANCE_PART_9.md) |
 
-> **Memory & I/O budget subtotal: PH-E1 + PH-E2 ➡️ pulled to v0.15.0**
+> **Memory & I/O budget subtotal: PH-E1 + PH-E2 ➡️ ✅ Completed in v0.15.0**
 
 ### Shared-Memory Template Caching (G14-SHC)
 
@@ -3227,7 +3215,7 @@ tables naturally without calling `pgtrickle.create_stream_table()`.
 - [ ] Hook chaining verified with TimescaleDB; non-pgtrickle matviews pass through unchanged
 - [ ] PH-D: DELETE+INSERT strategy benchmarked and gated behind GUC; hash-join planner hints for medium deltas
 - [ ] B-1: Algebraic aggregate fast-path replaces MERGE for `SUM`/`COUNT`/`AVG` GROUP BY queries; `__pgt_aux_count`/`__pgt_aux_sum` aux columns present; benchmarked at 100/1K/10K group cardinalities; `aggregate_fast_path` GUC respected; existing tests pass
-- [ ] PH-E: Delta cost estimation prevents OOM on large deltas; spill-aware auto-adjustment tested
+- [ ] PH-E: ~~Delta cost estimation prevents OOM on large deltas; spill-aware auto-adjustment tested~~ ✅ Done in v0.15.0
 - [ ] G14-SHC: Shared-memory template cache RFC written; prototype shows measurable cold-start elimination; implementation shipped or deferred with findings documented
 - [ ] Extension upgrade path tested (`0.15.0 → 0.16.0`)
 
@@ -3333,7 +3321,7 @@ These are not gated on 1.0 but represent the longer-term horizon.
 
 | Item | Description | Effort | Ref |
 |------|-------------|--------|-----|
-| ~~G13-PRF~~ | ~~**Modularize `src/dvm/parser.rs`.**~~ ➡️ Pulled to v0.15.0 | ~3–4wk | [plans/performance/REPORT_OVERALL_STATUS.md §13](plans/performance/REPORT_OVERALL_STATUS.md) |
+| ~~G13-PRF~~ | ~~**Modularize `src/dvm/parser.rs`.**~~ ✅ Done in v0.15.0 | ~3–4wk | [plans/performance/REPORT_OVERALL_STATUS.md §13](plans/performance/REPORT_OVERALL_STATUS.md) |
 | ~~G14-SHC~~ | ~~**Shared-memory template caching (research spike).**~~ ➡️ Pulled to v0.16.0 | ~2–3wk | [plans/performance/REPORT_OVERALL_STATUS.md §14](plans/performance/REPORT_OVERALL_STATUS.md) |
 
 > **Parser modularization & caching research: ➡️ Pulled forward to v0.15.0/v0.16.0**

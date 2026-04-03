@@ -933,3 +933,275 @@ async fn test_scheduler_respects_tolerance() {
         "scheduler should still refresh when watermark lag is within tolerance"
     );
 }
+
+// ── WM-7: Stuck Watermark Hold-Back tests ──────────────────────────────────
+
+/// WM-7: Scheduler skips refresh when a watermark is stuck (not advanced
+/// within holdback timeout). Uses a very short timeout (1s) so the test
+/// completes quickly.
+#[cfg(not(feature = "light-e2e"))]
+#[tokio::test]
+async fn test_scheduler_skips_stuck_watermark() {
+    let db = E2eDb::new_on_postgres_db().await;
+
+    db.execute("CREATE EXTENSION IF NOT EXISTS pg_trickle CASCADE")
+        .await;
+
+    // Configure fast scheduler + holdback timeout.
+    db.execute("ALTER SYSTEM SET pg_trickle.scheduler_interval_ms = 100")
+        .await;
+    db.execute("ALTER SYSTEM SET pg_trickle.min_schedule_seconds = 1")
+        .await;
+    db.execute("ALTER SYSTEM SET pg_trickle.auto_backoff = off")
+        .await;
+    db.execute("ALTER SYSTEM SET pg_trickle.watermark_holdback_timeout = 1")
+        .await;
+    db.reload_config_and_wait().await;
+    db.wait_for_setting("pg_trickle.scheduler_interval_ms", "100")
+        .await;
+    db.wait_for_setting("pg_trickle.min_schedule_seconds", "1")
+        .await;
+    db.wait_for_setting("pg_trickle.auto_backoff", "off").await;
+    db.wait_for_setting("pg_trickle.watermark_holdback_timeout", "1")
+        .await;
+
+    let sched_ok = db.wait_for_scheduler(Duration::from_secs(90)).await;
+    assert!(sched_ok, "pg_trickle scheduler must be running");
+
+    // Create sources and stream table.
+    db.execute("CREATE TABLE stuck_a (id INT PRIMARY KEY, val TEXT)")
+        .await;
+    db.execute("CREATE TABLE stuck_b (id INT PRIMARY KEY, val TEXT)")
+        .await;
+    db.execute("INSERT INTO stuck_a VALUES (1, 'a')").await;
+    db.execute("INSERT INTO stuck_b VALUES (1, 'b')").await;
+
+    db.create_st(
+        "stuck_report",
+        "SELECT a.id, a.val AS a_val, b.val AS b_val \
+         FROM stuck_a a JOIN stuck_b b ON a.id = b.id",
+        "1s",
+        "FULL",
+    )
+    .await;
+
+    // Trigger initial refresh.
+    db.execute("INSERT INTO stuck_a VALUES (99, 'trigger')")
+        .await;
+    let refreshed = db
+        .wait_for_auto_refresh("stuck_report", Duration::from_secs(60))
+        .await;
+    assert!(refreshed, "scheduler should auto-refresh before gating");
+
+    // Create watermark group and advance both sources to the SAME timestamp
+    // (aligned, but will become stuck).
+    db.execute(
+        "SELECT pgtrickle.create_watermark_group(\
+             'stuck_grp', ARRAY['stuck_a', 'stuck_b'], 0\
+         )",
+    )
+    .await;
+    db.execute("SELECT pgtrickle.advance_watermark('stuck_a', '2026-03-01 12:00:00+00')")
+        .await;
+    db.execute("SELECT pgtrickle.advance_watermark('stuck_b', '2026-03-01 12:00:00+00')")
+        .await;
+
+    // Wait 3 seconds so the watermarks become stale (timeout is 1s).
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
+    // Insert data to trigger scheduler.
+    db.execute("INSERT INTO stuck_a VALUES (2, 'post_stuck')")
+        .await;
+
+    // Wait for a SKIPPED record mentioning "stuck".
+    let pgt_id: i64 = db
+        .query_scalar(
+            "SELECT pgt_id FROM pgtrickle.pgt_stream_tables \
+             WHERE pgt_name = 'stuck_report'",
+        )
+        .await;
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    let mut got_skip = false;
+    while std::time::Instant::now() < deadline {
+        let skip_count: i64 = db
+            .query_scalar(&format!(
+                "SELECT count(*) FROM pgtrickle.pgt_refresh_history \
+                 WHERE pgt_id = {pgt_id} \
+                   AND status = 'SKIPPED' \
+                   AND action = 'SKIP' \
+                   AND error_message LIKE '%stuck%'"
+            ))
+            .await;
+        if skip_count > 0 {
+            got_skip = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+
+    assert!(
+        got_skip,
+        "scheduler should SKIP refresh when watermark is stuck"
+    );
+}
+
+/// WM-7: Scheduler resumes refresh after a stuck watermark is advanced
+/// (auto-resume).
+#[cfg(not(feature = "light-e2e"))]
+#[tokio::test]
+async fn test_scheduler_resumes_after_watermark_unstuck() {
+    let db = E2eDb::new_on_postgres_db().await;
+
+    db.execute("CREATE EXTENSION IF NOT EXISTS pg_trickle CASCADE")
+        .await;
+
+    // Configure fast scheduler + holdback timeout.
+    db.execute("ALTER SYSTEM SET pg_trickle.scheduler_interval_ms = 100")
+        .await;
+    db.execute("ALTER SYSTEM SET pg_trickle.min_schedule_seconds = 1")
+        .await;
+    db.execute("ALTER SYSTEM SET pg_trickle.auto_backoff = off")
+        .await;
+    db.execute("ALTER SYSTEM SET pg_trickle.watermark_holdback_timeout = 1")
+        .await;
+    db.reload_config_and_wait().await;
+    db.wait_for_setting("pg_trickle.scheduler_interval_ms", "100")
+        .await;
+    db.wait_for_setting("pg_trickle.min_schedule_seconds", "1")
+        .await;
+    db.wait_for_setting("pg_trickle.auto_backoff", "off").await;
+    db.wait_for_setting("pg_trickle.watermark_holdback_timeout", "1")
+        .await;
+
+    let sched_ok = db.wait_for_scheduler(Duration::from_secs(90)).await;
+    assert!(sched_ok, "pg_trickle scheduler must be running");
+
+    // Create sources and stream table.
+    db.execute("CREATE TABLE resume_a (id INT PRIMARY KEY, val TEXT)")
+        .await;
+    db.execute("CREATE TABLE resume_b (id INT PRIMARY KEY, val TEXT)")
+        .await;
+    db.execute("INSERT INTO resume_a VALUES (1, 'a')").await;
+    db.execute("INSERT INTO resume_b VALUES (1, 'b')").await;
+
+    db.create_st(
+        "resume_report",
+        "SELECT a.id, a.val AS a_val, b.val AS b_val \
+         FROM resume_a a JOIN resume_b b ON a.id = b.id",
+        "1s",
+        "FULL",
+    )
+    .await;
+
+    // Trigger initial refresh.
+    db.execute("INSERT INTO resume_a VALUES (99, 'trigger')")
+        .await;
+    let refreshed = db
+        .wait_for_auto_refresh("resume_report", Duration::from_secs(60))
+        .await;
+    assert!(refreshed, "scheduler should auto-refresh before gating");
+
+    // Create watermark group and advance both sources.
+    db.execute(
+        "SELECT pgtrickle.create_watermark_group(\
+             'resume_grp', ARRAY['resume_a', 'resume_b'], 0\
+         )",
+    )
+    .await;
+    db.execute("SELECT pgtrickle.advance_watermark('resume_a', '2026-03-01 12:00:00+00')")
+        .await;
+    db.execute("SELECT pgtrickle.advance_watermark('resume_b', '2026-03-01 12:00:00+00')")
+        .await;
+
+    // Wait for watermarks to become stale (timeout is 1s).
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
+    // Record the completed refresh count before unsticking.
+    let completed_before: i64 = db
+        .query_scalar(
+            "SELECT count(*) FROM pgtrickle.pgt_refresh_history \
+             WHERE pgt_id = (SELECT pgt_id FROM pgtrickle.pgt_stream_tables \
+                             WHERE pgt_name = 'resume_report') \
+               AND status = 'COMPLETED'",
+        )
+        .await;
+
+    // Re-advance watermarks to "unstick" them.
+    db.execute("SELECT pgtrickle.advance_watermark('resume_a', '2026-03-02 12:00:00+00')")
+        .await;
+    db.execute("SELECT pgtrickle.advance_watermark('resume_b', '2026-03-02 12:00:00+00')")
+        .await;
+
+    // Insert data so the scheduler has changes to process.
+    db.execute("INSERT INTO resume_a VALUES (3, 'unstuck')")
+        .await;
+
+    // Wait for a new COMPLETED refresh after unsticking.
+    let pgt_id: i64 = db
+        .query_scalar(
+            "SELECT pgt_id FROM pgtrickle.pgt_stream_tables \
+             WHERE pgt_name = 'resume_report'",
+        )
+        .await;
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    let mut resumed = false;
+    while std::time::Instant::now() < deadline {
+        let completed_after: i64 = db
+            .query_scalar(&format!(
+                "SELECT count(*) FROM pgtrickle.pgt_refresh_history \
+                 WHERE pgt_id = {pgt_id} AND status = 'COMPLETED'"
+            ))
+            .await;
+        if completed_after > completed_before {
+            resumed = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+
+    assert!(
+        resumed,
+        "scheduler should resume refreshing after stuck watermarks are advanced"
+    );
+}
+
+/// WM-7: Holdback timeout of 0 (disabled) does not cause stuck detection.
+#[tokio::test]
+async fn test_holdback_timeout_zero_disabled() {
+    let db = E2eDb::new().await.with_extension().await;
+
+    db.execute("CREATE TABLE hb0_a (id INT PRIMARY KEY, val TEXT)")
+        .await;
+    db.execute("CREATE TABLE hb0_b (id INT PRIMARY KEY, val TEXT)")
+        .await;
+    db.execute("INSERT INTO hb0_a VALUES (1, 'a')").await;
+    db.execute("INSERT INTO hb0_b VALUES (1, 'b')").await;
+
+    db.create_st(
+        "hb0_report",
+        "SELECT a.id, a.val AS a_val, b.val AS b_val \
+         FROM hb0_a a JOIN hb0_b b ON a.id = b.id",
+        "5m",
+        "FULL",
+    )
+    .await;
+
+    // Create aligned group — with default holdback_timeout = 0.
+    db.execute("SELECT pgtrickle.create_watermark_group('hb0_grp', ARRAY['hb0_a', 'hb0_b'], 0)")
+        .await;
+    db.execute("SELECT pgtrickle.advance_watermark('hb0_a', '2026-03-01 12:00:00+00')")
+        .await;
+    db.execute("SELECT pgtrickle.advance_watermark('hb0_b', '2026-03-01 12:00:00+00')")
+        .await;
+
+    // Manual refresh should succeed — holdback disabled.
+    db.refresh_st("hb0_report").await;
+
+    let count: i64 = db.count("public.hb0_report").await;
+    assert_eq!(
+        count, 1,
+        "with holdback_timeout=0, refresh should succeed regardless of watermark age"
+    );
+}

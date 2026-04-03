@@ -46,6 +46,32 @@ pub(crate) fn set_effective_mode(mode: &'static str) {
 pub fn take_effective_mode() -> &'static str {
     LAST_EFFECTIVE_MODE.with(|m| m.get())
 }
+
+// ── PH-E2: Last-refresh spill tracking ──────────────────────────────────
+
+thread_local! {
+    /// Temp blocks written during the most recent MERGE execution.
+    /// Set after each differential refresh by querying pg_stat_statements.
+    /// Read by the scheduler to track per-ST spill history.
+    static LAST_TEMP_BLKS_WRITTEN: Cell<i64> = const { Cell::new(-1) };
+}
+
+/// Record the temp blocks written for the currently-executing refresh.
+pub(crate) fn set_last_temp_blks_written(blks: i64) {
+    LAST_TEMP_BLKS_WRITTEN.with(|c| c.set(blks));
+}
+
+/// Take the temp blocks written by the most recent differential refresh.
+/// Returns -1 if not available (pg_stat_statements not installed, or not
+/// a differential refresh).
+pub fn take_last_temp_blks_written() -> i64 {
+    LAST_TEMP_BLKS_WRITTEN.with(|c| {
+        let v = c.get();
+        c.set(-1);
+        v
+    })
+}
+
 use crate::dag::RefreshMode;
 use crate::dvm;
 use crate::error::PgTrickleError;
@@ -669,6 +695,13 @@ fn apply_planner_hints(estimated_delta: i64, st_relid: pg_sys::Oid, scan_count: 
         return;
     }
 
+    // PH-D2: Manual join strategy override — bypass heuristics entirely.
+    let strategy = crate::config::pg_trickle_merge_join_strategy();
+    if strategy != crate::config::MergeJoinStrategy::Auto {
+        apply_fixed_join_strategy(strategy);
+        return;
+    }
+
     // ── Deep-join hints (DI-11) ─────────────────────────────────────
     // For 5+ table joins the delta SQL generates cascading L₀ snapshot
     // CTEs. Without planner guidance, PostgreSQL may choose nested-loop
@@ -773,6 +806,36 @@ fn apply_planner_hints(estimated_delta: i64, st_relid: pg_sys::Oid, scan_count: 
             );
         }
     }
+}
+
+/// PH-D2: Apply a fixed join strategy override via `SET LOCAL` hints.
+fn apply_fixed_join_strategy(strategy: crate::config::MergeJoinStrategy) {
+    let (nestloop, hashjoin, mergejoin, label) = match strategy {
+        crate::config::MergeJoinStrategy::HashJoin => ("off", "on", "on", "hash_join"),
+        crate::config::MergeJoinStrategy::NestedLoop => ("on", "off", "off", "nested_loop"),
+        crate::config::MergeJoinStrategy::MergeJoin => ("off", "off", "on", "merge_join"),
+        crate::config::MergeJoinStrategy::Auto => return,
+    };
+
+    for (param, val) in [
+        ("enable_nestloop", nestloop),
+        ("enable_hashjoin", hashjoin),
+        ("enable_mergejoin", mergejoin),
+    ] {
+        if let Err(e) = Spi::run(&format!("SET LOCAL {param} = {val}")) {
+            pgrx::debug1!("[pg_trickle] PH-D2: failed to SET LOCAL {param}: {}", e);
+        }
+    }
+
+    // For hash_join strategy, also raise work_mem to avoid hash spills.
+    if strategy == crate::config::MergeJoinStrategy::HashJoin {
+        let mb = crate::config::pg_trickle_merge_work_mem_mb();
+        if let Err(e) = Spi::run(&format!("SET LOCAL work_mem = '{mb}MB'")) {
+            pgrx::debug1!("[pg_trickle] PH-D2: failed to SET LOCAL work_mem: {}", e);
+        }
+    }
+
+    pgrx::debug1!("[pg_trickle] PH-D2: fixed join strategy={label} applied",);
 }
 
 // ── ST-to-ST Delta Capture (Phase 8.2/8.3) ─────────────────────────────
@@ -1720,6 +1783,37 @@ fn build_keyless_delete_template(quoted_table: &str, pgt_id: i64) -> String {
 ///   SELECT d.__pgt_row_id, d.user_cols...
 ///   FROM (...delta...) AS d
 ///   WHERE d.__pgt_action = 'I'
+///
+/// PH-E1: Estimate the output cardinality of the delta subquery by running
+/// a capped COUNT. Returns `None` if the USING clause cannot be extracted or
+/// the query fails (estimation is best-effort).
+///
+/// Extracts the delta subquery from the MERGE SQL's USING clause and runs:
+///   `SELECT count(*) FROM (delta_query LIMIT <limit+1>) __pgt_est`
+fn estimate_delta_output_rows(merge_sql: &str, limit: i32) -> Option<i64> {
+    // Extract USING clause: between "USING " and " AS d ON"
+    let using_start = merge_sql.find("USING ").map(|p| p + 6)?;
+    let using_end = merge_sql.find(" AS d ON ")?;
+    let using_clause = &merge_sql[using_start..using_end];
+
+    let cap = (limit as i64) + 1;
+    let estimate_sql = format!("SELECT count(*) FROM ({using_clause} LIMIT {cap}) __pgt_est");
+
+    match Spi::get_one::<i64>(&estimate_sql) {
+        Ok(Some(count)) => Some(count),
+        Ok(None) => Some(0),
+        Err(e) => {
+            pgrx::debug1!(
+                "[pg_trickle] PH-E1: delta estimation query failed (non-fatal): {}",
+                e,
+            );
+            None
+        }
+    }
+}
+
+/// Build an `INSERT ... SELECT` SQL statement from a MERGE SQL template
+/// for append-only stream tables.
 ///
 /// This is significantly faster than MERGE for append-only workloads
 /// because it skips the DELETE, UPDATE, and IS DISTINCT FROM checks.
@@ -4266,6 +4360,37 @@ pub fn execute_differential_refresh(
     // plans that spill excessive temp files.
     apply_planner_hints(total_change_count, st.pgt_relid, scan_count);
 
+    // ── PH-E1: Delta output cardinality estimation ──────────────────
+    // Before executing expensive MERGE, run a capped COUNT on the delta
+    // subquery. If the output exceeds the budget, fall back to FULL
+    // refresh to prevent OOM or excessive temp-file spills.
+    let max_estimate = crate::config::pg_trickle_max_delta_estimate_rows();
+    if max_estimate > 0
+        && let Some(estimate) = estimate_delta_output_rows(&resolved.merge_sql, max_estimate)
+        && estimate > max_estimate as i64
+    {
+        pgrx::notice!(
+            "[pg_trickle] PH-E1: Delta output estimate ({} rows) exceeds \
+             max_delta_estimate_rows ({}). Falling back to FULL refresh for {}.{}.",
+            estimate,
+            max_estimate,
+            st.pgt_schema,
+            st.pgt_name,
+        );
+        let t_full_start = Instant::now();
+        let result = execute_full_refresh(st);
+        let full_ms = t_full_start.elapsed().as_secs_f64() * 1000.0;
+        if let Err(e) =
+            StreamTableMeta::update_adaptive_threshold(st.pgt_id, st.auto_threshold, Some(full_ms))
+        {
+            pgrx::debug1!(
+                "[pg_trickle] PH-E1: failed to update adaptive threshold: {}",
+                e,
+            );
+        }
+        return result;
+    }
+
     // ── A-3a: Append-only INSERT fast path ───────────────────────────
     // When the stream table is marked append-only (and hasn't been
     // reverted by the heuristic check above), skip MERGE entirely and
@@ -4718,6 +4843,18 @@ pub fn execute_differential_refresh(
     }
 
     let t3 = Instant::now();
+
+    // PH-E2: Query pg_stat_statements for temp file spill metrics.
+    // Store in thread-local for the scheduler to read after this function returns.
+    let spill_threshold = crate::config::pg_trickle_spill_threshold_blocks();
+    if spill_threshold > 0 {
+        let temp_blks = crate::monitor::query_temp_file_usage(name)
+            .map(|(_read, written)| written)
+            .unwrap_or(0);
+        set_last_temp_blks_written(temp_blks);
+    } else {
+        set_last_temp_blks_written(-1);
+    }
 
     // Determine cache path and hint tier for profiling
     let cache_path = if was_cache_hit {
@@ -5634,6 +5771,34 @@ mod tests {
     }
 
     // ── build_append_only_insert_sql() ──────────────────────────────
+
+    // ── PH-E1: estimate_delta_output_rows extraction ────────────────
+
+    #[test]
+    fn test_extract_using_clause_for_estimation() {
+        // Verify the USING clause extraction pattern works correctly.
+        // (estimate_delta_output_rows calls SPI, so we test the parsing
+        // by checking the same extraction logic used in both functions.)
+        let merge_sql = r#"MERGE INTO "public"."test_st" AS st USING (SELECT * FROM delta) AS d ON st.__pgt_row_id = d.__pgt_row_id WHEN MATCHED THEN DELETE"#;
+
+        let using_start = merge_sql.find("USING ").map(|p| p + 6);
+        let using_end = merge_sql.find(" AS d ON ");
+        assert!(using_start.is_some());
+        assert!(using_end.is_some());
+        let clause = &merge_sql[using_start.unwrap()..using_end.unwrap()];
+        assert_eq!(clause, "(SELECT * FROM delta)");
+    }
+
+    #[test]
+    fn test_extract_using_clause_complex_cte() {
+        let merge_sql = r#"MERGE INTO "s"."t" AS st USING (WITH cte AS NOT MATERIALIZED (SELECT a FROM b) SELECT * FROM cte) AS d ON st.id = d.id WHEN MATCHED THEN DELETE"#;
+
+        let using_start = merge_sql.find("USING ").map(|p| p + 6).unwrap();
+        let using_end = merge_sql.find(" AS d ON ").unwrap();
+        let clause = &merge_sql[using_start..using_end];
+        assert!(clause.starts_with("(WITH cte AS NOT MATERIALIZED"));
+        assert!(clause.ends_with("SELECT * FROM cte)"));
+    }
 
     #[test]
     fn test_build_append_only_insert_sql_basic() {

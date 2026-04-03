@@ -1178,6 +1178,133 @@ SELECT pgtrickle.repair_stream_table('your_table');
 Once you've built your stream tables interactively, you'll want to deploy them
 reliably — via SQL migration scripts, dbt, or GitOps pipelines.
 
+### Kubernetes Deployment (CloudNativePG)
+
+pg_trickle integrates natively with [CloudNativePG](https://cloudnative-pg.io/)
+using **Image Volume Extensions** (Kubernetes 1.33+). The extension is packaged
+as a scratch-based OCI image containing only the `.so`, `.control`, and `.sql`
+files — no custom PostgreSQL image required.
+
+#### Prerequisites
+
+- Kubernetes 1.33+ with the `ImageVolume` feature gate enabled
+- CloudNativePG operator 1.28+
+- pg_trickle extension image pushed to your cluster registry
+
+#### Quick Start
+
+1. **Deploy the Cluster** with the extension mounted as an Image Volume:
+
+```yaml
+# cnpg/cluster-example.yaml (abridged)
+apiVersion: postgresql.cnpg.io/v1
+kind: Cluster
+metadata:
+  name: pg-trickle-demo
+spec:
+  instances: 3
+  imageName: ghcr.io/cloudnative-pg/postgresql:18
+  postgresql:
+    shared_preload_libraries:
+      - pg_trickle
+    extensions:
+      - name: pg-trickle
+        image:
+          reference: ghcr.io/<owner>/pg_trickle-ext:<version>
+    parameters:
+      max_worker_processes: "8"
+```
+
+2. **Create the extension** declaratively with a CNPG Database resource:
+
+```yaml
+# cnpg/database-example.yaml
+apiVersion: postgresql.cnpg.io/v1
+kind: Database
+metadata:
+  name: pg-trickle-app
+spec:
+  name: app
+  owner: app
+  cluster:
+    name: pg-trickle-demo
+  extensions:
+    - name: pg_trickle
+```
+
+3. **Apply both resources:**
+
+```bash
+kubectl apply -f cnpg/cluster-example.yaml
+kubectl apply -f cnpg/database-example.yaml
+```
+
+Full example manifests are in the [`cnpg/`](https://github.com/grove/pg-trickle/tree/main/cnpg) directory.
+
+#### Health Monitoring
+
+CNPG manages PostgreSQL liveness/readiness probes via its instance manager.
+For pg_trickle-specific health, use the built-in health check function:
+
+```sql
+-- Run against the primary or any replica:
+SELECT * FROM pgtrickle.health_check();
+```
+
+This returns rows for scheduler status, error/suspended tables, stale tables,
+CDC buffer growth, WAL slot lag, and worker pool utilization. Integrate it into
+your monitoring stack:
+
+- **Prometheus:** Use the CNPG monitoring integration to expose
+  `pgtrickle.health_check()` results as custom metrics
+- **Kubernetes CronJob:** Schedule periodic health checks and alert via your
+  existing alerting pipeline
+- **pgtrickle-tui:** The [TUI tool](TUI.md) has a dedicated Health view that
+  polls `health_check()` continuously
+
+#### Probe Configuration
+
+The example manifests include probe settings tuned for pg_trickle workloads:
+
+```yaml
+probes:
+  startup:
+    periodSeconds: 10
+    failureThreshold: 60     # 10 min for shared_preload_libraries init
+  liveness:
+    periodSeconds: 10
+    failureThreshold: 6      # 60s before restart
+  readiness:
+    type: streaming
+    maximumLag: 64Mi         # replicas must be streaming before serving reads
+```
+
+**Why `readiness: streaming`?** Stream tables are readable on replicas, but
+a lagging replica serves stale stream table data. The `maximumLag` setting
+ensures replicas are caught up before receiving traffic.
+
+#### Failover Behavior
+
+When the primary pod fails and CNPG promotes a replica:
+
+- **Scheduler:** The new primary starts the pg_trickle scheduler background
+  worker automatically (registered via `shared_preload_libraries`)
+- **Stream tables:** All stream table definitions are stored in the
+  `pgtrickle.pgt_stream_tables` catalog table, which is replicated to all
+  replicas. The promoted replica has the complete catalog.
+- **CDC triggers:** Trigger definitions are replicated as part of the WAL
+  stream. The new primary's triggers fire normally on new writes.
+- **Change buffers:** Uncommitted change buffer rows from in-flight
+  transactions on the old primary are lost (standard PostgreSQL behavior).
+  The next refresh cycle detects the gap and performs a FULL refresh to
+  resynchronize.
+- **Refresh frontiers:** Each stream table's last-refresh frontier is stored
+  in the catalog. If the frontier is ahead of the available change buffer data
+  (due to WAL replay lag), the scheduler falls back to FULL refresh once and
+  then resumes DIFFERENTIAL.
+
+No manual intervention is required after failover.
+
 ### Idempotent SQL Migrations
 
 Use `create_or_replace_stream_table()` in your migration scripts. It's safe to
@@ -1238,6 +1365,8 @@ so deployments are always idempotent.
 - **[ARCHITECTURE.md](ARCHITECTURE.md)** — Deep dive into the system architecture and data flow
 - **[DVM_OPERATORS.md](DVM_OPERATORS.md)** — How each SQL operator is differentiated for incremental maintenance
 - **[CONFIGURATION.md](CONFIGURATION.md)** — GUC variables for tuning schedule, concurrency, and cleanup behavior
+- **[Flyway & Liquibase Integration](integrations/flyway-liquibase.md)** — Migration patterns for Flyway and Liquibase
+- **[ORM Integration](integrations/orm.md)** — SQLAlchemy and Django ORM patterns for stream tables
 - **[What Happens on INSERT](tutorials/WHAT_HAPPENS_ON_INSERT.md)** — Detailed trace of a single INSERT through the entire pipeline
 - **[What Happens on UPDATE](tutorials/WHAT_HAPPENS_ON_UPDATE.md)** — How UPDATEs are split into D+I, group key changes, and net-effect computation
 - **[What Happens on DELETE](tutorials/WHAT_HAPPENS_ON_DELETE.md)** — Reference counting, group deletion, and INSERT+DELETE cancellation

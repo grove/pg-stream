@@ -813,6 +813,46 @@ fn explain_st_impl(
         props.push(("amplification_stats".to_string(), stats));
     }
 
+    // EXPL-ENH: Refresh timing stats from pgt_refresh_history.
+    if let Ok(timing) = refresh_timing_stats(st.pgt_id) {
+        props.push(("refresh_timing_stats".to_string(), timing));
+    }
+
+    // EXPL-ENH: Source partition info for partitioned table sources.
+    if let Ok(partitions) = source_partition_info(&st)
+        && !partitions.is_empty()
+    {
+        props.push(("source_partitions".to_string(), partitions));
+    }
+
+    // EXPL-ENH: Dependency sub-graph in DOT format.
+    if let Ok(dot) = dependency_subgraph(st.pgt_id, &format!("{}.{}", st.pgt_schema, st.pgt_name)) {
+        props.push(("dependency_graph_dot".to_string(), dot));
+    }
+
+    // PH-E2: Live temp file spill info from pg_stat_statements.
+    let spill_threshold = crate::config::pg_trickle_spill_threshold_blocks();
+    if spill_threshold > 0 {
+        let name = format!("{}.{}", st.pgt_schema, st.pgt_name);
+        match query_temp_file_usage(&name) {
+            Some((read_blks, written_blks)) => {
+                let exceeds = written_blks > spill_threshold as i64;
+                let info = format!(
+                    "{{\"temp_blks_read\":{},\"temp_blks_written\":{},\"threshold\":{},\"exceeds_threshold\":{}}}",
+                    read_blks, written_blks, spill_threshold, exceeds
+                );
+                props.push(("spill_info".to_string(), info));
+            }
+            None => {
+                props.push((
+                    "spill_info".to_string(),
+                    "{\"status\":\"pg_stat_statements not available or no matching statement\"}"
+                        .to_string(),
+                ));
+            }
+        }
+    }
+
     Ok(props)
 }
 
@@ -875,6 +915,160 @@ fn amplification_stats(pgt_id: i64) -> Result<String, PgTrickleError> {
         latest,
         threshold,
     ))
+}
+
+// ── EXPL-ENH: Refresh Timing Statistics ─────────────────────────────────
+
+/// Query the last 20 completed refreshes (any action) and compute duration
+/// statistics in milliseconds.
+///
+/// Returns a JSON string like:
+/// `{"samples":10,"min_ms":12.3,"max_ms":450.0,"avg_ms":85.7,"latest_ms":42.1,"latest_action":"DIFFERENTIAL"}`
+fn refresh_timing_stats(pgt_id: i64) -> Result<String, PgTrickleError> {
+    let sql = format!(
+        "SELECT action::text, \
+                EXTRACT(EPOCH FROM (end_time - start_time)) * 1000 AS duration_ms \
+         FROM pgtrickle.pgt_refresh_history \
+         WHERE pgt_id = {pgt_id} \
+           AND status = 'COMPLETED' \
+           AND end_time IS NOT NULL \
+         ORDER BY refresh_id DESC \
+         LIMIT 20"
+    );
+
+    let mut durations: Vec<f64> = Vec::new();
+    let mut latest_action = String::new();
+
+    Spi::connect(|client| {
+        let cursor = client.select(&sql, None, &[]).map_err(|e| {
+            PgTrickleError::SpiError(format!("refresh_timing_stats query failed: {e}"))
+        })?;
+        for row in cursor {
+            let action: String = row
+                .get::<String>(1)
+                .unwrap_or(Some(String::new()))
+                .unwrap_or_default();
+            let ms: f64 = row.get::<f64>(2).unwrap_or(Some(0.0)).unwrap_or(0.0);
+            if durations.is_empty() {
+                latest_action = action;
+            }
+            durations.push(ms);
+        }
+        Ok::<(), PgTrickleError>(())
+    })?;
+
+    if durations.is_empty() {
+        return Err(PgTrickleError::InternalError(
+            "no completed refresh history available".to_string(),
+        ));
+    }
+
+    let min = durations.iter().cloned().fold(f64::INFINITY, f64::min);
+    let max = durations.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+    let avg = durations.iter().sum::<f64>() / durations.len() as f64;
+    let latest = durations[0];
+
+    Ok(format!(
+        "{{\"samples\":{},\"min_ms\":{:.1},\"max_ms\":{:.1},\"avg_ms\":{:.1},\"latest_ms\":{:.1},\"latest_action\":\"{}\"}}",
+        durations.len(),
+        min,
+        max,
+        avg,
+        latest,
+        latest_action,
+    ))
+}
+
+// ── EXPL-ENH: Source Partition Info ──────────────────────────────────────
+
+/// For each source table, check if it is partitioned and report the
+/// partition strategy and key.
+///
+/// Returns a JSON array like:
+/// `[{"source":"public.orders","strategy":"RANGE","key":"order_date","partitions":12}]`
+fn source_partition_info(st: &crate::catalog::StreamTableMeta) -> Result<String, PgTrickleError> {
+    let sql = format!(
+        "SELECT d.source_relid, \
+                c.relkind, \
+                c.relnamespace::regnamespace::text AS schema, \
+                c.relname::text AS name, \
+                pg_catalog.pg_get_partkeydef(c.oid) AS partkey, \
+                (SELECT count(*) FROM pg_inherits i WHERE i.inhparent = c.oid) AS nparts \
+         FROM pgtrickle.pgt_dependencies d \
+         JOIN pg_class c ON c.oid = d.source_relid \
+         WHERE d.pgt_id = {} \
+           AND c.relkind = 'p'",
+        st.pgt_id
+    );
+
+    let mut entries: Vec<String> = Vec::new();
+    Spi::connect(|client| {
+        let cursor = client.select(&sql, None, &[]).map_err(|e| {
+            PgTrickleError::SpiError(format!("source_partition_info query failed: {e}"))
+        })?;
+        for row in cursor {
+            let schema: String = row
+                .get::<String>(3)
+                .unwrap_or(Some(String::new()))
+                .unwrap_or_default();
+            let name: String = row
+                .get::<String>(4)
+                .unwrap_or(Some(String::new()))
+                .unwrap_or_default();
+            let partkey: String = row
+                .get::<String>(5)
+                .unwrap_or(Some(String::new()))
+                .unwrap_or_default();
+            let nparts: i64 = row.get::<i64>(6).unwrap_or(Some(0)).unwrap_or(0);
+            entries.push(format!(
+                "{{\"source\":\"{}.{}\",\"partition_key\":\"{}\",\"partitions\":{}}}",
+                schema, name, partkey, nparts,
+            ));
+        }
+        Ok::<(), PgTrickleError>(())
+    })?;
+
+    Ok(format!("[{}]", entries.join(",")))
+}
+
+// ── EXPL-ENH: Dependency Sub-graph ──────────────────────────────────────
+
+/// Build a DOT-format dependency sub-graph for a stream table showing its
+/// immediate upstream sources and downstream dependents.
+fn dependency_subgraph(pgt_id: i64, st_name: &str) -> Result<String, PgTrickleError> {
+    use crate::dag::{NodeId, StDag};
+
+    let fallback_secs = crate::config::pg_trickle_min_schedule_seconds();
+    let dag = StDag::build_from_catalog(fallback_secs)?;
+
+    let node = NodeId::StreamTable(pgt_id);
+    let upstream = dag.get_upstream(node);
+    let downstream = dag.get_downstream(node);
+
+    let mut dot = String::from("digraph dependency_subgraph {\n");
+    dot.push_str(&format!(
+        "  \"{}\" [shape=box, style=filled, fillcolor=lightblue];\n",
+        st_name
+    ));
+
+    for up in &upstream {
+        let label = dag.node_label(up);
+        let shape = match up {
+            NodeId::BaseTable(_) => "ellipse",
+            NodeId::StreamTable(_) => "box",
+        };
+        dot.push_str(&format!("  \"{}\" [shape={}];\n", label, shape));
+        dot.push_str(&format!("  \"{}\" -> \"{}\";\n", label, st_name));
+    }
+
+    for down in &downstream {
+        let label = dag.node_label(down);
+        dot.push_str(&format!("  \"{}\" [shape=box];\n", label));
+        dot.push_str(&format!("  \"{}\" -> \"{}\";\n", st_name, label));
+    }
+
+    dot.push('}');
+    Ok(dot)
 }
 
 // ── CDC Health Monitoring ───────────────────────────────────────────────────

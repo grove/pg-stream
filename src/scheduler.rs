@@ -765,6 +765,21 @@ fn execute_worker_singleton(job: &SchedulerJob) -> RefreshOutcome {
         return RefreshOutcome::Success;
     }
 
+    // WM-7: Check watermark staleness — skip if any source watermark is stuck.
+    let (wm_stuck, wm_stuck_reason) = is_watermark_stuck(pgt_id);
+    if wm_stuck {
+        let reason = wm_stuck_reason.as_deref().unwrap_or("watermark stuck");
+        log!(
+            "pg_trickle refresh worker: skipping {}.{} — {} (job {})",
+            st.pgt_schema,
+            st.pgt_name,
+            reason,
+            job.job_id,
+        );
+        log_watermark_skip(&st, reason);
+        return RefreshOutcome::Success;
+    }
+
     // FUSE-5: Check fuse circuit breaker — blow if change count exceeds ceiling.
     if evaluate_fuse(&st) {
         log!(
@@ -854,6 +869,21 @@ fn execute_worker_atomic_group(job: &SchedulerJob, is_repeatable_read: bool) -> 
         let (wm_misaligned, wm_reason) = is_watermark_misaligned(pgt_id);
         if wm_misaligned {
             let reason = wm_reason.as_deref().unwrap_or("watermark misaligned");
+            log!(
+                "pg_trickle refresh worker: skipping {}.{} — {} (atomic group job {})",
+                st.pgt_schema,
+                st.pgt_name,
+                reason,
+                job.job_id,
+            );
+            log_watermark_skip(&st, reason);
+            continue;
+        }
+
+        // WM-7: Skip if any source watermark is stuck.
+        let (wm_stuck, wm_stuck_reason) = is_watermark_stuck(pgt_id);
+        if wm_stuck {
+            let reason = wm_stuck_reason.as_deref().unwrap_or("watermark stuck");
             log!(
                 "pg_trickle refresh worker: skipping {}.{} — {} (atomic group job {})",
                 st.pgt_schema,
@@ -1169,6 +1199,21 @@ fn execute_worker_fused_chain(job: &SchedulerJob) -> RefreshOutcome {
         let (wm_misaligned, wm_reason) = is_watermark_misaligned(pgt_id);
         if wm_misaligned {
             let reason = wm_reason.as_deref().unwrap_or("watermark misaligned");
+            log!(
+                "pg_trickle refresh worker: skipping {}.{} — {} (fused chain job {})",
+                st.pgt_schema,
+                st.pgt_name,
+                reason,
+                job.job_id,
+            );
+            log_watermark_skip(&st, reason);
+            continue;
+        }
+
+        // WM-7: Skip if any source watermark is stuck.
+        let (wm_stuck, wm_stuck_reason) = is_watermark_stuck(pgt_id);
+        if wm_stuck {
+            let reason = wm_stuck_reason.as_deref().unwrap_or("watermark stuck");
             log!(
                 "pg_trickle refresh worker: skipping {}.{} — {} (fused chain job {})",
                 st.pgt_schema,
@@ -2103,8 +2148,20 @@ pub extern "C-unwind" fn pg_trickle_scheduler_main(_arg: pg_sys::Datum) {
     // doubles each consecutive cycle; resets to 1.0 on the first on-time cycle.
     let mut backoff_factors: HashMap<i64, f64> = HashMap::new();
 
+    // PH-E2: Per-ST consecutive spill counters.
+    // When a differential refresh writes temp blocks exceeding the threshold,
+    // the counter increments.  After spill_consecutive_limit consecutive spills,
+    // the scheduler forces a FULL refresh.  Resets on any non-spilling refresh.
+    let mut spill_counters: HashMap<i64, i32> = HashMap::new();
+
     // Timestamp for periodic CDC trigger health check (~every 60s).
     let mut last_trigger_health_ms: u64 = 0;
+
+    // WM-7: Timestamp for periodic stuck-watermark alerting (~every 60s).
+    let mut last_watermark_stuck_check_ms: u64 = 0;
+    // WM-7: Track source OIDs that have already been reported as stuck to
+    // avoid spamming the NOTIFY channel every check cycle.
+    let mut reported_stuck_sources: HashSet<u32> = HashSet::new();
 
     // Phase 10: Crash recovery — mark any interrupted RUNNING records
     BackgroundWorker::transaction(AssertUnwindSafe(|| {
@@ -2297,6 +2354,72 @@ pub extern "C-unwind" fn pg_trickle_scheduler_main(_arg: pg_sys::Datum) {
                 monitor::check_cdc_trigger_health();
             }));
             last_trigger_health_ms = now_for_trigger_check;
+        }
+
+        // WM-7: Periodic stuck-watermark detection and alerting (~every 60s).
+        let timeout = config::pg_trickle_watermark_holdback_timeout();
+        if timeout > 0 {
+            let now_for_wm_check = current_epoch_ms();
+            if now_for_wm_check.saturating_sub(last_watermark_stuck_check_ms) >= 60_000 {
+                BackgroundWorker::transaction(AssertUnwindSafe(|| {
+                    match crate::catalog::find_stuck_watermarks(timeout) {
+                        Ok(stuck_list) => {
+                            // Collect currently-stuck OIDs for comparison.
+                            let current_stuck: HashSet<u32> =
+                                stuck_list.iter().map(|(_, oid, _)| *oid).collect();
+
+                            // Emit NOTIFY for newly-stuck sources only.
+                            for (group_name, source_oid, age_secs) in &stuck_list {
+                                if !reported_stuck_sources.contains(source_oid) {
+                                    let payload = format!(
+                                        "{{\"event\":\"watermark_stuck\",\"group\":\"{}\",\
+                                          \"source_oid\":{},\"age_secs\":{:.0}}}",
+                                        group_name, source_oid, age_secs
+                                    );
+                                    let _ = Spi::run_with_args(
+                                        "SELECT pg_notify('pgtrickle_alert', $1)",
+                                        &[payload.as_str().into()],
+                                    );
+                                    pgrx::warning!(
+                                        "pg_trickle: watermark stuck in group '{}' — \
+                                         source OID {} not advanced for {:.0}s (timeout {}s)",
+                                        group_name,
+                                        source_oid,
+                                        age_secs,
+                                        timeout,
+                                    );
+                                }
+                            }
+
+                            // Emit recovery NOTIFY for sources that were stuck but
+                            // have since advanced (auto-resume).
+                            for previously_stuck in &reported_stuck_sources {
+                                if !current_stuck.contains(previously_stuck) {
+                                    let payload = format!(
+                                        "{{\"event\":\"watermark_resumed\",\
+                                          \"source_oid\":{}}}",
+                                        previously_stuck
+                                    );
+                                    let _ = Spi::run_with_args(
+                                        "SELECT pg_notify('pgtrickle_alert', $1)",
+                                        &[payload.as_str().into()],
+                                    );
+                                    pgrx::info!(
+                                        "pg_trickle: watermark resumed for source OID {}",
+                                        previously_stuck,
+                                    );
+                                }
+                            }
+
+                            reported_stuck_sources = current_stuck;
+                        }
+                        Err(e) => {
+                            pgrx::warning!("pg_trickle: stuck watermark check failed: {}", e,);
+                        }
+                    }
+                }));
+                last_watermark_stuck_check_ms = now_for_wm_check;
+            }
         }
 
         // Phase 2: Create each pending slot in its own pristine transaction.
@@ -2659,6 +2782,7 @@ pub extern "C-unwind" fn pg_trickle_scheduler_main(_arg: pg_sys::Datum) {
                         initial_table_changes.get(&pgt_id).copied(),
                         tick_watermark.as_deref(),
                         Some(&mut entry),
+                        &mut spill_counters,
                     );
                     // P3-5: Update auto-backoff factor based on last refresh timing.
                     // NOTE: We are already inside the outer BackgroundWorker::transaction,
@@ -2716,6 +2840,7 @@ pub extern "C-unwind" fn pg_trickle_scheduler_main(_arg: pg_sys::Datum) {
                             initial_table_changes.get(&pgt_id).copied(),
                             tick_watermark.as_deref(),
                             Some(&mut entry),
+                            &mut spill_counters,
                         );
                     }
                     continue;
@@ -2794,6 +2919,20 @@ pub extern "C-unwind" fn pg_trickle_scheduler_main(_arg: pg_sys::Datum) {
                     let (wm_misaligned, wm_reason) = is_watermark_misaligned(pgt_id);
                     if wm_misaligned {
                         let reason = wm_reason.as_deref().unwrap_or("watermark misaligned");
+                        log!(
+                            "pg_trickle: skipping {}.{} in atomic group — {}",
+                            st.pgt_schema,
+                            st.pgt_name,
+                            reason,
+                        );
+                        log_watermark_skip(&st, reason);
+                        continue;
+                    }
+
+                    // WM-7: Skip if any source watermark is stuck.
+                    let (wm_stuck, wm_stuck_reason) = is_watermark_stuck(pgt_id);
+                    if wm_stuck {
+                        let reason = wm_stuck_reason.as_deref().unwrap_or("watermark stuck");
                         log!(
                             "pg_trickle: skipping {}.{} in atomic group — {}",
                             st.pgt_schema,
@@ -4083,6 +4222,7 @@ fn refresh_single_st(
     table_change_snapshot: Option<bool>,
     tick_watermark: Option<&str>,
     drift_counter: Option<&mut i32>,
+    spill_counters: &mut HashMap<i64, i32>,
 ) {
     let st = match load_st_by_id(pgt_id) {
         Some(st) => st,
@@ -4109,6 +4249,20 @@ fn refresh_single_st(
     let (wm_misaligned, wm_reason) = is_watermark_misaligned(pgt_id);
     if wm_misaligned {
         let reason = wm_reason.as_deref().unwrap_or("watermark misaligned");
+        log!(
+            "pg_trickle: skipping {}.{} — {}",
+            st.pgt_schema,
+            st.pgt_name,
+            reason,
+        );
+        log_watermark_skip(&st, reason);
+        return;
+    }
+
+    // WM-7: Check watermark staleness — skip if any source watermark is stuck.
+    let (wm_stuck, wm_stuck_reason) = is_watermark_stuck(pgt_id);
+    if wm_stuck {
+        let reason = wm_stuck_reason.as_deref().unwrap_or("watermark stuck");
         log!(
             "pg_trickle: skipping {}.{} — {}",
             st.pgt_schema,
@@ -4268,6 +4422,47 @@ fn refresh_single_st(
     match result {
         RefreshOutcome::Success => {
             retry.reset();
+
+            // PH-E2: Spill-aware refresh tracking.
+            // After a successful refresh, check whether the MERGE spilled
+            // to temp files and maintain a per-ST consecutive spill counter.
+            let spill_threshold = config::pg_trickle_spill_threshold_blocks();
+            if spill_threshold > 0 {
+                let temp_blks = refresh::take_last_temp_blks_written();
+                if temp_blks > spill_threshold as i64 {
+                    let count = spill_counters.entry(pgt_id).or_insert(0);
+                    *count += 1;
+                    let limit = config::pg_trickle_spill_consecutive_limit();
+                    if *count >= limit {
+                        pgrx::warning!(
+                            "pg_trickle: {}.{} spilled for {} consecutive refreshes \
+                             ({} temp blocks > {} threshold) — forcing FULL refresh",
+                            st.pgt_schema,
+                            st.pgt_name,
+                            count,
+                            temp_blks,
+                            spill_threshold,
+                        );
+                        let _ = StreamTableMeta::mark_for_reinitialize(st.pgt_id);
+                        *count = 0;
+                    } else {
+                        log!(
+                            "pg_trickle: {}.{} spilled ({} temp blocks > {} threshold, \
+                             {}/{} consecutive)",
+                            st.pgt_schema,
+                            st.pgt_name,
+                            temp_blks,
+                            spill_threshold,
+                            count,
+                            limit,
+                        );
+                    }
+                } else if temp_blks >= 0 {
+                    // Non-spilling refresh: reset counter.
+                    spill_counters.remove(&pgt_id);
+                }
+                // temp_blks == -1 means detection was disabled/unavailable; leave counter as-is.
+            }
         }
         RefreshOutcome::RetryableFailure => {
             let will_retry = retry.record_failure(retry_policy, now_ms);
@@ -4945,6 +5140,30 @@ fn is_watermark_misaligned(pgt_id: i64) -> (bool, Option<String>) {
         Err(e) => {
             pgrx::warning!(
                 "pg_trickle: watermark check failed for pgt_id={}: {}",
+                pgt_id,
+                e
+            );
+            (false, None)
+        }
+    }
+}
+
+/// WM-7: Check whether a stream table should be skipped because a watermark
+/// in an overlapping group is stuck (not advanced within the holdback timeout).
+fn is_watermark_stuck(pgt_id: i64) -> (bool, Option<String>) {
+    let timeout = config::pg_trickle_watermark_holdback_timeout();
+    if timeout <= 0 {
+        return (false, None);
+    }
+    let source_oids = get_source_oids_for_st(pgt_id);
+    if source_oids.is_empty() {
+        return (false, None);
+    }
+    match crate::catalog::check_watermark_staleness(&source_oids, timeout) {
+        Ok((stuck, reason)) => (stuck, reason),
+        Err(e) => {
+            pgrx::warning!(
+                "pg_trickle: watermark staleness check failed for pgt_id={}: {}",
                 pgt_id,
                 e
             );

@@ -11,6 +11,7 @@ Complete reference for all SQL functions, views, and catalog tables provided by 
     - [pgtrickle.create\_stream\_table](#pgtricklecreate_stream_table)
     - [pgtrickle.create\_stream\_table\_if\_not\_exists](#pgtricklecreate_stream_table_if_not_exists)
     - [pgtrickle.create\_or\_replace\_stream\_table](#pgtricklecreate_or_replace_stream_table)
+    - [pgtrickle.bulk\_create](#pgtricklebulk_create)
     - [pgtrickle.alter\_stream\_table](#pgtricklealter_stream_table)
     - [pgtrickle.drop\_stream\_table](#pgtrickledrop_stream_table)
     - [pgtrickle.resume\_stream\_table](#pgtrickleresume_stream_table)
@@ -40,8 +41,14 @@ Complete reference for all SQL functions, views, and catalog tables provided by 
     - [pgtrickle.explain\_st](#pgtrickleexplain_st)
     - [pgtrickle.list\_sources](#pgtricklelist_sources)
   - [Utilities](#utilities)
+    - [pgtrickle.rebuild\_cdc\_triggers](#pgtricklerebuild_cdc_triggers)
+    - [pgtrickle.convert\_buffers\_to\_unlogged](#pgtrickleconvert_buffers_to_unlogged)
     - [pgtrickle.pg\_trickle\_hash](#pgtricklepg_trickle_hash)
     - [pgtrickle.pg\_trickle\_hash\_multi](#pgtricklepg_trickle_hash_multi)
+  - [Diagnostics](#diagnostics)
+    - [pgtrickle.recommend\_refresh\_mode](#pgtricklerecommend_refresh_mode)
+    - [pgtrickle.refresh\_efficiency](#pgtricklerefresh_efficiency)
+    - [pgtrickle.export\_definition](#pgtrickleexport_definition)
 - [Expression Support](#expression-support)
   - [Conditional Expressions](#conditional-expressions)
   - [Comparison Operators](#comparison-operators)
@@ -661,6 +668,7 @@ SELECT pgtrickle.create_stream_table(
 - The defining query is parsed into an operator tree and validated for DVM support.
 - **Views as sources** — views referenced in the defining query are automatically inlined as subqueries (auto-rewrite pass #0). CDC triggers are created on the underlying base tables. Nested views (view → view → table) are fully expanded. The user's original query is preserved in `original_query` for reinit and introspection. Materialized views are rejected in DIFFERENTIAL mode (use FULL mode or the underlying query directly). Foreign tables are also rejected in DIFFERENTIAL mode.
 - CDC triggers and change buffer tables are created automatically for each source table.
+- **TRUNCATE on source tables** — when a source table is TRUNCATEd, a CDC trigger writes a marker row (`action='T'`) into the change buffer. On the next refresh cycle, pg_trickle detects the marker and automatically falls back to a FULL refresh. For single-source stream tables where no subsequent DML occurred after the TRUNCATE, an optimized fast path deletes all ST rows directly without re-running the full defining query.
 - The ST is registered in the dependency DAG; cycles are rejected.
 - Non-recursive CTEs are inlined as subqueries during parsing (Tier 1). Multi-reference CTEs share delta computation (Tier 2).
 - Recursive CTEs in DIFFERENTIAL mode use three strategies, auto-selected per refresh: **semi-naive evaluation** for INSERT-only changes, **DRed (Delete-and-Rederive)** for mixed DELETE/UPDATE changes, and **recomputation fallback** when CTE columns do not match ST storage columns. **Non-monotone recursive terms** (containing EXCEPT, Aggregate, Window, DISTINCT, AntiJoin, or INTERSECT SET) automatically fall back to recomputation to ensure correctness.
@@ -776,6 +784,56 @@ SELECT pgtrickle.create_or_replace_stream_table(
 - Mirrors PostgreSQL's `CREATE OR REPLACE` convention (`CREATE OR REPLACE VIEW`, `CREATE OR REPLACE FUNCTION`).
 - Never drops the stream table — even for incompatible schema changes, the ALTER QUERY path rebuilds storage in place while preserving the catalog entry (`pgt_id`).
 - For migration scripts that should **not** modify an existing definition, use [`create_stream_table_if_not_exists`](#pgtricklecreate_stream_table_if_not_exists) instead.
+
+---
+
+### pgtrickle.bulk_create
+
+Create multiple stream tables in a single transaction.
+
+```sql
+pgtrickle.bulk_create(
+    definitions  jsonb     -- Array of stream table definitions
+) → jsonb                  -- Array of result objects
+```
+
+Each element in the `definitions` array must be a JSON object with at least `name` and `query` keys. All other keys match the parameters of `create_stream_table` (snake_case):
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `name` | `string` | (required) | Stream table name (optionally schema-qualified). |
+| `query` | `string` | (required) | Defining SQL query. |
+| `schedule` | `string` | `'calculated'` | Refresh schedule. |
+| `refresh_mode` | `string` | `'AUTO'` | `'AUTO'`, `'FULL'`, `'DIFFERENTIAL'`, or `'IMMEDIATE'`. |
+| `initialize` | `boolean` | `true` | Whether to populate immediately. |
+| `diamond_consistency` | `string` | `NULL` | `'atomic'` or `'none'`. |
+| `diamond_schedule_policy` | `string` | `NULL` | `'fastest'` or `'slowest'`. |
+| `cdc_mode` | `string` | `NULL` | `'auto'`, `'trigger'`, or `'wal'`. |
+| `append_only` | `boolean` | `false` | Enable append-only fast path. |
+| `pooler_compatibility_mode` | `boolean` | `false` | PgBouncer compatibility. |
+| `partition_by` | `string` | `NULL` | Partition key. |
+| `max_differential_joins` | `integer` | `NULL` | Max join scan limit. |
+| `max_delta_fraction` | `number` | `NULL` | Max delta fraction (0.0–1.0). |
+
+**Returns** a JSONB array of result objects:
+
+```json
+[
+  {"name": "st1", "status": "created", "pgt_id": 42},
+  {"name": "st2", "status": "created", "pgt_id": 43}
+]
+```
+
+On any error, the entire transaction is rolled back (standard PostgreSQL transactional semantics). The error message includes the index and name of the failing definition.
+
+**Example:**
+
+```sql
+SELECT pgtrickle.bulk_create('[
+  {"name": "order_totals", "query": "SELECT customer_id, SUM(amount) AS total FROM orders GROUP BY customer_id", "schedule": "30s"},
+  {"name": "product_stats", "query": "SELECT product_id, COUNT(*) AS cnt FROM order_items GROUP BY product_id", "schedule": "1m"}
+]'::jsonb);
+```
 
 ---
 
@@ -1640,11 +1698,49 @@ SELECT * FROM pgtrickle.explain_st('order_totals');
 
 | property | value |
 |---|---|
-| Defining Query | SELECT region, SUM(amount) ... |
-| Refresh Mode | DIFFERENTIAL |
-| Operator Tree | Aggregate → Scan(orders) |
-| Source Tables | orders (oid=16384) |
-| DVM Supported | Yes |
+| pgt_name | public.order_totals |
+| defining_query | SELECT region, SUM(amount) ... |
+| refresh_mode | DIFFERENTIAL |
+| status | active |
+| is_populated | true |
+| dvm_supported | true |
+| operator_tree | Aggregate → Scan(orders) |
+| output_columns | region, total |
+| source_oids | 16384 |
+| delta_query | WITH ... SELECT ... |
+| frontier | {"orders": "0/15A3B80"} |
+| amplification_stats | {"samples":10,"min":1.0,...} |
+| refresh_timing_stats | {"samples":10,"min_ms":12.3,...} |
+| source_partitions | [{"source":"public.orders",...}] |
+| dependency_graph_dot | digraph dependency_subgraph { ... } |
+| spill_info | {"temp_blks_read":0,"temp_blks_written":1234,...} |
+
+#### Output Fields
+
+| Property | Description |
+|---|---|
+| `pgt_name` | Fully-qualified stream table name |
+| `defining_query` | The SQL query that defines the stream table |
+| `refresh_mode` | `DIFFERENTIAL`, `FULL`, or `IMMEDIATE` |
+| `status` | Current status (`active`, `suspended`, etc.) |
+| `is_populated` | Whether the stream table has been initially populated |
+| `dvm_supported` | Whether the defining query supports differential view maintenance |
+| `operator_tree` | Debug representation of the DVM operator tree |
+| `output_columns` | Comma-separated list of output column names |
+| `source_oids` | Comma-separated list of source table OIDs |
+| `aggregate_strategies` | Per-aggregate maintenance strategies (JSON, if aggregates present) |
+| `delta_query` | The generated delta SQL used for DIFFERENTIAL refresh |
+| `frontier` | Current LSN/watermark frontier (JSON) |
+| `amplification_stats` | Delta amplification ratio statistics over the last 20 refreshes (JSON) |
+| `refresh_timing_stats` | Refresh duration statistics over the last 20 completed refreshes (JSON). Fields: `samples`, `min_ms`, `max_ms`, `avg_ms`, `latest_ms`, `latest_action` |
+| `source_partitions` | Partition info for partitioned source tables (JSON array). Fields per entry: `source`, `partition_key`, `partitions` |
+| `dependency_graph_dot` | Dependency sub-graph in [DOT format](https://graphviz.org/doc/info/lang.html). Shows immediate upstream sources (ellipses for base tables, boxes for stream tables) and downstream dependents. Paste into a Graphviz renderer to visualize. |
+| `spill_info` | Temp file spill metrics from `pg_stat_statements` (JSON). Fields: `temp_blks_read`, `temp_blks_written`, `threshold`, `exceeds_threshold`. Only present when `pg_trickle.spill_threshold_blocks > 0`. |
+
+> **Note:** Properties are only included when data is available. For example,
+> `source_partitions` only appears when at least one source table is
+> partitioned, and `refresh_timing_stats` only appears after at least one
+> completed refresh.
 
 ---
 
@@ -1676,7 +1772,41 @@ not refreshing or to audit which source tables are being trigger-tracked.
 
 ### Utilities
 
-Low-level hashing functions used internally for row identity.
+Utility functions for CDC management and row identity hashing.
+
+---
+
+### pgtrickle.rebuild_cdc_triggers
+
+Rebuild all CDC triggers (function body + trigger DDL) for every source
+table tracked by pg_trickle. This recreates trigger functions and
+re-attaches the trigger to each source table.
+
+```sql
+pgtrickle.rebuild_cdc_triggers() → text
+```
+
+Returns `'done'` on success. Emits a `WARNING` per table on error and
+continues processing remaining sources.
+
+**When to use:**
+
+- After changing [`pg_trickle.cdc_trigger_mode`](CONFIGURATION.md#pg_tricklecdc_trigger_mode) from `row` to `statement` (or vice versa).
+- After `ALTER EXTENSION pg_trickle UPDATE` when the CDC trigger function body has changed.
+- After restoring from a backup where triggers may have been lost.
+
+**Example:**
+
+```sql
+-- Switch to statement-level triggers and rebuild
+SET pg_trickle.cdc_trigger_mode = 'statement';
+SELECT pgtrickle.rebuild_cdc_triggers();
+```
+
+**Notes:**
+- Called automatically during `ALTER EXTENSION pg_trickle UPDATE` (0.3.0 → 0.4.0) migration.
+- Safe to call at any time — existing triggers are dropped and recreated.
+- On error for a specific table, a `WARNING` is logged and processing continues with remaining sources.
 
 ---
 
@@ -2019,6 +2149,27 @@ pg_trickle checks all functions and operators in the defining query against `pg_
 
 FULL mode accepts all volatility classes since it re-evaluates the entire query each time.
 
+#### Volatile Function Policy (VOL-1)
+
+The `pg_trickle.volatile_function_policy` GUC controls how volatile functions are handled:
+
+| Value | Behavior |
+|-------|----------|
+| `reject` (default) | ERROR — volatile functions are rejected at creation time. |
+| `warn` | WARNING emitted but creation proceeds. Delta correctness is not guaranteed. |
+| `allow` | Silent — no warning or error. Use when you understand the implications. |
+
+```sql
+-- Allow volatile functions with a warning
+SET pg_trickle.volatile_function_policy = 'warn';
+
+-- Allow volatile functions silently
+SET pg_trickle.volatile_function_policy = 'allow';
+
+-- Restore default (reject volatile functions)
+SET pg_trickle.volatile_function_policy = 'reject';
+```
+
 ### COLLATE Expressions
 
 `COLLATE` clauses on expressions are supported:
@@ -2342,40 +2493,22 @@ CREATE SUBSCRIPTION my_sub
 The following edge cases produce incorrect delta results in DIFFERENTIAL mode under specific
 data mutation patterns. They have no effect on FULL mode.
 
-#### JOIN Key Column Change + Simultaneous Right-Side Delete
+#### JOIN Key Column Change + Simultaneous Right-Side Delete — Fixed (EC-01)
 
-When a row's join key column is updated **in the same refresh cycle** as the joined-side row is deleted,
-the delta query may fail to emit the required DELETE from the stream table:
+> **Resolved in v0.14.0.** This limitation no longer exists — the delta query
+> now uses a pre-change right snapshot (R₀) for DELETE deltas, ensuring stale
+> rows are correctly removed even when the join partner is simultaneously deleted.
 
-```sql
--- Stream table joining orders with customers
-SELECT pgtrickle.create_stream_table(
-    name     => 'order_details',
-    query    => 'SELECT o.id, c.name FROM orders o JOIN customers c ON o.cust_id = c.id',
-    schedule => '1m'
-);
+The fix splits Part 1 of the JOIN delta into two arms:
+- **Part 1a** (inserts): `ΔL_inserts ⋈ R₁` — uses current right state
+- **Part 1b** (deletes): `ΔL_deletes ⋈ R₀` — uses pre-change right state
 
--- Scenario that exposes the limitation:
--- In the same transaction (or same refresh interval):
-UPDATE orders SET cust_id = 5 WHERE cust_id = 3;  -- key change
-DELETE FROM customers WHERE id = 3;               -- old join partner deleted
--- The delta for the now-stale (orders.cust_id=3, customers.id=3) join result
--- may not be emitted as a DELETE, leaving a stale row in the stream table
--- until the next full refresh cycle.
-```
+R₀ is reconstructed as `R_current EXCEPT ALL ΔR_inserts UNION ALL ΔR_deletes` (or via
+NOT EXISTS anti-join for simple Scan nodes). This ensures the DELETE half always
+finds the old join partner, even if that partner was deleted in the same cycle.
 
-**Root cause:** The JOIN delta query reads `current_right` (customers) after all changes are applied.
-When customer 3 is deleted before the delta runs, the DELETE half of the join cannot find its join
-partner and is silently dropped.
-
-**Mitigations:**
-- **Adaptive FULL fallback** (default): when the scheduler detects a high change volume, it switches
-  to a full recompute, which will correct any stale rows. The threshold is configurable via
-  `pg_trickle.adaptive_full_threshold`.
-- **Avoid co-locating key-changing UPDATEs and DELETEs** in the same refresh interval. Stagger
-  changes across multiple refresh cycles.
-- **FULL mode** for stream tables where join key changes and right-side deletes are expected to
-  co-occur frequently.
+The fix applies to INNER JOIN, LEFT JOIN, and FULL OUTER JOIN delta operators.
+See [DVM_OPERATORS.md](DVM_OPERATORS.md) for implementation details.
 
 #### CUBE/ROLLUP Expansion Limit
 
@@ -3143,6 +3276,53 @@ WHERE NOT aligned;
 SELECT source_table, watermark, updated_at
 FROM pgtrickle.watermarks()
 ORDER BY watermark;
+```
+
+### Stuck Watermark Detection (WM-7, v0.15.0)
+
+When `pg_trickle.watermark_holdback_timeout` is set to a positive value
+(seconds), the scheduler periodically checks all watermark sources. If any
+source in a watermark group has not been advanced within the timeout,
+downstream stream tables in that group are **paused** (refresh is skipped)
+and a `pgtrickle_alert` NOTIFY is emitted.
+
+This protects against silent data staleness when an ETL pipeline breaks and
+stops advancing watermarks -- without this guard, stream tables would
+continue refreshing with stale external data.
+
+**Behavior:**
+
+- **Stuck detection**: Every ~60 seconds, the scheduler checks
+  `updated_at` for all watermark sources. If `now() - updated_at >
+  watermark_holdback_timeout`, the source is stuck.
+- **Pause**: Any stream table whose source set overlaps a group containing
+  a stuck source is skipped. A SKIP record with `"stuck"` in the reason
+  is logged to `pgt_refresh_history`.
+- **Alert**: A `pgtrickle_alert` NOTIFY with event `watermark_stuck` is
+  emitted (once per newly-stuck source, not repeated every check cycle).
+- **Auto-resume**: When the stuck watermark is advanced via
+  `advance_watermark()`, the next scheduler check detects the advancement,
+  lifts the pause, and emits a `watermark_resumed` event.
+
+#### Recipe 9 — Stuck Watermark Protection
+
+```sql
+-- Enable stuck-watermark detection with a 10-minute timeout.
+ALTER SYSTEM SET pg_trickle.watermark_holdback_timeout = 600;
+SELECT pg_reload_conf();
+
+-- Listen for alerts in a monitoring process.
+LISTEN pgtrickle_alert;
+
+-- When the ETL pipeline breaks and stops calling advance_watermark(),
+-- the scheduler will start skipping downstream STs after 10 minutes.
+-- You'll receive a NOTIFY payload like:
+--   {"event":"watermark_stuck","group":"order_pipeline","source_oid":16385,"age_secs":620}
+
+-- When the ETL pipeline recovers and advances the watermark:
+SELECT pgtrickle.advance_watermark('orders', '2026-03-02 00:00:00+00');
+-- The scheduler automatically resumes, and you'll receive:
+--   {"event":"watermark_resumed","source_oid":16385}
 ```
 
 ---

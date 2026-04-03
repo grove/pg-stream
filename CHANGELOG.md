@@ -36,7 +36,129 @@ For future plans and release milestones, see [ROADMAP.md](ROADMAP.md).
 
 ## [Unreleased]
 
-<!-- Next release notes go here -->
+### Added
+
+- **VOL-1:** `pg_trickle.volatile_function_policy` GUC — controls how volatile functions
+  are handled in DIFFERENTIAL/IMMEDIATE mode defining queries. Modes: `reject` (default,
+  current behavior), `warn` (WARNING but allow creation), `allow` (silent). Gives operators
+  flexibility when volatile expressions are intentional (e.g., sampling, audit timestamps).
+
+- **G15-BC:** `pgtrickle.bulk_create(definitions JSONB)` — create multiple stream tables
+  in a single transaction. Accepts a JSONB array of definitions (each with `name`, `query`,
+  and optional parameters matching `create_stream_table`). Returns a JSONB array of results
+  with `name`, `status`, and `pgt_id` per definition. Atomic: entire batch rolls back on
+  any error.
+
+- **EXPL-ENH:** `pgtrickle.explain_st()` now includes refresh timing statistics
+  (`refresh_timing_stats` — min/max/avg/latest duration from last 20 refreshes),
+  source partition info (`source_partitions` — partition key and child count for
+  partitioned source tables), and a dependency sub-graph in DOT format
+  (`dependency_graph_dot` — immediate upstream/downstream nodes, renderable by Graphviz).
+
+- **PH-D2:** `pg_trickle.merge_join_strategy` GUC — manual override for the join
+  strategy used during MERGE execution. Values: `auto` (default, delta-size heuristics),
+  `hash_join` (force hash joins + raised work_mem), `nested_loop` (force nested-loop
+  joins), `merge_join` (force merge joins). Useful for workloads with consistent delta
+  sizes where the heuristic is unnecessary overhead.
+
+- **PH-E1:** `pg_trickle.max_delta_estimate_rows` GUC — before executing the MERGE,
+  runs a capped COUNT on the delta subquery. If the output cardinality exceeds the
+  configured limit, emits a NOTICE and falls back to FULL refresh to prevent OOM or
+  excessive temp-file spills. Default: 0 (disabled). Recommended: 50000–500000.
+
+- **STST-3:** Seven new E2E tests for multi-level ST-on-ST cascade chains (3-level
+  and 4-level). Covers INSERT/UPDATE/DELETE propagation, mixed refresh modes
+  (DIFFERENTIAL + FULL in same chain), concurrent DML at multiple levels, and
+  DROP of intermediate stream tables with CASCADE.
+
+- **CIRC-IMM:** Ten new E2E tests for circular dependencies + IMMEDIATE mode
+  hardening. Diamond topology with IMMEDIATE on both branches (INSERT/UPDATE/DELETE),
+  near-circular topologies with direct + chain path convergence, rapid sequential
+  and mixed DML stress tests, fan-in from multiple sources. No deadlocks found.
+
+- **E4:** Flyway and Liquibase migration integration guide
+  (`docs/integrations/flyway-liquibase.md`). Covers versioned migrations, repeatable
+  migrations, `create_or_replace_stream_table`, `bulk_create`, Liquibase changesets
+  with rollback, preconditions, and CI environment patterns.
+
+- **E5:** ORM integration guides for SQLAlchemy and Django
+  (`docs/integrations/orm.md`). Read-only model patterns, write-blocking safeguards,
+  Django `RunSQL` migrations, DRF viewsets, freshness checking, and eventual
+  consistency handling.
+
+- **G14-SHC-SPIKE:** RFC for shared-memory MERGE template cache
+  (`plans/performance/RFC_SHARED_TEMPLATE_CACHE.md`). Proposes DSM segment + LWLock
+  design to eliminate per-connection cold-start penalty (~45 ms per ST). Covers data
+  structures, invalidation strategy, lock granularity, size budget, and go/no-go
+  criteria for v0.16.0 implementation.
+
+- **R4:** CloudNativePG operator hardening. Updated `cnpg/cluster-example.yaml` with
+  probe configuration tuned for pg_trickle workloads (streaming readiness with
+  `maximumLag`, startup/liveness timeouts for background worker initialization).
+  Added Kubernetes deployment section to `docs/GETTING_STARTED.md` covering Image
+  Volume setup, declarative extension management, health monitoring via
+  `pgtrickle.health_check()`, and primary→replica failover behavior.
+
+- **TS3:** Nexmark streaming benchmark test suite (`tests/e2e_nexmark_tests.rs`).
+  Models an online auction system with persons, auctions, and bids. 10 adapted Nexmark
+  queries (Q0--Q9) covering passthrough, projection, filter, joins, aggregates, and
+  DISTINCT ON. Three mutation functions (RF1 insert, RF2 delete, RF3 update) simulate
+  sustained high-frequency DML. Three test modes: differential correctness, FULL
+  correctness, and sustained churn. Added to CI as `#[ignore]` test suite. Documented
+  results in `docs/BENCHMARK.md`.
+
+- **WM-7:** Stuck watermark hold-back mode. New `pg_trickle.watermark_holdback_timeout`
+  GUC (default 0 = disabled) detects watermarks that have not been advanced within the
+  configured timeout. When a stuck watermark is detected, downstream stream tables in
+  the affected watermark group are paused (refresh skipped) and a `pgtrickle_alert`
+  NOTIFY with `watermark_stuck` event is emitted. Auto-resumes when the watermark is
+  advanced, with a `watermark_resumed` event. Protects against silent data staleness
+  from broken ETL pipelines.
+
+- **PH-E2:** Spill-aware refresh. Two new GUCs: `pg_trickle.spill_threshold_blocks`
+  (default 0 = disabled) and `pg_trickle.spill_consecutive_limit` (default 3). After
+  each differential MERGE, queries `pg_stat_statements` for `temp_blks_written`. If the
+  value exceeds the threshold for N consecutive refreshes, the scheduler forces a FULL
+  refresh to prevent repeated expensive spilling merges. Spill metrics are exposed in
+  `pgtrickle.explain_st()` via the new `spill_info` property. Requires the
+  `pg_stat_statements` extension.
+
+- **G13-PRF:** Parser modularization and unsafe audit. Split the monolithic
+  `src/dvm/parser.rs` (~21,000 lines) into 5 sub-modules: `mod.rs` (FFI helpers,
+  macros, entry points, tests), `types.rs` (OpTree, Expr, Column, etc.),
+  `validation.rs` (volatility checking, IVM support, IMMEDIATE, monotonicity),
+  `rewrites.rs` (all SQL rewrite passes), `sublinks.rs` (SubLink extraction from
+  WHERE clauses). Added `// SAFETY:` comments to all ~750 `unsafe` blocks (~676
+  newly documented). Zero behavior change -- all 1687 unit tests pass.
+
+- **I3:** dbt Hub publication readiness. Updated `dbt-pgtrickle/dbt_project.yml`
+  version to 0.15.0 (synced with extension). Updated `dbt-pgtrickle/README.md` with
+  both git-based and dbt Hub installation methods, fixed GitHub org placeholder.
+  Added dbt integration section to root `README.md`. Created dbt Hub submission
+  guide (`docs/integrations/dbt-hub-submission.md`) documenting the hubcap PR
+  process, separate-repo approach, and version syncing workflow.
+
+### Changed
+
+- **I2:** Complete documentation review for v0.15.0 readiness. Fixed `CONFIGURATION.md`
+  GUC count (23 → 40+), added 10 missing GUC documentation sections (`cdc_trigger_mode`,
+  `tick_watermark_enabled`, `matview_polling`, `log_merge_sql`, `fuse_default_ceiling`,
+  `delta_amplification_threshold`, `algebraic_drift_reset_cycles`,
+  `agg_diff_cardinality_threshold`). Added missing `rebuild_cdc_triggers()` documentation
+  to `SQL_REFERENCE.md`. Fixed outdated version reference in `FAQ.md`.
+
+- **TRUNC-1:** Documented existing TRUNCATE capture behavior in `docs/SQL_REFERENCE.md`.
+  TRUNCATE on source tables in trigger CDC mode already triggers automatic FULL refresh
+  via the `action='T'` marker mechanism (implemented in v0.14.0 CDC triggers).
+
+- **G8.1:** Verified cross-session MERGE cache invalidation is already complete via the
+  shared-memory `CACHE_GENERATION` counter + per-ST `defining_query_hash` check. No
+  additional `catalog_version` column needed.
+
+- **EC-01:** Verified JOIN key change + simultaneous right-side DELETE correctness fix
+  is already implemented via R₀ pre-change snapshot strategy (Part 1a/1b split in delta
+  query). Updated `docs/SQL_REFERENCE.md` to replace the documented limitation with a
+  description of the fix. Unit + TPC-H regression tests already cover this scenario.
 
 ---
 

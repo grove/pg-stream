@@ -282,6 +282,66 @@ A passing result confirms the scheduler's per-cycle overhead is negligible. Valu
 
 ---
 
+## Nexmark Streaming Benchmark
+
+The Nexmark benchmark validates correctness against a sustained high-frequency
+DML workload modelling an online auction system. It is adapted from the
+[Nexmark benchmark specification](https://datalab.cs.pdx.edu/niagara/NEXMark/)
+used by streaming systems like Flink, Feldera, and Materialize.
+
+### Data Model
+
+| Table | Description | Default Size |
+|-------|-------------|--------------|
+| `person` | Registered users (sellers/bidders) | 100 rows |
+| `auction` | Items listed for sale | 500 rows |
+| `bid` | Bids placed on auctions | 2,000 rows |
+
+### Queries
+
+| Query | Features | Description |
+|-------|----------|-------------|
+| Q0 | Passthrough | Identity projection of all bids |
+| Q1 | Projection + arithmetic | Currency conversion |
+| Q2 | Filter | Bids on specific auctions |
+| Q3 | JOIN + filter | Local item suggestion (person-auction join) |
+| Q4 | JOIN + GROUP BY + AVG | Average selling price by category |
+| Q5 | GROUP BY + COUNT | Hot items (bid count per auction) |
+| Q6 | JOIN + GROUP BY + AVG | Average bid price per seller |
+| Q7 | Aggregate (MAX) | Highest bid price |
+| Q8 | JOIN | Person-auction join (new users monitoring) |
+| Q9 | JOIN + DISTINCT ON | Winning bid per auction with bidder info |
+
+### Running Nexmark Tests
+
+```bash
+# Default scale (100 persons, 500 auctions, 2000 bids, 3 cycles)
+cargo test --test e2e_nexmark_tests -- --ignored --test-threads=1 --nocapture
+
+# Larger scale
+NEXMARK_PERSONS=1000 NEXMARK_AUCTIONS=5000 NEXMARK_BIDS=50000 NEXMARK_CYCLES=5 \
+  cargo test --test e2e_nexmark_tests -- --ignored --test-threads=1 --nocapture
+```
+
+### What Each Cycle Does
+
+Each refresh cycle applies three mutation functions (RF1-RF3) then refreshes
+all stream tables and asserts multiset equality:
+
+1. **RF1 (INSERT):** New persons, auctions, and bids
+2. **RF2 (DELETE):** Remove oldest bids, orphaned auctions, orphaned persons
+3. **RF3 (UPDATE):** Price changes, reserve adjustments, city moves
+4. **Refresh + Assert:** Differential refresh → EXCEPT ALL correctness check
+
+### Correctness Validation
+
+The test uses the same DBSP invariant as TPC-H: after every differential
+refresh, the stream table must be **multiset-equal** to re-executing the
+defining query from scratch (symmetric `EXCEPT ALL`). Additionally, negative
+`__pgt_count` values (over-retraction bugs) are detected.
+
+---
+
 ## DAG Topology Benchmarks
 
 The DAG topology benchmark suite in `tests/e2e_dag_bench_tests.rs` measures **end-to-end propagation latency and throughput** through multi-level DAG topologies. While the single-ST benchmarks above measure per-operator refresh speed, these benchmarks measure how efficiently changes propagate through chains, fan-outs, diamonds, and mixed topologies with 5–100+ stream tables.

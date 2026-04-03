@@ -377,6 +377,29 @@ pgtrickle watch -n 5                    # continuous output
 Diagnostics, CDC Health, Configuration, Health Checks, Alerts, Workers,
 Fuse, Watermarks, and Delta Inspector.
 
+## dbt Integration
+
+The `dbt-pgtrickle` package provides a custom `stream_table` materialization for
+[dbt](https://www.getdbt.com/). No custom adapter needed — works with the standard
+`dbt-postgres` adapter.
+
+```yaml
+# packages.yml
+packages:
+  - git: "https://github.com/grove/pg-trickle.git"
+    revision: v0.15.0
+    subdirectory: "dbt-pgtrickle"
+```
+
+```sql
+-- models/marts/order_totals.sql
+{{ config(materialized='stream_table', schedule='5m', refresh_mode='DIFFERENTIAL') }}
+SELECT customer_id, SUM(amount) AS total FROM {{ source('raw', 'orders') }} GROUP BY customer_id
+```
+
+See [dbt-pgtrickle/README.md](dbt-pgtrickle/README.md) for the full configuration
+reference, operations, and testing guide.
+
 ## Documentation
 
 | Document | Description |
