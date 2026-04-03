@@ -10,4 +10,11 @@
 --   Already implemented in v0.14.0 via CDC TRUNCATE triggers. No schema
 --   changes needed for this release.
 --
+-- G15-BC: bulk_create(definitions JSONB)
+--   Registered via pgrx #[pg_extern] (auto-registered on extension upgrade).
+--
+-- G8.1: Cross-session MERGE cache invalidation
+--   Already implemented via shared-memory CACHE_GENERATION counter.
+--   No catalog schema changes needed.
+--
 -- No catalog schema changes in this upgrade step.

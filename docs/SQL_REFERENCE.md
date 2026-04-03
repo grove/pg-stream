@@ -11,6 +11,7 @@ Complete reference for all SQL functions, views, and catalog tables provided by 
     - [pgtrickle.create\_stream\_table](#pgtricklecreate_stream_table)
     - [pgtrickle.create\_stream\_table\_if\_not\_exists](#pgtricklecreate_stream_table_if_not_exists)
     - [pgtrickle.create\_or\_replace\_stream\_table](#pgtricklecreate_or_replace_stream_table)
+    - [pgtrickle.bulk\_create](#pgtricklebulk_create)
     - [pgtrickle.alter\_stream\_table](#pgtricklealter_stream_table)
     - [pgtrickle.drop\_stream\_table](#pgtrickledrop_stream_table)
     - [pgtrickle.resume\_stream\_table](#pgtrickleresume_stream_table)
@@ -777,6 +778,56 @@ SELECT pgtrickle.create_or_replace_stream_table(
 - Mirrors PostgreSQL's `CREATE OR REPLACE` convention (`CREATE OR REPLACE VIEW`, `CREATE OR REPLACE FUNCTION`).
 - Never drops the stream table — even for incompatible schema changes, the ALTER QUERY path rebuilds storage in place while preserving the catalog entry (`pgt_id`).
 - For migration scripts that should **not** modify an existing definition, use [`create_stream_table_if_not_exists`](#pgtricklecreate_stream_table_if_not_exists) instead.
+
+---
+
+### pgtrickle.bulk_create
+
+Create multiple stream tables in a single transaction.
+
+```sql
+pgtrickle.bulk_create(
+    definitions  jsonb     -- Array of stream table definitions
+) → jsonb                  -- Array of result objects
+```
+
+Each element in the `definitions` array must be a JSON object with at least `name` and `query` keys. All other keys match the parameters of `create_stream_table` (snake_case):
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `name` | `string` | (required) | Stream table name (optionally schema-qualified). |
+| `query` | `string` | (required) | Defining SQL query. |
+| `schedule` | `string` | `'calculated'` | Refresh schedule. |
+| `refresh_mode` | `string` | `'AUTO'` | `'AUTO'`, `'FULL'`, `'DIFFERENTIAL'`, or `'IMMEDIATE'`. |
+| `initialize` | `boolean` | `true` | Whether to populate immediately. |
+| `diamond_consistency` | `string` | `NULL` | `'atomic'` or `'none'`. |
+| `diamond_schedule_policy` | `string` | `NULL` | `'fastest'` or `'slowest'`. |
+| `cdc_mode` | `string` | `NULL` | `'auto'`, `'trigger'`, or `'wal'`. |
+| `append_only` | `boolean` | `false` | Enable append-only fast path. |
+| `pooler_compatibility_mode` | `boolean` | `false` | PgBouncer compatibility. |
+| `partition_by` | `string` | `NULL` | Partition key. |
+| `max_differential_joins` | `integer` | `NULL` | Max join scan limit. |
+| `max_delta_fraction` | `number` | `NULL` | Max delta fraction (0.0–1.0). |
+
+**Returns** a JSONB array of result objects:
+
+```json
+[
+  {"name": "st1", "status": "created", "pgt_id": 42},
+  {"name": "st2", "status": "created", "pgt_id": 43}
+]
+```
+
+On any error, the entire transaction is rolled back (standard PostgreSQL transactional semantics). The error message includes the index and name of the failing definition.
+
+**Example:**
+
+```sql
+SELECT pgtrickle.bulk_create('[
+  {"name": "order_totals", "query": "SELECT customer_id, SUM(amount) AS total FROM orders GROUP BY customer_id", "schedule": "30s"},
+  {"name": "product_stats", "query": "SELECT product_id, COUNT(*) AS cnt FROM order_items GROUP BY product_id", "schedule": "1m"}
+]'::jsonb);
+```
 
 ---
 
