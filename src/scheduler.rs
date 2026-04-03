@@ -2148,6 +2148,12 @@ pub extern "C-unwind" fn pg_trickle_scheduler_main(_arg: pg_sys::Datum) {
     // doubles each consecutive cycle; resets to 1.0 on the first on-time cycle.
     let mut backoff_factors: HashMap<i64, f64> = HashMap::new();
 
+    // PH-E2: Per-ST consecutive spill counters.
+    // When a differential refresh writes temp blocks exceeding the threshold,
+    // the counter increments.  After spill_consecutive_limit consecutive spills,
+    // the scheduler forces a FULL refresh.  Resets on any non-spilling refresh.
+    let mut spill_counters: HashMap<i64, i32> = HashMap::new();
+
     // Timestamp for periodic CDC trigger health check (~every 60s).
     let mut last_trigger_health_ms: u64 = 0;
 
@@ -2776,6 +2782,7 @@ pub extern "C-unwind" fn pg_trickle_scheduler_main(_arg: pg_sys::Datum) {
                         initial_table_changes.get(&pgt_id).copied(),
                         tick_watermark.as_deref(),
                         Some(&mut entry),
+                        &mut spill_counters,
                     );
                     // P3-5: Update auto-backoff factor based on last refresh timing.
                     // NOTE: We are already inside the outer BackgroundWorker::transaction,
@@ -2833,6 +2840,7 @@ pub extern "C-unwind" fn pg_trickle_scheduler_main(_arg: pg_sys::Datum) {
                             initial_table_changes.get(&pgt_id).copied(),
                             tick_watermark.as_deref(),
                             Some(&mut entry),
+                            &mut spill_counters,
                         );
                     }
                     continue;
@@ -4214,6 +4222,7 @@ fn refresh_single_st(
     table_change_snapshot: Option<bool>,
     tick_watermark: Option<&str>,
     drift_counter: Option<&mut i32>,
+    spill_counters: &mut HashMap<i64, i32>,
 ) {
     let st = match load_st_by_id(pgt_id) {
         Some(st) => st,
@@ -4413,6 +4422,47 @@ fn refresh_single_st(
     match result {
         RefreshOutcome::Success => {
             retry.reset();
+
+            // PH-E2: Spill-aware refresh tracking.
+            // After a successful refresh, check whether the MERGE spilled
+            // to temp files and maintain a per-ST consecutive spill counter.
+            let spill_threshold = config::pg_trickle_spill_threshold_blocks();
+            if spill_threshold > 0 {
+                let temp_blks = refresh::take_last_temp_blks_written();
+                if temp_blks > spill_threshold as i64 {
+                    let count = spill_counters.entry(pgt_id).or_insert(0);
+                    *count += 1;
+                    let limit = config::pg_trickle_spill_consecutive_limit();
+                    if *count >= limit {
+                        pgrx::warning!(
+                            "pg_trickle: {}.{} spilled for {} consecutive refreshes \
+                             ({} temp blocks > {} threshold) — forcing FULL refresh",
+                            st.pgt_schema,
+                            st.pgt_name,
+                            count,
+                            temp_blks,
+                            spill_threshold,
+                        );
+                        let _ = StreamTableMeta::mark_for_reinitialize(st.pgt_id);
+                        *count = 0;
+                    } else {
+                        log!(
+                            "pg_trickle: {}.{} spilled ({} temp blocks > {} threshold, \
+                             {}/{} consecutive)",
+                            st.pgt_schema,
+                            st.pgt_name,
+                            temp_blks,
+                            spill_threshold,
+                            count,
+                            limit,
+                        );
+                    }
+                } else if temp_blks >= 0 {
+                    // Non-spilling refresh: reset counter.
+                    spill_counters.remove(&pgt_id);
+                }
+                // temp_blks == -1 means detection was disabled/unavailable; leave counter as-is.
+            }
         }
         RefreshOutcome::RetryableFailure => {
             let will_retry = retry.record_failure(retry_policy, now_ms);

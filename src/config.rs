@@ -58,6 +58,27 @@ pub static PGS_MAX_DELTA_ESTIMATE_ROWS: GucSetting<i32> = GucSetting::<i32>::new
 /// Set to 0 to disable stuck-watermark detection (default).
 pub static PGS_WATERMARK_HOLDBACK_TIMEOUT: GucSetting<i32> = GucSetting::<i32>::new(0);
 
+/// PH-E2: Temp blocks written threshold for spill detection.
+///
+/// After each differential MERGE, the refresh executor queries
+/// `pg_stat_statements` for `temp_blks_written`. If the value exceeds
+/// this threshold, the refresh is considered a "spill". When
+/// `spill_consecutive_limit` consecutive spills are recorded for the
+/// same stream table, the scheduler forces a FULL refresh on the next
+/// cycle to avoid repeated temp-file overhead.
+///
+/// Set to 0 to disable spill detection (default).
+/// Requires `pg_stat_statements` extension to be installed.
+pub static PGS_SPILL_THRESHOLD_BLOCKS: GucSetting<i32> = GucSetting::<i32>::new(0);
+
+/// PH-E2: Number of consecutive spills before auto-switching to FULL refresh.
+///
+/// When a stream table accumulates this many consecutive differential
+/// refreshes where `temp_blks_written > spill_threshold_blocks`, the
+/// scheduler marks the ST for reinitialization (FULL refresh) on the
+/// next cycle. The counter resets after each non-spilling refresh.
+pub static PGS_SPILL_CONSECUTIVE_LIMIT: GucSetting<i32> = GucSetting::<i32>::new(3);
+
 /// Whether to use TRUNCATE instead of DELETE for change buffer cleanup
 /// when the entire buffer is consumed by a refresh.
 ///
@@ -680,6 +701,35 @@ pub fn register_gucs() {
         GucFlags::default(),
     );
 
+    // PH-E2: Spill detection threshold.
+    GucRegistry::define_int_guc(
+        c"pg_trickle.spill_threshold_blocks",
+        c"Temp blocks written threshold for spill detection (0 = disabled).",
+        c"After each differential MERGE, queries pg_stat_statements for temp_blks_written. \
+           If the value exceeds this threshold, the refresh is a spill. After \
+           spill_consecutive_limit consecutive spills, forces FULL refresh. \
+           Requires pg_stat_statements. Set to 0 to disable.",
+        &PGS_SPILL_THRESHOLD_BLOCKS,
+        0,           // min (0 = disabled)
+        100_000_000, // max
+        GucContext::Suset,
+        GucFlags::default(),
+    );
+
+    // PH-E2: Consecutive spill limit before FULL fallback.
+    GucRegistry::define_int_guc(
+        c"pg_trickle.spill_consecutive_limit",
+        c"Consecutive spilling refreshes before auto-switching to FULL (default 3).",
+        c"When a stream table has this many consecutive differential refreshes with \
+           temp_blks_written exceeding spill_threshold_blocks, the scheduler forces \
+           a FULL refresh on the next cycle. Resets after any non-spilling refresh.",
+        &PGS_SPILL_CONSECUTIVE_LIMIT,
+        1,   // min
+        100, // max
+        GucContext::Suset,
+        GucFlags::default(),
+    );
+
     GucRegistry::define_bool_guc(
         c"pg_trickle.cleanup_use_truncate",
         c"Use TRUNCATE for change buffer cleanup when all rows are consumed.",
@@ -1237,6 +1287,16 @@ pub fn pg_trickle_watermark_holdback_timeout() -> i32 {
     PGS_WATERMARK_HOLDBACK_TIMEOUT.get()
 }
 
+/// PH-E2: Returns the spill detection threshold in temp blocks written (0 = disabled).
+pub fn pg_trickle_spill_threshold_blocks() -> i32 {
+    PGS_SPILL_THRESHOLD_BLOCKS.get()
+}
+
+/// PH-E2: Returns the consecutive spill limit before FULL fallback (default 3).
+pub fn pg_trickle_spill_consecutive_limit() -> i32 {
+    PGS_SPILL_CONSECUTIVE_LIMIT.get()
+}
+
 /// Returns the change buffer schema name.
 pub fn pg_trickle_change_buffer_schema() -> String {
     PGS_CHANGE_BUFFER_SCHEMA
@@ -1500,11 +1560,10 @@ pub fn pg_trickle_unlogged_buffers() -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        CdcTriggerMode, MergeJoinStrategy, PGS_WATERMARK_HOLDBACK_TIMEOUT, ParallelRefreshMode,
-        UserTriggersMode, VolatileFunctionPolicy, normalize_cdc_trigger_mode,
-        normalize_merge_join_strategy, normalize_parallel_refresh_mode,
-        normalize_recursive_max_depth, normalize_user_triggers_mode,
-        normalize_volatile_function_policy, threshold_mb_to_bytes,
+        CdcTriggerMode, MergeJoinStrategy, ParallelRefreshMode, UserTriggersMode,
+        VolatileFunctionPolicy, normalize_cdc_trigger_mode, normalize_merge_join_strategy,
+        normalize_parallel_refresh_mode, normalize_recursive_max_depth,
+        normalize_user_triggers_mode, normalize_volatile_function_policy, threshold_mb_to_bytes,
     };
 
     #[test]
@@ -1802,9 +1861,9 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_watermark_holdback_timeout_default_is_disabled() {
-        // The static default is 0 (disabled).
-        assert_eq!(PGS_WATERMARK_HOLDBACK_TIMEOUT.get(), 0);
-    }
+    // Note: GUC default value tests (PGS_WATERMARK_HOLDBACK_TIMEOUT,
+    // PGS_SPILL_THRESHOLD_BLOCKS, PGS_SPILL_CONSECUTIVE_LIMIT) require a
+    // PostgreSQL backend and are covered by E2E tests.  Calling
+    // `GucSetting::get()` in multi-threaded unit tests triggers pgrx's
+    // "postgres FFI may not be called from multiple threads" guard.
 }

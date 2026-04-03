@@ -46,6 +46,32 @@ pub(crate) fn set_effective_mode(mode: &'static str) {
 pub fn take_effective_mode() -> &'static str {
     LAST_EFFECTIVE_MODE.with(|m| m.get())
 }
+
+// ── PH-E2: Last-refresh spill tracking ──────────────────────────────────
+
+thread_local! {
+    /// Temp blocks written during the most recent MERGE execution.
+    /// Set after each differential refresh by querying pg_stat_statements.
+    /// Read by the scheduler to track per-ST spill history.
+    static LAST_TEMP_BLKS_WRITTEN: Cell<i64> = const { Cell::new(-1) };
+}
+
+/// Record the temp blocks written for the currently-executing refresh.
+pub(crate) fn set_last_temp_blks_written(blks: i64) {
+    LAST_TEMP_BLKS_WRITTEN.with(|c| c.set(blks));
+}
+
+/// Take the temp blocks written by the most recent differential refresh.
+/// Returns -1 if not available (pg_stat_statements not installed, or not
+/// a differential refresh).
+pub fn take_last_temp_blks_written() -> i64 {
+    LAST_TEMP_BLKS_WRITTEN.with(|c| {
+        let v = c.get();
+        c.set(-1);
+        v
+    })
+}
+
 use crate::dag::RefreshMode;
 use crate::dvm;
 use crate::error::PgTrickleError;
@@ -4817,6 +4843,18 @@ pub fn execute_differential_refresh(
     }
 
     let t3 = Instant::now();
+
+    // PH-E2: Query pg_stat_statements for temp file spill metrics.
+    // Store in thread-local for the scheduler to read after this function returns.
+    let spill_threshold = crate::config::pg_trickle_spill_threshold_blocks();
+    if spill_threshold > 0 {
+        let temp_blks = crate::monitor::query_temp_file_usage(name)
+            .map(|(_read, written)| written)
+            .unwrap_or(0);
+        set_last_temp_blks_written(temp_blks);
+    } else {
+        set_last_temp_blks_written(-1);
+    }
 
     // Determine cache path and hint tier for profiling
     let cache_path = if was_cache_hit {

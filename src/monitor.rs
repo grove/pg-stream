@@ -830,6 +830,29 @@ fn explain_st_impl(
         props.push(("dependency_graph_dot".to_string(), dot));
     }
 
+    // PH-E2: Live temp file spill info from pg_stat_statements.
+    let spill_threshold = crate::config::pg_trickle_spill_threshold_blocks();
+    if spill_threshold > 0 {
+        let name = format!("{}.{}", st.pgt_schema, st.pgt_name);
+        match query_temp_file_usage(&name) {
+            Some((read_blks, written_blks)) => {
+                let exceeds = written_blks > spill_threshold as i64;
+                let info = format!(
+                    "{{\"temp_blks_read\":{},\"temp_blks_written\":{},\"threshold\":{},\"exceeds_threshold\":{}}}",
+                    read_blks, written_blks, spill_threshold, exceeds
+                );
+                props.push(("spill_info".to_string(), info));
+            }
+            None => {
+                props.push((
+                    "spill_info".to_string(),
+                    "{\"status\":\"pg_stat_statements not available or no matching statement\"}"
+                        .to_string(),
+                ));
+            }
+        }
+    }
+
     Ok(props)
 }
 
