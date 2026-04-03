@@ -2,6 +2,12 @@
 --
 -- v0.15.0: External Test Suites & Integration
 --
--- Placeholder: DDL changes will be added here as features are implemented.
+-- VOL-1: volatile_function_policy GUC
+--   Registered via pgrx GUC infrastructure (no DDL needed — GUC is
+--   automatically available after extension upgrade).
 --
--- No schema changes in this upgrade step as of initial development cycle open.
+-- TRUNC-1: TRUNCATE capture for trigger-mode CDC
+--   Already implemented in v0.14.0 via CDC TRUNCATE triggers. No schema
+--   changes needed for this release.
+--
+-- No catalog schema changes in this upgrade step.

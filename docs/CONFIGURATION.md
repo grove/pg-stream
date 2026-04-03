@@ -879,6 +879,36 @@ SET pg_trickle.max_grouping_set_branches = 128;
 
 ---
 
+### pg_trickle.volatile_function_policy
+
+Controls how volatile functions in defining queries are handled for
+DIFFERENTIAL and IMMEDIATE modes.
+
+| Value | Behaviour |
+|-------|----------|
+| `reject` | **(Default)** Volatile functions cause an ERROR at stream table creation time. |
+| `warn` | Volatile functions emit a WARNING but creation proceeds. Delta correctness is not guaranteed. |
+| `allow` | Volatile functions are permitted silently. Use only when you understand that delta computation may produce incorrect results. |
+
+**Default:** `reject`
+**Context:** `SUSET` (superuser session-level)
+
+```sql
+-- Allow volatile functions with a warning
+SET pg_trickle.volatile_function_policy = 'warn';
+
+-- Allow volatile functions silently
+SET pg_trickle.volatile_function_policy = 'allow';
+```
+
+> **Note:** Volatile functions (e.g., `random()`, `clock_timestamp()`) produce
+> different values on each evaluation. In DIFFERENTIAL/IMMEDIATE modes, the
+> delta computation assumes deterministic functions — volatile functions may
+> cause stale or incorrect rows. FULL mode is unaffected since it recomputes
+> from scratch every time.
+
+---
+
 ### pg_trickle.unlogged_buffers
 
 Create new change buffer tables as `UNLOGGED` to reduce WAL amplification

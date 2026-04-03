@@ -661,6 +661,7 @@ SELECT pgtrickle.create_stream_table(
 - The defining query is parsed into an operator tree and validated for DVM support.
 - **Views as sources** — views referenced in the defining query are automatically inlined as subqueries (auto-rewrite pass #0). CDC triggers are created on the underlying base tables. Nested views (view → view → table) are fully expanded. The user's original query is preserved in `original_query` for reinit and introspection. Materialized views are rejected in DIFFERENTIAL mode (use FULL mode or the underlying query directly). Foreign tables are also rejected in DIFFERENTIAL mode.
 - CDC triggers and change buffer tables are created automatically for each source table.
+- **TRUNCATE on source tables** — when a source table is TRUNCATEd, a CDC trigger writes a marker row (`action='T'`) into the change buffer. On the next refresh cycle, pg_trickle detects the marker and automatically falls back to a FULL refresh. For single-source stream tables where no subsequent DML occurred after the TRUNCATE, an optimized fast path deletes all ST rows directly without re-running the full defining query.
 - The ST is registered in the dependency DAG; cycles are rejected.
 - Non-recursive CTEs are inlined as subqueries during parsing (Tier 1). Multi-reference CTEs share delta computation (Tier 2).
 - Recursive CTEs in DIFFERENTIAL mode use three strategies, auto-selected per refresh: **semi-naive evaluation** for INSERT-only changes, **DRed (Delete-and-Rederive)** for mixed DELETE/UPDATE changes, and **recomputation fallback** when CTE columns do not match ST storage columns. **Non-monotone recursive terms** (containing EXCEPT, Aggregate, Window, DISTINCT, AntiJoin, or INTERSECT SET) automatically fall back to recomputation to ensure correctness.
@@ -2018,6 +2019,27 @@ pg_trickle checks all functions and operators in the defining query against `pg_
 - **IMMUTABLE** functions are always safe and produce no warnings.
 
 FULL mode accepts all volatility classes since it re-evaluates the entire query each time.
+
+#### Volatile Function Policy (VOL-1)
+
+The `pg_trickle.volatile_function_policy` GUC controls how volatile functions are handled:
+
+| Value | Behavior |
+|-------|----------|
+| `reject` (default) | ERROR — volatile functions are rejected at creation time. |
+| `warn` | WARNING emitted but creation proceeds. Delta correctness is not guaranteed. |
+| `allow` | Silent — no warning or error. Use when you understand the implications. |
+
+```sql
+-- Allow volatile functions with a warning
+SET pg_trickle.volatile_function_policy = 'warn';
+
+-- Allow volatile functions silently
+SET pg_trickle.volatile_function_policy = 'allow';
+
+-- Restore default (reject volatile functions)
+SET pg_trickle.volatile_function_policy = 'reject';
+```
 
 ### COLLATE Expressions
 
