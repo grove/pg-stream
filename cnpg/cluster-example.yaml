@@ -10,6 +10,13 @@
 #   2. CNPG operator 1.28+ installed
 #   3. pg_trickle-ext image available in the cluster registry
 #
+# Health Monitoring:
+#   CNPG manages liveness/readiness probes via its instance manager.
+#   For pg_trickle-specific health, query the built-in health_check():
+#     SELECT * FROM pgtrickle.health_check();
+#   Expose pg_trickle metrics to Prometheus via the CNPG monitoring
+#   integration — see docs/GETTING_STARTED.md § Kubernetes Deployment.
+#
 # Deploy:
 #   kubectl apply -f cnpg/cluster-example.yaml
 #   kubectl apply -f cnpg/database-example.yaml
@@ -66,12 +73,36 @@ spec:
       # Extension creation is handled declaratively by the Database resource
       # (see cnpg/database-example.yaml). No postInitSQL needed.
 
+  # ── Probe Configuration ──────────────────────────────────────────────────
+  # Tuned for pg_trickle workloads: background workers and refresh cycles
+  # can cause brief CPU spikes, so give probes generous timeouts.
+  probes:
+    startup:
+      # pg_trickle registers background workers at startup. Allow extra time
+      # for shared_preload_libraries initialization.
+      periodSeconds: 10
+      failureThreshold: 60   # 10 minutes max startup
+    liveness:
+      periodSeconds: 10
+      failureThreshold: 6    # 60 seconds before restart
+      timeoutSeconds: 5
+    readiness:
+      # Replicas must be streaming before receiving read traffic.
+      # pg_trickle stream tables are readable on replicas, but stale
+      # replicas would serve outdated data.
+      type: streaming
+      maximumLag: 64Mi
+      periodSeconds: 10
+      failureThreshold: 3
+
   storage:
     size: 10Gi
     # Replace with your cluster's storage class
     storageClass: standard
 
-  # Optional: resource limits
+  # Optional: resource limits (recommended for production)
+  # The scheduler and parallel refresh workers share max_worker_processes.
+  # Budget: 1 scheduler + N refresh workers + standard PG workers.
   # resources:
   #   requests:
   #     memory: 512Mi
