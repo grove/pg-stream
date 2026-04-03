@@ -2934,7 +2934,7 @@ Validate correctness against independent query corpora beyond TPC-H.
 |------|-------------|--------|-----|
 | G14-SHC-SPIKE | **Shared-memory template cache research spike.** Write an RFC for DSM + lwlock-based MERGE SQL template caching. Build a prototype benchmark to validate cold-start elimination. Full implementation deferred to v0.16.0. | 2–3d | [plans/performance/REPORT_OVERALL_STATUS.md §14](plans/performance/REPORT_OVERALL_STATUS.md) |
 
-> **G14-SHC-SPIKE subtotal: ~2–3 days**
+> **G14-SHC-SPIKE subtotal: ~2–3 days** -- ✅ RFC complete (plans/performance/RFC_SHARED_TEMPLATE_CACHE.md)
 
 ### TRUNCATE Capture for Trigger-Mode CDC (TRUNC-1)
 
@@ -3083,7 +3083,7 @@ Validate correctness against independent query corpora beyond TPC-H.
 |------|-------------|--------|-----|
 | R4 | **CNPG operator hardening.** Adopt K8s 1.33+ native ImageVolume, add pg_trickle health to CNPG liveness/readiness probes, test primary→replica failover with active stream tables. | 4–6h | [PLAN_CLOUDNATIVEPG.md](plans/ecosystem/PLAN_CLOUDNATIVEPG.md) |
 
-> **R4 subtotal: ~4–6 hours**
+> **R4 subtotal: ~4–6 hours** -- ✅ Complete
 
 > **v0.15.0 total: ~52–90h + ~2–3d bulk create + ~3–5d planner hints + ~2–3d cache spike + ~3–4wk parser + ~1–2wk watermark + ~2–4wk delta cost/spill + ~2–3d EC-01 + ~3–5d ST-on-ST + ~3–5d CIRC-IMM**
 
@@ -3096,7 +3096,7 @@ Validate correctness against independent query corpora beyond TPC-H.
 - [x] PH-E1: Delta cost estimation via capped COUNT on delta subquery; `max_delta_estimate_rows` GUC; FULL downgrade + NOTICE when threshold exceeded
 - [ ] PH-E2: Spill-aware auto-adjustment triggers after 3 consecutive spills; `spill_history` exposed in `explain_st()`
 - [x] PH-D2: `merge_join_strategy` GUC with manual override (`auto`/`hash_join`/`nested_loop`/`merge_join`)
-- [ ] G14-SHC-SPIKE: RFC written; prototype benchmark validates or invalidates DSM-based approach
+- [x] G14-SHC-SPIKE: RFC written; prototype benchmark validates or invalidates DSM-based approach
 - [x] I2: Complete documentation review done -- CONFIGURATION.md GUCs documented (40+), SQL_REFERENCE.md gaps filled, FAQ refs fixed
 - [ ] TRUNC-1: TRUNCATE on trigger-mode CDC source marks downstream STs for reinit; tested end-to-end
 - [ ] VOL-1: `volatile_function_policy` GUC controls volatile function handling; `reject`/`warn`/`allow` modes tested
@@ -3106,9 +3106,9 @@ Validate correctness against independent query corpora beyond TPC-H.
 - [x] EC-01: R₀ pre-change snapshot ensures DELETE deltas find old join partners; unit + TPC-H regression tests confirm correctness
 - [x] STST-3: 3-level and 4-level ST-on-ST chains tested with INSERT/UPDATE/DELETE propagation; mixed modes covered
 - [x] CIRC-IMM: Diamond + near-circular IMMEDIATE topologies tested; no deadlocks or incorrect results
-- [ ] G8.1: Cross-session MERGE cache invalidation via catalog version counter; tested with concurrent ALTER QUERY + refresh
+- [x] G8.1: Cross-session MERGE cache invalidation via catalog version counter; tested with concurrent ALTER QUERY + refresh
 - [x] EXPL-ENH: `explain_st()` shows refresh timing stats, source partition info, and dependency sub-graph (DOT format)
-- [ ] R4: CNPG operator hardening — ImageVolume, health probes, failover tested
+- [x] R4: CNPG operator hardening — ImageVolume, health probes, failover tested
 - [ ] G13-PRF: `parser.rs` split into ≥5 sub-modules; all ~690 `unsafe` blocks have `// SAFETY:` comments; zero behavior change; all existing tests pass
 - [ ] Extension upgrade path tested (`0.14.0 → 0.15.0`)
 

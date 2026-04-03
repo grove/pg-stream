@@ -85,6 +85,19 @@ For future plans and release milestones, see [ROADMAP.md](ROADMAP.md).
   Django `RunSQL` migrations, DRF viewsets, freshness checking, and eventual
   consistency handling.
 
+- **G14-SHC-SPIKE:** RFC for shared-memory MERGE template cache
+  (`plans/performance/RFC_SHARED_TEMPLATE_CACHE.md`). Proposes DSM segment + LWLock
+  design to eliminate per-connection cold-start penalty (~45 ms per ST). Covers data
+  structures, invalidation strategy, lock granularity, size budget, and go/no-go
+  criteria for v0.16.0 implementation.
+
+- **R4:** CloudNativePG operator hardening. Updated `cnpg/cluster-example.yaml` with
+  probe configuration tuned for pg_trickle workloads (streaming readiness with
+  `maximumLag`, startup/liveness timeouts for background worker initialization).
+  Added Kubernetes deployment section to `docs/GETTING_STARTED.md` covering Image
+  Volume setup, declarative extension management, health monitoring via
+  `pgtrickle.health_check()`, and primary→replica failover behavior.
+
 ### Changed
 
 - **I2:** Complete documentation review for v0.15.0 readiness. Fixed `CONFIGURATION.md`
