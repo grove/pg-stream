@@ -98,6 +98,14 @@ For future plans and release milestones, see [ROADMAP.md](ROADMAP.md).
   Volume setup, declarative extension management, health monitoring via
   `pgtrickle.health_check()`, and primary→replica failover behavior.
 
+- **TS3:** Nexmark streaming benchmark test suite (`tests/e2e_nexmark_tests.rs`).
+  Models an online auction system with persons, auctions, and bids. 10 adapted Nexmark
+  queries (Q0--Q9) covering passthrough, projection, filter, joins, aggregates, and
+  DISTINCT ON. Three mutation functions (RF1 insert, RF2 delete, RF3 update) simulate
+  sustained high-frequency DML. Three test modes: differential correctness, FULL
+  correctness, and sustained churn. Added to CI as `#[ignore]` test suite. Documented
+  results in `docs/BENCHMARK.md`.
+
 ### Changed
 
 - **I2:** Complete documentation review for v0.15.0 readiness. Fixed `CONFIGURATION.md`

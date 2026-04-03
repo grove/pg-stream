@@ -2831,7 +2831,7 @@ Validate correctness against independent query corpora beyond TPC-H.
 | ~~TS2~~ | ~~JOB (Join Order Benchmark): correctness baseline and refresh latency profiling~~ ➡️ Pulled to v0.11.0 | 1–2d | [PLAN_TESTING_GAPS.md](plans/testing/PLAN_TESTING_GAPS.md) §J |
 | TS3 | Nexmark streaming benchmark: sustained high-frequency DML correctness | 1–2d | [PLAN_TESTING_GAPS.md](plans/testing/PLAN_TESTING_GAPS.md) §J |
 
-> **External test suites subtotal: ~1–2 days (TS3 only; TS1/TS2 in v0.11.0)**
+> **External test suites subtotal: ~1–2 days (TS3 only; TS1/TS2 in v0.11.0)** -- ✅ TS3 complete
 
 ### Documentation Review
 
@@ -3088,7 +3088,7 @@ Validate correctness against independent query corpora beyond TPC-H.
 > **v0.15.0 total: ~52–90h + ~2–3d bulk create + ~3–5d planner hints + ~2–3d cache spike + ~3–4wk parser + ~1–2wk watermark + ~2–4wk delta cost/spill + ~2–3d EC-01 + ~3–5d ST-on-ST + ~3–5d CIRC-IMM**
 
 **Exit criteria:**
-- [ ] At least one external test corpus (sqllogictest, JOB, or Nexmark) passes
+- [x] At least one external test corpus (sqllogictest, JOB, or Nexmark) passes
 - [ ] Complete documentation review done
 - [ ] G15-BC: `pgtrickle.bulk_create(definitions JSONB)` creates all STs and CDC triggers atomically; tested with 10+ definitions in a single call
 - [ ] G13-PRF: `parser.rs` split into ≥5 sub-modules; zero behavior change; all existing tests pass
