@@ -267,6 +267,17 @@ AS 'MODULE_PATHNAME', 'bootstrap_gate_status_fn_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
+-- src/api.rs:282
+-- pg_trickle::api::bulk_create
+CREATE  FUNCTION pgtrickle."bulk_create"(
+	"definitions" jsonb /* pgrx::datum::json::JsonB */
+) RETURNS jsonb /* pgrx::datum::json::JsonB */
+STRICT
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'bulk_create_wrapper';
+/* </end connected objects> */
+
+/* <begin connected objects> */
 -- src/api.rs:278
 -- pg_trickle::api::create_or_replace_stream_table
 CREATE  FUNCTION pgtrickle."create_or_replace_stream_table"(

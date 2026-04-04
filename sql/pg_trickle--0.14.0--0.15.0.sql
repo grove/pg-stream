@@ -11,7 +11,7 @@
 --   changes needed for this release.
 --
 -- G15-BC: bulk_create(definitions JSONB)
---   Registered via pgrx #[pg_extern] (auto-registered on extension upgrade).
+--   New SQL-callable function — CREATE FUNCTION added below.
 --
 -- G8.1: Cross-session MERGE cache invalidation
 --   Already implemented via shared-memory CACHE_GENERATION counter.
@@ -49,3 +49,12 @@ CREATE FUNCTION pgtrickle."drop_stream_table"(
 STRICT
 LANGUAGE c /* Rust */
 AS 'MODULE_PATHNAME', 'drop_stream_table_wrapper';
+
+-- G15-BC: bulk_create(definitions JSONB)
+-- New function added in 0.15.0 for batch stream table creation.
+CREATE FUNCTION pgtrickle."bulk_create"(
+    "definitions" jsonb /* pgrx::datum::json::JsonB */
+) RETURNS jsonb /* pgrx::datum::json::JsonB */
+STRICT
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'bulk_create_wrapper';
