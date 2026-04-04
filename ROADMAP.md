@@ -3259,6 +3259,39 @@ forward-compatibility before PG 19 reaches beta.
 
 > **TG2 subtotal: ~2–4 weeks (high-priority) + ~1–2 weeks (medium-priority)**
 
+### Performance Regression CI (BENCH-CI)
+
+> **In plain terms:** v0.16.0 changes core refresh paths (MERGE alternatives,
+> aggregate fast-path, append-only bypass, predicate pushdown, buffer
+> compaction). Without automated benchmarks in CI, performance regressions
+> will slip through silently. This adds a benchmark suite that runs on every
+> PR and compares against a committed baseline — any statistically significant
+> regression blocks the merge.
+
+| Item | Description | Effort | Ref |
+|------|-------------|--------|-----|
+| BENCH-CI-1 | **Benchmark harness in CI.** Run `just bench` (Criterion-based) on a fixed hardware profile (GitHub Actions large runner or self-hosted). Capture results as JSON artifacts. Compare against committed baseline using Criterion's `--save-baseline` / `--baseline`. | 2–3d | [plans/performance/PLAN_PERFORMANCE_PART_9.md §I](plans/performance/PLAN_PERFORMANCE_PART_9.md) |
+| BENCH-CI-2 | **Regression gate.** Parse Criterion JSON output; fail CI if any benchmark regresses by more than 10% (configurable threshold). Report regressions as PR comment with before/after numbers. | 1–2d | [plans/performance/PLAN_PERFORMANCE_PART_9.md §I](plans/performance/PLAN_PERFORMANCE_PART_9.md) |
+| BENCH-CI-3 | **Scenario coverage.** Ensure benchmark suite covers: scan, filter, aggregate (algebraic + non-algebraic), join (2-table, 3-table), window function, CTE, TopK, append-only, and mixed workloads. At minimum 1K/10K/100K row scales. | 2–3d | [plans/performance/PLAN_PERFORMANCE_PART_9.md §I](plans/performance/PLAN_PERFORMANCE_PART_9.md) |
+
+> **BENCH-CI subtotal: ~1–2 weeks**
+
+### Auto-Indexing on Stream Table Creation (AUTO-IDX)
+
+> **In plain terms:** pg_ivm automatically creates indexes on GROUP BY columns
+> and primary key columns when creating an incrementally maintained view.
+> pg_trickle currently requires manual index creation, which is a friction
+> point for new users. Auto-indexing creates appropriate indexes at stream
+> table creation time — GROUP BY keys, DISTINCT columns, and the
+> `__pgt_row_id` covering index for MERGE performance.
+
+| Item | Description | Effort | Ref |
+|------|-------------|--------|-----|
+| AUTO-IDX-1 | **Auto-create indexes on GROUP BY / DISTINCT columns.** At `create_stream_table()` time, analyze the defining query's GROUP BY and DISTINCT ON expressions. Create `CREATE INDEX IF NOT EXISTS` for each grouping key set. Skip for expressions that aren't simple column references. | 1–2d | [docs/research/PG_IVM_COMPARISON.md](docs/research/PG_IVM_COMPARISON.md) |
+| AUTO-IDX-2 | **Covering index on `__pgt_row_id`.** For stream tables with ≤ 8 output columns, create a covering index `INCLUDE (col1, col2, ...)` on `__pgt_row_id` to enable index-only scans during MERGE. Gate behind `pg_trickle.auto_index` GUC (default `true`). | 1d | [plans/performance/PLAN_NEW_STUFF.md §A-4](plans/performance/PLAN_NEW_STUFF.md) |
+
+> **AUTO-IDX subtotal: ~2–3 days**
+
 ### Quick Wins
 
 | Item | Description | Effort | Ref |
@@ -3268,7 +3301,7 @@ forward-compatibility before PG 19 reaches beta.
 
 > **Quick wins subtotal: ~2–4 hours**
 
-> **v0.16.0 total: ~1–2 weeks (MERGE alts) + ~4–6 weeks (aggregate fast-path) + ~1–2 weeks (append-only) + ~2–3 weeks (predicate pushdown) + ~2–3 weeks (template cache) + ~18–36 hours (PG 19 compat) + ~2–3 weeks (buffer compaction) + ~3–6 weeks (test coverage) + ~2–4 hours (quick wins)**
+> **v0.16.0 total: ~1–2 weeks (MERGE alts) + ~4–6 weeks (aggregate fast-path) + ~1–2 weeks (append-only) + ~2–3 weeks (predicate pushdown) + ~2–3 weeks (template cache) + ~18–36 hours (PG 19 compat) + ~2–3 weeks (buffer compaction) + ~3–6 weeks (test coverage) + ~1–2 weeks (bench CI) + ~2–3 days (auto-indexing) + ~2–4 hours (quick wins)**
 
 **Exit criteria:**
 - [ ] PH-D1: DELETE+INSERT strategy benchmarked and gated behind `merge_strategy` GUC; correctness verified for INSERT/UPDATE/DELETE deltas
@@ -3284,6 +3317,8 @@ forward-compatibility before PG 19 reaches beta.
 - [ ] TG2-MERGE: refresh.rs MERGE template generation has unit test coverage
 - [ ] TG2-CANCEL: Timeout and cancellation during refresh tested; no resource leaks
 - [ ] TG2-SCHEMA: Source table type changes and column renames tested end-to-end
+- [ ] BENCH-CI: Performance regression CI runs on every PR; 10% regression threshold blocks merge; scenario coverage includes scan/filter/aggregate/join/window/CTE/TopK
+- [ ] AUTO-IDX: Stream tables auto-create indexes on GROUP BY / DISTINCT columns; `__pgt_row_id` covering index for ≤ 8-column tables; `auto_index` GUC respected; existing tests pass
 - [ ] C2-BUG: `resume_stream_table()` implemented and callable from `SUSPENDED` state
 - [ ] SAST-SEMGREP: Semgrep elevated to blocking in CI pipeline
 - [ ] Extension upgrade path tested (`0.15.0 → 0.16.0`)
@@ -3293,11 +3328,15 @@ forward-compatibility before PG 19 reaches beta.
 ## v0.17.0 — Query Intelligence & Stability
 
 **Goal:** Make the refresh engine smarter, prove correctness through automated
-fuzzing, and harden for scale. Cost-based strategy selection replaces the fixed
-DIFF/FULL threshold, columnar change tracking skips irrelevant columns in
-wide-table UPDATEs, SQLancer integration provides automated semantic proving,
-incremental DAG rebuild supports 1000+ stream table deployments, and unsafe
-block reduction continues the safety hardening toward 1.0.
+fuzzing, harden for scale, and prepare for adoption. Cost-based strategy
+selection replaces the fixed DIFF/FULL threshold, columnar change tracking
+skips irrelevant columns in wide-table UPDATEs, SQLancer integration provides
+automated semantic proving, incremental DAG rebuild supports 1000+ stream table
+deployments, and unsafe block reduction continues the safety hardening toward
+1.0. On the adoption side: `api.rs` modularization improves code maintainability,
+a pg_ivm migration guide targets the largest potential adopter audience, a
+failure mode runbook equips production teams, and a Docker Compose playground
+provides a 60-second tryout experience.
 
 ### Cost-Based Refresh Strategy Selection (B-4)
 
@@ -3415,7 +3454,66 @@ block reduction continues the safety hardening toward 1.0.
 
 > **UNSAFE-R1/R2 subtotal: ~4–8 hours**
 
-> **v0.17.0 total: ~2–3 weeks (cost-based strategy) + ~3–4 weeks (columnar tracking) + ~32–48 hours (TIVM Phase 4) + ~1–2 days (ROWS FROM) + ~2–3 weeks (SQLancer) + ~2–3 weeks (incremental DAG) + ~4–8 hours (unsafe reduction)**
+### `api.rs` Modularization (API-MOD)
+
+> **In plain terms:** `api.rs` is 9,413 lines — the largest file in the
+> codebase. It contains stream table CRUD, ALTER QUERY, CDC management,
+> bulk operations, diagnostics, and monitoring functions all in one file.
+> The same treatment that `parser.rs` received in v0.15.0 (split from 21K
+> lines into 5 sub-modules) is needed here. Zero behavior change — purely
+> structural.
+
+| Item | Description | Effort | Ref |
+|------|-------------|--------|-----|
+| API-MOD | **Split `src/api.rs` into sub-modules.** Proposed split: `api/create.rs` (create/drop/alter), `api/refresh.rs` (refresh entry points), `api/cdc.rs` (CDC management), `api/diagnostics.rs` (explain_st, health_check), `api/bulk.rs` (bulk_create), `api/mod.rs` (re-exports). Zero behavior change. | 1–2 wk | — |
+
+> **API-MOD subtotal: ~1–2 weeks**
+
+### pg_ivm Migration Guide (MIG-IVM)
+
+> **In plain terms:** pg_ivm is the incumbent IVM extension with 1,400+
+> GitHub stars and 4 years of production use. Many potential pg_trickle
+> adopters are currently using pg_ivm. A step-by-step migration guide —
+> mapping pg_ivm concepts to pg_trickle equivalents, with concrete SQL
+> examples — removes the biggest adoption friction for this audience.
+
+| Item | Description | Effort | Ref |
+|------|-------------|--------|-----|
+| MIG-IVM | **pg_ivm → pg_trickle migration guide.** Map: `create_immv()` → `create_stream_table()`; `refresh_immv()` → `refresh_stream_table()`; IMMEDIATE mode equivalence; aggregate coverage differences (5 vs 60+); GUC mapping; worked example migrating a real pg_ivm deployment. Publish as `docs/tutorials/MIGRATING_FROM_PG_IVM.md`. | 2–3d | [docs/research/PG_IVM_COMPARISON.md](docs/research/PG_IVM_COMPARISON.md) |
+
+> **MIG-IVM subtotal: ~2–3 days**
+
+### Failure Mode Runbook (RUNBOOK)
+
+> **In plain terms:** Production teams need to know what happens when things
+> go wrong — and what to do about it. This documents every failure mode
+> pg_trickle can encounter (scheduler crash, WAL slot lag, OOM during
+> refresh, disk full, replication slot conflict, stuck watermarks, circular
+> convergence failure) with symptoms, diagnosis steps, and resolution
+> procedures. Essential for on-call engineers.
+
+| Item | Description | Effort | Ref |
+|------|-------------|--------|-----|
+| RUNBOOK | **Failure mode runbook.** Document: scheduler crash recovery, WAL decoder failures, OOM during refresh, disk-full behavior, replication slot conflicts, stuck watermarks, circular convergence timeout, CDC trigger failures, SUSPENDED state recovery, lock contention diagnosis. Include `health_check()` output interpretation and `explain_st()` troubleshooting. Publish as `docs/TROUBLESHOOTING.md`. | 3–5d | [docs/PRE_DEPLOYMENT.md](docs/PRE_DEPLOYMENT.md) |
+
+> **RUNBOOK subtotal: ~3–5 days**
+
+### Docker Quickstart Playground (PLAYGROUND)
+
+> **In plain terms:** The fastest way to evaluate any database extension is
+> to run it locally in 60 seconds. A `docker-compose.yml` with PostgreSQL +
+> pg_trickle pre-installed, sample data (e.g. the org-chart from
+> GETTING_STARTED.md), and a Jupyter notebook or pgAdmin web UI gives
+> potential users a zero-friction tryout experience. This is the single
+> most impactful thing for driving initial adoption.
+
+| Item | Description | Effort | Ref |
+|------|-------------|--------|-----|
+| PLAYGROUND | **Docker Compose quickstart.** `docker-compose.yml` with: PG 18 + pg_trickle, seed SQL script (org-chart example from GETTING_STARTED.md + TPC-H SF=0.01), pgAdmin web UI (optional). Single `docker compose up` command. README with guided walkthrough. | 2–3d | [docs/GETTING_STARTED.md](docs/GETTING_STARTED.md) |
+
+> **PLAYGROUND subtotal: ~2–3 days**
+
+> **v0.17.0 total: ~2–3 weeks (cost-based strategy) + ~3–4 weeks (columnar tracking) + ~32–48 hours (TIVM Phase 4) + ~1–2 days (ROWS FROM) + ~2–3 weeks (SQLancer) + ~2–3 weeks (incremental DAG) + ~4–8 hours (unsafe reduction) + ~1–2 weeks (api.rs modularization) + ~2–3 days (pg_ivm migration) + ~3–5 days (failure runbook) + ~2–3 days (Docker playground)**
 
 **Exit criteria:**
 - [ ] B-4: Cost-based strategy selector trained on per-ST history; cold-start fallback to fixed threshold; benchmarked on mixed workloads (scan, join, aggregate); `refresh_strategy` GUC respected
@@ -3427,6 +3525,10 @@ block reduction continues the safety hardening toward 1.0.
 - [ ] SQLANCER: Fuzzing environment operational; crash-test oracle finds zero panics on seed corpus; equivalence oracle validates DIFFERENTIAL ≡ FULL for fuzzed queries; stateful DML fuzzing runs clean for 10K+ mutation sequences
 - [ ] C-2: Incremental DAG rebuild reduces DDL-triggered latency spike to < 5ms at 100+ STs; ring buffer overflow falls back to full rebuild; no correctness regressions
 - [ ] UNSAFE-R1/R2: Unsafe block count reduced by ≥150; no behavioral changes; all existing tests pass
+- [ ] API-MOD: `api.rs` split into ≥4 sub-modules; zero behavior change; all existing tests pass
+- [ ] MIG-IVM: pg_ivm migration guide published with worked examples; covers create/refresh/alter/drop equivalences
+- [ ] RUNBOOK: Failure mode runbook covers ≥10 failure scenarios with symptoms, diagnosis, and resolution; includes health_check() interpretation
+- [ ] PLAYGROUND: `docker compose up` starts PG + pg_trickle + sample data in < 60 seconds; README walkthrough tested end-to-end
 - [ ] Extension upgrade path tested (`0.16.0 → 0.17.0`)
 
 ---
@@ -3454,13 +3556,17 @@ distribution — getting pg_trickle onto package registries.
 | R2b | PGXN `release_status` → `"stable"` (flip one field; PGXN testing release ships in v0.7.0) | 30min | [PLAN_PACKAGING.md](plans/infra/PLAN_PACKAGING.md) |
 | R3 | ~~Docker Hub official image~~ → CNPG extension image | ✅ Done | [PLAN_CLOUDNATIVEPG.md](plans/ecosystem/PLAN_CLOUDNATIVEPG.md) |
 | R4 | ~~CNPG operator hardening (K8s 1.33+ native ImageVolume)~~ ➡️ Pulled to v0.15.0 | 4–6h | [PLAN_CLOUDNATIVEPG.md](plans/ecosystem/PLAN_CLOUDNATIVEPG.md) |
+| R5 | **Docker Hub official image.** Publish `pgtrickle/pg_trickle:1.0.0-pg18` and `:latest` to Docker Hub. Sync Dockerfile.hub version tag with release. Automate via GitHub Actions release workflow. | 2–4h | — |
+| R6 | **Version sync automation.** Ensure `just check-version-sync` covers all version references (Cargo.toml, extension control files, Dockerfile.hub, dbt_project.yml, CNPG manifests). Add to CI as a blocking check. | 2–3h | — |
 
-> **v1.0.0 total: ~14–22 hours**
+> **v1.0.0 total: ~18–30 hours**
 
 **Exit criteria:**
 - [ ] Published on PGXN (stable) and apt/rpm via PGDG
+- [ ] Docker Hub image published (`pgtrickle/pg_trickle:1.0.0-pg18` and `:latest`)
 - [x] CNPG extension image published to GHCR (`pg_trickle-ext`)
 - [x] CNPG cluster-example.yaml validated (Image Volume approach)
+- [ ] `just check-version-sync` passes and blocks CI on mismatch
 - [ ] Upgrade path from v0.17.0 tested
 - [ ] Semantic versioning policy in effect
 
@@ -3607,9 +3713,9 @@ to keep the pre-1.0 milestones focused on performance and correctness.
 | v0.13.0 — Scalability Foundations, Partitioning Enhancements, MERGE Profiling & Multi-Tenant Scheduling | ~15–23 wk | — | |
 | v0.14.0 — Tiered Scheduling, UNLOGGED Buffers & Diagnostics | ~2–6 wk + ~1 wk patterns + ~2–4d stability + ~3.5–7d diagnostics + ~1–2d export + ~4–6d TUI + ~0.5d docs | — | |
 | v0.15.0 — External Test Suites & Integration | ~40–70h + ~2–3d bulk create + ~3–5d planner hints + ~2–3d cache spike + ~3–4wk parser + ~1–2wk watermark + ~2–4wk delta cost/spill | — | ✅ Released |
-| v0.16.0 — Performance & Refresh Optimization | ~1–2wk MERGE alts + ~4–6wk aggregate fast-path + ~1–2wk append-only + ~2–3wk predicate pushdown + ~2–3wk template cache + ~18–36h PG19 + ~2–3wk buffer compaction + ~3–6wk test coverage + ~2–4h quick wins | — | |
-| v0.17.0 — Query Intelligence & Stability | ~2–3wk cost-based strategy + ~3–4wk columnar tracking + ~32–48h TIVM Phase 4 + ~1–2d ROWS FROM + ~2–3wk SQLancer + ~2–3wk incremental DAG + ~4–8h unsafe reduction | — | |
-| v1.0.0 — Stable release | 18–27h | — | |
+| v0.16.0 — Performance & Refresh Optimization | ~1–2wk MERGE alts + ~4–6wk aggregate fast-path + ~1–2wk append-only + ~2–3wk predicate pushdown + ~2–3wk template cache + ~18–36h PG19 + ~2–3wk buffer compaction + ~3–6wk test coverage + ~1–2wk bench CI + ~2–3d auto-indexing + ~2–4h quick wins | — | |
+| v0.17.0 — Query Intelligence & Stability | ~2–3wk cost-based strategy + ~3–4wk columnar tracking + ~32–48h TIVM Phase 4 + ~1–2d ROWS FROM + ~2–3wk SQLancer + ~2–3wk incremental DAG + ~4–8h unsafe reduction + ~1–2wk api.rs mod + ~2–3d migration guide + ~3–5d runbook + ~2–3d playground | — | |
+| v1.0.0 — Stable release | ~18–30h | — | |
 | Post-1.0 (PG compat + Native DDL) | ~38–56h (PG 16–18) + ~13–21d (Native DDL) | — | |
 | Post-1.0 (ecosystem) | 88–134h | — | |
 | Post-1.0 (scale) | 6+ months | — | |
