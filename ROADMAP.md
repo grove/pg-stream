@@ -1,8 +1,8 @@
 # pg_trickle — Project Roadmap
 
-> **Last updated:** 2026-04-02
-> **Latest release:** 0.14.0 (2026-04-02)
-> **Current milestone:** v0.15.0 — External Test Suites & Integration
+> **Last updated:** 2026-04-03
+> **Latest release:** 0.15.0 (2026-04-03)
+> **Current milestone:** v0.16.0 — PG Backward Compatibility & Native DDL Syntax
 
 For a concise description of what pg_trickle is and why it exists, read
 [ESSENCE.md](ESSENCE.md) — it explains the core problem (full `REFRESH
@@ -62,14 +62,19 @@ from the v0.1.x series to 1.0 and beyond.
                                                                         │Released│─│Released│─│Released │─│Released │─│Released │─│Released │─│Released │
                                                                         │ ✅      │ │ ✅      │ │ ✅       │ │ ✅       │ │ ✅       │ │ ✅       │ │ ✅       │
                                                                         └────────┘ └────────┘ └─────────┘ └─────────┘ └─────────┘ └─────────┘ └─────────┘
+                                                                        └─ ┌─────────┐
+                                                                           │ 0.15.0  │
+                                                                           │Released │
+                                                                           │ ✅       │
+                                                                           └─────────┘
          We are here
               │
               ▼
-              └─ ┌─────────┐ ┌─────────┐ ┌────────┐ ┌────────┐
-                 │ 0.15.0  │ │ 0.16.0  │ │ 1.0.0  │ │ 1.x+   │
-                 │Test,    │─│PGCompat │─│Stable  │─│Scale & │
-                 │Integ.   │ │+DDL     │ │Release │ │Ecosys. │
-                 └─────────┘ └─────────┘ └────────┘ └────────┘
+              └─ ┌─────────┐ ┌────────┐ ┌────────┐
+                 │ 0.16.0  │ │ 1.0.0  │ │ 1.x+   │
+                 │PGCompat │─│Stable  │─│Scale & │
+                 │+DDL     │ │Release │ │Ecosys. │
+                 └─────────┘ └────────┘ └────────┘
 ```
 
 ---
@@ -2806,6 +2811,8 @@ Tiered scheduling infrastructure was already in place since v0.11/v0.12 (`refres
 
 ## v0.15.0 — External Test Suites & Integration
 
+**Status: Released (2026-04-03).** All 20 roadmap items complete.
+
 **Goal:** Validate correctness against independent query corpora and ship the
 dbt integration as a formal release.
 
@@ -3105,7 +3112,8 @@ Validate correctness against independent query corpora beyond TPC-H.
 - [x] EXPL-ENH: `explain_st()` shows refresh timing stats, source partition info, and dependency sub-graph (DOT format)
 - [x] R4: CNPG operator hardening — ImageVolume, health probes, failover tested
 - [x] G13-PRF: `parser.rs` split into 5 sub-modules; all ~750 `unsafe` blocks have `// SAFETY:` comments; zero behavior change; all existing tests pass
-- [ ] Extension upgrade path tested (`0.14.0 → 0.15.0`)
+- [x] Extension upgrade path tested (`0.14.0 → 0.15.0`)
+- [x] `just check-version-sync` passes
 
 ---
 
@@ -3361,7 +3369,7 @@ These are not gated on 1.0 but represent the longer-term horizon.
 | v0.12.0 — Scalability Foundations, Partitioning Enhancements & Correctness | ~18–27 wk + ~6–8 wk scalability + ~5–8 wk partitioning + ~1–3 wk defaults | — | |
 | v0.13.0 — Scalability Foundations, Partitioning Enhancements, MERGE Profiling & Multi-Tenant Scheduling | ~15–23 wk | — | |
 | v0.14.0 — Tiered Scheduling, UNLOGGED Buffers & Diagnostics | ~2–6 wk + ~1 wk patterns + ~2–4d stability + ~3.5–7d diagnostics + ~1–2d export + ~4–6d TUI + ~0.5d docs | — | |
-| v0.15.0 — External Test Suites & Integration | ~40–70h + ~2–3d bulk create + ~3–5d planner hints + ~2–3d cache spike + ~3–4wk parser + ~1–2wk watermark + ~2–4wk delta cost/spill | — | |
+| v0.15.0 — External Test Suites & Integration | ~40–70h + ~2–3d bulk create + ~3–5d planner hints + ~2–3d cache spike + ~3–4wk parser + ~1–2wk watermark + ~2–4wk delta cost/spill | — | ✅ Released |
 | v0.16.0 — PG Backward Compatibility & Native DDL Syntax | ~38–56h (PG compat) + ~13–21d (Native DDL) + ~2–3wk MERGE alts + ~2–4wk memory budget + ~2–3wk template cache | — | |
 | v1.0.0 — Stable release | 18–27h | — | |
 | Post-1.0 (ecosystem) | 88–134h | — | |

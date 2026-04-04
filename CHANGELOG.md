@@ -9,7 +9,7 @@ For future plans and release milestones, see [ROADMAP.md](ROADMAP.md).
 
 <!-- TOC start -->
 - [Unreleased](#unreleased)
-- [0.15.0 — Unreleased](#0150--unreleased)
+- [0.15.0 — 2026-04-03](#0150--2026-04-03)
 - [0.14.0 — 2026-04-02](#0140--2026-04-02)
 - [0.13.0 — 2026-03-31](#0130--2026-03-31)
 - [0.12.0 — 2026-03-28](#0120--2026-03-28)
@@ -36,235 +36,152 @@ For future plans and release milestones, see [ROADMAP.md](ROADMAP.md).
 
 ## [Unreleased]
 
-### Added
-
-- **VOL-1:** `pg_trickle.volatile_function_policy` GUC — controls how volatile functions
-  are handled in DIFFERENTIAL/IMMEDIATE mode defining queries. Modes: `reject` (default,
-  current behavior), `warn` (WARNING but allow creation), `allow` (silent). Gives operators
-  flexibility when volatile expressions are intentional (e.g., sampling, audit timestamps).
-
-- **G15-BC:** `pgtrickle.bulk_create(definitions JSONB)` — create multiple stream tables
-  in a single transaction. Accepts a JSONB array of definitions (each with `name`, `query`,
-  and optional parameters matching `create_stream_table`). Returns a JSONB array of results
-  with `name`, `status`, and `pgt_id` per definition. Atomic: entire batch rolls back on
-  any error.
-
-- **EXPL-ENH:** `pgtrickle.explain_st()` now includes refresh timing statistics
-  (`refresh_timing_stats` — min/max/avg/latest duration from last 20 refreshes),
-  source partition info (`source_partitions` — partition key and child count for
-  partitioned source tables), and a dependency sub-graph in DOT format
-  (`dependency_graph_dot` — immediate upstream/downstream nodes, renderable by Graphviz).
-
-- **PH-D2:** `pg_trickle.merge_join_strategy` GUC — manual override for the join
-  strategy used during MERGE execution. Values: `auto` (default, delta-size heuristics),
-  `hash_join` (force hash joins + raised work_mem), `nested_loop` (force nested-loop
-  joins), `merge_join` (force merge joins). Useful for workloads with consistent delta
-  sizes where the heuristic is unnecessary overhead.
-
-- **PH-E1:** `pg_trickle.max_delta_estimate_rows` GUC — before executing the MERGE,
-  runs a capped COUNT on the delta subquery. If the output cardinality exceeds the
-  configured limit, emits a NOTICE and falls back to FULL refresh to prevent OOM or
-  excessive temp-file spills. Default: 0 (disabled). Recommended: 50000–500000.
-
-- **STST-3:** Seven new E2E tests for multi-level ST-on-ST cascade chains (3-level
-  and 4-level). Covers INSERT/UPDATE/DELETE propagation, mixed refresh modes
-  (DIFFERENTIAL + FULL in same chain), concurrent DML at multiple levels, and
-  DROP of intermediate stream tables with CASCADE.
-
-- **CIRC-IMM:** Ten new E2E tests for circular dependencies + IMMEDIATE mode
-  hardening. Diamond topology with IMMEDIATE on both branches (INSERT/UPDATE/DELETE),
-  near-circular topologies with direct + chain path convergence, rapid sequential
-  and mixed DML stress tests, fan-in from multiple sources. No deadlocks found.
-
-- **E4:** Flyway and Liquibase migration integration guide
-  (`docs/integrations/flyway-liquibase.md`). Covers versioned migrations, repeatable
-  migrations, `create_or_replace_stream_table`, `bulk_create`, Liquibase changesets
-  with rollback, preconditions, and CI environment patterns.
-
-- **E5:** ORM integration guides for SQLAlchemy and Django
-  (`docs/integrations/orm.md`). Read-only model patterns, write-blocking safeguards,
-  Django `RunSQL` migrations, DRF viewsets, freshness checking, and eventual
-  consistency handling.
-
-- **G14-SHC-SPIKE:** RFC for shared-memory MERGE template cache
-  (`plans/performance/RFC_SHARED_TEMPLATE_CACHE.md`). Proposes DSM segment + LWLock
-  design to eliminate per-connection cold-start penalty (~45 ms per ST). Covers data
-  structures, invalidation strategy, lock granularity, size budget, and go/no-go
-  criteria for v0.16.0 implementation.
-
-- **R4:** CloudNativePG operator hardening. Updated `cnpg/cluster-example.yaml` with
-  probe configuration tuned for pg_trickle workloads (streaming readiness with
-  `maximumLag`, startup/liveness timeouts for background worker initialization).
-  Added Kubernetes deployment section to `docs/GETTING_STARTED.md` covering Image
-  Volume setup, declarative extension management, health monitoring via
-  `pgtrickle.health_check()`, and primary→replica failover behavior.
-
-- **TS3:** Nexmark streaming benchmark test suite (`tests/e2e_nexmark_tests.rs`).
-  Models an online auction system with persons, auctions, and bids. 10 adapted Nexmark
-  queries (Q0--Q9) covering passthrough, projection, filter, joins, aggregates, and
-  DISTINCT ON. Three mutation functions (RF1 insert, RF2 delete, RF3 update) simulate
-  sustained high-frequency DML. Three test modes: differential correctness, FULL
-  correctness, and sustained churn. Added to CI as `#[ignore]` test suite. Documented
-  results in `docs/BENCHMARK.md`.
-
-- **WM-7:** Stuck watermark hold-back mode. New `pg_trickle.watermark_holdback_timeout`
-  GUC (default 0 = disabled) detects watermarks that have not been advanced within the
-  configured timeout. When a stuck watermark is detected, downstream stream tables in
-  the affected watermark group are paused (refresh skipped) and a `pgtrickle_alert`
-  NOTIFY with `watermark_stuck` event is emitted. Auto-resumes when the watermark is
-  advanced, with a `watermark_resumed` event. Protects against silent data staleness
-  from broken ETL pipelines.
-
-- **PH-E2:** Spill-aware refresh. Two new GUCs: `pg_trickle.spill_threshold_blocks`
-  (default 0 = disabled) and `pg_trickle.spill_consecutive_limit` (default 3). After
-  each differential MERGE, queries `pg_stat_statements` for `temp_blks_written`. If the
-  value exceeds the threshold for N consecutive refreshes, the scheduler forces a FULL
-  refresh to prevent repeated expensive spilling merges. Spill metrics are exposed in
-  `pgtrickle.explain_st()` via the new `spill_info` property. Requires the
-  `pg_stat_statements` extension.
-
-- **G13-PRF:** Parser modularization and unsafe audit. Split the monolithic
-  `src/dvm/parser.rs` (~21,000 lines) into 5 sub-modules: `mod.rs` (FFI helpers,
-  macros, entry points, tests), `types.rs` (OpTree, Expr, Column, etc.),
-  `validation.rs` (volatility checking, IVM support, IMMEDIATE, monotonicity),
-  `rewrites.rs` (all SQL rewrite passes), `sublinks.rs` (SubLink extraction from
-  WHERE clauses). Added `// SAFETY:` comments to all ~750 `unsafe` blocks (~676
-  newly documented). Zero behavior change -- all 1687 unit tests pass.
-
-- **I3:** dbt Hub publication readiness. Updated `dbt-pgtrickle/dbt_project.yml`
-  version to 0.15.0 (synced with extension). Updated `dbt-pgtrickle/README.md` with
-  both git-based and dbt Hub installation methods, fixed GitHub org placeholder.
-  Added dbt integration section to root `README.md`. Created dbt Hub submission
-  guide (`docs/integrations/dbt-hub-submission.md`) documenting the hubcap PR
-  process, separate-repo approach, and version syncing workflow.
-
-### Changed
-
-- **I2:** Complete documentation review for v0.15.0 readiness. Fixed `CONFIGURATION.md`
-  GUC count (23 → 40+), added 10 missing GUC documentation sections (`cdc_trigger_mode`,
-  `tick_watermark_enabled`, `matview_polling`, `log_merge_sql`, `fuse_default_ceiling`,
-  `delta_amplification_threshold`, `algebraic_drift_reset_cycles`,
-  `agg_diff_cardinality_threshold`). Added missing `rebuild_cdc_triggers()` documentation
-  to `SQL_REFERENCE.md`. Fixed outdated version reference in `FAQ.md`.
-
-- **TRUNC-1:** Documented existing TRUNCATE capture behavior in `docs/SQL_REFERENCE.md`.
-  TRUNCATE on source tables in trigger CDC mode already triggers automatic FULL refresh
-  via the `action='T'` marker mechanism (implemented in v0.14.0 CDC triggers).
-
-- **G8.1:** Verified cross-session MERGE cache invalidation is already complete via the
-  shared-memory `CACHE_GENERATION` counter + per-ST `defining_query_hash` check. No
-  additional `catalog_version` column needed.
-
-- **EC-01:** Verified JOIN key change + simultaneous right-side DELETE correctness fix
-  is already implemented via R₀ pre-change snapshot strategy (Part 1a/1b split in delta
-  query). Updated `docs/SQL_REFERENCE.md` to replace the documented limitation with a
-  description of the fix. Unit + TPC-H regression tests already cover this scenario.
+*No changes yet.*
 
 ---
 
-## [0.15.0] — Unreleased
+## [0.15.0] — 2026-04-03
 
-0.15.0 is the **TUI Operational Capability** release. It transforms the
-terminal dashboard from a read-only monitor into a fully interactive tool
-for acting on problems — with write actions, a command palette, and deep
-enrichment across all views.
+0.15.0 brings the terminal dashboard to full operational capability, adds
+safety features that protect against runaway refreshes, and broadens the
+ecosystem with guides for popular migration and ORM frameworks. It also
+includes a major internal refactoring of the query parser and a new streaming
+benchmark suite.
 
-### TUI — Write Actions
+### Highlights
 
-The dashboard now supports in-terminal write operations without leaving the
-UI:
+- **Interactive terminal dashboard** — the `pgtrickle` TUI is no longer
+  read-only. Refresh, pause, resume, and repair stream tables directly from
+  the dashboard. A command palette (`:`) with fuzzy search makes common
+  operations fast. The poller reconnects automatically after network
+  interruptions.
 
-- **Refresh** a single stream table or all tables at once (`:refresh <name>`,
-  `:refresh all`).
-- **Pause / resume** a stream table to temporarily halt refreshes
-  (`:pause <name>`, `:resume <name>`).
-- **Reset fuse** to recover a blown or tripped circuit breaker
-  (`:fuse reset <name>`).
-- **Repair** a stream table that has fallen out of sync
-  (`:repair <name>`).
-- **Gate / ungate** a source table to hold back change propagation from the
-  Watermarks view (`g`/`u` keys).
+- **Bulk creation** — `pgtrickle.bulk_create()` creates many stream tables in
+  a single atomic transaction, ideal for CI/CD and dbt pipelines.
 
-### TUI — Command Palette
+- **Runaway-refresh protection** — two new safety nets prevent expensive
+  merges from spiralling: a pre-flight row-count estimate that downgrades to
+  FULL refresh when deltas are too large (`max_delta_estimate_rows`), and a
+  spill detector that forces FULL refresh after repeated temp-file writes
+  (`spill_threshold_blocks`).
 
-Press `:` to open a command palette with fuzzy matching and tab-completion.
-Type a command name or table name; matching suggestions appear instantly.
-Supported commands: `refresh`, `pause`, `resume`, `repair`, `fuse reset`,
-`export`, `validate`, `explain`.
+- **Stuck-watermark alerting** — if an upstream ETL pipeline stops advancing
+  its watermark, pg_trickle now pauses affected stream tables and sends a
+  `watermark_stuck` notification so the issue is surfaced immediately rather
+  than silently producing stale data.
 
-### TUI — Reconnect & Resilience
+- **Integration guides** — new documentation for Flyway, Liquibase,
+  SQLAlchemy, Django, and dbt Hub helps teams adopt pg_trickle alongside
+  their existing tooling.
 
-The poller now reconnects automatically after a connection loss using
-exponential back-off (capped at 15 s). A "reconnecting…" indicator appears
-in the header while the connection is being re-established. Actions are
-buffered in a channel (mpsc) so outstanding requests survive brief
-disconnects.
+### New Features
 
-### TUI — View Enrichment
+- **Volatile function policy** — a new `volatile_function_policy` setting
+  lets you choose whether volatile functions (like `random()` or
+  `clock_timestamp()`) should be rejected (the default), allowed with a
+  warning, or allowed silently when creating stream tables.
 
-All 14 views have been enriched with additional live data polled from the
-database in two parallel phases (20 queries via `tokio::join!`):
+- **Bulk create API** — `pgtrickle.bulk_create(definitions)` accepts a JSON
+  array of stream table definitions and creates them all in one transaction.
+  If any definition fails, the entire batch is rolled back.
 
-- **Diagnostics** — per-signal bar chart breakdown showing which signals
-  drove each refresh-mode recommendation.
-- **CDC Health** — dedicated panel with lag bytes, replication slot name,
-  LSN, and per-source alerts. Also shows dedup statistics and shared buffer
-  occupancy for change buffers.
-- **Detail** — properties panel now includes explain refresh mode (configured
-  vs effective mode with downgrade reason), source table list, rich refresh
-  history (with `+N / -N` row-delta counts and full-fallback indicator),
-  error diagnosis with classified error types and remediation hints, CDC
-  health per source, and diamond group / SCC membership.
-- **Graph** — nodes annotated with diamond group badges and SCC cycle
-  indicators; a metadata panel appears for the selected node.
-- **Delta Inspector** — Tab-switchable between the SQL plan and an Auxiliary
-  Columns tab listing `_pgt_*` tracking columns.
-- **Workers** — parallel job queue panel alongside the worker pool.
-- **Watermarks** — source gate status and alignment per watermark group.
-- **Header** — quick health row counts (total / error / stale) and scheduler
-  liveness indicator.
+- **Enhanced diagnostics** — `pgtrickle.explain_st()` now shows refresh
+  timing statistics (min/max/average duration), partition info for
+  partitioned source tables, and a dependency graph you can render with
+  Graphviz.
 
-### TUI — Cross-View Filter Persistence
+- **Join strategy override** — the `merge_join_strategy` setting lets you
+  force a specific join method (`hash_join`, `nested_loop`, or `merge_join`)
+  during delta merges, which can help when the automatic heuristic doesn't
+  suit your workload.
 
-The `/` key filter now applies across **all 10 list views**: Dashboard,
-Detail, Refresh Log, Diagnostics, CDC Health, Configuration, Health Checks,
-Workers, Fuse, and Issues. Filtering is case-insensitive and matches on
-contextually relevant fields per view.
+- **Pre-flight delta estimation** — when `max_delta_estimate_rows` is set,
+  pg_trickle counts the delta rows before merging. If the count exceeds the
+  limit, it falls back to a FULL refresh and logs a notice, preventing
+  out-of-memory conditions on unexpectedly large change sets.
 
-### TUI — Detail View Re-fetch on Navigation
+- **Spill-aware refresh** — if differential merges spill to disk repeatedly
+  (controlled by `spill_threshold_blocks` and `spill_consecutive_limit`),
+  the scheduler switches to FULL refresh automatically.
 
-Pressing `j`/`k` (or arrow keys) while on the Detail view immediately
-re-fetches enrichment data for the newly selected table so properties and
-history stay current without waiting for the next poll cycle.
+- **Stuck watermark hold-back** — the `watermark_holdback_timeout` setting
+  detects watermarks that have not advanced within a configurable window.
+  Downstream stream tables are paused and a `watermark_stuck` notification
+  is emitted until the watermark advances again.
 
-### TUI — Polish
+- **Cascade drop** — `drop_stream_table()` now accepts an optional `cascade`
+  parameter (default `true`). Setting it to `false` raises an error if
+  dependent stream tables exist, matching PostgreSQL's RESTRICT behavior.
 
-- **Toast messages** with auto-expiry confirm write actions and surface
-  errors.
+- **Nexmark benchmark suite** — a 10-query streaming benchmark (modelled on
+  an online auction system) validates correctness under sustained
+  high-frequency inserts, updates, and deletes.
+
+- **17 new end-to-end tests** — 7 tests for multi-level stream-table chains
+  (3- and 4-level cascades with mixed refresh modes) and 10 tests for
+  diamond/fan-in topologies with IMMEDIATE mode. No deadlocks were found.
+
+### Terminal Dashboard (TUI)
+
+- **Write actions** — refresh, pause, resume, repair, reset fuse, and
+  gate/ungate operations can now be performed without leaving the dashboard.
+- **Command palette** — press `:` for fuzzy-matched command entry with
+  tab-completion.
+- **Automatic reconnection** — the dashboard reconnects with exponential
+  back-off (up to 15 s) after a connection loss, with a visual indicator.
+- **Richer views** — all 14 views now show additional live data (diagnostics,
+  CDC health, refresh history with row-delta counts, error remediation hints,
+  dependency-graph annotations, worker queue status, and watermark alignment).
+- **Cross-view filtering** — the `/` search filter now persists across all
+  10 list views.
+- **Navigation re-fetch** — moving between rows in the Detail view
+  immediately fetches fresh data for the selected table.
+- **Toast messages** — write actions show confirmation and error toasts.
 - **Sort cycling** — press `s` / `S` on the Dashboard to cycle through 6
-  sort modes (name, status, errors, staleness, duration, tier).
-- **Scrollable views** — PgUp / PgDn / Home / End work in all list views.
-- **Mouse support** — scroll wheel navigation via `--mouse` flag.
-- **Theme toggle** — switch between dark and light themes with `t` or
-  `--theme dark|light`.
-- **Export** — `Ctrl+E` or `:export <name>` writes the current view to JSON.
-- **Notification bell** — `--bell` plays a terminal bell on critical
-  LISTEN/NOTIFY alerts.
-- **TLS support** — `--sslmode` and `--sslrootcert` flags, compiled under the
-  `tls` feature flag.
-- **Configurable poll interval** — `--interval <seconds>`.
+  sort modes.
+- **Mouse support** — `--mouse` enables scroll-wheel navigation.
+- **Theme toggle** — `t` or `--theme dark|light` switches colour themes.
+- **JSON export** — `Ctrl+E` or `:export` writes the current view to a file.
+- **TLS support** — `--sslmode` and `--sslrootcert` flags.
+
+### Documentation & Ecosystem
+
+- **Flyway / Liquibase guide** — migration patterns for versioned and
+  repeatable migrations, rollback blocks, and CI environments.
+- **SQLAlchemy / Django guide** — read-only model patterns, write-blocking
+  safeguards, DRF viewsets, and freshness checking.
+- **dbt Hub readiness** — the `dbt-pgtrickle` package is version-synced and
+  ready for dbt Hub submission.
+- **Kubernetes / CNPG** — updated probe configuration and a new deployment
+  section in the Getting Started guide.
+- **Full documentation review** — configuration reference expanded from 23
+  to 40+ settings, missing SQL reference entries filled in, outdated FAQ
+  answers corrected.
+
+### Internal Improvements
+
+- **Parser modularisation** — the 21 000-line query parser has been split
+  into 5 focused sub-modules (`types`, `validation`, `rewrites`, `sublinks`,
+  and the main entry point). No behavior change — all 1 687 unit tests pass.
+- **Unsafe audit** — every `unsafe` block in the codebase (~750 total) now
+  has a `// SAFETY:` comment explaining why it is sound.
+- **Shared-memory cache RFC** — an RFC for a DSM-based MERGE template cache
+  has been written, informing the v0.16.0 implementation plan.
+- **TRUNCATE handling verified** — TRUNCATE on source tables in trigger CDC
+  mode already triggers a FULL refresh; this is now documented.
+- **JOIN key-change fix verified** — the v0.14.0 correctness fix for
+  simultaneous JOIN key updates and DELETEs has been verified working and
+  the former known-limitation note replaced with a description of the fix.
 
 ### Bug Fixes
 
-- Fixed a panic when deserializing `pgtrickle.quick_health` — the view
-  returns `bigint` columns but the `QuickHealth` struct declared them as
-  `i32`. Changed to `i64`.
-- Fixed "Error: db error" toast appearing on tab 2 (Detail). Background
-  enrichment fetches (`FetchExplainMode`, `FetchSources`,
-  `FetchRefreshHistory`, `FetchDiagnoseErrors`, `FetchAuxiliaryColumns`) now
-  degrade silently on failure, matching the same graceful-degradation
-  pattern used for phase-2 poll queries. Only user-triggered commands still
-  show error toasts.
+- Fixed a panic in the TUI when deserializing health-check data that
+  returned 64-bit integers where 32-bit was expected.
+- Fixed spurious "Error: db error" toasts in the TUI Detail view —
+  background queries now degrade silently instead of surfacing transient
+  errors.
+- Fixed incorrect integer type annotations in two E2E tests for IMMEDIATE
+  mode diamond topologies.
 
 ---
 
