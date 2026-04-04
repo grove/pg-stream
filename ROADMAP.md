@@ -3299,8 +3299,10 @@ forward-compatibility before PG 19 reaches beta.
 | C2-BUG | **Implement missing `resume_stream_table()`.** Function is referenced in error messages (`SUSPENDED` status) but does not exist. P0 bug. | 1–2h | [PLAN_FEATURE_CLEANUP.md](plans/PLAN_FEATURE_CLEANUP.md) |
 | SAST-SEMGREP | **Elevate Semgrep to blocking in CI.** CodeQL and cargo-deny already block; Semgrep is advisory-only. Flip to blocking for consistent safety gating. | 1–2h | [PLAN_SAST.md](plans/testing/PLAN_SAST.md) |
 | ERR-REF | **Error reference documentation.** Document all 19 `PgTrickleError` variants with meaning, common causes, and suggested fixes. Publish as `docs/ERRORS.md`. Cross-link from FAQ. Errors currently describe the problem but don't prescribe the fix — e.g. `"unsupported operator for DIFFERENTIAL mode: TABLESAMPLE"` should suggest `refresh_mode => 'FULL'`. | 4–6h | [src/error.rs](src/error.rs) |
+| GUC-DEFAULTS | **Review dangerous GUC defaults.** `planner_aggressive = true` auto-disables nestloop and raises work_mem for large deltas — can cause unexpected spills. `cleanup_use_truncate = true` takes AccessExclusiveLock, problematic with PgBouncer. Evaluate safer defaults and document trade-offs in CONFIGURATION.md. | 2–4h | [src/config.rs](src/config.rs) |
+| BUF-LIMIT | **Change buffer hard growth limit.** If refresh fails repeatedly, change buffers grow indefinitely until manual intervention. Add `pg_trickle.max_buffer_rows` GUC (default: 1M) that triggers FULL refresh + buffer truncation when exceeded, preventing unbounded disk usage. | 4–8h | [src/cdc.rs](src/cdc.rs) |
 
-> **Quick wins subtotal: ~6–10 hours**
+> **Quick wins subtotal: ~12–22 hours**
 
 > **v0.16.0 total: ~1–2 weeks (MERGE alts) + ~4–6 weeks (aggregate fast-path) + ~1–2 weeks (append-only) + ~2–3 weeks (predicate pushdown) + ~2–3 weeks (template cache) + ~18–36 hours (PG 19 compat) + ~2–3 weeks (buffer compaction) + ~3–6 weeks (test coverage) + ~1–2 weeks (bench CI) + ~2–3 days (auto-indexing) + ~2–4 hours (quick wins)**
 
@@ -3323,6 +3325,8 @@ forward-compatibility before PG 19 reaches beta.
 - [ ] C2-BUG: `resume_stream_table()` implemented and callable from `SUSPENDED` state
 - [ ] SAST-SEMGREP: Semgrep elevated to blocking in CI pipeline
 - [ ] ERR-REF: Error reference doc published with all 19 PgTrickleError variants, common causes, and suggested fixes
+- [ ] GUC-DEFAULTS: `planner_aggressive` and `cleanup_use_truncate` defaults reviewed; safer defaults applied or trade-offs documented
+- [ ] BUF-LIMIT: `max_buffer_rows` GUC prevents unbounded change buffer growth; triggers FULL + truncation when exceeded
 - [ ] Extension upgrade path tested (`0.15.0 → 0.16.0`)
 
 ---
@@ -3740,7 +3744,7 @@ to keep the pre-1.0 milestones focused on performance and correctness.
 | v0.13.0 — Scalability Foundations, Partitioning Enhancements, MERGE Profiling & Multi-Tenant Scheduling | ~15–23 wk | — | |
 | v0.14.0 — Tiered Scheduling, UNLOGGED Buffers & Diagnostics | ~2–6 wk + ~1 wk patterns + ~2–4d stability + ~3.5–7d diagnostics + ~1–2d export + ~4–6d TUI + ~0.5d docs | — | |
 | v0.15.0 — External Test Suites & Integration | ~40–70h + ~2–3d bulk create + ~3–5d planner hints + ~2–3d cache spike + ~3–4wk parser + ~1–2wk watermark + ~2–4wk delta cost/spill | — | ✅ Released |
-| v0.16.0 — Performance & Refresh Optimization | ~1–2wk MERGE alts + ~4–6wk aggregate fast-path + ~1–2wk append-only + ~2–3wk predicate pushdown + ~2–3wk template cache + ~18–36h PG19 + ~2–3wk buffer compaction + ~3–6wk test coverage + ~1–2wk bench CI + ~2–3d auto-indexing + ~6–10h quick wins | — | |
+| v0.16.0 — Performance & Refresh Optimization | ~1–2wk MERGE alts + ~4–6wk aggregate fast-path + ~1–2wk append-only + ~2–3wk predicate pushdown + ~2–3wk template cache + ~18–36h PG19 + ~2–3wk buffer compaction + ~3–6wk test coverage + ~1–2wk bench CI + ~2–3d auto-indexing + ~12–22h quick wins | — | |
 | v0.17.0 — Query Intelligence & Stability | ~2–3wk cost-based strategy + ~3–4wk columnar tracking + ~32–48h TIVM Phase 4 + ~1–2d ROWS FROM + ~2–3wk SQLancer + ~2–3wk incremental DAG + ~4–8h unsafe reduction + ~1–2wk api.rs mod + ~2–3d migration guide + ~3–5d runbook + ~2–3d playground + ~2–3d doc polish | — | |
 | v1.0.0 — Stable release | ~18–30h | — | |
 | Post-1.0 (PG compat + Native DDL) | ~38–56h (PG 16–18) + ~13–21d (Native DDL) | — | |
