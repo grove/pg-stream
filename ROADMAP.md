@@ -3298,8 +3298,9 @@ forward-compatibility before PG 19 reaches beta.
 |------|-------------|--------|-----|
 | C2-BUG | **Implement missing `resume_stream_table()`.** Function is referenced in error messages (`SUSPENDED` status) but does not exist. P0 bug. | 1–2h | [PLAN_FEATURE_CLEANUP.md](plans/PLAN_FEATURE_CLEANUP.md) |
 | SAST-SEMGREP | **Elevate Semgrep to blocking in CI.** CodeQL and cargo-deny already block; Semgrep is advisory-only. Flip to blocking for consistent safety gating. | 1–2h | [PLAN_SAST.md](plans/testing/PLAN_SAST.md) |
+| ERR-REF | **Error reference documentation.** Document all 19 `PgTrickleError` variants with meaning, common causes, and suggested fixes. Publish as `docs/ERRORS.md`. Cross-link from FAQ. Errors currently describe the problem but don't prescribe the fix — e.g. `"unsupported operator for DIFFERENTIAL mode: TABLESAMPLE"` should suggest `refresh_mode => 'FULL'`. | 4–6h | [src/error.rs](src/error.rs) |
 
-> **Quick wins subtotal: ~2–4 hours**
+> **Quick wins subtotal: ~6–10 hours**
 
 > **v0.16.0 total: ~1–2 weeks (MERGE alts) + ~4–6 weeks (aggregate fast-path) + ~1–2 weeks (append-only) + ~2–3 weeks (predicate pushdown) + ~2–3 weeks (template cache) + ~18–36 hours (PG 19 compat) + ~2–3 weeks (buffer compaction) + ~3–6 weeks (test coverage) + ~1–2 weeks (bench CI) + ~2–3 days (auto-indexing) + ~2–4 hours (quick wins)**
 
@@ -3321,6 +3322,7 @@ forward-compatibility before PG 19 reaches beta.
 - [ ] AUTO-IDX: Stream tables auto-create indexes on GROUP BY / DISTINCT columns; `__pgt_row_id` covering index for ≤ 8-column tables; `auto_index` GUC respected; existing tests pass
 - [ ] C2-BUG: `resume_stream_table()` implemented and callable from `SUSPENDED` state
 - [ ] SAST-SEMGREP: Semgrep elevated to blocking in CI pipeline
+- [ ] ERR-REF: Error reference doc published with all 19 PgTrickleError variants, common causes, and suggested fixes
 - [ ] Extension upgrade path tested (`0.15.0 → 0.16.0`)
 
 ---
@@ -3513,7 +3515,27 @@ provides a 60-second tryout experience.
 
 > **PLAYGROUND subtotal: ~2–3 days**
 
-> **v0.17.0 total: ~2–3 weeks (cost-based strategy) + ~3–4 weeks (columnar tracking) + ~32–48 hours (TIVM Phase 4) + ~1–2 days (ROWS FROM) + ~2–3 weeks (SQLancer) + ~2–3 weeks (incremental DAG) + ~4–8 hours (unsafe reduction) + ~1–2 weeks (api.rs modularization) + ~2–3 days (pg_ivm migration) + ~3–5 days (failure runbook) + ~2–3 days (Docker playground)**
+### Documentation Polish (DOC-POLISH)
+
+> **In plain terms:** The existing documentation is comprehensive and
+> technically excellent, but it's optimized for users already familiar with
+> IVM and PostgreSQL internals. These items restructure the docs for a
+> better "first hour" experience — simpler getting-started examples, a
+> refresh mode decision guide, a condensed new-user FAQ, and a setup
+> verification checklist. The goal is to reduce cognitive overload for new
+> users without losing the depth that experienced users need.
+
+| Item | Description | Effort | Ref |
+|------|-------------|--------|-----|
+| DOC-HELLO | **Simplified "Hello Stream Table" in GETTING_STARTED.** Add a Chapter 0 with a single-table, single-aggregate stream table (e.g. `SELECT department, count(*) FROM employees GROUP BY department`). Create it, insert a row, verify the refresh. Build confidence before the multi-table org-chart example. | 2–4h | [docs/GETTING_STARTED.md](docs/GETTING_STARTED.md) |
+| DOC-DECIDE | **Refresh mode decision guide.** Flowchart: "Need transactional consistency? → IMMEDIATE. Volatile functions? → FULL. Otherwise → AUTO (DIFFERENTIAL with FULL fallback)." Include when-to-use guidance for each mode with concrete examples. Publish as a section in GETTING_STARTED or as a standalone tutorial. | 2–4h | [docs/tutorials/tuning-refresh-mode.md](docs/tutorials/tuning-refresh-mode.md) |
+| DOC-FAQ-NEW | **New User FAQ (top 15 questions).** Extract the 15 most common new-user questions from the 3,000-line FAQ into a prominent "New User FAQ" section at the top. Keyword-rich headings for searchability. Link to deep FAQ for details. | 2–3h | [docs/FAQ.md](docs/FAQ.md) |
+| DOC-VERIFY | **Post-install verification checklist.** SQL script that verifies: extension loaded, shared_preload_libraries configured, GUCs set, CDC triggers installable, first stream table creates and refreshes successfully. Runnable as `psql -f verify_install.sql`. | 2–4h | [docs/GETTING_STARTED.md](docs/GETTING_STARTED.md) |
+| DOC-STUBS | **Fill or remove research stubs.** `PG_IVM_COMPARISON.md` (60 bytes) and `CUSTOM_SQL_SYNTAX.md` (57 bytes) are empty stubs. Either flesh them out (PG_IVM_COMPARISON can draw from the existing comparison data) or remove from SUMMARY.md. | 2–4h | [docs/research/](docs/research/) |
+
+> **DOC-POLISH subtotal: ~2–3 days**
+
+> **v0.17.0 total: ~2–3 weeks (cost-based strategy) + ~3–4 weeks (columnar tracking) + ~32–48 hours (TIVM Phase 4) + ~1–2 days (ROWS FROM) + ~2–3 weeks (SQLancer) + ~2–3 weeks (incremental DAG) + ~4–8 hours (unsafe reduction) + ~1–2 weeks (api.rs modularization) + ~2–3 days (pg_ivm migration) + ~3–5 days (failure runbook) + ~2–3 days (Docker playground) + ~2–3 days (doc polish)**
 
 **Exit criteria:**
 - [ ] B-4: Cost-based strategy selector trained on per-ST history; cold-start fallback to fixed threshold; benchmarked on mixed workloads (scan, join, aggregate); `refresh_strategy` GUC respected
@@ -3529,6 +3551,11 @@ provides a 60-second tryout experience.
 - [ ] MIG-IVM: pg_ivm migration guide published with worked examples; covers create/refresh/alter/drop equivalences
 - [ ] RUNBOOK: Failure mode runbook covers ≥10 failure scenarios with symptoms, diagnosis, and resolution; includes health_check() interpretation
 - [ ] PLAYGROUND: `docker compose up` starts PG + pg_trickle + sample data in < 60 seconds; README walkthrough tested end-to-end
+- [ ] DOC-HELLO: Simplified "Hello Stream Table" added as Chapter 0 in GETTING_STARTED; single-table example builds confidence before complex org-chart
+- [ ] DOC-DECIDE: Refresh mode decision guide published with flowchart and concrete examples for IMMEDIATE/DIFFERENTIAL/FULL/AUTO
+- [ ] DOC-FAQ-NEW: New User FAQ section at top of FAQ.md with 15 keyword-rich entries
+- [ ] DOC-VERIFY: Post-install verification script (`verify_install.sql`) tests extension loading, GUC configuration, trigger creation, and first refresh
+- [ ] DOC-STUBS: Research stubs either fleshed out or removed from SUMMARY.md
 - [ ] Extension upgrade path tested (`0.16.0 → 0.17.0`)
 
 ---
@@ -3713,8 +3740,8 @@ to keep the pre-1.0 milestones focused on performance and correctness.
 | v0.13.0 — Scalability Foundations, Partitioning Enhancements, MERGE Profiling & Multi-Tenant Scheduling | ~15–23 wk | — | |
 | v0.14.0 — Tiered Scheduling, UNLOGGED Buffers & Diagnostics | ~2–6 wk + ~1 wk patterns + ~2–4d stability + ~3.5–7d diagnostics + ~1–2d export + ~4–6d TUI + ~0.5d docs | — | |
 | v0.15.0 — External Test Suites & Integration | ~40–70h + ~2–3d bulk create + ~3–5d planner hints + ~2–3d cache spike + ~3–4wk parser + ~1–2wk watermark + ~2–4wk delta cost/spill | — | ✅ Released |
-| v0.16.0 — Performance & Refresh Optimization | ~1–2wk MERGE alts + ~4–6wk aggregate fast-path + ~1–2wk append-only + ~2–3wk predicate pushdown + ~2–3wk template cache + ~18–36h PG19 + ~2–3wk buffer compaction + ~3–6wk test coverage + ~1–2wk bench CI + ~2–3d auto-indexing + ~2–4h quick wins | — | |
-| v0.17.0 — Query Intelligence & Stability | ~2–3wk cost-based strategy + ~3–4wk columnar tracking + ~32–48h TIVM Phase 4 + ~1–2d ROWS FROM + ~2–3wk SQLancer + ~2–3wk incremental DAG + ~4–8h unsafe reduction + ~1–2wk api.rs mod + ~2–3d migration guide + ~3–5d runbook + ~2–3d playground | — | |
+| v0.16.0 — Performance & Refresh Optimization | ~1–2wk MERGE alts + ~4–6wk aggregate fast-path + ~1–2wk append-only + ~2–3wk predicate pushdown + ~2–3wk template cache + ~18–36h PG19 + ~2–3wk buffer compaction + ~3–6wk test coverage + ~1–2wk bench CI + ~2–3d auto-indexing + ~6–10h quick wins | — | |
+| v0.17.0 — Query Intelligence & Stability | ~2–3wk cost-based strategy + ~3–4wk columnar tracking + ~32–48h TIVM Phase 4 + ~1–2d ROWS FROM + ~2–3wk SQLancer + ~2–3wk incremental DAG + ~4–8h unsafe reduction + ~1–2wk api.rs mod + ~2–3d migration guide + ~3–5d runbook + ~2–3d playground + ~2–3d doc polish | — | |
 | v1.0.0 — Stable release | ~18–30h | — | |
 | Post-1.0 (PG compat + Native DDL) | ~38–56h (PG 16–18) + ~13–21d (Native DDL) | — | |
 | Post-1.0 (ecosystem) | 88–134h | — | |
