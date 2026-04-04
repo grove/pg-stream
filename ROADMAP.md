@@ -3122,8 +3122,9 @@ Validate correctness against independent query corpora beyond TPC-H.
 
 **Goal:** Attack the MERGE bottleneck from multiple angles — alternative merge
 strategies, algebraic aggregate shortcuts, append-only bypass, delta filtering,
-shared-memory template caching — and add PostgreSQL 19 forward-compatibility
-before PG 19 reaches beta.
+change buffer compaction, shared-memory template caching — close critical test
+coverage gaps to validate these new paths, and add PostgreSQL 19
+forward-compatibility before PG 19 reaches beta.
 
 ### MERGE Alternatives & Planner Control (Phase D)
 
@@ -3215,7 +3216,59 @@ before PG 19 reaches beta.
 
 > **A3 subtotal: ~18–36 hours (gated on PG 19 beta availability; preliminary work can begin against PG 19 dev snapshots)**
 
-> **v0.16.0 total: ~1–2 weeks (MERGE alts) + ~4–6 weeks (aggregate fast-path) + ~1–2 weeks (append-only) + ~2–3 weeks (predicate pushdown) + ~2–3 weeks (template cache) + ~18–36 hours (PG 19 compat)**
+### Change Buffer Compaction (C-4)
+
+> **In plain terms:** A high-churn source table can accumulate thousands of
+> changes to the same row between refresh cycles — an INSERT followed by 10
+> UPDATEs followed by a DELETE is really just "nothing happened." Compaction
+> merges multiple changes to the same row ID into a single net change before
+> the delta query runs, reducing change buffer size by 50–90% for high-churn
+> tables. This directly reduces work for every downstream path (MERGE,
+> DELETE+INSERT, append-only INSERT, predicate pushdown).
+
+| Item | Description | Effort | Ref |
+|------|-------------|--------|-----|
+| C-4 | **Change buffer compaction.** Before delta-query execution, merge multiple changes to the same `__pgt_row_id` into a single net change: INSERT+DELETE cancel out; consecutive UPDATEs collapse to one. Trigger on buffer exceeding `pg_trickle.compact_threshold` rows (default: 100K). Expected impact: **50–90% reduction in change buffer size** for high-churn tables. | 2–3 wk | [plans/performance/PLAN_NEW_STUFF.md §C-4](plans/performance/PLAN_NEW_STUFF.md) |
+
+> **C-4 subtotal: ~2–3 weeks**
+
+### Test Coverage Hardening (TG2)
+
+> **In plain terms:** The performance optimizations in this release change
+> core refresh paths (MERGE alternatives, aggregate fast-path, append-only
+> bypass, predicate pushdown). Before and alongside these changes, critical
+> test coverage gaps need closing — particularly around operators and
+> scenarios where bugs could hide silently. These gaps were identified in
+> the TESTING_GAPS_2 audit.
+
+#### High-Priority Gaps
+
+| Item | Description | Effort | Ref |
+|------|-------------|--------|-----|
+| TG2-WIN | **Window function DVM execution tests.** ~5 unit tests exist but 0 DVM execution tests. Add execution-level tests for ROW_NUMBER, RANK, DENSE_RANK, LAG/LEAD delta behavior across INSERT/UPDATE/DELETE cycles. | 3–5d | [TESTING_GAPS_2.md](plans/testing/TESTING_GAPS_2.md) |
+| TG2-JOIN | **Join multi-cycle UPDATE/DELETE correctness.** E2E join tests are INSERT-only; no UPDATE/DELETE differential cycles. Add systematic multi-cycle coverage for INNER/LEFT/FULL JOIN with UPDATE and DELETE propagation. Risk: silent data corruption in production workloads. | 3–5d | [TESTING_GAPS_2.md](plans/testing/TESTING_GAPS_2.md) |
+| TG2-EQUIV | **Differential ≡ Full equivalence validation.** Only CTEs validated; joins and aggregates lack equivalence proof. Add a test harness that runs every defining query in both DIFFERENTIAL and FULL mode and asserts identical results. Critical for trusting the new optimization paths. | 3–5d | [TESTING_GAPS_2.md](plans/testing/TESTING_GAPS_2.md) |
+
+#### Medium-Priority Gaps
+
+| Item | Description | Effort | Ref |
+|------|-------------|--------|-----|
+| TG2-MERGE | **refresh.rs MERGE template unit tests.** Only helpers/enums tested; the core MERGE SQL template generation is untested at the unit level. | 2–3d | [TESTING_GAPS_2.md](plans/testing/TESTING_GAPS_2.md) |
+| TG2-CANCEL | **Timeout/cancellation during refresh.** Zero tests for `statement_timeout`, `pg_cancel_backend()` during active refresh. Risk: silent failures or resource leaks under production load. | 1–2d | [TESTING_GAPS_2.md](plans/testing/TESTING_GAPS_2.md) |
+| TG2-SCHEMA | **Source table schema evolution.** Partial DDL tests exist; type changes and column renames are thin. Risk: silent data corruption on schema change. | 2–3d | [TESTING_GAPS_2.md](plans/testing/TESTING_GAPS_2.md) |
+
+> **TG2 subtotal: ~2–4 weeks (high-priority) + ~1–2 weeks (medium-priority)**
+
+### Quick Wins
+
+| Item | Description | Effort | Ref |
+|------|-------------|--------|-----|
+| C2-BUG | **Implement missing `resume_stream_table()`.** Function is referenced in error messages (`SUSPENDED` status) but does not exist. P0 bug. | 1–2h | [PLAN_FEATURE_CLEANUP.md](plans/PLAN_FEATURE_CLEANUP.md) |
+| SAST-SEMGREP | **Elevate Semgrep to blocking in CI.** CodeQL and cargo-deny already block; Semgrep is advisory-only. Flip to blocking for consistent safety gating. | 1–2h | [PLAN_SAST.md](plans/testing/PLAN_SAST.md) |
+
+> **Quick wins subtotal: ~2–4 hours**
+
+> **v0.16.0 total: ~1–2 weeks (MERGE alts) + ~4–6 weeks (aggregate fast-path) + ~1–2 weeks (append-only) + ~2–3 weeks (predicate pushdown) + ~2–3 weeks (template cache) + ~18–36 hours (PG 19 compat) + ~2–3 weeks (buffer compaction) + ~3–6 weeks (test coverage) + ~2–4 hours (quick wins)**
 
 **Exit criteria:**
 - [ ] PH-D1: DELETE+INSERT strategy benchmarked and gated behind `merge_strategy` GUC; correctness verified for INSERT/UPDATE/DELETE deltas
@@ -3224,17 +3277,27 @@ before PG 19 reaches beta.
 - [ ] B-2: Delta predicate pushdown implemented for single-source Filter nodes; DELETE correctness verified (OR old_col predicate); selective-query benchmarks show delta row reduction
 - [ ] G14-SHC: Shared-memory template cache eliminates cold-start; DSM + lwlock implementation validated under PgBouncer transaction mode
 - [ ] A3: PG 19 builds and passes full E2E suite (conditional on PG 19 beta availability; if beta not yet available, pgrx bump + API audit complete with CI gated on snapshot)
+- [ ] C-4: Change buffer compaction reduces buffer size by ≥50% for high-churn benchmarks; `compact_threshold` GUC respected; no correctness regressions
+- [ ] TG2-WIN: Window function DVM execution tests cover ROW_NUMBER, RANK, DENSE_RANK, LAG/LEAD across INSERT/UPDATE/DELETE
+- [ ] TG2-JOIN: Join multi-cycle tests cover INNER/LEFT/FULL JOIN with UPDATE and DELETE propagation; no silent data loss
+- [ ] TG2-EQUIV: Differential ≡ Full equivalence validated for joins, aggregates, and window functions
+- [ ] TG2-MERGE: refresh.rs MERGE template generation has unit test coverage
+- [ ] TG2-CANCEL: Timeout and cancellation during refresh tested; no resource leaks
+- [ ] TG2-SCHEMA: Source table type changes and column renames tested end-to-end
+- [ ] C2-BUG: `resume_stream_table()` implemented and callable from `SUSPENDED` state
+- [ ] SAST-SEMGREP: Semgrep elevated to blocking in CI pipeline
 - [ ] Extension upgrade path tested (`0.15.0 → 0.16.0`)
 
 ---
 
 ## v0.17.0 — Query Intelligence & Stability
 
-**Goal:** Make the refresh engine smarter — cost-based strategy selection
-replaces the fixed DIFF/FULL threshold, columnar change tracking skips
-irrelevant columns in wide-table UPDATEs, and the remaining Transactional IVM
-Phase 4 work brings ENR-based transition tables and C-level triggers for
-lower-overhead immediate mode.
+**Goal:** Make the refresh engine smarter, prove correctness through automated
+fuzzing, and harden for scale. Cost-based strategy selection replaces the fixed
+DIFF/FULL threshold, columnar change tracking skips irrelevant columns in
+wide-table UPDATEs, SQLancer integration provides automated semantic proving,
+incremental DAG rebuild supports 1000+ stream table deployments, and unsafe
+block reduction continues the safety hardening toward 1.0.
 
 ### Cost-Based Refresh Strategy Selection (B-4)
 
@@ -3298,7 +3361,61 @@ lower-overhead immediate mode.
 
 > **A8 subtotal: ~1–2 days**
 
-> **v0.17.0 total: ~2–3 weeks (cost-based strategy) + ~3–4 weeks (columnar tracking) + ~32–48 hours (TIVM Phase 4) + ~1–2 days (ROWS FROM)**
+### SQLancer Fuzzing Integration (SQLANCER)
+
+> **In plain terms:** pg_trickle's tests were written by the pg_trickle team,
+> which means they share the same assumptions as the code. SQLancer is an
+> automated database testing tool that generates random SQL queries and checks
+> whether the results are correct — it has found hundreds of bugs in
+> PostgreSQL, SQLite, CockroachDB, and TiDB. Integrating SQLancer gives
+> pg_trickle a crash-test oracle (does the parser panic on fuzzed input?),
+> an equivalence oracle (does DIFFERENTIAL mode produce the same answer as
+> FULL?), and stateful DML fuzzing (do random INSERT/UPDATE/DELETE sequences
+> corrupt stream table data?). This is the single highest-value testing
+> investment for finding unknown correctness bugs.
+
+| Item | Description | Effort | Ref |
+|------|-------------|--------|-----|
+| SQLANCER-1 | **Fuzzing environment.** SQLancer in Docker, configured to target pg_trickle stream tables. Seed corpus from TPC-H + E2E defining queries. | 2–3d | [PLAN_SQLANCER.md](plans/testing/PLAN_SQLANCER.md) §1 |
+| SQLANCER-2 | **Crash-test oracle.** Feed randomized SQL to the parser and DVM pipeline. Zero-panic guarantee: any input that crashes the extension is a bug. | 3–5d | [PLAN_SQLANCER.md](plans/testing/PLAN_SQLANCER.md) §2 |
+| SQLANCER-3 | **Equivalence oracle.** For each fuzzed defining query, create a stream table in both DIFFERENTIAL and FULL mode, apply random DML, and assert identical results. Catches semantic divergence between the two refresh paths. | 3–5d | [PLAN_SQLANCER.md](plans/testing/PLAN_SQLANCER.md) §3 |
+| SQLANCER-4 | **Stateful DML fuzzing.** Random sequences of INSERT/UPDATE/DELETE on source tables, with periodic correctness checks against a plain materialized view baseline. Catches state-dependent bugs that only manifest after specific mutation histories. | 3–5d | [PLAN_SQLANCER.md](plans/testing/PLAN_SQLANCER.md) §4 |
+
+> **SQLANCER subtotal: ~2–3 weeks**
+
+### Incremental DAG Rebuild (C-2)
+
+> **In plain terms:** When any DDL change occurs (e.g. `ALTER STREAM TABLE`,
+> `DROP STREAM TABLE`), the entire dependency graph is rebuilt from scratch
+> by querying `pgt_dependencies`. For 1000+ stream tables this becomes
+> expensive — O(V+E) SPI queries. Incremental DAG maintenance records which
+> specific stream table was affected and only re-sorts the affected subgraph,
+> reducing the scheduler latency spike from ~50ms to ~1ms at scale.
+
+| Item | Description | Effort | Ref |
+|------|-------------|--------|-----|
+| C-2-1 | **Delta-based rebuild.** Record affected `pgt_id` in a bounded ring buffer in shared memory alongside `DAG_REBUILD_SIGNAL`. On overflow, fall back to full rebuild. | 1 wk | [plans/performance/PLAN_NEW_STUFF.md §C-2](plans/performance/PLAN_NEW_STUFF.md) |
+| C-2-2 | **Incremental topological sort.** Add/remove only affected edges and vertices; re-run topological sort on the affected subgraph only. Cache the sorted schedule in shared memory. | 1–2 wk | [plans/performance/PLAN_NEW_STUFF.md §C-2](plans/performance/PLAN_NEW_STUFF.md) |
+
+> **C-2 subtotal: ~2–3 weeks**
+
+### Unsafe Block Reduction — Phase 6 (UNSAFE-R1/R2)
+
+> **In plain terms:** pg_trickle achieved a 51% reduction in `unsafe` blocks
+> (from ~1,300 to 641) in earlier releases. The remaining blocks are
+> concentrated in well-documented field-accessor macros and standalone
+> `is_a` type checks. Converting these to safe wrappers removes another
+> 150–250 unsafe blocks with minimal risk — a meaningful safety improvement
+> before 1.0.
+
+| Item | Description | Effort | Ref |
+|------|-------------|--------|-----|
+| UNSAFE-R1 | **Safe field-accessor macros.** Replace `unsafe { (*node).field }` patterns with safe accessor functions. Estimated reduction: ~100–150 unsafe blocks. | 2–4h | [PLAN_REDUCED_UNSAFE.md §R1](plans/safety/PLAN_REDUCED_UNSAFE.md) |
+| UNSAFE-R2 | **Safe `is_a` checks.** Convert standalone `unsafe { is_a(node, T_Foo) }` calls to safe wrapper functions. Estimated reduction: ~50–99 unsafe blocks. | 2–4h | [PLAN_REDUCED_UNSAFE.md §R2](plans/safety/PLAN_REDUCED_UNSAFE.md) |
+
+> **UNSAFE-R1/R2 subtotal: ~4–8 hours**
+
+> **v0.17.0 total: ~2–3 weeks (cost-based strategy) + ~3–4 weeks (columnar tracking) + ~32–48 hours (TIVM Phase 4) + ~1–2 days (ROWS FROM) + ~2–3 weeks (SQLancer) + ~2–3 weeks (incremental DAG) + ~4–8 hours (unsafe reduction)**
 
 **Exit criteria:**
 - [ ] B-4: Cost-based strategy selector trained on per-ST history; cold-start fallback to fixed threshold; benchmarked on mixed workloads (scan, join, aggregate); `refresh_strategy` GUC respected
@@ -3307,6 +3424,9 @@ lower-overhead immediate mode.
 - [ ] A2-CTR: C-level triggers registered; per-statement overhead < 0.1ms; existing IMMEDIATE mode tests pass
 - [ ] A2-PS: Prepared statement reuse across refresh cycles; parse/plan overhead eliminated on steady-state workloads
 - [ ] A8: `ROWS FROM()` with multiple SRFs accepted in defining queries; E2E tests cover INSERT/UPDATE/DELETE propagation
+- [ ] SQLANCER: Fuzzing environment operational; crash-test oracle finds zero panics on seed corpus; equivalence oracle validates DIFFERENTIAL ≡ FULL for fuzzed queries; stateful DML fuzzing runs clean for 10K+ mutation sequences
+- [ ] C-2: Incremental DAG rebuild reduces DDL-triggered latency spike to < 5ms at 100+ STs; ring buffer overflow falls back to full rebuild; no correctness regressions
+- [ ] UNSAFE-R1/R2: Unsafe block count reduced by ≥150; no behavioral changes; all existing tests pass
 - [ ] Extension upgrade path tested (`0.16.0 → 0.17.0`)
 
 ---
@@ -3487,8 +3607,8 @@ to keep the pre-1.0 milestones focused on performance and correctness.
 | v0.13.0 — Scalability Foundations, Partitioning Enhancements, MERGE Profiling & Multi-Tenant Scheduling | ~15–23 wk | — | |
 | v0.14.0 — Tiered Scheduling, UNLOGGED Buffers & Diagnostics | ~2–6 wk + ~1 wk patterns + ~2–4d stability + ~3.5–7d diagnostics + ~1–2d export + ~4–6d TUI + ~0.5d docs | — | |
 | v0.15.0 — External Test Suites & Integration | ~40–70h + ~2–3d bulk create + ~3–5d planner hints + ~2–3d cache spike + ~3–4wk parser + ~1–2wk watermark + ~2–4wk delta cost/spill | — | ✅ Released |
-| v0.16.0 — Performance & Refresh Optimization | ~1–2wk MERGE alts + ~4–6wk aggregate fast-path + ~1–2wk append-only + ~2–3wk predicate pushdown + ~2–3wk template cache + ~18–36h PG19 | — | |
-| v0.17.0 — Query Intelligence & Stability | ~2–3wk cost-based strategy + ~3–4wk columnar tracking + ~32–48h TIVM Phase 4 + ~1–2d ROWS FROM | — | |
+| v0.16.0 — Performance & Refresh Optimization | ~1–2wk MERGE alts + ~4–6wk aggregate fast-path + ~1–2wk append-only + ~2–3wk predicate pushdown + ~2–3wk template cache + ~18–36h PG19 + ~2–3wk buffer compaction + ~3–6wk test coverage + ~2–4h quick wins | — | |
+| v0.17.0 — Query Intelligence & Stability | ~2–3wk cost-based strategy + ~3–4wk columnar tracking + ~32–48h TIVM Phase 4 + ~1–2d ROWS FROM + ~2–3wk SQLancer + ~2–3wk incremental DAG + ~4–8h unsafe reduction | — | |
 | v1.0.0 — Stable release | 18–27h | — | |
 | Post-1.0 (PG compat + Native DDL) | ~38–56h (PG 16–18) + ~13–21d (Native DDL) | — | |
 | Post-1.0 (ecosystem) | 88–134h | — | |
