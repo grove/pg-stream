@@ -15,6 +15,11 @@
 //! - Step 4d: DELETE an employee adjusts aggregate correctly
 //! - Step 7: Drop in reverse dependency order — storage tables, triggers, and
 //!   catalog entries are all removed
+//! - Regression: function-call GROUP BY (split_part) against a base-table source
+//!   exercises the differential DVM path; this was the path that triggered the
+//!   "column d.split_part(...) does not exist" bug (the department_report query
+//!   uses a stream-table source so manual refresh always falls back to FULL,
+//!   masking the bug in the standard step-4a test)
 //!
 //! Prerequisites: `./tests/build_e2e_image.sh`
 
@@ -560,4 +565,106 @@ async fn test_getting_started_step7_drop_in_order() {
     // Base tables themselves still exist
     assert!(db.table_exists("public", "departments").await);
     assert!(db.table_exists("public", "employees").await);
+}
+
+// ── Regression: function-call GROUP BY against a base-table source ───────────
+
+/// Regression test for the bug where GROUP BY with a function-call expression
+/// (e.g., `GROUP BY 1` when position 1 is `split_part(...)`) caused the
+/// delta CTE to omit an explicit alias, producing:
+///
+///   column d.split_part(full_path, ' > ', 2) does not exist
+///
+/// This was only triggered by the **background scheduler** for the
+/// `department_report` query (which sources `department_stats`, a stream
+/// table), because the manual refresh path for ST-on-ST dependencies always
+/// falls back to FULL, bypassing the differential DVM engine.
+///
+/// This test exercises the differential path directly against a **base table**
+/// source so `refresh_st()` uses the DVM engine and the broken delta SQL
+/// (if the bug re-regresses) causes an immediate test failure.
+#[tokio::test]
+async fn test_getting_started_func_call_group_by_differential_against_base_table() {
+    let db = E2eDb::new().await.with_extension().await;
+
+    // Minimal table: name contains a "category-subcategory" prefix we'll
+    // extract with split_part().
+    db.execute(
+        "CREATE TABLE products (
+            id       SERIAL PRIMARY KEY,
+            sku      TEXT NOT NULL,
+            price    NUMERIC(10,2) NOT NULL
+        )",
+    )
+    .await;
+
+    db.execute(
+        "INSERT INTO products (sku, price) VALUES
+            ('Electronics-TV',  499.99),
+            ('Electronics-PC',  899.99),
+            ('Books-Novel',      14.99),
+            ('Books-Textbook',   49.99)",
+    )
+    .await;
+
+    // GROUP BY 1 where position-1 is split_part(sku, '-', 1) — the exact
+    // expression shape that triggered the bug.
+    db.create_st(
+        "product_summary",
+        "SELECT split_part(sku, '-', 1) AS category,
+                COUNT(*) AS product_count,
+                SUM(price) AS total_price
+         FROM products
+         GROUP BY 1",
+        "1m",
+        "DIFFERENTIAL",
+    )
+    .await;
+
+    // Initial population via full refresh at creation time.
+    let initial_rows: i64 = db.count("public.product_summary").await;
+    assert_eq!(initial_rows, 2, "Electronics and Books categories");
+
+    let electronics_count: i64 = db
+        .query_scalar(
+            "SELECT product_count::bigint FROM product_summary WHERE category = 'Electronics'",
+        )
+        .await;
+    assert_eq!(electronics_count, 2);
+
+    // Insert a new product — triggers a CDC change against the base table,
+    // so the next differential refresh will build the delta CTE with
+    // split_part(...) in the GROUP BY.
+    db.execute("INSERT INTO products (sku, price) VALUES ('Electronics-Tablet', 349.99)")
+        .await;
+
+    // refresh_st() takes the DIFFERENTIAL path here (source is a plain TABLE,
+    // not a stream table): this is where the bug would have manifested as
+    // "column d.split_part(sku, '-', 1) does not exist".
+    db.refresh_st("product_summary").await;
+
+    let post_count: i64 = db
+        .query_scalar(
+            "SELECT product_count::bigint FROM product_summary WHERE category = 'Electronics'",
+        )
+        .await;
+    assert_eq!(post_count, 3, "Electronics count must be 3 after INSERT");
+
+    let post_price: String = db
+        .query_scalar(
+            "SELECT total_price::text FROM product_summary WHERE category = 'Electronics'",
+        )
+        .await;
+    assert_eq!(post_price, "1749.97");
+
+    // Books unchanged
+    let books_count: i64 = db
+        .query_scalar("SELECT product_count::bigint FROM product_summary WHERE category = 'Books'")
+        .await;
+    assert_eq!(books_count, 2, "Books group must be unaffected");
+
+    // Status must be ACTIVE and DIFFERENTIAL after a successful differential refresh
+    let (status, mode, _, _) = db.pgt_status("product_summary").await;
+    assert_eq!(status, "ACTIVE");
+    assert_eq!(mode, "DIFFERENTIAL");
 }

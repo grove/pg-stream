@@ -1461,9 +1461,15 @@ pub fn diff_aggregate(ctx: &mut DiffContext, op: &OpTree) -> Result<DiffResult, 
         let delta_cte = ctx.next_cte_name("agg_delta");
         let mut delta_selects = Vec::new();
 
-        // Group by columns — alias to output name for consistent downstream refs
+        // Group by columns — alias to output name for consistent downstream refs.
+        // When the output name is a SQL expression (contains '('), always add an
+        // explicit alias so the delta CTE column is named by the full expression
+        // as a quoted identifier. Without this guard, `split_part(x, y, z)` would
+        // be implicitly named `split_part` by PostgreSQL, causing the merge CTE's
+        // `d."split_part(x, y, z)"` reference to fail with "column does not exist".
+        // build_rescan_cte uses the same `&& !expr_sql.contains('(')` guard.
         for (resolved, output) in group_resolved.iter().zip(group_output.iter()) {
-            if resolved == output {
+            if resolved == output && !output.contains('(') {
                 delta_selects.push(col_ref_or_sql_expr(resolved));
             } else {
                 delta_selects.push(format!(
@@ -2900,6 +2906,49 @@ mod tests {
         assert_sql_not_contains(&sql, "LATERAL");
         // Should use standard path with __pgt_action
         assert_sql_contains(&sql, "__pgt_action");
+    }
+
+    #[test]
+    fn test_diff_aggregate_func_call_group_by_aliased_in_delta_cte() {
+        // Regression test: GROUP BY with a function call expression (e.g.,
+        // split_part(full_path, ' > ', 2)) must emit an explicit alias in the
+        // delta CTE so the merge CTE can reference d."split_part(full_path, ' > ', 2)".
+        // Without the fix, the column was implicitly named `split_part` by
+        // PostgreSQL, causing "column d.split_part(full_path, ' > ', 2) does not exist".
+        // Mirrors the department_report query in the getting-started tutorial.
+        let func_expr = Expr::FuncCall {
+            func_name: "split_part".to_string(),
+            args: vec![
+                colref("full_path"),
+                Expr::Literal("' > '".to_string()),
+                Expr::Literal("2".to_string()),
+            ],
+        };
+        let mut ctx = test_ctx_with_st("public", "department_report");
+        let child = filter(
+            binop(">=", colref("depth"), lit("1")),
+            scan(
+                1,
+                "department_stats",
+                "public",
+                "ds",
+                &["full_path", "depth", "headcount", "total_salary"],
+            ),
+        );
+        let tree = aggregate(
+            vec![func_expr],
+            vec![sum_col("headcount", "total_headcount")],
+            child,
+        );
+        let result = diff_aggregate(&mut ctx, &tree).unwrap();
+        let sql = ctx.build_with_query(&result.cte_name);
+
+        // The delta CTE must explicitly alias the function call expression so
+        // it can be referenced by its full name in the merge CTE.
+        // Check for: split_part(...) AS "split_part(full_path, ' > ', 2)"
+        assert_sql_contains(&sql, r#"AS "split_part(full_path, ' > ', 2)""#);
+        // The merge CTE must reference it with the quoted identifier.
+        assert_sql_contains(&sql, r#"d."split_part(full_path, ' > ', 2)""#);
     }
 
     #[test]
