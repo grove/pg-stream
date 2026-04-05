@@ -647,8 +647,8 @@ SELECT name, path FROM department_tree WHERE path LIKE '%R&D%' ORDER BY depth, n
 ```
 
 ```
-   name   |              path
-----------+----------------------------------
+   name   |           path           
+----------+--------------------------
  R&D      | Company > R&D
  Backend  | Company > R&D > Backend
  DevOps   | Company > R&D > DevOps
