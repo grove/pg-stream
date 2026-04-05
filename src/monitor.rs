@@ -470,8 +470,15 @@ fn st_refresh_stats() -> TableIterator<
                         CASE WHEN st.schedule IS NOT NULL AND st.data_timestamp IS NOT NULL
                                   AND st.schedule NOT LIKE '% %'
                                   AND st.schedule NOT LIKE '@%'
+                             -- Only stale when BOTH data_timestamp AND last_refresh_at
+                             -- are old: scheduler itself is falling behind.
+                             -- If last_refresh_at is recent the scheduler is healthy;
+                             -- data_timestamp is frozen because there is nothing new
+                             -- to refresh (no_upstream_changes), not a real problem.
                              THEN EXTRACT(EPOCH FROM (now() - st.data_timestamp)) >
-                                  pgtrickle.parse_duration_seconds(st.schedule)
+                                      pgtrickle.parse_duration_seconds(st.schedule)
+                                  AND EXTRACT(EPOCH FROM (now() - st.last_refresh_at)) >
+                                      pgtrickle.parse_duration_seconds(st.schedule) * 3
                         END,
                     false),
                     st.consecutive_errors::integer,
