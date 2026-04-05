@@ -54,6 +54,25 @@ jobs:
         continue-on-error: true
         run: semgrep scan --config .semgrep/pg_trickle.yml --sarif --output semgrep.sarif
 
+      - name: Filter suppressed findings from SARIF
+        # Semgrep 1.x includes nosemgrep-suppressed results in SARIF output with
+        # suppressions:[{kind:"inSource"}] metadata.  GitHub Code Scanning does NOT
+        # auto-dismiss alerts based on SARIF suppressions unless a repository-level
+        # setting is enabled.  Strip suppressed results here so GitHub only ever
+        # receives the genuine (unacknowledged) findings and will auto-close alerts
+        # for locations that are covered by a nosemgrep comment.
+        run: |
+          python3 - <<'EOF'
+          import json, sys
+          data = json.load(open("semgrep.sarif"))
+          for run in data["runs"]:
+              before = len(run["results"])
+              run["results"] = [r for r in run["results"] if not r.get("suppressions")]
+              after = len(run["results"])
+              print(f"SARIF: removed {before - after} suppressed result(s), {after} remain", file=sys.stderr)
+          json.dump(data, open("semgrep.sarif", "w"))
+          EOF
+
       - name: Upload SARIF report
         uses: github/codeql-action/upload-sarif@v4
         with:
