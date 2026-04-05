@@ -184,7 +184,8 @@ light-eligible; 10 files (~90 tests) require the full E2E image.
 | Full E2E + TPC-H | ❌ | ✅ | ✅ | ✅ |
 | Upgrade completeness | ✅ | ✅ | ✅ | ✅ |
 | Upgrade E2E | ❌ | ✅ | ✅ | ✅ |
-| Benchmarks | ❌ | ❌ | ✅ | ✅ |
+| Benchmarks | ❌ | ✅ | ✅ | ✅ |
+| Benchmark regression gate | ✅ | ❌ | ❌ | ✅ |
 | DAG bench (calc/throughput) | ❌ | ❌ | ✅ | ✅ |
 | DAG bench (parallel workers) | ❌ | ❌ | ✅ | ✅ |
 | E2E bench — refresh matrix | ❌ | ❌ | Weekly (Sun) | ✅ |
@@ -201,8 +202,10 @@ workflow, not in ci.yml.
 
 > **Note:** Full E2E and TPC-H tests are **skipped on PRs** (the Docker build
 > is ~20 min). Light E2E tests run on every PR using `cargo pgrx package` +
-> stock postgres container. To run the full CI matrix on a PR branch, use
-> manual dispatch (see below).
+> stock postgres container. Benchmark regression check runs on every PR targeting
+> `main` using the Criterion baseline saved by the last push to `main`
+> (via `scripts/criterion_regression_check.py`). To run the full CI matrix on a
+> PR branch, use manual dispatch (see below).
 
 ### Running All Tests Locally
 

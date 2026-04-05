@@ -93,6 +93,20 @@ For future plans and release milestones, see [ROADMAP.md](ROADMAP.md).
   exposes `template_cache` and `template_cache_stats` (L2 hits / full misses).
   *(G14-SHC)*
 
+- **Benchmark regression CI gate** — every PR targeting `main` now runs
+  Criterion benchmarks and fails if any benchmark mean regresses by more than
+  10% vs the baseline saved on the last push to `main`. The gate uses a new
+  `bench-regression` job in `.github/workflows/ci.yml` backed by a self-hosted
+  `scripts/criterion_regression_check.py` script (no external service required).
+  Threshold is configurable via `PGT_BENCH_REGRESSION_THRESHOLD`. *(BENCH-CI-1,
+  BENCH-CI-2)*
+
+- **Expanded Criterion bench scenarios** — `benches/diff_operators.rs` now
+  covers SemiJoin (EXISTS), AntiJoin (NOT EXISTS), TopK materialization shape
+  (1/3/5/10 group keys), aggregate scaled by group-by cardinality (1/5/10/20
+  keys), and N-table InnerJoin chains (2/3/5 tables). Total: 22 bench
+  functions (+5). *(BENCH-CI-3)*
+
 ### Changed
 
 - **GUC defaults reviewed** — added detailed tuning guidance for

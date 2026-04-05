@@ -372,12 +372,46 @@ jobs:
         run: |
           cargo nextest run --profile ci --test e2e_upgrade_tests --run-ignored all
 
+  # ── Benchmark regression gate (PRs targeting main only) ─────────────────
+  # Restores the Criterion baseline saved by the main-branch benchmarks job,
+  # runs all Criterion benches, then fails if any mean regresses > 10%.
+  # Non-fatal on cache miss (first run has no baseline to compare against).
+  bench-regression:
+    name: Benchmark regression check
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request' && github.base_ref == 'main'
+    timeout-minutes: 20
+    continue-on-error: false
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Setup pgrx environment
+        uses: ./.github/actions/setup-pgrx
+
+      - name: Restore Criterion baseline
+        id: restore-baseline
+        uses: actions/cache/restore@v4
+        with:
+          path: target/criterion
+          key: criterion-baseline-main
+          restore-keys: criterion-baseline-
+
+      - name: Run benchmarks (create new/ data)
+        run: ./scripts/run_benchmarks.sh
+
+      - name: Check for regressions
+        run: |
+          python3 scripts/criterion_regression_check.py
+        env:
+          PGT_BENCH_REGRESSION_THRESHOLD: "0.10"
+
   # ── Benchmarks (non-blocking, Linux only) ───────────────────────────────
   # Expensive; run on weekly schedule and manual dispatch only.
+  # On push to main: saves a Criterion baseline so PRs can compare against it.
   benchmarks:
     name: Benchmarks
     runs-on: ubuntu-latest
-    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
     timeout-minutes: 20
     continue-on-error: true
     steps:
@@ -386,8 +420,22 @@ jobs:
       - name: Setup pgrx environment
         uses: ./.github/actions/setup-pgrx
 
-      - name: Run benchmarks
-        run: ./scripts/run_benchmarks.sh
+      - name: Restore existing baseline (for comparison output)
+        uses: actions/cache/restore@v4
+        with:
+          path: target/criterion
+          key: criterion-baseline-main
+          restore-keys: criterion-baseline-
+
+      - name: Run benchmarks and save baseline
+        run: ./scripts/run_benchmarks.sh -- --save-baseline main
+
+      - name: Save Criterion baseline to cache
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: actions/cache/save@v4
+        with:
+          path: target/criterion
+          key: criterion-baseline-main
 
       - name: Upload benchmark results
         uses: actions/upload-artifact@v7

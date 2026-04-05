@@ -3309,7 +3309,7 @@ forward-compatibility before PG 19 reaches beta.
 - [ ] TG2-MERGE: refresh.rs MERGE template generation has unit test coverage
 - [ ] TG2-CANCEL: Timeout and cancellation during refresh tested; no resource leaks
 - [ ] TG2-SCHEMA: Source table type changes and column renames tested end-to-end
-- [ ] BENCH-CI: Performance regression CI runs on every PR; 10% regression threshold blocks merge; scenario coverage includes scan/filter/aggregate/join/window/CTE/TopK
+- [x] BENCH-CI: Performance regression CI runs on every PR; 10% regression threshold blocks merge; scenario coverage includes scan/filter/aggregate/join/window/CTE/TopK/SemiJoin/AntiJoin
 - [x] AUTO-IDX: Stream tables auto-create indexes on GROUP BY / DISTINCT columns; `__pgt_row_id` covering index for ≤ 8-column tables; `auto_index` GUC respected
 - [x] C2-BUG: `resume_stream_table()` verified operational (present since v0.2.0)
 - [x] ERR-REF: Error reference doc published with all 20 PgTrickleError variants, common causes, and suggested fixes
