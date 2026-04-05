@@ -1815,6 +1815,31 @@ fn estimate_delta_output_rows(merge_sql: &str, limit: i32) -> Option<i64> {
     }
 }
 
+/// Check whether the delta SQL contains CTE markers from DVM operators
+/// that are **not insert-monotonic** — i.e., where INSERT-only source
+/// changes can still produce DELETE or UPDATE actions in the delta output.
+///
+/// When this returns `true`, the append-only INSERT fast path (A-3a) is
+/// unsafe because the bare `INSERT … WHERE __pgt_action = 'I'` would miss
+/// delta DELETEs and duplicate-key UPDATEs.
+fn has_non_monotonic_cte(sql: &str) -> bool {
+    sql.contains("__pgt_cte_agg_") // Aggregate: group updates → 'I' with existing row_id
+        || sql.contains("__pgt_cte_left_join_") // LEFT JOIN: right INSERTs remove NULL-padded rows
+        || sql.contains("__pgt_cte_lj_") // LEFT JOIN flags CTE
+        || sql.contains("__pgt_cte_full_join_") // FULL JOIN
+        || sql.contains("__pgt_cte_fj_") // FULL JOIN flags CTE
+        || sql.contains("__pgt_cte_anti_join_") // NOT EXISTS / ALL subquery
+        || sql.contains("__pgt_cte_exct_") // EXCEPT: right INSERTs remove left rows
+        || sql.contains("__pgt_cte_win_") // Window: INSERTs change partition values
+        || sql.contains("__pgt_cte_scalar_sub_") // Scalar subquery: value changes
+        || sql.contains("__pgt_cte_sq_gate_") // Scalar subquery gate
+        || sql.contains("__pgt_cte_lat_sq_") // Lateral subquery
+        || sql.contains("__pgt_cte_rc_") // Recursive CTE
+        || sql.contains("__pgt_cte_dred_") // Recursive CTE (DRed)
+        || sql.contains("__pgt_cte_lat_changed_") // Lateral function
+        || sql.contains("__pgt_cte_lat_old_") // Lateral function
+}
+
 /// Build an `INSERT ... SELECT` SQL statement from a MERGE SQL template
 /// for append-only stream tables.
 ///
@@ -3675,7 +3700,18 @@ pub fn execute_differential_refresh(
     // use the INSERT fast path for this refresh cycle. The flag is set in
     // the catalog so subsequent refreshes also use the fast path until a
     // DELETE/UPDATE is detected (handled by the revert block above).
-    if !is_append_only && !st.has_keyless_source {
+    //
+    // Skip promotion for queries with non-monotonic operators (LEFT JOIN,
+    // aggregates, anti-joins, etc.) where source INSERTs can produce delta
+    // DELETEs — the append-only fast path would silently drop those DELETEs.
+    let cached_non_monotonic = MERGE_TEMPLATE_CACHE.with(|cache| {
+        cache
+            .borrow()
+            .get(&st.pgt_id)
+            .map(|entry| has_non_monotonic_cte(&entry.merge_sql_template))
+            .unwrap_or(false) // no cache entry → allow promotion (A-3a guard catches it)
+    });
+    if !is_append_only && !st.has_keyless_source && !cached_non_monotonic {
         let has_non_insert = catalog_source_oids.iter().any(|oid| {
             let prev_lsn = prev_frontier.get_lsn(*oid);
             let new_lsn = new_frontier.get_lsn(*oid);
@@ -4477,60 +4513,69 @@ pub fn execute_differential_refresh(
     // use a simple INSERT … SELECT from the delta. This avoids the
     // DELETE, UPDATE, and IS DISTINCT FROM overhead of the MERGE path.
     //
-    // Aggregate queries are excluded: the DVM aggregate operator remaps
-    // group-UPDATE actions to __pgt_action = 'I' in the final CTE, so
-    // source INSERTs that update existing aggregate groups would hit the
-    // UNIQUE constraint on __pgt_row_id (the bare INSERT has no NOT EXISTS
-    // guard).  The __pgt_cte_agg_ prefix is generated exclusively by the
-    // aggregate differentiation operator.
-    if is_append_only && !resolved.merge_sql.contains("__pgt_cte_agg_") {
-        let t_insert_start = Instant::now();
+    // Non-monotonic queries are excluded: for operators like LEFT JOIN,
+    // anti-join (ALL subqueries), aggregates, etc., source INSERTs can
+    // produce delta DELETEs or UPDATEs that the bare INSERT path cannot
+    // handle. When detected, clear the incorrectly set catalog flag so
+    // subsequent refreshes skip the heuristic check overhead.
+    if is_append_only {
+        if has_non_monotonic_cte(&resolved.merge_sql) {
+            pgrx::debug1!(
+                "[pg_trickle] A-3a: skipping append-only for {}.{} — \
+                 non-monotonic query operators detected",
+                schema,
+                name,
+            );
+            let _ = StreamTableMeta::update_append_only(st.pgt_id, false);
+        } else {
+            let t_insert_start = Instant::now();
 
-        // Build INSERT SQL from the resolved MERGE SQL's USING clause.
-        // The MERGE SQL has the form:
-        //   MERGE INTO "schema"."table" AS st USING (...delta...) AS d ON ...
-        // We extract the delta subquery and wrap it in INSERT INTO.
-        let insert_sql = build_append_only_insert_sql(schema, name, &resolved.merge_sql);
+            // Build INSERT SQL from the resolved MERGE SQL's USING clause.
+            // The MERGE SQL has the form:
+            //   MERGE INTO "schema"."table" AS st USING (...delta...) AS d ON ...
+            // We extract the delta subquery and wrap it in INSERT INTO.
+            let insert_sql = build_append_only_insert_sql(schema, name, &resolved.merge_sql);
 
-        let rows_inserted = Spi::connect_mut(|client| {
-            let result = client
-                .update(&insert_sql, None, &[])
-                .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
-            Ok::<i64, PgTrickleError>(result.len() as i64)
-        })?;
+            let rows_inserted = Spi::connect_mut(|client| {
+                let result = client
+                    .update(&insert_sql, None, &[])
+                    .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
+                Ok::<i64, PgTrickleError>(result.len() as i64)
+            })?;
 
-        let t_insert = t_insert_start.elapsed();
-        pgrx::debug1!(
-            "[pg_trickle] append-only INSERT for {}.{}: {} rows in {:.1}ms",
-            schema,
-            name,
-            rows_inserted,
-            t_insert.as_secs_f64() * 1000.0,
-        );
+            let t_insert = t_insert_start.elapsed();
+            pgrx::debug1!(
+                "[pg_trickle] append-only INSERT for {}.{}: {} rows in {:.1}ms",
+                schema,
+                name,
+                rows_inserted,
+                t_insert.as_secs_f64() * 1000.0,
+            );
 
-        // C-1: Defer cleanup of consumed change buffer rows.
-        let cleanup_source_oids = resolved.source_oids.clone();
-        if !cleanup_source_oids.is_empty() {
-            PENDING_CLEANUP.with(|q| {
-                q.borrow_mut().push(PendingCleanup {
-                    change_schema: change_schema.clone(),
-                    source_oids: cleanup_source_oids,
+            // C-1: Defer cleanup of consumed change buffer rows.
+            let cleanup_source_oids = resolved.source_oids.clone();
+            if !cleanup_source_oids.is_empty() {
+                PENDING_CLEANUP.with(|q| {
+                    q.borrow_mut().push(PendingCleanup {
+                        change_schema: change_schema.clone(),
+                        source_oids: cleanup_source_oids,
+                    });
                 });
-            });
+            }
+
+            pgrx::info!(
+                "[PGS_PROFILE] decision={:.2}ms insert_exec={:.2}ms total={:.2}ms affected={} mode=APPEND_ONLY",
+                t_decision.as_secs_f64() * 1000.0,
+                t_insert.as_secs_f64() * 1000.0,
+                (t_decision + t_insert).as_secs_f64() * 1000.0,
+                rows_inserted,
+            );
+
+            // G12-ERM-1: Record the effective mode for this execution path.
+            set_effective_mode("APPEND_ONLY");
+
+            return Ok((rows_inserted, 0));
         }
-
-        pgrx::info!(
-            "[PGS_PROFILE] decision={:.2}ms insert_exec={:.2}ms total={:.2}ms affected={} mode=APPEND_ONLY",
-            t_decision.as_secs_f64() * 1000.0,
-            t_insert.as_secs_f64() * 1000.0,
-            (t_decision + t_insert).as_secs_f64() * 1000.0,
-            rows_inserted,
-        );
-
-        // G12-ERM-1: Record the effective mode for this execution path.
-        set_effective_mode("APPEND_ONLY");
-
-        return Ok((rows_inserted, 0));
     }
 
     // ── User-trigger detection ───────────────────────────────────────
