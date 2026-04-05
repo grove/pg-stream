@@ -121,6 +121,9 @@ struct CachedMergeTemplate {
     /// predicate injection. Only populated when `st_partition_key` is set,
     /// but stored for all STs to keep the struct layout consistent.
     delta_sql_template: String,
+    /// B-1: When true, all aggregates are algebraically invertible and the
+    /// explicit DML fast-path can be used instead of MERGE.
+    is_all_algebraic: bool,
 }
 
 thread_local! {
@@ -1816,6 +1819,35 @@ fn estimate_delta_output_rows(merge_sql: &str, limit: i32) -> Option<i64> {
     }
 }
 
+/// Check whether the delta SQL contains CTE markers from DVM operators
+/// that are **not insert-monotonic** — i.e., where INSERT-only source
+/// changes can still produce DELETE or UPDATE actions in the delta output.
+///
+/// When this returns `true`, the append-only INSERT fast path (A-3a) is
+/// unsafe because the bare `INSERT … WHERE __pgt_action = 'I'` would miss
+/// delta DELETEs and duplicate-key UPDATEs.
+fn has_non_monotonic_cte(sql: &str) -> bool {
+    sql.contains("__pgt_cte_agg_") // Aggregate: group updates → 'I' with existing row_id
+        || sql.contains("__pgt_cte_left_join_") // LEFT JOIN: right INSERTs remove NULL-padded rows
+        || sql.contains("__pgt_cte_lj_") // LEFT JOIN flags CTE
+        || sql.contains("__pgt_cte_full_join_") // FULL JOIN
+        || sql.contains("__pgt_cte_fj_") // FULL JOIN flags CTE
+        || sql.contains("__pgt_cte_anti_join_") // NOT EXISTS / ALL subquery
+        || sql.contains("__pgt_cte_semi_join_") // EXISTS subquery
+        || sql.contains("__pgt_cte_r_old_") // Semi/anti join pre-change snapshot
+        || sql.contains("__pgt_cte_isect_") // INTERSECT: right INSERTs remove left rows
+        || sql.contains("__pgt_cte_dist_") // DISTINCT: INSERTs change dedup outcome
+        || sql.contains("__pgt_cte_exct_") // EXCEPT: right INSERTs remove left rows
+        || sql.contains("__pgt_cte_win_") // Window: INSERTs change partition values
+        || sql.contains("__pgt_cte_scalar_sub_") // Scalar subquery: value changes
+        || sql.contains("__pgt_cte_sq_gate_") // Scalar subquery gate
+        || sql.contains("__pgt_cte_lat_sq_") // Lateral subquery
+        || sql.contains("__pgt_cte_rc_") // Recursive CTE
+        || sql.contains("__pgt_cte_dred_") // Recursive CTE (DRed)
+        || sql.contains("__pgt_cte_lat_changed_") // Lateral function
+        || sql.contains("__pgt_cte_lat_old_") // Lateral function
+}
+
 /// Build an `INSERT ... SELECT` SQL statement from a MERGE SQL template
 /// for append-only stream tables.
 ///
@@ -2104,6 +2136,7 @@ pub fn prewarm_merge_cache(st: &StreamTableMeta) {
                 trigger_insert_template,
                 trigger_using_template: using_clause.clone(),
                 delta_sql_template: delta_sql_template.clone(),
+                is_all_algebraic: delta_result.is_all_algebraic,
             },
         );
     });
@@ -3667,6 +3700,65 @@ pub fn execute_differential_refresh(
         }
     }
 
+    // ── A-3-AO: Append-only heuristic auto-promotion ────────────────
+    // When the stream table is NOT marked append-only, check whether the
+    // current change buffer batch is INSERT-only. If so, opportunistically
+    // use the INSERT fast path for this refresh cycle. The flag is set in
+    // the catalog so subsequent refreshes also use the fast path until a
+    // DELETE/UPDATE is detected (handled by the revert block above).
+    //
+    // Skip promotion for queries with non-monotonic operators (LEFT JOIN,
+    // aggregates, anti-joins, etc.) where source INSERTs can produce delta
+    // DELETEs — the append-only fast path would silently drop those DELETEs.
+    let cached_non_monotonic = MERGE_TEMPLATE_CACHE.with(|cache| {
+        cache
+            .borrow()
+            .get(&st.pgt_id)
+            .map(|entry| has_non_monotonic_cte(&entry.merge_sql_template))
+            .unwrap_or(false) // no cache entry → allow promotion (A-3a guard catches it)
+    });
+    if !is_append_only && !st.has_keyless_source && !cached_non_monotonic {
+        let has_non_insert = catalog_source_oids.iter().any(|oid| {
+            let prev_lsn = prev_frontier.get_lsn(*oid);
+            let new_lsn = new_frontier.get_lsn(*oid);
+            match Spi::get_one::<bool>(&format!(
+                "SELECT EXISTS(\
+                   SELECT 1 FROM \"{change_schema}\".changes_{oid} \
+                   WHERE lsn > '{prev_lsn}'::pg_lsn \
+                   AND lsn <= '{new_lsn}'::pg_lsn \
+                   AND action IN ('D', 'U') \
+                   LIMIT 1\
+                 )",
+            )) {
+                Ok(Some(v)) => v,
+                Ok(None) => false,
+                Err(_) => true, // SPI failure: safe default (skip heuristic)
+            }
+        });
+
+        if !has_non_insert {
+            pgrx::debug1!(
+                "[pg_trickle] A-3-AO: heuristic append-only promotion for {}.{} — \
+                 current batch is INSERT-only",
+                schema,
+                name,
+            );
+            is_append_only = true;
+            // Persist the flag so subsequent refreshes also use the fast path.
+            // If a DELETE/UPDATE appears later, the revert block above will
+            // clear it and emit a WARNING + NOTIFY.
+            if let Err(e) = StreamTableMeta::update_append_only(st.pgt_id, true) {
+                pgrx::debug1!(
+                    "[pg_trickle] A-3-AO: failed to set is_append_only for {}.{}: {}",
+                    schema,
+                    name,
+                    e,
+                );
+                is_append_only = false; // revert on failure
+            }
+        }
+    }
+
     // ── S2: TRUNCATE detection ───────────────────────────────────────
     // If any source table was TRUNCATEd, the change buffer contains a
     // marker row with action='T'. Differential deltas cannot represent
@@ -3811,6 +3903,29 @@ pub fn execute_differential_refresh(
         if change_count > threshold_rows {
             should_fallback = true;
             break; // No need to check remaining sources
+        }
+    }
+
+    // ── BUF-LIMIT: Hard buffer growth limit ─────────────────────────
+    // If any source's change buffer exceeds max_buffer_rows, force FULL
+    // refresh to prevent unbounded disk growth from repeated failures.
+    let max_buffer_rows = crate::config::pg_trickle_max_buffer_rows();
+    if !should_fallback && max_buffer_rows > 0 {
+        for &(oid, change_count, _table_size) in &per_source_stats {
+            if change_count > max_buffer_rows {
+                pgrx::warning!(
+                    "[pg_trickle] Change buffer for source OID {} of {}.{} has {} rows, \
+                     exceeding max_buffer_rows limit ({}). Forcing FULL refresh and \
+                     truncating buffer to prevent unbounded growth.",
+                    oid,
+                    st.pgt_schema,
+                    st.pgt_name,
+                    change_count,
+                    max_buffer_rows,
+                );
+                should_fallback = true;
+                break;
+            }
         }
     }
 
@@ -3997,6 +4112,8 @@ pub fn execute_differential_refresh(
         /// LSN values). Used to compute partition key range for A1-3 predicate
         /// injection on partitioned stream tables.
         resolved_delta_sql: String,
+        /// B-1: Whether all aggregates are algebraically invertible.
+        is_all_algebraic: bool,
     }
 
     let mut resolved = if let Some(entry) = cached {
@@ -4032,6 +4149,7 @@ pub fn execute_differential_refresh(
                 new_frontier,
                 &zero_change_oids,
             ),
+            is_all_algebraic: entry.is_all_algebraic,
         }
     } else {
         // ── Cache miss: full pipeline + PREPARE + cache ──────────────
@@ -4237,6 +4355,7 @@ pub fn execute_differential_refresh(
                         trigger_insert_template: trigger_insert_template.clone(),
                         trigger_using_template: template_using.clone(),
                         delta_sql_template: delta_sql_template.clone(),
+                        is_all_algebraic: delta_result.is_all_algebraic,
                     },
                 );
             });
@@ -4270,6 +4389,7 @@ pub fn execute_differential_refresh(
                 new_frontier,
                 &zero_change_oids,
             ),
+            is_all_algebraic: delta_result.is_all_algebraic,
         }
     };
 
@@ -4398,54 +4518,70 @@ pub fn execute_differential_refresh(
     // reverted by the heuristic check above), skip MERGE entirely and
     // use a simple INSERT … SELECT from the delta. This avoids the
     // DELETE, UPDATE, and IS DISTINCT FROM overhead of the MERGE path.
+    //
+    // Non-monotonic queries are excluded: for operators like LEFT JOIN,
+    // anti-join (ALL subqueries), aggregates, etc., source INSERTs can
+    // produce delta DELETEs or UPDATEs that the bare INSERT path cannot
+    // handle. When detected, clear the incorrectly set catalog flag so
+    // subsequent refreshes skip the heuristic check overhead.
     if is_append_only {
-        let t_insert_start = Instant::now();
+        if has_non_monotonic_cte(&resolved.merge_sql) {
+            pgrx::debug1!(
+                "[pg_trickle] A-3a: skipping append-only for {}.{} — \
+                 non-monotonic query operators detected",
+                schema,
+                name,
+            );
+            let _ = StreamTableMeta::update_append_only(st.pgt_id, false);
+        } else {
+            let t_insert_start = Instant::now();
 
-        // Build INSERT SQL from the resolved MERGE SQL's USING clause.
-        // The MERGE SQL has the form:
-        //   MERGE INTO "schema"."table" AS st USING (...delta...) AS d ON ...
-        // We extract the delta subquery and wrap it in INSERT INTO.
-        let insert_sql = build_append_only_insert_sql(schema, name, &resolved.merge_sql);
+            // Build INSERT SQL from the resolved MERGE SQL's USING clause.
+            // The MERGE SQL has the form:
+            //   MERGE INTO "schema"."table" AS st USING (...delta...) AS d ON ...
+            // We extract the delta subquery and wrap it in INSERT INTO.
+            let insert_sql = build_append_only_insert_sql(schema, name, &resolved.merge_sql);
 
-        let rows_inserted = Spi::connect_mut(|client| {
-            let result = client
-                .update(&insert_sql, None, &[])
-                .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
-            Ok::<i64, PgTrickleError>(result.len() as i64)
-        })?;
+            let rows_inserted = Spi::connect_mut(|client| {
+                let result = client
+                    .update(&insert_sql, None, &[])
+                    .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
+                Ok::<i64, PgTrickleError>(result.len() as i64)
+            })?;
 
-        let t_insert = t_insert_start.elapsed();
-        pgrx::debug1!(
-            "[pg_trickle] append-only INSERT for {}.{}: {} rows in {:.1}ms",
-            schema,
-            name,
-            rows_inserted,
-            t_insert.as_secs_f64() * 1000.0,
-        );
+            let t_insert = t_insert_start.elapsed();
+            pgrx::debug1!(
+                "[pg_trickle] append-only INSERT for {}.{}: {} rows in {:.1}ms",
+                schema,
+                name,
+                rows_inserted,
+                t_insert.as_secs_f64() * 1000.0,
+            );
 
-        // C-1: Defer cleanup of consumed change buffer rows.
-        let cleanup_source_oids = resolved.source_oids.clone();
-        if !cleanup_source_oids.is_empty() {
-            PENDING_CLEANUP.with(|q| {
-                q.borrow_mut().push(PendingCleanup {
-                    change_schema: change_schema.clone(),
-                    source_oids: cleanup_source_oids,
+            // C-1: Defer cleanup of consumed change buffer rows.
+            let cleanup_source_oids = resolved.source_oids.clone();
+            if !cleanup_source_oids.is_empty() {
+                PENDING_CLEANUP.with(|q| {
+                    q.borrow_mut().push(PendingCleanup {
+                        change_schema: change_schema.clone(),
+                        source_oids: cleanup_source_oids,
+                    });
                 });
-            });
+            }
+
+            pgrx::info!(
+                "[PGS_PROFILE] decision={:.2}ms insert_exec={:.2}ms total={:.2}ms affected={} mode=APPEND_ONLY",
+                t_decision.as_secs_f64() * 1000.0,
+                t_insert.as_secs_f64() * 1000.0,
+                (t_decision + t_insert).as_secs_f64() * 1000.0,
+                rows_inserted,
+            );
+
+            // G12-ERM-1: Record the effective mode for this execution path.
+            set_effective_mode("APPEND_ONLY");
+
+            return Ok((rows_inserted, 0));
         }
-
-        pgrx::info!(
-            "[PGS_PROFILE] decision={:.2}ms insert_exec={:.2}ms total={:.2}ms affected={} mode=APPEND_ONLY",
-            t_decision.as_secs_f64() * 1000.0,
-            t_insert.as_secs_f64() * 1000.0,
-            (t_decision + t_insert).as_secs_f64() * 1000.0,
-            rows_inserted,
-        );
-
-        // G12-ERM-1: Record the effective mode for this execution path.
-        set_effective_mode("APPEND_ONLY");
-
-        return Ok((rows_inserted, 0));
     }
 
     // ── User-trigger detection ───────────────────────────────────────
@@ -4488,8 +4624,76 @@ pub fn execute_differential_refresh(
     }
 
     // ── B-3: Strategy selection ──────────────────────────────────────
-    // Always use MERGE. The delete_insert path was removed in v0.2.0
-    // (pg_trickle.merge_strategy GUC removed — C1 cleanup).
+    // PH-D1: Choose between MERGE and DELETE+INSERT based on the
+    // merge_strategy GUC and the delta-to-target ratio heuristic.
+    let merge_strategy = crate::config::pg_trickle_merge_strategy();
+    let use_delete_insert = match merge_strategy {
+        crate::config::MergeStrategy::DeleteInsert => true,
+        crate::config::MergeStrategy::Merge => false,
+        crate::config::MergeStrategy::Auto => {
+            // Heuristic: use DELETE+INSERT when delta is a small fraction
+            // of the target table. Estimate target rows from pg_class.
+            let threshold = crate::config::pg_trickle_merge_strategy_threshold();
+            if total_change_count > 0 && threshold > 0.0 {
+                let target_rows: i64 = Spi::get_one::<i64>(&format!(
+                    "SELECT CASE WHEN reltuples >= 1 THEN reltuples::bigint \
+                            ELSE (SELECT COUNT(*) FROM \"{}\".\"{}\" ) END \
+                     FROM pg_class WHERE oid = {}::oid",
+                    schema.replace('"', "\"\""),
+                    name.replace('"', "\"\""),
+                    st.pgt_relid.to_u32(),
+                ))
+                .unwrap_or(Some(0))
+                .unwrap_or(0);
+                if target_rows > 0 {
+                    let ratio = total_change_count as f64 / target_rows as f64;
+                    let chosen = ratio < threshold;
+                    if chosen {
+                        pgrx::debug1!(
+                            "[pg_trickle] PH-D1: auto chose DELETE+INSERT for {}.{}: \
+                             ratio={:.4} < threshold={:.4} ({} changes / {} target rows)",
+                            schema,
+                            name,
+                            ratio,
+                            threshold,
+                            total_change_count,
+                            target_rows,
+                        );
+                    }
+                    chosen
+                } else {
+                    false
+                }
+            } else {
+                false
+            }
+        }
+    };
+    // DELETE+INSERT is incompatible with the explicit DML path (user triggers,
+    // keyless sources, downstream ST consumers) — those already use their own
+    // decomposed DML.  Also skip for partitioned STs (hash-merge path).
+    let use_delete_insert = use_delete_insert && !use_explicit_dml && st.st_partition_key.is_none();
+
+    // ── B-1: Aggregate fast-path ─────────────────────────────────────
+    // When the GUC is on and ALL aggregates are algebraically invertible
+    // (COUNT, SUM, AVG, etc.), use explicit DML (DELETE+UPDATE+INSERT)
+    // instead of MERGE. The explicit DML path does targeted row-level
+    // operations via a materialized temp table, avoiding the hash-join
+    // cost of MERGE which dominates for aggregate queries with many groups.
+    let use_agg_fast_path = resolved.is_all_algebraic
+        && crate::config::pg_trickle_aggregate_fast_path()
+        && !st.has_keyless_source
+        && !use_explicit_dml
+        && !use_delete_insert
+        && st.st_partition_key.is_none();
+    if use_agg_fast_path {
+        pgrx::debug1!(
+            "[pg_trickle] B-1: aggregate fast-path enabled for {}.{} \
+             (all aggregates algebraically invertible)",
+            schema,
+            name,
+        );
+    }
 
     // ── A1-2/A1-3: Partition-key range predicate injection ───────────
     // For partitioned stream tables, compute the MIN/MAX of the partition
@@ -4574,6 +4778,116 @@ pub fn execute_differential_refresh(
     let (merge_count, strategy_label) = if let Some(result) = hash_merge_result {
         // A1-3b: HASH per-partition MERGE already executed above.
         result
+    } else if use_delete_insert {
+        // ── PH-D1: DELETE+INSERT path ───────────────────────────────
+        // For small deltas against large tables, separate DELETE + INSERT
+        // avoids the MERGE join cost. The delta is materialized into a
+        // temp table, then applied as two targeted statements.
+        let t_mat_start = Instant::now();
+
+        let materialize_sql = format!(
+            "CREATE TEMP TABLE __pgt_delta_{pgt_id} ON COMMIT DROP AS \
+             SELECT * FROM {using_clause} AS d",
+            pgt_id = st.pgt_id,
+            using_clause = resolved.trigger_using_sql,
+        );
+        Spi::run(&materialize_sql).map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
+        let t_mat = t_mat_start.elapsed();
+
+        // Step 1: DELETE rows marked for removal
+        let t_del_start = Instant::now();
+        let del_count = Spi::connect_mut(|client| {
+            let result = client
+                .update(&resolved.trigger_delete_sql, None, &[])
+                .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
+            Ok::<usize, PgTrickleError>(result.len())
+        })?;
+        let t_del = t_del_start.elapsed();
+
+        // Step 2: INSERT new rows (skipping UPDATE — the delta represents
+        // UPDATEs as D+I pairs with different __pgt_row_id values)
+        let t_ins_start = Instant::now();
+        let ins_count = Spi::connect_mut(|client| {
+            let result = client
+                .update(&resolved.trigger_insert_sql, None, &[])
+                .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
+            Ok::<usize, PgTrickleError>(result.len())
+        })?;
+        let t_ins = t_ins_start.elapsed();
+
+        pgrx::info!(
+            "[PGS_PROFILE] delete_insert: materialize={:.2}ms delete={:.2}ms({}) \
+             insert={:.2}ms({}) for {}.{}",
+            t_mat.as_secs_f64() * 1000.0,
+            t_del.as_secs_f64() * 1000.0,
+            del_count,
+            t_ins.as_secs_f64() * 1000.0,
+            ins_count,
+            schema,
+            name,
+        );
+
+        (del_count + ins_count, "delete_insert")
+    } else if use_agg_fast_path {
+        // ── B-1: Aggregate fast-path ────────────────────────────────
+        // For all-algebraic aggregate queries, use explicit DML
+        // (DELETE+UPDATE+INSERT) to avoid the MERGE hash-join cost.
+        let t_mat_start = Instant::now();
+
+        let materialize_sql = format!(
+            "CREATE TEMP TABLE __pgt_delta_{pgt_id} ON COMMIT DROP AS \
+             SELECT * FROM {using_clause} AS d",
+            pgt_id = st.pgt_id,
+            using_clause = resolved.trigger_using_sql,
+        );
+        Spi::run(&materialize_sql).map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
+        let t_mat = t_mat_start.elapsed();
+
+        // Step 1: DELETE rows marked for removal
+        let t_del_start = Instant::now();
+        let del_count = Spi::connect_mut(|client| {
+            let result = client
+                .update(&resolved.trigger_delete_sql, None, &[])
+                .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
+            Ok::<usize, PgTrickleError>(result.len())
+        })?;
+        let t_del = t_del_start.elapsed();
+
+        // Step 2: UPDATE existing rows where values changed
+        let t_upd_start = Instant::now();
+        let upd_count = Spi::connect_mut(|client| {
+            let result = client
+                .update(&resolved.trigger_update_sql, None, &[])
+                .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
+            Ok::<usize, PgTrickleError>(result.len())
+        })?;
+        let t_upd = t_upd_start.elapsed();
+
+        // Step 3: INSERT genuinely new rows
+        let t_ins_start = Instant::now();
+        let ins_count = Spi::connect_mut(|client| {
+            let result = client
+                .update(&resolved.trigger_insert_sql, None, &[])
+                .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
+            Ok::<usize, PgTrickleError>(result.len())
+        })?;
+        let t_ins = t_ins_start.elapsed();
+
+        pgrx::info!(
+            "[PGS_PROFILE] agg_fast_path: materialize={:.2}ms delete={:.2}ms({}) \
+             update={:.2}ms({}) insert={:.2}ms({}) for {}.{}",
+            t_mat.as_secs_f64() * 1000.0,
+            t_del.as_secs_f64() * 1000.0,
+            del_count,
+            t_upd.as_secs_f64() * 1000.0,
+            upd_count,
+            t_ins.as_secs_f64() * 1000.0,
+            ins_count,
+            schema,
+            name,
+        );
+
+        (del_count + upd_count + ins_count, "agg_fast_path")
     } else if use_explicit_dml {
         // ── User-trigger path: explicit DML ─────────────────────────
         // Decompose the MERGE into DELETE + UPDATE + INSERT so that
@@ -5537,6 +5851,7 @@ mod tests {
                     trigger_insert_template: String::new(),
                     trigger_using_template: String::new(),
                     delta_sql_template: String::new(),
+                    is_all_algebraic: false,
                 },
             );
         });
@@ -5567,6 +5882,7 @@ mod tests {
                     trigger_insert_template: String::new(),
                     trigger_using_template: String::new(),
                     delta_sql_template: String::new(),
+                    is_all_algebraic: false,
                 },
             );
         });

@@ -95,6 +95,8 @@ struct CachedDeltaTemplate {
     is_deduplicated: bool,
     /// A-2: Whether the delta includes `__pgt_key_changed` boolean column.
     has_key_changed: bool,
+    /// B-1: Whether all aggregates are algebraically invertible.
+    is_all_algebraic: bool,
 }
 
 thread_local! {
@@ -299,6 +301,10 @@ pub struct DeltaQueryResult {
     /// rows for value-only UPDATEs, halving MERGE source rows and converting
     /// DELETE+INSERT to a single UPDATE.
     pub has_key_changed: bool,
+    /// B-1: When true, all aggregates in the query are algebraically invertible
+    /// (COUNT, SUM, AVG, STDDEV, etc.), enabling the explicit DML fast-path
+    /// at refresh time instead of MERGE.
+    pub is_all_algebraic: bool,
 }
 
 /// Generate the full delta SQL query for a defining query.
@@ -377,6 +383,7 @@ pub fn generate_delta_query(
         source_oids,
         is_deduplicated: diff_dedup,
         has_key_changed: diff_has_key_changed,
+        is_all_algebraic: result.tree.is_all_algebraic_agg(),
     })
 }
 
@@ -460,10 +467,58 @@ pub fn generate_delta_query_cached(
             source_oids: entry.source_oids,
             is_deduplicated: entry.is_deduplicated,
             has_key_changed: entry.has_key_changed,
+            is_all_algebraic: entry.is_all_algebraic,
+        });
+    }
+
+    // G14-SHC: L2 cache — check the catalog-backed template cache.
+    // ~1 ms SPI lookup, vs ~45 ms full DVM parse+differentiate.
+    if let Some(ct) = crate::template_cache::lookup(pgt_id, query_hash) {
+        // Track L2 hit (only when shmem is initialized; skipped in
+        // Light E2E mode where shared_preload_libraries is not set).
+        if crate::shmem::is_shmem_available() {
+            crate::shmem::TEMPLATE_CACHE_L2_HITS
+                .get()
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+
+        let entry = CachedDeltaTemplate {
+            defining_query_hash: query_hash,
+            delta_sql_template: ct.delta_sql_template.clone(),
+            output_columns: ct.output_columns.clone(),
+            source_oids: ct.source_oids.clone(),
+            is_deduplicated: ct.is_deduplicated,
+            has_key_changed: ct.has_key_changed,
+            is_all_algebraic: ct.is_all_algebraic,
+        };
+        // Promote to L1 (thread-local) for subsequent calls.
+        DELTA_TEMPLATE_CACHE.with(|cache| {
+            cache.borrow_mut().insert(pgt_id, entry);
+        });
+        let delta_sql = resolve_delta_template(
+            &ct.delta_sql_template,
+            &ct.source_oids,
+            prev_frontier,
+            new_frontier,
+        );
+        return Ok(DeltaQueryResult {
+            delta_sql,
+            output_columns: ct.output_columns,
+            source_oids: ct.source_oids,
+            is_deduplicated: ct.is_deduplicated,
+            has_key_changed: ct.has_key_changed,
+            is_all_algebraic: ct.is_all_algebraic,
         });
     }
 
     // Cache miss — parse, differentiate with placeholder mode, and cache.
+    // Track full miss (only when shmem is initialized).
+    if crate::shmem::is_shmem_available() {
+        crate::shmem::TEMPLATE_CACHE_MISSES
+            .get()
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
     let result = parse_defining_query_full(defining_query)?;
 
     let mut source_oids: Vec<u32> = result.tree.source_oids();
@@ -499,6 +554,8 @@ pub fn generate_delta_query_cached(
     let (template_sql, output_columns, diff_dedup, diff_has_key_changed) =
         ctx.differentiate_with_columns(&result.tree)?;
 
+    let is_all_algebraic = result.tree.is_all_algebraic_agg();
+
     // Store in cache.
     let entry = CachedDeltaTemplate {
         defining_query_hash: query_hash,
@@ -507,10 +564,25 @@ pub fn generate_delta_query_cached(
         source_oids: source_oids.clone(),
         is_deduplicated: diff_dedup,
         has_key_changed: diff_has_key_changed,
+        is_all_algebraic,
     };
     DELTA_TEMPLATE_CACHE.with(|cache| {
         cache.borrow_mut().insert(pgt_id, entry);
     });
+
+    // G14-SHC: Persist to L2 (catalog table) for cross-backend sharing.
+    let _ = crate::template_cache::store(
+        pgt_id,
+        query_hash,
+        &crate::template_cache::CachedTemplate {
+            delta_sql_template: template_sql.clone(),
+            output_columns: output_columns.clone(),
+            source_oids: source_oids.clone(),
+            is_deduplicated: diff_dedup,
+            has_key_changed: diff_has_key_changed,
+            is_all_algebraic,
+        },
+    );
 
     // Resolve placeholders for this invocation.
     let delta_sql =
@@ -522,6 +594,7 @@ pub fn generate_delta_query_cached(
         source_oids,
         is_deduplicated: diff_dedup,
         has_key_changed: diff_has_key_changed,
+        is_all_algebraic,
     })
 }
 
@@ -1450,6 +1523,7 @@ mod tests {
             source_oids: vec![42],
             is_deduplicated: true,
             has_key_changed: false,
+            is_all_algebraic: false,
         };
         DELTA_TEMPLATE_CACHE.with(|cache| {
             cache.borrow_mut().insert(pgt_id, entry);
@@ -1474,6 +1548,7 @@ mod tests {
             source_oids: vec![],
             is_deduplicated: false,
             has_key_changed: false,
+            is_all_algebraic: false,
         };
         DELTA_TEMPLATE_CACHE.with(|cache| {
             cache.borrow_mut().insert(pgt_id, entry);
@@ -1500,6 +1575,7 @@ mod tests {
             source_oids: vec![],
             is_deduplicated: true,
             has_key_changed: true,
+            is_all_algebraic: false,
         };
         DELTA_TEMPLATE_CACHE.with(|cache| {
             cache.borrow_mut().insert(pgt_id, entry);

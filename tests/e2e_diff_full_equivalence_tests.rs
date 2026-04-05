@@ -732,3 +732,125 @@ async fn test_diff_full_equivalence_three_table_join() {
     db.assert_st_matches_query("dfe_3t_st", q).await;
     assert_differential_mode(&db, "dfe_3t_st").await;
 }
+
+// ═══════════════════════════════════════════════════════════════════════
+// LATERAL SUBQUERY
+// ═══════════════════════════════════════════════════════════════════════
+
+#[tokio::test]
+async fn test_diff_full_equivalence_lateral_subquery() {
+    let db = E2eDb::new().await.with_extension().await;
+    db.execute("CREATE TABLE dfe_lat_dept (id INT PRIMARY KEY, name TEXT)")
+        .await;
+    db.execute(
+        "CREATE TABLE dfe_lat_emp (id INT PRIMARY KEY, dept_id INT, salary INT, emp_name TEXT)",
+    )
+    .await;
+    db.execute("INSERT INTO dfe_lat_dept VALUES (1,'Eng'),(2,'Sales'),(3,'HR')")
+        .await;
+    db.execute(
+        "INSERT INTO dfe_lat_emp VALUES \
+         (10,1,100,'Alice'),(11,1,120,'Bob'),(12,2,90,'Carol'),\
+         (13,2,110,'Dave'),(14,3,80,'Eve')",
+    )
+    .await;
+
+    let q = "SELECT d.name, top.emp_name, top.salary \
+             FROM dfe_lat_dept d, \
+             LATERAL (SELECT e.emp_name, e.salary \
+                      FROM dfe_lat_emp e \
+                      WHERE e.dept_id = d.id \
+                      ORDER BY e.salary DESC LIMIT 2) top";
+    db.create_st("dfe_lat_st", q, "1m", "DIFFERENTIAL").await;
+    db.assert_st_matches_query("dfe_lat_st", q).await;
+    assert_differential_mode(&db, "dfe_lat_st").await;
+
+    // Cycle 1: INSERT new high-salary employee → enters top-2
+    db.execute("INSERT INTO dfe_lat_emp VALUES (15,1,200,'Frank')")
+        .await;
+    db.refresh_st("dfe_lat_st").await;
+    db.assert_st_matches_query("dfe_lat_st", q).await;
+    assert_differential_mode(&db, "dfe_lat_st").await;
+
+    // Cycle 2: UPDATE salary → reorder within department
+    db.execute("UPDATE dfe_lat_emp SET salary = 300 WHERE id = 14")
+        .await;
+    db.refresh_st("dfe_lat_st").await;
+    db.assert_st_matches_query("dfe_lat_st", q).await;
+    assert_differential_mode(&db, "dfe_lat_st").await;
+
+    // Cycle 3: DELETE top employee from Eng → next one enters
+    db.execute("DELETE FROM dfe_lat_emp WHERE id = 15").await;
+    db.refresh_st("dfe_lat_st").await;
+    db.assert_st_matches_query("dfe_lat_st", q).await;
+    assert_differential_mode(&db, "dfe_lat_st").await;
+
+    // Cycle 4: INSERT + DELETE in same cycle
+    db.execute("INSERT INTO dfe_lat_emp VALUES (16,3,150,'Grace')")
+        .await;
+    db.execute("DELETE FROM dfe_lat_emp WHERE id = 12").await;
+    db.refresh_st("dfe_lat_st").await;
+    db.assert_st_matches_query("dfe_lat_st", q).await;
+    assert_differential_mode(&db, "dfe_lat_st").await;
+
+    // Cycle 5: UPDATE department → employee moves between departments
+    db.execute("UPDATE dfe_lat_emp SET dept_id = 2 WHERE id = 10")
+        .await;
+    db.refresh_st("dfe_lat_st").await;
+    db.assert_st_matches_query("dfe_lat_st", q).await;
+    assert_differential_mode(&db, "dfe_lat_st").await;
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// TopK (ORDER BY + LIMIT)
+// ═══════════════════════════════════════════════════════════════════════
+
+#[tokio::test]
+async fn test_diff_full_equivalence_topk() {
+    let db = E2eDb::new().await.with_extension().await;
+    db.execute("CREATE TABLE dfe_topk (id INT PRIMARY KEY, score INT, label TEXT)")
+        .await;
+    db.execute(
+        "INSERT INTO dfe_topk VALUES \
+         (1,50,'a'),(2,30,'b'),(3,90,'c'),(4,10,'d'),(5,70,'e'),(6,80,'f')",
+    )
+    .await;
+
+    let q = "SELECT id, score, label FROM dfe_topk ORDER BY score DESC LIMIT 3";
+    db.create_st("dfe_topk_st", q, "1m", "DIFFERENTIAL").await;
+    db.assert_st_matches_query("dfe_topk_st", q).await;
+    assert_differential_mode(&db, "dfe_topk_st").await;
+
+    // Cycle 1: INSERT new row that enters top-3
+    db.execute("INSERT INTO dfe_topk VALUES (7,95,'g')").await;
+    db.refresh_st("dfe_topk_st").await;
+    db.assert_st_matches_query("dfe_topk_st", q).await;
+    assert_differential_mode(&db, "dfe_topk_st").await;
+
+    // Cycle 2: UPDATE score of non-top row to make it enter top-3
+    db.execute("UPDATE dfe_topk SET score = 100 WHERE id = 4")
+        .await;
+    db.refresh_st("dfe_topk_st").await;
+    db.assert_st_matches_query("dfe_topk_st", q).await;
+    assert_differential_mode(&db, "dfe_topk_st").await;
+
+    // Cycle 3: DELETE a top-3 row → next one enters
+    db.execute("DELETE FROM dfe_topk WHERE id = 4").await;
+    db.refresh_st("dfe_topk_st").await;
+    db.assert_st_matches_query("dfe_topk_st", q).await;
+    assert_differential_mode(&db, "dfe_topk_st").await;
+
+    // Cycle 4: UPDATE score of top row to drop below threshold
+    db.execute("UPDATE dfe_topk SET score = 1 WHERE id = 7")
+        .await;
+    db.refresh_st("dfe_topk_st").await;
+    db.assert_st_matches_query("dfe_topk_st", q).await;
+    assert_differential_mode(&db, "dfe_topk_st").await;
+
+    // Cycle 5: mixed INSERT + DELETE
+    db.execute("INSERT INTO dfe_topk VALUES (8,85,'h')").await;
+    db.execute("DELETE FROM dfe_topk WHERE id = 3").await;
+    db.refresh_st("dfe_topk_st").await;
+    db.assert_st_matches_query("dfe_topk_st", q).await;
+    assert_differential_mode(&db, "dfe_topk_st").await;
+}

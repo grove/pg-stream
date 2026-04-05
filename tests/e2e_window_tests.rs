@@ -919,3 +919,113 @@ async fn test_window_with_nulls() {
 
     db.assert_st_matches_query("window_null_st", q).await;
 }
+
+// ── TG2-WIN: LAG / LEAD differential tests ───────────────────────────
+
+#[tokio::test]
+async fn test_window_lag_differential() {
+    let db = E2eDb::new().await.with_extension().await;
+    db.execute(
+        "CREATE TABLE wf_lag (id SERIAL PRIMARY KEY, dept TEXT NOT NULL, salary INT NOT NULL)",
+    )
+    .await;
+    db.execute(
+        "INSERT INTO wf_lag (dept, salary) VALUES
+         ('eng', 100), ('eng', 80), ('sales', 90), ('sales', 70)",
+    )
+    .await;
+
+    let q = "SELECT dept, salary, LAG(salary) OVER (PARTITION BY dept ORDER BY salary DESC) AS prev_salary FROM wf_lag";
+    db.create_st("wf_lag_st", q, "1m", "DIFFERENTIAL").await;
+    db.assert_st_matches_query("wf_lag_st", q).await;
+
+    // INSERT: new row shifts LAG values
+    db.execute("INSERT INTO wf_lag (dept, salary) VALUES ('eng', 95)")
+        .await;
+    db.refresh_st("wf_lag_st").await;
+    db.assert_st_matches_query("wf_lag_st", q).await;
+
+    // UPDATE: change salary to shift ordering
+    db.execute("UPDATE wf_lag SET salary = 110 WHERE salary = 80")
+        .await;
+    db.refresh_st("wf_lag_st").await;
+    db.assert_st_matches_query("wf_lag_st", q).await;
+
+    // DELETE: remove a row, LAG recalculated
+    db.execute("DELETE FROM wf_lag WHERE salary = 95").await;
+    db.refresh_st("wf_lag_st").await;
+    db.assert_st_matches_query("wf_lag_st", q).await;
+}
+
+#[tokio::test]
+async fn test_window_lead_differential() {
+    let db = E2eDb::new().await.with_extension().await;
+    db.execute(
+        "CREATE TABLE wf_lead (id SERIAL PRIMARY KEY, dept TEXT NOT NULL, salary INT NOT NULL)",
+    )
+    .await;
+    db.execute(
+        "INSERT INTO wf_lead (dept, salary) VALUES
+         ('eng', 100), ('eng', 80), ('eng', 60), ('sales', 90)",
+    )
+    .await;
+
+    let q = "SELECT dept, salary, LEAD(salary) OVER (PARTITION BY dept ORDER BY salary DESC) AS next_salary FROM wf_lead";
+    db.create_st("wf_lead_st", q, "1m", "DIFFERENTIAL").await;
+    db.assert_st_matches_query("wf_lead_st", q).await;
+
+    // INSERT: new row into a different partition
+    db.execute("INSERT INTO wf_lead (dept, salary) VALUES ('sales', 70)")
+        .await;
+    db.refresh_st("wf_lead_st").await;
+    db.assert_st_matches_query("wf_lead_st", q).await;
+
+    // UPDATE: move row to new partition
+    db.execute("UPDATE wf_lead SET dept = 'sales' WHERE salary = 60")
+        .await;
+    db.refresh_st("wf_lead_st").await;
+    db.assert_st_matches_query("wf_lead_st", q).await;
+
+    // DELETE: remove top earner, LEAD shifts
+    db.execute("DELETE FROM wf_lead WHERE salary = 100").await;
+    db.refresh_st("wf_lead_st").await;
+    db.assert_st_matches_query("wf_lead_st", q).await;
+}
+
+#[tokio::test]
+async fn test_window_dense_rank_differential() {
+    let db = E2eDb::new().await.with_extension().await;
+    db.execute(
+        "CREATE TABLE wf_dr (id SERIAL PRIMARY KEY, dept TEXT NOT NULL, salary INT NOT NULL)",
+    )
+    .await;
+    db.execute(
+        "INSERT INTO wf_dr (dept, salary) VALUES
+         ('eng', 100), ('eng', 100), ('eng', 80), ('sales', 90), ('sales', 70)",
+    )
+    .await;
+
+    let q = "SELECT dept, salary, DENSE_RANK() OVER (PARTITION BY dept ORDER BY salary DESC) AS dr FROM wf_dr";
+    db.create_st("wf_dr_st", q, "1m", "DIFFERENTIAL").await;
+    db.assert_st_matches_query("wf_dr_st", q).await;
+
+    // INSERT: tied salary — DENSE_RANK should not increment
+    db.execute("INSERT INTO wf_dr (dept, salary) VALUES ('eng', 100)")
+        .await;
+    db.refresh_st("wf_dr_st").await;
+    db.assert_st_matches_query("wf_dr_st", q).await;
+
+    // UPDATE: break a tie
+    db.execute("UPDATE wf_dr SET salary = 90 WHERE dept = 'eng' AND salary = 80")
+        .await;
+    db.refresh_st("wf_dr_st").await;
+    db.assert_st_matches_query("wf_dr_st", q).await;
+
+    // DELETE: remove tied row
+    db.execute(
+        "DELETE FROM wf_dr WHERE id = (SELECT min(id) FROM wf_dr WHERE dept = 'eng' AND salary = 100)",
+    )
+    .await;
+    db.refresh_st("wf_dr_st").await;
+    db.assert_st_matches_query("wf_dr_st", q).await;
+}

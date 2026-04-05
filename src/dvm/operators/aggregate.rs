@@ -1650,7 +1650,15 @@ pub fn diff_aggregate(ctx: &mut DiffContext, op: &OpTree) -> Result<DiffResult, 
     };
 
     let mut merge_selects = Vec::new();
-    merge_selects.push(format!("{row_id_expr} AS __pgt_row_id"));
+    // Use the existing row ID from the target when the group already exists
+    // (LEFT JOIN hit), otherwise compute a hash from the group-by columns.
+    // This ensures the DVM-generated row IDs are compatible with however the
+    // initial FULL refresh assigned IDs (ROW_NUMBER vs hash), preventing
+    // duplicate-key violations when the aggregate fast-path (B-1) or MERGE
+    // tries to UPDATE/DELETE by __pgt_row_id.
+    merge_selects.push(format!(
+        "COALESCE(st.__pgt_row_id, {row_id_expr}) AS __pgt_row_id"
+    ));
 
     // Group columns
     for col in &group_output {

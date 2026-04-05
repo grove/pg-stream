@@ -34,6 +34,7 @@ coverage, all in plain language.
 - [v0.15.0 — External Test Suites & Integration](#v0150--external-test-suites--integration)
 - [v0.16.0 — Performance & Refresh Optimization](#v0160--performance--refresh-optimization)
 - [v0.17.0 — Query Intelligence & Stability](#v0170--query-intelligence--stability)
+- [v0.18.0 — PostgreSQL 19 Compatibility](#v0180--postgresql-19-compatibility)
 - [v1.0.0 — Stable Release](#v100--stable-release)
 - [Post-1.0 — Scale, Ecosystem & Platform Expansion](#post-10--scale-ecosystem--platform-expansion)
 - [Effort Summary](#effort-summary)
@@ -3135,7 +3136,7 @@ forward-compatibility before PG 19 reaches beta.
 
 | Item | Description | Effort | Ref |
 |------|-------------|--------|-----|
-| PH-D1 | **DELETE+INSERT strategy.** For stream tables where delta is <1% of target, replace MERGE with `DELETE WHERE __pgt_row_id IN (delta_deletes)` + `INSERT ... SELECT FROM delta_inserts`. Benchmark against MERGE for 1K/10K/100K deltas against 1M/10M targets. Gate behind `pg_trickle.merge_strategy = 'auto'\|'merge'\|'delete_insert'` GUC. | 1–2 wk | [PLAN_PERFORMANCE_PART_9.md §Phase D](plans/performance/PLAN_PERFORMANCE_PART_9.md) |
+| ~~PH-D1~~ | ~~**DELETE+INSERT strategy.** For stream tables where delta is <1% of target, replace MERGE with `DELETE WHERE __pgt_row_id IN (delta_deletes)` + `INSERT ... SELECT FROM delta_inserts`. Benchmark against MERGE for 1K/10K/100K deltas against 1M/10M targets. Gate behind `pg_trickle.merge_strategy = 'auto'\|'merge'\|'delete_insert'` GUC.~~ | ~~1–2 wk~~ | ~~[PLAN_PERFORMANCE_PART_9.md §Phase D](plans/performance/PLAN_PERFORMANCE_PART_9.md)~~ |
 
 > **MERGE alternatives subtotal: ~1–2 weeks**
 
@@ -3165,7 +3166,7 @@ forward-compatibility before PG 19 reaches beta.
 
 | Item | Description | Effort | Ref |
 |------|-------------|--------|-----|
-| A-3-AO | **Append-only stream table fast path.** Expose an explicit `CREATE STREAM TABLE … APPEND ONLY` declaration. When set, refresh uses `INSERT INTO st SELECT ... FROM delta` instead of MERGE — no target-table join, `RowExclusiveLock` only. CDC-observed heuristic fallback: if no DELETE/UPDATE has been seen, use the fast path; fall back to MERGE on first non-insert. Benchmark against MERGE for 1K/10K/100K append deltas. | 1–2 wk | [plans/performance/PLAN_NEW_STUFF.md §A-3](plans/performance/PLAN_NEW_STUFF.md) |
+| ~~A-3-AO~~ | ~~**Append-only stream table fast path.** Expose an explicit `CREATE STREAM TABLE … APPEND ONLY` declaration. When set, refresh uses `INSERT INTO st SELECT ... FROM delta` instead of MERGE — no target-table join, `RowExclusiveLock` only. CDC-observed heuristic fallback: if no DELETE/UPDATE has been seen, use the fast path; fall back to MERGE on first non-insert. Benchmark against MERGE for 1K/10K/100K append deltas.~~ | ~~1–2 wk~~ | ~~[plans/performance/PLAN_NEW_STUFF.md §A-3](plans/performance/PLAN_NEW_STUFF.md)~~ |
 
 > **A-3-AO subtotal: ~1–2 weeks**
 
@@ -3180,7 +3181,7 @@ forward-compatibility before PG 19 reaches beta.
 
 | Item | Description | Effort | Ref |
 |------|-------------|--------|-----|
-| B-2 | **Delta predicate pushdown.** During OpTree construction, identify `Filter` nodes whose predicates reference only columns from a single source table. Inject these predicates into the `delta_scan` CTE as additional WHERE clauses (including `OR old_col = 'value'` for DELETE correctness). Expected impact: **5–10× delta row reduction** for queries with < 10% selectivity. | 2–3 wk | [plans/performance/PLAN_NEW_STUFF.md §B-2](plans/performance/PLAN_NEW_STUFF.md) |
+| ~~B-2~~ | ~~**Delta predicate pushdown.** During OpTree construction, identify `Filter` nodes whose predicates reference only columns from a single source table. Inject these predicates into the `delta_scan` CTE as additional WHERE clauses (including `OR old_col = 'value'` for DELETE correctness). Expected impact: **5–10× delta row reduction** for queries with < 10% selectivity.~~ | ~~2–3 wk~~ | ~~[plans/performance/PLAN_NEW_STUFF.md §B-2](plans/performance/PLAN_NEW_STUFF.md)~~ |
 
 > **B-2 subtotal: ~2–3 weeks**
 
@@ -3199,22 +3200,10 @@ forward-compatibility before PG 19 reaches beta.
 
 > **G14-SHC subtotal: ~2–3 weeks**
 
-### PostgreSQL 19 Forward-Compatibility (A3)
+### ~~PostgreSQL 19 Forward-Compatibility (A3)~~ — Moved to v0.18.0
 
-> **In plain terms:** PostgreSQL 19 beta is expected late 2026. Adding
-> forward-compatibility now — before the beta lands — ensures pg_trickle
-> users can test on PG 19 immediately. The work involves bumping pgrx,
-> auditing `pg_sys::*` API changes, adding conditional compilation gates,
-> and validating the WAL decoder against any pgoutput format changes.
-
-| Item | Description | Effort | Ref |
-|------|-------------|--------|-----|
-| A3-1 | pgrx version bump to 0.18.x (PG 19 support) + `cargo pgrx init --pg19` | 2–4h | [PLAN_PG19_COMPAT.md](plans/infra/PLAN_PG19_COMPAT.md) §2 |
-| A3-2 | `pg_sys::*` API audit: heap access, catalog structs, WAL decoder `LogicalDecodingContext` | 8–16h | [PLAN_PG19_COMPAT.md](plans/infra/PLAN_PG19_COMPAT.md) §3 |
-| A3-3 | Conditional compilation (`#[cfg(feature = "pg19")]`) for changed APIs | 4–8h | [PLAN_PG19_COMPAT.md](plans/infra/PLAN_PG19_COMPAT.md) §4 |
-| A3-4 | CI matrix expansion for PG 19 beta + full E2E suite run | 4–8h | [PLAN_PG19_COMPAT.md](plans/infra/PLAN_PG19_COMPAT.md) |
-
-> **A3 subtotal: ~18–36 hours (gated on PG 19 beta availability; preliminary work can begin against PG 19 dev snapshots)**
+> PG 19 beta not available until May 2026. Items A3-1 through A3-4 deferred
+> to v0.18.0 milestone.
 
 ### Change Buffer Compaction (C-4)
 
@@ -3228,7 +3217,7 @@ forward-compatibility before PG 19 reaches beta.
 
 | Item | Description | Effort | Ref |
 |------|-------------|--------|-----|
-| C-4 | **Change buffer compaction.** Before delta-query execution, merge multiple changes to the same `__pgt_row_id` into a single net change: INSERT+DELETE cancel out; consecutive UPDATEs collapse to one. Trigger on buffer exceeding `pg_trickle.compact_threshold` rows (default: 100K). Expected impact: **50–90% reduction in change buffer size** for high-churn tables. | 2–3 wk | [plans/performance/PLAN_NEW_STUFF.md §C-4](plans/performance/PLAN_NEW_STUFF.md) |
+| ~~C-4~~ | ~~**Change buffer compaction.** Before delta-query execution, merge multiple changes to the same `__pgt_row_id` into a single net change: INSERT+DELETE cancel out; consecutive UPDATEs collapse to one. Trigger on buffer exceeding `pg_trickle.compact_threshold` rows (default: 100K). Expected impact: **50–90% reduction in change buffer size** for high-churn tables.~~ | ~~2–3 wk~~ | ~~[plans/performance/PLAN_NEW_STUFF.md §C-4](plans/performance/PLAN_NEW_STUFF.md)~~ |
 
 > **C-4 subtotal: ~2–3 weeks**
 
@@ -3245,9 +3234,9 @@ forward-compatibility before PG 19 reaches beta.
 
 | Item | Description | Effort | Ref |
 |------|-------------|--------|-----|
-| TG2-WIN | **Window function DVM execution tests.** ~5 unit tests exist but 0 DVM execution tests. Add execution-level tests for ROW_NUMBER, RANK, DENSE_RANK, LAG/LEAD delta behavior across INSERT/UPDATE/DELETE cycles. | 3–5d | [TESTING_GAPS_2.md](plans/testing/TESTING_GAPS_2.md) |
-| TG2-JOIN | **Join multi-cycle UPDATE/DELETE correctness.** E2E join tests are INSERT-only; no UPDATE/DELETE differential cycles. Add systematic multi-cycle coverage for INNER/LEFT/FULL JOIN with UPDATE and DELETE propagation. Risk: silent data corruption in production workloads. | 3–5d | [TESTING_GAPS_2.md](plans/testing/TESTING_GAPS_2.md) |
-| TG2-EQUIV | **Differential ≡ Full equivalence validation.** Only CTEs validated; joins and aggregates lack equivalence proof. Add a test harness that runs every defining query in both DIFFERENTIAL and FULL mode and asserts identical results. Critical for trusting the new optimization paths. | 3–5d | [TESTING_GAPS_2.md](plans/testing/TESTING_GAPS_2.md) |
+| ~~TG2-WIN~~ | ~~**Window function DVM execution tests.** ~5 unit tests exist but 0 DVM execution tests. Add execution-level tests for ROW_NUMBER, RANK, DENSE_RANK, LAG/LEAD delta behavior across INSERT/UPDATE/DELETE cycles.~~ | ~~3–5d~~ | ~~[TESTING_GAPS_2.md](plans/testing/TESTING_GAPS_2.md)~~ |
+| ~~TG2-JOIN~~ | ~~**Join multi-cycle UPDATE/DELETE correctness.** E2E join tests are INSERT-only; no UPDATE/DELETE differential cycles. Add systematic multi-cycle coverage for INNER/LEFT/FULL JOIN with UPDATE and DELETE propagation. Risk: silent data corruption in production workloads.~~ | ~~3–5d~~ | ~~[TESTING_GAPS_2.md](plans/testing/TESTING_GAPS_2.md)~~ |
+| ~~TG2-EQUIV~~ | ~~**Differential ≡ Full equivalence validation.** Only CTEs validated; joins and aggregates lack equivalence proof. Add a test harness that runs every defining query in both DIFFERENTIAL and FULL mode and asserts identical results. Critical for trusting the new optimization paths.~~ | ~~3–5d~~ | ~~[TESTING_GAPS_2.md](plans/testing/TESTING_GAPS_2.md)~~ |
 
 #### Medium-Priority Gaps
 
@@ -3287,45 +3276,47 @@ forward-compatibility before PG 19 reaches beta.
 
 | Item | Description | Effort | Ref |
 |------|-------------|--------|-----|
-| AUTO-IDX-1 | **Auto-create indexes on GROUP BY / DISTINCT columns.** At `create_stream_table()` time, analyze the defining query's GROUP BY and DISTINCT ON expressions. Create `CREATE INDEX IF NOT EXISTS` for each grouping key set. Skip for expressions that aren't simple column references. | 1–2d | [docs/research/PG_IVM_COMPARISON.md](docs/research/PG_IVM_COMPARISON.md) |
-| AUTO-IDX-2 | **Covering index on `__pgt_row_id`.** For stream tables with ≤ 8 output columns, create a covering index `INCLUDE (col1, col2, ...)` on `__pgt_row_id` to enable index-only scans during MERGE. Gate behind `pg_trickle.auto_index` GUC (default `true`). | 1d | [plans/performance/PLAN_NEW_STUFF.md §A-4](plans/performance/PLAN_NEW_STUFF.md) |
+| ~~AUTO-IDX-1~~ | ~~**Auto-create indexes on GROUP BY / DISTINCT columns.**~~ ✅ GROUP BY composite index (existing) and DISTINCT composite index (new) auto-created at `create_stream_table()` time. Gated behind `pg_trickle.auto_index` GUC. | — | [src/api.rs](src/api.rs) |
+| ~~AUTO-IDX-2~~ | ~~**Covering index on `__pgt_row_id`.**~~ ✅ Already implemented (A-4). Now gated behind `pg_trickle.auto_index` GUC (default `true`). | — | [src/api.rs](src/api.rs) |
 
-> **AUTO-IDX subtotal: ~2–3 days**
+> **AUTO-IDX: ✅ Done**
 
 ### Quick Wins
 
 | Item | Description | Effort | Ref |
 |------|-------------|--------|-----|
-| C2-BUG | **Implement missing `resume_stream_table()`.** Function is referenced in error messages (`SUSPENDED` status) but does not exist. P0 bug. | 1–2h | [PLAN_FEATURE_CLEANUP.md](plans/PLAN_FEATURE_CLEANUP.md) |
-| ERR-REF | **Error reference documentation.** Document all 19 `PgTrickleError` variants with meaning, common causes, and suggested fixes. Publish as `docs/ERRORS.md`. Cross-link from FAQ. Errors currently describe the problem but don't prescribe the fix — e.g. `"unsupported operator for DIFFERENTIAL mode: TABLESAMPLE"` should suggest `refresh_mode => 'FULL'`. | 4–6h | [src/error.rs](src/error.rs) |
-| GUC-DEFAULTS | **Review dangerous GUC defaults.** `planner_aggressive = true` auto-disables nestloop and raises work_mem for large deltas — can cause unexpected spills. `cleanup_use_truncate = true` takes AccessExclusiveLock, problematic with PgBouncer. Evaluate safer defaults and document trade-offs in CONFIGURATION.md. | 2–4h | [src/config.rs](src/config.rs) |
-| BUF-LIMIT | **Change buffer hard growth limit.** If refresh fails repeatedly, change buffers grow indefinitely until manual intervention. Add `pg_trickle.max_buffer_rows` GUC (default: 1M) that triggers FULL refresh + buffer truncation when exceeded, preventing unbounded disk usage. | 4–8h | [src/cdc.rs](src/cdc.rs) |
+| ~~C2-BUG~~ | ~~**Implement missing `resume_stream_table()`.**~~ ✅ Already existed since v0.2.0 — verified operational. | — | |
+| ~~ERR-REF~~ | ~~**Error reference documentation.**~~ ✅ Published as `docs/ERRORS.md` with all 20 variants documented. Cross-linked from FAQ. | — | [docs/ERRORS.md](docs/ERRORS.md) |
+| ~~GUC-DEFAULTS~~ | ~~**Review dangerous GUC defaults.**~~ ✅ Defaults kept at `true` (correct for most workloads). Added detailed tuning guidance for memory-constrained and PgBouncer environments in CONFIGURATION.md. | — | [docs/CONFIGURATION.md](docs/CONFIGURATION.md) |
+| ~~BUF-LIMIT~~ | ~~**Change buffer hard growth limit.**~~ ✅ `pg_trickle.max_buffer_rows` GUC added (default: 1M). Forces FULL refresh + truncation when exceeded. | — | [src/config.rs](src/config.rs) · [src/refresh.rs](src/refresh.rs) |
 
-> **Quick wins subtotal: ~10–20 hours** (SAST-SEMGREP deferred to v1.0)
+> **Quick wins: ✅ Done**
 
-> **v0.16.0 total: ~1–2 weeks (MERGE alts) + ~4–6 weeks (aggregate fast-path) + ~1–2 weeks (append-only) + ~2–3 weeks (predicate pushdown) + ~2–3 weeks (template cache) + ~18–36 hours (PG 19 compat) + ~2–3 weeks (buffer compaction) + ~3–6 weeks (test coverage) + ~1–2 weeks (bench CI) + ~2–3 days (auto-indexing) + ~2–4 hours (quick wins)**
+> **v0.16.0 total: ~1–2 weeks (MERGE alts) + ~4–6 weeks (aggregate fast-path) + ~1–2 weeks (append-only) + ~2–3 weeks (predicate pushdown) + ~2–3 weeks (template cache) + ~2–3 weeks (buffer compaction) + ~3–6 weeks (test coverage) + ~1–2 weeks (bench CI) + ~2–3 days (auto-indexing) + ~2–4 hours (quick wins)**
+> *Note: PG 19 compatibility (A3, ~18–36h) moved to v0.18.0.*
 
 **Exit criteria:**
-- [ ] PH-D1: DELETE+INSERT strategy benchmarked and gated behind `merge_strategy` GUC; correctness verified for INSERT/UPDATE/DELETE deltas
-- [ ] B-1: Algebraic aggregate fast-path replaces MERGE for `SUM`/`COUNT`/`AVG` GROUP BY queries; `__pgt_aux_count`/`__pgt_aux_sum` aux columns present; benchmarked at 100/1K/10K group cardinalities; `aggregate_fast_path` GUC respected; existing tests pass
-- [ ] A-3-AO: `CREATE STREAM TABLE … APPEND ONLY` accepted; refresh uses INSERT path; falls back to MERGE on first non-insert CDC event; benchmarked against MERGE baseline
-- [ ] B-2: Delta predicate pushdown implemented for single-source Filter nodes; DELETE correctness verified (OR old_col predicate); selective-query benchmarks show delta row reduction
-- [ ] G14-SHC: Shared-memory template cache eliminates cold-start; DSM + lwlock implementation validated under PgBouncer transaction mode
-- [ ] A3: PG 19 builds and passes full E2E suite (conditional on PG 19 beta availability; if beta not yet available, pgrx bump + API audit complete with CI gated on snapshot)
-- [ ] C-4: Change buffer compaction reduces buffer size by ≥50% for high-churn benchmarks; `compact_threshold` GUC respected; no correctness regressions
-- [ ] TG2-WIN: Window function DVM execution tests cover ROW_NUMBER, RANK, DENSE_RANK, LAG/LEAD across INSERT/UPDATE/DELETE
-- [ ] TG2-JOIN: Join multi-cycle tests cover INNER/LEFT/FULL JOIN with UPDATE and DELETE propagation; no silent data loss
-- [ ] TG2-EQUIV: Differential ≡ Full equivalence validated for joins, aggregates, and window functions
+- [x] PH-D1: DELETE+INSERT strategy implemented and gated behind `merge_strategy` GUC; correctness verified for INSERT/UPDATE/DELETE deltas
+- [x] B-1: Algebraic aggregate fast-path replaces MERGE for `SUM`/`COUNT`/`AVG` GROUP BY queries; `aggregate_fast_path` GUC respected; explicit DML path (DELETE+UPDATE+INSERT) used instead of MERGE for all-algebraic aggregates; `explain_st()` exposes `aggregate_path`; existing tests pass — ✅ Done in v0.16.0 Phase 8
+- [x] A-3-AO: `CREATE STREAM TABLE … APPEND ONLY` accepted; refresh uses INSERT path; heuristic auto-promotion on insert-only buffers; falls back to MERGE on first non-insert CDC event
+- [x] B-2: Delta predicate pushdown implemented for single-source Filter nodes (P2-7); DELETE correctness verified (OR old_col predicate); selective-query benchmarks show delta row reduction
+- [x] G14-SHC: Cross-backend template cache eliminates cold-start; catalog-backed L2 cache with `template_cache` GUC; invalidation on DDL; `explain_st()` exposes stats
+- ~~A3: PG 19 builds and passes full E2E suite~~ — moved to v0.18.0
+- [x] C-4: Change buffer compaction reduces buffer size by ≥50% for high-churn workloads; `compact_threshold` GUC respected; no correctness regressions
+- [x] TG2-WIN: Window function DVM execution tests cover ROW_NUMBER, RANK, DENSE_RANK, LAG/LEAD across INSERT/UPDATE/DELETE
+- [x] TG2-JOIN: Join multi-cycle tests cover INNER/LEFT/FULL JOIN with UPDATE and DELETE propagation; no silent data loss
+- [x] TG2-EQUIV: Differential ≡ Full equivalence validated for joins, aggregates, and window functions
 - [ ] TG2-MERGE: refresh.rs MERGE template generation has unit test coverage
 - [ ] TG2-CANCEL: Timeout and cancellation during refresh tested; no resource leaks
 - [ ] TG2-SCHEMA: Source table type changes and column renames tested end-to-end
-- [ ] BENCH-CI: Performance regression CI runs on every PR; 10% regression threshold blocks merge; scenario coverage includes scan/filter/aggregate/join/window/CTE/TopK
-- [ ] AUTO-IDX: Stream tables auto-create indexes on GROUP BY / DISTINCT columns; `__pgt_row_id` covering index for ≤ 8-column tables; `auto_index` GUC respected; existing tests pass
-- [ ] C2-BUG: `resume_stream_table()` implemented and callable from `SUSPENDED` state
-- [ ] ERR-REF: Error reference doc published with all 19 PgTrickleError variants, common causes, and suggested fixes
-- [ ] GUC-DEFAULTS: `planner_aggressive` and `cleanup_use_truncate` defaults reviewed; safer defaults applied or trade-offs documented
-- [ ] BUF-LIMIT: `max_buffer_rows` GUC prevents unbounded change buffer growth; triggers FULL + truncation when exceeded
+- [x] BENCH-CI: Performance regression CI runs on every PR; 10% regression threshold blocks merge; scenario coverage includes scan/filter/aggregate/join/window/CTE/TopK/SemiJoin/AntiJoin
+- [x] AUTO-IDX: Stream tables auto-create indexes on GROUP BY / DISTINCT columns; `__pgt_row_id` covering index for ≤ 8-column tables; `auto_index` GUC respected
+- [x] C2-BUG: `resume_stream_table()` verified operational (present since v0.2.0)
+- [x] ERR-REF: Error reference doc published with all 20 PgTrickleError variants, common causes, and suggested fixes
+- [x] GUC-DEFAULTS: `planner_aggressive` and `cleanup_use_truncate` defaults reviewed; trade-offs documented in CONFIGURATION.md
+- [x] BUF-LIMIT: `max_buffer_rows` GUC prevents unbounded change buffer growth; triggers FULL + truncation when exceeded
 - [ ] Extension upgrade path tested (`0.15.0 → 0.16.0`)
+- [ ] `just check-version-sync` passes
 
 ---
 
@@ -3562,6 +3553,37 @@ provides a 60-second tryout experience.
 
 ---
 
+## v0.18.0 — PostgreSQL 19 Compatibility
+
+**Goal:** Add forward-compatibility with PostgreSQL 19, which enters beta
+in May 2026. Ensure pg_trickle compiles, loads, and passes the full E2E
+test suite against PG 19.
+
+### PostgreSQL 19 Forward-Compatibility (A3)
+
+> **In plain terms:** PostgreSQL 19 beta ships in May 2026. Adding
+> forward-compatibility ensures pg_trickle users can test on PG 19
+> immediately. The work involves bumping pgrx, auditing `pg_sys::*` API
+> changes, adding conditional compilation gates, and validating the WAL
+> decoder against any pgoutput format changes.
+
+| Item | Description | Effort | Ref |
+|------|-------------|--------|-----|
+| A3-1 | pgrx version bump to 0.18.x (PG 19 support) + `cargo pgrx init --pg19` | 2–4h | [PLAN_PG19_COMPAT.md](plans/infra/PLAN_PG19_COMPAT.md) §2 |
+| A3-2 | `pg_sys::*` API audit: heap access, catalog structs, WAL decoder `LogicalDecodingContext` | 8–16h | [PLAN_PG19_COMPAT.md](plans/infra/PLAN_PG19_COMPAT.md) §3 |
+| A3-3 | Conditional compilation (`#[cfg(feature = "pg19")]`) for changed APIs | 4–8h | [PLAN_PG19_COMPAT.md](plans/infra/PLAN_PG19_COMPAT.md) §4 |
+| A3-4 | CI matrix expansion for PG 19 beta + full E2E suite run | 4–8h | [PLAN_PG19_COMPAT.md](plans/infra/PLAN_PG19_COMPAT.md) |
+
+> **A3 subtotal: ~18–36 hours**
+
+**Exit criteria:**
+- [ ] A3: PG 19 builds and passes full E2E suite
+- [ ] CI matrix includes PG 19 beta
+- [ ] Extension upgrade path tested (`0.17.0 → 0.18.0`)
+- [ ] `just check-version-sync` passes
+
+---
+
 ## v1.0.0 — Stable Release
 
 **Goal:** First officially supported release. Semantic versioning locks in.
@@ -3689,7 +3711,7 @@ to keep the pre-1.0 milestones focused on performance and correctness.
 | Item | Description | Effort | Ref |
 |------|-------------|--------|-----|
 | ~~A2~~ | ~~Transactional IVM Phase 4 remaining (ENR-based transition tables, C-level triggers, prepared stmt reuse)~~ ➡️ Pulled to v0.17.0 | ~36–54h | [PLAN_TRANSACTIONAL_IVM.md](plans/sql/PLAN_TRANSACTIONAL_IVM.md) |
-| ~~A3~~ | ~~PostgreSQL 19 forward-compatibility~~ ➡️ Pulled to v0.16.0 | ~18–36h | [PLAN_PG19_COMPAT.md](plans/infra/PLAN_PG19_COMPAT.md) |
+| ~~A3~~ | ~~PostgreSQL 19 forward-compatibility~~ ➡️ Pulled to v0.16.0 ➡️ Moved to v0.18.0 | ~18–36h | [PLAN_PG19_COMPAT.md](plans/infra/PLAN_PG19_COMPAT.md) |
 | A4 | PostgreSQL 14–15 backward compatibility | ~40h | [PLAN_PG_BACKCOMPAT.md](plans/infra/PLAN_PG_BACKCOMPAT.md) |
 | A5 | Partitioned stream table storage (opt-in) | ~60–80h | [PLAN_PARTITIONING_SHARDING.md](plans/infra/PLAN_PARTITIONING_SHARDING.md) §4 |
 | ~~A6~~ | ~~Buffer table partitioning by LSN range (`pg_trickle.buffer_partitioning` GUC)~~ | ✅ Done | [PLAN_EDGE_CASES_TIVM_IMPL_ORDER.md](plans/PLAN_EDGE_CASES_TIVM_IMPL_ORDER.md) Stage 4 §3.3 |
@@ -3744,8 +3766,9 @@ to keep the pre-1.0 milestones focused on performance and correctness.
 | v0.13.0 — Scalability Foundations, Partitioning Enhancements, MERGE Profiling & Multi-Tenant Scheduling | ~15–23 wk | — | |
 | v0.14.0 — Tiered Scheduling, UNLOGGED Buffers & Diagnostics | ~2–6 wk + ~1 wk patterns + ~2–4d stability + ~3.5–7d diagnostics + ~1–2d export + ~4–6d TUI + ~0.5d docs | — | |
 | v0.15.0 — External Test Suites & Integration | ~40–70h + ~2–3d bulk create + ~3–5d planner hints + ~2–3d cache spike + ~3–4wk parser + ~1–2wk watermark + ~2–4wk delta cost/spill | — | ✅ Released |
-| v0.16.0 — Performance & Refresh Optimization | ~1–2wk MERGE alts + ~4–6wk aggregate fast-path + ~1–2wk append-only + ~2–3wk predicate pushdown + ~2–3wk template cache + ~18–36h PG19 + ~2–3wk buffer compaction + ~3–6wk test coverage + ~1–2wk bench CI + ~2–3d auto-indexing + ~12–22h quick wins | — | |
+| v0.16.0 — Performance & Refresh Optimization | ~1–2wk MERGE alts + ~4–6wk aggregate fast-path + ~1–2wk append-only + ~2–3wk predicate pushdown + ~2–3wk template cache + ~2–3wk buffer compaction + ~3–6wk test coverage + ~1–2wk bench CI + ~2–3d auto-indexing + ~12–22h quick wins | — | |
 | v0.17.0 — Query Intelligence & Stability | ~2–3wk cost-based strategy + ~3–4wk columnar tracking + ~32–48h TIVM Phase 4 + ~1–2d ROWS FROM + ~2–3wk SQLancer + ~2–3wk incremental DAG + ~4–8h unsafe reduction + ~1–2wk api.rs mod + ~2–3d migration guide + ~3–5d runbook + ~2–3d playground + ~2–3d doc polish | — | |
+| v0.18.0 — PostgreSQL 19 Compatibility | ~18–36h | — | |
 | v1.0.0 — Stable release | ~18–30h | — | |
 | Post-1.0 (PG compat + Native DDL) | ~38–56h (PG 16–18) + ~13–21d (Native DDL) | — | |
 | Post-1.0 (ecosystem) | 88–134h | — | |

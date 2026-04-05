@@ -26,6 +26,8 @@ Complete reference for all pg_trickle GUC (Grand Unified Configuration) variable
     - [pg\_trickle.max\_delta\_estimate\_rows](#pg_tricklemax_delta_estimate_rows)
     - [pg\_trickle.planner\_aggressive](#pg_trickleplanner_aggressive)
     - [pg\_trickle.merge\_join\_strategy](#pg_tricklemerge_join_strategy)
+    - [pg\_trickle.merge\_strategy](#pg_tricklemerge_strategy)
+    - [pg\_trickle.merge\_strategy\_threshold](#pg_tricklemerge_strategy_threshold)
     - [pg\_trickle.merge\_planner\_hints](#pg_tricklemerge_planner_hints) *(deprecated)*
     - [pg\_trickle.merge\_work\_mem\_mb](#pg_tricklemerge_work_mem_mb)
     - [pg\_trickle.merge\_seqscan\_threshold](#pg_tricklemerge_seqscan_threshold)
@@ -38,6 +40,10 @@ Complete reference for all pg_trickle GUC (Grand Unified Configuration) variable
     - [pg\_trickle.block\_source\_ddl](#pg_trickleblock_source_ddl)
     - [pg\_trickle.buffer\_alert\_threshold](#pg_tricklebuffer_alert_threshold)
     - [pg\_trickle.compact\_threshold](#pg_tricklecompact_threshold)
+    - [pg\_trickle.max\_buffer\_rows](#pg_tricklemax_buffer_rows)
+    - [pg\_trickle.auto\_index](#pg_trickleauto_index)
+    - [pg\_trickle.aggregate\_fast\_path](#pg_trickleaggregate_fast_path)
+    - [pg\_trickle.template\_cache](#pg_trickletemplate_cache)
     - [pg\_trickle.buffer\_partitioning](#pg_tricklebuffer_partitioning)
     - [pg\_trickle.max\_grouping\_set\_branches](#pg_tricklemax_grouping_set_branches)
     - [pg\_trickle.max\_parse\_depth](#pg_tricklemax_parse_depth)
@@ -473,6 +479,7 @@ After a differential refresh consumes all rows from the change buffer, the engin
 **Tuning Guidance:**
 - **Most workloads**: Leave at `true` — the performance benefit outweighs the brief lock.
 - **High-concurrency OLTP** with continuous writes during refresh: Set to `false` if you observe lock-wait timeouts on the change buffer.
+- **PgBouncer / connection poolers**: The `AccessExclusiveLock` acquired by `TRUNCATE` is held only on the change buffer table (not the source table), but in transaction-pooling mode with frequent refreshes, even brief exclusive locks can cause connection queuing. If you observe elevated `pg_stat_activity` wait events on change buffer tables, switch to `false`.
 
 ```sql
 -- Use per-row DELETE for change buffer cleanup
@@ -499,6 +506,7 @@ When enabled, the refresh executor estimates the delta size and applies optimize
 **Tuning Guidance:**
 - **Most workloads**: Leave at `true` — the hints improve tail latency without affecting small deltas.
 - **Custom plan overrides**: Set to `false` if you manage planner settings yourself or if the hints conflict with your `pg_hint_plan` configuration.
+- **Memory-constrained environments**: When enabled, large deltas (≥ 10,000 rows) raise `work_mem` to 64 MB (configurable via [`merge_work_mem_mb`](#pg_tricklemerge_work_mem_mb)). If your server has limited RAM and runs many concurrent refreshes, this can cause unexpected memory pressure or temp-file spills. Monitor `temp_blks_written` in `pg_stat_statements` and consider lowering `merge_work_mem_mb` or disabling this GUC if spills are frequent.
 
 ```sql
 -- Disable all planner hints
@@ -539,6 +547,72 @@ SET pg_trickle.merge_join_strategy = 'hash_join';
 
 -- Revert to automatic heuristics
 SET pg_trickle.merge_join_strategy = 'auto';
+```
+
+---
+
+### pg_trickle.merge_strategy
+
+*Added in v0.16.0.* Controls how differential refresh applies deltas to stream tables.
+
+| Property | Value |
+|---|---|
+| Type | `text` |
+| Default | `'auto'` |
+| Values | `auto`, `merge`, `delete_insert` |
+| Context | `SUSET` |
+| Restart Required | No |
+
+| Value | Behaviour |
+|---|---|
+| `auto` (default) | Use DELETE+INSERT when `delta_rows / target_rows` is below [`merge_strategy_threshold`](#pg_tricklemerge_strategy_threshold); MERGE otherwise |
+| `merge` | Always use the PostgreSQL MERGE statement |
+| `delete_insert` | Always use separate DELETE + INSERT statements |
+
+The DELETE+INSERT strategy avoids the MERGE join cost by executing two targeted statements:
+a DELETE for removed rows (matched by `__pgt_row_id`), then an INSERT for new rows.
+This is significantly cheaper for sub-1% deltas against large tables because it avoids
+scanning the entire target for the MERGE join.
+
+**Tuning Guidance:**
+- **Most workloads**: Leave at `auto` — the heuristic picks DELETE+INSERT for small deltas automatically.
+- **Append-heavy workloads**: Consider `delete_insert` if deltas are consistently tiny relative to the target.
+- **Correctness concerns**: The `merge` setting preserves the pre-v0.16.0 behaviour.
+
+```sql
+-- Force DELETE+INSERT for all differential refreshes
+SET pg_trickle.merge_strategy = 'delete_insert';
+
+-- Revert to automatic heuristics
+SET pg_trickle.merge_strategy = 'auto';
+```
+
+---
+
+### pg_trickle.merge_strategy_threshold
+
+*Added in v0.16.0.* Delta ratio threshold for the `auto` merge strategy.
+
+| Property | Value |
+|---|---|
+| Type | `float` |
+| Default | `0.01` (1%) |
+| Range | `0.001` – `1.0` |
+| Context | `SUSET` |
+| Restart Required | No |
+
+When [`merge_strategy`](#pg_tricklemerge_strategy) is `auto`, DELETE+INSERT is used instead of
+MERGE when `delta_rows / target_rows` is below this threshold. The target row count is estimated
+from `pg_class.reltuples`.
+
+**Tuning Guidance:**
+- **Default (0.01)**: DELETE+INSERT for deltas under 1% of the target table size.
+- **Higher values (0.05–0.10)**: More aggressive use of DELETE+INSERT; useful for wide tables where MERGE join overhead is high.
+- **Lower values (0.001)**: Only use DELETE+INSERT for very tiny deltas.
+
+```sql
+-- Use DELETE+INSERT for deltas under 5% of target size
+SET pg_trickle.merge_strategy_threshold = 0.05;
 ```
 
 ---
@@ -910,6 +984,155 @@ SET pg_trickle.compact_threshold = 50000;
 
 -- Disable compaction
 SET pg_trickle.compact_threshold = 0;
+```
+
+---
+
+### pg_trickle.max_buffer_rows
+
+*Added in v0.16.0.* Hard limit on change buffer rows per source table. When
+a source table's change buffer exceeds this limit at refresh time, pg_trickle
+forces a FULL refresh and truncates the buffer, preventing unbounded disk
+growth when differential refresh fails repeatedly.
+
+| Property | Value |
+|---|---|
+| Type | `integer` |
+| Default | `1000000` (1 million rows) |
+| Range | `0` – `100000000` |
+| Context | `SUSET` |
+| Restart Required | No |
+
+Set to `0` to disable the limit (not recommended for production).
+
+**Tuning Guidance:**
+- **Most workloads**: Leave at `1000000`. This accommodates high-throughput tables while preventing runaway growth.
+- **High-throughput event tables**: Raise to `5000000`–`10000000` if your source tables regularly accumulate large change buffers between refresh cycles.
+- **Small databases / tight disk budgets**: Lower to `100000`–`500000` to limit change buffer disk usage.
+
+```sql
+-- Set buffer limit to 5 million rows
+SET pg_trickle.max_buffer_rows = 5000000;
+
+-- Disable the limit (not recommended)
+SET pg_trickle.max_buffer_rows = 0;
+```
+
+---
+
+### pg_trickle.auto_index
+
+*Added in v0.16.0.* Controls whether `create_stream_table()` automatically
+creates performance indexes on stream tables.
+
+| Property | Value |
+|---|---|
+| Type | `bool` |
+| Default | `true` |
+| Context | `SUSET` |
+| Restart Required | No |
+
+When enabled, the following indexes are created automatically:
+
+1. **GROUP BY composite index** — for aggregate queries in DIFFERENTIAL mode,
+   a composite index on the GROUP BY columns is created to speed up group
+   lookups during MERGE.
+
+2. **DISTINCT composite index** — for DISTINCT queries with ≤ 8 output columns,
+   a composite index on all output columns is created.
+
+3. **Covering `__pgt_row_id` index** — for stream tables with ≤ 8 output
+   columns, the `__pgt_row_id` index includes all user columns via `INCLUDE`,
+   enabling index-only scans during MERGE (20–50% faster for small deltas
+   against large targets).
+
+The `__pgt_row_id` index itself is always created regardless of this setting
+(it is required for correctness).
+
+**Tuning Guidance:**
+- **Most workloads**: Leave at `true`.
+- **Custom index strategies**: Set to `false` if you prefer to manage indexes
+  manually or if the auto-created indexes conflict with your workload patterns.
+
+```sql
+-- Disable automatic index creation
+SET pg_trickle.auto_index = false;
+```
+
+---
+
+### pg_trickle.aggregate_fast_path
+
+*Added in v0.16.0.* Controls whether stream tables with all-algebraic
+aggregates use the explicit DML fast-path instead of MERGE.
+
+| Property | Value |
+|---|---|
+| Type | `bool` |
+| Default | `true` |
+| Context | `SUSET` |
+| Restart Required | No |
+
+When enabled, stream tables whose aggregates are all algebraically invertible
+(COUNT, SUM, AVG, STDDEV, VAR, CORR, REGR_*, etc.) use the explicit DML path
+(DELETE + UPDATE + INSERT via a materialized temp table) instead of the generic
+MERGE statement. This avoids the MERGE hash-join cost, which dominates for
+aggregate queries with high group cardinality.
+
+**Not eligible:**
+- Queries with SEMI_ALGEBRAIC aggregates (MIN, MAX) — these may require
+  group-rescan on extremum deletion
+- Queries with GROUP_RESCAN aggregates (STRING_AGG, ARRAY_AGG, JSON_AGG, etc.)
+- Queries with user-defined triggers on the stream table (already use explicit
+  DML via the user-trigger path)
+
+The `explain_st()` output shows the `aggregate_path` field:
+- `explicit_dml` — fast-path is active
+- `merge` — using the default MERGE path
+- `merge (fast-path disabled)` — eligible but GUC is off
+
+```sql
+-- Disable aggregate fast-path
+SET pg_trickle.aggregate_fast_path = false;
+
+-- Check the current aggregate path for a stream table
+SELECT * FROM pgtrickle.explain_st('my_agg_st');
+```
+
+---
+
+### pg_trickle.template_cache
+
+*Added in v0.16.0.* Controls the cross-backend delta template cache backed by
+an UNLOGGED catalog table.
+
+| Property | Value |
+|---|---|
+| Type | `bool` |
+| Default | `true` |
+| Context | `SUSET` |
+| Restart Required | No |
+
+When enabled, delta SQL templates generated by the DVM engine are persisted in
+`pgtrickle.pgt_template_cache` so that new backends skip the ~45 ms
+parse+differentiate step on their first refresh of each stream table (down to
+~1 ms SPI lookup).
+
+Templates are automatically invalidated when:
+- A stream table's defining query changes (ALTER STREAM TABLE ... SET QUERY)
+- A stream table is dropped
+- A stream table is reinitialized
+
+The `explain_st()` output includes `template_cache` (enabled/disabled) and
+`template_cache_stats` with L2 hit and full miss counters.
+
+```sql
+-- Disable the template cache for debugging
+SET pg_trickle.template_cache = false;
+
+-- Check template cache stats
+SELECT * FROM pgtrickle.explain_st('my_st')
+WHERE property IN ('template_cache', 'template_cache_stats');
 ```
 
 ---

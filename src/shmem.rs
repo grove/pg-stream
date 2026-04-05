@@ -116,6 +116,16 @@ pub static TOTAL_DIFF_REFRESHES: PgAtomic<AtomicU64> =
 pub static DEDUP_NEEDED_REFRESHES: PgAtomic<AtomicU64> =
     unsafe { PgAtomic::new(c"pg_trickle_dedup_needed_refreshes") };
 
+/// G14-SHC: Number of delta template cache L2 hits (catalog table).
+// SAFETY: PgAtomic::new requires a static CStr name.
+pub static TEMPLATE_CACHE_L2_HITS: PgAtomic<AtomicU64> =
+    unsafe { PgAtomic::new(c"pg_trickle_template_cache_l2_hits") };
+
+/// G14-SHC: Number of delta template cache full misses (DVM re-parse).
+// SAFETY: PgAtomic::new requires a static CStr name.
+pub static TEMPLATE_CACHE_MISSES: PgAtomic<AtomicU64> =
+    unsafe { PgAtomic::new(c"pg_trickle_template_cache_misses") };
+
 /// Register shared memory allocations. Called from `_PG_init()`.
 pub fn init_shared_memory() {
     pg_shmem_init!(PGS_STATE);
@@ -125,6 +135,8 @@ pub fn init_shared_memory() {
     pg_shmem_init!(RECONCILE_EPOCH);
     pg_shmem_init!(TOTAL_DIFF_REFRESHES);
     pg_shmem_init!(DEDUP_NEEDED_REFRESHES);
+    pg_shmem_init!(TEMPLATE_CACHE_L2_HITS);
+    pg_shmem_init!(TEMPLATE_CACHE_MISSES);
     SHMEM_INITIALIZED.store(true, std::sync::atomic::Ordering::Relaxed);
 }
 
@@ -301,7 +313,7 @@ pub fn current_cache_generation() -> u64 {
 ///
 /// Returns `false` when the extension was loaded via `CREATE EXTENSION`
 /// without being listed in `shared_preload_libraries`.
-fn is_shmem_available() -> bool {
+pub fn is_shmem_available() -> bool {
     // Use a simple flag set during init_shared_memory()
     SHMEM_INITIALIZED.load(std::sync::atomic::Ordering::Relaxed)
 }

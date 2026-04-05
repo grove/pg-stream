@@ -336,30 +336,95 @@ pub fn diff_window(ctx: &mut DiffContext, op: &OpTree) -> Result<DiffResult, PgT
                 .join(" AND ")
         };
 
-        let exclusion_predicate = if let Some(key_cond) = key_match_cond {
-            key_cond
+        if let Some(key_cond) = key_match_cond {
+            // Key-based matching: keys are unique, simple NOT EXISTS is safe.
+            format!(
+                "-- Surviving old rows (key-matched exclusion)\n\
+                 SELECT {pt_cols_old}{aux_old}\n\
+                 FROM {old_rows_cte} o\n\
+                 WHERE NOT EXISTS (\n\
+                     SELECT 1 FROM {child_delta} d2\n\
+                     WHERE {key_cond}\n\
+                 )\n\
+                 UNION ALL\n\
+                 -- Newly inserted rows\n\
+                 SELECT {pt_cols_delta}{aux_delta}\n\
+                 FROM {child_delta} d\n\
+                 WHERE d.\"__pgt_action\" = 'I'\n\
+                 AND EXISTS (\n\
+                     SELECT 1 FROM {changed_parts_cte} cp WHERE {partition_join_delta_cp}\n\
+                 )",
+                child_delta = child_result.cte_name,
+            )
         } else {
-            format!("d2.\"__pgt_action\" = 'D' AND {delete_match_cond}")
-        };
-
-        format!(
-            "-- Surviving old rows (pass-through only, window cols stripped)\n\
-             SELECT {pt_cols_old}{aux_old}\n\
-             FROM {old_rows_cte} o\n\
-             WHERE NOT EXISTS (\n\
-                 SELECT 1 FROM {child_delta} d2\n\
-                 WHERE {exclusion_predicate}\n\
-             )\n\
-             UNION ALL\n\
-             -- Newly inserted rows\n\
-             SELECT {pt_cols_delta}{aux_delta}\n\
-             FROM {child_delta} d\n\
-             WHERE d.\"__pgt_action\" = 'I'\n\
-             AND EXISTS (\n\
-                 SELECT 1 FROM {changed_parts_cte} cp WHERE {partition_join_delta_cp}\n\
-             )",
-            child_delta = child_result.cte_name,
-        )
+            // Content-based matching with counted exclusion.
+            // When multiple old rows share the same pass-through values
+            // (e.g., tied salaries in a DENSE_RANK window), a naive NOT EXISTS
+            // would remove ALL matching rows instead of just the deleted ones.
+            // ROW_NUMBER pairing ensures exactly one old row is excluded per
+            // delta DELETE with the same content.
+            let rn_partition_old = if pt_aliases.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    "PARTITION BY {} ",
+                    pt_aliases
+                        .iter()
+                        .map(|c| format!("o.{}", quote_ident(c)))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            };
+            let rn_partition_d2 = if pt_aliases.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    "PARTITION BY {} ",
+                    pt_aliases
+                        .iter()
+                        .map(|c| format!("_xd.{}", quote_ident(c)))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            };
+            let pt_cols_xd = prefixed_col_list("_xd", &pt_aliases);
+            let aux_xd = if aux_cols.is_empty() {
+                String::new()
+            } else {
+                aux_cols
+                    .iter()
+                    .map(|c| format!(", _xd.{}", quote_ident(c)))
+                    .collect::<Vec<String>>()
+                    .join("")
+            };
+            format!(
+                "-- Surviving old rows (counted exclusion for duplicate content)\n\
+                 SELECT {pt_cols_old}{aux_old}\n\
+                 FROM (\n\
+                     SELECT {pt_cols_old}{aux_old},\n\
+                            ROW_NUMBER() OVER ({rn_partition_old}ORDER BY o.\"__pgt_row_id\") AS __pgt_xrn\n\
+                     FROM {old_rows_cte} o\n\
+                 ) o\n\
+                 WHERE NOT EXISTS (\n\
+                     SELECT 1 FROM (\n\
+                         SELECT {pt_cols_xd}{aux_xd},\n\
+                                ROW_NUMBER() OVER ({rn_partition_d2}ORDER BY _xd.\"__pgt_row_id\") AS __pgt_xrn\n\
+                         FROM {child_delta} _xd\n\
+                         WHERE _xd.\"__pgt_action\" = 'D'\n\
+                     ) d2\n\
+                     WHERE {delete_match_cond} AND d2.__pgt_xrn = o.__pgt_xrn\n\
+                 )\n\
+                 UNION ALL\n\
+                 -- Newly inserted rows\n\
+                 SELECT {pt_cols_delta}{aux_delta}\n\
+                 FROM {child_delta} d\n\
+                 WHERE d.\"__pgt_action\" = 'I'\n\
+                 AND EXISTS (\n\
+                     SELECT 1 FROM {changed_parts_cte} cp WHERE {partition_join_delta_cp}\n\
+                 )",
+                child_delta = child_result.cte_name,
+            )
+        }
     };
     ctx.add_cte(current_input_cte.clone(), current_input_sql);
 

@@ -621,6 +621,106 @@ mod classify_agg_strategy_tests {
     }
 }
 
+#[cfg(test)]
+mod is_all_algebraic_agg_tests {
+    use super::*;
+
+    fn make_agg(func: AggFunc) -> AggExpr {
+        AggExpr {
+            function: func,
+            argument: None,
+            alias: "a".to_string(),
+            is_distinct: false,
+            second_arg: None,
+            filter: None,
+            order_within_group: None,
+        }
+    }
+
+    fn scan_child() -> Box<OpTree> {
+        Box::new(OpTree::Scan {
+            table_name: "t".to_string(),
+            schema: "public".to_string(),
+            alias: "t".to_string(),
+            columns: vec![],
+            table_oid: 0,
+            pk_columns: vec![],
+        })
+    }
+
+    #[test]
+    fn test_no_aggregate_returns_false() {
+        let tree = OpTree::Scan {
+            table_name: "t".to_string(),
+            schema: "public".to_string(),
+            alias: "t".to_string(),
+            columns: vec![],
+            table_oid: 0,
+            pk_columns: vec![],
+        };
+        assert!(!tree.is_all_algebraic_agg());
+    }
+
+    #[test]
+    fn test_all_invertible_returns_true() {
+        let tree = OpTree::Aggregate {
+            group_by: vec![],
+            aggregates: vec![
+                make_agg(AggFunc::Count),
+                make_agg(AggFunc::Sum),
+                make_agg(AggFunc::CountStar),
+            ],
+            child: scan_child(),
+        };
+        assert!(tree.is_all_algebraic_agg());
+    }
+
+    #[test]
+    fn test_avg_via_aux_returns_true() {
+        let tree = OpTree::Aggregate {
+            group_by: vec![],
+            aggregates: vec![make_agg(AggFunc::Sum), make_agg(AggFunc::Avg)],
+            child: scan_child(),
+        };
+        assert!(tree.is_all_algebraic_agg());
+    }
+
+    #[test]
+    fn test_min_semi_algebraic_returns_false() {
+        let tree = OpTree::Aggregate {
+            group_by: vec![],
+            aggregates: vec![make_agg(AggFunc::Sum), make_agg(AggFunc::Min)],
+            child: scan_child(),
+        };
+        assert!(!tree.is_all_algebraic_agg());
+    }
+
+    #[test]
+    fn test_string_agg_group_rescan_returns_false() {
+        let tree = OpTree::Aggregate {
+            group_by: vec![],
+            aggregates: vec![make_agg(AggFunc::Sum), make_agg(AggFunc::StringAgg)],
+            child: scan_child(),
+        };
+        assert!(!tree.is_all_algebraic_agg());
+    }
+
+    #[test]
+    fn test_aggregate_under_project_returns_true() {
+        let agg = OpTree::Aggregate {
+            group_by: vec![],
+            aggregates: vec![make_agg(AggFunc::Count)],
+            child: scan_child(),
+        };
+        let tree = OpTree::Project {
+            expressions: vec![],
+            aliases: vec![],
+            child: Box::new(agg),
+        };
+        assert!(tree.is_all_algebraic_agg());
+    }
+}
+
 /// Sort expression for ORDER BY or window functions.
 #[derive(Debug, Clone)]
 pub struct SortExpr {
@@ -1619,6 +1719,19 @@ impl OpTree {
         }
     }
 
+    /// Returns `true` if the top-level operator (after transparent wrappers)
+    /// is a `Distinct` node. Used by AUTO-IDX-1 to decide whether to create
+    /// an index on the DISTINCT output columns.
+    pub fn has_distinct(&self) -> bool {
+        match self {
+            OpTree::Distinct { .. } => true,
+            OpTree::Filter { child, .. }
+            | OpTree::Project { child, .. }
+            | OpTree::Subquery { child, .. } => child.has_distinct(),
+            _ => false,
+        }
+    }
+
     /// Return the column names that should be hashed to produce `__pgt_row_id`.
     ///
     /// This mirrors the hash generation in each operator's diff function:
@@ -2080,6 +2193,23 @@ impl OpTree {
             })
             .map(|(alias, _)| alias)
             .collect()
+    }
+
+    /// B-1: Check whether the tree has an Aggregate node AND all its
+    /// aggregates use algebraically invertible strategies (ALGEBRAIC_INVERTIBLE
+    /// or ALGEBRAIC_VIA_AUX).  SEMI_ALGEBRAIC (MIN/MAX) is excluded because
+    /// it can require group-rescan on extremum deletion.
+    ///
+    /// Returns `true` only when every aggregate in the tree is fully
+    /// algebraic, enabling the explicit DML fast-path at refresh time.
+    pub fn is_all_algebraic_agg(&self) -> bool {
+        let strategies = self.aggregate_strategies();
+        if strategies.is_empty() {
+            return false; // No aggregates — not eligible
+        }
+        strategies.iter().all(|(_, strategy)| {
+            *strategy == "ALGEBRAIC_INVERTIBLE" || *strategy == "ALGEBRAIC_VIA_AUX"
+        })
     }
 
     /// Collect `(table_oid, Vec<column_name>)` pairs from all Scan nodes.

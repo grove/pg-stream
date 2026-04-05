@@ -32,6 +32,7 @@ fn make_scan(alias: &str, oid: u32, cols: &[&str]) -> OpTree {
     }
 }
 
+/// Create a `DiffContext` with two pre-seeded source frontiers (OIDs 16384 & 16385).
 fn test_ctx() -> DiffContext {
     let mut prev = Frontier::new();
     prev.set_source(
@@ -57,6 +58,27 @@ fn test_ctx() -> DiffContext {
         "2024-01-01T01:00:00Z".to_string(),
     );
 
+    DiffContext::new_standalone(prev, new)
+}
+
+/// Create a `DiffContext` with `n` source frontiers for multi-join benches.
+/// OIDs are assigned as `16384, 16385, ..., 16384 + n - 1`.
+fn test_ctx_n(n: usize) -> DiffContext {
+    let mut prev = Frontier::new();
+    let mut new = Frontier::new();
+    for i in 0..n {
+        let oid = 16384u32 + i as u32;
+        prev.set_source(
+            oid,
+            "0/1000".to_string(),
+            "2024-01-01T00:00:00Z".to_string(),
+        );
+        new.set_source(
+            oid,
+            "0/2000".to_string(),
+            "2024-01-01T01:00:00Z".to_string(),
+        );
+    }
     DiffContext::new_standalone(prev, new)
 }
 
@@ -1197,6 +1219,264 @@ fn bench_diff_tpch_q21(c: &mut Criterion) {
     });
 }
 
+// ── Semi-join operator ─────────────────────────────────────────────────────
+
+/// BENCH-CI-3: SemiJoin (EXISTS / IN) delta generation.
+///
+/// Represents: `SELECT o.* FROM orders o WHERE EXISTS (SELECT 1 FROM events e WHERE e.order_id = o.id)`
+fn bench_diff_semi_join(c: &mut Criterion) {
+    let semi = OpTree::SemiJoin {
+        condition: Expr::BinaryOp {
+            op: "=".to_string(),
+            left: Box::new(Expr::ColumnRef {
+                table_alias: Some("e".to_string()),
+                column_name: "order_id".to_string(),
+            }),
+            right: Box::new(Expr::ColumnRef {
+                table_alias: Some("o".to_string()),
+                column_name: "id".to_string(),
+            }),
+        },
+        left: Box::new(make_scan(
+            "o",
+            16384,
+            &["id", "customer_id", "amount", "status"],
+        )),
+        right: Box::new(make_scan("e", 16385, &["id", "order_id", "event_type"])),
+    };
+
+    c.bench_function("diff_semi_join", |b| {
+        b.iter(|| {
+            let mut ctx = test_ctx();
+            ctx.diff_node(black_box(&semi)).unwrap()
+        });
+    });
+}
+
+// ── Anti-join operator ─────────────────────────────────────────────────────
+
+/// BENCH-CI-3: AntiJoin (NOT EXISTS / NOT IN) delta generation.
+///
+/// Represents: `SELECT o.* FROM orders o WHERE NOT EXISTS (SELECT 1 FROM cancels c WHERE c.order_id = o.id)`
+fn bench_diff_anti_join(c: &mut Criterion) {
+    let anti = OpTree::AntiJoin {
+        condition: Expr::BinaryOp {
+            op: "=".to_string(),
+            left: Box::new(Expr::ColumnRef {
+                table_alias: Some("c".to_string()),
+                column_name: "order_id".to_string(),
+            }),
+            right: Box::new(Expr::ColumnRef {
+                table_alias: Some("o".to_string()),
+                column_name: "id".to_string(),
+            }),
+        },
+        left: Box::new(make_scan(
+            "o",
+            16384,
+            &["id", "customer_id", "amount", "status"],
+        )),
+        right: Box::new(make_scan("c", 16385, &["id", "order_id", "reason"])),
+    };
+
+    c.bench_function("diff_anti_join", |b| {
+        b.iter(|| {
+            let mut ctx = test_ctx();
+            ctx.diff_node(black_box(&anti)).unwrap()
+        });
+    });
+}
+
+// ── TopK / ORDER BY + aggregation (TopK materialization shape) ─────────────
+
+/// BENCH-CI-3: TopK query shape — Aggregate + many group-by keys.
+///
+/// Represents the TopK materialization pattern:
+/// `SELECT region, product, SUM(amount), COUNT(*) FROM orders GROUP BY region, product`
+/// followed by ORDER BY + LIMIT at apply time.  The DVM query shape is the
+/// inner aggregation; number of group-by keys determines codegen cost.
+fn bench_diff_topk(c: &mut Criterion) {
+    let mut group = c.benchmark_group("diff_topk");
+    group.sample_size(200);
+    group.measurement_time(Duration::from_secs(10));
+
+    for n_keys in [1usize, 3, 5, 10] {
+        let group_by: Vec<Expr> = (0..n_keys)
+            .map(|i| Expr::ColumnRef {
+                table_alias: None,
+                column_name: format!("key_{i}"),
+            })
+            .collect();
+
+        let cols: Vec<String> = {
+            let mut c: Vec<String> = (0..n_keys).map(|i| format!("key_{i}")).collect();
+            c.push("amount".to_string());
+            c
+        };
+        let col_refs: Vec<&str> = cols.iter().map(|s| s.as_str()).collect();
+
+        let topk = OpTree::Aggregate {
+            group_by,
+            aggregates: vec![
+                AggExpr {
+                    function: AggFunc::Sum,
+                    argument: Some(Expr::ColumnRef {
+                        table_alias: None,
+                        column_name: "amount".to_string(),
+                    }),
+                    alias: "total".to_string(),
+                    is_distinct: false,
+                    filter: None,
+                    second_arg: None,
+                    order_within_group: None,
+                },
+                AggExpr {
+                    function: AggFunc::CountStar,
+                    argument: None,
+                    alias: "cnt".to_string(),
+                    is_distinct: false,
+                    filter: None,
+                    second_arg: None,
+                    order_within_group: None,
+                },
+            ],
+            child: Box::new(make_scan("orders", 16384, &col_refs)),
+        };
+
+        group.bench_with_input(
+            BenchmarkId::from_parameter(format!("{n_keys}keys")),
+            &topk,
+            |b, op| {
+                b.iter(|| {
+                    let mut ctx = test_ctx();
+                    ctx.differentiate(black_box(op)).unwrap()
+                });
+            },
+        );
+    }
+    group.finish();
+}
+
+// ── Scaled aggregate: parametrized group-by key count ─────────────────────
+
+/// BENCH-CI-3: Aggregate with varying group-by cardinality.
+///
+/// Measures how DVM codegen cost scales with the number of GROUP BY columns.
+/// This is the primary scaling dimension for pure-Rust differentiation benchmarks.
+fn bench_diff_aggregate_scaled(c: &mut Criterion) {
+    let mut group = c.benchmark_group("diff_aggregate_scaled");
+    group.sample_size(100);
+    group.measurement_time(Duration::from_secs(10));
+
+    for n_keys in [1usize, 5, 10, 20] {
+        let group_by: Vec<Expr> = (0..n_keys)
+            .map(|i| Expr::ColumnRef {
+                table_alias: None,
+                column_name: format!("dim_{i}"),
+            })
+            .collect();
+
+        let mut col_names: Vec<String> = (0..n_keys).map(|i| format!("dim_{i}")).collect();
+        col_names.push("metric".to_string());
+        let col_refs: Vec<&str> = col_names.iter().map(|s| s.as_str()).collect();
+
+        let agg = OpTree::Aggregate {
+            group_by,
+            aggregates: vec![
+                AggExpr {
+                    function: AggFunc::Sum,
+                    argument: Some(Expr::ColumnRef {
+                        table_alias: None,
+                        column_name: "metric".to_string(),
+                    }),
+                    alias: "total_metric".to_string(),
+                    is_distinct: false,
+                    filter: None,
+                    second_arg: None,
+                    order_within_group: None,
+                },
+                AggExpr {
+                    function: AggFunc::Avg,
+                    argument: Some(Expr::ColumnRef {
+                        table_alias: None,
+                        column_name: "metric".to_string(),
+                    }),
+                    alias: "avg_metric".to_string(),
+                    is_distinct: false,
+                    filter: None,
+                    second_arg: None,
+                    order_within_group: None,
+                },
+            ],
+            child: Box::new(make_scan("facts", 16384, &col_refs)),
+        };
+
+        group.bench_with_input(
+            BenchmarkId::from_parameter(format!("{n_keys}keys")),
+            &agg,
+            |b, op| {
+                b.iter(|| {
+                    let mut ctx = test_ctx();
+                    ctx.differentiate(black_box(op)).unwrap()
+                });
+            },
+        );
+    }
+    group.finish();
+}
+
+// ── Multi-table join chain ─────────────────────────────────────────────────
+
+/// BENCH-CI-3: InnerJoin chain with varying depth (append-only INSERT shape).
+///
+/// Measures codegen cost for multi-source joins: 2-table, 3-table, 5-table.
+fn bench_diff_join_chain(c: &mut Criterion) {
+    let mut group = c.benchmark_group("diff_join_chain");
+    group.sample_size(100);
+    group.measurement_time(Duration::from_secs(10));
+
+    for n_tables in [2usize, 3, 5] {
+        // Build a left-associative join chain: t0 JOIN t1 ON ... JOIN t2 ON ...
+        let make_cond = |i: usize| Expr::BinaryOp {
+            op: "=".to_string(),
+            left: Box::new(Expr::ColumnRef {
+                table_alias: Some(format!("t{}", i - 1)),
+                column_name: "id".to_string(),
+            }),
+            right: Box::new(Expr::ColumnRef {
+                table_alias: Some(format!("t{i}")),
+                column_name: format!("t{}_id", i - 1),
+            }),
+        };
+
+        let mut tree: OpTree = make_scan("t0", 16384, &["id", "name", "value"]);
+        for i in 1..n_tables {
+            let right = make_scan(
+                &format!("t{i}"),
+                16384 + i as u32,
+                &["id", &format!("t{}_id", i - 1), "extra"],
+            );
+            tree = OpTree::InnerJoin {
+                condition: make_cond(i),
+                left: Box::new(tree),
+                right: Box::new(right),
+            };
+        }
+
+        group.bench_with_input(
+            BenchmarkId::from_parameter(format!("{n_tables}tables")),
+            &tree,
+            |b, op| {
+                b.iter(|| {
+                    let mut ctx = test_ctx_n(n_tables);
+                    ctx.differentiate(black_box(op)).unwrap()
+                });
+            },
+        );
+    }
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_diff_scan,
@@ -1215,5 +1495,10 @@ criterion_group!(
     bench_diff_tpch_q08,
     bench_diff_tpch_q18,
     bench_diff_tpch_q21,
+    bench_diff_semi_join,
+    bench_diff_anti_join,
+    bench_diff_topk,
+    bench_diff_aggregate_scaled,
+    bench_diff_join_chain,
 );
 criterion_main!(benches);

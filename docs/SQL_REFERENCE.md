@@ -3142,6 +3142,24 @@ be temporally aligned.
 | `tolerance_secs` | `float8` | Maximum allowed lag in seconds (default 0) |
 | `created_at` | `timestamptz` | When the group was created |
 
+#### pgtrickle.pgt_template_cache
+
+*Added in v0.16.0.* Cross-backend delta SQL template cache (UNLOGGED). Stores
+compiled delta query templates so new backends skip the ~45 ms DVM
+parse+differentiate step. Managed automatically — no user interaction required.
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `pgt_id` | `bigint` | Stream table ID (PK, FK → pgt_stream_tables) |
+| `query_hash` | `bigint` | Hash of the defining query (staleness detection) |
+| `delta_sql` | `text` | Delta SQL template with LSN placeholder tokens |
+| `columns` | `text[]` | Output column names |
+| `source_oids` | `integer[]` | Source table OIDs |
+| `is_dedup` | `boolean` | Whether the delta is deduplicated per row ID |
+| `key_changed` | `boolean` | Whether `__pgt_key_changed` column is present |
+| `all_algebraic` | `boolean` | Whether all aggregates are algebraically invertible |
+| `cached_at` | `timestamptz` | When the entry was last populated |
+
 ### Functions
 
 #### pgtrickle.advance_watermark(source TEXT, watermark TIMESTAMPTZ)

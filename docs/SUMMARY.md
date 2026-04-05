@@ -58,6 +58,7 @@
 # Reference
 
 - [FAQ](FAQ.md)
+- [Error Reference](ERRORS.md)
 - [Changelog](changelog.md)
 - [Roadmap](roadmap.md)
 - [Release Process](RELEASE.md)

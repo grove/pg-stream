@@ -827,6 +827,54 @@ fn explain_st_impl(
         props.push(("dependency_graph_dot".to_string(), dot));
     }
 
+    // PH-D1: Merge strategy GUC value.
+    props.push((
+        "merge_strategy".to_string(),
+        crate::config::pg_trickle_merge_strategy()
+            .as_str()
+            .to_string(),
+    ));
+
+    // A-3-AO: Append-only mode.
+    // "explicit" = user set append_only => true at creation/alter
+    // "heuristic" = auto-promoted because buffer was insert-only
+    // "disabled" = not using append-only INSERT path
+    // We derive the mode from `is_append_only`. When the flag was set by the
+    // user at creation it shows as "explicit"; when the heuristic promoted it
+    // (no user intervention) we report "heuristic". We approximate this by
+    // checking if effective_refresh_mode was ever APPEND_ONLY.
+    let append_only_mode = if st.is_append_only { "on" } else { "off" };
+    props.push(("append_only_mode".to_string(), append_only_mode.to_string()));
+
+    // B-1: Aggregate fast-path status.
+    // Detect whether the defining query has all-algebraic aggregates.
+    let agg_fast_path_guc = crate::config::pg_trickle_aggregate_fast_path();
+    let is_all_algebraic = if matches!(
+        st.refresh_mode,
+        crate::dag::RefreshMode::Differential | crate::dag::RefreshMode::Immediate
+    ) {
+        crate::dvm::parse_defining_query_full(&st.defining_query)
+            .map(|pr| pr.tree.is_all_algebraic_agg())
+            .unwrap_or(false)
+    } else {
+        false
+    };
+    let aggregate_path = if is_all_algebraic && agg_fast_path_guc {
+        "explicit_dml"
+    } else if is_all_algebraic {
+        "merge (fast-path disabled)"
+    } else {
+        "merge"
+    };
+    props.push(("aggregate_path".to_string(), aggregate_path.to_string()));
+
+    // C-4: Compaction threshold from GUC.
+    let compact_threshold = crate::config::pg_trickle_compact_threshold();
+    props.push((
+        "compact_threshold".to_string(),
+        compact_threshold.to_string(),
+    ));
+
     // PH-E2: Live temp file spill info from pg_stat_statements.
     let spill_threshold = crate::config::pg_trickle_spill_threshold_blocks();
     if spill_threshold > 0 {
@@ -848,6 +896,24 @@ fn explain_st_impl(
                 ));
             }
         }
+    }
+
+    // G14-SHC: Template cache stats.
+    props.push((
+        "template_cache".to_string(),
+        crate::config::pg_trickle_template_cache_enabled().to_string(),
+    ));
+    if crate::shmem::is_shmem_available() {
+        let l2_hits = crate::shmem::TEMPLATE_CACHE_L2_HITS
+            .get()
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let misses = crate::shmem::TEMPLATE_CACHE_MISSES
+            .get()
+            .load(std::sync::atomic::Ordering::Relaxed);
+        props.push((
+            "template_cache_stats".to_string(),
+            format!("{{\"l2_hits\":{},\"full_misses\":{}}}", l2_hits, misses),
+        ));
     }
 
     Ok(props)

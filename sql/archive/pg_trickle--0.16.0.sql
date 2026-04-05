@@ -205,6 +205,20 @@ SELECT pg_catalog.pg_extension_config_dump('pgtrickle.pgt_dependencies', '');
 SELECT pg_catalog.pg_extension_config_dump('pgtrickle.pgt_source_gates', '');
 SELECT pg_catalog.pg_extension_config_dump('pgtrickle.pgt_watermarks', '');
 SELECT pg_catalog.pg_extension_config_dump('pgtrickle.pgt_watermark_groups', '');
+
+-- G14-SHC: Shared template cache (catalog-backed)
+CREATE UNLOGGED TABLE IF NOT EXISTS pgtrickle.pgt_template_cache (
+    pgt_id       BIGINT PRIMARY KEY
+                 REFERENCES pgtrickle.pgt_stream_tables(pgt_id) ON DELETE CASCADE,
+    query_hash   BIGINT NOT NULL,
+    delta_sql    TEXT NOT NULL,
+    columns      TEXT[] NOT NULL,
+    source_oids  INTEGER[] NOT NULL,
+    is_dedup     BOOLEAN NOT NULL DEFAULT FALSE,
+    key_changed  BOOLEAN NOT NULL DEFAULT FALSE,
+    all_algebraic BOOLEAN NOT NULL DEFAULT FALSE,
+    cached_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+);
 /* </end connected objects> */
 
 /* <begin connected objects> */

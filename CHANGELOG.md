@@ -36,7 +36,111 @@ For future plans and release milestones, see [ROADMAP.md](ROADMAP.md).
 
 ## [Unreleased]
 
-*No changes yet.*
+### Added
+
+- **Error reference documentation** — new [docs/ERRORS.md](docs/ERRORS.md) documents
+  all 20 `PgTrickleError` variants with descriptions, common causes, and suggested
+  fixes. Cross-linked from the FAQ Troubleshooting section and the documentation
+  book. *(ERR-REF)*
+
+- **Change buffer hard growth limit** — new `pg_trickle.max_buffer_rows` GUC
+  (default: 1,000,000) prevents unbounded change buffer growth when differential
+  refresh fails repeatedly. When a source table's buffer exceeds the limit,
+  pg_trickle forces a FULL refresh and truncates the buffer, emitting a WARNING.
+  *(BUF-LIMIT)*
+
+- **Automatic index creation GUC** — new `pg_trickle.auto_index` GUC (default:
+  `true`) gates automatic creation of GROUP BY, DISTINCT, and covering
+  `__pgt_row_id` indexes on stream tables. Previously these indexes were always
+  created with no way to disable them. *(AUTO-IDX)*
+
+- **DISTINCT column indexing** — stream tables backed by `SELECT DISTINCT`
+  queries now automatically receive a composite index on the distinct columns
+  (up to 8 columns), improving deduplication lookup performance during MERGE.
+  *(AUTO-IDX-1)*
+
+- **MERGE strategy alternatives** — new `pg_trickle.merge_strategy` GUC
+  (`auto` / `merge` / `delete_insert`) selects the delta apply strategy.
+  In `auto` mode (default), DELETE+INSERT is used when
+  `delta_rows / target_rows` is below `merge_strategy_threshold` (default 1%),
+  avoiding the MERGE join cost for sub-1% deltas against large tables.
+  `explain_st()` now exposes `merge_strategy`. *(PH-D1)*
+
+- **Append-only heuristic auto-promotion** — stream tables that receive only
+  INSERT changes are now automatically promoted to the append-only INSERT fast
+  path, skipping the MERGE join entirely. If a DELETE or UPDATE is later
+  detected, the system reverts to MERGE with a WARNING and NOTIFY alert.
+  `explain_st()` now exposes `append_only_mode`. *(A-3-AO)*
+
+- **Aggregate fast-path** — new `pg_trickle.aggregate_fast_path` GUC (default:
+  `true`) enables explicit DML (DELETE+UPDATE+INSERT) instead of MERGE for
+  stream tables whose aggregates are all algebraically invertible (COUNT, SUM,
+  AVG, STDDEV, etc.). The explicit DML path materializes the delta into a temp
+  table and applies targeted per-row operations, avoiding the MERGE hash-join
+  cost that dominates for aggregate queries with many groups. `explain_st()`
+  now exposes `aggregate_path`. *(B-1)*
+
+- **Compaction stats in explain_st()** — `explain_st()` now exposes
+  `compact_threshold`, showing the configured change buffer compaction
+  threshold. *(C-4)*
+
+- **Cross-backend template cache** — new `pg_trickle.template_cache` GUC
+  (default: `true`) enables a catalog-backed delta SQL template cache. Delta
+  templates are persisted in an UNLOGGED table (`pgtrickle.pgt_template_cache`)
+  so that new backends skip the ~45 ms DVM parse+differentiate step on their
+  first refresh of each stream table (down to ~1 ms SPI lookup). Templates are
+  automatically invalidated on ALTER QUERY, DROP, and reinitialize. `explain_st()`
+  exposes `template_cache` and `template_cache_stats` (L2 hits / full misses).
+  *(G14-SHC)*
+
+- **Benchmark regression CI gate** — every PR targeting `main` now runs
+  Criterion benchmarks and fails if any benchmark mean regresses by more than
+  10% vs the baseline saved on the last push to `main`. The gate uses a new
+  `bench-regression` job in `.github/workflows/ci.yml` backed by a self-hosted
+  `scripts/criterion_regression_check.py` script (no external service required).
+  Threshold is configurable via `PGT_BENCH_REGRESSION_THRESHOLD`. *(BENCH-CI-1,
+  BENCH-CI-2)*
+
+- **Expanded Criterion bench scenarios** — `benches/diff_operators.rs` now
+  covers SemiJoin (EXISTS), AntiJoin (NOT EXISTS), TopK materialization shape
+  (1/3/5/10 group keys), aggregate scaled by group-by cardinality (1/5/10/20
+  keys), and N-table InnerJoin chains (2/3/5 tables). Total: 22 bench
+  functions (+5). *(BENCH-CI-3)*
+
+### Changed
+
+- **GUC defaults reviewed** — added detailed tuning guidance for
+  `pg_trickle.planner_aggressive` (memory pressure in concurrent refresh
+  scenarios) and `pg_trickle.cleanup_use_truncate` (PgBouncer / connection
+  pooler interaction with `AccessExclusiveLock`). Defaults remain unchanged
+  (`true` for both) as they are correct for the majority of workloads.
+  *(GUC-DEFAULTS)*
+
+### Tests
+
+- **JOIN multi-cycle UPDATE/DELETE tests** — 4 new E2E tests covering INNER
+  JOIN update propagation, LEFT JOIN right-side delete→NULL transition, FULL
+  JOIN both-side update (no phantom rows), and 3-table join chain middle
+  delete. *(TG2-JOIN)*
+
+- **Window function differential tests** — 3 new E2E tests for LAG, LEAD, and
+  DENSE_RANK differential correctness across INSERT/UPDATE/DELETE cycles.
+  *(TG2-WIN)*
+
+- **Differential≡Full equivalence tests** — 2 new equivalence tests for LATERAL
+  subquery and TopK (ORDER BY + LIMIT) patterns, each with 5 mutation cycles
+  and `assert_differential_mode()` validation. *(TG2-EQUIV)*
+
+- **Source schema evolution tests** — 4 new E2E tests for source-table DDL
+  resilience: unused column rename (no impact), used column rename (detected),
+  column addition (no impact), and compatible type widening (INT→BIGINT).
+  *(TG2-SCHEMA)*
+
+### Fixed
+
+- **`resume_stream_table()` confirmed operational** — the function referenced in
+  `SUSPENDED` state error messages was verified to exist and work correctly
+  (it has been present since v0.2.0). *(C2-BUG)*
 
 ---
 

@@ -2421,6 +2421,9 @@ for status information.
 
 ### How do I diagnose stalled data flow through stream tables?
 
+> **See also:** [Error Reference](ERRORS.md) — comprehensive guide to all
+> pg_trickle error variants with causes and fixes.
+
 If data seems to have stopped flowing -- stream tables show stale results
 despite DML on the source tables -- follow this systematic diagnostic workflow.
 Each step narrows the problem from broad health checks down to specific root

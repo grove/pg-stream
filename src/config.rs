@@ -214,6 +214,36 @@ pub static PGS_BUFFER_ALERT_THRESHOLD: GucSetting<i32> = GucSetting::<i32>::new(
 /// Set to 0 to disable compaction. Typical values: 10_000–1_000_000.
 pub static PGS_COMPACT_THRESHOLD: GucSetting<i32> = GucSetting::<i32>::new(100_000);
 
+/// BUF-LIMIT: Hard limit on total change buffer rows per source table.
+///
+/// When a source table's change buffer exceeds this many rows at refresh
+/// time, pg_trickle falls back to FULL refresh and truncates the buffer.
+/// This prevents unbounded disk growth when differential refresh fails
+/// repeatedly.
+///
+/// Set to 0 to disable the limit. Default: 1,000,000 rows.
+pub static PGS_MAX_BUFFER_ROWS: GucSetting<i32> = GucSetting::<i32>::new(1_000_000);
+
+/// AUTO-IDX: Automatic index creation on stream tables.
+///
+/// When enabled, `create_stream_table()` automatically creates indexes on
+/// GROUP BY keys, DISTINCT columns, and adds INCLUDE clauses to the
+/// `__pgt_row_id` index for stream tables with ≤ 8 output columns.
+pub static PGS_AUTO_INDEX: GucSetting<bool> = GucSetting::<bool>::new(true);
+
+/// B-1: Aggregate fast-path — use explicit DML instead of MERGE for
+/// GROUP BY queries where all aggregates are algebraically invertible
+/// (COUNT, SUM, AVG, etc.).  The explicit DML path (DELETE+UPDATE+INSERT)
+/// avoids the MERGE hash-join cost, which is the dominant overhead for
+/// aggregate stream tables with many groups.
+pub static PGS_AGGREGATE_FAST_PATH: GucSetting<bool> = GucSetting::<bool>::new(true);
+
+/// G14-SHC: Enable the cross-backend template cache backed by an UNLOGGED
+/// catalog table (`pgtrickle.pgt_template_cache`).  When enabled, delta SQL
+/// templates are persisted so that new backends avoid the ~45 ms DVM
+/// parse+differentiate cost on their first refresh of each stream table.
+pub static PGS_TEMPLATE_CACHE: GucSetting<bool> = GucSetting::<bool>::new(true);
+
 /// Maximum allowed grouping set branches for CUBE/ROLLUP expansion (EC-02).
 pub static PGS_MAX_GROUPING_SET_BRANCHES: GucSetting<i32> = GucSetting::<i32>::new(64);
 
@@ -580,6 +610,53 @@ fn normalize_merge_join_strategy(value: Option<String>) -> MergeJoinStrategy {
 /// Default `false` — change buffers remain WAL-logged and crash-safe.
 pub static PGS_UNLOGGED_BUFFERS: GucSetting<bool> = GucSetting::<bool>::new(false);
 
+/// PH-D1: MERGE strategy override.
+///
+/// Controls how differential refresh applies deltas to stream tables:
+/// - `"auto"` (default): use DELETE+INSERT when `delta_rows / target_rows`
+///   is below `merge_strategy_threshold`; MERGE otherwise.
+/// - `"merge"`: always use the MERGE statement.
+/// - `"delete_insert"`: always use DELETE + INSERT (two separate statements).
+pub static PGS_MERGE_STRATEGY: GucSetting<Option<std::ffi::CString>> =
+    GucSetting::<Option<std::ffi::CString>>::new(Some(c"auto"));
+
+/// PH-D1: Delta ratio threshold for the `auto` merge strategy.
+///
+/// When `merge_strategy = 'auto'`, DELETE+INSERT is used instead of MERGE
+/// when `delta_rows / target_rows < merge_strategy_threshold`. This avoids
+/// the MERGE join cost for sub-1% deltas against large tables.
+///
+/// Default: 0.01 (1%).
+pub static PGS_MERGE_STRATEGY_THRESHOLD: GucSetting<f64> = GucSetting::<f64>::new(0.01);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MergeStrategy {
+    /// Heuristic: DELETE+INSERT for small deltas, MERGE otherwise.
+    Auto,
+    /// Always MERGE.
+    Merge,
+    /// Always DELETE + INSERT.
+    DeleteInsert,
+}
+
+impl MergeStrategy {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            MergeStrategy::Auto => "auto",
+            MergeStrategy::Merge => "merge",
+            MergeStrategy::DeleteInsert => "delete_insert",
+        }
+    }
+}
+
+fn normalize_merge_strategy(value: Option<String>) -> MergeStrategy {
+    match value.as_deref().map(str::to_ascii_lowercase).as_deref() {
+        Some("merge") => MergeStrategy::Merge,
+        Some("delete_insert") => MergeStrategy::DeleteInsert,
+        _ => MergeStrategy::Auto,
+    }
+}
+
 /// Register all GUC variables. Called from `_PG_init()`.
 pub fn register_gucs() {
     GucRegistry::define_bool_guc(
@@ -876,6 +953,57 @@ pub fn register_gucs() {
         &PGS_COMPACT_THRESHOLD,
         0,           // min: 0 (disabled)
         100_000_000, // max: 100M rows
+        GucContext::Suset,
+        GucFlags::default(),
+    );
+
+    // BUF-LIMIT: Hard limit on change buffer rows per source table.
+    GucRegistry::define_int_guc(
+        c"pg_trickle.max_buffer_rows",
+        c"Hard limit on change buffer rows per source table (0 = unlimited).",
+        c"When a source table's change buffer exceeds this many rows at refresh time, \
+           pg_trickle falls back to FULL refresh and truncates the buffer. Prevents \
+           unbounded disk growth when differential refresh fails repeatedly.",
+        &PGS_MAX_BUFFER_ROWS,
+        0,           // min: 0 (disabled)
+        100_000_000, // max: 100M rows
+        GucContext::Suset,
+        GucFlags::default(),
+    );
+
+    // AUTO-IDX: Automatic index creation on stream tables.
+    GucRegistry::define_bool_guc(
+        c"pg_trickle.auto_index",
+        c"Automatically create indexes on stream tables at creation time.",
+        c"When true (default), create_stream_table() auto-creates indexes on GROUP BY keys, \
+           DISTINCT columns, and adds INCLUDE clauses to the __pgt_row_id index for small \
+           stream tables. Set to false to manage indexes manually.",
+        &PGS_AUTO_INDEX,
+        GucContext::Suset,
+        GucFlags::default(),
+    );
+
+    // B-1: Aggregate fast-path.
+    GucRegistry::define_bool_guc(
+        c"pg_trickle.aggregate_fast_path",
+        c"Use explicit DML instead of MERGE for all-algebraic aggregate stream tables.",
+        c"When true (default), stream tables whose aggregates are all algebraically invertible \
+           (COUNT, SUM, AVG, STDDEV, etc.) use the targeted DELETE+UPDATE+INSERT path instead \
+           of MERGE, avoiding the hash-join cost. Set to false to force MERGE for all stream \
+           tables.",
+        &PGS_AGGREGATE_FAST_PATH,
+        GucContext::Suset,
+        GucFlags::default(),
+    );
+
+    // G14-SHC: Cross-backend template cache.
+    GucRegistry::define_bool_guc(
+        c"pg_trickle.template_cache",
+        c"Enable the cross-backend delta template cache.",
+        c"When true (default), delta SQL templates are persisted in an UNLOGGED catalog table \
+           so that new backends skip the ~45 ms DVM parse+differentiate step. \
+           Set to false to always regenerate templates from scratch.",
+        &PGS_TEMPLATE_CACHE,
         GucContext::Suset,
         GucFlags::default(),
     );
@@ -1226,6 +1354,34 @@ pub fn register_gucs() {
         GucContext::Suset,
         GucFlags::default(),
     );
+
+    // PH-D1: MERGE strategy override.
+    GucRegistry::define_string_guc(
+        c"pg_trickle.merge_strategy",
+        c"Delta apply strategy: auto (default), merge, delete_insert.",
+        c"'auto' (default) uses DELETE+INSERT for sub-1% deltas (delta_rows / target_rows \
+           below merge_strategy_threshold) and MERGE otherwise. \
+           'merge' always uses the MERGE statement. \
+           'delete_insert' always uses separate DELETE + INSERT statements, \
+           avoiding the MERGE join cost for small deltas against large tables.",
+        &PGS_MERGE_STRATEGY,
+        GucContext::Suset,
+        GucFlags::default(),
+    );
+
+    // PH-D1: Merge strategy threshold.
+    GucRegistry::define_float_guc(
+        c"pg_trickle.merge_strategy_threshold",
+        c"Delta ratio threshold for auto merge_strategy (default: 0.01 = 1%).",
+        c"When merge_strategy = 'auto', DELETE+INSERT is used instead of MERGE when \
+           delta_rows / target_rows is below this threshold. Higher values cause more \
+           refreshes to use DELETE+INSERT. Range: 0.001 to 1.0.",
+        &PGS_MERGE_STRATEGY_THRESHOLD,
+        0.001, // min
+        1.0,   // max
+        GucContext::Suset,
+        GucFlags::default(),
+    );
 }
 
 // ── Convenience accessors ──────────────────────────────────────────────────
@@ -1387,6 +1543,28 @@ pub fn pg_trickle_buffer_alert_threshold() -> i64 {
 /// Returns 0 when compaction is disabled.
 pub fn pg_trickle_compact_threshold() -> i64 {
     PGS_COMPACT_THRESHOLD.get() as i64
+}
+
+/// Returns the max buffer rows limit (row count).
+/// Returns 0 when the limit is disabled.
+pub fn pg_trickle_max_buffer_rows() -> i64 {
+    PGS_MAX_BUFFER_ROWS.get() as i64
+}
+
+/// Returns whether automatic index creation is enabled.
+pub fn pg_trickle_auto_index() -> bool {
+    PGS_AUTO_INDEX.get()
+}
+
+/// B-1: Returns whether the aggregate fast-path (explicit DML for
+/// all-algebraic aggregate queries) is enabled.
+pub fn pg_trickle_aggregate_fast_path() -> bool {
+    PGS_AGGREGATE_FAST_PATH.get()
+}
+
+/// G14-SHC: Returns whether the cross-backend template cache is enabled.
+pub fn pg_trickle_template_cache_enabled() -> bool {
+    PGS_TEMPLATE_CACHE.get()
 }
 
 /// Returns the buffer partitioning mode: `"off"`, `"on"`, or `"auto"`.
@@ -1557,12 +1735,26 @@ pub fn pg_trickle_unlogged_buffers() -> bool {
     PGS_UNLOGGED_BUFFERS.get()
 }
 
+/// PH-D1: Returns the merge strategy override.
+pub fn pg_trickle_merge_strategy() -> MergeStrategy {
+    normalize_merge_strategy(
+        PGS_MERGE_STRATEGY
+            .get()
+            .and_then(|cs| cs.to_str().ok().map(str::to_owned)),
+    )
+}
+
+/// PH-D1: Returns the merge strategy threshold for the `auto` heuristic.
+pub fn pg_trickle_merge_strategy_threshold() -> f64 {
+    PGS_MERGE_STRATEGY_THRESHOLD.get()
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        CdcTriggerMode, MergeJoinStrategy, ParallelRefreshMode, UserTriggersMode,
+        CdcTriggerMode, MergeJoinStrategy, MergeStrategy, ParallelRefreshMode, UserTriggersMode,
         VolatileFunctionPolicy, normalize_cdc_trigger_mode, normalize_merge_join_strategy,
-        normalize_parallel_refresh_mode, normalize_recursive_max_depth,
+        normalize_merge_strategy, normalize_parallel_refresh_mode, normalize_recursive_max_depth,
         normalize_user_triggers_mode, normalize_volatile_function_policy, threshold_mb_to_bytes,
     };
 
@@ -1856,6 +2048,58 @@ mod tests {
         ] {
             assert_eq!(
                 normalize_merge_join_strategy(Some(strategy.as_str().to_string())),
+                strategy
+            );
+        }
+    }
+
+    #[test]
+    fn test_normalize_merge_strategy_defaults_to_auto() {
+        assert_eq!(normalize_merge_strategy(None), MergeStrategy::Auto);
+        assert_eq!(
+            normalize_merge_strategy(Some("".to_string())),
+            MergeStrategy::Auto
+        );
+        assert_eq!(
+            normalize_merge_strategy(Some("garbage".to_string())),
+            MergeStrategy::Auto
+        );
+    }
+
+    #[test]
+    fn test_normalize_merge_strategy_all_variants() {
+        assert_eq!(
+            normalize_merge_strategy(Some("merge".to_string())),
+            MergeStrategy::Merge
+        );
+        assert_eq!(
+            normalize_merge_strategy(Some("delete_insert".to_string())),
+            MergeStrategy::DeleteInsert
+        );
+        assert_eq!(
+            normalize_merge_strategy(Some("auto".to_string())),
+            MergeStrategy::Auto
+        );
+        // Case-insensitive
+        assert_eq!(
+            normalize_merge_strategy(Some("DELETE_INSERT".to_string())),
+            MergeStrategy::DeleteInsert
+        );
+        assert_eq!(
+            normalize_merge_strategy(Some("MERGE".to_string())),
+            MergeStrategy::Merge
+        );
+    }
+
+    #[test]
+    fn test_normalize_merge_strategy_roundtrip_via_as_str() {
+        for strategy in [
+            MergeStrategy::Auto,
+            MergeStrategy::Merge,
+            MergeStrategy::DeleteInsert,
+        ] {
+            assert_eq!(
+                normalize_merge_strategy(Some(strategy.as_str().to_string())),
                 strategy
             );
         }
