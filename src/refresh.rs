@@ -717,20 +717,24 @@ fn apply_planner_hints(estimated_delta: i64, st_relid: pg_sys::Oid, scan_count: 
             );
         }
         let mb = crate::config::pg_trickle_merge_work_mem_mb().max(512);
-        if let Err(e) = Spi::run(&format!("SET LOCAL work_mem = '{mb}MB'")) {
+        // mb is a config integer, not user-supplied input; SET LOCAL cannot use parameterized queries.
+        let work_mem_sql = format!("SET LOCAL work_mem = '{mb}MB'");
+        if let Err(e) = Spi::run(&work_mem_sql) {
             pgrx::debug1!("[pg_trickle] DI-11: failed to SET LOCAL work_mem: {}", e);
         }
-        // Raise join_collapse_limit so the planner evaluates all join
         // orderings for the inlined NOT MATERIALIZED snapshot CTEs.
         // Default is 8; deep joins can exceed this after CTE inlining.
         let jcl = (scan_count + 2).max(12);
-        if let Err(e) = Spi::run(&format!("SET LOCAL join_collapse_limit = {jcl}")) {
+        // jcl is a computed integer, not user-supplied input; SET LOCAL cannot use parameterized queries.
+        let jcl_sql = format!("SET LOCAL join_collapse_limit = {jcl}");
+        if let Err(e) = Spi::run(&jcl_sql) {
             pgrx::debug1!(
                 "[pg_trickle] DI-11: failed to SET LOCAL join_collapse_limit: {}",
                 e
             );
         }
-        if let Err(e) = Spi::run(&format!("SET LOCAL from_collapse_limit = {jcl}")) {
+        let fcl_sql = format!("SET LOCAL from_collapse_limit = {jcl}");
+        if let Err(e) = Spi::run(&fcl_sql) {
             pgrx::debug1!(
                 "[pg_trickle] DI-11: failed to SET LOCAL from_collapse_limit: {}",
                 e
@@ -822,7 +826,9 @@ fn apply_fixed_join_strategy(strategy: crate::config::MergeJoinStrategy) {
         ("enable_hashjoin", hashjoin),
         ("enable_mergejoin", mergejoin),
     ] {
-        if let Err(e) = Spi::run(&format!("SET LOCAL {param} = {val}")) {
+        // param is from a fixed extension-controlled array; val is a bool; SET LOCAL cannot use parameterized queries.
+        let set_sql = format!("SET LOCAL {param} = {val}");
+        if let Err(e) = Spi::run(&set_sql) {
             pgrx::debug1!("[pg_trickle] PH-D2: failed to SET LOCAL {param}: {}", e);
         }
     }
@@ -830,7 +836,9 @@ fn apply_fixed_join_strategy(strategy: crate::config::MergeJoinStrategy) {
     // For hash_join strategy, also raise work_mem to avoid hash spills.
     if strategy == crate::config::MergeJoinStrategy::HashJoin {
         let mb = crate::config::pg_trickle_merge_work_mem_mb();
-        if let Err(e) = Spi::run(&format!("SET LOCAL work_mem = '{mb}MB'")) {
+        // mb is a config integer, not user-supplied input; SET LOCAL cannot use parameterized queries.
+        let work_mem_sql = format!("SET LOCAL work_mem = '{mb}MB'");
+        if let Err(e) = Spi::run(&work_mem_sql) {
             pgrx::debug1!("[pg_trickle] PH-D2: failed to SET LOCAL work_mem: {}", e);
         }
     }
@@ -959,13 +967,11 @@ pub fn capture_delta_to_bypass_table(
     // refresh.  If `execute_scheduled_refresh` internally fell back to
     // FULL (e.g. no previous frontier), the table won't exist and we
     // must skip the capture to avoid a "relation does not exist" ERROR.
-    // nosemgrep: semgrep.rust.spi.query.dynamic-format — pgt_id is a plain i64, not user-supplied input.
-    let delta_exists: bool = Spi::get_one::<bool>(&format!(
-        "SELECT to_regclass('__pgt_delta_{}') IS NOT NULL",
-        pgt_id
-    ))
-    .unwrap_or(Some(false))
-    .unwrap_or(false);
+    // pgt_id is a plain i64, not user-supplied input.
+    let delta_exists_sql = format!("SELECT to_regclass('__pgt_delta_{}') IS NOT NULL", pgt_id);
+    let delta_exists: bool = Spi::get_one::<bool>(&delta_exists_sql)
+        .unwrap_or(Some(false))
+        .unwrap_or(false);
 
     if !delta_exists {
         pgrx::debug1!(
@@ -984,13 +990,11 @@ pub fn capture_delta_to_bypass_table(
     // __pgt_row_id into a single I, which omits the D for old column values.
     // Downstream STs with WHERE filters on changed columns would miss the
     // deletion and retain stale rows.
-    // nosemgrep: semgrep.rust.spi.query.dynamic-format — pgt_id is a plain i64, not user-supplied input.
-    let pre_snapshot_exists: bool = Spi::get_one::<bool>(&format!(
-        "SELECT to_regclass('__pgt_pre_{}') IS NOT NULL",
-        pgt_id
-    ))
-    .unwrap_or(Some(false))
-    .unwrap_or(false);
+    // pgt_id is a plain i64, not user-supplied input.
+    let pre_snap_sql = format!("SELECT to_regclass('__pgt_pre_{}') IS NOT NULL", pgt_id);
+    let pre_snapshot_exists: bool = Spi::get_one::<bool>(&pre_snap_sql)
+        .unwrap_or(Some(false))
+        .unwrap_or(false);
 
     // DAG-4/ST-ST-10: Read the MAX(lsn) from the persistent change buffer
     // so that bypass table rows use an LSN that falls within the downstream
@@ -2456,8 +2460,7 @@ pub fn execute_full_refresh(st: &StreamTableMeta) -> Result<(i64, i64), PgTrickl
         // Drop any leftover pre-snapshot from a previous iteration
         // (e.g., SCC fixpoint loops where subtransaction commits don't
         // fire ON COMMIT DROP until the outer transaction commits).
-        // nosemgrep: semgrep.rust.spi.run.dynamic-format — st.pgt_id is a plain i64, not user-supplied input.
-        let _ = Spi::run(&format!("DROP TABLE IF EXISTS __pgt_pre_{}", st.pgt_id));
+        let _ = Spi::run(&format!("DROP TABLE IF EXISTS __pgt_pre_{}", st.pgt_id)); // nosemgrep: rust.spi.run.dynamic-format — st.pgt_id is a plain i64, not user-supplied input.
 
         let snapshot_sql = format!(
             "CREATE TEMP TABLE __pgt_pre_{pgt_id} ON COMMIT DROP AS \
@@ -2565,14 +2568,12 @@ pub fn execute_full_refresh(st: &StreamTableMeta) -> Result<(i64, i64), PgTrickl
             // Escape single quotes in the JSON payload.
             let escaped_name = name.replace('\'', "''");
             let escaped_schema = schema.replace('\'', "''");
-            // nosemgrep: rust.spi.run.dynamic-format — NOTIFY does not support
-            // parameterized payloads in PostgreSQL; single quotes are escaped
-            // above and rows_inserted is a plain integer.
-            Spi::run(&format!(
+            // NOTIFY does not support parameterized payloads; single quotes are escaped above.
+            let notify_sql = format!(
                 "NOTIFY pgtrickle_refresh, '{{\"stream_table\": \"{escaped_name}\", \
                  \"schema\": \"{escaped_schema}\", \"mode\": \"FULL\", \"rows\": {rows_inserted}}}'"
-            ))
-            .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
+            );
+            Spi::run(&notify_sql).map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
         }
 
         pgrx::info!(
@@ -4612,8 +4613,7 @@ pub fn execute_differential_refresh(
                 name.replace('"', "\"\""),
             );
 
-            // nosemgrep: semgrep.rust.spi.run.dynamic-format — st.pgt_id is a plain i64, not user-supplied input.
-            let _ = Spi::run(&format!("DROP TABLE IF EXISTS __pgt_pre_{}", st.pgt_id));
+            let _ = Spi::run(&format!("DROP TABLE IF EXISTS __pgt_pre_{}", st.pgt_id)); // nosemgrep: rust.spi.run.dynamic-format — st.pgt_id is a plain i64, not user-supplied input.
 
             let snapshot_sql = format!(
                 "CREATE TEMP TABLE __pgt_pre_{pgt_id} ON COMMIT DROP AS \

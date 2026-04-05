@@ -5746,7 +5746,7 @@ mod pg_tests {
     }
 
     fn regclass_oid(qualified_name: &str) -> u32 {
-        Spi::get_one::<i32>(&format!("SELECT '{}'::regclass::oid::int4", qualified_name)) // nosemgrep: semgrep.rust.spi.query.dynamic-format \u2014 test-only helper; qualified_name is always a hard-coded literal in tests, never runtime user input
+        Spi::get_one::<i32>(&format!("SELECT '{}'::regclass::oid::int4", qualified_name)) // nosemgrep: rust.spi.query.dynamic-format \u2014 test-only helper; qualified_name is always a hard-coded literal in tests, never runtime user input
             .expect("failed to look up relation oid")
             .expect("relation oid query returned NULL") as u32
     }

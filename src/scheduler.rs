@@ -4638,7 +4638,7 @@ fn execute_scheduled_refresh(
     // runs as superuser, but this ensures the defining query always
     // materializes the full result set even if pg_trickle is installed
     // by a non-superuser role with BYPASSRLS.
-    // nosemgrep: semgrep.sql.row-security.disabled — intentional R3 bypass, mirrors REFRESH MATERIALIZED VIEW semantics.
+    // nosemgrep: sql.row-security.disabled — intentional R3 bypass, mirrors REFRESH MATERIALIZED VIEW semantics.
     let _ = Spi::run("SET LOCAL row_security = off");
 
     // Execute the refresh

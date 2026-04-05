@@ -3704,7 +3704,7 @@ fn execute_manual_refresh(
     // always materializes the full result set regardless of who called
     // refresh_stream_table(). This mirrors REFRESH MATERIALIZED VIEW
     // semantics and prevents the "who refreshed it?" correctness hazard.
-    // nosemgrep: semgrep.sql.row-security.disabled — intentional R3 bypass, mirrors REFRESH MATERIALIZED VIEW semantics.
+    // nosemgrep: sql.row-security.disabled — intentional R3 bypass, mirrors REFRESH MATERIALIZED VIEW semantics.
     Spi::run("SET LOCAL row_security = off")
         .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
 
@@ -4038,22 +4038,19 @@ fn execute_manual_full_refresh(
     // Re-enable user triggers and emit NOTIFY so listeners know a FULL
     // refresh occurred.
     if has_triggers {
-        // nosemgrep: rust.spi.run.dynamic-format — ALTER TABLE DDL cannot be
-        // parameterized; quoted_table is a PostgreSQL-quoted identifier.
-        Spi::run(&format!("ALTER TABLE {quoted_table} ENABLE TRIGGER USER"))
+        Spi::run(&format!("ALTER TABLE {quoted_table} ENABLE TRIGGER USER")) // nosemgrep: rust.spi.run.dynamic-format — ALTER TABLE DDL cannot be parameterized; quoted_table is a PostgreSQL-quoted identifier.
             .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
 
         // PB2: Skip NOTIFY when pooler compatibility mode is enabled.
         if !st.pooler_compatibility_mode {
             let escaped_name = table_name.replace('\'', "''");
             let escaped_schema = schema.replace('\'', "''");
-            // nosemgrep: rust.spi.run.dynamic-format — NOTIFY does not support
-            // parameterized payloads; single quotes are escaped above.
-            Spi::run(&format!(
+            // NOTIFY does not support parameterized payloads; single quotes are escaped above.
+            let notify_sql = format!(
                 "NOTIFY pgtrickle_refresh, '{{\"stream_table\": \"{escaped_name}\", \
                  \"schema\": \"{escaped_schema}\", \"mode\": \"FULL\"}}'"
-            ))
-            .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
+            );
+            Spi::run(&notify_sql).map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
         }
 
         pgrx::info!(
@@ -5048,13 +5045,9 @@ fn gate_source(source: &str) -> Result<(), PgTrickleError> {
 
     // Signal the scheduler that the gate set has changed.
     let payload = format!("{}", source_relid.to_u32());
-    // nosemgrep: semgrep.rust.spi.run.dynamic-format — pg_notify does not support parameterized
-    // payloads; payload is source_relid.to_u32() (a plain integer, not user-supplied text).
-    Spi::run(&format!(
-        "SELECT pg_notify('pgtrickle_source_gate', '{}')",
-        &payload
-    ))
-    .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
+    // pg_notify does not support parameterized payloads; payload is source_relid.to_u32() (a plain integer).
+    let gate_sql = format!("SELECT pg_notify('pgtrickle_source_gate', '{}')", &payload);
+    Spi::run(&gate_sql).map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
 
     pgrx::info!(
         "pg_trickle: source {} (oid={}) is now gated",
@@ -5075,13 +5068,9 @@ fn ungate_source(source: &str) -> Result<(), PgTrickleError> {
 
     // Signal the scheduler that the gate set has changed.
     let payload = format!("{}", source_relid.to_u32());
-    // nosemgrep: semgrep.rust.spi.run.dynamic-format — pg_notify does not support parameterized
-    // payloads; payload is source_relid.to_u32() (a plain integer, not user-supplied text).
-    Spi::run(&format!(
-        "SELECT pg_notify('pgtrickle_source_gate', '{}')",
-        &payload
-    ))
-    .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
+    // pg_notify does not support parameterized payloads; payload is source_relid.to_u32() (a plain integer).
+    let gate_sql = format!("SELECT pg_notify('pgtrickle_source_gate', '{}')", &payload);
+    Spi::run(&gate_sql).map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
 
     pgrx::info!(
         "pg_trickle: source {} (oid={}) is now ungated",
@@ -5234,13 +5223,9 @@ fn advance_watermark(source: &str, watermark: TimestampWithTimeZone) -> Result<(
 
     // Notify the scheduler that watermark state changed.
     let payload = format!("wm:{}", source_relid.to_u32());
-    // nosemgrep: semgrep.rust.spi.run.dynamic-format — pg_notify does not support parameterized
-    // payloads; payload is "wm:" + source_relid.to_u32() (plain integer, not user-supplied text).
-    Spi::run(&format!(
-        "SELECT pg_notify('pgtrickle_watermark', '{}')",
-        &payload
-    ))
-    .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
+    // pg_notify does not support parameterized payloads; payload is "wm:" + source_relid.to_u32() (plain integer).
+    let wm_sql = format!("SELECT pg_notify('pgtrickle_watermark', '{}')", &payload);
+    Spi::run(&wm_sql).map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
 
     pgrx::info!(
         "pg_trickle: watermark for {} (oid={}) advanced",

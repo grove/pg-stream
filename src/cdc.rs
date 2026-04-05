@@ -266,9 +266,7 @@ pub fn drop_change_trigger(
             format!("pg_trickle_cdc_del_{}", oid_u32), // statement DELETE
             format!("pg_trickle_cdc_truncate_{}", oid_u32), // TRUNCATE (both modes)
         ] {
-            // nosemgrep: semgrep.rust.spi.run.dynamic-format — DDL cannot be parameterized;
-            // trig is built from oid_u32 (a plain integer) and table is a regclass-quoted identifier.
-            let _ = Spi::run(&format!("DROP TRIGGER IF EXISTS {trig} ON {table}"));
+            let _ = Spi::run(&format!("DROP TRIGGER IF EXISTS {trig} ON {table}")); // nosemgrep: rust.spi.run.dynamic-format — DDL cannot be parameterized; trig is an oid_u32 integer, table is a regclass-quoted identifier.
         }
     }
 
@@ -608,16 +606,15 @@ pub fn ensure_st_change_buffer(
 
 /// Count how many downstream STs depend on a given upstream ST.
 pub fn count_downstream_st_consumers(pgt_id: i64) -> i64 {
-    // The upstream ST's pgt_relid is stored as source_relid in pgt_dependencies
-    // nosemgrep: semgrep.rust.spi.query.dynamic-format — pgt_id is a plain i64, not user-supplied input.
-    Spi::get_one::<i64>(&format!(
+    // The upstream ST's pgt_relid is stored as source_relid in pgt_dependencies.
+    // pgt_id is a plain i64, not user-supplied input.
+    let sql = format!(
         "SELECT COUNT(*)::bigint FROM pgtrickle.pgt_dependencies \
          WHERE source_relid = (\
            SELECT pgt_relid FROM pgtrickle.pgt_stream_tables WHERE pgt_id = {pgt_id}\
          ) AND source_type = 'STREAM_TABLE'"
-    ))
-    .unwrap_or(Some(0))
-    .unwrap_or(0)
+    );
+    Spi::get_one::<i64>(&sql).unwrap_or(Some(0)).unwrap_or(0)
 }
 
 /// C-4: Compact a change buffer by eliminating net-zero pk_hash groups
@@ -1997,9 +1994,7 @@ pub fn rebuild_cdc_trigger(
         format!("pg_trickle_cdc_upd_{}", oid_u32),
         format!("pg_trickle_cdc_del_{}", oid_u32),
     ] {
-        // nosemgrep: semgrep.rust.spi.run.dynamic-format — DDL cannot be parameterized;
-        // trig is built from oid_u32 (a plain integer) and source_table is a regclass-quoted identifier.
-        let _ = Spi::run(&format!("DROP TRIGGER IF EXISTS {trig} ON {source_table}"));
+        let _ = Spi::run(&format!("DROP TRIGGER IF EXISTS {trig} ON {source_table}")); // nosemgrep: rust.spi.run.dynamic-format — DDL cannot be parameterized; trig is an oid_u32 integer, source_table is a regclass-quoted identifier.
     }
 
     // 3. Create new trigger(s) matching the current mode.
@@ -2655,19 +2650,14 @@ pub fn setup_matview_polling(
             PgTrickleError::NotFound(format!("Materialized view with OID {oid_u32} not found"))
         })?;
 
-        // nosemgrep: rust.spi.run.dynamic-format — DDL (LIKE) cannot use
-        // parameterized queries; snapshot_table is built from a PG OID and
-        // source_table is oid::regclass::text, both extension-controlled.
-        Spi::run(&format!(
+        // DDL cannot be parameterized; snapshot_table is from a PG OID, source_table is oid::regclass::text, both extension-controlled.
+        let create_sql = format!(
             "CREATE TABLE IF NOT EXISTS {snapshot_table} (LIKE {source_table} INCLUDING ALL)"
-        ))
-        .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
+        );
+        Spi::run(&create_sql).map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
 
-        // nosemgrep: rust.spi.run.dynamic-format — same rationale as above.
-        Spi::run(&format!(
-            "INSERT INTO {snapshot_table} SELECT * FROM {source_table}"
-        ))
-        .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
+        let insert_sql = format!("INSERT INTO {snapshot_table} SELECT * FROM {source_table}");
+        Spi::run(&insert_sql).map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
 
         Spi::run_with_args(
             "INSERT INTO pgtrickle.pgt_change_tracking \
