@@ -1829,6 +1829,10 @@ fn has_non_monotonic_cte(sql: &str) -> bool {
         || sql.contains("__pgt_cte_full_join_") // FULL JOIN
         || sql.contains("__pgt_cte_fj_") // FULL JOIN flags CTE
         || sql.contains("__pgt_cte_anti_join_") // NOT EXISTS / ALL subquery
+        || sql.contains("__pgt_cte_semi_join_") // EXISTS subquery
+        || sql.contains("__pgt_cte_r_old_") // Semi/anti join pre-change snapshot
+        || sql.contains("__pgt_cte_isect_") // INTERSECT: right INSERTs remove left rows
+        || sql.contains("__pgt_cte_dist_") // DISTINCT: INSERTs change dedup outcome
         || sql.contains("__pgt_cte_exct_") // EXCEPT: right INSERTs remove left rows
         || sql.contains("__pgt_cte_win_") // Window: INSERTs change partition values
         || sql.contains("__pgt_cte_scalar_sub_") // Scalar subquery: value changes
@@ -4676,6 +4680,7 @@ pub fn execute_differential_refresh(
     // cost of MERGE which dominates for aggregate queries with many groups.
     let use_agg_fast_path = resolved.is_all_algebraic
         && crate::config::pg_trickle_aggregate_fast_path()
+        && !st.has_keyless_source
         && !use_explicit_dml
         && !use_delete_insert
         && st.st_partition_key.is_none();
