@@ -4509,8 +4509,55 @@ pub fn execute_differential_refresh(
     }
 
     // ── B-3: Strategy selection ──────────────────────────────────────
-    // Always use MERGE. The delete_insert path was removed in v0.2.0
-    // (pg_trickle.merge_strategy GUC removed — C1 cleanup).
+    // PH-D1: Choose between MERGE and DELETE+INSERT based on the
+    // merge_strategy GUC and the delta-to-target ratio heuristic.
+    let merge_strategy = crate::config::pg_trickle_merge_strategy();
+    let use_delete_insert = match merge_strategy {
+        crate::config::MergeStrategy::DeleteInsert => true,
+        crate::config::MergeStrategy::Merge => false,
+        crate::config::MergeStrategy::Auto => {
+            // Heuristic: use DELETE+INSERT when delta is a small fraction
+            // of the target table. Estimate target rows from pg_class.
+            let threshold = crate::config::pg_trickle_merge_strategy_threshold();
+            if total_change_count > 0 && threshold > 0.0 {
+                let target_rows: i64 = Spi::get_one::<i64>(&format!(
+                    "SELECT CASE WHEN reltuples >= 1 THEN reltuples::bigint \
+                            ELSE (SELECT COUNT(*) FROM \"{}\".\"{}\" ) END \
+                     FROM pg_class WHERE oid = {}::oid",
+                    schema.replace('"', "\"\""),
+                    name.replace('"', "\"\""),
+                    st.pgt_relid.to_u32(),
+                ))
+                .unwrap_or(Some(0))
+                .unwrap_or(0);
+                if target_rows > 0 {
+                    let ratio = total_change_count as f64 / target_rows as f64;
+                    let chosen = ratio < threshold;
+                    if chosen {
+                        pgrx::debug1!(
+                            "[pg_trickle] PH-D1: auto chose DELETE+INSERT for {}.{}: \
+                             ratio={:.4} < threshold={:.4} ({} changes / {} target rows)",
+                            schema,
+                            name,
+                            ratio,
+                            threshold,
+                            total_change_count,
+                            target_rows,
+                        );
+                    }
+                    chosen
+                } else {
+                    false
+                }
+            } else {
+                false
+            }
+        }
+    };
+    // DELETE+INSERT is incompatible with the explicit DML path (user triggers,
+    // keyless sources, downstream ST consumers) — those already use their own
+    // decomposed DML.  Also skip for partitioned STs (hash-merge path).
+    let use_delete_insert = use_delete_insert && !use_explicit_dml && st.st_partition_key.is_none();
 
     // ── A1-2/A1-3: Partition-key range predicate injection ───────────
     // For partitioned stream tables, compute the MIN/MAX of the partition
@@ -4595,6 +4642,56 @@ pub fn execute_differential_refresh(
     let (merge_count, strategy_label) = if let Some(result) = hash_merge_result {
         // A1-3b: HASH per-partition MERGE already executed above.
         result
+    } else if use_delete_insert {
+        // ── PH-D1: DELETE+INSERT path ───────────────────────────────
+        // For small deltas against large tables, separate DELETE + INSERT
+        // avoids the MERGE join cost. The delta is materialized into a
+        // temp table, then applied as two targeted statements.
+        let t_mat_start = Instant::now();
+
+        let materialize_sql = format!(
+            "CREATE TEMP TABLE __pgt_delta_{pgt_id} ON COMMIT DROP AS \
+             SELECT * FROM {using_clause} AS d",
+            pgt_id = st.pgt_id,
+            using_clause = resolved.trigger_using_sql,
+        );
+        Spi::run(&materialize_sql).map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
+        let t_mat = t_mat_start.elapsed();
+
+        // Step 1: DELETE rows marked for removal
+        let t_del_start = Instant::now();
+        let del_count = Spi::connect_mut(|client| {
+            let result = client
+                .update(&resolved.trigger_delete_sql, None, &[])
+                .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
+            Ok::<usize, PgTrickleError>(result.len())
+        })?;
+        let t_del = t_del_start.elapsed();
+
+        // Step 2: INSERT new rows (skipping UPDATE — the delta represents
+        // UPDATEs as D+I pairs with different __pgt_row_id values)
+        let t_ins_start = Instant::now();
+        let ins_count = Spi::connect_mut(|client| {
+            let result = client
+                .update(&resolved.trigger_insert_sql, None, &[])
+                .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
+            Ok::<usize, PgTrickleError>(result.len())
+        })?;
+        let t_ins = t_ins_start.elapsed();
+
+        pgrx::info!(
+            "[PGS_PROFILE] delete_insert: materialize={:.2}ms delete={:.2}ms({}) \
+             insert={:.2}ms({}) for {}.{}",
+            t_mat.as_secs_f64() * 1000.0,
+            t_del.as_secs_f64() * 1000.0,
+            del_count,
+            t_ins.as_secs_f64() * 1000.0,
+            ins_count,
+            schema,
+            name,
+        );
+
+        (del_count + ins_count, "delete_insert")
     } else if use_explicit_dml {
         // ── User-trigger path: explicit DML ─────────────────────────
         // Decompose the MERGE into DELETE + UPDATE + INSERT so that

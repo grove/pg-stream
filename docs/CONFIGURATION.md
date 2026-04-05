@@ -26,6 +26,8 @@ Complete reference for all pg_trickle GUC (Grand Unified Configuration) variable
     - [pg\_trickle.max\_delta\_estimate\_rows](#pg_tricklemax_delta_estimate_rows)
     - [pg\_trickle.planner\_aggressive](#pg_trickleplanner_aggressive)
     - [pg\_trickle.merge\_join\_strategy](#pg_tricklemerge_join_strategy)
+    - [pg\_trickle.merge\_strategy](#pg_tricklemerge_strategy)
+    - [pg\_trickle.merge\_strategy\_threshold](#pg_tricklemerge_strategy_threshold)
     - [pg\_trickle.merge\_planner\_hints](#pg_tricklemerge_planner_hints) *(deprecated)*
     - [pg\_trickle.merge\_work\_mem\_mb](#pg_tricklemerge_work_mem_mb)
     - [pg\_trickle.merge\_seqscan\_threshold](#pg_tricklemerge_seqscan_threshold)
@@ -543,6 +545,72 @@ SET pg_trickle.merge_join_strategy = 'hash_join';
 
 -- Revert to automatic heuristics
 SET pg_trickle.merge_join_strategy = 'auto';
+```
+
+---
+
+### pg_trickle.merge_strategy
+
+*Added in v0.16.0.* Controls how differential refresh applies deltas to stream tables.
+
+| Property | Value |
+|---|---|
+| Type | `text` |
+| Default | `'auto'` |
+| Values | `auto`, `merge`, `delete_insert` |
+| Context | `SUSET` |
+| Restart Required | No |
+
+| Value | Behaviour |
+|---|---|
+| `auto` (default) | Use DELETE+INSERT when `delta_rows / target_rows` is below [`merge_strategy_threshold`](#pg_tricklemerge_strategy_threshold); MERGE otherwise |
+| `merge` | Always use the PostgreSQL MERGE statement |
+| `delete_insert` | Always use separate DELETE + INSERT statements |
+
+The DELETE+INSERT strategy avoids the MERGE join cost by executing two targeted statements:
+a DELETE for removed rows (matched by `__pgt_row_id`), then an INSERT for new rows.
+This is significantly cheaper for sub-1% deltas against large tables because it avoids
+scanning the entire target for the MERGE join.
+
+**Tuning Guidance:**
+- **Most workloads**: Leave at `auto` — the heuristic picks DELETE+INSERT for small deltas automatically.
+- **Append-heavy workloads**: Consider `delete_insert` if deltas are consistently tiny relative to the target.
+- **Correctness concerns**: The `merge` setting preserves the pre-v0.16.0 behaviour.
+
+```sql
+-- Force DELETE+INSERT for all differential refreshes
+SET pg_trickle.merge_strategy = 'delete_insert';
+
+-- Revert to automatic heuristics
+SET pg_trickle.merge_strategy = 'auto';
+```
+
+---
+
+### pg_trickle.merge_strategy_threshold
+
+*Added in v0.16.0.* Delta ratio threshold for the `auto` merge strategy.
+
+| Property | Value |
+|---|---|
+| Type | `float` |
+| Default | `0.01` (1%) |
+| Range | `0.001` – `1.0` |
+| Context | `SUSET` |
+| Restart Required | No |
+
+When [`merge_strategy`](#pg_tricklemerge_strategy) is `auto`, DELETE+INSERT is used instead of
+MERGE when `delta_rows / target_rows` is below this threshold. The target row count is estimated
+from `pg_class.reltuples`.
+
+**Tuning Guidance:**
+- **Default (0.01)**: DELETE+INSERT for deltas under 1% of the target table size.
+- **Higher values (0.05–0.10)**: More aggressive use of DELETE+INSERT; useful for wide tables where MERGE join overhead is high.
+- **Lower values (0.001)**: Only use DELETE+INSERT for very tiny deltas.
+
+```sql
+-- Use DELETE+INSERT for deltas under 5% of target size
+SET pg_trickle.merge_strategy_threshold = 0.05;
 ```
 
 ---

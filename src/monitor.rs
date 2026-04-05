@@ -827,6 +827,14 @@ fn explain_st_impl(
         props.push(("dependency_graph_dot".to_string(), dot));
     }
 
+    // PH-D1: Merge strategy GUC value.
+    props.push((
+        "merge_strategy".to_string(),
+        crate::config::pg_trickle_merge_strategy()
+            .as_str()
+            .to_string(),
+    ));
+
     // PH-E2: Live temp file spill info from pg_stat_statements.
     let spill_threshold = crate::config::pg_trickle_spill_threshold_blocks();
     if spill_threshold > 0 {

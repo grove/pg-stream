@@ -59,6 +59,13 @@ For future plans and release milestones, see [ROADMAP.md](ROADMAP.md).
   (up to 8 columns), improving deduplication lookup performance during MERGE.
   *(AUTO-IDX-1)*
 
+- **MERGE strategy alternatives** — new `pg_trickle.merge_strategy` GUC
+  (`auto` / `merge` / `delete_insert`) selects the delta apply strategy.
+  In `auto` mode (default), DELETE+INSERT is used when
+  `delta_rows / target_rows` is below `merge_strategy_threshold` (default 1%),
+  avoiding the MERGE join cost for sub-1% deltas against large tables.
+  `explain_st()` now exposes `merge_strategy`. *(PH-D1)*
+
 ### Changed
 
 - **GUC defaults reviewed** — added detailed tuning guidance for

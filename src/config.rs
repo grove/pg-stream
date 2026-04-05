@@ -597,6 +597,53 @@ fn normalize_merge_join_strategy(value: Option<String>) -> MergeJoinStrategy {
 /// Default `false` — change buffers remain WAL-logged and crash-safe.
 pub static PGS_UNLOGGED_BUFFERS: GucSetting<bool> = GucSetting::<bool>::new(false);
 
+/// PH-D1: MERGE strategy override.
+///
+/// Controls how differential refresh applies deltas to stream tables:
+/// - `"auto"` (default): use DELETE+INSERT when `delta_rows / target_rows`
+///   is below `merge_strategy_threshold`; MERGE otherwise.
+/// - `"merge"`: always use the MERGE statement.
+/// - `"delete_insert"`: always use DELETE + INSERT (two separate statements).
+pub static PGS_MERGE_STRATEGY: GucSetting<Option<std::ffi::CString>> =
+    GucSetting::<Option<std::ffi::CString>>::new(Some(c"auto"));
+
+/// PH-D1: Delta ratio threshold for the `auto` merge strategy.
+///
+/// When `merge_strategy = 'auto'`, DELETE+INSERT is used instead of MERGE
+/// when `delta_rows / target_rows < merge_strategy_threshold`. This avoids
+/// the MERGE join cost for sub-1% deltas against large tables.
+///
+/// Default: 0.01 (1%).
+pub static PGS_MERGE_STRATEGY_THRESHOLD: GucSetting<f64> = GucSetting::<f64>::new(0.01);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MergeStrategy {
+    /// Heuristic: DELETE+INSERT for small deltas, MERGE otherwise.
+    Auto,
+    /// Always MERGE.
+    Merge,
+    /// Always DELETE + INSERT.
+    DeleteInsert,
+}
+
+impl MergeStrategy {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            MergeStrategy::Auto => "auto",
+            MergeStrategy::Merge => "merge",
+            MergeStrategy::DeleteInsert => "delete_insert",
+        }
+    }
+}
+
+fn normalize_merge_strategy(value: Option<String>) -> MergeStrategy {
+    match value.as_deref().map(str::to_ascii_lowercase).as_deref() {
+        Some("merge") => MergeStrategy::Merge,
+        Some("delete_insert") => MergeStrategy::DeleteInsert,
+        _ => MergeStrategy::Auto,
+    }
+}
+
 /// Register all GUC variables. Called from `_PG_init()`.
 pub fn register_gucs() {
     GucRegistry::define_bool_guc(
@@ -1269,6 +1316,34 @@ pub fn register_gucs() {
         GucContext::Suset,
         GucFlags::default(),
     );
+
+    // PH-D1: MERGE strategy override.
+    GucRegistry::define_string_guc(
+        c"pg_trickle.merge_strategy",
+        c"Delta apply strategy: auto (default), merge, delete_insert.",
+        c"'auto' (default) uses DELETE+INSERT for sub-1% deltas (delta_rows / target_rows \
+           below merge_strategy_threshold) and MERGE otherwise. \
+           'merge' always uses the MERGE statement. \
+           'delete_insert' always uses separate DELETE + INSERT statements, \
+           avoiding the MERGE join cost for small deltas against large tables.",
+        &PGS_MERGE_STRATEGY,
+        GucContext::Suset,
+        GucFlags::default(),
+    );
+
+    // PH-D1: Merge strategy threshold.
+    GucRegistry::define_float_guc(
+        c"pg_trickle.merge_strategy_threshold",
+        c"Delta ratio threshold for auto merge_strategy (default: 0.01 = 1%).",
+        c"When merge_strategy = 'auto', DELETE+INSERT is used instead of MERGE when \
+           delta_rows / target_rows is below this threshold. Higher values cause more \
+           refreshes to use DELETE+INSERT. Range: 0.001 to 1.0.",
+        &PGS_MERGE_STRATEGY_THRESHOLD,
+        0.001, // min
+        1.0,   // max
+        GucContext::Suset,
+        GucFlags::default(),
+    );
 }
 
 // ── Convenience accessors ──────────────────────────────────────────────────
@@ -1611,12 +1686,26 @@ pub fn pg_trickle_unlogged_buffers() -> bool {
     PGS_UNLOGGED_BUFFERS.get()
 }
 
+/// PH-D1: Returns the merge strategy override.
+pub fn pg_trickle_merge_strategy() -> MergeStrategy {
+    normalize_merge_strategy(
+        PGS_MERGE_STRATEGY
+            .get()
+            .and_then(|cs| cs.to_str().ok().map(str::to_owned)),
+    )
+}
+
+/// PH-D1: Returns the merge strategy threshold for the `auto` heuristic.
+pub fn pg_trickle_merge_strategy_threshold() -> f64 {
+    PGS_MERGE_STRATEGY_THRESHOLD.get()
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        CdcTriggerMode, MergeJoinStrategy, ParallelRefreshMode, UserTriggersMode,
+        CdcTriggerMode, MergeJoinStrategy, MergeStrategy, ParallelRefreshMode, UserTriggersMode,
         VolatileFunctionPolicy, normalize_cdc_trigger_mode, normalize_merge_join_strategy,
-        normalize_parallel_refresh_mode, normalize_recursive_max_depth,
+        normalize_merge_strategy, normalize_parallel_refresh_mode, normalize_recursive_max_depth,
         normalize_user_triggers_mode, normalize_volatile_function_policy, threshold_mb_to_bytes,
     };
 
@@ -1910,6 +1999,58 @@ mod tests {
         ] {
             assert_eq!(
                 normalize_merge_join_strategy(Some(strategy.as_str().to_string())),
+                strategy
+            );
+        }
+    }
+
+    #[test]
+    fn test_normalize_merge_strategy_defaults_to_auto() {
+        assert_eq!(normalize_merge_strategy(None), MergeStrategy::Auto);
+        assert_eq!(
+            normalize_merge_strategy(Some("".to_string())),
+            MergeStrategy::Auto
+        );
+        assert_eq!(
+            normalize_merge_strategy(Some("garbage".to_string())),
+            MergeStrategy::Auto
+        );
+    }
+
+    #[test]
+    fn test_normalize_merge_strategy_all_variants() {
+        assert_eq!(
+            normalize_merge_strategy(Some("merge".to_string())),
+            MergeStrategy::Merge
+        );
+        assert_eq!(
+            normalize_merge_strategy(Some("delete_insert".to_string())),
+            MergeStrategy::DeleteInsert
+        );
+        assert_eq!(
+            normalize_merge_strategy(Some("auto".to_string())),
+            MergeStrategy::Auto
+        );
+        // Case-insensitive
+        assert_eq!(
+            normalize_merge_strategy(Some("DELETE_INSERT".to_string())),
+            MergeStrategy::DeleteInsert
+        );
+        assert_eq!(
+            normalize_merge_strategy(Some("MERGE".to_string())),
+            MergeStrategy::Merge
+        );
+    }
+
+    #[test]
+    fn test_normalize_merge_strategy_roundtrip_via_as_str() {
+        for strategy in [
+            MergeStrategy::Auto,
+            MergeStrategy::Merge,
+            MergeStrategy::DeleteInsert,
+        ] {
+            assert_eq!(
+                normalize_merge_strategy(Some(strategy.as_str().to_string())),
                 strategy
             );
         }

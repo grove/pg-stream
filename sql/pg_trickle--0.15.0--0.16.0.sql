@@ -11,3 +11,8 @@
 --   Registered via pgrx GUC infrastructure (auto-available after upgrade).
 --   Controls automatic index creation on GROUP BY/DISTINCT columns and
 --   covering __pgt_row_id index (default: true).
+
+-- PH-D1: merge_strategy + merge_strategy_threshold GUCs
+--   Registered via pgrx GUC infrastructure (auto-available after upgrade).
+--   merge_strategy: 'auto' (default), 'merge', 'delete_insert'
+--   merge_strategy_threshold: 0.01 (default) — delta ratio threshold for auto mode
