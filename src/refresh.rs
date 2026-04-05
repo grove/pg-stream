@@ -1866,7 +1866,8 @@ fn build_append_only_insert_sql(schema: &str, name: &str, merge_sql: &str) -> St
         "INSERT INTO {quoted_table} ({col_list}) \
          SELECT {d_col_list} \
          FROM {using_clause} AS d \
-         WHERE d.__pgt_action = 'I'"
+         WHERE d.__pgt_action = 'I' \
+         ON CONFLICT (__pgt_row_id) DO NOTHING"
     )
 }
 

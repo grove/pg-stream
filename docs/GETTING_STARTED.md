@@ -536,8 +536,9 @@ The stream tables don't know about Heidi yet. The change is in the buffer, waiti
 > ```sql
 > SELECT name, data_timestamp, staleness FROM pgtrickle.pgt_status();
 > ```
-> Or force an immediate synchronous refresh for the tutorial. Note that `refresh_stream_table` only refreshes the named table — it does not cascade upstream — so refresh in topological order:
+> To force an immediate synchronous refresh, wait a moment first (so the scheduler can finish its current tick), then call in topological order. Note that `refresh_stream_table` only refreshes the named table — it does not cascade upstream:
 > ```sql
+> SELECT pg_sleep(2);  -- let the scheduler finish any in-progress tick
 > SELECT pgtrickle.refresh_stream_table('department_stats');
 > SELECT pgtrickle.refresh_stream_table('department_report');
 > ```
@@ -578,8 +579,9 @@ INSERT INTO departments (id, name, parent_id) VALUES
 
 **What happened:** The CDC trigger on `departments` fired. The change buffer for `departments` has one new row. None of the stream tables know about it yet.
 
-> **The scheduler handles this automatically** — all three tables will refresh within a second in the correct dependency order (upstream first). To force it synchronously, refresh each table in topological order (`refresh_stream_table` does not cascade upstream):
+> **The scheduler handles this automatically** — all three tables will refresh within a second in the correct dependency order (upstream first). To force it synchronously, wait a moment first then refresh each table in topological order (`refresh_stream_table` does not cascade upstream):
 > ```sql
+> SELECT pg_sleep(2);
 > SELECT pgtrickle.refresh_stream_table('department_tree');
 > SELECT pgtrickle.refresh_stream_table('department_stats');
 > SELECT pgtrickle.refresh_stream_table('department_report');
@@ -621,9 +623,10 @@ UPDATE departments SET name = 'R&D' WHERE id = 2;
 
 **What happened in the change buffer:** The CDC trigger captured the **old** row (`name='Engineering'`) and the **new** row (`name='R&D'`). Both old and new values are stored so the delta can compute what to remove and what to add.
 
-Wait a moment for the scheduler to propagate the rename through all layers. To force it synchronously, refresh each table in topological order (`refresh_stream_table` does not cascade upstream):
+Wait a moment for the scheduler to propagate the rename through all layers. To force it synchronously, wait then refresh each table in topological order (`refresh_stream_table` does not cascade upstream):
 
 ```sql
+SELECT pg_sleep(2);
 SELECT pgtrickle.refresh_stream_table('department_tree');
 SELECT pgtrickle.refresh_stream_table('department_stats');
 SELECT pgtrickle.refresh_stream_table('department_report');
@@ -664,9 +667,10 @@ DELETE FROM employees WHERE name = 'Bob';
 
 **What happened:** The `AFTER DELETE` trigger on `employees` fired, writing a change buffer row with action type `D` and Bob's old values (`department_id=5, salary=115000`). The delta query will use these old values to compute the correct aggregate adjustment — it knows to subtract 115000 from Backend's salary sum and decrement the count.
 
-> **Important — refresh before querying:** The background scheduler refreshes all three tables within ~1 second, *in topological order*. To see the result immediately, explicitly refresh in upstream-first order:
+> **Important — refresh before querying:** The background scheduler refreshes all three tables within ~1 second, *in topological order*. To see the result immediately, wait a moment then explicitly refresh in upstream-first order:
 
 ```sql
+SELECT pg_sleep(2);
 SELECT pgtrickle.refresh_stream_table('department_stats');
 SELECT pgtrickle.refresh_stream_table('department_report');
 ```
