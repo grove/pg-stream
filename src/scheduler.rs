@@ -3702,7 +3702,17 @@ fn check_schedule(st: &StreamTableMeta, _dag: &StDag) -> bool {
     check_upstream_changes(st)
 }
 
-/// Emit a StaleData alert if the stream table is currently stale.
+/// Emit a StaleData or NoUpstreamChanges alert depending on whether the
+/// scheduler itself is falling behind.
+///
+/// The distinction matters:
+/// - **StaleData** (warning): `last_refresh_at` is also old, meaning the
+///   scheduler is stuck, in backoff, or overloaded.  The view is genuinely
+///   out of date.
+/// - **NoUpstreamChanges** (info): `last_refresh_at` is recent (scheduler is
+///   alive and looping), but `data_timestamp` is frozen because the source
+///   tables have had no writes.  The view is correct; there is just nothing
+///   new to show.
 ///
 /// Called when a refresh is skipped (due to backoff, row lock, etc.)
 /// so that operators are notified via NOTIFY even when the scheduler
@@ -3715,21 +3725,43 @@ fn emit_stale_alert_if_needed(st: &StreamTableMeta) {
             && !trimmed.contains(' ')
             && let Ok(max_secs) = crate::api::parse_duration(trimmed)
         {
-            let staleness = Spi::get_one_with_args::<f64>(
-                "SELECT EXTRACT(EPOCH FROM (now() - data_timestamp))::float8 \
+            let schedule_f64 = max_secs as f64;
+
+            // Fetch both timestamps in one query.
+            let row = Spi::get_two_with_args::<f64, f64>(
+                "SELECT \
+                     EXTRACT(EPOCH FROM (now() - data_timestamp))::float8, \
+                     EXTRACT(EPOCH FROM (now() - last_refresh_at))::float8 \
                  FROM pgtrickle.pgt_stream_tables WHERE pgt_id = $1",
                 &[st.pgt_id.into()],
             )
-            .unwrap_or(None);
+            .unwrap_or((None, None));
 
-            if let Some(stale_secs) = staleness {
-                // Alert when staleness exceeds 2× the schedule
-                let schedule_f64 = max_secs as f64;
-                if stale_secs > schedule_f64 * 2.0 {
+            let (data_age, refresh_age) = row;
+
+            if let Some(data_secs) = data_age
+                && data_secs > schedule_f64 * 2.0
+            {
+                // Is the scheduler itself running on time?
+                // Use 3× schedule as a generous liveness window.
+                let scheduler_alive = refresh_age
+                    .map(|r| r <= schedule_f64 * 3.0)
+                    .unwrap_or(false);
+
+                if scheduler_alive {
+                    // Scheduler is healthy — source tables are just quiet.
+                    monitor::alert_no_upstream_changes(
+                        &st.pgt_schema,
+                        &st.pgt_name,
+                        data_secs,
+                        st.pooler_compatibility_mode,
+                    );
+                } else {
+                    // Scheduler is also behind — genuine staleness.
                     monitor::alert_stale_data(
                         &st.pgt_schema,
                         &st.pgt_name,
-                        stale_secs,
+                        data_secs,
                         schedule_f64,
                         st.pooler_compatibility_mode,
                     );

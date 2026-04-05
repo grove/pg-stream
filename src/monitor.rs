@@ -61,6 +61,9 @@ pub enum AlertEvent {
     CdcTriggerDisabled,
     /// Change buffer cleanup persistently failing for a source OID.
     CleanupFailure,
+    /// Scheduler is running normally but no upstream source rows have changed
+    /// — data_timestamp is frozen because there is genuinely nothing new.
+    NoUpstreamChanges,
 }
 
 impl AlertEvent {
@@ -80,6 +83,7 @@ impl AlertEvent {
             AlertEvent::FrozenTierSkip => "frozen_tier_skip",
             AlertEvent::CdcTriggerDisabled => "cdc_trigger_disabled",
             AlertEvent::CleanupFailure => "cleanup_failure",
+            AlertEvent::NoUpstreamChanges => "no_upstream_changes",
         }
     }
 }
@@ -156,6 +160,26 @@ pub fn alert_stale_data(
                 0.0
             },
         ),
+        skip_notify,
+    );
+}
+
+/// Emit a no-upstream-changes informational event.
+///
+/// Fired when the scheduler is healthy (last_refresh_at is recent) but
+/// data_timestamp has not advanced because no source rows changed.  This
+/// is distinct from a genuine staleness problem.
+pub fn alert_no_upstream_changes(
+    pgt_schema: &str,
+    pgt_name: &str,
+    idle_secs: f64,
+    skip_notify: bool,
+) {
+    emit_alert(
+        AlertEvent::NoUpstreamChanges,
+        pgt_schema,
+        pgt_name,
+        &format!(r#""idle_seconds":{:.1}"#, idle_secs),
         skip_notify,
     );
 }

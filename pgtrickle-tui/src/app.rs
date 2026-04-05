@@ -1964,23 +1964,43 @@ fn parse_alert_payload(payload: &str) -> crate::state::AlertEvent {
             let del = i64_field("rows_deleted").unwrap_or(0);
             let ms = i64_field("duration_ms").unwrap_or(0);
             let metric = format!("+{ins}/-{del} rows, {ms}ms");
-            let context = str_field("action").map(|a| format!("action={a}")).unwrap_or_default();
+            let context = str_field("action")
+                .map(|a| format!("action={a}"))
+                .unwrap_or_default();
             (metric, context)
         }
         "refresh_failed" => {
             let context = str_field("error").unwrap_or_default();
-            let metric = str_field("action").map(|a| format!("action={a}")).unwrap_or_default();
+            let metric = str_field("action")
+                .map(|a| format!("action={a}"))
+                .unwrap_or_default();
             (metric, context)
         }
         "scheduler_falling_behind" => {
-            let ratio = f64_field("ratio").map(|r| format!("ratio={r:.2}")).unwrap_or_default();
-            let elapsed = i64_field("elapsed_ms").map(|m| format!("{m}ms")).unwrap_or_default();
-            let metric = if ratio.is_empty() { elapsed } else if elapsed.is_empty() { ratio } else { format!("{ratio}, {elapsed}") };
+            let ratio = f64_field("ratio")
+                .map(|r| format!("ratio={r:.2}"))
+                .unwrap_or_default();
+            let elapsed = i64_field("elapsed_ms")
+                .map(|m| format!("{m}ms"))
+                .unwrap_or_default();
+            let metric = if ratio.is_empty() {
+                elapsed
+            } else if elapsed.is_empty() {
+                ratio
+            } else {
+                format!("{ratio}, {elapsed}")
+            };
             (metric, String::new())
         }
         "cleanup_failure" => {
             let context = str_field("error").unwrap_or_default();
             (String::new(), context)
+        }
+        "no_upstream_changes" => {
+            let metric = f64_field("idle_seconds")
+                .map(|s| format!("idle={s:.0}s"))
+                .unwrap_or_default();
+            (metric, String::new())
         }
         _ => (String::new(), String::new()),
     };
@@ -2020,6 +2040,7 @@ fn alert_event_severity(event: &str) -> &'static str {
         | "scheduler_falling_behind"
         | "cdc_trigger_disabled"
         | "cleanup_failure" => "warning",
+        "no_upstream_changes" => "info",
         _ => "info",
     }
 }
