@@ -242,7 +242,12 @@ pub struct DagEdge {
 pub struct AlertEvent {
     pub timestamp: DateTime<Utc>,
     pub severity: String,
-    pub message: String,
+    /// Alert event type, e.g. "stale_data", "refresh_failed".
+    pub event: String,
+    /// Stream table qualified name ("schema.name"), if applicable.
+    pub table: String,
+    /// Human-readable detail summary (extra numeric/string context).
+    pub detail: String,
 }
 
 #[derive(Clone, Serialize)]

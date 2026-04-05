@@ -3,9 +3,9 @@ source: pgtrickle-tui/src/views/mod.rs
 expression: output
 ---
 ┌ Alerts (1) ──────────────────────────────────────────────────────────────────┐
-│⚠ 12:00:00 Refresh failed for orders_live                                     │
+│Sev  Time       Event                    Table                    Detail      │
 │                                                                              │
-│                                                                              │
+│⚠    12:00:00   stale_data               public.orders_live       staleness_se│
 │                                                                              │
 │                                                                              │
 │                                                                              │

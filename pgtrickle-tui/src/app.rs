@@ -1870,6 +1870,89 @@ fn draw_footer(frame: &mut ratatui::Frame, area: Rect, app: &App) {
     frame.render_widget(Paragraph::new(footer), area);
 }
 
+/// Parse a `pg_trickle_alert` NOTIFY payload into an `AlertEvent`.
+///
+/// The server always emits a JSON object with at minimum an `event` field.
+/// We derive `severity` from the event type, extract `st` (or `pgt_schema.pgt_name`)
+/// as the table name, and build a concise `detail` string from the remaining
+/// numeric/string fields.
+fn parse_alert_payload(payload: &str) -> crate::state::AlertEvent {
+    let now = chrono::Utc::now();
+
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(payload) else {
+        return crate::state::AlertEvent {
+            timestamp: now,
+            severity: "info".to_string(),
+            event: "unknown".to_string(),
+            table: String::new(),
+            detail: payload.to_string(),
+        };
+    };
+
+    let event = v
+        .get("event")
+        .and_then(|e| e.as_str())
+        .unwrap_or("unknown")
+        .to_string();
+
+    let severity = alert_event_severity(&event).to_string();
+
+    // Best-effort table name: prefer "st" (pre-formatted "schema.name"), then
+    // fall back to composing from pgt_schema + pgt_name.
+    let table = v
+        .get("st")
+        .and_then(|s| s.as_str())
+        .map(|s| s.to_string())
+        .or_else(|| {
+            let schema = v.get("pgt_schema").and_then(|s| s.as_str())?;
+            let name = v.get("pgt_name").and_then(|s| s.as_str())?;
+            Some(format!("{schema}.{name}"))
+        })
+        .unwrap_or_default();
+
+    // Build detail from remaining fields, skipping the ones already shown elsewhere.
+    const SKIP: &[&str] = &["event", "severity", "pgt_schema", "pgt_name", "st"];
+    let detail = if let Some(obj) = v.as_object() {
+        obj.iter()
+            .filter(|(k, _)| !SKIP.contains(&k.as_str()))
+            .map(|(k, val)| {
+                let v_str = match val {
+                    serde_json::Value::String(s) => s.clone(),
+                    other => other.to_string(),
+                };
+                format!("{k}={v_str}")
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
+    } else {
+        String::new()
+    };
+
+    crate::state::AlertEvent {
+        timestamp: now,
+        severity,
+        event,
+        table,
+        detail,
+    }
+}
+
+/// Infer alert severity from the event type string.
+fn alert_event_severity(event: &str) -> &'static str {
+    match event {
+        "auto_suspended" | "reinitialize_needed" | "refresh_failed" | "fuse_blown_reminder" => {
+            "critical"
+        }
+        "stale_data"
+        | "buffer_growth_warning"
+        | "slot_lag_warning"
+        | "scheduler_falling_behind"
+        | "cdc_trigger_disabled"
+        | "cleanup_failure" => "warning",
+        _ => "info",
+    }
+}
+
 async fn listen_task(conn_args: ConnectionArgs, tx: mpsc::Sender<crate::state::AlertEvent>) {
     use tokio_postgres::AsyncMessage;
     use tokio_postgres::NoTls;
@@ -1926,27 +2009,7 @@ async fn listen_task(conn_args: ConnectionArgs, tx: mpsc::Sender<crate::state::A
             payload = notify_rx.recv() => {
                 match payload {
                     Some(payload) => {
-                        // Parse severity from JSON payload if possible
-                        let (severity, message) = if let Ok(v) = serde_json::from_str::<serde_json::Value>(&payload) {
-                            let sev = v.get("severity")
-                                .and_then(|s| s.as_str())
-                                .unwrap_or("info")
-                                .to_string();
-                            let msg = v.get("message")
-                                .and_then(|s| s.as_str())
-                                .or_else(|| v.get("detail").and_then(|s| s.as_str()))
-                                .unwrap_or(&payload)
-                                .to_string();
-                            (sev, msg)
-                        } else {
-                            ("info".to_string(), payload)
-                        };
-
-                        let alert = crate::state::AlertEvent {
-                            timestamp: chrono::Utc::now(),
-                            severity,
-                            message,
-                        };
+                        let alert = parse_alert_payload(&payload);
                         if tx.send(alert).await.is_err() {
                             return;
                         }

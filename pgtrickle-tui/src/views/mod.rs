@@ -256,7 +256,9 @@ mod snapshot_tests {
                 .unwrap()
                 .with_timezone(&chrono::Utc),
             severity: "warning".to_string(),
-            message: "Refresh failed for orders_live".to_string(),
+            event: "stale_data".to_string(),
+            table: "public.orders_live".to_string(),
+            detail: "staleness_seconds=12.5, ratio=2.50".to_string(),
         });
 
         let backend = TestBackend::new(80, 24);

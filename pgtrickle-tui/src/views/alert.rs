@@ -22,7 +22,7 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
         return;
     }
 
-    let header = Row::new(vec!["Sev", "Time", "Message"])
+    let header = Row::new(vec!["Sev", "Time", "Event", "Table", "Detail"])
         .style(theme.header)
         .bottom_margin(1);
 
@@ -32,23 +32,27 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
         .map(|alert| {
             let sev_style = theme.severity_style(&alert.severity);
             let icon = match alert.severity.as_str() {
-                "critical" => "✗ critical",
-                "warning" => "⚠ warning",
-                _ => "● info",
+                "critical" => "✗",
+                "warning" => "⚠",
+                _ => "●",
             };
             Row::new(vec![
                 Cell::from(icon).style(sev_style),
                 Cell::from(alert.timestamp.format("%H:%M:%S").to_string())
                     .style(theme.dim),
-                Cell::from(alert.message.as_str()),
+                Cell::from(alert.event.as_str()),
+                Cell::from(alert.table.as_str()).style(theme.dim),
+                Cell::from(alert.detail.as_str()),
             ])
         })
         .collect();
 
     let widths = [
+        Constraint::Length(4),
         Constraint::Length(10),
-        Constraint::Length(10),
-        Constraint::Min(20),
+        Constraint::Length(24),
+        Constraint::Length(24),
+        Constraint::Min(10),
     ];
 
     let table = Table::new(rows, widths).header(header).block(block);
