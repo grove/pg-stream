@@ -3812,6 +3812,29 @@ pub fn execute_differential_refresh(
         }
     }
 
+    // ── BUF-LIMIT: Hard buffer growth limit ─────────────────────────
+    // If any source's change buffer exceeds max_buffer_rows, force FULL
+    // refresh to prevent unbounded disk growth from repeated failures.
+    let max_buffer_rows = crate::config::pg_trickle_max_buffer_rows();
+    if !should_fallback && max_buffer_rows > 0 {
+        for &(oid, change_count, _table_size) in &per_source_stats {
+            if change_count > max_buffer_rows {
+                pgrx::warning!(
+                    "[pg_trickle] Change buffer for source OID {} of {}.{} has {} rows, \
+                     exceeding max_buffer_rows limit ({}). Forcing FULL refresh and \
+                     truncating buffer to prevent unbounded growth.",
+                    oid,
+                    st.pgt_schema,
+                    st.pgt_name,
+                    change_count,
+                    max_buffer_rows,
+                );
+                should_fallback = true;
+                break;
+            }
+        }
+    }
+
     if should_fallback {
         pgrx::warning!(
             "[pg_trickle] Falling back to FULL refresh for {}.{}: change ratio exceeds \

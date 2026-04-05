@@ -214,6 +214,16 @@ pub static PGS_BUFFER_ALERT_THRESHOLD: GucSetting<i32> = GucSetting::<i32>::new(
 /// Set to 0 to disable compaction. Typical values: 10_000–1_000_000.
 pub static PGS_COMPACT_THRESHOLD: GucSetting<i32> = GucSetting::<i32>::new(100_000);
 
+/// BUF-LIMIT: Hard limit on total change buffer rows per source table.
+///
+/// When a source table's change buffer exceeds this many rows at refresh
+/// time, pg_trickle falls back to FULL refresh and truncates the buffer.
+/// This prevents unbounded disk growth when differential refresh fails
+/// repeatedly.
+///
+/// Set to 0 to disable the limit. Default: 1,000,000 rows.
+pub static PGS_MAX_BUFFER_ROWS: GucSetting<i32> = GucSetting::<i32>::new(1_000_000);
+
 /// Maximum allowed grouping set branches for CUBE/ROLLUP expansion (EC-02).
 pub static PGS_MAX_GROUPING_SET_BRANCHES: GucSetting<i32> = GucSetting::<i32>::new(64);
 
@@ -880,6 +890,20 @@ pub fn register_gucs() {
         GucFlags::default(),
     );
 
+    // BUF-LIMIT: Hard limit on change buffer rows per source table.
+    GucRegistry::define_int_guc(
+        c"pg_trickle.max_buffer_rows",
+        c"Hard limit on change buffer rows per source table (0 = unlimited).",
+        c"When a source table's change buffer exceeds this many rows at refresh time, \
+           pg_trickle falls back to FULL refresh and truncates the buffer. Prevents \
+           unbounded disk growth when differential refresh fails repeatedly.",
+        &PGS_MAX_BUFFER_ROWS,
+        0,           // min: 0 (disabled)
+        100_000_000, // max: 100M rows
+        GucContext::Suset,
+        GucFlags::default(),
+    );
+
     GucRegistry::define_int_guc(
         c"pg_trickle.max_grouping_set_branches",
         c"Maximum allowed grouping set branches in CUBE/ROLLUP queries.",
@@ -1387,6 +1411,12 @@ pub fn pg_trickle_buffer_alert_threshold() -> i64 {
 /// Returns 0 when compaction is disabled.
 pub fn pg_trickle_compact_threshold() -> i64 {
     PGS_COMPACT_THRESHOLD.get() as i64
+}
+
+/// Returns the max buffer rows limit (row count).
+/// Returns 0 when the limit is disabled.
+pub fn pg_trickle_max_buffer_rows() -> i64 {
+    PGS_MAX_BUFFER_ROWS.get() as i64
 }
 
 /// Returns the buffer partitioning mode: `"off"`, `"on"`, or `"auto"`.

@@ -36,7 +36,33 @@ For future plans and release milestones, see [ROADMAP.md](ROADMAP.md).
 
 ## [Unreleased]
 
-*No changes yet.*
+### Added
+
+- **Error reference documentation** — new [docs/ERRORS.md](docs/ERRORS.md) documents
+  all 20 `PgTrickleError` variants with descriptions, common causes, and suggested
+  fixes. Cross-linked from the FAQ Troubleshooting section and the documentation
+  book. *(ERR-REF)*
+
+- **Change buffer hard growth limit** — new `pg_trickle.max_buffer_rows` GUC
+  (default: 1,000,000) prevents unbounded change buffer growth when differential
+  refresh fails repeatedly. When a source table's buffer exceeds the limit,
+  pg_trickle forces a FULL refresh and truncates the buffer, emitting a WARNING.
+  *(BUF-LIMIT)*
+
+### Changed
+
+- **GUC defaults reviewed** — added detailed tuning guidance for
+  `pg_trickle.planner_aggressive` (memory pressure in concurrent refresh
+  scenarios) and `pg_trickle.cleanup_use_truncate` (PgBouncer / connection
+  pooler interaction with `AccessExclusiveLock`). Defaults remain unchanged
+  (`true` for both) as they are correct for the majority of workloads.
+  *(GUC-DEFAULTS)*
+
+### Fixed
+
+- **`resume_stream_table()` confirmed operational** — the function referenced in
+  `SUSPENDED` state error messages was verified to exist and work correctly
+  (it has been present since v0.2.0). *(C2-BUG)*
 
 ---
 

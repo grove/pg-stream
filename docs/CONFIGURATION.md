@@ -38,6 +38,7 @@ Complete reference for all pg_trickle GUC (Grand Unified Configuration) variable
     - [pg\_trickle.block\_source\_ddl](#pg_trickleblock_source_ddl)
     - [pg\_trickle.buffer\_alert\_threshold](#pg_tricklebuffer_alert_threshold)
     - [pg\_trickle.compact\_threshold](#pg_tricklecompact_threshold)
+    - [pg\_trickle.max\_buffer\_rows](#pg_tricklemax_buffer_rows)
     - [pg\_trickle.buffer\_partitioning](#pg_tricklebuffer_partitioning)
     - [pg\_trickle.max\_grouping\_set\_branches](#pg_tricklemax_grouping_set_branches)
     - [pg\_trickle.max\_parse\_depth](#pg_tricklemax_parse_depth)
@@ -473,6 +474,7 @@ After a differential refresh consumes all rows from the change buffer, the engin
 **Tuning Guidance:**
 - **Most workloads**: Leave at `true` — the performance benefit outweighs the brief lock.
 - **High-concurrency OLTP** with continuous writes during refresh: Set to `false` if you observe lock-wait timeouts on the change buffer.
+- **PgBouncer / connection poolers**: The `AccessExclusiveLock` acquired by `TRUNCATE` is held only on the change buffer table (not the source table), but in transaction-pooling mode with frequent refreshes, even brief exclusive locks can cause connection queuing. If you observe elevated `pg_stat_activity` wait events on change buffer tables, switch to `false`.
 
 ```sql
 -- Use per-row DELETE for change buffer cleanup
@@ -499,6 +501,7 @@ When enabled, the refresh executor estimates the delta size and applies optimize
 **Tuning Guidance:**
 - **Most workloads**: Leave at `true` — the hints improve tail latency without affecting small deltas.
 - **Custom plan overrides**: Set to `false` if you manage planner settings yourself or if the hints conflict with your `pg_hint_plan` configuration.
+- **Memory-constrained environments**: When enabled, large deltas (≥ 10,000 rows) raise `work_mem` to 64 MB (configurable via [`merge_work_mem_mb`](#pg_tricklemerge_work_mem_mb)). If your server has limited RAM and runs many concurrent refreshes, this can cause unexpected memory pressure or temp-file spills. Monitor `temp_blks_written` in `pg_stat_statements` and consider lowering `merge_work_mem_mb` or disabling this GUC if spills are frequent.
 
 ```sql
 -- Disable all planner hints
@@ -910,6 +913,38 @@ SET pg_trickle.compact_threshold = 50000;
 
 -- Disable compaction
 SET pg_trickle.compact_threshold = 0;
+```
+
+---
+
+### pg_trickle.max_buffer_rows
+
+*Added in v0.16.0.* Hard limit on change buffer rows per source table. When
+a source table's change buffer exceeds this limit at refresh time, pg_trickle
+forces a FULL refresh and truncates the buffer, preventing unbounded disk
+growth when differential refresh fails repeatedly.
+
+| Property | Value |
+|---|---|
+| Type | `integer` |
+| Default | `1000000` (1 million rows) |
+| Range | `0` – `100000000` |
+| Context | `SUSET` |
+| Restart Required | No |
+
+Set to `0` to disable the limit (not recommended for production).
+
+**Tuning Guidance:**
+- **Most workloads**: Leave at `1000000`. This accommodates high-throughput tables while preventing runaway growth.
+- **High-throughput event tables**: Raise to `5000000`–`10000000` if your source tables regularly accumulate large change buffers between refresh cycles.
+- **Small databases / tight disk budgets**: Lower to `100000`–`500000` to limit change buffer disk usage.
+
+```sql
+-- Set buffer limit to 5 million rows
+SET pg_trickle.max_buffer_rows = 5000000;
+
+-- Disable the limit (not recommended)
+SET pg_trickle.max_buffer_rows = 0;
 ```
 
 ---
