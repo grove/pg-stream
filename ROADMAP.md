@@ -34,6 +34,7 @@ coverage, all in plain language.
 - [v0.15.0 — External Test Suites & Integration](#v0150--external-test-suites--integration)
 - [v0.16.0 — Performance & Refresh Optimization](#v0160--performance--refresh-optimization)
 - [v0.17.0 — Query Intelligence & Stability](#v0170--query-intelligence--stability)
+- [v0.18.0 — PostgreSQL 19 Compatibility](#v0180--postgresql-19-compatibility)
 - [v1.0.0 — Stable Release](#v100--stable-release)
 - [Post-1.0 — Scale, Ecosystem & Platform Expansion](#post-10--scale-ecosystem--platform-expansion)
 - [Effort Summary](#effort-summary)
@@ -3199,22 +3200,10 @@ forward-compatibility before PG 19 reaches beta.
 
 > **G14-SHC subtotal: ~2–3 weeks**
 
-### PostgreSQL 19 Forward-Compatibility (A3)
+### ~~PostgreSQL 19 Forward-Compatibility (A3)~~ — Moved to v0.18.0
 
-> **In plain terms:** PostgreSQL 19 beta is expected late 2026. Adding
-> forward-compatibility now — before the beta lands — ensures pg_trickle
-> users can test on PG 19 immediately. The work involves bumping pgrx,
-> auditing `pg_sys::*` API changes, adding conditional compilation gates,
-> and validating the WAL decoder against any pgoutput format changes.
-
-| Item | Description | Effort | Ref |
-|------|-------------|--------|-----|
-| A3-1 | pgrx version bump to 0.18.x (PG 19 support) + `cargo pgrx init --pg19` | 2–4h | [PLAN_PG19_COMPAT.md](plans/infra/PLAN_PG19_COMPAT.md) §2 |
-| A3-2 | `pg_sys::*` API audit: heap access, catalog structs, WAL decoder `LogicalDecodingContext` | 8–16h | [PLAN_PG19_COMPAT.md](plans/infra/PLAN_PG19_COMPAT.md) §3 |
-| A3-3 | Conditional compilation (`#[cfg(feature = "pg19")]`) for changed APIs | 4–8h | [PLAN_PG19_COMPAT.md](plans/infra/PLAN_PG19_COMPAT.md) §4 |
-| A3-4 | CI matrix expansion for PG 19 beta + full E2E suite run | 4–8h | [PLAN_PG19_COMPAT.md](plans/infra/PLAN_PG19_COMPAT.md) |
-
-> **A3 subtotal: ~18–36 hours (gated on PG 19 beta availability; preliminary work can begin against PG 19 dev snapshots)**
+> PG 19 beta not available until May 2026. Items A3-1 through A3-4 deferred
+> to v0.18.0 milestone.
 
 ### Change Buffer Compaction (C-4)
 
@@ -3303,7 +3292,8 @@ forward-compatibility before PG 19 reaches beta.
 
 > **Quick wins: ✅ Done**
 
-> **v0.16.0 total: ~1–2 weeks (MERGE alts) + ~4–6 weeks (aggregate fast-path) + ~1–2 weeks (append-only) + ~2–3 weeks (predicate pushdown) + ~2–3 weeks (template cache) + ~18–36 hours (PG 19 compat) + ~2–3 weeks (buffer compaction) + ~3–6 weeks (test coverage) + ~1–2 weeks (bench CI) + ~2–3 days (auto-indexing) + ~2–4 hours (quick wins)**
+> **v0.16.0 total: ~1–2 weeks (MERGE alts) + ~4–6 weeks (aggregate fast-path) + ~1–2 weeks (append-only) + ~2–3 weeks (predicate pushdown) + ~2–3 weeks (template cache) + ~2–3 weeks (buffer compaction) + ~3–6 weeks (test coverage) + ~1–2 weeks (bench CI) + ~2–3 days (auto-indexing) + ~2–4 hours (quick wins)**
+> *Note: PG 19 compatibility (A3, ~18–36h) moved to v0.18.0.*
 
 **Exit criteria:**
 - [x] PH-D1: DELETE+INSERT strategy implemented and gated behind `merge_strategy` GUC; correctness verified for INSERT/UPDATE/DELETE deltas
@@ -3311,7 +3301,7 @@ forward-compatibility before PG 19 reaches beta.
 - [x] A-3-AO: `CREATE STREAM TABLE … APPEND ONLY` accepted; refresh uses INSERT path; heuristic auto-promotion on insert-only buffers; falls back to MERGE on first non-insert CDC event
 - [x] B-2: Delta predicate pushdown implemented for single-source Filter nodes (P2-7); DELETE correctness verified (OR old_col predicate); selective-query benchmarks show delta row reduction
 - [x] G14-SHC: Cross-backend template cache eliminates cold-start; catalog-backed L2 cache with `template_cache` GUC; invalidation on DDL; `explain_st()` exposes stats
-- [ ] A3: PG 19 builds and passes full E2E suite (conditional on PG 19 beta availability; if beta not yet available, pgrx bump + API audit complete with CI gated on snapshot)
+- ~~A3: PG 19 builds and passes full E2E suite~~ — moved to v0.18.0
 - [x] C-4: Change buffer compaction reduces buffer size by ≥50% for high-churn workloads; `compact_threshold` GUC respected; no correctness regressions
 - [x] TG2-WIN: Window function DVM execution tests cover ROW_NUMBER, RANK, DENSE_RANK, LAG/LEAD across INSERT/UPDATE/DELETE
 - [x] TG2-JOIN: Join multi-cycle tests cover INNER/LEFT/FULL JOIN with UPDATE and DELETE propagation; no silent data loss
@@ -3563,6 +3553,37 @@ provides a 60-second tryout experience.
 
 ---
 
+## v0.18.0 — PostgreSQL 19 Compatibility
+
+**Goal:** Add forward-compatibility with PostgreSQL 19, which enters beta
+in May 2026. Ensure pg_trickle compiles, loads, and passes the full E2E
+test suite against PG 19.
+
+### PostgreSQL 19 Forward-Compatibility (A3)
+
+> **In plain terms:** PostgreSQL 19 beta ships in May 2026. Adding
+> forward-compatibility ensures pg_trickle users can test on PG 19
+> immediately. The work involves bumping pgrx, auditing `pg_sys::*` API
+> changes, adding conditional compilation gates, and validating the WAL
+> decoder against any pgoutput format changes.
+
+| Item | Description | Effort | Ref |
+|------|-------------|--------|-----|
+| A3-1 | pgrx version bump to 0.18.x (PG 19 support) + `cargo pgrx init --pg19` | 2–4h | [PLAN_PG19_COMPAT.md](plans/infra/PLAN_PG19_COMPAT.md) §2 |
+| A3-2 | `pg_sys::*` API audit: heap access, catalog structs, WAL decoder `LogicalDecodingContext` | 8–16h | [PLAN_PG19_COMPAT.md](plans/infra/PLAN_PG19_COMPAT.md) §3 |
+| A3-3 | Conditional compilation (`#[cfg(feature = "pg19")]`) for changed APIs | 4–8h | [PLAN_PG19_COMPAT.md](plans/infra/PLAN_PG19_COMPAT.md) §4 |
+| A3-4 | CI matrix expansion for PG 19 beta + full E2E suite run | 4–8h | [PLAN_PG19_COMPAT.md](plans/infra/PLAN_PG19_COMPAT.md) |
+
+> **A3 subtotal: ~18–36 hours**
+
+**Exit criteria:**
+- [ ] A3: PG 19 builds and passes full E2E suite
+- [ ] CI matrix includes PG 19 beta
+- [ ] Extension upgrade path tested (`0.17.0 → 0.18.0`)
+- [ ] `just check-version-sync` passes
+
+---
+
 ## v1.0.0 — Stable Release
 
 **Goal:** First officially supported release. Semantic versioning locks in.
@@ -3690,7 +3711,7 @@ to keep the pre-1.0 milestones focused on performance and correctness.
 | Item | Description | Effort | Ref |
 |------|-------------|--------|-----|
 | ~~A2~~ | ~~Transactional IVM Phase 4 remaining (ENR-based transition tables, C-level triggers, prepared stmt reuse)~~ ➡️ Pulled to v0.17.0 | ~36–54h | [PLAN_TRANSACTIONAL_IVM.md](plans/sql/PLAN_TRANSACTIONAL_IVM.md) |
-| ~~A3~~ | ~~PostgreSQL 19 forward-compatibility~~ ➡️ Pulled to v0.16.0 | ~18–36h | [PLAN_PG19_COMPAT.md](plans/infra/PLAN_PG19_COMPAT.md) |
+| ~~A3~~ | ~~PostgreSQL 19 forward-compatibility~~ ➡️ Pulled to v0.16.0 ➡️ Moved to v0.18.0 | ~18–36h | [PLAN_PG19_COMPAT.md](plans/infra/PLAN_PG19_COMPAT.md) |
 | A4 | PostgreSQL 14–15 backward compatibility | ~40h | [PLAN_PG_BACKCOMPAT.md](plans/infra/PLAN_PG_BACKCOMPAT.md) |
 | A5 | Partitioned stream table storage (opt-in) | ~60–80h | [PLAN_PARTITIONING_SHARDING.md](plans/infra/PLAN_PARTITIONING_SHARDING.md) §4 |
 | ~~A6~~ | ~~Buffer table partitioning by LSN range (`pg_trickle.buffer_partitioning` GUC)~~ | ✅ Done | [PLAN_EDGE_CASES_TIVM_IMPL_ORDER.md](plans/PLAN_EDGE_CASES_TIVM_IMPL_ORDER.md) Stage 4 §3.3 |
@@ -3745,8 +3766,9 @@ to keep the pre-1.0 milestones focused on performance and correctness.
 | v0.13.0 — Scalability Foundations, Partitioning Enhancements, MERGE Profiling & Multi-Tenant Scheduling | ~15–23 wk | — | |
 | v0.14.0 — Tiered Scheduling, UNLOGGED Buffers & Diagnostics | ~2–6 wk + ~1 wk patterns + ~2–4d stability + ~3.5–7d diagnostics + ~1–2d export + ~4–6d TUI + ~0.5d docs | — | |
 | v0.15.0 — External Test Suites & Integration | ~40–70h + ~2–3d bulk create + ~3–5d planner hints + ~2–3d cache spike + ~3–4wk parser + ~1–2wk watermark + ~2–4wk delta cost/spill | — | ✅ Released |
-| v0.16.0 — Performance & Refresh Optimization | ~1–2wk MERGE alts + ~4–6wk aggregate fast-path + ~1–2wk append-only + ~2–3wk predicate pushdown + ~2–3wk template cache + ~18–36h PG19 + ~2–3wk buffer compaction + ~3–6wk test coverage + ~1–2wk bench CI + ~2–3d auto-indexing + ~12–22h quick wins | — | |
+| v0.16.0 — Performance & Refresh Optimization | ~1–2wk MERGE alts + ~4–6wk aggregate fast-path + ~1–2wk append-only + ~2–3wk predicate pushdown + ~2–3wk template cache + ~2–3wk buffer compaction + ~3–6wk test coverage + ~1–2wk bench CI + ~2–3d auto-indexing + ~12–22h quick wins | — | |
 | v0.17.0 — Query Intelligence & Stability | ~2–3wk cost-based strategy + ~3–4wk columnar tracking + ~32–48h TIVM Phase 4 + ~1–2d ROWS FROM + ~2–3wk SQLancer + ~2–3wk incremental DAG + ~4–8h unsafe reduction + ~1–2wk api.rs mod + ~2–3d migration guide + ~3–5d runbook + ~2–3d playground + ~2–3d doc polish | — | |
+| v0.18.0 — PostgreSQL 19 Compatibility | ~18–36h | — | |
 | v1.0.0 — Stable release | ~18–30h | — | |
 | Post-1.0 (PG compat + Native DDL) | ~38–56h (PG 16–18) + ~13–21d (Native DDL) | — | |
 | Post-1.0 (ecosystem) | 88–134h | — | |
