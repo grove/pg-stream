@@ -3297,12 +3297,11 @@ forward-compatibility before PG 19 reaches beta.
 | Item | Description | Effort | Ref |
 |------|-------------|--------|-----|
 | C2-BUG | **Implement missing `resume_stream_table()`.** Function is referenced in error messages (`SUSPENDED` status) but does not exist. P0 bug. | 1–2h | [PLAN_FEATURE_CLEANUP.md](plans/PLAN_FEATURE_CLEANUP.md) |
-| SAST-SEMGREP | **Elevate Semgrep to blocking in CI.** CodeQL and cargo-deny already block; Semgrep is advisory-only. Flip to blocking for consistent safety gating. | 1–2h | [PLAN_SAST.md](plans/testing/PLAN_SAST.md) |
 | ERR-REF | **Error reference documentation.** Document all 19 `PgTrickleError` variants with meaning, common causes, and suggested fixes. Publish as `docs/ERRORS.md`. Cross-link from FAQ. Errors currently describe the problem but don't prescribe the fix — e.g. `"unsupported operator for DIFFERENTIAL mode: TABLESAMPLE"` should suggest `refresh_mode => 'FULL'`. | 4–6h | [src/error.rs](src/error.rs) |
 | GUC-DEFAULTS | **Review dangerous GUC defaults.** `planner_aggressive = true` auto-disables nestloop and raises work_mem for large deltas — can cause unexpected spills. `cleanup_use_truncate = true` takes AccessExclusiveLock, problematic with PgBouncer. Evaluate safer defaults and document trade-offs in CONFIGURATION.md. | 2–4h | [src/config.rs](src/config.rs) |
 | BUF-LIMIT | **Change buffer hard growth limit.** If refresh fails repeatedly, change buffers grow indefinitely until manual intervention. Add `pg_trickle.max_buffer_rows` GUC (default: 1M) that triggers FULL refresh + buffer truncation when exceeded, preventing unbounded disk usage. | 4–8h | [src/cdc.rs](src/cdc.rs) |
 
-> **Quick wins subtotal: ~12–22 hours**
+> **Quick wins subtotal: ~10–20 hours** (SAST-SEMGREP deferred to v1.0)
 
 > **v0.16.0 total: ~1–2 weeks (MERGE alts) + ~4–6 weeks (aggregate fast-path) + ~1–2 weeks (append-only) + ~2–3 weeks (predicate pushdown) + ~2–3 weeks (template cache) + ~18–36 hours (PG 19 compat) + ~2–3 weeks (buffer compaction) + ~3–6 weeks (test coverage) + ~1–2 weeks (bench CI) + ~2–3 days (auto-indexing) + ~2–4 hours (quick wins)**
 
@@ -3323,7 +3322,6 @@ forward-compatibility before PG 19 reaches beta.
 - [ ] BENCH-CI: Performance regression CI runs on every PR; 10% regression threshold blocks merge; scenario coverage includes scan/filter/aggregate/join/window/CTE/TopK
 - [ ] AUTO-IDX: Stream tables auto-create indexes on GROUP BY / DISTINCT columns; `__pgt_row_id` covering index for ≤ 8-column tables; `auto_index` GUC respected; existing tests pass
 - [ ] C2-BUG: `resume_stream_table()` implemented and callable from `SUSPENDED` state
-- [ ] SAST-SEMGREP: Semgrep elevated to blocking in CI pipeline
 - [ ] ERR-REF: Error reference doc published with all 19 PgTrickleError variants, common causes, and suggested fixes
 - [ ] GUC-DEFAULTS: `planner_aggressive` and `cleanup_use_truncate` defaults reviewed; safer defaults applied or trade-offs documented
 - [ ] BUF-LIMIT: `max_buffer_rows` GUC prevents unbounded change buffer growth; triggers FULL + truncation when exceeded
@@ -3589,6 +3587,7 @@ distribution — getting pg_trickle onto package registries.
 | R4 | ~~CNPG operator hardening (K8s 1.33+ native ImageVolume)~~ ➡️ Pulled to v0.15.0 | 4–6h | [PLAN_CLOUDNATIVEPG.md](plans/ecosystem/PLAN_CLOUDNATIVEPG.md) |
 | R5 | **Docker Hub official image.** Publish `pgtrickle/pg_trickle:1.0.0-pg18` and `:latest` to Docker Hub. Sync Dockerfile.hub version tag with release. Automate via GitHub Actions release workflow. | 2–4h | — |
 | R6 | **Version sync automation.** Ensure `just check-version-sync` covers all version references (Cargo.toml, extension control files, Dockerfile.hub, dbt_project.yml, CNPG manifests). Add to CI as a blocking check. | 2–3h | — |
+| SAST-SEMGREP | **Elevate Semgrep to blocking in CI.** CodeQL and cargo-deny already block; Semgrep is advisory-only. Flip to blocking for consistent safety gating. Before flipping, verify zero findings across all current rules. | 1–2h | [PLAN_SAST.md](plans/testing/PLAN_SAST.md) |
 
 > **v1.0.0 total: ~18–30 hours**
 
@@ -3598,6 +3597,7 @@ distribution — getting pg_trickle onto package registries.
 - [x] CNPG extension image published to GHCR (`pg_trickle-ext`)
 - [x] CNPG cluster-example.yaml validated (Image Volume approach)
 - [ ] `just check-version-sync` passes and blocks CI on mismatch
+- [ ] SAST-SEMGREP: Semgrep elevated to blocking in CI; zero findings verified
 - [ ] Upgrade path from v0.17.0 tested
 - [ ] Semantic versioning policy in effect
 
