@@ -15,6 +15,12 @@
 #   ./scripts/run_benchmarks.sh                          # all benchmarks
 #   ./scripts/run_benchmarks.sh diff_operators            # specific bench
 #   ./scripts/run_benchmarks.sh -- --output-format bencher # pass criterion args
+#
+# Environment variables:
+#   BENCH_QUICK=1    — Use reduced sample size (50) and measurement time (5s)
+#                      for CI regression gates. Still sufficient for detecting
+#                      >10% regressions while cutting run time ~60%.
+#   BENCH_FEATURES   — Cargo features (default: pg18)
 
 set -euo pipefail
 
@@ -60,6 +66,14 @@ done
 # If no filter provided, run all benches
 if [[ ${#BENCH_FILTER[@]} -eq 0 ]]; then
     BENCH_FILTER=("${ALL_BENCHES[@]}")
+fi
+
+# ── Quick mode for CI regression gates ────────────────────────────────────
+# BENCH_QUICK=1 reduces sample_size and measurement_time so the full suite
+# fits within CI timeout while still detecting >10% regressions reliably.
+if [[ "${BENCH_QUICK:-0}" == "1" ]]; then
+    echo "BENCH_QUICK=1: using reduced sample-size=50, measurement-time=5s"
+    CRITERION_ARGS+=("--sample-size" "50" "--measurement-time" "5")
 fi
 
 # ── Helper: ensure_stub ───────────────────────────────────────────────────

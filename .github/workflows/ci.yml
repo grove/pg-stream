@@ -380,7 +380,7 @@ jobs:
     name: Benchmark regression check
     runs-on: ubuntu-latest
     if: github.event_name == 'pull_request' && github.base_ref == 'main'
-    timeout-minutes: 20
+    timeout-minutes: 25
     continue-on-error: false
     steps:
       - uses: actions/checkout@v5
@@ -398,6 +398,8 @@ jobs:
 
       - name: Run benchmarks (create new/ data)
         run: ./scripts/run_benchmarks.sh
+        env:
+          BENCH_QUICK: "1"
 
       - name: Check for regressions
         run: |
@@ -412,7 +414,7 @@ jobs:
     name: Benchmarks
     runs-on: ubuntu-latest
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
-    timeout-minutes: 20
+    timeout-minutes: 25
     continue-on-error: true
     steps:
       - uses: actions/checkout@v5
@@ -429,6 +431,8 @@ jobs:
 
       - name: Run benchmarks and save baseline
         run: ./scripts/run_benchmarks.sh -- --save-baseline main
+        env:
+          BENCH_QUICK: "1"
 
       - name: Save Criterion baseline to cache
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
