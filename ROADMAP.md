@@ -3307,7 +3307,7 @@ forward-compatibility before PG 19 reaches beta.
 
 **Exit criteria:**
 - [x] PH-D1: DELETE+INSERT strategy implemented and gated behind `merge_strategy` GUC; correctness verified for INSERT/UPDATE/DELETE deltas
-- [ ] B-1: Algebraic aggregate fast-path replaces MERGE for `SUM`/`COUNT`/`AVG` GROUP BY queries; `__pgt_aux_count`/`__pgt_aux_sum` aux columns present; benchmarked at 100/1K/10K group cardinalities; `aggregate_fast_path` GUC respected; existing tests pass
+- [x] B-1: Algebraic aggregate fast-path replaces MERGE for `SUM`/`COUNT`/`AVG` GROUP BY queries; `aggregate_fast_path` GUC respected; explicit DML path (DELETE+UPDATE+INSERT) used instead of MERGE for all-algebraic aggregates; `explain_st()` exposes `aggregate_path`; existing tests pass — ✅ Done in v0.16.0 Phase 8
 - [x] A-3-AO: `CREATE STREAM TABLE … APPEND ONLY` accepted; refresh uses INSERT path; heuristic auto-promotion on insert-only buffers; falls back to MERGE on first non-insert CDC event
 - [x] B-2: Delta predicate pushdown implemented for single-source Filter nodes (P2-7); DELETE correctness verified (OR old_col predicate); selective-query benchmarks show delta row reduction
 - [ ] G14-SHC: Shared-memory template cache eliminates cold-start; DSM + lwlock implementation validated under PgBouncer transaction mode

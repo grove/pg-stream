@@ -72,6 +72,14 @@ For future plans and release milestones, see [ROADMAP.md](ROADMAP.md).
   detected, the system reverts to MERGE with a WARNING and NOTIFY alert.
   `explain_st()` now exposes `append_only_mode`. *(A-3-AO)*
 
+- **Aggregate fast-path** — new `pg_trickle.aggregate_fast_path` GUC (default:
+  `true`) enables explicit DML (DELETE+UPDATE+INSERT) instead of MERGE for
+  stream tables whose aggregates are all algebraically invertible (COUNT, SUM,
+  AVG, STDDEV, etc.). The explicit DML path materializes the delta into a temp
+  table and applies targeted per-row operations, avoiding the MERGE hash-join
+  cost that dominates for aggregate queries with many groups. `explain_st()`
+  now exposes `aggregate_path`. *(B-1)*
+
 - **Compaction stats in explain_st()** — `explain_st()` now exposes
   `compact_threshold`, showing the configured change buffer compaction
   threshold. *(C-4)*
@@ -99,6 +107,11 @@ For future plans and release milestones, see [ROADMAP.md](ROADMAP.md).
 - **Differential≡Full equivalence tests** — 2 new equivalence tests for LATERAL
   subquery and TopK (ORDER BY + LIMIT) patterns, each with 5 mutation cycles
   and `assert_differential_mode()` validation. *(TG2-EQUIV)*
+
+- **Source schema evolution tests** — 4 new E2E tests for source-table DDL
+  resilience: unused column rename (no impact), used column rename (detected),
+  column addition (no impact), and compatible type widening (INT→BIGINT).
+  *(TG2-SCHEMA)*
 
 ### Fixed
 

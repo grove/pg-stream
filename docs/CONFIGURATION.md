@@ -42,6 +42,7 @@ Complete reference for all pg_trickle GUC (Grand Unified Configuration) variable
     - [pg\_trickle.compact\_threshold](#pg_tricklecompact_threshold)
     - [pg\_trickle.max\_buffer\_rows](#pg_tricklemax_buffer_rows)
     - [pg\_trickle.auto\_index](#pg_trickleauto_index)
+    - [pg\_trickle.aggregate\_fast\_path](#pg_trickleaggregate_fast_path)
     - [pg\_trickle.buffer\_partitioning](#pg_tricklebuffer_partitioning)
     - [pg\_trickle.max\_grouping\_set\_branches](#pg_tricklemax_grouping_set_branches)
     - [pg\_trickle.max\_parse\_depth](#pg_tricklemax_parse_depth)
@@ -1055,6 +1056,46 @@ The `__pgt_row_id` index itself is always created regardless of this setting
 ```sql
 -- Disable automatic index creation
 SET pg_trickle.auto_index = false;
+```
+
+---
+
+### pg_trickle.aggregate_fast_path
+
+*Added in v0.16.0.* Controls whether stream tables with all-algebraic
+aggregates use the explicit DML fast-path instead of MERGE.
+
+| Property | Value |
+|---|---|
+| Type | `bool` |
+| Default | `true` |
+| Context | `SUSET` |
+| Restart Required | No |
+
+When enabled, stream tables whose aggregates are all algebraically invertible
+(COUNT, SUM, AVG, STDDEV, VAR, CORR, REGR_*, etc.) use the explicit DML path
+(DELETE + UPDATE + INSERT via a materialized temp table) instead of the generic
+MERGE statement. This avoids the MERGE hash-join cost, which dominates for
+aggregate queries with high group cardinality.
+
+**Not eligible:**
+- Queries with SEMI_ALGEBRAIC aggregates (MIN, MAX) — these may require
+  group-rescan on extremum deletion
+- Queries with GROUP_RESCAN aggregates (STRING_AGG, ARRAY_AGG, JSON_AGG, etc.)
+- Queries with user-defined triggers on the stream table (already use explicit
+  DML via the user-trigger path)
+
+The `explain_st()` output shows the `aggregate_path` field:
+- `explicit_dml` — fast-path is active
+- `merge` — using the default MERGE path
+- `merge (fast-path disabled)` — eligible but GUC is off
+
+```sql
+-- Disable aggregate fast-path
+SET pg_trickle.aggregate_fast_path = false;
+
+-- Check the current aggregate path for a stream table
+SELECT * FROM pgtrickle.explain_st('my_agg_st');
 ```
 
 ---
