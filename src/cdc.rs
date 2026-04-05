@@ -266,7 +266,7 @@ pub fn drop_change_trigger(
             format!("pg_trickle_cdc_del_{}", oid_u32), // statement DELETE
             format!("pg_trickle_cdc_truncate_{}", oid_u32), // TRUNCATE (both modes)
         ] {
-            let _ = Spi::run(&format!("DROP TRIGGER IF EXISTS {trig} ON {table}")); // nosemgrep — DDL cannot be parameterized; trig is an oid_u32 integer, table is a regclass-quoted identifier.
+            let _ = Spi::run(&format!("DROP TRIGGER IF EXISTS {trig} ON {table}")); // nosemgrep: rust.spi.run.dynamic-format — DDL cannot be parameterized; trig is an oid_u32 integer, table is a regclass-quoted identifier.
         }
     }
 
@@ -1994,7 +1994,7 @@ pub fn rebuild_cdc_trigger(
         format!("pg_trickle_cdc_upd_{}", oid_u32),
         format!("pg_trickle_cdc_del_{}", oid_u32),
     ] {
-        let _ = Spi::run(&format!("DROP TRIGGER IF EXISTS {trig} ON {source_table}")); // nosemgrep — DDL cannot be parameterized; trig is an oid_u32 integer, source_table is a regclass-quoted identifier.
+        let _ = Spi::run(&format!("DROP TRIGGER IF EXISTS {trig} ON {source_table}")); // nosemgrep: rust.spi.run.dynamic-format — DDL cannot be parameterized; trig is an oid_u32 integer, source_table is a regclass-quoted identifier.
     }
 
     // 3. Create new trigger(s) matching the current mode.

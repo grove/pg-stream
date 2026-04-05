@@ -1089,14 +1089,14 @@ impl StDag {
                         result,
                     );
                     let w_lowlink = lowlinks[&w];
-                    let v_lowlink = lowlinks.get_mut(&v).unwrap(); // nosemgrep — SCC invariant: v is always in lowlinks
+                    let v_lowlink = lowlinks.get_mut(&v).unwrap(); // nosemgrep: rust.panic-in-sql-path — SCC invariant: v is always in lowlinks
                     if w_lowlink < *v_lowlink {
                         *v_lowlink = w_lowlink;
                     }
                 } else if on_stack.contains(&w) {
                     // Successor w is on the stack → it's in the current SCC.
                     let w_index = indices[&w];
-                    let v_lowlink = lowlinks.get_mut(&v).unwrap(); // nosemgrep — SCC invariant: v is always in lowlinks
+                    let v_lowlink = lowlinks.get_mut(&v).unwrap(); // nosemgrep: rust.panic-in-sql-path — SCC invariant: v is always in lowlinks
                     if w_index < *v_lowlink {
                         *v_lowlink = w_index;
                     }
@@ -1108,7 +1108,7 @@ impl StDag {
         if lowlinks[&v] == indices[&v] {
             let mut scc_nodes = Vec::new();
             loop {
-                let w = stack.pop().unwrap(); // nosemgrep — SCC loop invariant: stack is non-empty when root node found
+                let w = stack.pop().unwrap(); // nosemgrep: rust.panic-in-sql-path — SCC loop invariant: stack is non-empty when root node found
                 on_stack.remove(&w);
                 scc_nodes.push(w);
                 if w == v {
@@ -1791,7 +1791,7 @@ impl ExecutionUnitDag {
         );
 
         // Collect external downstream edges of the LAST unit in the chain.
-        let last_id = *chain.last().unwrap(); // nosemgrep — chain is always non-empty by construction in build_execution_units
+        let last_id = *chain.last().unwrap(); // nosemgrep: rust.panic-in-sql-path — chain is always non-empty by construction in build_execution_units
         let external_downstream: Vec<ExecutionUnitId> =
             self.edges.get(&last_id).cloned().unwrap_or_default();
 

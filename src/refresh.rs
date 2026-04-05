@@ -2460,7 +2460,7 @@ pub fn execute_full_refresh(st: &StreamTableMeta) -> Result<(i64, i64), PgTrickl
         // Drop any leftover pre-snapshot from a previous iteration
         // (e.g., SCC fixpoint loops where subtransaction commits don't
         // fire ON COMMIT DROP until the outer transaction commits).
-        let _ = Spi::run(&format!("DROP TABLE IF EXISTS __pgt_pre_{}", st.pgt_id)); // nosemgrep — st.pgt_id is a plain i64, not user-supplied input.
+        let _ = Spi::run(&format!("DROP TABLE IF EXISTS __pgt_pre_{}", st.pgt_id)); // nosemgrep: rust.spi.run.dynamic-format — st.pgt_id is a plain i64, not user-supplied input.
 
         let snapshot_sql = format!(
             "CREATE TEMP TABLE __pgt_pre_{pgt_id} ON COMMIT DROP AS \
@@ -4613,7 +4613,7 @@ pub fn execute_differential_refresh(
                 name.replace('"', "\"\""),
             );
 
-            let _ = Spi::run(&format!("DROP TABLE IF EXISTS __pgt_pre_{}", st.pgt_id)); // nosemgrep — st.pgt_id is a plain i64, not user-supplied input.
+            let _ = Spi::run(&format!("DROP TABLE IF EXISTS __pgt_pre_{}", st.pgt_id)); // nosemgrep: rust.spi.run.dynamic-format — st.pgt_id is a plain i64, not user-supplied input.
 
             let snapshot_sql = format!(
                 "CREATE TEMP TABLE __pgt_pre_{pgt_id} ON COMMIT DROP AS \
