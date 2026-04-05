@@ -123,14 +123,16 @@ SELECT pgtrickle.create_stream_table(
 Query it immediately — it was populated by the initial full refresh:
 
 ```sql
-SELECT * FROM category_summary ORDER BY category;
+SELECT category, product_count, avg_price, min_price, max_price, in_stock_count
+FROM category_summary ORDER BY category;
 ```
 
 ```
-   category    | product_count | avg_price | min_price | max_price | in_stock_count
----------------+---------------+-----------+-----------+-----------+----------------
- Books         |             3 |     16.66 |      9.99 |     24.99 |              3
- Electronics   |             2 |    174.99 |     49.99 |    299.99 |              2
+  category   | product_count | avg_price | min_price | max_price | in_stock_count
+-------------+---------------+-----------+-----------+-----------+----------------
+ Books       |             3 |     16.66 |      9.99 |     24.99 |              3
+ Electronics |             2 |    174.99 |     49.99 |    299.99 |              2
+(2 rows)
 ```
 
 ### 1.3 Watch an INSERT update one group
@@ -142,13 +144,15 @@ INSERT INTO products (category, price) VALUES ('Books', 39.99);
 Within ~1 second (or call `SELECT pgtrickle.refresh_stream_table('category_summary')` to force it):
 
 ```sql
-SELECT * FROM category_summary WHERE category = 'Books';
+SELECT category, product_count, avg_price, min_price, max_price, in_stock_count
+FROM category_summary WHERE category = 'Books';
 ```
 
 ```
  category | product_count | avg_price | min_price | max_price | in_stock_count
 ----------+---------------+-----------+-----------+-----------+----------------
  Books    |             4 |     22.49 |      9.99 |     39.99 |              4
+(1 row)
 ```
 
 The `Electronics` row was **not touched at all** — pg_trickle read exactly 1
@@ -163,13 +167,15 @@ UPDATE products SET price = 19.99 WHERE price = 299.99;
 After the next refresh:
 
 ```sql
-SELECT * FROM category_summary WHERE category = 'Electronics';
+SELECT category, product_count, avg_price, min_price, max_price, in_stock_count
+FROM category_summary WHERE category = 'Electronics';
 ```
 
 ```
   category   | product_count | avg_price | min_price | max_price | in_stock_count
 -------------+---------------+-----------+-----------+-----------+----------------
  Electronics |             2 |     34.99 |     19.99 |     49.99 |              2
+(1 row)
 ```
 
 For `AVG`, pg_trickle maintains running sum and count columns internally, so
@@ -332,21 +338,22 @@ That single function call did a lot of work atomically (all in one transaction):
 Query it immediately — it's already populated:
 
 ```sql
-SELECT * FROM department_tree ORDER BY path;
+SELECT id, name, parent_id, path, depth FROM department_tree ORDER BY path;
 ```
 
 Expected output:
 
 ```
- id |    name     | parent_id |            path             | depth
-----+-------------+-----------+-----------------------------+-------
-  1 | Company     |           | Company                     |     0
-  2 | Engineering |         1 | Company > Engineering       |     1
-  5 | Backend     |         2 | Company > Engineering > Backend  | 2
-  6 | Frontend    |         2 | Company > Engineering > Frontend | 2
-  7 | Platform    |         2 | Company > Engineering > Platform | 2
-  4 | Operations  |         1 | Company > Operations        |     1
-  3 | Sales       |         1 | Company > Sales             |     1
+ id |    name     | parent_id |               path               | depth
+----+-------------+-----------+----------------------------------+-------
+  1 | Company     |           | Company                          |     0
+  2 | Engineering |         1 | Company > Engineering            |     1
+  5 | Backend     |         2 | Company > Engineering > Backend  |     2
+  6 | Frontend    |         2 | Company > Engineering > Frontend |     2
+  7 | Platform    |         2 | Company > Engineering > Platform |     2
+  4 | Operations  |         1 | Company > Operations             |     1
+  3 | Sales       |         1 | Company > Sales                  |     1
+(7 rows)
 ```
 
 This is a **real PostgreSQL table** — you can create indexes on it, join it in other queries, reference it in views, or even use it as a source for other stream tables. pg_trickle keeps it in sync automatically.
@@ -409,15 +416,16 @@ ORDER BY full_path;
 Expected output:
 
 ```
- department_name |                 full_path                  | headcount | total_salary
------------------+--------------------------------------------+-----------+--------------
- Backend         | Company > Engineering > Backend            |         2 |    235000.00
- Frontend        | Company > Engineering > Frontend           |         1 |    110000.00
- Platform        | Company > Engineering > Platform           |         1 |    130000.00
- Engineering     | Company > Engineering                      |         0 |         0.00
- Operations      | Company > Operations                       |         1 |    100000.00
- Sales           | Company > Sales                            |         2 |    185000.00
- Company         | Company                                    |         0 |         0.00
+ department_name |            full_path             | headcount | total_salary
+-----------------+----------------------------------+-----------+--------------
+ Company         | Company                          |         0 |            0
+ Engineering     | Company > Engineering            |         0 |            0
+ Backend         | Company > Engineering > Backend  |         2 |    235000.00
+ Frontend        | Company > Engineering > Frontend |         1 |    110000.00
+ Platform        | Company > Engineering > Platform |         1 |    130000.00
+ Operations      | Company > Operations             |         1 |    100000.00
+ Sales           | Company > Sales                  |         2 |    185000.00
+(7 rows)
 ```
 
 Notice that the `full_path` column comes from `department_tree` — this data already went through one layer of incremental maintenance before landing here.
@@ -464,7 +472,7 @@ department_tree ──────────┤
 Query the report:
 
 ```sql
-SELECT * FROM department_report ORDER BY division;
+SELECT division, total_headcount, total_payroll FROM department_report ORDER BY division;
 ```
 
 ```
@@ -473,6 +481,7 @@ SELECT * FROM department_report ORDER BY division;
  Engineering |               4 |    475000.00
  Operations  |               1 |    100000.00
  Sales       |               2 |    185000.00
+(3 rows)
 ```
 
 ---
@@ -594,9 +603,10 @@ SELECT id, name, depth, path FROM department_tree WHERE name = 'DevOps';
 ```
 
 ```
- id |  name  | depth |              path               
-----+--------+-------+---------------------------------
-  8 | DevOps |     2 | Company > Engineering > DevOps  
+ id |  name  | depth |              path
+----+--------+-------+--------------------------------
+  8 | DevOps |     2 | Company > Engineering > DevOps
+(1 row)
 ```
 
 The recursive CTE automatically expanded to include the new department at the correct depth and path. One inserted row in `departments` produced one new row in the stream table.
@@ -671,9 +681,10 @@ FROM department_stats WHERE department_name = 'Backend';
 ```
 
 ```
- department_name | headcount | total_salary | avg_salary
------------------+-----------+--------------+------------
- Backend         |         1 |    120000.00 |  120000.00
+ department_name | headcount | total_salary |     avg_salary
+-----------------+-----------+--------------+---------------------
+ Backend         |         1 |    120000.00 | 120000.000000000000
+(1 row)
 ```
 
 Headcount dropped from 2 → 1 and the salary aggregates updated. Again, only the Backend group was touched — the other 6 department rows were untouched.
