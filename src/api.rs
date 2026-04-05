@@ -3704,8 +3704,7 @@ fn execute_manual_refresh(
     // always materializes the full result set regardless of who called
     // refresh_stream_table(). This mirrors REFRESH MATERIALIZED VIEW
     // semantics and prevents the "who refreshed it?" correctness hazard.
-    // nosemgrep: sql.row-security.disabled — intentional R3 bypass, mirrors REFRESH MATERIALIZED VIEW semantics.
-    Spi::run("SET LOCAL row_security = off")
+    Spi::run("SET LOCAL row_security = off") // nosemgrep — intentional R3 bypass, mirrors REFRESH MATERIALIZED VIEW semantics.
         .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
 
     // ERG-D: Determine the action label for history recording.
@@ -4038,7 +4037,7 @@ fn execute_manual_full_refresh(
     // Re-enable user triggers and emit NOTIFY so listeners know a FULL
     // refresh occurred.
     if has_triggers {
-        Spi::run(&format!("ALTER TABLE {quoted_table} ENABLE TRIGGER USER")) // nosemgrep: rust.spi.run.dynamic-format — ALTER TABLE DDL cannot be parameterized; quoted_table is a PostgreSQL-quoted identifier.
+        Spi::run(&format!("ALTER TABLE {quoted_table} ENABLE TRIGGER USER")) // nosemgrep — ALTER TABLE DDL cannot be parameterized; quoted_table is a PostgreSQL-quoted identifier.
             .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
 
         // PB2: Skip NOTIFY when pooler compatibility mode is enabled.
