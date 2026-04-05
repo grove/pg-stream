@@ -1873,9 +1873,9 @@ fn draw_footer(frame: &mut ratatui::Frame, area: Rect, app: &App) {
 /// Parse a `pg_trickle_alert` NOTIFY payload into an `AlertEvent`.
 ///
 /// The server always emits a JSON object with at minimum an `event` field.
-/// We derive `severity` from the event type, extract `st` (or `pgt_schema.pgt_name`)
-/// as the table name, and build a concise `detail` string from the remaining
-/// numeric/string fields.
+/// We derive `severity` from the event type, extract `st` as the table name,
+/// and decompose the remaining fields into `metric` (primary numeric) and
+/// `context` (secondary string).
 fn parse_alert_payload(payload: &str) -> crate::state::AlertEvent {
     let now = chrono::Utc::now();
 
@@ -1885,7 +1885,8 @@ fn parse_alert_payload(payload: &str) -> crate::state::AlertEvent {
             severity: "info".to_string(),
             event: "unknown".to_string(),
             table: String::new(),
-            detail: payload.to_string(),
+            metric: String::new(),
+            context: payload.to_string(),
         };
     };
 
@@ -1897,8 +1898,6 @@ fn parse_alert_payload(payload: &str) -> crate::state::AlertEvent {
 
     let severity = alert_event_severity(&event).to_string();
 
-    // Best-effort table name: prefer "st" (pre-formatted "schema.name"), then
-    // fall back to composing from pgt_schema + pgt_name.
     let table = v
         .get("st")
         .and_then(|s| s.as_str())
@@ -1910,22 +1909,80 @@ fn parse_alert_payload(payload: &str) -> crate::state::AlertEvent {
         })
         .unwrap_or_default();
 
-    // Build detail from remaining fields, skipping the ones already shown elsewhere.
-    const SKIP: &[&str] = &["event", "severity", "pgt_schema", "pgt_name", "st"];
-    let detail = if let Some(obj) = v.as_object() {
-        obj.iter()
-            .filter(|(k, _)| !SKIP.contains(&k.as_str()))
-            .map(|(k, val)| {
-                let v_str = match val {
-                    serde_json::Value::String(s) => s.clone(),
-                    other => other.to_string(),
-                };
-                format!("{k}={v_str}")
-            })
-            .collect::<Vec<_>>()
-            .join(", ")
-    } else {
-        String::new()
+    let str_field = |key: &str| -> Option<String> {
+        v.get(key).and_then(|x| x.as_str()).map(|s| s.to_string())
+    };
+    let f64_field = |key: &str| -> Option<f64> { v.get(key).and_then(|x| x.as_f64()) };
+    let i64_field = |key: &str| -> Option<i64> { v.get(key).and_then(|x| x.as_i64()) };
+
+    let (metric, context) = match event.as_str() {
+        "stale_data" => {
+            let metric = f64_field("ratio")
+                .map(|r| format!("ratio={r:.2}×"))
+                .unwrap_or_default();
+            let context = f64_field("staleness_seconds")
+                .map(|s| format!("staleness={s:.1}s"))
+                .unwrap_or_default();
+            (metric, context)
+        }
+        "auto_suspended" => {
+            let metric = i64_field("consecutive_errors")
+                .map(|n| format!("errors={n}"))
+                .unwrap_or_default();
+            (metric, String::new())
+        }
+        "resumed" => {
+            let context = str_field("previous_status")
+                .map(|s| format!("prev={s}"))
+                .unwrap_or_default();
+            (String::new(), context)
+        }
+        "reinitialize_needed" => {
+            let context = str_field("reason").unwrap_or_default();
+            (String::new(), context)
+        }
+        "buffer_growth_warning" => {
+            let metric = i64_field("pending_bytes")
+                .map(|b| format_bytes(b))
+                .unwrap_or_default();
+            let context = str_field("slot_name")
+                .map(|s| format!("slot={s}"))
+                .unwrap_or_default();
+            (metric, context)
+        }
+        "slot_lag_warning" => {
+            let metric = i64_field("retained_wal_bytes")
+                .map(|b| format_bytes(b))
+                .unwrap_or_default();
+            let context = str_field("slot_name")
+                .map(|s| format!("slot={s}"))
+                .unwrap_or_default();
+            (metric, context)
+        }
+        "refresh_completed" => {
+            let ins = i64_field("rows_inserted").unwrap_or(0);
+            let del = i64_field("rows_deleted").unwrap_or(0);
+            let ms = i64_field("duration_ms").unwrap_or(0);
+            let metric = format!("+{ins}/-{del} rows, {ms}ms");
+            let context = str_field("action").map(|a| format!("action={a}")).unwrap_or_default();
+            (metric, context)
+        }
+        "refresh_failed" => {
+            let context = str_field("error").unwrap_or_default();
+            let metric = str_field("action").map(|a| format!("action={a}")).unwrap_or_default();
+            (metric, context)
+        }
+        "scheduler_falling_behind" => {
+            let ratio = f64_field("ratio").map(|r| format!("ratio={r:.2}")).unwrap_or_default();
+            let elapsed = i64_field("elapsed_ms").map(|m| format!("{m}ms")).unwrap_or_default();
+            let metric = if ratio.is_empty() { elapsed } else if elapsed.is_empty() { ratio } else { format!("{ratio}, {elapsed}") };
+            (metric, String::new())
+        }
+        "cleanup_failure" => {
+            let context = str_field("error").unwrap_or_default();
+            (String::new(), context)
+        }
+        _ => (String::new(), String::new()),
     };
 
     crate::state::AlertEvent {
@@ -1933,7 +1990,21 @@ fn parse_alert_payload(payload: &str) -> crate::state::AlertEvent {
         severity,
         event,
         table,
-        detail,
+        metric,
+        context,
+    }
+}
+
+/// Format a byte count as a human-readable string.
+fn format_bytes(bytes: i64) -> String {
+    if bytes >= 1_073_741_824 {
+        format!("{:.1} GiB", bytes as f64 / 1_073_741_824.0)
+    } else if bytes >= 1_048_576 {
+        format!("{:.1} MiB", bytes as f64 / 1_048_576.0)
+    } else if bytes >= 1_024 {
+        format!("{:.0} KiB", bytes as f64 / 1_024.0)
+    } else {
+        format!("{bytes} B")
     }
 }
 

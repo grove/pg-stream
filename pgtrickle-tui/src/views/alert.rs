@@ -22,7 +22,7 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
         return;
     }
 
-    let header = Row::new(vec!["Sev", "Time", "Event", "Table", "Detail"])
+    let header = Row::new(vec!["Sev", "Time", "Event", "Table", "Metric", "Context"])
         .style(theme.header)
         .bottom_margin(1);
 
@@ -42,7 +42,8 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
                     .style(theme.dim),
                 Cell::from(alert.event.as_str()),
                 Cell::from(alert.table.as_str()).style(theme.dim),
-                Cell::from(alert.detail.as_str()),
+                Cell::from(alert.metric.as_str()),
+                Cell::from(alert.context.as_str()).style(theme.dim),
             ])
         })
         .collect();
@@ -51,7 +52,8 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
         Constraint::Length(4),
         Constraint::Length(10),
         Constraint::Length(24),
-        Constraint::Length(24),
+        Constraint::Length(22),
+        Constraint::Length(16),
         Constraint::Min(10),
     ];
 

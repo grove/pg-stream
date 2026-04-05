@@ -246,8 +246,10 @@ pub struct AlertEvent {
     pub event: String,
     /// Stream table qualified name ("schema.name"), if applicable.
     pub table: String,
-    /// Human-readable detail summary (extra numeric/string context).
-    pub detail: String,
+    /// Primary observable metric (numeric), e.g. "ratio=2.50×", "pending=4096 B".
+    pub metric: String,
+    /// Secondary text context, e.g. "slot=pg_trickle_1", "error=<msg>".
+    pub context: String,
 }
 
 #[derive(Clone, Serialize)]

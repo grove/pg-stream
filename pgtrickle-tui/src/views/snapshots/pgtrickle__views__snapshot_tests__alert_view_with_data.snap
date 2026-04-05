@@ -3,9 +3,9 @@ source: pgtrickle-tui/src/views/mod.rs
 expression: output
 ---
 ┌ Alerts (1) ──────────────────────────────────────────────────────────────────┐
-│Sev  Time       Event                    Table                    Detail      │
+│Sev  Time       Event             Table            Metric           Context   │
 │                                                                              │
-│⚠    12:00:00   stale_data               public.orders_live       staleness_se│
+│⚠    12:00:00   stale_data        public.orders_li ratio=2.50×      staleness=│
 │                                                                              │
 │                                                                              │
 │                                                                              │
