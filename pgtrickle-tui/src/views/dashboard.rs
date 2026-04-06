@@ -269,9 +269,9 @@ fn render_table(
             Constraint::Fill(2),    // Schema
             Constraint::Length(11), // Status  (INITIALIZING = 11)
             Constraint::Length(12), // Mode    (DIFFERENTIAL = 12)
-            Constraint::Fill(2),    // Effective
+            Constraint::Fill(1),    // Effective
             Constraint::Length(5),  // Stale
-            Constraint::Length(12), // Refreshed (relative)
+            Constraint::Length(14), // Refreshed (e.g. "1h 21m 32s")
             Constraint::Length(6),  // Tier
             Constraint::Length(8),  // Avg ms
             Constraint::Length(10), // Refreshes
@@ -282,9 +282,9 @@ fn render_table(
             Constraint::Fill(2),    // Schema
             Constraint::Length(11), // Status
             Constraint::Length(12), // Mode
-            Constraint::Fill(2),    // Effective
+            Constraint::Fill(1),    // Effective
             Constraint::Length(5),  // Stale
-            Constraint::Length(12), // Refreshed (relative)
+            Constraint::Length(14), // Refreshed (e.g. "1h 21m 32s")
         ]
     };
 
@@ -495,8 +495,23 @@ fn format_age(staleness: &str) -> String {
 /// Returns strings like "43s", "4m 21s", "1h 21m 32s".
 fn ago(ts: &str) -> String {
     use chrono::{DateTime, Utc};
+
+    // PostgreSQL may emit a bare ±HH offset (e.g. "+02") without the minutes
+    // part. Normalise it to ±HH:MM so chrono's %:z can parse it.
+    let normalised;
+    let ts = if let Some(pos) = ts.rfind(['+', '-']).filter(|&p| {
+        // Only the timezone sign, not a sign in the time portion (after the space)
+        p > ts.find(' ').unwrap_or(0) && ts[p + 1..].len() <= 2 // bare ±HH has at most 2 digits after sign
+    }) {
+        normalised = format!("{}:00", ts);
+        let _ = pos;
+        &normalised
+    } else {
+        ts
+    };
+
     let Ok(dt) =
-        DateTime::parse_from_str(ts, "%Y-%m-%d %H:%M:%S%.f%z").map(|d| d.with_timezone(&Utc))
+        DateTime::parse_from_str(ts, "%Y-%m-%d %H:%M:%S%.f%:z").map(|d| d.with_timezone(&Utc))
     else {
         return ts.to_string();
     };
@@ -512,5 +527,31 @@ fn ago(ts: &str) -> String {
         let m = (secs % 3600) / 60;
         let s = secs % 60;
         format!("{h}h {m}m {s}s")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ago;
+
+    #[test]
+    fn test_ago_parses_pg_timestamp_bare_offset() {
+        let ts = "2020-01-01 00:00:00.000000+02";
+        let result = ago(ts);
+        assert!(
+            !result.starts_with("2020"),
+            "ago() should return relative time, not raw timestamp; got: {result}"
+        );
+        assert!(result.contains('h'), "expected hours in result; got: {result}");
+    }
+
+    #[test]
+    fn test_ago_parses_full_offset() {
+        let ts = "2020-01-01 00:00:00.000000+02:00";
+        let result = ago(ts);
+        assert!(
+            !result.starts_with("2020"),
+            "ago() should handle +HH:MM offsets; got: {result}"
+        );
     }
 }
