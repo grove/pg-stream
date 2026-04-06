@@ -1189,7 +1189,10 @@ fn handle_key(app: &mut App, key: KeyEvent) {
             }
         }
         KeyCode::Char('e')
-            if app.current_view == View::Detail || app.current_view == View::DeltaInspector =>
+            if matches!(
+                app.current_view,
+                View::Dashboard | View::Detail | View::DeltaInspector
+            ) =>
         {
             // Export DDL overlay
             if let Some(idx) = app.selected_stream_table_index() {
