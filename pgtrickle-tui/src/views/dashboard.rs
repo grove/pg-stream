@@ -204,7 +204,7 @@ fn render_table(
                 ("⚠ cascade".to_string(), theme.warning)
             } else if let Some(explain) = state.explain_mode_cache.get(&st.name) {
                 if explain.configured_mode != explain.effective_mode {
-                    (format!("⚠ {}↓", explain.effective_mode), theme.warning)
+                    (format!("{} ↓", explain.effective_mode), theme.warning)
                 } else {
                     ("✓ ok".to_string(), theme.ok)
                 }
@@ -246,7 +246,7 @@ fn render_table(
             Constraint::Fill(2),    // Schema
             Constraint::Length(11), // Status  (INITIALIZING = 11)
             Constraint::Length(12), // Mode    (DIFFERENTIAL = 12)
-            Constraint::Length(13), // Effective (⚠ NO_DATA↓ = 11)
+            Constraint::Fill(2),    // Effective
             Constraint::Length(5),  // Stale
             Constraint::Fill(2),    // Last Refresh
             Constraint::Length(8),  // Avg ms
@@ -258,7 +258,7 @@ fn render_table(
             Constraint::Fill(2),    // Schema
             Constraint::Length(11), // Status
             Constraint::Length(12), // Mode
-            Constraint::Length(13), // Effective
+            Constraint::Fill(2),    // Effective
             Constraint::Length(5),  // Stale
             Constraint::Fill(2),    // Last Refresh
         ]

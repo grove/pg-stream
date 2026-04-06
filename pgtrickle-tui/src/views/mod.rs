@@ -175,8 +175,8 @@ mod snapshot_tests {
             .unwrap();
         let output = buffer_to_string(terminal.backend());
         assert!(
-            output.contains("NO_DATA↓"),
-            "downgraded EFF should show effective mode with ↓ arrow; got:\n{output}"
+            output.contains("NO_DATA \u{2193}"),
+            "downgraded EFF should show effective mode with space+arrow; got:\n{output}"
         );
     }
 
