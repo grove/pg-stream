@@ -17,8 +17,8 @@ expression: output
 │                                                                                                  │
 └──────────────────────────────────────────────────────────────────────────────────────────────────┘
 ┌ Trigger Inventory (1 triggers) ──────────────────────────────────────────────────────────────────┐
-│Source Table                       Trigger Name                           Events                  │
-│orders                             pgt_cdc_orders                         INSERT OR UPDATE OR DELE│
+│Source Table                  Trigger Name                    Type           Present    Enabled   │
+│orders                        pgt_cdc_orders                  DML            ✓          ✓         │
 │                                                                                                  │
 │                                                                                                  │
 │                                                                                                  │

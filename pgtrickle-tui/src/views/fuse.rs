@@ -42,10 +42,11 @@ fn render_table(
     let f = filter.unwrap_or("").to_lowercase();
     let header = Row::new(vec![
         "Stream Table",
+        "Mode",
         "Fuse State",
-        "Errors",
-        "Last Error",
+        "Ceiling",
         "Blown At",
+        "Reason",
     ])
     .style(theme.header)
     .bottom_margin(1);
@@ -59,7 +60,7 @@ fn render_table(
             let state_style = match fuse.fuse_state.as_str() {
                 "BLOWN" => theme.error,
                 "TRIPPED" => theme.warning,
-                "OK" | "HEALTHY" => theme.active,
+                "armed" | "OK" | "HEALTHY" => theme.active,
                 _ => theme.dim,
             };
             let icon = match fuse.fuse_state.as_str() {
@@ -67,12 +68,17 @@ fn render_table(
                 "TRIPPED" => "⚠",
                 _ => "✓",
             };
+            let ceiling_str = fuse
+                .fuse_ceiling
+                .map(|c| c.to_string())
+                .unwrap_or_else(|| "-".to_string());
             let row = Row::new(vec![
                 Cell::from(fuse.stream_table.as_str()),
+                Cell::from(fuse.fuse_mode.as_str()),
                 Cell::from(format!("{icon} {}", fuse.fuse_state)).style(state_style),
-                Cell::from(format!("{}", fuse.consecutive_errors)),
-                Cell::from(fuse.last_error.as_deref().unwrap_or("-")),
+                Cell::from(ceiling_str),
                 Cell::from(fuse.blown_at.as_deref().unwrap_or("-")),
+                Cell::from(fuse.blow_reason.as_deref().unwrap_or("-")),
             ]);
             if i == selected {
                 row.style(theme.selected)
@@ -89,11 +95,12 @@ fn render_table(
         .count();
 
     let widths = [
-        Constraint::Percentage(22),
-        Constraint::Percentage(15),
-        Constraint::Percentage(10),
-        Constraint::Percentage(33),
+        Constraint::Percentage(18),
+        Constraint::Percentage(8),
+        Constraint::Percentage(14),
+        Constraint::Percentage(8),
         Constraint::Percentage(20),
+        Constraint::Percentage(32),
     ];
 
     let table = Table::new(rows, widths).header(header).block(
@@ -132,25 +139,31 @@ fn render_detail(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme,
             Span::raw(&fuse.stream_table),
         ]),
         Line::from(vec![
+            Span::styled(" Mode: ", theme.header),
+            Span::raw(&fuse.fuse_mode),
+        ]),
+        Line::from(vec![
             Span::styled(" State: ", theme.header),
             Span::styled(&fuse.fuse_state, state_style),
         ]),
-        Line::from(vec![
-            Span::styled(" Consecutive Errors: ", theme.header),
-            Span::raw(format!("{}", fuse.consecutive_errors)),
-        ]),
     ];
 
-    if let Some(ref err) = fuse.last_error {
+    if let Some(ceiling) = fuse.fuse_ceiling {
         lines.push(Line::from(vec![
-            Span::styled(" Last Error: ", theme.header),
-            Span::styled(err.as_str(), theme.error),
+            Span::styled(" Ceiling: ", theme.header),
+            Span::raw(format!("{ceiling}")),
         ]));
     }
     if let Some(ref at) = fuse.blown_at {
         lines.push(Line::from(vec![
             Span::styled(" Blown At: ", theme.header),
             Span::raw(at.as_str()),
+        ]));
+    }
+    if let Some(ref reason) = fuse.blow_reason {
+        lines.push(Line::from(vec![
+            Span::styled(" Blow Reason: ", theme.header),
+            Span::styled(reason.as_str(), theme.error),
         ]));
     }
 

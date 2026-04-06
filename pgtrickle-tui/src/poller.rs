@@ -404,8 +404,7 @@ pub async fn execute_action(client: &Client, action: &ActionRequest) -> ActionRe
             match client
                 .query(
                     "SELECT action::text, status::text, rows_inserted, rows_deleted,
-                            delta_row_count, duration_ms, was_full_fallback,
-                            start_time::text, error_message::text
+                            duration_ms, start_time::text, error_message::text
                      FROM pgtrickle.get_refresh_history($1, 10)
                      ORDER BY start_time DESC",
                     &[name],
@@ -422,11 +421,9 @@ pub async fn execute_action(client: &Client, action: &ActionRequest) -> ActionRe
                                     "status": row.get::<_, String>(1),
                                     "rows_inserted": row.get::<_, Option<i64>>(2),
                                     "rows_deleted": row.get::<_, Option<i64>>(3),
-                                    "delta_row_count": row.get::<_, Option<i64>>(4),
-                                    "duration_ms": row.get::<_, Option<f64>>(5),
-                                    "was_full_fallback": row.get::<_, bool>(6),
-                                    "start_time": row.get::<_, String>(7),
-                                    "error_message": row.get::<_, Option<String>>(8),
+                                    "duration_ms": row.get::<_, Option<f64>>(4),
+                                    "start_time": row.get::<_, String>(5),
+                                    "error_message": row.get::<_, Option<String>>(6),
                                 })
                             })
                             .collect::<Vec<_>>(),
@@ -710,10 +707,11 @@ async fn poll_gucs_query(client: &Client) -> Option<Vec<GucParam>> {
 async fn poll_refresh_log_query(client: &Client) -> Option<Vec<RefreshLogEntry>> {
     let rows = client
         .query(
-            "SELECT refreshed_at::text, pgt_name::text, action::text,
-                    status::text, duration_ms, rows_affected
+            "SELECT start_time::text, stream_table::text, action::text,
+                    status::text, duration_ms,
+                    (rows_inserted + rows_deleted)::bigint AS rows_affected
              FROM pgtrickle.refresh_timeline()
-             ORDER BY refreshed_at DESC
+             ORDER BY start_time DESC
              LIMIT 200",
             &[],
         )
@@ -733,36 +731,34 @@ async fn poll_refresh_log_query(client: &Client) -> Option<Vec<RefreshLogEntry>>
     )
 }
 
-/// Returns (workers, job_queue).
-async fn poll_workers_query(client: &Client) -> Option<(Vec<WorkerInfo>, Vec<JobQueueEntry>)> {
-    let workers = client
+/// Returns (pool_summary, recent_jobs).
+async fn poll_workers_query(client: &Client) -> Option<(Option<WorkerInfo>, Vec<JobQueueEntry>)> {
+    // Single-row pool summary
+    let pool = client
         .query(
-            "SELECT worker_id, state::text, table_name::text,
-                    started_at::text, duration_ms
-             FROM pgtrickle.worker_pool_status()
-             ORDER BY worker_id",
+            "SELECT active_workers, max_workers, per_db_cap, parallel_mode::text
+             FROM pgtrickle.worker_pool_status()",
             &[],
         )
         .await
         .ok()
-        .map(|rows| {
-            rows.iter()
-                .map(|row| WorkerInfo {
-                    worker_id: row.get(0),
-                    state: row.get(1),
-                    table_name: row.get(2),
-                    started_at: row.get(3),
-                    duration_ms: row.get(4),
-                })
-                .collect()
-        })
-        .unwrap_or_default();
+        .and_then(|rows| rows.into_iter().next())
+        .map(|row| WorkerInfo {
+            active_workers: row.get(0),
+            max_workers: row.get(1),
+            per_db_cap: row.get(2),
+            parallel_mode: row.get(3),
+        });
 
-    let queue = client
+    // Recent parallel jobs (last 300 s)
+    let jobs = client
         .query(
-            "SELECT position, table_name::text, priority, queued_at::text, wait_ms
+            "SELECT job_id, unit_key::text, unit_kind::text, status::text,
+                    member_count, attempt_no, scheduler_pid, worker_pid,
+                    enqueued_at::text, started_at::text, finished_at::text, duration_ms
              FROM pgtrickle.parallel_job_status()
-             ORDER BY position",
+             ORDER BY enqueued_at DESC
+             LIMIT 200",
             &[],
         )
         .await
@@ -770,25 +766,31 @@ async fn poll_workers_query(client: &Client) -> Option<(Vec<WorkerInfo>, Vec<Job
         .map(|rows| {
             rows.iter()
                 .map(|row| JobQueueEntry {
-                    position: row.get(0),
-                    table_name: row.get(1),
-                    priority: row.get(2),
-                    queued_at: row.get(3),
-                    wait_ms: row.get(4),
+                    job_id: row.get(0),
+                    unit_key: row.get(1),
+                    unit_kind: row.get(2),
+                    status: row.get(3),
+                    member_count: row.get(4),
+                    attempt_no: row.get(5),
+                    scheduler_pid: row.get(6),
+                    worker_pid: row.get(7),
+                    enqueued_at: row.get(8),
+                    started_at: row.get(9),
+                    finished_at: row.get(10),
+                    duration_ms: row.get(11),
                 })
                 .collect()
         })
         .unwrap_or_default();
 
-    Some((workers, queue))
+    Some((pool, jobs))
 }
 
 async fn poll_fuses_query(client: &Client) -> Option<Vec<FuseInfo>> {
     let rows = client
         .query(
-            "SELECT pgt_name::text, fuse_state::text,
-                    consecutive_errors, last_error_message::text,
-                    blown_at::text
+            "SELECT stream_table::text, fuse_mode::text, fuse_state::text,
+                    fuse_ceiling, blown_at::text, blow_reason::text
              FROM pgtrickle.fuse_status()
              ORDER BY CASE fuse_state WHEN 'BLOWN' THEN 1 WHEN 'TRIPPED' THEN 2 ELSE 3 END",
             &[],
@@ -799,10 +801,11 @@ async fn poll_fuses_query(client: &Client) -> Option<Vec<FuseInfo>> {
         rows.iter()
             .map(|row| FuseInfo {
                 stream_table: row.get(0),
-                fuse_state: row.get(1),
-                consecutive_errors: row.get(2),
-                last_error: row.get(3),
+                fuse_mode: row.get(1),
+                fuse_state: row.get(2),
+                fuse_ceiling: row.get(3),
                 blown_at: row.get(4),
+                blow_reason: row.get(5),
             })
             .collect(),
     )
@@ -811,8 +814,7 @@ async fn poll_fuses_query(client: &Client) -> Option<Vec<FuseInfo>> {
 async fn poll_watermarks_query(client: &Client) -> Option<Vec<WatermarkGroup>> {
     let rows = client
         .query(
-            "SELECT group_name::text, member_count, min_watermark::text,
-                    max_watermark::text, gated
+            "SELECT group_name::text, source_count, tolerance_secs, created_at::text
              FROM pgtrickle.watermark_groups()
              ORDER BY group_name",
             &[],
@@ -823,10 +825,9 @@ async fn poll_watermarks_query(client: &Client) -> Option<Vec<WatermarkGroup>> {
         rows.iter()
             .map(|row| WatermarkGroup {
                 group_name: row.get(0),
-                member_count: row.get(1),
-                min_watermark: row.get(2),
-                max_watermark: row.get(3),
-                gated: row.get(4),
+                source_count: row.get(1),
+                tolerance_secs: row.get(2),
+                created_at: row.get(3),
             })
             .collect(),
     )
@@ -835,7 +836,7 @@ async fn poll_watermarks_query(client: &Client) -> Option<Vec<WatermarkGroup>> {
 async fn poll_triggers_query(client: &Client) -> Option<Vec<TriggerInfo>> {
     let rows = client
         .query(
-            "SELECT source_table::text, trigger_name::text, firing_events::text
+            "SELECT source_table::text, trigger_name::text, trigger_type::text, present, enabled
              FROM pgtrickle.trigger_inventory()
              ORDER BY source_table, trigger_name",
             &[],
@@ -847,7 +848,9 @@ async fn poll_triggers_query(client: &Client) -> Option<Vec<TriggerInfo>> {
             .map(|row| TriggerInfo {
                 source_table: row.get(0),
                 trigger_name: row.get(1),
-                firing_events: row.get(2),
+                trigger_type: row.get(2),
+                present: row.get(3),
+                enabled: row.get(4),
             })
             .collect(),
     )

@@ -48,33 +48,20 @@ fn render_groups_table(
     theme: &Theme,
     selected: usize,
 ) {
-    let header = Row::new(vec![
-        "Group",
-        "Members",
-        "Min Watermark",
-        "Max Watermark",
-        "Gated",
-    ])
-    .style(theme.header)
-    .bottom_margin(1);
+    let header = Row::new(vec!["Group", "Sources", "Tolerance (s)", "Created At"])
+        .style(theme.header)
+        .bottom_margin(1);
 
     let rows: Vec<Row> = state
         .watermark_groups
         .iter()
         .enumerate()
         .map(|(i, wg)| {
-            let gate_style = if wg.gated {
-                theme.warning
-            } else {
-                theme.active
-            };
-            let gate_icon = if wg.gated { "⚠ Yes" } else { "✓ No" };
             let row = Row::new(vec![
                 Cell::from(wg.group_name.as_str()),
-                Cell::from(format!("{}", wg.member_count)),
-                Cell::from(wg.min_watermark.as_deref().unwrap_or("-")),
-                Cell::from(wg.max_watermark.as_deref().unwrap_or("-")),
-                Cell::from(gate_icon).style(gate_style),
+                Cell::from(format!("{}", wg.source_count)),
+                Cell::from(format!("{:.1}", wg.tolerance_secs)),
+                Cell::from(wg.created_at.as_deref().unwrap_or("-")),
             ]);
             if i == selected {
                 row.style(theme.selected)
@@ -84,14 +71,11 @@ fn render_groups_table(
         })
         .collect();
 
-    let gated = state.watermark_groups.iter().filter(|w| w.gated).count();
-
     let widths = [
         Constraint::Percentage(25),
         Constraint::Percentage(12),
-        Constraint::Percentage(23),
-        Constraint::Percentage(23),
-        Constraint::Percentage(17),
+        Constraint::Percentage(20),
+        Constraint::Percentage(43),
     ];
 
     let table = Table::new(rows, widths).header(header).block(
@@ -100,9 +84,8 @@ fn render_groups_table(
             .border_style(theme.border)
             .title(Span::styled(
                 format!(
-                    " [Tab 1] Watermark Groups ({} groups, {} gated) — Tab to switch ",
-                    state.watermark_groups.len(),
-                    gated
+                    " [Tab 1] Watermark Groups ({} groups) — Tab to switch ",
+                    state.watermark_groups.len()
                 ),
                 theme.title,
             )),

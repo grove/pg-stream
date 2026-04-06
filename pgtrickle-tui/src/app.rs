@@ -161,6 +161,10 @@ struct App {
     validate_overlay: Option<String>,
     /// Delta inspector sub-tab (0=SQL, 1=Auxiliary columns)
     delta_inspector_tab: usize,
+    /// Whether the DAG Mini-Map panel has keyboard focus on the Dashboard
+    dag_focused: bool,
+    /// Scroll offset for the DAG Mini-Map
+    dag_scroll: usize,
 }
 
 /// Simple command palette for `:` mode.
@@ -274,6 +278,8 @@ impl App {
             ddl_overlay: None,
             validate_overlay: None,
             delta_inspector_tab: 0,
+            dag_focused: false,
+            dag_scroll: 0,
         }
     }
 
@@ -450,16 +456,15 @@ impl App {
 
     fn filtered_workers_len(&self) -> usize {
         if self.filter.is_none() {
-            return self.state.workers.len();
+            return self.state.job_queue.len();
         }
         self.state
-            .workers
+            .job_queue
             .iter()
-            .filter(|w| {
-                w.table_name
-                    .as_deref()
-                    .is_some_and(|n| self.filter_matches(n))
-                    || self.filter_matches(&w.state)
+            .filter(|j| {
+                self.filter_matches(&j.unit_key)
+                    || self.filter_matches(&j.status)
+                    || self.filter_matches(&j.unit_kind)
             })
             .count()
     }
@@ -617,6 +622,16 @@ async fn run_app(
                     app.state.auxiliary_columns_cache = auxiliary_columns_cache;
                     app.state.poll_interval_ms = app.poll_interval * 1000;
                     app.clamp_selection();
+                    // Pre-fetch explain mode for all tables so Dashboard's
+                    // Effective column is populated without needing to visit Detail.
+                    if let Some(ref tx) = app.action_tx {
+                        for st in &app.state.stream_tables {
+                            if !app.state.explain_mode_cache.contains_key(&st.name) {
+                                let _ =
+                                    tx.try_send(ActionRequest::FetchExplainMode(st.name.clone()));
+                            }
+                        }
+                    }
                 }
                 PollMsg::Error(e) => {
                     app.state.error_message = Some(e);
@@ -724,14 +739,7 @@ async fn run_app(
                                     status: v.get("status")?.as_str()?.to_string(),
                                     rows_inserted: v.get("rows_inserted").and_then(|s| s.as_i64()),
                                     rows_deleted: v.get("rows_deleted").and_then(|s| s.as_i64()),
-                                    delta_row_count: v
-                                        .get("delta_row_count")
-                                        .and_then(|s| s.as_i64()),
                                     duration_ms: v.get("duration_ms").and_then(|s| s.as_f64()),
-                                    was_full_fallback: v
-                                        .get("was_full_fallback")
-                                        .and_then(|s| s.as_bool())
-                                        .unwrap_or(false),
                                     start_time: v.get("start_time")?.as_str()?.to_string(),
                                     error_message: v
                                         .get("error_message")
@@ -1091,6 +1099,25 @@ fn handle_key(app: &mut App, key: KeyEvent) {
         return;
     }
 
+    // DAG Mini-Map focus mode: intercept navigation keys on Dashboard
+    if app.dag_focused && app.current_view == View::Dashboard {
+        match key.code {
+            KeyCode::Char('j') | KeyCode::Down => {
+                app.dag_scroll = app.dag_scroll.saturating_add(1);
+                return;
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                app.dag_scroll = app.dag_scroll.saturating_sub(1);
+                return;
+            }
+            KeyCode::Tab | KeyCode::Esc => {
+                app.dag_focused = false;
+                return;
+            }
+            _ => {} // let other keys (q, number keys, etc.) fall through
+        }
+    }
+
     // Global keys
     match key.code {
         KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -1179,7 +1206,10 @@ fn handle_key(app: &mut App, key: KeyEvent) {
             }
         }
         KeyCode::Char('e')
-            if app.current_view == View::Detail || app.current_view == View::DeltaInspector =>
+            if matches!(
+                app.current_view,
+                View::Dashboard | View::Detail | View::DeltaInspector
+            ) =>
         {
             // Export DDL overlay
             if let Some(idx) = app.selected_stream_table_index() {
@@ -1240,6 +1270,12 @@ fn handle_key(app: &mut App, key: KeyEvent) {
             app.selected = 0;
         }
 
+        // ── DAG Mini-Map focus (Dashboard) ───────────────────────
+        KeyCode::Tab if app.current_view == View::Dashboard => {
+            app.dag_focused = true;
+            app.dag_scroll = 0;
+        }
+
         // ── Delta Inspector sub-tab ──────────────────────────────
         KeyCode::Tab if app.current_view == View::DeltaInspector => {
             app.delta_inspector_tab = (app.delta_inspector_tab + 1) % 2;
@@ -1291,21 +1327,33 @@ fn handle_key(app: &mut App, key: KeyEvent) {
             if app.current_view == View::Detail {
                 fetch_detail_data(app);
             }
+            if app.current_view == View::DeltaInspector {
+                fetch_delta_sql(app);
+            }
         }
         KeyCode::Char('k') | KeyCode::Up => {
             app.move_up();
             if app.current_view == View::Detail {
                 fetch_detail_data(app);
             }
+            if app.current_view == View::DeltaInspector {
+                fetch_delta_sql(app);
+            }
         }
         KeyCode::PageDown => {
             for _ in 0..20 {
                 app.move_down();
             }
+            if app.current_view == View::DeltaInspector {
+                fetch_delta_sql(app);
+            }
         }
         KeyCode::PageUp => {
             for _ in 0..20 {
                 app.move_up();
+            }
+            if app.current_view == View::DeltaInspector {
+                fetch_delta_sql(app);
             }
         }
         KeyCode::Enter => {
@@ -1503,6 +1551,7 @@ fn export_current_view(app: &mut App) {
 }
 
 fn switch_view(app: &mut App, view: View) {
+    app.dag_focused = false;
     if app.current_view != view {
         let preserve_selection =
             matches!(
@@ -1751,9 +1800,16 @@ fn draw_body(frame: &mut ratatui::Frame, area: Rect, app: &App) {
 fn render_view(frame: &mut ratatui::Frame, area: Rect, app: &App) {
     let filter = app.filter.as_deref();
     match app.current_view {
-        View::Dashboard => {
-            views::dashboard::render(frame, area, &app.state, &app.theme, app.selected, filter)
-        }
+        View::Dashboard => views::dashboard::render(
+            frame,
+            area,
+            &app.state,
+            &app.theme,
+            app.selected,
+            filter,
+            app.dag_focused,
+            app.dag_scroll,
+        ),
         View::Detail => views::detail::render(
             frame,
             area,
@@ -1943,7 +1999,7 @@ fn parse_alert_payload(payload: &str) -> crate::state::AlertEvent {
         }
         "buffer_growth_warning" => {
             let metric = i64_field("pending_bytes")
-                .map(|b| format_bytes(b))
+                .map(format_bytes)
                 .unwrap_or_default();
             let context = str_field("slot_name")
                 .map(|s| format!("slot={s}"))
@@ -1952,7 +2008,7 @@ fn parse_alert_payload(payload: &str) -> crate::state::AlertEvent {
         }
         "slot_lag_warning" => {
             let metric = i64_field("retained_wal_bytes")
-                .map(|b| format_bytes(b))
+                .map(format_bytes)
                 .unwrap_or_default();
             let context = str_field("slot_name")
                 .map(|s| format!("slot={s}"))

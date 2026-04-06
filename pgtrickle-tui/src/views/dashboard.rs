@@ -7,6 +7,7 @@ use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Sparkline, Table};
 use crate::state::AppState;
 use crate::theme::Theme;
 
+#[allow(clippy::too_many_arguments)]
 pub fn render(
     frame: &mut Frame,
     area: Rect,
@@ -14,12 +15,23 @@ pub fn render(
     theme: &Theme,
     selected: usize,
     filter: Option<&str>,
+    dag_focused: bool,
+    dag_scroll: usize,
 ) {
     let wide = area.width >= 140;
     let tall = area.height >= 35;
 
     if wide && tall {
-        render_wide(frame, area, state, theme, selected, filter);
+        render_wide(
+            frame,
+            area,
+            state,
+            theme,
+            selected,
+            filter,
+            dag_focused,
+            dag_scroll,
+        );
     } else {
         render_standard(frame, area, state, theme, selected, filter);
     }
@@ -65,6 +77,7 @@ fn filtered_sorted_indices(state: &AppState, filter: Option<&str>) -> Vec<usize>
     indices
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_wide(
     frame: &mut Frame,
     area: Rect,
@@ -72,13 +85,15 @@ fn render_wide(
     theme: &Theme,
     selected: usize,
     filter: Option<&str>,
+    dag_focused: bool,
+    dag_scroll: usize,
 ) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(3), // Status ribbon
             Constraint::Min(10),   // Main content
-            Constraint::Length(3), // DAG mini-map
+            Constraint::Min(6),    // DAG mini-map
         ])
         .split(area);
 
@@ -92,7 +107,7 @@ fn render_wide(
 
     render_table(frame, main[0], state, theme, selected, true, filter);
     render_issues_sidebar(frame, main[1], state, theme);
-    render_dag_minimap(frame, chunks[2], state, theme);
+    render_dag_minimap(frame, chunks[2], state, theme, dag_focused, dag_scroll);
 }
 
 fn render_standard(
@@ -171,11 +186,12 @@ fn render_table(
         "Schema",
         "Status",
         "Mode",
-        "EFF",
+        "Effective",
         "Stale",
-        "Last Refresh",
+        "Refreshed",
     ];
     if show_eff {
+        header_cells.push("Tier");
         header_cells.push("Avg ms");
         header_cells.push("Refreshes");
     }
@@ -196,13 +212,23 @@ fn render_table(
             let stale_str = if st.stale { "yes" } else { "no" };
             let stale_style = if st.stale { theme.warning } else { theme.ok };
 
-            // EFF column (F21): effective staleness considering cascade
+            // EFF column (F21): effective staleness considering cascade,
+            // plus downgrade hint from explain_mode_cache when available.
             let (eff_str, eff_style) = if st.status == "ERROR" || st.status == "SUSPENDED" {
-                ("✗ err", theme.error)
+                ("✗ err".to_string(), theme.error)
             } else if st.cascade_stale {
-                ("⚠ cascade", theme.warning)
+                ("⚠ cascade".to_string(), theme.warning)
+            } else if let Some(explain) = state.explain_mode_cache.get(&st.name) {
+                if explain.configured_mode != explain.effective_mode {
+                    (
+                        format!("{} ↓", super::friendly_mode(&explain.effective_mode)),
+                        theme.warning,
+                    )
+                } else {
+                    ("✓ ok".to_string(), theme.ok)
+                }
             } else {
-                ("✓ ok", theme.ok)
+                ("✓ ok".to_string(), theme.ok)
             };
 
             let mut cells = vec![
@@ -212,10 +238,16 @@ fn render_table(
                 Cell::from(st.refresh_mode.as_str()),
                 Cell::from(eff_str).style(eff_style),
                 Cell::from(stale_str).style(stale_style),
-                Cell::from(st.last_refresh_at.as_deref().unwrap_or("-").to_string()),
+                Cell::from(
+                    st.last_refresh_at
+                        .as_deref()
+                        .map(ago)
+                        .unwrap_or_else(|| "-".to_string()),
+                ),
             ];
 
             if show_eff {
+                cells.push(Cell::from(st.tier.as_deref().unwrap_or("-")));
                 cells.push(Cell::from(
                     st.avg_duration_ms
                         .map(|ms| format!("{ms:.1}"))
@@ -235,25 +267,26 @@ fn render_table(
 
     let widths = if show_eff {
         vec![
-            Constraint::Min(20),
-            Constraint::Length(12),
-            Constraint::Length(10),
-            Constraint::Length(14),
-            Constraint::Length(10),
-            Constraint::Length(6),
-            Constraint::Length(22),
-            Constraint::Length(8),
-            Constraint::Length(10),
+            Constraint::Fill(3),    // Name
+            Constraint::Fill(2),    // Schema
+            Constraint::Length(11), // Status  (INITIALIZING = 11)
+            Constraint::Length(12), // Mode    (DIFFERENTIAL = 12)
+            Constraint::Fill(1),    // Effective
+            Constraint::Length(5),  // Stale
+            Constraint::Length(14), // Refreshed (e.g. "1h 21m 32s")
+            Constraint::Length(6),  // Tier
+            Constraint::Length(8),  // Avg ms
+            Constraint::Length(10), // Refreshes
         ]
     } else {
         vec![
-            Constraint::Min(20),
-            Constraint::Length(12),
-            Constraint::Length(10),
-            Constraint::Length(14),
-            Constraint::Length(10),
-            Constraint::Length(6),
-            Constraint::Length(22),
+            Constraint::Fill(3),    // Name
+            Constraint::Fill(2),    // Schema
+            Constraint::Length(11), // Status
+            Constraint::Length(12), // Mode
+            Constraint::Fill(1),    // Effective
+            Constraint::Length(5),  // Stale
+            Constraint::Length(14), // Refreshed (e.g. "1h 21m 32s")
         ]
     };
 
@@ -381,27 +414,149 @@ fn render_issues_sidebar(frame: &mut Frame, area: Rect, state: &AppState, theme:
     frame.render_widget(paragraph, area);
 }
 
-fn render_dag_minimap(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
+fn render_dag_minimap(
+    frame: &mut Frame,
+    area: Rect,
+    state: &AppState,
+    theme: &Theme,
+    focused: bool,
+    scroll: usize,
+) {
+    // Build schema.name → StreamTableInfo lookup for freshness badges.
+    // dag_edges use schema-qualified node names (e.g. "public.category_summary").
+    let st_lookup: std::collections::HashMap<String, &crate::state::StreamTableInfo> = state
+        .stream_tables
+        .iter()
+        .map(|st| (format!("{}.{}", st.schema, st.name), st))
+        .collect();
+
     let lines: Vec<Line> = state
         .dag_edges
         .iter()
         .filter(|e| e.depth <= 2)
-        .take(area.height.saturating_sub(2) as usize)
         .map(|e| {
             let status_style = e
                 .status
                 .as_deref()
                 .map(|s| theme.status_style(s))
                 .unwrap_or_default();
-            Line::from(Span::styled(e.tree_line.as_str(), status_style))
+
+            let mut spans = vec![Span::styled(e.tree_line.as_str(), status_style)];
+
+            if let Some(st) = st_lookup.get(e.node.as_str()) {
+                let (icon, badge_style) = if st.status == "ERROR" || st.status == "SUSPENDED" {
+                    ("✗", theme.error)
+                } else if st.cascade_stale || st.stale {
+                    ("⚠", theme.warning)
+                } else {
+                    ("✓", theme.ok)
+                };
+                let age = st
+                    .staleness
+                    .as_deref()
+                    .map(|s| format!(" {} {}", format_age(s), icon))
+                    .unwrap_or_else(|| format!(" {icon}"));
+                spans.push(Span::styled(age, badge_style));
+            }
+
+            Line::from(spans)
         })
         .collect();
 
+    let (border_style, title_suffix) = if focused {
+        (theme.active, " ↑↓ scroll  Tab/Esc exit ")
+    } else {
+        (theme.border, " Tab to focus ")
+    };
+
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(theme.border)
-        .title(Span::styled(" DAG Mini-Map ", theme.title));
+        .border_style(border_style)
+        .title(Span::styled(" DAG Mini-Map ", theme.title))
+        .title_bottom(Span::styled(title_suffix, theme.dim));
 
-    let paragraph = Paragraph::new(lines).block(block);
+    let paragraph = Paragraph::new(lines)
+        .block(block)
+        .scroll((scroll as u16, 0));
     frame.render_widget(paragraph, area);
+}
+
+/// Convert a raw seconds string (e.g. "49253s") to a compact human-readable age.
+fn format_age(staleness: &str) -> String {
+    let secs: f64 = staleness.trim_end_matches('s').parse().unwrap_or(0.0);
+    if secs >= 3600.0 {
+        format!("{:.0}h", secs / 3600.0)
+    } else if secs >= 60.0 {
+        format!("{:.0}m", secs / 60.0)
+    } else {
+        format!("{:.0}s", secs)
+    }
+}
+
+/// Format a PostgreSQL timestamptz string as a human-readable age relative to now.
+/// Returns strings like "43s", "4m 21s", "1h 21m 32s".
+fn ago(ts: &str) -> String {
+    use chrono::{DateTime, Utc};
+
+    // PostgreSQL may emit a bare ±HH offset (e.g. "+02") without the minutes
+    // part. Normalise it to ±HH:MM so chrono's %:z can parse it.
+    let normalised;
+    let ts = if let Some(pos) = ts.rfind(['+', '-']).filter(|&p| {
+        // Only the timezone sign, not a sign in the time portion (after the space)
+        p > ts.find(' ').unwrap_or(0) && ts[p + 1..].len() <= 2 // bare ±HH has at most 2 digits after sign
+    }) {
+        normalised = format!("{}:00", ts);
+        let _ = pos;
+        &normalised
+    } else {
+        ts
+    };
+
+    let Ok(dt) =
+        DateTime::parse_from_str(ts, "%Y-%m-%d %H:%M:%S%.f%:z").map(|d| d.with_timezone(&Utc))
+    else {
+        return ts.to_string();
+    };
+    let secs = Utc::now().signed_duration_since(dt).num_seconds().max(0) as u64;
+    if secs < 60 {
+        format!("{secs}s")
+    } else if secs < 3600 {
+        let m = secs / 60;
+        let s = secs % 60;
+        format!("{m}m {s}s")
+    } else {
+        let h = secs / 3600;
+        let m = (secs % 3600) / 60;
+        let s = secs % 60;
+        format!("{h}h {m}m {s}s")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ago;
+
+    #[test]
+    fn test_ago_parses_pg_timestamp_bare_offset() {
+        let ts = "2020-01-01 00:00:00.000000+02";
+        let result = ago(ts);
+        assert!(
+            !result.starts_with("2020"),
+            "ago() should return relative time, not raw timestamp; got: {result}"
+        );
+        assert!(
+            result.contains('h'),
+            "expected hours in result; got: {result}"
+        );
+    }
+
+    #[test]
+    fn test_ago_parses_full_offset() {
+        let ts = "2020-01-01 00:00:00.000000+02:00";
+        let result = ago(ts);
+        assert!(
+            !result.starts_with("2020"),
+            "ago() should handle +HH:MM offsets; got: {result}"
+        );
+    }
 }

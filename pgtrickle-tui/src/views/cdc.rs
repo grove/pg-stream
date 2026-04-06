@@ -149,7 +149,7 @@ fn render_buffers(
 
 fn render_triggers(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     let header = Row::new(
-        ["Source Table", "Trigger Name", "Events"]
+        ["Source Table", "Trigger Name", "Type", "Present", "Enabled"]
             .iter()
             .map(|h| Cell::from(*h).style(theme.header)),
     )
@@ -159,18 +159,26 @@ fn render_triggers(frame: &mut Frame, area: Rect, state: &AppState, theme: &Them
         .trigger_inventory
         .iter()
         .map(|t| {
+            let present_icon = if t.present { "✓" } else { "✗" };
+            let present_style = if t.present { theme.ok } else { theme.warning };
+            let enabled_icon = if t.enabled { "✓" } else { "✗" };
+            let enabled_style = if t.enabled { theme.ok } else { theme.warning };
             Row::new(vec![
                 Cell::from(t.source_table.as_str()),
                 Cell::from(t.trigger_name.as_str()),
-                Cell::from(t.firing_events.as_str()),
+                Cell::from(t.trigger_type.as_str()),
+                Cell::from(present_icon).style(present_style),
+                Cell::from(enabled_icon).style(enabled_style),
             ])
         })
         .collect();
 
     let widths = [
+        Constraint::Percentage(30),
         Constraint::Percentage(35),
-        Constraint::Percentage(40),
-        Constraint::Percentage(25),
+        Constraint::Percentage(15),
+        Constraint::Percentage(10),
+        Constraint::Percentage(10),
     ];
 
     let ok_count = state.trigger_inventory.len();

@@ -3,10 +3,10 @@ source: pgtrickle-tui/src/views/mod.rs
 expression: output
 ---
 ┌ Fuse & Circuit Breaker (1 blown, 2 total) ───────────────────────────────────────────────────────┐
-│Stream Table           Fuse State     Errors     Last Error                   Blown At            │
+│Stream Table       Mode    Fuse Stat Ceiling  Blown At             Reason                         │
 │                                                                                                  │
-│revenue_daily          ✗ BLOWN        5          division by zero             2026-04-01 11:58:00 │
-│orders_live            ✓ OK           0          -                            -                   │
+│revenue_daily      auto    ✗ BLOWN   5        2026-04-01 11:58:00  division by zero               │
+│orders_live        off     ✓ armed   -        -                    -                              │
 │                                                                                                  │
 │                                                                                                  │
 │                                                                                                  │
@@ -18,11 +18,11 @@ expression: output
 └──────────────────────────────────────────────────────────────────────────────────────────────────┘
 ┌ Fuse Detail ─────────────────────────────────────────────────────────────────────────────────────┐
 │ Table: revenue_daily                                                                             │
+│ Mode: auto                                                                                       │
 │ State: BLOWN                                                                                     │
-│ Consecutive Errors: 5                                                                            │
-│ Last Error: division by zero                                                                     │
+│ Ceiling: 5                                                                                       │
 │ Blown At: 2026-04-01 11:58:00                                                                    │
+│ Blow Reason: division by zero                                                                    │
 │                                                                                                  │
 │ To reset: SELECT pgtrickle.reset_fuse('<table>');                                                │
-│                                                                                                  │
 └──────────────────────────────────────────────────────────────────────────────────────────────────┘

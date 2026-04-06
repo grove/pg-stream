@@ -14,6 +14,20 @@ pub mod refresh_log;
 pub mod watermarks;
 pub mod workers;
 
+/// Translate server-side refresh action/mode names into user-friendly labels.
+pub fn friendly_mode(mode: &str) -> &str {
+    match mode {
+        "NO_DATA" => "no changes",
+        "DIFFERENTIAL" => "differential",
+        "FULL" => "full",
+        "REINITIALIZE" => "reinitializing",
+        "SKIP" => "skipped",
+        "APPEND_ONLY" => "append-only",
+        "TOP_K" => "top-k",
+        other => other,
+    }
+}
+
 #[cfg(test)]
 mod snapshot_tests {
     use ratatui::Terminal;
@@ -88,7 +102,7 @@ mod snapshot_tests {
     #[test]
     fn test_dashboard_standard_80x24() {
         let output = render_to_string(80, 24, |frame, area, state, theme| {
-            super::dashboard::render(frame, area, state, theme, 0, None);
+            super::dashboard::render(frame, area, state, theme, 0, None, false, 0);
         });
         assert!(
             output.contains("Stream Tables"),
@@ -108,7 +122,7 @@ mod snapshot_tests {
     #[test]
     fn test_dashboard_wide_150x40() {
         let output = render_to_string(150, 40, |frame, area, state, theme| {
-            super::dashboard::render(frame, area, state, theme, 0, None);
+            super::dashboard::render(frame, area, state, theme, 0, None, false, 0);
         });
         assert!(output.contains("Stream Tables"), "should contain ribbon");
         assert!(
@@ -128,7 +142,7 @@ mod snapshot_tests {
     #[test]
     fn test_dashboard_with_filter() {
         let output = render_to_string(80, 24, |frame, area, state, theme| {
-            super::dashboard::render(frame, area, state, theme, 0, Some("orders"));
+            super::dashboard::render(frame, area, state, theme, 0, Some("orders"), false, 0);
         });
         assert!(
             output.contains("filter: orders"),
@@ -144,11 +158,40 @@ mod snapshot_tests {
     #[test]
     fn test_dashboard_empty_state() {
         let output = render_empty_to_string(80, 24, |frame, area, state, theme| {
-            super::dashboard::render(frame, area, state, theme, 0, None);
+            super::dashboard::render(frame, area, state, theme, 0, None, false, 0);
         });
         assert!(output.contains("0 total"), "should show zero total");
         assert!(output.contains("0 active"), "should show zero active");
         assert!(output.contains("0 of 0"), "should show empty table count");
+    }
+
+    #[test]
+    fn test_dashboard_eff_downgrade_hint() {
+        let theme = Theme::default_dark();
+        let mut state = test_fixtures::sample_state();
+        // Inject a downgrade for the first stream table.
+        let first_name = state.stream_tables[0].name.clone();
+        state.explain_mode_cache.insert(
+            first_name,
+            crate::state::ExplainRefreshMode {
+                configured_mode: "DIFFERENTIAL".to_string(),
+                effective_mode: "NO_DATA".to_string(),
+                downgrade_reason: Some("no pending changes".to_string()),
+            },
+        );
+        let backend = TestBackend::new(120, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                super::dashboard::render(frame, area, &state, &theme, 0, None, false, 0);
+            })
+            .unwrap();
+        let output = buffer_to_string(terminal.backend());
+        assert!(
+            output.contains("no changes \u{2193}"),
+            "downgraded EFF should show effective mode with space+arrow; got:\n{output}"
+        );
     }
 
     // ── Detail view ──────────────────────────────────────────────────

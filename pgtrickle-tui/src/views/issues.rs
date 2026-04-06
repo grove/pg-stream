@@ -106,14 +106,18 @@ fn render_table(
         .enumerate()
         .map(|(i, issue)| {
             let (icon, sev_style) = match issue.severity.as_str() {
-                "critical" => ("✗", theme.error),
+                "critical" | "error" => ("✗", theme.error),
                 "warning" => ("⚠", theme.warning),
                 _ => ("ℹ", theme.dim),
+            };
+            let table_cell = match issue.affected_table.as_deref() {
+                Some(t) => t.to_string(),
+                None => "(system-wide)".to_string(),
             };
             let row = Row::new(vec![
                 Cell::from(format!("{icon} {}", issue.severity)).style(sev_style),
                 Cell::from(issue.category.as_str()),
-                Cell::from(issue.affected_table.as_deref().unwrap_or("-")),
+                Cell::from(table_cell),
                 Cell::from(issue.summary.as_str()),
                 Cell::from(format!("{}", issue.blast_radius)),
             ]);

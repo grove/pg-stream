@@ -133,7 +133,7 @@ fn render_properties(
         let mode_style = if downgraded { theme.warning } else { theme.ok };
         let mut mode_spans = vec![
             Span::styled(" Effective: ", theme.header),
-            Span::styled(&explain.effective_mode, mode_style),
+            Span::styled(super::friendly_mode(&explain.effective_mode), mode_style),
         ];
         if downgraded {
             mode_spans.push(Span::styled(" ↓ downgraded", theme.warning));
@@ -427,13 +427,6 @@ fn render_rich_refresh_history(
             if let Some(del) = e.rows_deleted {
                 spans.push(Span::raw(" "));
                 spans.push(Span::styled(format!("-{del}"), theme.error));
-            }
-            if let Some(delta) = e.delta_row_count {
-                spans.push(Span::raw(format!("  ({delta} Δ)")));
-            }
-
-            if e.was_full_fallback {
-                spans.push(Span::styled(" (fallback)", theme.warning));
             }
 
             let icon = if e.status == "success" || e.status == "ok" {

@@ -21,6 +21,14 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme, se
         .flat_map(|s| s.members.split(", ").map(move |m| (m, s.scc_id)))
         .collect();
 
+    // Freshness lookup: schema.name -> StreamTableInfo
+    // dag_edges use schema-qualified node names (e.g. "public.category_summary").
+    let st_lookup: std::collections::HashMap<String, &crate::state::StreamTableInfo> = state
+        .stream_tables
+        .iter()
+        .map(|st| (format!("{}.{}", st.schema, st.name), st))
+        .collect();
+
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Min(3), Constraint::Length(3)])
@@ -56,6 +64,23 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme, se
                     format!(" ○{sid}"),
                     Style::default().fg(Color::Magenta),
                 ));
+            }
+
+            // Freshness badge
+            if let Some(st) = st_lookup.get(edge.node.as_str()) {
+                let (icon, badge_style) = if st.status == "ERROR" || st.status == "SUSPENDED" {
+                    ("✗", theme.error)
+                } else if st.cascade_stale || st.stale {
+                    ("⚠", theme.warning)
+                } else {
+                    ("✓", theme.ok)
+                };
+                let age = st
+                    .staleness
+                    .as_deref()
+                    .map(|s| format!("  {} {}", format_age(s), icon))
+                    .unwrap_or_else(|| format!("  {icon}"));
+                spans.push(Span::styled(age, badge_style));
             }
 
             Line::from(spans)
@@ -106,6 +131,34 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme, se
             ));
         }
 
+        // Freshness detail for the selected node
+        if let Some(st) = st_lookup.get(edge.node.as_str()) {
+            let age_str = st
+                .staleness
+                .as_deref()
+                .map(|s| format!("age {}", format_age(s)))
+                .unwrap_or_else(|| "age unknown".to_string());
+            let last = st
+                .last_refresh_at
+                .as_deref()
+                .map(|t| format!(", last refresh {t}"))
+                .unwrap_or_default();
+            let (freshness_label, freshness_style) =
+                if st.status == "ERROR" || st.status == "SUSPENDED" {
+                    (format!("  ✗ {}{}", age_str, last), theme.error)
+                } else if st.cascade_stale {
+                    (
+                        format!("  ⚠ cascade-stale  {}{}", age_str, last),
+                        theme.warning,
+                    )
+                } else if st.stale {
+                    (format!("  ⚠ stale  {}{}", age_str, last), theme.warning)
+                } else {
+                    (format!("  ✓ fresh  {}{}", age_str, last), theme.ok)
+                };
+            spans.push(Span::styled(freshness_label, freshness_style));
+        }
+
         vec![Line::from(spans)]
     } else {
         vec![Line::styled(" No node selected", theme.dim)]
@@ -115,4 +168,16 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme, se
         .borders(Borders::ALL)
         .border_style(theme.border);
     frame.render_widget(Paragraph::new(meta_lines).block(meta_block), chunks[1]);
+}
+
+/// Convert a raw seconds string (e.g. "49253s") to a compact human-readable age.
+fn format_age(staleness: &str) -> String {
+    let secs: f64 = staleness.trim_end_matches('s').parse().unwrap_or(0.0);
+    if secs >= 3600.0 {
+        format!("{:.0}h", secs / 3600.0)
+    } else if secs >= 60.0 {
+        format!("{:.0}m", secs / 60.0)
+    } else {
+        format!("{:.0}s", secs)
+    }
 }
