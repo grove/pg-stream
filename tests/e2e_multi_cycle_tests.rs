@@ -289,6 +289,12 @@ async fn test_prepared_statements_cleared_after_cache_invalidation() {
     client
         .batch_execute(
             "SET pg_trickle.use_prepared_statements = on;
+             -- Disable the aggregate fast-path so this GROUP BY+SUM query uses the
+             -- MERGE path and actually creates __pgt_merge_* prepared statements.
+             -- The agg fast-path (added in B-1) correctly materialises a delta temp
+             -- table instead of PREPARE/EXECUTE, which would make the prepared-
+             -- statement invalidation assertions below vacuously false.
+             SET pg_trickle.aggregate_fast_path = off;
              CREATE TABLE mc_prep_invalidate (id SERIAL PRIMARY KEY, grp TEXT, val INT);
              -- Insert multiple groups to avoid the aggregate saturation threshold
              -- forcing a fall back to FULL refresh, which skirts the MERGE path.

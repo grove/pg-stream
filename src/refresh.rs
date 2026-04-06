@@ -4859,6 +4859,12 @@ pub fn execute_differential_refresh(
         // temp table, then applied as two targeted statements.
         let t_mat_start = Instant::now();
 
+        // Drop any stale delta table from a prior refresh in the same
+        // transaction (e.g. two refresh_stream_table calls in one batch_execute).
+        // ON COMMIT DROP normally handles cleanup, but that only fires at
+        // transaction commit, so subsequent calls within the same transaction
+        // would otherwise see "relation already exists".
+        let _ = Spi::run(&format!("DROP TABLE IF EXISTS __pgt_delta_{}", st.pgt_id)); // nosemgrep: rust.spi.run.dynamic-format — st.pgt_id is a plain i64, not user-supplied input.
         let materialize_sql = format!(
             "CREATE TEMP TABLE __pgt_delta_{pgt_id} ON COMMIT DROP AS \
              SELECT * FROM {using_clause} AS d",
@@ -4908,6 +4914,9 @@ pub fn execute_differential_refresh(
         // (DELETE+UPDATE+INSERT) to avoid the MERGE hash-join cost.
         let t_mat_start = Instant::now();
 
+        // Drop any stale delta table from a prior refresh in the same
+        // transaction (same-transaction multiple refresh edge case).
+        let _ = Spi::run(&format!("DROP TABLE IF EXISTS __pgt_delta_{}", st.pgt_id)); // nosemgrep: rust.spi.run.dynamic-format — st.pgt_id is a plain i64, not user-supplied input.
         let materialize_sql = format!(
             "CREATE TEMP TABLE __pgt_delta_{pgt_id} ON COMMIT DROP AS \
              SELECT * FROM {using_clause} AS d",
@@ -4971,6 +4980,9 @@ pub fn execute_differential_refresh(
         // This avoids evaluating the delta query three times.
         let t_mat_start = Instant::now();
 
+        // Drop any stale delta table from a prior refresh in the same
+        // transaction (same-transaction multiple refresh edge case).
+        let _ = Spi::run(&format!("DROP TABLE IF EXISTS __pgt_delta_{}", st.pgt_id)); // nosemgrep: rust.spi.run.dynamic-format — st.pgt_id is a plain i64, not user-supplied input.
         let materialize_sql = format!(
             "CREATE TEMP TABLE __pgt_delta_{pgt_id} ON COMMIT DROP AS \
              SELECT * FROM {using_clause} AS d",
