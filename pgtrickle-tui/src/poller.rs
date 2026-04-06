@@ -468,12 +468,17 @@ pub async fn execute_action(client: &Client, action: &ActionRequest) -> ActionRe
                 Some(pair) => pair,
                 None => ("public", name.as_str()),
             };
-            // Get estimated row count from pg_class
+            // Get estimated row count: prefer pg_stat_user_tables.n_live_tup
+            // (updated by autovacuum without needing ANALYZE) and fall back to
+            // pg_class.reltuples. Returns -1 if the table has never been scanned.
             let row_count = match client
                 .query_one(
-                    "SELECT COALESCE(c.reltuples, -1)::bigint
+                    "SELECT GREATEST(
+                         COALESCE(NULLIF(s.n_live_tup, 0), NULLIF(c.reltuples::bigint, -1), -1)
+                     )
                      FROM pg_class c
                      JOIN pg_namespace n ON n.oid = c.relnamespace
+                     LEFT JOIN pg_stat_user_tables s ON s.relid = c.oid
                      WHERE n.nspname = $1 AND c.relname = $2",
                     &[&schema, &table],
                 )

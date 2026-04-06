@@ -521,16 +521,19 @@ fn render_change_activity(
 
     // Row count from pg_class (if fetched)
     if let Some(activity) = state.change_activity_cache.get(&st.name) {
-        let count_str = if activity.row_count < 0 {
-            "-".to_string()
+        if activity.row_count < 0 {
+            lines.push(Line::from(vec![
+                Span::styled(" Row count:        ", theme.header),
+                Span::styled("not yet analyzed", theme.dim),
+                Span::styled("  (run ANALYZE)", theme.dim),
+            ]));
         } else {
-            format_count(activity.row_count)
-        };
-        lines.push(Line::from(vec![
-            Span::styled(" Row count:        ", theme.header),
-            Span::raw(format!("~{count_str}")),
-            Span::styled("  (estimated)", theme.dim),
-        ]));
+            lines.push(Line::from(vec![
+                Span::styled(" Row count:        ", theme.header),
+                Span::raw(format!("~{}", format_count(activity.row_count))),
+                Span::styled("  (estimated)", theme.dim),
+            ]));
+        }
     } else {
         lines.push(Line::from(vec![
             Span::styled(" Row count:        ", theme.header),
