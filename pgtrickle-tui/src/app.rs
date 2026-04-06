@@ -167,6 +167,10 @@ struct App {
     dag_focused: bool,
     /// Scroll offset for the DAG Mini-Map
     dag_scroll: usize,
+    /// CDC Health view: which section (0=Buffers,1=CDC Health,2=SBS,3=Triggers) has focus
+    cdc_section: usize,
+    /// CDC Health view: per-section row selection [buffers, cdc_health, sbs, triggers]
+    cdc_sel: [usize; 4],
 }
 
 /// Simple command palette for `:` mode.
@@ -282,6 +286,8 @@ impl App {
             delta_inspector_tab: 0,
             dag_focused: false,
             dag_scroll: 0,
+            cdc_section: 0,
+            cdc_sel: [0; 4],
         }
     }
 
@@ -432,6 +438,31 @@ impl App {
                 self.filter_matches(&b.stream_table) || self.filter_matches(&b.source_table)
             })
             .count()
+    }
+
+    /// Returns visible section IDs for the CDC view (logical slots 0-3).
+    /// 0=Buffers (always), 1=CDC Health, 2=Shared Buffer Stats, 3=Triggers (always).
+    fn cdc_visible_sections(&self) -> Vec<usize> {
+        let mut v = vec![0];
+        if !self.state.cdc_health.is_empty() {
+            v.push(1);
+        }
+        if !self.state.shared_buffer_stats.is_empty() {
+            v.push(2);
+        }
+        v.push(3);
+        v
+    }
+
+    /// Row count for a CDC logical section.
+    fn cdc_section_len(&self, sect: usize) -> usize {
+        match sect {
+            0 => self.filtered_cdc_len(),
+            1 => self.state.cdc_health.len(),
+            2 => self.state.shared_buffer_stats.len(),
+            3 => self.state.trigger_inventory.len(),
+            _ => 0,
+        }
     }
 
     fn filtered_config_len(&self) -> usize {
@@ -1290,6 +1321,27 @@ fn handle_key(app: &mut App, key: KeyEvent) {
             app.selected = 0;
         }
 
+        // ── CDC Health section focus ──────────────────────────────
+        KeyCode::Tab if app.current_view == View::Cdc => {
+            let sections = app.cdc_visible_sections();
+            let pos = sections.iter().position(|&s| s == app.cdc_section).unwrap_or(0);
+            app.cdc_section = sections[(pos + 1) % sections.len()];
+        }
+        KeyCode::Esc if app.current_view == View::Cdc => {
+            app.cdc_section = 0;
+        }
+        KeyCode::Down | KeyCode::Char('j') if app.current_view == View::Cdc => {
+            let sect = app.cdc_section;
+            let len = app.cdc_section_len(sect);
+            if len > 0 {
+                app.cdc_sel[sect] = (app.cdc_sel[sect] + 1).min(len - 1);
+            }
+        }
+        KeyCode::Up | KeyCode::Char('k') if app.current_view == View::Cdc => {
+            let sect = app.cdc_section;
+            app.cdc_sel[sect] = app.cdc_sel[sect].saturating_sub(1);
+        }
+
         // ── DAG Mini-Map focus (Dashboard) ───────────────────────
         KeyCode::Tab if app.current_view == View::Dashboard => {
             app.dag_focused = true;
@@ -1849,7 +1901,7 @@ fn render_view(frame: &mut ratatui::Frame, area: Rect, app: &App) {
         View::Diagnostics => {
             views::diagnostics::render(frame, area, &app.state, &app.theme, app.selected, filter)
         }
-        View::Cdc => views::cdc::render(frame, area, &app.state, &app.theme, app.selected, filter),
+        View::Cdc => views::cdc::render(frame, area, &app.state, &app.theme, app.cdc_section, &app.cdc_sel, filter),
         View::Config => {
             views::config::render(frame, area, &app.state, &app.theme, app.selected, filter)
         }

@@ -276,7 +276,7 @@ mod snapshot_tests {
     #[test]
     fn test_cdc_view() {
         let output = render_to_string(100, 24, |frame, area, state, theme| {
-            super::cdc::render(frame, area, state, theme, 0, None);
+            super::cdc::render(frame, area, state, theme, 0, &[0; 4], None);
         });
         insta::assert_snapshot!(output);
     }
