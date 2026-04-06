@@ -83,6 +83,9 @@ from the v0.1.x series to 1.0 and beyond.
 
 ## v0.1.x Series — Released
 
+<details>
+<summary>Completed items (click to expand)</summary>
+
 ### v0.1.0 — Released (2026-02-26)
 
 **Status: Released — all 13 design phases implemented.**
@@ -118,7 +121,10 @@ Patch release: Completed 50/51 SQL_GAPS_7 items across all tiers. Highlights:
 
 See [CHANGELOG.md](CHANGELOG.md) for the full feature list.
 
+</details>
+
 ---
+
 
 ## v0.2.0 — TopK, Diamond Consistency & Transactional IVM
 
@@ -251,6 +257,9 @@ See [PLAN_TRANSACTIONAL_IVM.md](plans/sql/PLAN_TRANSACTIONAL_IVM.md).
 Patch release focused on upgrade safety, documentation, and three catalog
 schema additions via `sql/pg_trickle--0.2.0--0.2.1.sql`:
 
+<details>
+<summary>Completed items (click to expand)</summary>
+
 - `has_keyless_source BOOLEAN NOT NULL DEFAULT FALSE` — EC-06 keyless source
   flag; changes apply strategy from MERGE to counted DELETE when set.
 - `function_hashes TEXT` — EC-16 function-body hash map; forces a full
@@ -303,7 +312,10 @@ GitHub Pages book grew from 14 to 20 pages:
 - [x] CI enforces upgrade script completeness on every PR
 - [x] All documentation pages build and render in mdBook
 
+</details>
+
 ---
+
 
 ## v0.2.2 — OFFSET, AUTO Mode, ALTER QUERY, Edge Cases & CDC Hardening
 
@@ -313,6 +325,9 @@ This milestone shipped paged TopK OFFSET support, AUTO-by-default refresh
 selection, ALTER QUERY, the remaining upgrade-tooling work, edge-case and WAL
 CDC hardening, IMMEDIATE-mode parity fixes, and the outstanding documentation
 sweep.
+
+<details>
+<summary>Completed items (click to expand)</summary>
 
 ### ORDER BY + LIMIT + OFFSET (Paged TopK) — Finalization ✅
 
@@ -464,9 +479,17 @@ Remaining documentation gaps identified in Stage 7 of the gap analysis.
 - [x] WAL CDC mode passes full E2E suite
 - [x] E2E tests pass (`just build-e2e-image && just test-e2e`)
 
+</details>
+
 ---
 
+
 ## v0.2.3 — Non-Determinism, CDC/Mode Gaps & Operational Polish
+
+**Status: Released (2026-03-09).**
+
+<details>
+<summary>Completed items (click to expand)</summary>
 
 **Goal:** Close a small set of high-leverage correctness and operational gaps
 that do not need to wait for the larger v0.3.0 parallel refresh, security, and
@@ -600,11 +623,17 @@ validations, resource leaks, and observability holes. Phased from quick wins
 - [x] Per-table `cdc_mode` override functional in SQL API and dbt adapter (G1)
 - [x] Extension upgrade path tested (`0.2.2 → 0.2.3`)
 
-**Status: Released (2026-03-09).**
+</details>
 
 ---
 
+
 ## v0.3.0 — DVM Correctness, SAST & Test Coverage
+
+**Status: Released (2026-03-11).**
+
+<details>
+<summary>Completed items (click to expand)</summary>
 
 **Goal:** Re-enable all 18 previously-ignored DVM correctness E2E tests by
 fixing HAVING, FULL OUTER JOIN, correlated EXISTS+HAVING, and correlated scalar
@@ -682,11 +711,17 @@ with rollback, mode-comparison, single-row, and DAG tests.
 - [x] TPC-H T1–T6 implemented; rollback, differential-vs-immediate, single-row, and DAG tests pass
 - [x] Extension upgrade path tested (`0.2.3 → 0.3.0`)
 
-**Status: Released (2026-03-11).**
+</details>
 
 ---
 
+
 ## v0.4.0 — Parallel Refresh & Performance Hardening
+
+**Status: Released (2026-03-12).**
+
+<details>
+<summary>Completed items (click to expand)</summary>
 
 **Goal:** Deliver true parallel refresh, cut write-side CDC overhead with
 statement-level triggers, close a cross-source snapshot consistency gap, and
@@ -799,9 +834,17 @@ updated in the same transaction from producing an inconsistent stream table.
 - [x] Codecov badge on README; coverage report uploading
 - [x] Extension upgrade path tested (`0.3.0 → 0.4.0`)
 
+</details>
+
 ---
 
+
 ## v0.5.0 — Row-Level Security & Operational Controls
+
+**Status: Released (2026-03-13).**
+
+<details>
+<summary>Completed items (click to expand)</summary>
 
 **Goal:** Harden the security context for stream tables and IVM triggers,
 add source-level pause/resume gating for bulk-load coordination, and deliver
@@ -909,11 +952,17 @@ intersects the current gated set.
 - [x] A-3a: Append-Only INSERT path eliminates MERGE for event-sourced stream tables
 - [x] Extension upgrade path tested (`0.4.0 → 0.5.0`)
 
-**Status: Released (2026-03-13).**
+</details>
 
 ---
 
+
 ## v0.6.0 — Partitioning, Idempotent DDL, Edge Cases & Circular Dependency Foundation
+
+**Status: Released (2026-03-14).**
+
+<details>
+<summary>Completed items (click to expand)</summary>
 
 **Goal:** Validate partitioned source tables, add `create_or_replace_stream_table`
 for idempotent deployments (critical for dbt and migration workflows), close all
@@ -1115,9 +1164,10 @@ Forms the prerequisite for full SCC-based fixpoint refresh in v0.7.0.
 - [x] SQL Reference updated for EC-03, EC-32, and foreign table polling patterns
 - [x] Extension upgrade path tested (`0.5.0 → 0.6.0`)
 
-**Status: Released (2026-03-14).**
+</details>
 
 ---
+
 
 ## v0.7.0 — Performance, Watermarks, Circular DAG Execution, Observability & Infrastructure
 
@@ -1129,6 +1179,9 @@ user-injected temporal watermark gating for batch-ETL coordination,
 complete the fixpoint scheduler for circular stream table DAGs, ship
 ready-made Prometheus/Grafana monitoring, and prepare the 1.0 packaging
 and deployment infrastructure.
+
+<details>
+<summary>Completed items (click to expand)</summary>
 
 ### Watermark Gating
 
@@ -1259,7 +1312,10 @@ convergence (zero net change) or `max_fixpoint_iterations` is exceeded.
 - [x] CNPG integration smoke test passes in CI
 - [x] Extension upgrade path tested (`0.6.0 → 0.7.0`)
 
+</details>
+
 ---
+
 
 ## v0.8.0 — pg_dump Support & Test Hardening
 
@@ -1268,6 +1324,9 @@ convergence (zero net change) or `max_fixpoint_iterations` is exceeded.
 **Goal:** Complete the pg_dump round-trip story so stream tables survive
 `pg_dump`/`pg_restore` cycles, and comprehensively harden the 
 E2E test suites with multiset invariants to mathematically enforce DVM correctness.
+
+<details>
+<summary>Completed items (click to expand)</summary>
 
 ### pg_dump / pg_restore Support
 
@@ -1313,7 +1372,10 @@ that re-links orphaned catalog entries on extension restore.
 - [x] pg_dump round-trip produces valid, restorable SQL for stream tables *(Done)*
 - [ ] Extension upgrade path tested (`0.7.0 → 0.8.0`)
 
+</details>
+
 ---
+
 
 ## v0.9.0 — Incremental Aggregate Maintenance
 
@@ -1324,6 +1386,9 @@ that re-links orphaned catalog entries on extension restore.
 to O(1) for the common case. This is the highest-potential-payoff item in the
 performance plan — benchmarks show aggregate scenarios going from 2.5 ms to sub-1 ms
 per group.
+
+<details>
+<summary>Completed items (click to expand)</summary>
 
 ### Critical Bug Fixes
 
@@ -1566,7 +1631,10 @@ These items are correct as implemented but scale with data size rather than delt
 - [x] G-5 (P3-4): Index-aware MERGE planning: `SET LOCAL enable_seqscan = off` for small deltas against large STs
 - [x] G-6 (P3-5): `auto_backoff` GUC implemented; scheduler doubles interval when stream table falls behind
 
+</details>
+
 ---
+
 
 ## v0.10.0 — DVM Hardening, Connection Pooler Compatibility, Core Refresh Optimizations & Infrastructure Prep
 
@@ -1583,6 +1651,9 @@ partitioning), deliver the first wave of refresh performance optimizations
 refresh strategy), enable cloud-native PgBouncer transaction-mode deployments
 via an opt-in compatibility mode, and complete the pre-1.0 packaging
 and deployment infrastructure.
+
+<details>
+<summary>Completed items (click to expand)</summary>
 
 ### Connection Pooler Compatibility
 
@@ -1778,7 +1849,10 @@ These items address scheduler CPU efficiency and DAG maintenance overhead at sca
 - [x] NS-7: Isolated `CALCULATED` schedule emits `NOTICE` with effective fallback interval
 - [x] NS-8: `diamond_consistency` default changed to `'atomic'`; catalog DDL, API code comments, and all documentation updated to match actual runtime behavior (API already resolved `NULL` to `Atomic`)
 
+</details>
+
 ---
+
 
 ## v0.11.0 — Partitioned Stream Tables, Prometheus & Grafana Observability, Safety Hardening & Correctness
 
@@ -1790,6 +1864,9 @@ ready-to-use Prometheus + Grafana monitoring stack · FUSE circuit breaker · VA
 changed-column bitmask (no more 63-column cap) · per-database worker quotas ·
 DAG scheduling performance improvements (fused chains, adaptive polling, amplification
 detection) · TPC-H correctness gate in CI · safer production defaults.
+
+<details>
+<summary>Completed items (click to expand)</summary>
 
 ### Partitioned Stream Tables — Storage (A-1)
 
@@ -2110,7 +2187,10 @@ Deliver **one** of TS1 or TS2; whichever is completed first meets the exit crite
 - [x] DAG-5: ST buffer batch coalescing cancels redundant I/D pairs — ✅ Done in v0.11.0 Phase 10
 - [x] Extension upgrade path tested (`0.10.0 → 0.11.0`) — ✅ upgrade SQL in `sql/pg_trickle--0.10.0--0.11.0.sql`
 
+</details>
+
 ---
+
 
 ## v0.12.0 — Correctness, Reliability & Developer Tooling
 
@@ -2125,6 +2205,10 @@ Partitioning Enhancements, MERGE Profiling, and dbt Macro Updates) have been
 reliability. See §v0.13.0 for those items.
 
 **Status: Released (2026-03-28).**
+
+
+<details>
+<summary>Completed items (click to expand)</summary>
 
 ### Anomalous Change Detection (Fuse)
 
@@ -2395,7 +2479,10 @@ large design changes; all build on existing infrastructure.
 - [x] `scripts/check_upgrade_completeness.sh` passes ✅
 - [x] Extension upgrade path tested (`0.11.0 → 0.12.0`) ✅
 
+</details>
+
 ---
+
 
 ## v0.13.0 — Scalability Foundations, Partitioning Enhancements, MERGE Profiling & Multi-Tenant Scheduling
 
@@ -2408,6 +2495,9 @@ a MERGE deduplication profiling pass, the dbt macro updates, per-database
 worker quotas for multi-tenant deployments, the TPC-H-derived benchmarking
 harness for data-driven performance validation, and a small SQL coverage
 cleanup for PG 16+ expression types.
+
+<details>
+<summary>Completed items (click to expand)</summary>
 
 > **Phases from PLAN_0_12_0.md:** Phases 5 (Scalability), 6 (Partitioning),
 > 7 (MERGE Profiling), and 8 (dbt Macro Updates). Plus three new phases: 9
@@ -2607,7 +2697,10 @@ Target: reduce regression escape rate from ~15% to <5%.
 - [x] DI-11: Predicate pushdown enabled with scalar-subquery guard; deep-join L₀ threshold (4 scans); deep-join planner hints (5+ total scans); 22/22 TPC-H DIFFERENTIAL ✅ Done
 - [x] Extension upgrade path tested (`0.12.0 → 0.13.0`) ✅ Done
 
+</details>
+
 ---
+
 
 ## v0.14.0 — Tiered Scheduling, UNLOGGED Buffers & Diagnostics
 
@@ -2619,6 +2712,9 @@ hardening (SECURITY DEFINER triggers with explicit search_path), GHCR Docker
 image, pre-deployment checklist, best-practice patterns guide, and
 comprehensive E2E test coverage. See [CHANGELOG.md](CHANGELOG.md) for the
 full feature list.
+
+<details>
+<summary>Completed items (click to expand)</summary>
 
 ### Quick Polish & Error State Circuit Breaker (Phase 1 + 1b) — ✅ Done
 
@@ -2809,7 +2905,10 @@ Tiered scheduling infrastructure was already in place since v0.11/v0.12 (`refres
 - [x] ERR-1: Error-state circuit breaker with E2E test coverage ✅ Done
 - [x] Extension upgrade path tested (`0.13.0 → 0.14.0`) ✅ Done
 
+</details>
+
 ---
+
 
 ## v0.15.0 — External Test Suites & Integration
 
@@ -2817,6 +2916,9 @@ Tiered scheduling infrastructure was already in place since v0.11/v0.12 (`refres
 
 **Goal:** Validate correctness against independent query corpora and ship the
 dbt integration as a formal release.
+
+<details>
+<summary>Completed items (click to expand)</summary>
 
 ### External Test Suite Integration
 
@@ -3117,7 +3219,10 @@ Validate correctness against independent query corpora beyond TPC-H.
 - [x] Extension upgrade path tested (`0.14.0 → 0.15.0`)
 - [x] `just check-version-sync` passes
 
+</details>
+
 ---
+
 
 ## v0.16.0 — Performance & Refresh Optimization
 
