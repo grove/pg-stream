@@ -1,8 +1,8 @@
 # pg_trickle — Project Roadmap
 
-> **Last updated:** 2026-04-04
-> **Latest release:** 0.15.0 (2026-04-03)
-> **Current milestone:** v0.16.0 — Performance & Refresh Optimization
+> **Last updated:** 2026-04-06
+> **Latest release:** 0.16.0 (2026-04-06)
+> **Current milestone:** v0.17.0 — Query Intelligence & Stability
 
 For a concise description of what pg_trickle is and why it exists, read
 [ESSENCE.md](ESSENCE.md) — it explains the core problem (full `REFRESH
@@ -64,19 +64,19 @@ from the v0.1.x series to 1.0 and beyond.
                                                                         │Released│─│Released│─│Released │─│Released │─│Released │─│Released │─│Released │
                                                                         │ ✅      │ │ ✅      │ │ ✅       │ │ ✅       │ │ ✅       │ │ ✅       │ │ ✅       │
                                                                         └────────┘ └────────┘ └─────────┘ └─────────┘ └─────────┘ └─────────┘ └─────────┘
-                                                                        └─ ┌─────────┐
-                                                                           │ 0.15.0  │
-                                                                           │Released │
-                                                                           │ ✅       │
-                                                                           └─────────┘
+                                                                        └─ ┌─────────┐ ┌─────────┐
+                                                                           │ 0.15.0  │ │ 0.16.0  │
+                                                                           │Released │─│Released │
+                                                                           │ ✅       │ │ ✅       │
+                                                                           └─────────┘ └─────────┘
          We are here
               │
               ▼
-              └─ ┌─────────┐ ┌─────────┐ ┌────────┐ ┌────────┐
-                 │ 0.16.0  │ │ 0.17.0  │ │ 1.0.0  │ │ 1.x+   │
-                 │Perf &   │─│Query    │─│Stable  │─│Scale & │
-                 │Refresh  │ │Intel.   │ │Release │ │Ecosys. │
-                 └─────────┘ └─────────┘ └────────┘ └────────┘
+              └─ ┌─────────┐ ┌────────┐ ┌────────┐
+                 │ 0.17.0  │ │ 1.0.0  │ │ 1.x+   │
+                 │Query    │─│Stable  │─│Scale & │
+                 │Intel.   │ │Release │ │Ecosys. │
+                 └─────────┘ └────────┘ └────────┘
 ```
 
 ---
@@ -3121,11 +3121,21 @@ Validate correctness against independent query corpora beyond TPC-H.
 
 ## v0.16.0 — Performance & Refresh Optimization
 
+**Status: Released (2026-04-06).**
+
+Faster refreshes across the board: sub-1% deltas use DELETE+INSERT instead of
+MERGE, insert-only stream tables auto-detect and skip the MERGE join, algebraic
+aggregates apply pinpoint updates, and a cross-backend template cache eliminates
+cold-start latency. Automated benchmark regression gating prevents future
+performance degradation.
+
+<details>
+<summary>Completed items (click to expand)</summary>
+
 **Goal:** Attack the MERGE bottleneck from multiple angles — alternative merge
 strategies, algebraic aggregate shortcuts, append-only bypass, delta filtering,
 change buffer compaction, shared-memory template caching — close critical test
-coverage gaps to validate these new paths, and add PostgreSQL 19
-forward-compatibility before PG 19 reaches beta.
+coverage gaps to validate these new paths.
 
 ### MERGE Alternatives & Planner Control (Phase D)
 
@@ -3306,17 +3316,19 @@ forward-compatibility before PG 19 reaches beta.
 - [x] TG2-WIN: Window function DVM execution tests cover ROW_NUMBER, RANK, DENSE_RANK, LAG/LEAD across INSERT/UPDATE/DELETE
 - [x] TG2-JOIN: Join multi-cycle tests cover INNER/LEFT/FULL JOIN with UPDATE and DELETE propagation; no silent data loss
 - [x] TG2-EQUIV: Differential ≡ Full equivalence validated for joins, aggregates, and window functions
-- [ ] TG2-MERGE: refresh.rs MERGE template generation has unit test coverage
-- [ ] TG2-CANCEL: Timeout and cancellation during refresh tested; no resource leaks
-- [ ] TG2-SCHEMA: Source table type changes and column renames tested end-to-end
+- [ ] ~~TG2-MERGE: refresh.rs MERGE template generation has unit test coverage~~ — deferred to v0.17.0
+- [ ] ~~TG2-CANCEL: Timeout and cancellation during refresh tested; no resource leaks~~ — deferred to v0.17.0
+- [x] TG2-SCHEMA: Source table type changes and column renames tested end-to-end
 - [x] BENCH-CI: Performance regression CI runs on every PR; 10% regression threshold blocks merge; scenario coverage includes scan/filter/aggregate/join/window/CTE/TopK/SemiJoin/AntiJoin
 - [x] AUTO-IDX: Stream tables auto-create indexes on GROUP BY / DISTINCT columns; `__pgt_row_id` covering index for ≤ 8-column tables; `auto_index` GUC respected
 - [x] C2-BUG: `resume_stream_table()` verified operational (present since v0.2.0)
 - [x] ERR-REF: Error reference doc published with all 20 PgTrickleError variants, common causes, and suggested fixes
 - [x] GUC-DEFAULTS: `planner_aggressive` and `cleanup_use_truncate` defaults reviewed; trade-offs documented in CONFIGURATION.md
 - [x] BUF-LIMIT: `max_buffer_rows` GUC prevents unbounded change buffer growth; triggers FULL + truncation when exceeded
-- [ ] Extension upgrade path tested (`0.15.0 → 0.16.0`)
-- [ ] `just check-version-sync` passes
+- [x] Extension upgrade path tested (`0.15.0 → 0.16.0`)
+- [x] `just check-version-sync` passes
+
+</details>
 
 ---
 
