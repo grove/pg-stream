@@ -196,13 +196,20 @@ fn render_table(
             let stale_str = if st.stale { "yes" } else { "no" };
             let stale_style = if st.stale { theme.warning } else { theme.ok };
 
-            // EFF column (F21): effective staleness considering cascade
+            // EFF column (F21): effective staleness considering cascade,
+            // plus downgrade hint from explain_mode_cache when available.
             let (eff_str, eff_style) = if st.status == "ERROR" || st.status == "SUSPENDED" {
-                ("✗ err", theme.error)
+                ("✗ err".to_string(), theme.error)
             } else if st.cascade_stale {
-                ("⚠ cascade", theme.warning)
+                ("⚠ cascade".to_string(), theme.warning)
+            } else if let Some(explain) = state.explain_mode_cache.get(&st.name) {
+                if explain.configured_mode != explain.effective_mode {
+                    (format!("⚠ {}↓", explain.effective_mode), theme.warning)
+                } else {
+                    ("✓ ok".to_string(), theme.ok)
+                }
             } else {
-                ("✓ ok", theme.ok)
+                ("✓ ok".to_string(), theme.ok)
             };
 
             let mut cells = vec![
@@ -239,7 +246,7 @@ fn render_table(
             Constraint::Length(12),
             Constraint::Length(10),
             Constraint::Length(14),
-            Constraint::Length(10),
+            Constraint::Length(12),
             Constraint::Length(6),
             Constraint::Length(22),
             Constraint::Length(8),
@@ -251,7 +258,7 @@ fn render_table(
             Constraint::Length(12),
             Constraint::Length(10),
             Constraint::Length(14),
-            Constraint::Length(10),
+            Constraint::Length(12),
             Constraint::Length(6),
             Constraint::Length(22),
         ]

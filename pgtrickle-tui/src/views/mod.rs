@@ -151,6 +151,35 @@ mod snapshot_tests {
         assert!(output.contains("0 of 0"), "should show empty table count");
     }
 
+    #[test]
+    fn test_dashboard_eff_downgrade_hint() {
+        let theme = Theme::default_dark();
+        let mut state = test_fixtures::sample_state();
+        // Inject a downgrade for the first stream table.
+        let first_name = state.stream_tables[0].name.clone();
+        state.explain_mode_cache.insert(
+            first_name,
+            crate::state::ExplainRefreshMode {
+                configured_mode: "DIFFERENTIAL".to_string(),
+                effective_mode: "NO_DATA".to_string(),
+                downgrade_reason: Some("no pending changes".to_string()),
+            },
+        );
+        let backend = TestBackend::new(120, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                super::dashboard::render(frame, area, &state, &theme, 0, None);
+            })
+            .unwrap();
+        let output = buffer_to_string(terminal.backend());
+        assert!(
+            output.contains("NO_DATA↓"),
+            "downgraded EFF should show effective mode with ↓ arrow; got:\n{output}"
+        );
+    }
+
     // ── Detail view ──────────────────────────────────────────────────
 
     #[test]
