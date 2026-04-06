@@ -102,7 +102,7 @@ mod snapshot_tests {
     #[test]
     fn test_dashboard_standard_80x24() {
         let output = render_to_string(80, 24, |frame, area, state, theme| {
-            super::dashboard::render(frame, area, state, theme, 0, None);
+            super::dashboard::render(frame, area, state, theme, 0, None, false, 0);
         });
         assert!(
             output.contains("Stream Tables"),
@@ -122,7 +122,7 @@ mod snapshot_tests {
     #[test]
     fn test_dashboard_wide_150x40() {
         let output = render_to_string(150, 40, |frame, area, state, theme| {
-            super::dashboard::render(frame, area, state, theme, 0, None);
+            super::dashboard::render(frame, area, state, theme, 0, None, false, 0);
         });
         assert!(output.contains("Stream Tables"), "should contain ribbon");
         assert!(
@@ -142,7 +142,7 @@ mod snapshot_tests {
     #[test]
     fn test_dashboard_with_filter() {
         let output = render_to_string(80, 24, |frame, area, state, theme| {
-            super::dashboard::render(frame, area, state, theme, 0, Some("orders"));
+            super::dashboard::render(frame, area, state, theme, 0, Some("orders"), false, 0);
         });
         assert!(
             output.contains("filter: orders"),
@@ -158,7 +158,7 @@ mod snapshot_tests {
     #[test]
     fn test_dashboard_empty_state() {
         let output = render_empty_to_string(80, 24, |frame, area, state, theme| {
-            super::dashboard::render(frame, area, state, theme, 0, None);
+            super::dashboard::render(frame, area, state, theme, 0, None, false, 0);
         });
         assert!(output.contains("0 total"), "should show zero total");
         assert!(output.contains("0 active"), "should show zero active");
@@ -184,7 +184,7 @@ mod snapshot_tests {
         terminal
             .draw(|frame| {
                 let area = frame.area();
-                super::dashboard::render(frame, area, &state, &theme, 0, None);
+                super::dashboard::render(frame, area, &state, &theme, 0, None, false, 0);
             })
             .unwrap();
         let output = buffer_to_string(terminal.backend());

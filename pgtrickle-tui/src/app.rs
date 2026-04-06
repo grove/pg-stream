@@ -161,6 +161,10 @@ struct App {
     validate_overlay: Option<String>,
     /// Delta inspector sub-tab (0=SQL, 1=Auxiliary columns)
     delta_inspector_tab: usize,
+    /// Whether the DAG Mini-Map panel has keyboard focus on the Dashboard
+    dag_focused: bool,
+    /// Scroll offset for the DAG Mini-Map
+    dag_scroll: usize,
 }
 
 /// Simple command palette for `:` mode.
@@ -274,6 +278,8 @@ impl App {
             ddl_overlay: None,
             validate_overlay: None,
             delta_inspector_tab: 0,
+            dag_focused: false,
+            dag_scroll: 0,
         }
     }
 
@@ -1101,6 +1107,25 @@ fn handle_key(app: &mut App, key: KeyEvent) {
         return;
     }
 
+    // DAG Mini-Map focus mode: intercept navigation keys on Dashboard
+    if app.dag_focused && app.current_view == View::Dashboard {
+        match key.code {
+            KeyCode::Char('j') | KeyCode::Down => {
+                app.dag_scroll = app.dag_scroll.saturating_add(1);
+                return;
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                app.dag_scroll = app.dag_scroll.saturating_sub(1);
+                return;
+            }
+            KeyCode::Tab | KeyCode::Esc => {
+                app.dag_focused = false;
+                return;
+            }
+            _ => {} // let other keys (q, number keys, etc.) fall through
+        }
+    }
+
     // Global keys
     match key.code {
         KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -1251,6 +1276,12 @@ fn handle_key(app: &mut App, key: KeyEvent) {
         KeyCode::Tab if app.current_view == View::Watermarks => {
             app.watermarks_tab = (app.watermarks_tab + 1) % 2;
             app.selected = 0;
+        }
+
+        // ── DAG Mini-Map focus (Dashboard) ───────────────────────
+        KeyCode::Tab if app.current_view == View::Dashboard => {
+            app.dag_focused = true;
+            app.dag_scroll = 0;
         }
 
         // ── Delta Inspector sub-tab ──────────────────────────────
@@ -1516,6 +1547,7 @@ fn export_current_view(app: &mut App) {
 }
 
 fn switch_view(app: &mut App, view: View) {
+    app.dag_focused = false;
     if app.current_view != view {
         let preserve_selection =
             matches!(
@@ -1764,9 +1796,16 @@ fn draw_body(frame: &mut ratatui::Frame, area: Rect, app: &App) {
 fn render_view(frame: &mut ratatui::Frame, area: Rect, app: &App) {
     let filter = app.filter.as_deref();
     match app.current_view {
-        View::Dashboard => {
-            views::dashboard::render(frame, area, &app.state, &app.theme, app.selected, filter)
-        }
+        View::Dashboard => views::dashboard::render(
+            frame,
+            area,
+            &app.state,
+            &app.theme,
+            app.selected,
+            filter,
+            app.dag_focused,
+            app.dag_scroll,
+        ),
         View::Detail => views::detail::render(
             frame,
             area,

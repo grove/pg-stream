@@ -14,12 +14,23 @@ pub fn render(
     theme: &Theme,
     selected: usize,
     filter: Option<&str>,
+    dag_focused: bool,
+    dag_scroll: usize,
 ) {
     let wide = area.width >= 140;
     let tall = area.height >= 35;
 
     if wide && tall {
-        render_wide(frame, area, state, theme, selected, filter);
+        render_wide(
+            frame,
+            area,
+            state,
+            theme,
+            selected,
+            filter,
+            dag_focused,
+            dag_scroll,
+        );
     } else {
         render_standard(frame, area, state, theme, selected, filter);
     }
@@ -72,13 +83,15 @@ fn render_wide(
     theme: &Theme,
     selected: usize,
     filter: Option<&str>,
+    dag_focused: bool,
+    dag_scroll: usize,
 ) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(3), // Status ribbon
             Constraint::Min(10),   // Main content
-            Constraint::Length(3), // DAG mini-map
+            Constraint::Min(6),    // DAG mini-map
         ])
         .split(area);
 
@@ -92,7 +105,7 @@ fn render_wide(
 
     render_table(frame, main[0], state, theme, selected, true, filter);
     render_issues_sidebar(frame, main[1], state, theme);
-    render_dag_minimap(frame, chunks[2], state, theme);
+    render_dag_minimap(frame, chunks[2], state, theme, dag_focused, dag_scroll);
 }
 
 fn render_standard(
@@ -391,12 +404,18 @@ fn render_issues_sidebar(frame: &mut Frame, area: Rect, state: &AppState, theme:
     frame.render_widget(paragraph, area);
 }
 
-fn render_dag_minimap(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
+fn render_dag_minimap(
+    frame: &mut Frame,
+    area: Rect,
+    state: &AppState,
+    theme: &Theme,
+    focused: bool,
+    scroll: usize,
+) {
     let lines: Vec<Line> = state
         .dag_edges
         .iter()
         .filter(|e| e.depth <= 2)
-        .take(area.height.saturating_sub(2) as usize)
         .map(|e| {
             let status_style = e
                 .status
@@ -407,11 +426,20 @@ fn render_dag_minimap(frame: &mut Frame, area: Rect, state: &AppState, theme: &T
         })
         .collect();
 
+    let (border_style, title_suffix) = if focused {
+        (theme.active, " ↑↓ scroll  Tab/Esc exit ")
+    } else {
+        (theme.border, " Tab to focus ")
+    };
+
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(theme.border)
-        .title(Span::styled(" DAG Mini-Map ", theme.title));
+        .border_style(border_style)
+        .title(Span::styled(" DAG Mini-Map ", theme.title))
+        .title_bottom(Span::styled(title_suffix, theme.dim));
 
-    let paragraph = Paragraph::new(lines).block(block);
+    let paragraph = Paragraph::new(lines)
+        .block(block)
+        .scroll((scroll as u16, 0));
     frame.render_widget(paragraph, area);
 }
