@@ -169,14 +169,14 @@ mod snapshot_tests {
     fn test_dashboard_eff_downgrade_hint() {
         let theme = Theme::default_dark();
         let mut state = test_fixtures::sample_state();
-        // Inject a downgrade for the first stream table.
+        // Inject a real downgrade (DIFFERENTIAL → FULL) for the first stream table.
         let first_name = state.stream_tables[0].name.clone();
         state.explain_mode_cache.insert(
-            first_name,
+            first_name.clone(),
             crate::state::ExplainRefreshMode {
                 configured_mode: "DIFFERENTIAL".to_string(),
-                effective_mode: "NO_DATA".to_string(),
-                downgrade_reason: Some("no pending changes".to_string()),
+                effective_mode: "FULL".to_string(),
+                downgrade_reason: Some("query too complex".to_string()),
             },
         );
         let backend = TestBackend::new(120, 24);
@@ -189,8 +189,29 @@ mod snapshot_tests {
             .unwrap();
         let output = buffer_to_string(terminal.backend());
         assert!(
-            output.contains("no changes \u{2193}"),
+            output.contains("full \u{2193}"),
             "downgraded EFF should show effective mode with space+arrow; got:\n{output}"
+        );
+
+        // NO_DATA is not a real downgrade — should show ✓ ok
+        state.explain_mode_cache.insert(
+            first_name,
+            crate::state::ExplainRefreshMode {
+                configured_mode: "DIFFERENTIAL".to_string(),
+                effective_mode: "NO_DATA".to_string(),
+                downgrade_reason: Some("no pending changes".to_string()),
+            },
+        );
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                super::dashboard::render(frame, area, &state, &theme, 0, None, false, 0);
+            })
+            .unwrap();
+        let output = buffer_to_string(terminal.backend());
+        assert!(
+            output.contains("\u{2713} ok"),
+            "NO_DATA should show ✓ ok, not downgraded; got:\n{output}"
         );
     }
 

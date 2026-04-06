@@ -462,6 +462,28 @@ pub async fn execute_action(client: &Client, action: &ActionRequest) -> ActionRe
                 Err(e) => Err(e),
             }
         }
+        ActionRequest::FetchChangeActivity(name) => {
+            // Parse schema.name
+            let (schema, table) = match name.split_once('.') {
+                Some(pair) => pair,
+                None => ("public", name.as_str()),
+            };
+            // Get estimated row count from pg_class
+            let row_count = match client
+                .query_one(
+                    "SELECT COALESCE(c.reltuples, -1)::bigint
+                     FROM pg_class c
+                     JOIN pg_namespace n ON n.oid = c.relnamespace
+                     WHERE n.nspname = $1 AND c.relname = $2",
+                    &[&schema, &table],
+                )
+                .await
+            {
+                Ok(row) => row.get::<_, i64>(0),
+                Err(_) => -1,
+            };
+            Ok(serde_json::json!({ "row_count": row_count }).to_string())
+        }
     };
 
     match result {

@@ -118,6 +118,8 @@ enum PollMsg {
     RefreshHistory(String, String), // (table_name, json)
     /// Auxiliary columns fetched on demand
     AuxiliaryColumns(String, String), // (table_name, json)
+    /// Change activity fetched on demand
+    ChangeActivity(String, String), // (table_name, json)
     /// Reconnected after connection loss
     Reconnected,
 }
@@ -766,6 +768,16 @@ async fn run_app(
                         app.state.auxiliary_columns_cache.insert(name, parsed);
                     }
                 }
+                PollMsg::ChangeActivity(name, json) => {
+                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&json) {
+                        let row_count = v.get("row_count").and_then(|r| r.as_i64()).unwrap_or(-1);
+                        // Extract short name (last component) for cache key
+                        let key = name.split('.').next_back().unwrap_or(&name).to_string();
+                        app.state
+                            .change_activity_cache
+                            .insert(key, crate::state::ChangeActivity { row_count });
+                    }
+                }
                 PollMsg::Reconnected => {
                     app.toast = Some(Toast::success("Reconnected to database"));
                 }
@@ -900,6 +912,10 @@ async fn poller_task(
                                 let _ = tx.send(PollMsg::AuxiliaryColumns(name.clone(), result.message)).await;
                                 continue;
                             }
+                            ActionRequest::FetchChangeActivity(name) if result.success => {
+                                let _ = tx.send(PollMsg::ChangeActivity(name.clone(), result.message)).await;
+                                continue;
+                            }
                             // Silently degrade background enrichment fetches — these are
                             // auto-triggered and may not exist on older extension versions.
                             ActionRequest::FetchDiagnoseErrors(_)
@@ -907,6 +923,7 @@ async fn poller_task(
                             | ActionRequest::FetchSources(_)
                             | ActionRequest::FetchRefreshHistory(_)
                             | ActionRequest::FetchAuxiliaryColumns(_)
+                            | ActionRequest::FetchChangeActivity(_)
                                 if !result.success =>
                             {
                                 continue;
@@ -1612,6 +1629,11 @@ fn fetch_detail_data(app: &App) {
                 && !app.state.diagnosed_errors.contains_key(&name)
             {
                 let _ = tx.try_send(ActionRequest::FetchDiagnoseErrors(name.clone()));
+            }
+            // Fetch change activity (row count + pending changes)
+            if !app.state.change_activity_cache.contains_key(&name) {
+                let qualified = format!("{}.{}", st.schema, st.name);
+                let _ = tx.try_send(ActionRequest::FetchChangeActivity(qualified));
             }
         }
     }
