@@ -3749,7 +3749,11 @@ pub fn execute_differential_refresh(
             .map(|entry| has_non_monotonic_cte(&entry.merge_sql_template))
             .unwrap_or(false) // no cache entry → allow promotion (A-3a guard catches it)
     });
-    if !is_append_only && !st.has_keyless_source && !cached_non_monotonic {
+    if !is_append_only
+        && !st.has_keyless_source
+        && !cached_non_monotonic
+        && !has_downstream_st_consumers(st.pgt_id)
+    {
         let has_non_insert = catalog_source_oids.iter().any(|oid| {
             let prev_lsn = prev_frontier.get_lsn(*oid);
             let new_lsn = new_frontier.get_lsn(*oid);
@@ -4589,7 +4593,12 @@ pub fn execute_differential_refresh(
     // produce delta DELETEs or UPDATEs that the bare INSERT path cannot
     // handle. When detected, clear the incorrectly set catalog flag so
     // subsequent refreshes skip the heuristic check overhead.
-    if is_append_only {
+    //
+    // STs with downstream ST consumers must skip this path: the fast
+    // path returns early before capture_delta_to_st_buffer() runs,
+    // so downstream STs would never see change buffer rows and their
+    // data_timestamp would never advance — breaking ST-on-ST cascades.
+    if is_append_only && !has_downstream_st_consumers(st.pgt_id) {
         if has_non_monotonic_cte(&resolved.merge_sql) {
             pgrx::debug1!(
                 "[pg_trickle] A-3a: skipping append-only for {}.{} — \
