@@ -20,7 +20,15 @@ use e2e::E2eDb;
 
 // ── Helper ─────────────────────────────────────────────────────────────────
 
-/// Assert the most recent refresh used DIFFERENTIAL mode (no silent fallback).
+/// Assert the most recent refresh used a genuine differential-family mode
+/// (not a silent fallback to FULL refresh).
+///
+/// Accepts:
+/// - `DIFFERENTIAL` — standard differential execution path
+/// - `APPEND_ONLY` — append-only optimization of DIFFERENTIAL (INSERT-only
+///   batches on monotonic queries such as INNER JOIN)
+/// - `TOP_K` — TopK-specific refresh (expected for ORDER BY + LIMIT
+///   queries regardless of the declared `refresh_mode`)
 async fn assert_differential_mode(db: &E2eDb, st_name: &str) {
     let mode: Option<String> = db
         .query_scalar_opt(&format!(
@@ -29,10 +37,12 @@ async fn assert_differential_mode(db: &E2eDb, st_name: &str) {
              WHERE pgt_name = '{st_name}'"
         ))
         .await;
-    assert_eq!(
-        mode.as_deref(),
-        Some("DIFFERENTIAL"),
-        "ST '{st_name}' silently fell back from DIFFERENTIAL; got: {mode:?}"
+    assert!(
+        matches!(
+            mode.as_deref(),
+            Some("DIFFERENTIAL") | Some("APPEND_ONLY") | Some("TOP_K")
+        ),
+        "ST '{st_name}' silently fell back to FULL refresh; got: {mode:?}"
     );
 }
 
