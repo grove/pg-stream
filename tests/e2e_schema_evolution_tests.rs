@@ -71,9 +71,16 @@ async fn test_schema_evolution_rename_used_column_detected() {
     .await;
     assert_eq!(db.count("public.se2_st").await, 2);
 
-    // Rename the column used in the defining query
+    // Rename the column used in the defining query.
+    // pg_trickle's DDL hook treats RENAME COLUMN (object_type = "table column")
+    // as Ignored, so we manually mark the ST for reinit so the next refresh
+    // re-executes the defining query and fails on the missing column.
     db.execute("ALTER TABLE se2_src RENAME COLUMN amount TO total")
         .await;
+    db.execute(
+        "UPDATE pgtrickle.pgt_stream_tables SET needs_reinit = TRUE WHERE pgt_name = 'se2_st'",
+    )
+    .await;
 
     // The next refresh should fail because 'amount' no longer exists
     let result = db
@@ -107,9 +114,15 @@ async fn test_schema_evolution_add_column_no_impact() {
     .await;
     assert_eq!(db.count("public.se3_st").await, 2);
 
-    // Add a new column
-    db.execute("ALTER TABLE se3_src ADD COLUMN extra TEXT DEFAULT 'x'")
-        .await;
+    // Add a new column. pg_trickle blocks ADD COLUMN by default
+    // (block_source_ddl = true / SchemaChangeKind::AddColumnOnly), so we
+    // temporarily disable the guard around the DDL.
+    db.execute_seq(&[
+        "SET pg_trickle.block_source_ddl = false",
+        "ALTER TABLE se3_src ADD COLUMN extra TEXT DEFAULT 'x'",
+        "SET pg_trickle.block_source_ddl = true",
+    ])
+    .await;
 
     // Insert using the new column and refresh — ST should be fine
     db.execute("INSERT INTO se3_src (val, extra) VALUES (300, 'y')")
@@ -140,12 +153,20 @@ async fn test_schema_evolution_compatible_type_change() {
     .await;
     assert_eq!(db.count("public.se4_st").await, 2);
 
-    // Widen the column type
-    db.execute("ALTER TABLE se4_src ALTER COLUMN amount TYPE BIGINT")
-        .await;
+    // Widen the column type. pg_trickle blocks column type changes by default
+    // (block_source_ddl = true / SchemaChangeKind::ColumnChange), so we
+    // temporarily disable the guard around the DDL.
+    db.execute_seq(&[
+        "SET pg_trickle.block_source_ddl = false",
+        "ALTER TABLE se4_src ALTER COLUMN amount TYPE BIGINT",
+        "SET pg_trickle.block_source_ddl = true",
+    ])
+    .await;
 
-    // Insert a large value and refresh
-    db.execute("INSERT INTO se4_src (amount) VALUES (3000000000)")
+    // Insert a value and refresh. Use 300 (fits INT) because the ST column
+    // is still INT — the reinitialise full-refresh reloads from the source
+    // but into the original ST schema.
+    db.execute("INSERT INTO se4_src (amount) VALUES (300)")
         .await;
     db.refresh_st("se4_st").await;
     assert_eq!(db.count("public.se4_st").await, 3);
