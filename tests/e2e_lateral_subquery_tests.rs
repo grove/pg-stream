@@ -570,13 +570,14 @@ async fn test_lateral_subquery_self_ref_multi_cycle() {
         "CREATE TABLE lat_mc (id SERIAL PRIMARY KEY, region TEXT NOT NULL, amount INT NOT NULL, score INT NOT NULL)",
     )
     .await;
-    // 10K rows, 5 regions, score 0-99 — same pattern as bench
+    // 1K rows, 5 regions, score 0-99 — sufficient to exercise the self-ref
+    // LATERAL correctness path without the cost of a 10K-row scan per cycle.
     db.execute(
         "INSERT INTO lat_mc (region, amount, score) \
          SELECT CASE (i%5) WHEN 0 THEN 'north' WHEN 1 THEN 'south' \
                 WHEN 2 THEN 'east' WHEN 3 THEN 'west' ELSE 'central' END, \
                 (i*17+13)%10000, (i*31+7)%100 \
-         FROM generate_series(1,10000) s(i)",
+         FROM generate_series(1,1000) s(i)",
     )
     .await;
 
@@ -587,25 +588,27 @@ async fn test_lateral_subquery_self_ref_multi_cycle() {
     db.create_st("lat_mc_st", q, "1m", "DIFFERENTIAL").await;
     db.assert_st_matches_query("lat_mc_st", q).await;
 
-    // Run 12 cycles of mixed DML (matching benchmark: 2 warmup + 10 measured)
-    for _cycle in 1..=12 {
-        // 1% change rate: 100 changes = 70 updates + 15 deletes + 15 inserts
-        db.execute(
-            "UPDATE lat_mc SET amount = amount + 1 \
-             WHERE id IN (SELECT id FROM lat_mc ORDER BY random() LIMIT 70)",
-        )
+    // 5 cycles (2 warmup + 3 measured) with deterministic predicates.
+    // Using id % N instead of ORDER BY random() avoids a seq-scan+sort on
+    // every DML statement and keeps the test reproducible.
+    for cycle in 1..=5 {
+        // ~7% update, ~1% delete, re-insert to keep row count stable
+        db.execute(&format!(
+            "UPDATE lat_mc SET amount = amount + 1 WHERE id % 14 = {}",
+            cycle % 14
+        ))
         .await;
-        db.execute(
-            "DELETE FROM lat_mc \
-             WHERE id IN (SELECT id FROM lat_mc ORDER BY random() LIMIT 15)",
-        )
+        db.execute(&format!(
+            "DELETE FROM lat_mc WHERE id % 97 = {}",
+            cycle % 97
+        ))
         .await;
         db.execute(
             "INSERT INTO lat_mc (region, amount, score) \
              SELECT CASE (i%5) WHEN 0 THEN 'north' WHEN 1 THEN 'south' \
                     WHEN 2 THEN 'east' WHEN 3 THEN 'west' ELSE 'central' END, \
-                    (random()*10000)::int, (random()*100)::int \
-             FROM generate_series(1,15) s(i)",
+                    (i*17+13)%10000, (i*31+7)%100 \
+             FROM generate_series(1,10) s(i)",
         )
         .await;
 
