@@ -403,7 +403,7 @@ jobs:
 
       - name: Restore Criterion baseline
         id: restore-baseline
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@v5
         with:
           path: target/criterion
           key: criterion-baseline-main
@@ -444,7 +444,7 @@ jobs:
             v3-cargo-bench-release-${{ runner.os }}-${{ env.ImageOS || 'unknown' }}-
 
       - name: Restore existing baseline (for comparison output)
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@v5
         with:
           path: target/criterion
           key: criterion-baseline-main
@@ -457,7 +457,7 @@ jobs:
 
       - name: Save Criterion baseline to cache
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@v5
         with:
           path: target/criterion
           key: criterion-baseline-main
