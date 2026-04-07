@@ -1645,7 +1645,12 @@ pub fn build_column_snapshot(
 
     let mut hasher = Sha256::new();
     hasher.update(json_str.as_bytes());
-    let fingerprint = format!("{:x}", hasher.finalize());
+    let hash = hasher.finalize();
+    let fingerprint = hash.iter().fold(String::with_capacity(64), |mut s, b| {
+        use std::fmt::Write;
+        let _ = write!(s, "{b:02x}");
+        s
+    });
 
     let snapshot = pgrx::JsonB(snapshot_obj);
     Ok((snapshot, fingerprint))
