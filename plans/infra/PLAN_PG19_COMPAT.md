@@ -1,7 +1,7 @@
 # PLAN_PG19_COMPAT.md — PostgreSQL 19 Forward-Compatibility
 
 > **Status:** Draft  
-> **Target version:** Post-1.0 (Advanced SQL A3)  
+> **Target version:** v0.19.0 (post-v0.18.0 hardening release)  
 > **Author:** pg_trickle project
 
 ---

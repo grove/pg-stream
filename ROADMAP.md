@@ -34,7 +34,8 @@ coverage, all in plain language.
 - [v0.15.0 — External Test Suites & Integration](#v0150--external-test-suites--integration)
 - [v0.16.0 — Performance & Refresh Optimization](#v0160--performance--refresh-optimization)
 - [v0.17.0 — Query Intelligence & Stability](#v0170--query-intelligence--stability)
-- [v0.18.0 — PostgreSQL 19 Compatibility](#v0180--postgresql-19-compatibility)
+- [v0.18.0 — Hardening & Delta Performance](#v0180--hardening--delta-performance)
+- [v0.19.0 — PostgreSQL 19 Compatibility](#v0190--postgresql-19-compatibility)
 - [v1.0.0 — Stable Release](#v100--stable-release)
 - [Post-1.0 — Scale, Ecosystem & Platform Expansion](#post-10--scale-ecosystem--platform-expansion)
 - [Effort Summary](#effort-summary)
@@ -74,7 +75,8 @@ from the v0.1.x series to 1.0 and beyond.
 | v0.15.0 | External test suites & integration | ✅ Released |
 | **v0.16.0** | **Performance & refresh optimization** | **✅ Released** |
 | v0.17.0 | Query intelligence & stability | 🚧 Next |
-| v0.18.0 | PostgreSQL 19 compatibility | Planned |
+| v0.18.0 | Hardening & delta performance | Planned |
+| v0.19.0 | PostgreSQL 19 compatibility | Planned |
 | v1.0.0 | Stable release | Planned |
 
 ---
@@ -3313,10 +3315,10 @@ coverage gaps to validate these new paths.
 
 > **G14-SHC subtotal: ~2–3 weeks**
 
-### ~~PostgreSQL 19 Forward-Compatibility (A3)~~ — Moved to v0.18.0
+### ~~PostgreSQL 19 Forward-Compatibility (A3)~~ — Moved to v0.19.0
 
-> PG 19 beta not available until May 2026. Items A3-1 through A3-4 deferred
-> to v0.18.0 milestone.
+> PG 19 beta not available in time. Items A3-1 through A3-4 deferred
+> to v0.19.0 milestone.
 
 ### Change Buffer Compaction (C-4)
 
@@ -3406,7 +3408,7 @@ coverage gaps to validate these new paths.
 > **Quick wins: ✅ Done**
 
 > **v0.16.0 total: ~1–2 weeks (MERGE alts) + ~4–6 weeks (aggregate fast-path) + ~1–2 weeks (append-only) + ~2–3 weeks (predicate pushdown) + ~2–3 weeks (template cache) + ~2–3 weeks (buffer compaction) + ~3–6 weeks (test coverage) + ~1–2 weeks (bench CI) + ~2–3 days (auto-indexing) + ~2–4 hours (quick wins)**
-> *Note: PG 19 compatibility (A3, ~18–36h) moved to v0.18.0.*
+> *Note: PG 19 compatibility (A3, ~18–36h) moved to v0.19.0.*
 
 **Exit criteria:**
 - [x] PH-D1: DELETE+INSERT strategy implemented and gated behind `merge_strategy` GUC; correctness verified for INSERT/UPDATE/DELETE deltas
@@ -3414,7 +3416,7 @@ coverage gaps to validate these new paths.
 - [x] A-3-AO: `CREATE STREAM TABLE … APPEND ONLY` accepted; refresh uses INSERT path; heuristic auto-promotion on insert-only buffers; falls back to MERGE on first non-insert CDC event
 - [x] B-2: Delta predicate pushdown implemented for single-source Filter nodes (P2-7); DELETE correctness verified (OR old_col predicate); selective-query benchmarks show delta row reduction
 - [x] G14-SHC: Cross-backend template cache eliminates cold-start; catalog-backed L2 cache with `template_cache` GUC; invalidation on DDL; `explain_st()` exposes stats
-- ~~A3: PG 19 builds and passes full E2E suite~~ — moved to v0.18.0
+- ~~A3: PG 19 builds and passes full E2E suite~~ — moved to v0.19.0
 - [x] C-4: Change buffer compaction reduces buffer size by ≥50% for high-churn workloads; `compact_threshold` GUC respected; no correctness regressions
 - [x] TG2-WIN: Window function DVM execution tests cover ROW_NUMBER, RANK, DENSE_RANK, LAG/LEAD across INSERT/UPDATE/DELETE
 - [x] TG2-JOIN: Join multi-cycle tests cover INNER/LEFT/FULL JOIN with UPDATE and DELETE propagation; no silent data loss
@@ -3670,33 +3672,168 @@ provides a 60-second tryout experience.
 
 ---
 
-## v0.18.0 — PostgreSQL 19 Compatibility
+## v0.18.0 — Hardening & Delta Performance
 
-**Goal:** Add forward-compatibility with PostgreSQL 19, which enters beta
-in May 2026. Ensure pg_trickle compiles, loads, and passes the full E2E
-test suite against PG 19.
+**Goal:** Production hardening, performance, and observability improvements
+that close the remaining correctness and safety gaps before the stable
+release. Builds confidence in the engine ahead of v1.0.0.
+
+### Production Correctness — `unwrap()` Audit (SAFE-1)
+
+> **In plain terms:** A small number of SQL-parsing code paths in
+> production (non-test) code call `.unwrap()` directly — if they encounter
+> unexpected input they will panic the backend process and disconnect all
+> clients. These should propagate errors gracefully instead.
+
+| Item | Description | Effort |
+|------|-------------|--------|
+| SAFE-1-1 | `detect_and_strip_distinct()` call in `api.rs` (L8163) → propagate `PgTrickleError` | 1h |
+| SAFE-1-2 | `find_top_level_keyword(sql, "FROM")` calls in `api.rs` (L8229–8258, 3×) → propagate error | 1h |
+| SAFE-1-3 | `merge_sql[using_start.unwrap()..using_end.unwrap()]` in `refresh.rs` (L6236) → bounds-check | 1h |
+| SAFE-1-4 | `entry.unwrap()` in delta computation loop in `refresh.rs` (L5992) → return `Err` | 1h |
+| SAFE-1-5 | Chained `.unwrap().unwrap()` in `refresh.rs` (L6556–6557) → propagate | 1h |
+
+> **SAFE-1 subtotal: ~4–6 hours**
+
+### Multi-Source Delta Engine — B3-2 (B3-MERGE)
+
+> **In plain terms:** When a stream table joins multiple tables and more
+> than one of those tables receives changes in the same scheduler cycle,
+> the current engine generates one delta branch per source and stacks them
+> in a `UNION ALL`. With this change those branches are merged into a
+> single `GROUP BY + SUM(weight)` query using Z-set algebra, eliminating
+> duplicate evaluation of shared join paths. B3-1 (branch pruning) and
+> B3-3 (correctness proofs) are already done; this is the final payoff.
+
+| Item | Description | Effort | Ref |
+|------|-------------|--------|-----|
+| B3-2-1 | Z-set merged-delta generation in `src/dvm/diff.rs` (`DiffEngine::diff_node()`) | 8–10h | [PLAN_MULTI_TABLE_DELTA_BATCHING.md](plans/performance/PLAN_MULTI_TABLE_DELTA_BATCHING.md) |
+| B3-2-2 | Unit + property-based tests (existing B3-3 diamond-flow tests must pass unchanged) | 2–4h | — |
+| B3-2-3 | Benchmark regression check against Part-8 baseline | 2h | — |
+
+> **B3-MERGE subtotal: ~12–16 hours**
+
+### TPC-H Regression Baseline (TPCH-BASE)
+
+> **In plain terms:** The TPC-H correctness tests run all 22 queries but
+> the expected-output comparison guard was never populated — so the tests
+> catch structural failures but not quiet result regressions. Populating
+> the baseline turns the suite into a true correctness canary.
+
+| Item | Description | Effort |
+|------|-------------|--------|
+| TPCH-BASE-1 | Run TPC-H suite once at known-good state; capture output | 30min |
+| TPCH-BASE-2 | Populate comparison baseline in `e2e_tpch_tests.rs` line 89 (remove TODO); verify guard fires on a deliberate regression | 1h |
+
+> **TPCH-BASE subtotal: ~1–2 hours**
+
+### Spill Detection Alerting (PH-E2)
+
+> **In plain terms:** The GUCs `pg_trickle.spill_threshold_blocks` and
+> `pg_trickle.spill_consecutive_limit` already exist to configure spill
+> budgets, but no alert fires when a refresh actually spills to disk. This
+> adds an `AlertEvent::SpillThresholdExceeded` notification so operators
+> know when large delta queries are hitting disk.
+
+| Item | Description | Effort |
+|------|-------------|--------|
+| PH-E2-1 | Add `AlertEvent::SpillThresholdExceeded` variant to `src/monitor.rs` | 1h |
+| PH-E2-2 | Detect spill after MERGE execution; emit alert when consecutive count exceeds limit | 2–3h |
+| PH-E2-3 | E2E test: configure low spill threshold, trigger spill, assert alert fires | 1–2h |
+
+> **PH-E2 subtotal: ~4–6 hours**
+
+### Template Cache Observability (CACHE-OBS)
+
+> **In plain terms:** The delta SQL template cache (`IVM_DELTA_CACHE`)
+> saves regenerating delta queries on every refresh cycle, but its hit rate
+> is invisible to operators. Adding `pgtrickle.cache_stats()` lets you see
+> whether the cache is effective and tune `pg_trickle.ivm_cache_size`
+> accordingly.
+
+| Item | Description | Effort |
+|------|-------------|--------|
+| CACHE-OBS-1 | Add hit/miss/eviction counters to `IVM_DELTA_CACHE` | 1h |
+| CACHE-OBS-2 | Expose via `pgtrickle.cache_stats()` returning `(hits BIGINT, misses BIGINT, evictions BIGINT, size INT)` | 1–2h |
+| CACHE-OBS-3 | Documentation and E2E smoke test | 1h |
+
+> **CACHE-OBS subtotal: ~3–4 hours**
+
+### `unsafe` Block Reduction — Phase 1 (UNSAFE-P1)
+
+> **In plain terms:** The DVM parser has 1,286 `unsafe` blocks — 98% of
+> the total. Phase 1 introduces a single `pg_cstr_to_str()` safe helper
+> that eliminates ~69 of the most mechanical ones: C-string-to-Rust
+> conversions. No API or behavior change; pure safety improvement.
+
+| Item | Description | Effort | Ref |
+|------|-------------|--------|-----|
+| UNSAFE-P1-1 | Implement `pg_cstr_to_str(ptr: *const c_char) -> &str` safe wrapper in `src/dvm/parser/mod.rs` | 1h | [PLAN_REDUCED_UNSAFE.md](plans/safety/PLAN_REDUCED_UNSAFE.md) §Phase 1 |
+| UNSAFE-P1-2 | Replace ~69 `unsafe { CStr::from_ptr(...).to_str()... }` call-sites with the safe helper | 4–6h | — |
+| UNSAFE-P1-3 | `unsafe_inventory.sh` baseline update + CI check | 1h | `scripts/unsafe_inventory.sh` |
+
+> **UNSAFE-P1 subtotal: ~6–8 hours**
+
+### Cross-Source Snapshot Consistency — Phase 3 (CSS-3)
+
+> **In plain terms:** When a stream table reads from two different source
+> tables, there is a window where it can see source A at a newer point in
+> time than source B — for example, seeing a new order but the old
+> inventory count. Phase 3 completes the tick-watermark enforcement so
+> both sources are always read at the same consistent LSN before any
+> refresh proceeds. Phases 1 and 2 are already complete.
+
+| Item | Description | Effort | Ref |
+|------|-------------|--------|-----|
+| CSS-3-1 | LSN watermark enforcement in the scheduler — hold refresh until all upstream sources reach the same tick boundary | 4–6h | [PLAN_CROSS_SOURCE_SNAPSHOT_CONSISTENCY.md](plans/sql/PLAN_CROSS_SOURCE_SNAPSHOT_CONSISTENCY.md) §Phase 3 |
+| CSS-3-2 | Catalog column `pgt_css_watermark_lsn` + GUC `pg_trickle.cross_source_consistency` (default `off`) | 2–3h | — |
+| CSS-3-3 | E2E test: concurrent writes to two sources, assert stream table never sees a split snapshot | 2–3h | — |
+
+> **CSS-3 subtotal: ~8–12 hours**
+
+> **v0.18.0 total: ~38–54 hours**
+
+**Exit criteria:**
+- [ ] SAFE-1: All production-path `unwrap()` calls in `api.rs` and `refresh.rs` replaced with proper error propagation
+- [ ] B3-2: Merged multi-source delta implemented; all B3-3 diamond-flow property tests pass unchanged
+- [ ] TPCH-BASE: TPC-H baseline populated; deliberate regression detected by the guard
+- [ ] PH-E2: Spill alert fires in E2E test with artificially low threshold
+- [ ] CACHE-OBS: `pgtrickle.cache_stats()` returns correct counters in smoke test
+- [ ] UNSAFE-P1: `unsafe_inventory.sh` reports ≥69 fewer `unsafe` blocks; CI baseline updated
+- [ ] CSS-3: Split-snapshot E2E test passes under concurrent writes
+- [ ] Extension upgrade path tested (`0.17.0 → 0.18.0`)
+- [ ] `just check-version-sync` passes
+
+---
+
+## v0.19.0 — PostgreSQL 19 Compatibility
+
+**Goal:** Add forward-compatibility with PostgreSQL 19. Ensure pg_trickle
+compiles, loads, and passes the full E2E test suite against PG 19. Gated
+on pgrx 0.18.x availability (expected July–August 2026) and on PostgreSQL
+19 beta reaching sufficient stability.
 
 ### PostgreSQL 19 Forward-Compatibility (A3)
 
-> **In plain terms:** PostgreSQL 19 beta ships in May 2026. Adding
-> forward-compatibility ensures pg_trickle users can test on PG 19
-> immediately. The work involves bumping pgrx, auditing `pg_sys::*` API
-> changes, adding conditional compilation gates, and validating the WAL
-> decoder against any pgoutput format changes.
+> **In plain terms:** When PostgreSQL 19 beta stabilises and pgrx 0.18.x
+> ships with PG 19 support, this milestone bumps the pgrx dependency,
+> audits every internal `pg_sys::*` API call for breaking changes, adds
+> conditional compilation gates, and validates the WAL decoder against any
+> pgoutput format changes introduced in PG 19.
 
 | Item | Description | Effort | Ref |
 |------|-------------|--------|-----|
 | A3-1 | pgrx version bump to 0.18.x (PG 19 support) + `cargo pgrx init --pg19` | 2–4h | [PLAN_PG19_COMPAT.md](plans/infra/PLAN_PG19_COMPAT.md) §2 |
 | A3-2 | `pg_sys::*` API audit: heap access, catalog structs, WAL decoder `LogicalDecodingContext` | 8–16h | [PLAN_PG19_COMPAT.md](plans/infra/PLAN_PG19_COMPAT.md) §3 |
 | A3-3 | Conditional compilation (`#[cfg(feature = "pg19")]`) for changed APIs | 4–8h | [PLAN_PG19_COMPAT.md](plans/infra/PLAN_PG19_COMPAT.md) §4 |
-| A3-4 | CI matrix expansion for PG 19 beta + full E2E suite run | 4–8h | [PLAN_PG19_COMPAT.md](plans/infra/PLAN_PG19_COMPAT.md) |
+| A3-4 | CI matrix expansion for PG 19 + full E2E suite run | 4–8h | [PLAN_PG19_COMPAT.md](plans/infra/PLAN_PG19_COMPAT.md) |
 
 > **A3 subtotal: ~18–36 hours**
 
 **Exit criteria:**
 - [ ] A3: PG 19 builds and passes full E2E suite
-- [ ] CI matrix includes PG 19 beta
-- [ ] Extension upgrade path tested (`0.17.0 → 0.18.0`)
+- [ ] CI matrix includes PG 19
+- [ ] Extension upgrade path tested (`0.18.0 → 0.19.0`)
 - [ ] `just check-version-sync` passes
 
 ---
@@ -3828,7 +3965,7 @@ to keep the pre-1.0 milestones focused on performance and correctness.
 | Item | Description | Effort | Ref |
 |------|-------------|--------|-----|
 | ~~A2~~ | ~~Transactional IVM Phase 4 remaining (ENR-based transition tables, C-level triggers, prepared stmt reuse)~~ ➡️ Pulled to v0.17.0 | ~36–54h | [PLAN_TRANSACTIONAL_IVM.md](plans/sql/PLAN_TRANSACTIONAL_IVM.md) |
-| ~~A3~~ | ~~PostgreSQL 19 forward-compatibility~~ ➡️ Pulled to v0.16.0 ➡️ Moved to v0.18.0 | ~18–36h | [PLAN_PG19_COMPAT.md](plans/infra/PLAN_PG19_COMPAT.md) |
+| ~~A3~~ | ~~PostgreSQL 19 forward-compatibility~~ ➡️ Pulled to v0.16.0 ➡️ Moved to v0.19.0 | ~18–36h | [PLAN_PG19_COMPAT.md](plans/infra/PLAN_PG19_COMPAT.md) |
 | A4 | PostgreSQL 14–15 backward compatibility | ~40h | [PLAN_PG_BACKCOMPAT.md](plans/infra/PLAN_PG_BACKCOMPAT.md) |
 | A5 | Partitioned stream table storage (opt-in) | ~60–80h | [PLAN_PARTITIONING_SHARDING.md](plans/infra/PLAN_PARTITIONING_SHARDING.md) §4 |
 | ~~A6~~ | ~~Buffer table partitioning by LSN range (`pg_trickle.buffer_partitioning` GUC)~~ | ✅ Done | [PLAN_EDGE_CASES_TIVM_IMPL_ORDER.md](plans/PLAN_EDGE_CASES_TIVM_IMPL_ORDER.md) Stage 4 §3.3 |
@@ -3885,7 +4022,8 @@ to keep the pre-1.0 milestones focused on performance and correctness.
 | v0.15.0 — External Test Suites & Integration | ~40–70h + ~2–3d bulk create + ~3–5d planner hints + ~2–3d cache spike + ~3–4wk parser + ~1–2wk watermark + ~2–4wk delta cost/spill | — | ✅ Released |
 | v0.16.0 — Performance & Refresh Optimization | ~1–2wk MERGE alts + ~4–6wk aggregate fast-path + ~1–2wk append-only + ~2–3wk predicate pushdown + ~2–3wk template cache + ~2–3wk buffer compaction + ~3–6wk test coverage + ~1–2wk bench CI + ~2–3d auto-indexing + ~12–22h quick wins | — | |
 | v0.17.0 — Query Intelligence & Stability | ~2–3wk cost-based strategy + ~3–4wk columnar tracking + ~32–48h TIVM Phase 4 + ~1–2d ROWS FROM + ~2–3wk SQLancer + ~2–3wk incremental DAG + ~4–8h unsafe reduction + ~1–2wk api.rs mod + ~2–3d migration guide + ~3–5d runbook + ~2–3d playground + ~2–3d doc polish | — | |
-| v0.18.0 — PostgreSQL 19 Compatibility | ~18–36h | — | |
+| v0.18.0 — Hardening & Delta Performance | ~38–54h | — | |
+| v0.19.0 — PostgreSQL 19 Compatibility | ~18–36h | — | |
 | v1.0.0 — Stable release | ~18–30h | — | |
 | Post-1.0 (PG compat + Native DDL) | ~38–56h (PG 16–18) + ~13–21d (Native DDL) | — | |
 | Post-1.0 (ecosystem) | 88–134h | — | |
