@@ -25,6 +25,7 @@ pub enum ActionRequest {
     FetchSources(String),
     FetchRefreshHistory(String),
     FetchAuxiliaryColumns(String),
+    FetchChangeActivity(String),
 }
 
 /// Result from poller → UI thread after executing an action.
@@ -182,6 +183,8 @@ pub struct AppState {
     pub refresh_history_cache: HashMap<String, Vec<RefreshHistoryEntry>>,
     /// Auxiliary columns cache: st_name -> columns
     pub auxiliary_columns_cache: HashMap<String, Vec<AuxiliaryColumn>>,
+    /// Change activity cache: st_name -> activity summary
+    pub change_activity_cache: HashMap<String, ChangeActivity>,
 
     /// Whether all poll sub-queries failed (connection lost detection)
     pub poll_failure_count: usize,
@@ -462,6 +465,12 @@ pub struct AuxiliaryColumn {
     pub column_name: String,
     pub data_type: String,
     pub purpose: String,
+}
+
+#[derive(Clone, Serialize)]
+pub struct ChangeActivity {
+    /// Estimated row count from pg_class.reltuples
+    pub row_count: i64,
 }
 
 impl AppState {

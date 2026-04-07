@@ -280,6 +280,7 @@ pub fn sample_state() -> AppState {
         scc_groups: vec![],
         refresh_history_cache: std::collections::HashMap::new(),
         auxiliary_columns_cache: std::collections::HashMap::new(),
+        change_activity_cache: std::collections::HashMap::new(),
         poll_failure_count: 0,
         poll_total_count: 0,
     };

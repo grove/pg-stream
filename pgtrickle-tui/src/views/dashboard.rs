@@ -219,7 +219,9 @@ fn render_table(
             } else if st.cascade_stale {
                 ("⚠ cascade".to_string(), theme.warning)
             } else if let Some(explain) = state.explain_mode_cache.get(&st.name) {
-                if explain.configured_mode != explain.effective_mode {
+                if explain.configured_mode != explain.effective_mode
+                    && explain.effective_mode != "NO_DATA"
+                {
                     (
                         format!("{} ↓", super::friendly_mode(&explain.effective_mode)),
                         theme.warning,

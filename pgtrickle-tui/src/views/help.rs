@@ -102,8 +102,9 @@ fn context_help(view: View) -> Vec<&'static str> {
         View::Graph => vec!["ASCII dependency graph", "Arrows show refresh dependencies"],
         View::RefreshLog => vec!["Recent refresh history", "Duration and row counts shown"],
         View::Cdc => vec![
-            "Change buffers, CDC health, dedup",
-            "Watch for growing buffers and lag",
+            "Tab to move between sections",
+            "↑↓ to navigate rows in section",
+            "Esc to return focus to Buffers",
         ],
         View::Health => vec![
             "Overall system health summary",

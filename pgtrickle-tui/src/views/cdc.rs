@@ -1,17 +1,26 @@
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::style::Style;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table};
+use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState};
 
 use crate::state::AppState;
 use crate::theme::Theme;
+
+/// Logical section IDs for the CDC view.
+/// 0=Change Buffers, 1=CDC Health, 2=Shared Buffer Stats, 3=Triggers
+const SECT_BUFFERS: usize = 0;
+const SECT_HEALTH: usize = 1;
+const SECT_SBS: usize = 2;
+const SECT_TRIGGERS: usize = 3;
 
 pub fn render(
     frame: &mut Frame,
     area: Rect,
     state: &AppState,
     theme: &Theme,
-    selected: usize,
+    focused_section: usize,
+    sel: &[usize; 4],
     filter: Option<&str>,
 ) {
     // Decide layout based on whether we have CDC health or dedup data
@@ -36,14 +45,36 @@ pub fn render(
             .split(area);
 
         let mut idx = 0;
-        render_buffers(frame, chunks[idx], state, theme, selected, filter);
+        render_buffers(
+            frame,
+            chunks[idx],
+            state,
+            theme,
+            sel[SECT_BUFFERS],
+            focused_section == SECT_BUFFERS,
+            filter,
+        );
         idx += 1;
         if has_health {
-            render_cdc_health(frame, chunks[idx], state, theme);
+            render_cdc_health(
+                frame,
+                chunks[idx],
+                state,
+                theme,
+                sel[SECT_HEALTH],
+                focused_section == SECT_HEALTH,
+            );
             idx += 1;
         }
         if has_sbs {
-            render_shared_buffer_stats(frame, chunks[idx], state, theme);
+            render_shared_buffer_stats(
+                frame,
+                chunks[idx],
+                state,
+                theme,
+                sel[SECT_SBS],
+                focused_section == SECT_SBS,
+            );
             idx += 1;
         }
 
@@ -54,9 +85,23 @@ pub fn render(
                 .constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
                 .split(chunks[idx]);
             render_dedup_stats(frame, bottom[0], state, theme);
-            render_triggers(frame, bottom[1], state, theme);
+            render_triggers(
+                frame,
+                bottom[1],
+                state,
+                theme,
+                sel[SECT_TRIGGERS],
+                focused_section == SECT_TRIGGERS,
+            );
         } else {
-            render_triggers(frame, chunks[idx], state, theme);
+            render_triggers(
+                frame,
+                chunks[idx],
+                state,
+                theme,
+                sel[SECT_TRIGGERS],
+                focused_section == SECT_TRIGGERS,
+            );
         }
     } else {
         // Original 2-section layout
@@ -65,9 +110,28 @@ pub fn render(
             .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
             .split(area);
 
-        render_buffers(frame, chunks[0], state, theme, selected, filter);
-        render_triggers(frame, chunks[1], state, theme);
+        render_buffers(
+            frame,
+            chunks[0],
+            state,
+            theme,
+            sel[SECT_BUFFERS],
+            focused_section == SECT_BUFFERS,
+            filter,
+        );
+        render_triggers(
+            frame,
+            chunks[1],
+            state,
+            theme,
+            sel[SECT_TRIGGERS],
+            focused_section == SECT_TRIGGERS,
+        );
     }
+}
+
+fn focused_border(theme: &Theme, focused: bool) -> Style {
+    if focused { theme.active } else { theme.border }
 }
 
 fn render_buffers(
@@ -75,7 +139,8 @@ fn render_buffers(
     area: Rect,
     state: &AppState,
     theme: &Theme,
-    selected: usize,
+    sel: usize,
+    focused: bool,
     filter: Option<&str>,
 ) {
     let f = filter.unwrap_or("").to_lowercase();
@@ -110,10 +175,10 @@ fn render_buffers(
                 theme.ok
             };
 
-            let style = if i == selected {
+            let style = if focused && i == sel {
                 theme.selected
             } else {
-                ratatui::style::Style::default()
+                Style::default()
             };
 
             Row::new(vec![
@@ -135,19 +200,33 @@ fn render_buffers(
         Constraint::Length(14),
     ];
 
+    let title = if focused {
+        format!(" ▶ Change Buffers ({}) ", state.cdc_buffers.len())
+    } else {
+        format!(" Change Buffers ({}) ", state.cdc_buffers.len())
+    };
+
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(theme.border)
-        .title(Span::styled(
-            format!(" Change Buffers ({}) ", state.cdc_buffers.len()),
-            theme.title,
-        ));
+        .border_style(focused_border(theme, focused))
+        .title(Span::styled(title, theme.title));
 
     let table = Table::new(rows, widths).header(header).block(block);
-    frame.render_widget(table, area);
+    let mut ts = TableState::default();
+    if focused {
+        ts.select(Some(sel));
+    }
+    frame.render_stateful_widget(table, area, &mut ts);
 }
 
-fn render_triggers(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
+fn render_triggers(
+    frame: &mut Frame,
+    area: Rect,
+    state: &AppState,
+    theme: &Theme,
+    sel: usize,
+    focused: bool,
+) {
     let header = Row::new(
         ["Source Table", "Trigger Name", "Type", "Present", "Enabled"]
             .iter()
@@ -158,11 +237,17 @@ fn render_triggers(frame: &mut Frame, area: Rect, state: &AppState, theme: &Them
     let rows: Vec<Row> = state
         .trigger_inventory
         .iter()
-        .map(|t| {
+        .enumerate()
+        .map(|(i, t)| {
             let present_icon = if t.present { "✓" } else { "✗" };
             let present_style = if t.present { theme.ok } else { theme.warning };
             let enabled_icon = if t.enabled { "✓" } else { "✗" };
             let enabled_style = if t.enabled { theme.ok } else { theme.warning };
+            let row_style = if focused && i == sel {
+                theme.selected
+            } else {
+                Style::default()
+            };
             Row::new(vec![
                 Cell::from(t.source_table.as_str()),
                 Cell::from(t.trigger_name.as_str()),
@@ -170,6 +255,7 @@ fn render_triggers(frame: &mut Frame, area: Rect, state: &AppState, theme: &Them
                 Cell::from(present_icon).style(present_style),
                 Cell::from(enabled_icon).style(enabled_style),
             ])
+            .style(row_style)
         })
         .collect();
 
@@ -182,16 +268,22 @@ fn render_triggers(frame: &mut Frame, area: Rect, state: &AppState, theme: &Them
     ];
 
     let ok_count = state.trigger_inventory.len();
+    let title = if focused {
+        format!(" ▶ Trigger Inventory ({ok_count} triggers) ")
+    } else {
+        format!(" Trigger Inventory ({ok_count} triggers) ")
+    };
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(theme.border)
-        .title(Span::styled(
-            format!(" Trigger Inventory ({ok_count} triggers) "),
-            theme.title,
-        ));
+        .border_style(focused_border(theme, focused))
+        .title(Span::styled(title, theme.title));
 
     let table = Table::new(rows, widths).header(header).block(block);
-    frame.render_widget(table, area);
+    let mut ts = TableState::default();
+    if focused {
+        ts.select(Some(sel));
+    }
+    frame.render_stateful_widget(table, area, &mut ts);
 }
 
 fn format_bytes(bytes: i64) -> String {
@@ -204,11 +296,18 @@ fn format_bytes(bytes: i64) -> String {
     }
 }
 
-fn render_cdc_health(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
+fn render_cdc_health(
+    frame: &mut Frame,
+    area: Rect,
+    state: &AppState,
+    theme: &Theme,
+    sel: usize,
+    focused: bool,
+) {
     if state.cdc_health.is_empty() {
         let block = Block::default()
             .borders(Borders::ALL)
-            .border_style(theme.border)
+            .border_style(focused_border(theme, focused))
             .title(Span::styled(" CDC Health ", theme.title));
         frame.render_widget(
             Paragraph::new(Line::styled(" No CDC health data", theme.dim)).block(block),
@@ -227,7 +326,8 @@ fn render_cdc_health(frame: &mut Frame, area: Rect, state: &AppState, theme: &Th
     let rows: Vec<Row> = state
         .cdc_health
         .iter()
-        .map(|h| {
+        .enumerate()
+        .map(|(i, h)| {
             let lag_str = h
                 .lag_bytes
                 .map(format_bytes)
@@ -242,6 +342,11 @@ fn render_cdc_health(frame: &mut Frame, area: Rect, state: &AppState, theme: &Th
             } else {
                 theme.dim
             };
+            let row_style = if focused && i == sel {
+                theme.selected
+            } else {
+                Style::default()
+            };
             Row::new(vec![
                 Cell::from(h.source_table.as_str()),
                 Cell::from(h.cdc_mode.as_str()),
@@ -250,6 +355,7 @@ fn render_cdc_health(frame: &mut Frame, area: Rect, state: &AppState, theme: &Th
                 Cell::from(h.confirmed_lsn.as_deref().unwrap_or("-")),
                 Cell::from(h.alert.as_deref().unwrap_or("-")).style(alert_style),
             ])
+            .style(row_style)
         })
         .collect();
 
@@ -267,7 +373,7 @@ fn render_cdc_health(frame: &mut Frame, area: Rect, state: &AppState, theme: &Th
         .iter()
         .filter(|h| h.alert.is_some())
         .count();
-    let title = if alerts > 0 {
+    let base_title = if alerts > 0 {
         format!(
             " CDC Health ({} sources, {} alerts) ",
             state.cdc_health.len(),
@@ -276,14 +382,23 @@ fn render_cdc_health(frame: &mut Frame, area: Rect, state: &AppState, theme: &Th
     } else {
         format!(" CDC Health ({} sources) ", state.cdc_health.len())
     };
+    let title = if focused {
+        format!(" ▶{}", &base_title[1..])
+    } else {
+        base_title
+    };
 
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(theme.border)
+        .border_style(focused_border(theme, focused))
         .title(Span::styled(title, theme.title));
 
     let table = Table::new(rows, widths).header(header).block(block);
-    frame.render_widget(table, area);
+    let mut ts = TableState::default();
+    if focused {
+        ts.select(Some(sel));
+    }
+    frame.render_stateful_widget(table, area, &mut ts);
 }
 
 fn render_dedup_stats(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
@@ -330,7 +445,14 @@ fn render_dedup_stats(frame: &mut Frame, area: Rect, state: &AppState, theme: &T
     frame.render_widget(Paragraph::new(lines).block(block), area);
 }
 
-fn render_shared_buffer_stats(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
+fn render_shared_buffer_stats(
+    frame: &mut Frame,
+    area: Rect,
+    state: &AppState,
+    theme: &Theme,
+    sel: usize,
+    focused: bool,
+) {
     let header = Row::new(
         [
             "Source",
@@ -348,7 +470,13 @@ fn render_shared_buffer_stats(frame: &mut Frame, area: Rect, state: &AppState, t
     let rows: Vec<Row> = state
         .shared_buffer_stats
         .iter()
-        .map(|s| {
+        .enumerate()
+        .map(|(i, s)| {
+            let row_style = if focused && i == sel {
+                theme.selected
+            } else {
+                Style::default()
+            };
             Row::new(vec![
                 Cell::from(s.source_table.as_str()),
                 Cell::from(format!("{} ({})", s.consumer_count, s.consumers)),
@@ -357,6 +485,7 @@ fn render_shared_buffer_stats(frame: &mut Frame, area: Rect, state: &AppState, t
                 Cell::from(s.buffer_rows.to_string()),
                 Cell::from(if s.is_partitioned { "yes" } else { "no" }),
             ])
+            .style(row_style)
         })
         .collect();
 
@@ -369,17 +498,26 @@ fn render_shared_buffer_stats(frame: &mut Frame, area: Rect, state: &AppState, t
         Constraint::Length(6),
     ];
 
+    let title = if focused {
+        format!(
+            " ▶ Shared Buffer Stats ({}) ",
+            state.shared_buffer_stats.len()
+        )
+    } else {
+        format!(
+            " Shared Buffer Stats ({}) ",
+            state.shared_buffer_stats.len()
+        )
+    };
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(theme.border)
-        .title(Span::styled(
-            format!(
-                " Shared Buffer Stats ({}) ",
-                state.shared_buffer_stats.len()
-            ),
-            theme.title,
-        ));
+        .border_style(focused_border(theme, focused))
+        .title(Span::styled(title, theme.title));
 
     let table = Table::new(rows, widths).header(header).block(block);
-    frame.render_widget(table, area);
+    let mut ts = TableState::default();
+    if focused {
+        ts.select(Some(sel));
+    }
+    frame.render_stateful_widget(table, area, &mut ts);
 }

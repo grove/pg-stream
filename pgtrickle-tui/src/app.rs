@@ -118,6 +118,8 @@ enum PollMsg {
     RefreshHistory(String, String), // (table_name, json)
     /// Auxiliary columns fetched on demand
     AuxiliaryColumns(String, String), // (table_name, json)
+    /// Change activity fetched on demand
+    ChangeActivity(String, String), // (table_name, json)
     /// Reconnected after connection loss
     Reconnected,
 }
@@ -165,6 +167,10 @@ struct App {
     dag_focused: bool,
     /// Scroll offset for the DAG Mini-Map
     dag_scroll: usize,
+    /// CDC Health view: which section (0=Buffers,1=CDC Health,2=SBS,3=Triggers) has focus
+    cdc_section: usize,
+    /// CDC Health view: per-section row selection [buffers, cdc_health, sbs, triggers]
+    cdc_sel: [usize; 4],
 }
 
 /// Simple command palette for `:` mode.
@@ -280,6 +286,8 @@ impl App {
             delta_inspector_tab: 0,
             dag_focused: false,
             dag_scroll: 0,
+            cdc_section: 0,
+            cdc_sel: [0; 4],
         }
     }
 
@@ -430,6 +438,31 @@ impl App {
                 self.filter_matches(&b.stream_table) || self.filter_matches(&b.source_table)
             })
             .count()
+    }
+
+    /// Returns visible section IDs for the CDC view (logical slots 0-3).
+    /// 0=Buffers (always), 1=CDC Health, 2=Shared Buffer Stats, 3=Triggers (always).
+    fn cdc_visible_sections(&self) -> Vec<usize> {
+        let mut v = vec![0];
+        if !self.state.cdc_health.is_empty() {
+            v.push(1);
+        }
+        if !self.state.shared_buffer_stats.is_empty() {
+            v.push(2);
+        }
+        v.push(3);
+        v
+    }
+
+    /// Row count for a CDC logical section.
+    fn cdc_section_len(&self, sect: usize) -> usize {
+        match sect {
+            0 => self.filtered_cdc_len(),
+            1 => self.state.cdc_health.len(),
+            2 => self.state.shared_buffer_stats.len(),
+            3 => self.state.trigger_inventory.len(),
+            _ => 0,
+        }
     }
 
     fn filtered_config_len(&self) -> usize {
@@ -611,6 +644,8 @@ async fn run_app(
                         std::mem::take(&mut app.state.refresh_history_cache);
                     let auxiliary_columns_cache =
                         std::mem::take(&mut app.state.auxiliary_columns_cache);
+                    let change_activity_cache =
+                        std::mem::take(&mut app.state.change_activity_cache);
                     app.state = *new_state;
                     app.state.alerts = alerts;
                     app.state.delta_sql_cache = delta_sql_cache;
@@ -620,6 +655,7 @@ async fn run_app(
                     app.state.source_detail_cache = source_detail_cache;
                     app.state.refresh_history_cache = refresh_history_cache;
                     app.state.auxiliary_columns_cache = auxiliary_columns_cache;
+                    app.state.change_activity_cache = change_activity_cache;
                     app.state.poll_interval_ms = app.poll_interval * 1000;
                     app.clamp_selection();
                     // Pre-fetch explain mode for all tables so Dashboard's
@@ -766,6 +802,16 @@ async fn run_app(
                         app.state.auxiliary_columns_cache.insert(name, parsed);
                     }
                 }
+                PollMsg::ChangeActivity(name, json) => {
+                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&json) {
+                        let row_count = v.get("row_count").and_then(|r| r.as_i64()).unwrap_or(-1);
+                        // Extract short name (last component) for cache key
+                        let key = name.split('.').next_back().unwrap_or(&name).to_string();
+                        app.state
+                            .change_activity_cache
+                            .insert(key, crate::state::ChangeActivity { row_count });
+                    }
+                }
                 PollMsg::Reconnected => {
                     app.toast = Some(Toast::success("Reconnected to database"));
                 }
@@ -900,6 +946,10 @@ async fn poller_task(
                                 let _ = tx.send(PollMsg::AuxiliaryColumns(name.clone(), result.message)).await;
                                 continue;
                             }
+                            ActionRequest::FetchChangeActivity(name) if result.success => {
+                                let _ = tx.send(PollMsg::ChangeActivity(name.clone(), result.message)).await;
+                                continue;
+                            }
                             // Silently degrade background enrichment fetches — these are
                             // auto-triggered and may not exist on older extension versions.
                             ActionRequest::FetchDiagnoseErrors(_)
@@ -907,6 +957,7 @@ async fn poller_task(
                             | ActionRequest::FetchSources(_)
                             | ActionRequest::FetchRefreshHistory(_)
                             | ActionRequest::FetchAuxiliaryColumns(_)
+                            | ActionRequest::FetchChangeActivity(_)
                                 if !result.success =>
                             {
                                 continue;
@@ -1270,6 +1321,30 @@ fn handle_key(app: &mut App, key: KeyEvent) {
             app.selected = 0;
         }
 
+        // ── CDC Health section focus ──────────────────────────────
+        KeyCode::Tab if app.current_view == View::Cdc => {
+            let sections = app.cdc_visible_sections();
+            let pos = sections
+                .iter()
+                .position(|&s| s == app.cdc_section)
+                .unwrap_or(0);
+            app.cdc_section = sections[(pos + 1) % sections.len()];
+        }
+        KeyCode::Esc if app.current_view == View::Cdc => {
+            app.cdc_section = 0;
+        }
+        KeyCode::Down | KeyCode::Char('j') if app.current_view == View::Cdc => {
+            let sect = app.cdc_section;
+            let len = app.cdc_section_len(sect);
+            if len > 0 {
+                app.cdc_sel[sect] = (app.cdc_sel[sect] + 1).min(len - 1);
+            }
+        }
+        KeyCode::Up | KeyCode::Char('k') if app.current_view == View::Cdc => {
+            let sect = app.cdc_section;
+            app.cdc_sel[sect] = app.cdc_sel[sect].saturating_sub(1);
+        }
+
         // ── DAG Mini-Map focus (Dashboard) ───────────────────────
         KeyCode::Tab if app.current_view == View::Dashboard => {
             app.dag_focused = true;
@@ -1613,6 +1688,11 @@ fn fetch_detail_data(app: &App) {
             {
                 let _ = tx.try_send(ActionRequest::FetchDiagnoseErrors(name.clone()));
             }
+            // Fetch change activity (row count + pending changes)
+            if !app.state.change_activity_cache.contains_key(&name) {
+                let qualified = format!("{}.{}", st.schema, st.name);
+                let _ = tx.try_send(ActionRequest::FetchChangeActivity(qualified));
+            }
         }
     }
 }
@@ -1824,7 +1904,15 @@ fn render_view(frame: &mut ratatui::Frame, area: Rect, app: &App) {
         View::Diagnostics => {
             views::diagnostics::render(frame, area, &app.state, &app.theme, app.selected, filter)
         }
-        View::Cdc => views::cdc::render(frame, area, &app.state, &app.theme, app.selected, filter),
+        View::Cdc => views::cdc::render(
+            frame,
+            area,
+            &app.state,
+            &app.theme,
+            app.cdc_section,
+            &app.cdc_sel,
+            filter,
+        ),
         View::Config => {
             views::config::render(frame, area, &app.state, &app.theme, app.selected, filter)
         }

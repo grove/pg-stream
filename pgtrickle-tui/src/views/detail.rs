@@ -41,6 +41,7 @@ pub fn render(
     if has_sources {
         constraints.push(Constraint::Length(8)); // Sources
     }
+    constraints.push(Constraint::Length(8)); // Change activity (always shown)
     constraints.push(Constraint::Length(10)); // Stats + efficiency
     if has_history {
         constraints.push(Constraint::Length(10)); // Rich refresh history
@@ -67,6 +68,8 @@ pub fn render(
         render_sources(frame, chunks[idx], st, state, theme);
         idx += 1;
     }
+    render_change_activity(frame, chunks[idx], st, state, theme);
+    idx += 1;
     render_stats(frame, chunks[idx], st, state, theme);
     idx += 1;
     if has_history {
@@ -129,7 +132,8 @@ fn render_properties(
 
     // Explain refresh mode (if cached)
     if let Some(explain) = state.explain_mode_cache.get(&st.name) {
-        let downgraded = explain.configured_mode != explain.effective_mode;
+        let downgraded = explain.configured_mode != explain.effective_mode
+            && explain.effective_mode != "NO_DATA";
         let mode_style = if downgraded { theme.warning } else { theme.ok };
         let mut mode_spans = vec![
             Span::styled(" Effective: ", theme.header),
@@ -504,6 +508,118 @@ fn render_error_diagnosis(
         .block(block)
         .wrap(Wrap { trim: false });
     frame.render_widget(paragraph, area);
+}
+
+fn render_change_activity(
+    frame: &mut Frame,
+    area: Rect,
+    st: &StreamTableInfo,
+    state: &AppState,
+    theme: &Theme,
+) {
+    let mut lines = Vec::new();
+
+    // Row count from pg_class (if fetched)
+    if let Some(activity) = state.change_activity_cache.get(&st.name) {
+        if activity.row_count < 0 {
+            lines.push(Line::from(vec![
+                Span::styled(" Row count:        ", theme.header),
+                Span::styled("not yet analyzed", theme.dim),
+                Span::styled("  (run ANALYZE)", theme.dim),
+            ]));
+        } else {
+            lines.push(Line::from(vec![
+                Span::styled(" Row count:        ", theme.header),
+                Span::raw(format!("~{}", format_count(activity.row_count))),
+                Span::styled("  (estimated)", theme.dim),
+            ]));
+        }
+    } else {
+        lines.push(Line::from(vec![
+            Span::styled(" Row count:        ", theme.header),
+            Span::styled("…", theme.dim),
+        ]));
+    }
+
+    // Pending changes from already-polled cdc_buffers
+    let buffers: Vec<_> = state
+        .cdc_buffers
+        .iter()
+        .filter(|b| b.stream_table == st.name)
+        .collect();
+
+    let total_pending: i64 = buffers.iter().map(|b| b.pending_rows).sum();
+
+    if !buffers.is_empty() {
+        let pending_style = if total_pending > 10_000 {
+            theme.warning
+        } else if total_pending > 0 {
+            Style::default().fg(Color::Yellow)
+        } else {
+            theme.ok
+        };
+        lines.push(Line::from(vec![
+            Span::styled(" Pending changes:  ", theme.header),
+            Span::styled(format_count(total_pending), pending_style),
+            Span::styled(format!("  across {} source(s)", buffers.len()), theme.dim),
+        ]));
+
+        for buf in &buffers {
+            let bytes_str = format_bytes(buf.buffer_bytes);
+            let row_style = if buf.pending_rows > 5_000 {
+                theme.warning
+            } else {
+                theme.dim
+            };
+            lines.push(Line::from(vec![
+                Span::raw("   "),
+                Span::styled(&buf.source_table, theme.header),
+                Span::raw(": "),
+                Span::styled(format_count(buf.pending_rows), row_style),
+                Span::raw(format!(" rows ({bytes_str})")),
+            ]));
+        }
+    } else {
+        lines.push(Line::from(vec![
+            Span::styled(" Pending changes:  ", theme.header),
+            Span::styled("0", theme.ok),
+        ]));
+    }
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(theme.border)
+        .title(Span::styled(" Change Activity ", theme.title));
+
+    let paragraph = Paragraph::new(lines).block(block);
+    frame.render_widget(paragraph, area);
+}
+
+/// Format a row count with thousand separators.
+fn format_count(n: i64) -> String {
+    if n < 1_000 {
+        return n.to_string();
+    }
+    let s = n.to_string();
+    let mut result = String::with_capacity(s.len() + s.len() / 3);
+    for (i, c) in s.chars().enumerate() {
+        if i > 0 && (s.len() - i).is_multiple_of(3) {
+            result.push(',');
+        }
+        result.push(c);
+    }
+    result
+}
+
+/// Format bytes to a human-readable string.
+fn format_bytes(bytes: i64) -> String {
+    if bytes < 1_024 {
+        format!("{bytes} B")
+    } else if bytes < 1_024 * 1_024 {
+        format!("{:.1} KB", bytes as f64 / 1_024.0)
+    } else {
+        format!("{:.1} MB", bytes as f64 / (1_024.0 * 1_024.0))
+    }
 }
 
 fn render_details(
