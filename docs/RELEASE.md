@@ -195,6 +195,7 @@ Complete these steps immediately after a release tag has been pushed and both th
 - [ ] **Bump `META.json`** — both the top-level `"version"` and the nested `"provides" → "pg_trickle" → "version"` to match
 - [ ] **Write `plans/PLAN_0_<next>_0.md`** — initial planning document for the next milestone
 - [ ] **Delete `plans/PLAN_0_<released>_0.md`** — remove the now-completed plan
+- [ ] **Wrap roadmap items** — in `ROADMAP.md`, wrap all completed items from the old release with `<details>` tags to archive them
 - [ ] **Add `## [Unreleased]` stub** to `CHANGELOG.md` above the just-released entry
 - [ ] **Create `sql/pg_trickle--<released>--<next>.sql`** — empty upgrade script stub for the next migration hop
 - [ ] **Copy `sql/archive/pg_trickle--<released>.sql` → `sql/archive/pg_trickle--<next>.sql`** — placeholder archive baseline for the next version
