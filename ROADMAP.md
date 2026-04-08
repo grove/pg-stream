@@ -3969,6 +3969,7 @@ Dependencies: None. Schema change: No.
 | UX-3 | Error message actionability audit | S | P1 |
 | UX-4 | Single-endpoint health summary function | S | P2 |
 | UX-5 | Prometheus metric completeness audit | XS | P2 |
+| UX-6 | TUI surfaces for cache_stats and health_summary | XS | P2 |
 
 **UX-1 — Template cache observability (CACHE-OBS)**
 
@@ -4016,6 +4017,22 @@ documentation. Ensure metric names follow Prometheus naming conventions
 (`pgtrickle_*` prefix, snake_case, unit suffix).
 Dependencies: None. Schema change: No.
 
+**UX-6 — TUI surfaces for cache_stats and health_summary**
+
+> **In plain terms:** The new `pgtrickle.cache_stats()` (UX-1) and
+> `pgtrickle.health_summary()` (UX-4) functions are useful in isolation but
+> are most discoverable when surfaced in the TUI. Even a read-only status
+> panel showing total STs, healthy/degraded/error counts, cache hit rate, and
+> scheduler state would make these endpoints visible to users who reach the
+> extension through `pgtrickle-tui` rather than raw SQL. Audit `pgtrickle-tui/src/`
+> to identify the lightest-weight integration point (likely a new "Health" tab
+> or an expanded "Status" panel). If TUI changes are out of scope for this
+> release, document the gap in `docs/TUI.md` so it is not silently deferred.
+
+Verify: TUI displays non-zero cache stats and a valid health JSONB row after
+at least one refresh cycle in the E2E playground environment.
+Dependencies: UX-1, UX-4. Schema change: No.
+
 ### Test Coverage
 
 | ID | Title | Effort | Priority |
@@ -4026,6 +4043,7 @@ Dependencies: None. Schema change: No.
 | TEST-4 | Property-based tests for Z-set merged delta | M | P0 |
 | TEST-5 | Light E2E eligibility audit | S | P2 |
 | TEST-6 | Three-version upgrade chain test (0.16→0.17→0.18) | S | P0 |
+| TEST-7 | dbt integration regression coverage | S | P1 |
 
 **TEST-1 — TPC-H regression baseline (TPCH-BASE)**
 Same as CORR-2. Capture known-good outputs; verify guard fires on deliberate
@@ -4069,6 +4087,21 @@ Extend upgrade E2E tests to cover: fresh install of 0.16.0, create stream
 tables, upgrade to 0.17.0, verify survival, upgrade to 0.18.0, verify
 survival + new features functional.
 Dependencies: All schema-changing items. Schema change: No.
+
+**TEST-7 — dbt integration regression coverage**
+
+> **In plain terms:** The `dbt-pgtrickle` macro package is the primary
+> adoption vector for teams using dbt, but the integration test suite in
+> `dbt-pgtrickle/integration_tests/` currently verifies only happy-path macro
+> expansion. Add regression tests covering: (a) `pgtrickle_stream_table` macro
+> with all supported materialisation strategies (`differential`, `full`, `auto`),
+> (b) incremental model compatibility, (c) `pgtrickle_status` test macro,
+> (d) teardown and recreation idempotency (drop + re-run produces identical
+> output). Run as part of `just test-dbt`.
+
+Verify: `just test-dbt` passes all new cases; idempotency test confirms
+identical stream table contents after a full `dbt run --full-refresh` cycle.
+Dependencies: None. Schema change: No.
 
 ### Conflicts & Risks
 
@@ -4138,6 +4171,8 @@ Dependencies: All schema-changing items. Schema change: No.
 - [ ] TEST-2: SQLancer crash-test oracle runs 10K+ fuzzed queries with zero panics
 - [ ] TEST-3: CDC edge case tests cover NULL PKs, composite PKs, generated columns, domain types, arrays
 - [ ] TEST-5: At least 10 tests migrated from full E2E to light E2E
+- [ ] TEST-7: dbt regression suite covers all macro strategies and teardown idempotency; `just test-dbt` passes
+- [ ] UX-6: TUI (or `docs/TUI.md` gap note) reflects `cache_stats()` and `health_summary()` availability
 - [ ] Extension upgrade path tested (`0.17.0 → 0.18.0`)
 - [ ] `just check-version-sync` passes
 
