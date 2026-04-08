@@ -100,7 +100,7 @@ SELECT pgtrickle.create_stream_table(
         SELECT p.category,
                p.name AS product_name,
                SUM(o.quantity) AS total_sold,
-               RANK() OVER (PARTITION BY p.category ORDER BY SUM(o.quantity) DESC) AS rnk
+               RANK() OVER (PARTITION BY category ORDER BY SUM(o.quantity) DESC) AS rnk
         FROM orders o
         JOIN products p ON p.id = o.product_id
         GROUP BY p.category, p.name

@@ -46,10 +46,33 @@ SELECT * FROM sales_by_region ORDER BY total_revenue DESC;
 
 ## Try it in 30 seconds — no installation needed
 
+Start a PostgreSQL 18 container with pg_trickle pre-installed and sample data loaded:
+
 ```bash
 cd playground && docker compose up -d
+```
+
+Then connect with psql:
+
+```bash
 psql postgresql://postgres:playground@localhost:5432/playground
 ```
+
+Or launch the **terminal UI** for a live monitoring dashboard:
+
+```bash
+# Install the TUI (requires Rust toolchain)
+cargo install --path pgtrickle-tui
+
+# Make sure ~/.cargo/bin is on your PATH (add to ~/.bashrc or ~/.zshrc if needed)
+export PATH="$HOME/.cargo/bin:$PATH"
+
+# Connect to the playground
+pgtrickle --url postgresql://postgres:playground@localhost:5432/playground
+```
+
+Press `1`–`9` to switch between views (Dashboard, Dependencies, Refresh Log, CDC Health, …),
+`r` to trigger a manual refresh, `/` to filter by name, and `?` for the full keybindings overlay.
 
 The [`playground/`](playground/) directory is a self-contained Docker environment with sample
 tables, pre-loaded data, and five stream tables demonstrating key pg_trickle patterns — basic

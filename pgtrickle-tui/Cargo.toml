@@ -1,6 +1,6 @@
 [package]
 name = "pgtrickle-tui"
-version = "0.13.0"
+version = "0.17.0"
 edition = "2024"
 description = "Terminal User Interface for pg_trickle stream tables"
 license = "Apache-2.0"
