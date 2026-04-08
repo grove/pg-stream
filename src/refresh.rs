@@ -4153,27 +4153,25 @@ pub fn execute_differential_refresh(
     // whether DIFFERENTIAL or FULL is cheaper for the *current* delta.
     if !should_fallback && !skip_ratio_check && total_change_count > 0 {
         let complexity = classify_query_complexity(&st.defining_query);
-        if let Some(hist) = query_refresh_history_stats(st.pgt_id) {
-            if cost_model_prefers_full(
+        if let Some(hist) = query_refresh_history_stats(st.pgt_id)
+            && cost_model_prefers_full(
                 hist.avg_ms_per_delta,
                 hist.avg_full_ms,
                 total_change_count,
                 complexity,
-            ) {
-                pgrx::debug1!(
-                    "[pg_trickle] B-4 cost model: FULL preferred for {}.{} \
-                     (est_diff={:.1}ms > est_full×margin={:.1}ms, class={:?}, Δ={})",
-                    st.pgt_schema,
-                    st.pgt_name,
-                    hist.avg_ms_per_delta
-                        * complexity.diff_cost_factor()
-                        * total_change_count as f64,
-                    hist.avg_full_ms * crate::config::pg_trickle_cost_model_safety_margin(),
-                    complexity,
-                    total_change_count,
-                );
-                should_fallback = true;
-            }
+            )
+        {
+            pgrx::debug1!(
+                "[pg_trickle] B-4 cost model: FULL preferred for {}.{} \
+                 (est_diff={:.1}ms > est_full×margin={:.1}ms, class={:?}, Δ={})",
+                st.pgt_schema,
+                st.pgt_name,
+                hist.avg_ms_per_delta * complexity.diff_cost_factor() * total_change_count as f64,
+                hist.avg_full_ms * crate::config::pg_trickle_cost_model_safety_margin(),
+                complexity,
+                total_change_count,
+            );
+            should_fallback = true;
         }
     }
 
