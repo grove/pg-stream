@@ -3496,11 +3496,11 @@ provides a 60-second tryout experience.
 
 | Item | Description | Effort | Ref |
 |------|-------------|--------|-----|
-| A2-ENR | **ENR-based transition tables.** Replace temp-table delta handoff with Ephemeral Named Relations — the trigger writes directly into an ENR tuplestore that the refresh engine reads without copying. Eliminates the INSERT/SELECT round-trip for transition data. | 12–18h | [PLAN_TRANSACTIONAL_IVM.md](plans/sql/PLAN_TRANSACTIONAL_IVM.md) §Phase 4 |
-| A2-CTR | **C-level triggers.** Replace the SQL-level `CREATE TRIGGER` with a C-level trigger function registered via `CreateTrigger()`. Reduces per-statement overhead from ~0.5ms to ~0.05ms by eliminating SPI round-trips for the trigger body. | 12–18h | [PLAN_TRANSACTIONAL_IVM.md](plans/sql/PLAN_TRANSACTIONAL_IVM.md) §Phase 4 |
-| A2-PS | **Prepared statement reuse.** Cache the delta query as a prepared statement (`SPI_prepare` + `SPI_execute_plan`) across refresh cycles within the same session. Eliminates repeated parse/plan overhead (~2–5ms per refresh for complex queries). | 8–12h | [PLAN_TRANSACTIONAL_IVM.md](plans/sql/PLAN_TRANSACTIONAL_IVM.md) §Phase 4 |
+| ~~A2-ENR~~ | ~~**ENR-based transition tables.**~~ 🚫 **Deferred post-1.0** — requires raw `pg_sys` ENR tuplestore FFI not surfaced by pgrx; carries memory-corruption and `pg_upgrade` compatibility risk. Revisit after 1.0 stabilisation. | ~~12–18h~~ | [PLAN_TRANSACTIONAL_IVM.md](plans/sql/PLAN_TRANSACTIONAL_IVM.md) §Phase 4 |
+| ~~A2-CTR~~ | ~~**C-level triggers.**~~ 🚫 **Deferred post-1.0** — requires raw `CreateTrigger()` FFI not surfaced by pgrx; carries memory-corruption and `pg_upgrade` compatibility risk. Revisit after 1.0 stabilisation. | ~~12–18h~~ | [PLAN_TRANSACTIONAL_IVM.md](plans/sql/PLAN_TRANSACTIONAL_IVM.md) §Phase 4 |
+| ~~A2-PS~~ | ~~**Prepared statement reuse.**~~ ✅ **Already shipped** — `pg_trickle.use_prepared_statements` GUC (default `true`) implemented and wired in `refresh.rs`; parse/plan overhead eliminated on steady-state workloads. | ~~8–12h~~ | [PLAN_TRANSACTIONAL_IVM.md](plans/sql/PLAN_TRANSACTIONAL_IVM.md) §Phase 4 |
 
-> **A2 subtotal: ~32–48 hours**
+> **A2 subtotal: 0h remaining** (A2-PS shipped; A2-ENR + A2-CTR deferred post-1.0)
 
 ### `ROWS FROM()` Support (A8)
 
@@ -3652,9 +3652,9 @@ provides a 60-second tryout experience.
 **Exit criteria:**
 - [ ] B-4: Cost-based strategy selector trained on per-ST history; cold-start fallback to fixed threshold; benchmarked on mixed workloads (scan, join, aggregate); `refresh_strategy` GUC respected
 - [ ] A-2-COL: CDC trigger emits `changed_columns` bitmask; delta-scan filters irrelevant rows; wide-table UPDATE benchmark shows ≥50% delta reduction; aggregate correction optimization tested
-- [ ] A2-ENR: ENR-based transition tables eliminate temp-table round-trip; IMMEDIATE mode latency reduced vs SQL-trigger baseline
-- [ ] A2-CTR: C-level triggers registered; per-statement overhead < 0.1ms; existing IMMEDIATE mode tests pass
-- [ ] A2-PS: Prepared statement reuse across refresh cycles; parse/plan overhead eliminated on steady-state workloads
+- ~~[ ] A2-ENR~~: 🚫 Deferred post-1.0 — requires raw `pg_sys` ENR tuplestore FFI (memory-corruption risk); revisit after 1.0 stabilisation
+- ~~[ ] A2-CTR~~: 🚫 Deferred post-1.0 — requires raw `CreateTrigger()` C FFI (memory-corruption risk); revisit after 1.0 stabilisation
+- [x] A2-PS: ✅ Already shipped — `pg_trickle.use_prepared_statements` GUC (default `true`) wired in `refresh.rs`; parse/plan overhead eliminated on steady-state workloads
 - [x] A8: `ROWS FROM()` with multiple SRFs accepted in defining queries; E2E tests cover INSERT/UPDATE/DELETE propagation
 - [ ] SQLANCER: Fuzzing environment operational; crash-test oracle finds zero panics on seed corpus; equivalence oracle validates DIFFERENTIAL ≡ FULL for fuzzed queries; stateful DML fuzzing runs clean for 10K+ mutation sequences
 - [x] C-2: Incremental DAG rebuild reduces DDL-triggered latency spike to < 5ms at 100+ STs; ring buffer overflow falls back to full rebuild; no correctness regressions
