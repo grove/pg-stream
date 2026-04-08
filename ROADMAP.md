@@ -1,8 +1,8 @@
 # pg_trickle — Project Roadmap
 
 > **Last updated:** 2026-04-08
-> **Latest release:** 0.16.0 (2026-04-06)
-> **Current milestone:** v0.17.0 — Query Intelligence & Stability
+> **Latest release:** 0.17.0 (2026-04-08)
+> **Current milestone:** v0.18.0 — Hardening & Delta Performance
 
 For a concise description of what pg_trickle is and why it exists, read
 [ESSENCE.md](ESSENCE.md) — it explains the core problem (full `REFRESH
@@ -74,7 +74,7 @@ from the v0.1.x series to 1.0 and beyond.
 | v0.14.0 | Tiered scheduling, UNLOGGED buffers & diagnostics | ✅ Released |
 | v0.15.0 | External test suites & integration | ✅ Released |
 | **v0.16.0** | **Performance & refresh optimization** | **✅ Released** |
-| **v0.17.0** | **Query intelligence & stability** | **🚧 In Progress** |
+| **v0.17.0** | **Query intelligence & stability** | **✅ Released** |
 | v0.18.0 | Hardening & delta performance | Planned |
 | v0.19.0 | PostgreSQL 19 compatibility | Planned |
 | v1.0.0 | Stable release | Planned |
@@ -3441,6 +3441,8 @@ coverage gaps to validate these new paths.
 
 ## v0.17.0 — Query Intelligence & Stability
 
+**Status: Released (2026-04-08).**
+
 **Goal:** Make the refresh engine smarter, prove correctness through automated
 fuzzing, harden for scale, and prepare for adoption. Cost-based strategy
 selection replaces the fixed DIFF/FULL threshold, columnar change tracking
@@ -3668,7 +3670,7 @@ provides a 60-second tryout experience.
 - [x] DOC-FAQ-NEW: New User FAQ section with 15 keyword-rich entries added at top of FAQ.md
 - [x] DOC-VERIFY: `scripts/verify_install.sql` checks shared_preload_libraries, extension, scheduler, GUCs, and runs end-to-end stream table cycle
 - [x] DOC-STUBS: Research stubs already use `{{#include}}` directives pointing to substantial content (923 + 1232 lines)
-- [ ] Extension upgrade path tested (`0.16.0 → 0.17.0`)
+- [x] Extension upgrade path tested (`0.16.0 → 0.17.0`)
 
 ---
 

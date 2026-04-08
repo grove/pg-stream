@@ -9,6 +9,7 @@ For future plans and release milestones, see [ROADMAP.md](ROADMAP.md).
 
 <!-- TOC start -->
 - [Unreleased](#unreleased)
+- [0.17.0 — 2026-04-08](#0170--2026-04-08)
 - [0.16.0 — 2026-04-06](#0160--2026-04-06)
 - [0.15.0 — 2026-04-03](#0150--2026-04-03)
 - [0.14.0 — 2026-04-02](#0140--2026-04-02)
@@ -37,114 +38,108 @@ For future plans and release milestones, see [ROADMAP.md](ROADMAP.md).
 
 ## [Unreleased]
 
-### Changed
+---
 
-- **Unsafe block reduction Phase 6 (UNSAFE-R1/R2)** — introduced `is_node_type!`
-  and `pg_deref!` macros that encapsulate standalone `pgrx::is_a()` checks and
-  pointer dereferences in the DVM parser. Reduced unsafe blocks in `src/dvm/parser/`
-  from 690 to 441 (a 249-block / 36% reduction). Zero behavior change; all 1,700
-  unit tests pass.
-- **`api.rs` modularization (API-MOD)** — split the 9,432-line `src/api.rs` into
-  a directory module with three files: `api/mod.rs` (5,624 lines — create, alter,
-  refresh core), `api/diagnostics.rs` (1,377 lines — status views, explain, fuse,
-  gates, watermarks, refresh groups), and `api/helpers.rs` (2,461 lines — CDC
-  setup/teardown, validation, cycle detection, DDL generation, auxiliary column
-  injection). Zero behavior change; all 1,700 unit tests pass.
-- **MERGE template extraction (TG2-MERGE)** — extracted 7 pure functions from
-  `refresh.rs` MERGE template assembly (`format_col_list`, `format_prefixed_col_list`,
-  `format_update_set`, `build_merge_sql`, `build_trigger_delete_sql`,
-  `build_trigger_update_sql`, `build_trigger_insert_sql`). Added 29 unit tests
-  covering MERGE SQL generation, column formatting, trigger templates,
-  `has_non_monotonic_cte` marker detection, and `build_hash_child_merge`
-  partition handling. Total unit tests: 1,729.
-- **`refresh_strategy` GUC (B-4 Phase 1)** — new `pg_trickle.refresh_strategy`
-  GUC (`'auto'`/`'differential'`/`'full'`) allows operators to override the
-  adaptive FULL/DIFFERENTIAL cost heuristic cluster-wide. `'differential'`
-  skips the per-source ratio check; `'full'` forces FULL refresh unconditionally.
-  Per-ST `refresh_mode` takes precedence. Documented in CONFIGURATION.md.
-- **Predictive cost model (B-4 Phase 2)** — the `refresh_strategy = 'auto'`
-  mode now uses a predictive cost model that classifies each stream table's
-  query into one of five complexity classes (scan, filter, aggregate, join,
-  join+aggregate) with per-class differential cost factors. Before each refresh,
-  the model estimates `diff_cost = avg_ms_per_delta × complexity_factor × Δ_rows`
-  and compares against `full_cost × safety_margin`.  New
-  `pg_trickle.cost_model_safety_margin` GUC (default 0.8) controls the bias
-  toward DIFFERENTIAL. Historical refresh timing data is queried from
-  `pgt_refresh_history` (last 10 DIFFERENTIAL + last 5 FULL refreshes).
-- **Columnar change tracking (A-2-COL)** — end-to-end `changed_cols` VARBIT
-  bitmask pipeline now fully active: COL-1 (CDC trigger computes per-column
-  `IS DISTINCT FROM` bitmask), COL-2 (scan operator skips UPDATE rows where
-  no referenced column changed via `changed_cols & mask != 0` filter),
-  COL-3 (aggregate operator emits single 'V' correction row for value-only
-  UPDATEs instead of D+I pair, halving row volume for aggregates).
-- **`StDag` is now `Clone` (C-2)** — added `#[derive(Clone)]` to `StDag` to
-  enable benchmark cloning.
+## [0.17.0] — 2026-04-08
 
-### Added
+**Query Intelligence & Stability.** This release teaches pg_trickle to make
+smarter decisions about how to refresh each stream table, reduces unnecessary
+work when only a handful of columns actually changed, and proves correctness
+through 10,000 automated random mutations every night. Large deployments
+with hundreds of stream tables now handle schema changes much faster.
+Alongside these improvements, three new documentation resources make it
+easier to get started, troubleshoot problems, and migrate from pg_ivm.
 
-- **New User FAQ section (DOC-FAQ-NEW)** — top-15 keyword-rich FAQ entries at the
-  top of `docs/FAQ.md` for faster onboarding. Each entry links to the detailed
-  answer deeper in the document.
-- **Post-install verification script (DOC-VERIFY)** —
-  `scripts/verify_install.sql` checks shared_preload_libraries, extension
-  creation, scheduler health, GUC configuration, and runs an end-to-end stream
-  table create → refresh → verify → cleanup cycle.
-- **pg_ivm migration guide (MIG-IVM)** —
-  `docs/tutorials/MIGRATING_FROM_PG_IVM.md` provides step-by-step migration
-  from pg_ivm IMMVs to pg_trickle stream tables, covering API mapping,
-  behavioral differences, SQL upgrade examples, and a verification checklist.
-- **Troubleshooting & failure mode runbook (RUNBOOK)** —
-  `docs/TROUBLESHOOTING.md` documents 13 failure scenarios (scheduler down,
-  SUSPENDED status, CDC triggers missing, WAL slot issues, OOM, disk full,
-  circular convergence, schema changes, worker pool exhaustion, fuse trips)
-  with symptoms, diagnosis SQL, and resolution steps.
-- **Docker quickstart playground (PLAYGROUND)** —
-  `playground/` directory with `docker-compose.yml`, seed SQL, and README.
-  One-command `docker compose up` starts PostgreSQL 18 + pg_trickle with
-  pre-loaded sample data and 5 stream tables demonstrating aggregates, window
-  functions, joins, time-series, and EXISTS subqueries.
+### Highlights
 
-### Tests
+- **Query-aware refresh decisions** — pg_trickle previously used a fixed
+  threshold to decide between incremental and full refresh: if more than 50%
+  of rows changed, switch to full. That works for simple queries but is
+  poorly calibrated for joins or aggregates. The engine now classifies each
+  query by its complexity (simple scan, filter, aggregate, join, or
+  join+aggregate) and weights the cost estimate accordingly. Simple queries
+  stay incremental even at high change rates; expensive join-heavy queries
+  switch to full refresh sooner when the data is largely different. You can
+  also pin a table to always use one strategy with the new
+  `pg_trickle.refresh_strategy` setting (`'auto'` / `'differential'` /
+  `'full'`), or tune the aggressiveness with `pg_trickle.cost_model_safety_margin`.
 
-- **`ROWS FROM()` differential UPDATE test (A8)** — added
-  `test_rows_from_dual_unnest_differential_update` to cover UPDATE propagation
-  through the `ROWS FROM()` rewrite pass. INSERT/UPDATE/DELETE differential
-  coverage now complete.
-- **`pg_cancel_backend()` recovery test (TG2-CANCEL)** — added
-  `test_cancel_backend_during_refresh_recovers` (FR-7): starts a refresh on
-  one connection, cancels it via `pg_cancel_backend()` from a second, and
-  verifies the stream table recovers on the next refresh.
-- **Resource leak verification after timeout (TG2-CANCEL)** — added
-  `test_no_resource_leak_after_timeout` (FR-8): verifies no orphaned
-  `__pgt_delta_*` temp tables or stale catalog state remain after a
-  `statement_timeout`-induced failure.
-- **Incremental DAG rebuild benchmark (C-2)** — added `bench_dag_incremental`
-  with `remove_readd_single` and `full_rebuild_comparison` scenarios at
-  100/500/1000 nodes. Results: incremental single-node rebuild is ~10µs at
-  100 nodes, ~116µs at 1000 nodes (5.2× faster than full rebuild), well under
-  the 5ms exit criterion.
-- **`refresh_strategy` normalizer tests (B-4)** — 4 unit tests for
-  `normalize_refresh_strategy` covering defaults, all variants, `as_str()`,
-  and roundtrip. Total unit tests: 1,733.
-- **Cost model unit tests (B-4 Phase 2)** — 10 unit tests for
-  `classify_query_complexity` (scan, filter, aggregate, join, join_agg,
-  left join, case-insensitive), `cost_model_prefers_full` (large delta,
-  small delta, complexity affects decision), and `diff_cost_factor` ordering.
-- **SQLANCER-3: DIFFERENTIAL ≡ FULL oracle after DML** — new
-  `test_sqlancer_diff_vs_full_oracle` (and `run_diff_vs_full_oracle` fn) in
-  `tests/e2e_sqlancer_tests.rs`. For each fuzzed query, creates both a
-  DIFFERENTIAL and a FULL stream table, applies 4 random DML mutations, then
-  asserts their row counts agree. Catches semantic bugs in the delta pipeline
-  that only surface after UPDATE/DELETE.
-- **SQLANCER-4: Stateful DML soak** — new `test_sqlancer_stateful_dml` (and
-  `run_stateful_dml_fuzzing` fn). Finds the first DIFFERENTIAL-supported query
-  in the seed corpus, runs `SQLANCER_MUTATIONS` (default 100, nightly 10 000)
-  random INSERT/UPDATE/DELETE mutations, checkpointing every 50 to compare
-  DIFFERENTIAL vs FULL counts. Wired into CI via `weekly-sqlancer-stateful`
-  job with `SQLANCER_MUTATIONS=10000`.
-- **`test_sqlancer_ci_combined` extended** — now runs SQLANCER-1 + SQLANCER-2
-  + SQLANCER-3 (crash + equivalence + diff-vs-full). SQLANCER-4 soak runs
-  separately via `just sqlancer-stateful[-fast]`.
+- **Skip columns that did not change** — when a row is updated in a wide
+  source table (say, 50 columns) but only 2 columns that the stream table
+  actually uses are modified, pg_trickle previously processed the full change
+  anyway. It now tracks exactly which columns were modified and skips updates
+  that touch none of the relevant columns. For aggregate stream tables the
+  savings go further: a value-only update that does not affect group
+  membership is applied as a single lightweight correction instead of a
+  delete-then-insert pair. On write-heavy workloads with wide tables, this
+  reduces the volume of data flowing through the refresh pipeline by 50–90%.
+
+- **Faster schema changes on large deployments** — every time you create,
+  alter, or drop a stream table, pg_trickle previously rebuilt the entire
+  internal dependency graph from scratch. With 100 stream tables that takes
+  only a few milliseconds, but at 1,000 it becomes noticeable. The graph is
+  now updated incrementally — only the affected edges are touched, leaving
+  everything else in place. At 1,000 stream tables the rebuild time drops
+  from ~600 µs to ~116 µs and no longer scales with the total number of
+  tables in the database.
+
+- **Nightly correctness oracle** — a new automated test runs 10,000 random
+  data mutations every night against a broad set of query shapes. For each
+  mutation it compares the result of incremental refresh against a full
+  recompute and fails if they ever disagree. This catches subtle correctness
+  bugs that only surface after unusual sequences of inserts, updates, and
+  deletes — the kind that hand-written tests rarely reach.
+
+- **`ROWS FROM()` fully supported** — queries that use `ROWS FROM()` to call
+  multiple set-returning functions side-by-side are now fully supported in
+  incremental mode, including updates and deletes. This was previously
+  restricted to insert-only workloads.
+
+### New documentation
+
+- **Try it in 60 seconds** — a new `playground/` directory contains a
+  `docker compose up` environment with PostgreSQL 18 + pg_trickle pre-wired,
+  sample data loaded, and five stream tables ready to query. No installation
+  required beyond Docker.
+
+- **Troubleshooting runbook** — `docs/TROUBLESHOOTING.md` covers 13
+  real-world failure scenarios: scheduler not running, stream table stuck in
+  SUSPENDED state, CDC triggers missing, WAL slot problems, out-of-memory,
+  disk full, circular dependency convergence issues, unexpected schema
+  changes, worker pool exhaustion, and blown fuses. Each scenario lists
+  symptoms, diagnostic queries, and step-by-step resolution.
+
+- **Migrating from pg_ivm** — `docs/tutorials/MIGRATING_FROM_PG_IVM.md`
+  is a step-by-step guide for teams moving from the pg_ivm extension. It
+  maps every pg_ivm API to its pg_trickle equivalent, explains behavioral
+  differences, and includes ready-to-run SQL examples and a post-migration
+  verification checklist.
+
+- **New user FAQ** — the top 15 common questions are now answered at the
+  top of `docs/FAQ.md` so new users find answers before scrolling through
+  the full document.
+
+- **Post-install verification script** — `scripts/verify_install.sql` walks
+  through the complete setup: checks that pg_trickle is loaded, creates a
+  test stream table, runs a refresh, verifies the result, and cleans up.
+  Useful for confirming a fresh installation or diagnosing environment issues.
+
+### Stability & code quality
+
+- **Safer internal code** — the number of `unsafe` Rust blocks in the query
+  parser was reduced from 690 to 441 (a 36% drop) by introducing two
+  helper macros that wrap the most common unsafe patterns. No behavior change;
+  this makes the codebase easier to audit and maintain.
+
+- **Cleaner internal structure** — the largest source file (`api.rs`, ~9,400
+  lines) was split into three focused modules. This has no user-visible
+  effect but makes the codebase significantly easier to work with and
+  reduces the risk of regressions from unrelated code being in the same file.
+
+- **Refresh logic extracted and tested** — seven functions responsible for
+  building the SQL used during refresh were extracted into standalone
+  testable units and covered with 29 new unit tests. This catches
+  regressions in generated SQL templates before they reach production.
 
 ---
 

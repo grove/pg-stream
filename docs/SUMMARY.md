@@ -25,6 +25,8 @@
 - [CloudNativePG / Kubernetes](integrations/cloudnativepg.md)
 - [Prometheus & Grafana](integrations/prometheus.md)
 - [PgBouncer & Connection Poolers](integrations/pgbouncer.md)
+- [Flyway & Liquibase](integrations/flyway-liquibase.md)
+- [ORM Integration](integrations/orm.md)
 
 ---
 
