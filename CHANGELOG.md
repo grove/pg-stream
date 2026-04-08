@@ -44,6 +44,12 @@ For future plans and release milestones, see [ROADMAP.md](ROADMAP.md).
   pointer dereferences in the DVM parser. Reduced unsafe blocks in `src/dvm/parser/`
   from 690 to 441 (a 249-block / 36% reduction). Zero behavior change; all 1,700
   unit tests pass.
+- **`api.rs` modularization (API-MOD)** — split the 9,432-line `src/api.rs` into
+  a directory module with three files: `api/mod.rs` (5,624 lines — create, alter,
+  refresh core), `api/diagnostics.rs` (1,377 lines — status views, explain, fuse,
+  gates, watermarks, refresh groups), and `api/helpers.rs` (2,461 lines — CDC
+  setup/teardown, validation, cycle detection, DDL generation, auxiliary column
+  injection). Zero behavior change; all 1,700 unit tests pass.
 
 ### Added
 
