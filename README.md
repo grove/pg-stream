@@ -48,6 +48,11 @@ SELECT * FROM sales_by_region ORDER BY total_revenue DESC;
 
 ```bash
 cd playground && docker compose up -d
+```
+
+Then connect with psql:
+
+```bash
 psql postgresql://postgres:playground@localhost:5432/playground
 ```
 
