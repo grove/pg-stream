@@ -16,7 +16,33 @@
 
 ## Stream Tables for PostgreSQL 18
 
-pg_trickle brings declarative, automatically-refreshing materialized views to PostgreSQL, inspired by the [DBSP](https://arxiv.org/abs/2203.16684) differential dataflow framework ([comparison](docs/research/DBSP_COMPARISON.md)). Define a SQL query and a schedule bound (or cron schedule); the extension handles the rest.
+pg_trickle brings declarative, automatically-refreshing materialized views to PostgreSQL, inspired by the [DBSP](https://arxiv.org/abs/2203.16684) differential dataflow framework ([comparison](docs/research/DBSP_COMPARISON.md)). Define a SQL query and a schedule; the extension handles the rest.
+
+A **stream table** is a table defined by a SQL query that stays up to date automatically as the underlying data changes. You write to your base tables normally — `INSERT`, `UPDATE`, `DELETE` — and pg_trickle propagates the changes downstream. No polling, no manual refresh calls, no application-level orchestration.
+
+The key difference from `REFRESH MATERIALIZED VIEW` is that pg_trickle uses **Incremental View Maintenance (IVM)**: when a row changes, only the effect of that row on the query result is computed. If you insert one row into a ten-million-row table, pg_trickle processes one row — not ten million. At high change rates it falls back to a full recompute automatically; at low change rates (the common case) the speedup is substantial. The [TPC-H benchmarks](#tpc-h-validation-22-queries-sf001) show 5–90× measured improvements across the 22 standard analytical queries at a 1% change rate.
+
+Stream tables support the full range of SQL — `GROUP BY`, `JOIN`, `WINDOW`, `EXISTS`, `WITH RECURSIVE`, CTEs, LATERAL, subqueries — and can depend on other stream tables, forming a DAG that is refreshed in topological order. Changes propagate through the entire graph automatically.
+
+```sql
+-- Create a stream table that stays up to date with no manual work
+SELECT pgtrickle.create_stream_table(
+    name     => 'sales_by_region',
+    query    => $$
+        SELECT c.region,
+               COUNT(*)                   AS order_count,
+               SUM(o.quantity * p.price)  AS total_revenue
+        FROM orders o
+        JOIN customers c ON c.id = o.customer_id
+        JOIN products  p ON p.id = o.product_id
+        GROUP BY c.region
+    $$,
+    schedule => '1s'
+);
+
+-- Query it like any table — always fresh
+SELECT * FROM sales_by_region ORDER BY total_revenue DESC;
+```
 
 ### Try it in 30 seconds — no installation needed
 
