@@ -122,8 +122,42 @@ SELECT * FROM my_experiment;
 docker compose down -v
 ```
 
+## Terminal UI
+
+For a live monitoring dashboard, use the `pgtrickle` TUI:
+
+```bash
+# Install (once, requires Rust toolchain)
+cargo install --path ../pgtrickle-tui
+
+# Make sure ~/.cargo/bin is on your PATH (add to ~/.bashrc or ~/.zshrc if needed)
+export PATH="$HOME/.cargo/bin:$PATH"
+
+# Launch against the playground
+pgtrickle --url postgresql://postgres:playground@localhost:5432/playground
+```
+
+This opens a full-screen interactive dashboard that auto-refreshes every 2 seconds.
+Switch views with the number keys or letters:
+
+| Key | View |
+|-----|------|
+| `1` | Dashboard — all stream tables with status and staleness |
+| `2` | Detail — deep dive into the selected table |
+| `3` | Dependencies — ASCII dependency tree |
+| `4` | Refresh Log — timeline of recent refreshes |
+| `5` | Diagnostics — recommended refresh mode per table |
+| `6` | CDC Health — change buffer sizes |
+| `8` | Health Checks — extension health summary |
+| `d` | Delta Inspector — auto-generated delta SQL |
+
+Useful keys: `r` refresh selected, `R` refresh all, `/` filter, `?` help, `q` quit.
+
+See the full [TUI User Guide](../docs/TUI.md) for all views, keyboard shortcuts, and CLI subcommands.
+
 ## Next Steps
 
 - [Getting Started Guide](../docs/GETTING_STARTED.md) — full tutorial with org-chart example
 - [SQL Reference](../docs/SQL_REFERENCE.md) — all functions and configuration
 - [Patterns](../docs/PATTERNS.md) — best-practice patterns for production use
+- [TUI User Guide](../docs/TUI.md) — terminal UI reference
