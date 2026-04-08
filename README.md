@@ -46,6 +46,8 @@ SELECT * FROM sales_by_region ORDER BY total_revenue DESC;
 
 ## Try it in 30 seconds — no installation needed
 
+Start a PostgreSQL 18 container with pg_trickle pre-installed and sample data loaded:
+
 ```bash
 cd playground && docker compose up -d
 ```
