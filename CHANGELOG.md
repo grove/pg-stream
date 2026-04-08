@@ -50,6 +50,13 @@ For future plans and release milestones, see [ROADMAP.md](ROADMAP.md).
   gates, watermarks, refresh groups), and `api/helpers.rs` (2,461 lines — CDC
   setup/teardown, validation, cycle detection, DDL generation, auxiliary column
   injection). Zero behavior change; all 1,700 unit tests pass.
+- **MERGE template extraction (TG2-MERGE)** — extracted 7 pure functions from
+  `refresh.rs` MERGE template assembly (`format_col_list`, `format_prefixed_col_list`,
+  `format_update_set`, `build_merge_sql`, `build_trigger_delete_sql`,
+  `build_trigger_update_sql`, `build_trigger_insert_sql`). Added 29 unit tests
+  covering MERGE SQL generation, column formatting, trigger templates,
+  `has_non_monotonic_cte` marker detection, and `build_hash_child_merge`
+  partition handling. Total unit tests: 1,729.
 
 ### Added
 

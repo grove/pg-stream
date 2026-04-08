@@ -3421,7 +3421,7 @@ coverage gaps to validate these new paths.
 - [x] TG2-WIN: Window function DVM execution tests cover ROW_NUMBER, RANK, DENSE_RANK, LAG/LEAD across INSERT/UPDATE/DELETE
 - [x] TG2-JOIN: Join multi-cycle tests cover INNER/LEFT/FULL JOIN with UPDATE and DELETE propagation; no silent data loss
 - [x] TG2-EQUIV: Differential ≡ Full equivalence validated for joins, aggregates, and window functions
-- [ ] ~~TG2-MERGE: refresh.rs MERGE template generation has unit test coverage~~ — deferred to v0.17.0
+- [x] TG2-MERGE: refresh.rs MERGE template generation has unit test coverage (completed in v0.17.0)
 - [ ] ~~TG2-CANCEL: Timeout and cancellation during refresh tested; no resource leaks~~ — deferred to v0.17.0
 - [x] TG2-SCHEMA: Source table type changes and column renames tested end-to-end
 - [x] BENCH-CI: Performance regression CI runs on every PR; 10% regression threshold blocks merge; scenario coverage includes scan/filter/aggregate/join/window/CTE/TopK/SemiJoin/AntiJoin

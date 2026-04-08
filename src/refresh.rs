@@ -1907,6 +1907,147 @@ fn build_append_only_insert_sql(schema: &str, name: &str, merge_sql: &str) -> St
     )
 }
 
+// ── TG2-MERGE: Extracted pure template builders ─────────────────────
+//
+// These functions are the core MERGE/DML template assembly logic, extracted
+// from prewarm_merge_cache() and execute_differential_refresh() so they can
+// be unit-tested without a database.
+
+/// Format a quoted column list: `"col1", "col2", "col3"`.
+fn format_col_list(user_cols: &[String]) -> String {
+    user_cols
+        .iter()
+        .map(|c| format!("\"{}\"", c.replace('"', "\"\"")))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Format a prefixed quoted column list: `d."col1", d."col2"`.
+fn format_prefixed_col_list(prefix: &str, user_cols: &[String]) -> String {
+    user_cols
+        .iter()
+        .map(|c| format!("{prefix}.\"{}\"", c.replace('"', "\"\"")))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Format an UPDATE SET clause: `"col1" = d."col1", "col2" = d."col2"`.
+fn format_update_set(user_cols: &[String]) -> String {
+    user_cols
+        .iter()
+        .map(|c| {
+            let qc = format!("\"{}\"", c.replace('"', "\"\""));
+            format!("{qc} = d.{qc}")
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Build the core MERGE SQL template for differential refresh.
+///
+/// This is the primary delta-application statement: it merges incoming
+/// delta rows (with `__pgt_action` = 'I' or 'D') into the stream table,
+/// performing DELETE, UPDATE, or INSERT as appropriate.
+///
+/// Extracted as a pure function for unit testability (TG2-MERGE).
+fn build_merge_sql(
+    quoted_table: &str,
+    using_clause: &str,
+    user_cols: &[String],
+    has_partition_key: bool,
+) -> String {
+    let user_col_list = format_col_list(user_cols);
+    let d_user_col_list = format_prefixed_col_list("d", user_cols);
+    let update_set_clause = format_update_set(user_cols);
+    let is_distinct_clause = build_is_distinct_clause(user_cols);
+
+    format!(
+        "MERGE INTO {quoted_table} AS st \
+         USING {using_clause} AS d \
+         ON st.__pgt_row_id = d.__pgt_row_id{part} \
+         WHEN MATCHED AND d.__pgt_action = 'D' THEN DELETE \
+         WHEN MATCHED AND d.__pgt_action = 'I' AND ({is_distinct_clause}) THEN \
+           UPDATE SET {update_set_clause} \
+         WHEN NOT MATCHED AND d.__pgt_action = 'I' THEN \
+           INSERT (__pgt_row_id, {user_col_list}) \
+           VALUES (d.__pgt_row_id, {d_user_col_list})",
+        part = if has_partition_key {
+            " __PGT_PART_PRED__"
+        } else {
+            ""
+        },
+    )
+}
+
+/// Build the trigger-path DELETE template.
+///
+/// For keyless sources, uses counted DELETE via ROW_NUMBER to avoid
+/// removing all rows with a matching row_id. For keyed sources, uses
+/// a simple equi-join DELETE.
+fn build_trigger_delete_sql(quoted_table: &str, pgt_id: i64, use_keyless: bool) -> String {
+    if use_keyless {
+        build_keyless_delete_template(quoted_table, pgt_id)
+    } else {
+        format!(
+            "DELETE FROM {quoted_table} AS st \
+             USING __pgt_delta_{pgt_id} AS d \
+             WHERE st.__pgt_row_id = d.__pgt_row_id \
+               AND d.__pgt_action = 'D'",
+        )
+    }
+}
+
+/// Build the trigger-path UPDATE template.
+///
+/// Updates existing rows where the delta action is 'I' and values changed
+/// (IS DISTINCT FROM guard prevents no-op writes).
+fn build_trigger_update_sql(quoted_table: &str, pgt_id: i64, user_cols: &[String]) -> String {
+    let update_set_clause = format_update_set(user_cols);
+    let is_distinct_clause = build_is_distinct_clause(user_cols);
+    format!(
+        "UPDATE {quoted_table} AS st \
+         SET {update_set_clause} \
+         FROM __pgt_delta_{pgt_id} AS d \
+         WHERE st.__pgt_row_id = d.__pgt_row_id \
+           AND d.__pgt_action = 'I' \
+           AND ({is_distinct_clause})",
+    )
+}
+
+/// Build the trigger-path INSERT template.
+///
+/// For keyless sources, uses plain INSERT (no NOT EXISTS check since
+/// duplicate row_ids are expected). For keyed sources, uses NOT EXISTS
+/// to avoid inserting rows that already exist in the stream table.
+fn build_trigger_insert_sql(
+    quoted_table: &str,
+    pgt_id: i64,
+    user_cols: &[String],
+    use_keyless: bool,
+) -> String {
+    let user_col_list = format_col_list(user_cols);
+    let d_user_col_list = format_prefixed_col_list("d", user_cols);
+    if use_keyless {
+        format!(
+            "INSERT INTO {quoted_table} (__pgt_row_id, {user_col_list}) \
+             SELECT d.__pgt_row_id, {d_user_col_list} \
+             FROM __pgt_delta_{pgt_id} AS d \
+             WHERE d.__pgt_action = 'I'",
+        )
+    } else {
+        format!(
+            "INSERT INTO {quoted_table} (__pgt_row_id, {user_col_list}) \
+             SELECT d.__pgt_row_id, {d_user_col_list} \
+             FROM __pgt_delta_{pgt_id} AS d \
+             WHERE d.__pgt_action = 'I' \
+               AND NOT EXISTS (\
+                 SELECT 1 FROM {quoted_table} AS st \
+                 WHERE st.__pgt_row_id = d.__pgt_row_id\
+               )",
+        )
+    }
+}
+
 /// Pre-warm the delta SQL + MERGE template caches for a stream table.
 ///
 /// Called after `create_stream_table()` to avoid a cold-start penalty on
@@ -1965,26 +2106,7 @@ pub fn prewarm_merge_cache(st: &StreamTableMeta) {
         name.replace('"', "\"\""),
     );
 
-    let user_col_list: String = user_cols
-        .iter()
-        .map(|c| format!("\"{}\"", c.replace('"', "\"\"")))
-        .collect::<Vec<_>>()
-        .join(", ");
-
-    let d_user_col_list: String = user_cols
-        .iter()
-        .map(|c| format!("d.\"{}\"", c.replace('"', "\"\"")))
-        .collect::<Vec<_>>()
-        .join(", ");
-
-    let update_set_clause: String = user_cols
-        .iter()
-        .map(|c| {
-            let qc = format!("\"{}\"", c.replace('"', "\"\""));
-            format!("{qc} = d.{qc}")
-        })
-        .collect::<Vec<_>>()
-        .join(", ");
+    let user_col_list = format_col_list(user_cols);
 
     let delta_sql_template =
         dvm::get_delta_sql_template(st.pgt_id).unwrap_or(delta_result.delta_sql);
@@ -2019,24 +2141,11 @@ pub fn prewarm_merge_cache(st: &StreamTableMeta) {
         build_weight_agg_using(&delta_sql_template, &user_col_list)
     };
 
-    // B-1: IS DISTINCT FROM guard to skip no-op UPDATEs.
-    let is_distinct_clause: String = build_is_distinct_clause(user_cols);
-
-    let merge_template = format!(
-        "MERGE INTO {quoted_table} AS st \
-         USING {using_clause} AS d \
-         ON st.__pgt_row_id = d.__pgt_row_id{part_pred_placeholder} \
-         WHEN MATCHED AND d.__pgt_action = 'D' THEN DELETE \
-         WHEN MATCHED AND d.__pgt_action = 'I' AND ({is_distinct_clause}) THEN \
-           UPDATE SET {update_set_clause} \
-         WHEN NOT MATCHED AND d.__pgt_action = 'I' THEN \
-           INSERT (__pgt_row_id, {user_col_list}) \
-           VALUES (d.__pgt_row_id, {d_user_col_list})",
-        part_pred_placeholder = if st.st_partition_key.is_some() {
-            " __PGT_PART_PRED__"
-        } else {
-            ""
-        },
+    let merge_template = build_merge_sql(
+        &quoted_table,
+        &using_clause,
+        user_cols,
+        st.st_partition_key.is_some(),
     );
 
     // Build cleanup template.
@@ -2067,17 +2176,8 @@ pub fn prewarm_merge_cache(st: &StreamTableMeta) {
     // __pgt_row_id values are expected. The UPDATE step is a no-op
     // because the scan-level net counting decomposes updates into
     // separate D + I rows.
-    let trigger_delete_template = if st.has_keyless_source {
-        build_keyless_delete_template(&quoted_table, st.pgt_id)
-    } else {
-        format!(
-            "DELETE FROM {quoted_table} AS st \
-             USING __pgt_delta_{pgt_id} AS d \
-             WHERE st.__pgt_row_id = d.__pgt_row_id \
-               AND d.__pgt_action = 'D'",
-            pgt_id = st.pgt_id,
-        )
-    };
+    let trigger_delete_template =
+        build_trigger_delete_sql(&quoted_table, st.pgt_id, st.has_keyless_source);
 
     // EC-06: For keyless sources, the scan-level delta decomposes UPDATEs
     // into D+I pairs (different content hashes), so the UPDATE template
@@ -2085,39 +2185,10 @@ pub fn prewarm_merge_cache(st: &StreamTableMeta) {
     // the aggregate delta produces 'I' actions for changed groups that
     // need real UPDATEs. Using the normal UPDATE template handles both
     // cases correctly.
-    let trigger_update_template = format!(
-        "UPDATE {quoted_table} AS st \
-         SET {update_set_clause} \
-         FROM __pgt_delta_{pgt_id} AS d \
-         WHERE st.__pgt_row_id = d.__pgt_row_id \
-           AND d.__pgt_action = 'I' \
-           AND ({is_distinct_clause})",
-        pgt_id = st.pgt_id,
-    );
+    let trigger_update_template = build_trigger_update_sql(&quoted_table, st.pgt_id, user_cols);
 
-    let trigger_insert_template = if st.has_keyless_source {
-        // Plain INSERT — no NOT EXISTS check since duplicate row_ids
-        // are expected for keyless sources.
-        format!(
-            "INSERT INTO {quoted_table} (__pgt_row_id, {user_col_list}) \
-             SELECT d.__pgt_row_id, {d_user_col_list} \
-             FROM __pgt_delta_{pgt_id} AS d \
-             WHERE d.__pgt_action = 'I'",
-            pgt_id = st.pgt_id,
-        )
-    } else {
-        format!(
-            "INSERT INTO {quoted_table} (__pgt_row_id, {user_col_list}) \
-             SELECT d.__pgt_row_id, {d_user_col_list} \
-             FROM __pgt_delta_{pgt_id} AS d \
-             WHERE d.__pgt_action = 'I' \
-               AND NOT EXISTS (\
-                 SELECT 1 FROM {quoted_table} AS st \
-                 WHERE st.__pgt_row_id = d.__pgt_row_id\
-               )",
-            pgt_id = st.pgt_id,
-        )
-    };
+    let trigger_insert_template =
+        build_trigger_insert_sql(&quoted_table, st.pgt_id, user_cols, st.has_keyless_source);
 
     // Cache the MERGE template with LSN placeholder tokens.
     // Each refresh resolves the tokens to concrete LSN values
@@ -4257,26 +4328,7 @@ pub fn execute_differential_refresh(
             name.replace('"', "\"\""),
         );
 
-        let user_col_list: String = user_cols
-            .iter()
-            .map(|c| format!("\"{}\"", c.replace('"', "\"\"")))
-            .collect::<Vec<_>>()
-            .join(", ");
-
-        let d_user_col_list: String = user_cols
-            .iter()
-            .map(|c| format!("d.\"{}\"", c.replace('"', "\"\"")))
-            .collect::<Vec<_>>()
-            .join(", ");
-
-        let update_set_clause: String = user_cols
-            .iter()
-            .map(|c| {
-                let qc = format!("\"{}\"", c.replace('"', "\"\""));
-                format!("{qc} = d.{qc}")
-            })
-            .collect::<Vec<_>>()
-            .join(", ");
+        let user_col_list = format_col_list(&user_cols);
 
         // Build cleanup SQL templates — plain DELETE statements (no DO block).
         let cleanup_schema = crate::config::pg_trickle_change_buffer_schema().replace('"', "\"\"");
@@ -4316,28 +4368,11 @@ pub fn execute_differential_refresh(
             build_weight_agg_using(&delta_sql_template, &user_col_list)
         };
 
-        // ── B-1: IS DISTINCT FROM guard to skip no-op UPDATEs ───────
-        // When a group's aggregate value hasn't actually changed, the
-        // MERGE would still perform an UPDATE (writing an identical
-        // tuple).  Adding an IS DISTINCT FROM check on the WHEN MATCHED
-        // clause lets PostgreSQL skip the heap write entirely.
-        let is_distinct_clause: String = build_is_distinct_clause(&user_cols);
-
-        let merge_template = format!(
-            "MERGE INTO {quoted_table} AS st \
-             USING {template_using} AS d \
-             ON st.__pgt_row_id = d.__pgt_row_id{part_pred_placeholder} \
-             WHEN MATCHED AND d.__pgt_action = 'D' THEN DELETE \
-             WHEN MATCHED AND d.__pgt_action = 'I' AND ({is_distinct_clause}) THEN \
-               UPDATE SET {update_set_clause} \
-             WHEN NOT MATCHED AND d.__pgt_action = 'I' THEN \
-               INSERT (__pgt_row_id, {user_col_list}) \
-               VALUES (d.__pgt_row_id, {d_user_col_list})",
-            part_pred_placeholder = if st.st_partition_key.is_some() {
-                " __PGT_PART_PRED__"
-            } else {
-                ""
-            },
+        let merge_template = build_merge_sql(
+            &quoted_table,
+            &template_using,
+            &user_cols,
+            st.st_partition_key.is_some(),
         );
         // QF-1: Log at LOG level only when pg_trickle.log_merge_sql = on.
         if crate::config::pg_trickle_log_merge_sql() {
@@ -4354,51 +4389,17 @@ pub fn execute_differential_refresh(
         // EC-06: Keyless sources use counted DELETE + plain INSERT.
         // But if is_dedup is true, the ST itself has a unique row ID
         // so we must use standard keyed templates.
-        let trigger_delete_template = if st.has_keyless_source && !is_dedup {
-            build_keyless_delete_template(&quoted_table, st.pgt_id)
-        } else {
-            format!(
-                "DELETE FROM {quoted_table} AS st \
-                 USING __pgt_delta_{pgt_id} AS d \
-                 WHERE st.__pgt_row_id = d.__pgt_row_id \
-                   AND d.__pgt_action = 'D'",
-                pgt_id = st.pgt_id,
-            )
-        };
+        let use_keyless = st.has_keyless_source && !is_dedup;
+        let trigger_delete_template =
+            build_trigger_delete_sql(&quoted_table, st.pgt_id, use_keyless);
 
         // EC-06: Use normal UPDATE template for keyless sources — see
         // prewarm_merge_cache comment for full rationale.
-        let trigger_update_template = format!(
-            "UPDATE {quoted_table} AS st \
-             SET {update_set_clause} \
-             FROM __pgt_delta_{pgt_id} AS d \
-             WHERE st.__pgt_row_id = d.__pgt_row_id \
-               AND d.__pgt_action = 'I' \
-               AND ({is_distinct_clause})",
-            pgt_id = st.pgt_id,
-        );
+        let trigger_update_template =
+            build_trigger_update_sql(&quoted_table, st.pgt_id, &user_cols);
 
-        let trigger_insert_template = if st.has_keyless_source && !is_dedup {
-            format!(
-                "INSERT INTO {quoted_table} (__pgt_row_id, {user_col_list}) \
-                 SELECT d.__pgt_row_id, {d_user_col_list} \
-                 FROM __pgt_delta_{pgt_id} AS d \
-                 WHERE d.__pgt_action = 'I'",
-                pgt_id = st.pgt_id,
-            )
-        } else {
-            format!(
-                "INSERT INTO {quoted_table} (__pgt_row_id, {user_col_list}) \
-                 SELECT d.__pgt_row_id, {d_user_col_list} \
-                 FROM __pgt_delta_{pgt_id} AS d \
-                 WHERE d.__pgt_action = 'I' \
-                   AND NOT EXISTS (\
-                     SELECT 1 FROM {quoted_table} AS st \
-                     WHERE st.__pgt_row_id = d.__pgt_row_id\
-                   )",
-                pgt_id = st.pgt_id,
-            )
-        };
+        let trigger_insert_template =
+            build_trigger_insert_sql(&quoted_table, st.pgt_id, &user_cols, use_keyless);
 
         let _ = std::fs::write(
             "/tmp/pgtrickle_debug.sql",
@@ -6500,6 +6501,261 @@ mod tests {
             sql.contains("\"\""),
             "Double quotes in column names must be escaped; got: {sql}"
         );
+    }
+
+    // ── TG2-MERGE: build_merge_sql() unit tests ────────────────────
+
+    #[test]
+    fn test_build_merge_sql_single_column() {
+        let cols = vec!["amount".to_string()];
+        let sql = build_merge_sql("\"public\".\"totals\"", "(delta_query)", &cols, false);
+        assert!(sql.starts_with("MERGE INTO \"public\".\"totals\" AS st"));
+        assert!(sql.contains("USING (delta_query) AS d"));
+        assert!(sql.contains("ON st.__pgt_row_id = d.__pgt_row_id"));
+        assert!(sql.contains("WHEN MATCHED AND d.__pgt_action = 'D' THEN DELETE"));
+        assert!(sql.contains("UPDATE SET \"amount\" = d.\"amount\""));
+        assert!(sql.contains("INSERT (__pgt_row_id, \"amount\")"));
+        assert!(sql.contains("VALUES (d.__pgt_row_id, d.\"amount\")"));
+        assert!(!sql.contains("__PGT_PART_PRED__"));
+    }
+
+    #[test]
+    fn test_build_merge_sql_multiple_columns() {
+        let cols = vec!["region".to_string(), "total".to_string(), "cnt".to_string()];
+        let sql = build_merge_sql(
+            "\"pgtrickle\".\"sales\"",
+            "(SELECT * FROM delta)",
+            &cols,
+            false,
+        );
+        assert!(sql.contains(
+            "UPDATE SET \"region\" = d.\"region\", \"total\" = d.\"total\", \"cnt\" = d.\"cnt\""
+        ));
+        assert!(sql.contains("INSERT (__pgt_row_id, \"region\", \"total\", \"cnt\")"));
+        assert!(sql.contains("VALUES (d.__pgt_row_id, d.\"region\", d.\"total\", d.\"cnt\")"));
+    }
+
+    #[test]
+    fn test_build_merge_sql_with_partition_key() {
+        let cols = vec!["val".to_string()];
+        let sql = build_merge_sql("\"public\".\"partitioned\"", "(delta)", &cols, true);
+        assert!(sql.contains("ON st.__pgt_row_id = d.__pgt_row_id __PGT_PART_PRED__"));
+    }
+
+    #[test]
+    fn test_build_merge_sql_without_partition_key() {
+        let cols = vec!["val".to_string()];
+        let sql = build_merge_sql("\"public\".\"simple\"", "(delta)", &cols, false);
+        assert!(!sql.contains("__PGT_PART_PRED__"));
+    }
+
+    #[test]
+    fn test_build_merge_sql_column_quoting() {
+        let cols = vec!["my \"col\"".to_string(), "normal".to_string()];
+        let sql = build_merge_sql("\"public\".\"t\"", "(delta)", &cols, false);
+        assert!(sql.contains("\"my \"\"col\"\"\""));
+    }
+
+    #[test]
+    fn test_build_merge_sql_is_distinct_from_guard() {
+        let cols = vec!["a".to_string(), "b".to_string()];
+        let sql = build_merge_sql("\"public\".\"t\"", "(delta)", &cols, false);
+        assert!(sql.contains("IS DISTINCT FROM"));
+        assert!(sql.contains("st.\"a\"::text IS DISTINCT FROM d.\"a\"::text"));
+    }
+
+    // ── TG2-MERGE: format helpers ───────────────────────────────────
+
+    #[test]
+    fn test_format_col_list_basic() {
+        let cols = vec!["a".to_string(), "b".to_string()];
+        assert_eq!(format_col_list(&cols), "\"a\", \"b\"");
+    }
+
+    #[test]
+    fn test_format_col_list_quoting() {
+        let cols = vec!["my \"col\"".to_string()];
+        assert_eq!(format_col_list(&cols), "\"my \"\"col\"\"\"");
+    }
+
+    #[test]
+    fn test_format_prefixed_col_list_basic() {
+        let cols = vec!["x".to_string(), "y".to_string()];
+        assert_eq!(format_prefixed_col_list("d", &cols), "d.\"x\", d.\"y\"");
+    }
+
+    #[test]
+    fn test_format_update_set_basic() {
+        let cols = vec!["a".to_string(), "b".to_string()];
+        assert_eq!(format_update_set(&cols), "\"a\" = d.\"a\", \"b\" = d.\"b\"");
+    }
+
+    // ── TG2-MERGE: trigger template unit tests ──────────────────────
+
+    #[test]
+    fn test_build_trigger_delete_keyed() {
+        let sql = build_trigger_delete_sql("\"public\".\"t\"", 42, false);
+        assert!(sql.contains("DELETE FROM \"public\".\"t\" AS st"));
+        assert!(sql.contains("USING __pgt_delta_42 AS d"));
+        assert!(sql.contains("d.__pgt_action = 'D'"));
+    }
+
+    #[test]
+    fn test_build_trigger_delete_keyless() {
+        let sql = build_trigger_delete_sql("\"public\".\"t\"", 42, true);
+        assert!(sql.contains("ROW_NUMBER()"));
+        assert!(sql.contains("__pgt_delta_42"));
+    }
+
+    #[test]
+    fn test_build_trigger_update_sql_basic() {
+        let cols = vec!["val".to_string()];
+        let sql = build_trigger_update_sql("\"public\".\"t\"", 7, &cols);
+        assert!(sql.contains("UPDATE \"public\".\"t\" AS st"));
+        assert!(sql.contains("SET \"val\" = d.\"val\""));
+        assert!(sql.contains("FROM __pgt_delta_7 AS d"));
+        assert!(sql.contains("d.__pgt_action = 'I'"));
+        assert!(sql.contains("IS DISTINCT FROM"));
+    }
+
+    #[test]
+    fn test_build_trigger_insert_keyed() {
+        let cols = vec!["a".to_string(), "b".to_string()];
+        let sql = build_trigger_insert_sql("\"public\".\"t\"", 10, &cols, false);
+        assert!(sql.contains("INSERT INTO \"public\".\"t\""));
+        assert!(sql.contains("NOT EXISTS"));
+        assert!(sql.contains("__pgt_delta_10"));
+    }
+
+    #[test]
+    fn test_build_trigger_insert_keyless() {
+        let cols = vec!["a".to_string(), "b".to_string()];
+        let sql = build_trigger_insert_sql("\"public\".\"t\"", 10, &cols, true);
+        assert!(sql.contains("INSERT INTO \"public\".\"t\""));
+        assert!(!sql.contains("NOT EXISTS"));
+        assert!(sql.contains("__pgt_delta_10"));
+    }
+
+    // ── TG2-MERGE: has_non_monotonic_cte() unit tests ───────────────
+
+    #[test]
+    fn test_has_non_monotonic_cte_plain_scan() {
+        assert!(!has_non_monotonic_cte(
+            "SELECT * FROM changes_42 WHERE lsn > $1",
+        ));
+    }
+
+    #[test]
+    fn test_has_non_monotonic_cte_aggregate() {
+        assert!(has_non_monotonic_cte(
+            "WITH __pgt_cte_agg_1 AS (SELECT ...) SELECT * FROM __pgt_cte_agg_1",
+        ));
+    }
+
+    #[test]
+    fn test_has_non_monotonic_cte_left_join() {
+        assert!(has_non_monotonic_cte("... __pgt_cte_left_join_1 ..."));
+    }
+
+    #[test]
+    fn test_has_non_monotonic_cte_full_join() {
+        assert!(has_non_monotonic_cte("... __pgt_cte_full_join_1 ..."));
+    }
+
+    #[test]
+    fn test_has_non_monotonic_cte_anti_join() {
+        assert!(has_non_monotonic_cte("... __pgt_cte_anti_join_1 ..."));
+    }
+
+    #[test]
+    fn test_has_non_monotonic_cte_semi_join() {
+        assert!(has_non_monotonic_cte("... __pgt_cte_semi_join_1 ..."));
+    }
+
+    #[test]
+    fn test_has_non_monotonic_cte_distinct() {
+        assert!(has_non_monotonic_cte("... __pgt_cte_dist_1 ..."));
+    }
+
+    #[test]
+    fn test_has_non_monotonic_cte_window() {
+        assert!(has_non_monotonic_cte("... __pgt_cte_win_1 ..."));
+    }
+
+    #[test]
+    fn test_has_non_monotonic_cte_recursive() {
+        assert!(has_non_monotonic_cte("... __pgt_cte_rc_1 ..."));
+    }
+
+    #[test]
+    fn test_has_non_monotonic_cte_intersect() {
+        assert!(has_non_monotonic_cte("... __pgt_cte_isect_1 ..."));
+    }
+
+    #[test]
+    fn test_has_non_monotonic_cte_except() {
+        assert!(has_non_monotonic_cte("... __pgt_cte_exct_1 ..."));
+    }
+
+    // ── TG2-MERGE: build_hash_child_merge() unit tests ──────────────
+
+    #[test]
+    fn test_build_hash_child_merge_replaces_target() {
+        let original = "MERGE INTO \"public\".\"parent\" AS st \
+                        USING (SELECT * FROM delta) AS d \
+                        ON st.__pgt_row_id = d.__pgt_row_id \
+                        WHEN MATCHED AND d.__pgt_action = 'D' THEN DELETE";
+        let result = build_hash_child_merge(
+            "\"public\".\"child_p0\"",
+            "__pgt_delta_mat_42",
+            "\"key\"",
+            pg_sys::Oid::from(12345u32),
+            4,
+            0,
+            original,
+            "\"public\".\"parent\"",
+        );
+        assert!(result.contains("ONLY \"public\".\"child_p0\""));
+        assert!(!result.contains("\"public\".\"parent\""));
+    }
+
+    #[test]
+    fn test_build_hash_child_merge_filters_with_satisfies_hash() {
+        let original = "MERGE INTO \"public\".\"parent\" AS st \
+                        USING (SELECT * FROM delta) AS d \
+                        ON st.__pgt_row_id = d.__pgt_row_id \
+                        WHEN MATCHED THEN DELETE";
+        let result = build_hash_child_merge(
+            "\"public\".\"child_p1\"",
+            "__pgt_mat",
+            "\"hash_col\"",
+            pg_sys::Oid::from(99u32),
+            8,
+            3,
+            original,
+            "\"public\".\"parent\"",
+        );
+        assert!(result.contains("satisfies_hash_partition(99::oid, 8, 3, \"hash_col\")"));
+        assert!(result.contains("__pgt_mat"));
+    }
+
+    #[test]
+    fn test_build_hash_child_merge_strips_part_pred() {
+        let original = "MERGE INTO \"public\".\"parent\" AS st \
+                        USING (SELECT * FROM delta) AS d \
+                        ON st.__pgt_row_id = d.__pgt_row_id __PGT_PART_PRED__ \
+                        WHEN MATCHED THEN DELETE";
+        let result = build_hash_child_merge(
+            "\"public\".\"child\"",
+            "__pgt_mat",
+            "\"k\"",
+            pg_sys::Oid::from(1u32),
+            2,
+            1,
+            original,
+            "\"public\".\"parent\"",
+        );
+        assert!(!result.contains("__PGT_PART_PRED__"));
     }
 }
 
