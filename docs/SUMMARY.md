@@ -7,6 +7,7 @@
 # User Guide
 
 - [Getting Started](GETTING_STARTED.md)
+- [Playground (Docker sandbox)](PLAYGROUND.md)
 - [Best-Practice Patterns](PATTERNS.md)
 - [Pre-Deployment Checklist](PRE_DEPLOYMENT.md)
 - [SQL Reference](SQL_REFERENCE.md)
