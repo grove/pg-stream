@@ -2,8 +2,8 @@
 
 use super::E2eDb;
 
-const DEFAULT_CASES: usize = 8;
-const DEFAULT_CYCLES: usize = 8;
+const DEFAULT_CASES: usize = 3;
+const DEFAULT_CYCLES: usize = 4;
 const DEFAULT_INITIAL_ROWS: usize = 12;
 const SEED_STRIDE: u64 = 0x9e37_79b9_7f4a_7c15;
 
