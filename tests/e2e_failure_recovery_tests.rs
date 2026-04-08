@@ -502,11 +502,11 @@ async fn test_no_resource_leak_after_timeout() {
     db.create_st("fr_leak_st", q, "1m", "DIFFERENTIAL").await;
     db.assert_st_matches_query("fr_leak_st", q).await;
 
-    // Get the OID of the stream table source for change buffer lookup
-    let pgt_id: i64 = db
-        .query_scalar(
-            "SELECT pgt_id::bigint FROM pgtrickle.pgt_stream_tables WHERE pgt_name = 'fr_leak_st'",
-        )
+    // Get the OID of the stream table source for change buffer lookup.
+    // The change buffer is named changes_{src_oid} where src_oid is the
+    // PostgreSQL OID of the source table — not the catalog pgt_id bigserial.
+    let src_oid: i64 = db
+        .query_scalar("SELECT oid::bigint FROM pg_class WHERE relname = 'fr_leak_src'")
         .await;
 
     // Insert more rows to create pending changes
@@ -545,7 +545,7 @@ async fn test_no_resource_leak_after_timeout() {
              JOIN pg_namespace n ON n.oid = c.relnamespace \
              WHERE n.nspname = 'pgtrickle_changes' \
              AND c.relname = 'changes_{}')",
-            pgt_id
+            src_oid
         ))
         .await;
     assert!(
