@@ -16,6 +16,16 @@
 
 **Stream Tables for PostgreSQL 18**
 
+> **Try it in 30 seconds — no installation needed:**
+> ```bash
+> cd playground && docker compose up -d
+> psql postgresql://postgres:playground@localhost:5432/playground
+> ```
+> The [`playground/`](playground/) directory is a self-contained Docker environment with sample
+> tables, pre-loaded data, and five stream tables demonstrating key pg_trickle patterns — basic
+> aggregates, window functions, multi-table joins, time-series, and EXISTS subqueries. See
+> [`playground/README.md`](playground/README.md) or the [Playground docs page](docs/PLAYGROUND.md).
+
 pg_trickle brings declarative, automatically-refreshing materialized views to PostgreSQL, inspired by the [DBSP](https://arxiv.org/abs/2203.16684) differential dataflow framework ([comparison](docs/research/DBSP_COMPARISON.md)). Define a SQL query and a schedule bound (or cron schedule); the extension handles the rest.
 
 ## History and Motivation
