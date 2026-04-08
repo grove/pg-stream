@@ -80,17 +80,17 @@ falls back to triggers.
 
 ### Tutorials
 
-- **[Fuse Circuit Breaker](tutorials/fuse-circuit-breaker.md)** — protect stream tables from bulk-change storms
-- **[Tiered Scheduling](tutorials/tiered-scheduling.md)** — configure multi-tier refresh cadences
-- **[Migrating from Materialized Views](tutorials/migrating-from-matviews.md)** — step-by-step migration guide
-- **[Circular Dependencies](tutorials/circular-dependencies.md)** — handle SCCs in your DAG
-- **[Monitoring & Alerting](tutorials/monitoring-alerting.md)** — set up observability for stream tables
-- **[ETL Bulk Load Patterns](tutorials/etl-bulk-load.md)** — safely load large batches without overwhelming CDC
+- **[Fuse Circuit Breaker](tutorials/FUSE_CIRCUIT_BREAKER.md)** — protect stream tables from bulk-change storms
+- **[Tiered Scheduling](tutorials/TIERED_SCHEDULING.md)** — configure multi-tier refresh cadences
+- **[Migrating from Materialized Views](tutorials/MIGRATING_FROM_MATERIALIZED_VIEWS.md)** — step-by-step migration guide
+- **[Circular Dependencies](tutorials/CIRCULAR_DEPENDENCIES.md)** — handle SCCs in your DAG
+- **[Monitoring & Alerting](tutorials/MONITORING_AND_ALERTING.md)** — set up observability for stream tables
+- **[ETL Bulk Load Patterns](tutorials/ETL_BULK_LOAD.md)** — safely load large batches without overwhelming CDC
 
 ### Integrations
 
 - **[CloudNativePG](integrations/cloudnativepg.md)** — deploy pg_trickle on Kubernetes
-- **[Prometheus & Grafana](integrations/prometheus-grafana.md)** — metrics and dashboards
+- **[Prometheus & Grafana](integrations/prometheus.md)** — metrics and dashboards
 - **[PgBouncer](integrations/pgbouncer.md)** — connection pooling configuration
 
 ---
