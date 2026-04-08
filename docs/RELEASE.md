@@ -55,19 +55,28 @@ Follow [Semantic Versioning](https://semver.org/):
 
 ### 2. Update the version
 
-Three files must have their version bumped together:
+Four files must have their version bumped together:
 
 ```bash
-# 1. Cargo.toml — the canonical version source
+# 1. Cargo.toml — the canonical version source for the extension
 #    Change:  version = "0.7.0"  →  version = "0.8.0"
 
-# 2. META.json — the PGXN package metadata
+# 2. pgtrickle-tui/Cargo.toml — the TUI binary; must always match Cargo.toml
+#    Change:  version = "0.7.0"  →  version = "0.8.0"
+
+# 3. META.json — the PGXN package metadata
 #    Change both top-level "version" and the nested "provides" version
 
-# 3. CHANGELOG.md
+# 4. CHANGELOG.md
 #    Rename ## [Unreleased] → ## [0.8.0] — YYYY-MM-DD
 #    Add a new empty ## [Unreleased] section at the top
 ```
+
+> **Important:** `Cargo.toml` (extension) and `pgtrickle-tui/Cargo.toml` (TUI)
+> must always carry the **same version**. They are built and released together,
+> and a mismatch causes `cargo install --path pgtrickle-tui` to report the wrong
+> version. The `just check-version-sync` script does **not** currently enforce
+> this, so it must be checked manually.
 
 The extension control file (`pg_trickle.control`) uses
 `default_version = '@CARGO_VERSION@'`, which pgrx substitutes automatically at
@@ -192,6 +201,7 @@ Complete these steps immediately after a release tag has been pushed and both th
 
 - [ ] **Create a post-release branch** from `main` (e.g. `post-release-<ver>-a`)
 - [ ] **Bump `Cargo.toml`** `version` to the next development version (e.g. `0.12.0` → `0.13.0`)
+- [ ] **Bump `pgtrickle-tui/Cargo.toml`** `version` to the same next development version — must always match `Cargo.toml`
 - [ ] **Bump `META.json`** — both the top-level `"version"` and the nested `"provides" → "pg_trickle" → "version"` to match
 - [ ] **Write `plans/PLAN_0_<next>_0.md`** — initial planning document for the next milestone
 - [ ] **Delete `plans/PLAN_0_<released>_0.md`** — remove the now-completed plan
