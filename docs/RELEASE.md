@@ -211,6 +211,7 @@ Complete these steps immediately after a release tag has been pushed and both th
 - [ ] **Copy `sql/archive/pg_trickle--<released>.sql` → `sql/archive/pg_trickle--<next>.sql`** — placeholder archive baseline for the next version
 - [ ] **Update `justfile`** — advance `build-upgrade-image` and `test-upgrade` `to` defaults to `<next>`; update the `build-hub` Docker image tag
 - [ ] **Update `tests/e2e_upgrade_tests.rs`** — advance all `unwrap_or("<released>".into())` fallback strings to `<next>`
+- [ ] **Update version numbers in `README.md`** — search for occurrences of the released version (e.g. `0.17.0`) and advance them to `<next>`: CNPG image reference (`ghcr.io/grove/pg_trickle-ext:<version>`), dbt `revision` tag, and any other hardcoded version strings. A quick check: `grep -n '<released>' README.md`
 - [ ] **Run `just check-version-sync`** — must exit 0 before opening the PR
 - [ ] **Open a PR** against `main` with the commit title `chore: start v<next> development cycle`
 
