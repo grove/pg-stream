@@ -14,9 +14,47 @@
 
 > For a plain-language description of the problem pg_trickle solves, the differential dataflow approach, and the hybrid CDC architecture, read **[ESSENCE.md](ESSENCE.md)**.
 
-**Stream Tables for PostgreSQL 18**
+## Stream Tables for PostgreSQL 18
 
-pg_trickle brings declarative, automatically-refreshing materialized views to PostgreSQL, inspired by the [DBSP](https://arxiv.org/abs/2203.16684) differential dataflow framework ([comparison](docs/research/DBSP_COMPARISON.md)). Define a SQL query and a schedule bound (or cron schedule); the extension handles the rest.
+pg_trickle brings declarative, automatically-refreshing materialized views to PostgreSQL, inspired by the [DBSP](https://arxiv.org/abs/2203.16684) differential dataflow framework ([comparison](docs/research/DBSP_COMPARISON.md)). Define a SQL query and a schedule; the extension handles the rest.
+
+A **stream table** is a table defined by a SQL query that stays up to date automatically as the underlying data changes. You write to your base tables normally — `INSERT`, `UPDATE`, `DELETE` — and pg_trickle propagates the changes downstream. No polling, no manual refresh calls, no application-level orchestration.
+
+The key difference from `REFRESH MATERIALIZED VIEW` is that pg_trickle uses **Incremental View Maintenance (IVM)**: when a row changes, only the effect of that row on the query result is computed. If you insert one row into a ten-million-row table, pg_trickle processes one row — not ten million. At high change rates it falls back to a full recompute automatically; at low change rates (the common case) the speedup is substantial. The [TPC-H benchmarks](#tpc-h-validation-22-queries-sf001) show 5–90× measured improvements across the 22 standard analytical queries at a 1% change rate.
+
+Stream tables support the full range of SQL — `GROUP BY`, `JOIN`, `WINDOW`, `EXISTS`, `WITH RECURSIVE`, CTEs, LATERAL, subqueries — and can depend on other stream tables, forming a DAG that is refreshed in topological order. Changes propagate through the entire graph automatically.
+
+```sql
+-- Create a stream table that stays up to date with no manual work
+SELECT pgtrickle.create_stream_table(
+    name     => 'sales_by_region',
+    query    => $$
+        SELECT c.region,
+               COUNT(*)                   AS order_count,
+               SUM(o.quantity * p.price)  AS total_revenue
+        FROM orders o
+        JOIN customers c ON c.id = o.customer_id
+        JOIN products  p ON p.id = o.product_id
+        GROUP BY c.region
+    $$,
+    schedule => '1s'
+);
+
+-- Query it like any table — always fresh
+SELECT * FROM sales_by_region ORDER BY total_revenue DESC;
+```
+
+## Try it in 30 seconds — no installation needed
+
+```bash
+cd playground && docker compose up -d
+psql postgresql://postgres:playground@localhost:5432/playground
+```
+
+The [`playground/`](playground/) directory is a self-contained Docker environment with sample
+tables, pre-loaded data, and five stream tables demonstrating key pg_trickle patterns — basic
+aggregates, window functions, multi-table joins, time-series, and EXISTS subqueries. See
+[`playground/README.md`](playground/README.md) or the [Playground docs page](docs/PLAYGROUND.md).
 
 ## History and Motivation
 
@@ -32,25 +70,56 @@ We also do not think the use of AI should lower the standard for trust. If anyth
 
 ## Key Features
 
-- **Declarative** — define a query and a schedule bound (or cron expression); the extension schedules and executes refreshes automatically.
-- **Four refresh modes** — `AUTO` (smart default: DIFFERENTIAL when possible, FULL fallback), `DIFFERENTIAL` (incremental delta), `FULL` (complete recomputation), and `IMMEDIATE` (synchronous in-transaction maintenance via statement-level triggers with transition tables).
-- **Differential View Maintenance (DVM)** — only processes changed rows, not the entire base table. Delta queries are derived automatically from the defining query's operator tree.
-- **Transactional IVM (IMMEDIATE mode)** — stream tables can be maintained **within the same transaction** as the base table DML, providing read-your-writes consistency. Supports all DVM operators including window functions, LATERAL joins, scalar subqueries, cascading IMMEDIATE stream tables, WITH RECURSIVE, and TopK micro-refresh.
-- **CTE Support** — full support for Common Table Expressions. Non-recursive CTEs are inlined and differentiated algebraically. Multi-reference CTEs share delta computation. Recursive CTEs (`WITH RECURSIVE`) work in FULL, DIFFERENTIAL, and IMMEDIATE modes.
-- **TopK support** — `ORDER BY ... LIMIT N [OFFSET M]` queries are accepted and refreshed correctly via scoped recomputation. Paged TopK (`OFFSET M`) supports server-side pagination.
-- **ALTER QUERY** — change the defining query of an existing stream table online. The engine classifies schema changes (same / compatible / incompatible), migrates the storage table, updates the dependency graph, and runs a full refresh. Compatible changes preserve the storage table OID so views and publications remain valid.
-- **Trigger-based CDC** — lightweight `AFTER` row-level triggers capture changes into buffer tables. No logical replication slots or `wal_level = logical` required. Triggers are created and dropped automatically.
-- **Hybrid CDC (optional)** — when `wal_level = logical` is available, the system can automatically transition from triggers to WAL-based (logical replication) capture for lower write-side overhead. Controlled by the `pg_trickle.cdc_mode` GUC (`trigger` / `auto` / `wal`).
-- **DAG-aware scheduling** — stream tables that depend on other stream tables are refreshed in topological order. `CALCULATED` schedule propagation is supported.
-- **Diamond dependency consistency** — diamond-shaped DAGs (A→B→D, A→C→D) can be refreshed atomically to prevent split-version reads.
-- **Circular dependency support** — monotone dependency cycles can be enabled explicitly and are refreshed to a fixed point with convergence guardrails and monitoring.
-- **Watermark gating** — external loaders can publish per-source watermarks so downstream refreshes wait until related sources are aligned.
-- **Multi-database auto-discovery** — a single launcher worker automatically spawns per-database scheduler workers for every database that has the extension installed. No manual per-database configuration needed.
-- **PgBouncer compatible** — works behind PgBouncer in transaction-pool mode (the default on Supabase, Railway, Neon, and similar managed platforms). Session locks have been replaced with row-level locking. Per-table `pooler_compatibility_mode` disables prepared statements and NOTIFY for connection-pooler deployments.
-- **Tiered scheduling** — assign stream tables to Hot / Warm / Cold / Frozen tiers to control effective refresh rates in large deployments (`pg_trickle.tiered_scheduling = on`).
-- **Change buffer compaction** — automatically collapses cancelling INSERT/DELETE pairs and sequential changes to the same row, reducing delta scan overhead 50–90 % for high-churn tables.
-- **Crash-safe** — row-level locks prevent concurrent refreshes; crash recovery marks in-flight refreshes as failed and resumes normal operation.
-- **Observable** — built-in monitoring views, refresh history, slot health checks, staleness reporting, SCC status, watermark status, `NOTIFY`-based alerting, and dedicated helper functions such as `health_check`, `change_buffer_sizes`, `dependency_tree`, `refresh_timeline`, `trigger_inventory`, `list_sources`, `diamond_groups`, and `pgt_scc_status`.
+### Core IVM engine
+
+- **Incremental by default** — delta queries are derived automatically from the defining query's operator tree; only changed rows are processed.
+- **Four refresh modes** — `AUTO` (smart default: DIFFERENTIAL when possible, FULL fallback), `DIFFERENTIAL` (incremental), `FULL` (complete recomputation), and `IMMEDIATE` (synchronous, in-transaction IVM).
+- **Transactional IVM** — `IMMEDIATE` mode maintains stream tables within the same transaction as the base-table DML, giving read-your-writes consistency with no background worker required.
+- **Change buffer compaction** — cancelling INSERT/DELETE pairs and sequential changes to the same row are collapsed automatically, reducing delta scan overhead 50–90% on high-churn tables.
+- **Adaptive fallback** — when change rate exceeds the `pg_trickle.adaptive_full_threshold` (default 50%), the engine switches to FULL automatically and switches back when the rate drops.
+
+### SQL coverage
+
+- **Joins** — `INNER`, `LEFT`, `RIGHT`, `FULL OUTER`, `NATURAL`, nested (3+ tables), non-equi-joins.
+- **Aggregation** — fully algebraic `COUNT`/`SUM`/`AVG`; semi-algebraic `MIN`/`MAX`; group-rescan for 30+ other aggregates (`STRING_AGG`, `ARRAY_AGG`, `STDDEV`, `PERCENTILE_*`, `CORR`, …).
+- **Window functions** — `ROW_NUMBER`, `RANK`, `SUM OVER`, `RANGE`/`ROWS`/`GROUPS` frames, named `WINDOW` clauses, multiple partitions.
+- **Set operations** — `UNION ALL`, `UNION`, `INTERSECT`, `EXCEPT`.
+- **Subqueries** — `EXISTS`/`NOT EXISTS`, `IN`/`NOT IN`, scalar subqueries in `SELECT` and `WHERE`, subqueries in `FROM`.
+- **CTEs** — non-recursive `WITH` (inlined, shared delta); `WITH RECURSIVE` in FULL, DIFFERENTIAL, and IMMEDIATE modes.
+- **TopK** — `ORDER BY … LIMIT N [OFFSET M]` via scoped recomputation; server-side pagination with `OFFSET`.
+- **LATERAL / SRFs** — `jsonb_array_elements`, `unnest`, `jsonb_each`, `JSON_TABLE`, and other set-returning functions.
+- **DDL** — `ALTER QUERY` changes the defining query online; the engine migrates storage and reruns a full refresh with no downtime.
+
+### Change data capture
+
+- **Trigger-based CDC** — lightweight `AFTER` row-level triggers; no `wal_level = logical`, no replication slots required.
+- **Hybrid CDC** — when `wal_level = logical` is available, pg_trickle transitions from triggers to WAL-based capture automatically (`pg_trickle.cdc_mode = auto`), reducing write-path overhead to near-zero.
+- **Watermark gating** — external loaders publish per-source watermarks; downstream refreshes wait until all sources are aligned before proceeding.
+
+### Scheduling & dependency management
+
+- **DAG-aware** — stream tables that depend on other stream tables are refreshed in topological order; `CALCULATED` schedule propagation is supported.
+- **Diamond consistency** — diamond-shaped DAGs (A→B→D, A→C→D) are refreshed atomically to prevent split-version reads.
+- **Circular dependencies** — monotone cycles can be enabled explicitly and are driven to a fixed point with convergence guardrails.
+- **Tiered scheduling** — Hot / Warm / Cold / Frozen tiers control effective refresh rates in large deployments; Frozen tables are skipped until manually thawed.
+- **Multi-database** — a single launcher worker auto-discovers every database with the extension installed and spawns a scheduler for each.
+
+### Production & operations
+
+- **PgBouncer / connection-pool compatible** — works behind PgBouncer in transaction-pool mode (Supabase, Railway, Neon, etc.); row-level locking replaces session locks; per-table `pooler_compatibility_mode` available.
+- **Crash-safe** — row-level locks prevent concurrent refreshes; in-flight refreshes are marked failed and resumed cleanly on recovery.
+- **Online ALTER QUERY** — schema changes are classified (same / compatible / incompatible), storage migrated, and the dependency graph updated without dropping and recreating the stream table.
+- **CNPG / Kubernetes ready** — purpose-built Docker images and CloudNativePG manifests included.
+
+### Observability
+
+- `pgtrickle.health_check()` — overall extension health at a glance.
+- `pgtrickle.pgt_status()` — status, staleness, and refresh mode for every stream table.
+- `pgtrickle.refresh_timeline(n)` — last _n_ refresh events with timings.
+- `pgtrickle.change_buffer_sizes()` — pending CDC entries per source table.
+- `pgtrickle.dependency_tree()` — full DAG with topological order.
+- `pgtrickle.explain_st(name)` — the delta SQL pg_trickle will run on next refresh.
+- `NOTIFY`-based alerting, SCC status, watermark status, trigger inventory, diamond groups, and more.
 
 ## SQL Support
 
