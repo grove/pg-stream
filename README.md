@@ -44,7 +44,7 @@ SELECT pgtrickle.create_stream_table(
 SELECT * FROM sales_by_region ORDER BY total_revenue DESC;
 ```
 
-### Try it in 30 seconds — no installation needed
+## Try it in 30 seconds — no installation needed
 
 ```bash
 cd playground && docker compose up -d
@@ -55,8 +55,6 @@ The [`playground/`](playground/) directory is a self-contained Docker environmen
 tables, pre-loaded data, and five stream tables demonstrating key pg_trickle patterns — basic
 aggregates, window functions, multi-table joins, time-series, and EXISTS subqueries. See
 [`playground/README.md`](playground/README.md) or the [Playground docs page](docs/PLAYGROUND.md).
-
----
 
 ## History and Motivation
 
