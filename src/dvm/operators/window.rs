@@ -34,11 +34,18 @@ fn build_agg_alias_map(child: &OpTree) -> std::collections::HashMap<String, Stri
     };
     if let OpTree::Aggregate { aggregates, .. } = node {
         for agg in aggregates {
-            // Build the SQL form of this aggregate: e.g., SUM("val")
+            // Build the SQL form of this aggregate: e.g., SUM(val).
+            // Strip table qualifiers from arguments so the key matches even
+            // when the argument is written as `SUM(oi.quantity)` in the
+            // source query.  The lookup side (render_window_sql) also strips
+            // qualifiers, so both sides are normalised.
             let agg_sql = match &agg.function {
                 AggFunc::CountStar => "COUNT(*)".to_string(),
                 _ => {
-                    let arg_sql = agg.argument.as_ref().map_or(String::new(), |e| e.to_sql());
+                    let arg_sql = agg
+                        .argument
+                        .as_ref()
+                        .map_or(String::new(), |e| e.strip_qualifier().to_sql());
                     format!("{}({})", agg.function.sql_name(), arg_sql)
                 }
             };
@@ -60,9 +67,11 @@ fn render_window_sql(
     w: &WindowExpr,
     agg_map: &std::collections::HashMap<String, String>,
 ) -> String {
-    if agg_map.is_empty() {
-        return w.to_sql();
-    }
+    // Always render manually (no early return for agg_map.is_empty()) so that
+    // we can strip table qualifiers from every expression.  Within the
+    // recomputed-input CTE all columns are referenced by their bare output
+    // names (the pass-through aliases), never by the original table-qualified
+    // form from the source query.
 
     /// Resolve an expression against the aggregate alias map (case-insensitive).
     fn resolve(sql: &str, m: &std::collections::HashMap<String, String>) -> String {
@@ -75,7 +84,7 @@ fn render_window_sql(
     } else {
         w.args
             .iter()
-            .map(|a| resolve(&a.to_sql(), agg_map))
+            .map(|a| resolve(&a.strip_qualifier().to_sql(), agg_map))
             .collect::<Vec<_>>()
             .join(", ")
     };
@@ -85,7 +94,7 @@ fn render_window_sql(
         let pb = w
             .partition_by
             .iter()
-            .map(|e| resolve(&e.to_sql(), agg_map))
+            .map(|e| resolve(&e.strip_qualifier().to_sql(), agg_map))
             .collect::<Vec<_>>()
             .join(", ");
         over_parts.push(format!("PARTITION BY {pb}"));
@@ -95,7 +104,7 @@ fn render_window_sql(
             .order_by
             .iter()
             .map(|s| {
-                let resolved = resolve(&s.expr.to_sql(), agg_map);
+                let resolved = resolve(&s.expr.strip_qualifier().to_sql(), agg_map);
                 let dir = if s.ascending { "ASC" } else { "DESC" };
                 let nulls = if s.ascending {
                     if s.nulls_first { " NULLS FIRST" } else { "" }
@@ -166,7 +175,13 @@ pub fn diff_window(ctx: &mut DiffContext, op: &OpTree) -> Result<DiffResult, PgT
     // for those columns when reading old ST rows.
     let st_stored_cols: Option<Vec<String>> = ctx.st_user_columns.clone();
 
-    let partition_cols: Vec<String> = partition_by.iter().map(|e| e.to_sql()).collect();
+    // Use output_name() (bare column name, no table qualifier) so that
+    // col_list() / quote_ident() don't wrap an already-qualified expression
+    // like `"p"."category"` in another layer of quotes.  Within all the
+    // generated CTEs the column is referenced by its unqualified output
+    // name (i.e. the pass-through alias), never by the original table-qualified
+    // form from the source query.
+    let partition_cols: Vec<String> = partition_by.iter().map(|e| e.output_name()).collect();
 
     // ── CTE 1: Find changed partition keys ─────────────────────────────
     let changed_parts_cte = ctx.next_cte_name("win_parts");
@@ -648,5 +663,55 @@ mod tests {
         let tree = scan(1, "t", "public", "t", &["id"]);
         let result = diff_window(&mut ctx, &tree);
         assert!(result.is_err());
+    }
+
+    /// Regression test: table-qualified column refs in PARTITION BY (e.g.
+    /// `PARTITION BY p.category`) must NOT produce double-quoted identifiers
+    /// like `""p"."category""` in the generated SQL.  The column should be
+    /// referenced by its bare output name (`"category"`) throughout all CTEs.
+    #[test]
+    fn test_diff_window_qualified_partition_columns() {
+        let mut ctx = test_ctx_with_st("public", "st");
+        let child = scan(1, "products", "public", "p", &["name", "category", "price"]);
+        let wf = window_expr(
+            "RANK",
+            vec![],
+            // Partition by a table-qualified column ref: p.category
+            vec![qcolref("p", "category")],
+            vec![sort_asc(qcolref("p", "price"))],
+            "category_rank",
+        );
+        let tree = window(
+            vec![wf],
+            // Shared partition_by also uses the qualified form
+            vec![qcolref("p", "category")],
+            vec![
+                (qcolref("p", "name"), "name".to_string()),
+                (qcolref("p", "category"), "category".to_string()),
+                (qcolref("p", "price"), "price".to_string()),
+            ],
+            child,
+        );
+        let result = diff_window(&mut ctx, &tree).unwrap();
+        let sql = ctx.build_with_query(&result.cte_name);
+
+        // The generated SQL must NOT contain double-quoted identifiers of
+        // the form `""p"."category""` — that is the symptom of the bug.
+        assert!(
+            !sql.contains(r#"""p"."category"""#),
+            "SQL contains double-quoted qualified ref (bug regression): {sql}"
+        );
+
+        // The column should appear as the bare identifier "category"
+        assert!(
+            sql.contains("\"category\"") || sql.contains("category"),
+            "Expected bare 'category' column reference in SQL: {sql}"
+        );
+
+        // Standard shape checks
+        assert!(result.columns.contains(&"category_rank".to_string()));
+        assert_sql_contains(&sql, "DISTINCT");
+        assert_sql_contains(&sql, "DELETE");
+        assert_sql_contains(&sql, "INSERT");
     }
 }
