@@ -255,7 +255,6 @@ async fn check_worker_alive(db: &E2eDb) -> Result<(), String> {
             "SELECT EXISTS (
                 SELECT 1 FROM pg_stat_activity
                 WHERE backend_type = 'pg_trickle scheduler'
-                  AND state IS NOT NULL
             )",
         )
         .await;

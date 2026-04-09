@@ -6,6 +6,13 @@ retries = 2
 junit = { path = "junit.xml" }
 
 [[profile.ci.overrides]]
+# Stability tests (soak, MDB) must NOT be retried: each test runs for
+# 10+ minutes, and retries = 2 would push total runtime to 30 min,
+# exceeding the 20-minute step timeout in stability-tests.yml.
+filter = 'test(test_soak_stability) | test(test_multi_database_isolation)'
+retries = 0
+
+[[profile.ci.overrides]]
 # Each e2e test gets its own database, so moderate parallelism is safe.
 # filter matches both test function names (e2e_*) and binary names (e2e_*_tests)
 filter = 'test(/e2e_/) | binary(/^e2e_/)'
@@ -23,6 +30,11 @@ test-group = "integration-serial"
 # connection saturation from many simultaneous property-test databases.
 e2e-serial = { max-threads = 4 }
 integration-serial = { max-threads = 1 }
+
+[[profile.default.overrides]]
+# Stability tests must NOT be retried — they run 10+ minutes each.
+filter = 'test(test_soak_stability) | test(test_multi_database_isolation)'
+retries = 0
 
 [[profile.default.overrides]]
 # Each e2e test gets its own database, so moderate parallelism is safe.
