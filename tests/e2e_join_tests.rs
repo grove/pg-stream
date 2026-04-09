@@ -144,6 +144,110 @@ async fn test_full_join_both_side_update() {
     db.assert_st_matches_query("fj_both_st", q).await;
 }
 
+/// INNER JOIN with large stream table: simultaneous UPDATE on both sides forces
+/// PH-D1 strategy (ratio < 1%) and must produce correct results. This is the
+/// G17-SOAK soak_join scenario that triggered a duplicate-key constraint error.
+#[tokio::test]
+async fn test_inner_join_simultaneous_both_sides_update_large() {
+    let db = E2eDb::new().await.with_extension().await;
+    db.execute(
+        "CREATE TABLE ij_big_left (
+            id SERIAL PRIMARY KEY,
+            category INT NOT NULL,
+            value NUMERIC(12,2) NOT NULL,
+            label TEXT NOT NULL
+        )",
+    )
+    .await;
+    db.execute(
+        "CREATE TABLE ij_big_right (
+            id SERIAL PRIMARY KEY,
+            category INT NOT NULL,
+            value NUMERIC(12,2) NOT NULL,
+            label TEXT NOT NULL
+        )",
+    )
+    .await;
+
+    // Insert 100 rows per source with 5 categories (20 rows/cat each).
+    // Join output: 20×20×5 = 2000 rows. With 10 changes → ratio 0.5% < 1% → PH-D1.
+    db.execute(
+        "INSERT INTO ij_big_left (category, value, label)
+         SELECT (g % 5), (g * 10)::numeric(12,2), 'L' || g
+         FROM generate_series(1, 100) g",
+    )
+    .await;
+    db.execute(
+        "INSERT INTO ij_big_right (category, value, label)
+         SELECT (g % 5), (g * 10)::numeric(12,2), 'R' || g
+         FROM generate_series(1, 100) g",
+    )
+    .await;
+
+    let q = "SELECT l.id, l.category, l.value, r.label AS label_r
+             FROM ij_big_left l
+             JOIN ij_big_right r ON l.category = r.category";
+    db.create_st("ij_big_st", q, "1m", "DIFFERENTIAL").await;
+    db.assert_st_matches_query("ij_big_st", q).await;
+
+    // Round 1: UPDATE 5 rows in left AND 5 rows in right simultaneously.
+    // Both sources have changes in the same refresh cycle.
+    db.execute("UPDATE ij_big_left SET value = value + 100, label = label || '_u' WHERE id <= 5")
+        .await;
+    db.execute("UPDATE ij_big_right SET value = value + 100, label = label || '_u' WHERE id <= 5")
+        .await;
+    db.refresh_st("ij_big_st").await;
+    db.assert_st_matches_query("ij_big_st", q).await;
+
+    // Round 2: UPDATE different rows simultaneously.
+    db.execute(
+        "UPDATE ij_big_left SET value = value + 50, label = label || '_v' WHERE id BETWEEN 10 AND 15",
+    )
+    .await;
+    db.execute(
+        "UPDATE ij_big_right SET value = value + 50, label = label || '_v' WHERE id BETWEEN 10 AND 15",
+    )
+    .await;
+    db.refresh_st("ij_big_st").await;
+    db.assert_st_matches_query("ij_big_st", q).await;
+
+    // Round 3: INSERT new rows into BOTH sources + UPDATE existing rows.
+    db.execute(
+        "INSERT INTO ij_big_left (category, value, label)
+         SELECT (g % 5), (g * 7)::numeric(12,2), 'NewL' || g
+         FROM generate_series(1, 10) g",
+    )
+    .await;
+    db.execute(
+        "INSERT INTO ij_big_right (category, value, label)
+         SELECT (g % 5), (g * 7)::numeric(12,2), 'NewR' || g
+         FROM generate_series(1, 10) g",
+    )
+    .await;
+    db.execute("UPDATE ij_big_left SET value = value + 25 WHERE id BETWEEN 20 AND 25")
+        .await;
+    db.execute("UPDATE ij_big_right SET value = value + 25 WHERE id BETWEEN 20 AND 25")
+        .await;
+    db.refresh_st("ij_big_st").await;
+    db.assert_st_matches_query("ij_big_st", q).await;
+
+    // Round 4: Multi-cycle stress — UPDATE same rows multiple times in sequence.
+    for i in 1..=5_u32 {
+        db.execute(&format!(
+            "UPDATE ij_big_left SET value = value + {i}, label = label || '.{i}'
+             WHERE id BETWEEN 1 AND 10"
+        ))
+        .await;
+        db.execute(&format!(
+            "UPDATE ij_big_right SET value = value + {i}, label = label || '.{i}'
+             WHERE id BETWEEN 1 AND 10"
+        ))
+        .await;
+        db.refresh_st("ij_big_st").await;
+        db.assert_st_matches_query("ij_big_st", q).await;
+    }
+}
+
 /// 3-table join chain: delete from middle table → correct propagation.
 #[tokio::test]
 async fn test_three_table_join_middle_delete() {

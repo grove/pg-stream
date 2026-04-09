@@ -684,7 +684,10 @@ fn extract_panic_message(payload: &Box<dyn std::any::Any + Send>) -> String {
         return match caught {
             CaughtError::PostgresError(ereport)
             | CaughtError::ErrorReport(ereport)
-            | CaughtError::RustPanic { ereport, .. } => ereport.message().to_string(),
+            | CaughtError::RustPanic { ereport, .. } => {
+                // Include full debug output to capture DETAIL, HINT, etc.
+                format!("{:?}", ereport)
+            }
         };
     }
     if let Some(msg) = payload.downcast_ref::<&str>() {
