@@ -4216,7 +4216,15 @@ pub fn execute_differential_refresh(
     // refresh is cheaper than MERGE because it avoids per-row IS DISTINCT
     // FROM checks.  This catches the common "few groups, many changes"
     // pattern that falls below the global ratio threshold.
+    //
+    // Skip when:
+    // - `skip_ratio_check` is true (user explicitly forces DIFFERENTIAL
+    //   via the `pg_trickle.refresh_strategy` GUC)
+    // - group count is very small (< 10): the comparison is unreliable
+    //   because a handful of INSERTs for new groups easily triggers the
+    //   threshold without actually saturating existing groups
     if !should_fallback
+        && !skip_ratio_check
         && total_change_count > 0
         && st.defining_query.to_ascii_uppercase().contains("GROUP BY")
     {
@@ -4233,7 +4241,7 @@ pub fn execute_differential_refresh(
         .unwrap_or(Some(0))
         .unwrap_or(0);
 
-        if st_group_count > 0 && total_change_count >= st_group_count {
+        if st_group_count >= 10 && total_change_count >= st_group_count {
             pgrx::warning!(
                 "[pg_trickle] Falling back to FULL refresh for {}.{}: aggregate saturation \
                  — {} changes >= {} groups.\n\
