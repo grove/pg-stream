@@ -4060,7 +4060,7 @@ pub fn execute_differential_refresh(
 
         let sql = format!(
             "SELECT sz.table_size, cnt.change_count \
-             FROM (SELECT GREATEST(reltuples::bigint, 1) AS table_size \
+             FROM (SELECT GREATEST(reltuples::bigint, 1000) AS table_size \
                    FROM pg_class WHERE oid = {oid}::oid) sz, \
              LATERAL (SELECT count(*)::bigint AS change_count FROM (\
                 SELECT 1 FROM \"{change_schema}\".changes_{oid} \
@@ -4506,14 +4506,6 @@ pub fn execute_differential_refresh(
 
         let trigger_insert_template =
             build_trigger_insert_sql(&quoted_table, st.pgt_id, &user_cols, use_keyless);
-
-        let _ = std::fs::write(
-            "/tmp/pgtrickle_debug.sql",
-            format!(
-                "MERGE:\n{}\n\nTRIGGER_INSERT:\n{}\n",
-                merge_template, trigger_insert_template
-            ),
-        );
 
         // Store templates in the cache for subsequent refreshes.
         if !has_recursive_cte {
@@ -5036,8 +5028,24 @@ pub fn execute_differential_refresh(
         })?;
         let t_del = t_del_start.elapsed();
 
-        // Step 2: INSERT new rows (skipping UPDATE — the delta represents
-        // UPDATEs as D+I pairs with different __pgt_row_id values)
+        // Step 2: UPDATE existing rows where values changed.
+        // Weight aggregation collapses D+I pairs for the same __pgt_row_id
+        // into a single 'I' action when the net weight is positive. For
+        // value-only updates this means the DELETE is lost, so the INSERT
+        // below would fail its NOT EXISTS guard.  An explicit UPDATE step
+        // handles these cases correctly — identical to the B-1 aggregate
+        // fast-path.  Aggregate deltas also produce 'I' for changed groups
+        // (mapping meta_action 'U' → 'I'), requiring UPDATE semantics.
+        let t_upd_start = Instant::now();
+        let upd_count = Spi::connect_mut(|client| {
+            let result = client
+                .update(&resolved.trigger_update_sql, None, &[])
+                .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
+            Ok::<usize, PgTrickleError>(result.len())
+        })?;
+        let t_upd = t_upd_start.elapsed();
+
+        // Step 3: INSERT genuinely new rows
         let t_ins_start = Instant::now();
         let ins_count = Spi::connect_mut(|client| {
             let result = client
@@ -5049,17 +5057,19 @@ pub fn execute_differential_refresh(
 
         pgrx::info!(
             "[PGS_PROFILE] delete_insert: materialize={:.2}ms delete={:.2}ms({}) \
-             insert={:.2}ms({}) for {}.{}",
+             update={:.2}ms({}) insert={:.2}ms({}) for {}.{}",
             t_mat.as_secs_f64() * 1000.0,
             t_del.as_secs_f64() * 1000.0,
             del_count,
+            t_upd.as_secs_f64() * 1000.0,
+            upd_count,
             t_ins.as_secs_f64() * 1000.0,
             ins_count,
             schema,
             name,
         );
 
-        (del_count + ins_count, "delete_insert")
+        (del_count + upd_count + ins_count, "delete_insert")
     } else if use_agg_fast_path {
         // ── B-1: Aggregate fast-path ────────────────────────────────
         // For all-algebraic aggregate queries, use explicit DML
