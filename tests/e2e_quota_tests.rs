@@ -166,6 +166,12 @@ async fn test_per_database_worker_quota_does_not_starve_refreshes() {
         completed_b,
         "quota_st_b should refresh even with per_database_worker_quota=1"
     );
+
+    // Clean up cluster-wide ALTER SYSTEM settings so subsequent tests that
+    // use E2eDb::new() (which does NOT reset server configuration) see the
+    // correct defaults.
+    db.execute("ALTER SYSTEM RESET ALL").await;
+    db.reload_config_and_wait().await;
 }
 
 /// When quota is 0 (disabled) the scheduler behaves as before — all STs
@@ -209,6 +215,12 @@ async fn test_per_database_worker_quota_zero_disables_cap() {
         completed,
         "ST should refresh normally when per_database_worker_quota=0"
     );
+
+    // Clean up cluster-wide ALTER SYSTEM settings so subsequent tests that
+    // use E2eDb::new() (which does NOT reset server configuration) see the
+    // correct defaults.
+    db.execute("ALTER SYSTEM RESET ALL").await;
+    db.reload_config_and_wait().await;
 }
 
 // ── Helper ─────────────────────────────────────────────────────────────────
