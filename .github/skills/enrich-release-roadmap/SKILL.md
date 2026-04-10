@@ -161,16 +161,28 @@ In a "Conflicts & Risks" subsection, call out:
 
 ---
 
-## Output Format
+## Output & Application
 
-Return a Markdown block ready to paste directly into `ROADMAP.md`, following
-the same style as existing release sections:
+Do NOT present the enrichment for review or ask for confirmation.
+Apply the changes directly:
+
+1. **Replace** the target release section in `ROADMAP.md` with the enriched
+   version (preserve existing items, add pillar sections after them).
+   Follow the same style as existing enriched release sections in the file.
+2. **Update** the effort summary table row for the target release to reflect
+   the new effort estimate.
+3. **Commit and push** with message:
+   `roadmap: enrich v<X.Y.Z> with six-pillar quality items`
+
+The enriched section must follow this structure:
 
 ```markdown
 ## v<X.Y.Z> — <Theme Title>
 
 > **Release Theme**
 > <one-paragraph theme>
+
+### <Existing subsections with original items preserved>
 
 ### Correctness
 | ID | Title | Effort | Priority |
