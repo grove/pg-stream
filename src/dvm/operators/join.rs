@@ -576,9 +576,19 @@ JOIN {delta_right} dr ON {cond}",
         let cond = rewrite_join_condition(condition, left, "dl", right, "dr");
         // delta_left is referenced in Part 1a/1b and correction; mark NOT MATERIALIZED.
         ctx.mark_cte_not_materialized(&left_result.cte_name);
-        let hash_correction =
-            "pgtrickle.pg_trickle_hash_multi(ARRAY[dl.__pgt_row_id::TEXT, dr.__pgt_row_id::TEXT])"
-                .to_string();
+
+        // Row ID for EC-02 correction rows: hash of both sides' PK columns,
+        // using the same canonical left-first, right-second order as
+        // Part 1 and Part 2 to ensure consistent row_ids.  Using
+        // dl.__pgt_row_id / dr.__pgt_row_id here would produce
+        // hash(hash(L), hash(R)) instead of hash(L_pk, R_pk), causing
+        // phantom row accumulation.
+        let mut hash_corr_args = left_key_exprs_dl.clone();
+        hash_corr_args.extend(right_key_exprs_dr.clone());
+        let hash_correction = format!(
+            "pgtrickle.pg_trickle_hash_multi(ARRAY[{}])",
+            hash_corr_args.join(", ")
+        );
         format!(
             "
 
