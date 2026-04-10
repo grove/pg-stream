@@ -149,16 +149,7 @@ pub fn diff_full_join(ctx: &mut DiffContext, op: &OpTree) -> Result<DiffResult, 
     // Same fix as inner_join / outer_join: when a left DELETE's old right
     // partner is simultaneously deleted, R₁ misses the match.
     // DI-11: Use same threshold as inner join for deep R₀ reconstruction.
-    //
-    // When use_l0 is true (Part 2 uses L₀), the standard DBSP formula
-    // is already exact — no EC-01 split needed. See diff_inner_join
-    // for the full derivation.
-    let l0_available = use_pre_change_snapshot(left, ctx.inside_semijoin, 4);
-    let use_r0 = if l0_available {
-        false
-    } else {
-        use_pre_change_snapshot(right, ctx.inside_semijoin, 4)
-    };
+    let use_r0 = use_pre_change_snapshot(right, ctx.inside_semijoin, 4);
 
     let r0_snapshot = if use_r0 {
         if is_join_child(right) {
@@ -481,16 +472,12 @@ mod tests {
         let result = diff_full_join(&mut ctx, &tree).unwrap();
         let sql = ctx.build_with_query(&result.cte_name);
 
-        // When L₀ is available (Scan children), Parts 1 and 3 are NOT
-        // split — standard formula is exact, no EC-01 needed.
-        // Parts 7a/7b (right anti-join transitions) are always present.
-        assert_sql_contains(&sql, "Part 1");
-        assert_sql_not_contains(&sql, "Part 1a");
-        assert_sql_not_contains(&sql, "Part 1b");
+        // EC-01: Parts 1 and 3 are split when right child is simple (Scan)
+        assert_sql_contains(&sql, "Part 1a");
+        assert_sql_contains(&sql, "Part 1b");
         assert_sql_contains(&sql, "Part 2");
-        assert_sql_contains(&sql, "Part 3");
-        assert_sql_not_contains(&sql, "Part 3a");
-        assert_sql_not_contains(&sql, "Part 3b");
+        assert_sql_contains(&sql, "Part 3a");
+        assert_sql_contains(&sql, "Part 3b");
         assert_sql_contains(&sql, "Part 4");
         assert_sql_contains(&sql, "Part 5");
         assert_sql_contains(&sql, "Part 6");
@@ -499,9 +486,9 @@ mod tests {
     }
 
     #[test]
-    fn test_ec01_full_join_no_r0_when_l0_available() {
-        // When L₀ is available (Scan children), R₀ is NOT used and
-        // Parts 1 and 3 are unsplit.
+    fn test_ec01_full_join_r0_uses_except_all() {
+        // For Scan right children, Part 1b and Part 3b should use R₀ via
+        // EXCEPT ALL to find pre-change right partners.
         let mut ctx = test_ctx();
         let left = scan(1, "a", "public", "a", &["id"]);
         let right = scan(2, "b", "public", "b", &["id", "name"]);
@@ -514,11 +501,11 @@ mod tests {
         let result = diff_full_join(&mut ctx, &tree).unwrap();
         let sql = ctx.build_with_query(&result.cte_name);
 
-        // L₀ uses NOT EXISTS anti-join (DI-2)
+        // R₀ uses DI-2 NOT EXISTS anti-join pattern
         assert_sql_contains(&sql, "NOT EXISTS");
-        // Parts 1 and 3 are NOT split
-        assert_sql_not_contains(&sql, "Part 1b");
-        assert_sql_not_contains(&sql, "Part 3b");
+        // Part 1b and Part 3b present
+        assert_sql_contains(&sql, "Part 1b");
+        assert_sql_contains(&sql, "Part 3b");
     }
 
     #[test]
