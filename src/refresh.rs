@@ -2118,7 +2118,10 @@ fn build_trigger_insert_sql(
              WHERE d.__pgt_action = 'I'",
         )
     } else {
-        // Keyed: pre-delete + INSERT with ON CONFLICT DO NOTHING safety net
+        // Keyed: DISTINCT ON eliminates within-delta duplicates; ON CONFLICT
+        // is a safety net for any remaining row_id collisions with the ST.
+        // Callers that need guaranteed conflict-free inserts (PH-D1) should
+        // delete all matching row_ids from the ST before executing this.
         format!(
             "INSERT INTO {quoted_table} (__pgt_row_id, {user_col_list}) \
              SELECT DISTINCT ON (d.__pgt_row_id) d.__pgt_row_id, {d_user_col_list} \
@@ -3468,15 +3471,6 @@ pub fn execute_differential_refresh(
         )));
     }
 
-    pgrx::warning!(
-        "[pg_trickle] TRACE enter execute_differential_refresh for {schema}.{name} \
-         (pgt_id={}, is_append_only={}, has_keyless_source={}, relid={})",
-        st.pgt_id,
-        st.is_append_only,
-        st.has_keyless_source,
-        st.pgt_relid.to_u32(),
-    );
-
     // ── EC-16: Function-body change detection ────────────────────────
     // Check whether any user-defined function referenced in this ST's
     // defining query has had its source code changed via ALTER FUNCTION
@@ -3912,17 +3906,23 @@ pub fn execute_differential_refresh(
             .map(|entry| has_non_monotonic_cte(&entry.merge_sql_template))
             .unwrap_or(false) // no cache entry → allow promotion (A-3a guard catches it)
     });
+    // Also check whether the delta is deduplicated. Non-deduplicated
+    // deltas (joins, aggregates) can produce phantom row_id collisions
+    // across refresh cycles that the append-only INSERT path cannot
+    // safely handle — those need the PH-D1 DELETE+INSERT path.
+    let cached_is_deduplicated = MERGE_TEMPLATE_CACHE.with(|cache| {
+        cache
+            .borrow()
+            .get(&st.pgt_id)
+            .map(|entry| entry.is_deduplicated)
+            .unwrap_or(true) // no cache → assume dedup (safe: first cycle has no phantoms)
+    });
     if !is_append_only
         && !st.has_keyless_source
         && !cached_non_monotonic
+        && cached_is_deduplicated
         && !has_downstream_st_consumers(st.pgt_id)
     {
-        pgrx::warning!(
-            "[pg_trickle] TRACE A-3-AO guard ENTERED for {schema}.{name} \
-             (pgt_id={}, cached_non_monotonic={})",
-            st.pgt_id,
-            cached_non_monotonic,
-        );
         let has_non_insert = catalog_source_oids.iter().any(|oid| {
             let prev_lsn = prev_frontier.get_lsn(*oid);
             let new_lsn = new_frontier.get_lsn(*oid);
@@ -3975,11 +3975,6 @@ pub fn execute_differential_refresh(
         });
 
         if !has_non_insert {
-            pgrx::warning!(
-                "[pg_trickle] TRACE A-3-AO PROMOTING {schema}.{name} to append-only \
-                 (pgt_id={}, batch is INSERT-only)",
-                st.pgt_id,
-            );
             pgrx::debug1!(
                 "[pg_trickle] A-3-AO: heuristic append-only promotion for {}.{} — \
                  current batch is INSERT-only",
@@ -4747,19 +4742,20 @@ pub fn execute_differential_refresh(
     // data_timestamp would never advance — breaking ST-on-ST cascades.
     if is_append_only && !has_downstream_st_consumers(st.pgt_id) {
         let non_monotonic = has_non_monotonic_cte(&resolved.merge_sql);
-        pgrx::warning!(
-            "[pg_trickle] TRACE A-3a append-only EXECUTING for {schema}.{name} \
-             (pgt_id={}, non_monotonic={}, is_deduplicated={}, merge_sql_len={})",
-            st.pgt_id,
-            non_monotonic,
-            resolved.is_deduplicated,
-            resolved.merge_sql.len(),
-        );
-        let _ = std::fs::write(
-            format!("/tmp/pgt_ao_{}.txt", st.pgt_id),
-            format!("APPEND-ONLY for {}.{}", schema, name),
-        );
-        if non_monotonic {
+        // Non-deduplicated deltas (joins, aggregates) must NOT use the
+        // append-only fast path: even with ON CONFLICT DO NOTHING, the
+        // delta can produce rows that collide with existing ST rows from
+        // prior cycles. Revert the catalog flag and fall through to the
+        // normal PH-D1/MERGE path.
+        if !resolved.is_deduplicated {
+            pgrx::debug1!(
+                "[pg_trickle] A-3a: skipping append-only for {}.{} — \
+                 non-deduplicated delta (join/aggregate)",
+                schema,
+                name,
+            );
+            let _ = StreamTableMeta::update_append_only(st.pgt_id, false);
+        } else if non_monotonic {
             pgrx::debug1!(
                 "[pg_trickle] A-3a: skipping append-only for {}.{} — \
                  non-monotonic query operators detected",
@@ -4775,12 +4771,6 @@ pub fn execute_differential_refresh(
             //   MERGE INTO "schema"."table" AS st USING (...delta...) AS d ON ...
             // We extract the delta subquery and wrap it in INSERT INTO.
             let insert_sql = build_append_only_insert_sql(schema, name, &resolved.merge_sql);
-
-            pgrx::warning!(
-                "[pg_trickle] TRACE A-3a INSERT SQL for {schema}.{name} (pgt_id={}): {}",
-                st.pgt_id,
-                &insert_sql[..insert_sql.len().min(500)],
-            );
 
             // A-3a: If user_triggers = 'off' and the ST has user triggers,
             // suppress them around the INSERT (same as the normal MERGE path).
@@ -5079,34 +5069,10 @@ pub fn execute_differential_refresh(
         && st.st_partition_key.is_none()
         && !has_pgt_placeholders;
 
-    pgrx::warning!(
-        "[pg_trickle] TRACE strategy selection for {schema}.{name} (pgt_id={}): \
-         use_delete_insert={}, use_agg_fast_path={}, use_explicit_dml={}, \
-         use_prepared={}, is_deduplicated={}, has_keyless={}",
-        st.pgt_id,
-        use_delete_insert,
-        use_agg_fast_path,
-        use_explicit_dml,
-        use_prepared,
-        resolved.is_deduplicated,
-        st.has_keyless_source,
-    );
-
     let (merge_count, strategy_label) = if let Some(result) = hash_merge_result {
         // A1-3b: HASH per-partition MERGE already executed above.
-        let _ = std::fs::write(
-            format!("/tmp/pgt_strat_{}.txt", st.pgt_id),
-            "HASH-MERGE-RESULT",
-        );
         result
     } else if use_delete_insert {
-        let _ = std::fs::write(
-            format!("/tmp/pgt_strat_{}.txt", st.pgt_id),
-            format!(
-                "PH-D1-ENTER use_di={} dedup={} keyless={}",
-                use_delete_insert, resolved.is_deduplicated, st.has_keyless_source
-            ),
-        );
         // ── PH-D1: DELETE+INSERT path ───────────────────────────────
         // For small deltas against large tables, separate DELETE + INSERT
         // avoids the MERGE join cost. The delta is materialized into a
@@ -5128,65 +5094,55 @@ pub fn execute_differential_refresh(
         Spi::run(&materialize_sql).map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
         let t_mat = t_mat_start.elapsed();
 
-        // Diagnostic: check delta for duplicate row_ids and ST conflicts
-        {
-            let dup_count = Spi::get_one::<i64>(&format!(
-                "SELECT COUNT(*) FROM (\
-                    SELECT __pgt_row_id FROM __pgt_delta_{pgt_id} \
-                    WHERE __pgt_action = 'I' \
-                    GROUP BY __pgt_row_id HAVING COUNT(*) > 1\
-                ) x",
-                pgt_id = st.pgt_id,
-            ))
-            .unwrap_or(Some(0))
-            .unwrap_or(0);
-            let conflict_count = Spi::get_one::<i64>(&format!(
-                "SELECT COUNT(*) FROM __pgt_delta_{pgt_id} d \
-                 JOIN \"{sch}\".\"{tbl}\" st ON st.__pgt_row_id = d.__pgt_row_id \
-                 WHERE d.__pgt_action = 'I'",
-                pgt_id = st.pgt_id,
-                sch = schema.replace('"', "\"\""),
-                tbl = name.replace('"', "\"\""),
-            ))
-            .unwrap_or(Some(0))
-            .unwrap_or(0);
-            let total_i = Spi::get_one::<i64>(&format!(
-                "SELECT COUNT(*) FROM __pgt_delta_{} WHERE __pgt_action = 'I'",
-                st.pgt_id,
-            ))
-            .unwrap_or(Some(0))
-            .unwrap_or(0);
-            let _ = std::fs::write(
-                format!("/tmp/pgt_delta_diag_{}.txt", st.pgt_id),
-                format!(
-                    "PH-D1 delta for {}.{}: total_I={}, dup_rowids={}, st_conflicts={}",
-                    schema, name, total_i, dup_count, conflict_count,
-                ),
-            );
-        }
-
-        // Step 1: DELETE rows marked for removal
+        // Step 1: DELETE rows touched by the delta.
+        //
+        // For keyed sources, delete ALL rows whose __pgt_row_id appears
+        // anywhere in the delta (both 'D' and 'I' actions).  This is
+        // critical for join deltas: an UPDATE on a source row produces
+        // both a 'D' (old values) and an 'I' (new values) with the same
+        // __pgt_row_id. Deleting all matching row_ids up-front guarantees
+        // the subsequent INSERT never hits a UNIQUE_VIOLATION, eliminating
+        // the fragile ON CONFLICT + pre-delete approach.
+        //
+        // For keyless sources, only delete rows matching 'D' actions
+        // (the __pgt_row_id index is non-unique, so no conflict risk).
         let t_del_start = Instant::now();
-        let _ = std::fs::write(format!("/tmp/pgt_step_{}.txt", st.pgt_id), "STEP-1-DELETE");
-        let del_count = Spi::connect_mut(|client| {
-            let result = client
-                .update(&resolved.trigger_delete_sql, None, &[])
-                .map_err(|e| PgTrickleError::SpiError(format!("[PH-D1-DELETE] {}", e)))?;
-            Ok::<usize, PgTrickleError>(result.len())
-        })?;
+        let del_count = if !st.has_keyless_source {
+            let quoted_table = format!(
+                "\"{}\".\"{}\"",
+                schema.replace('"', "\"\""),
+                name.replace('"', "\"\""),
+            );
+            let unified_del_sql = format!(
+                "DELETE FROM {quoted_table} WHERE __pgt_row_id IN (\
+                     SELECT __pgt_row_id FROM __pgt_delta_{pgt_id}\
+                 )",
+                pgt_id = st.pgt_id,
+            );
+            Spi::connect_mut(|client| {
+                let result = client
+                    .update(&unified_del_sql, None, &[])
+                    .map_err(|e| PgTrickleError::SpiError(format!("[PH-D1-DELETE] {}", e)))?;
+                Ok::<usize, PgTrickleError>(result.len())
+            })?
+        } else {
+            Spi::connect_mut(|client| {
+                let result = client
+                    .update(&resolved.trigger_delete_sql, None, &[])
+                    .map_err(|e| PgTrickleError::SpiError(format!("[PH-D1-DELETE] {}", e)))?;
+                Ok::<usize, PgTrickleError>(result.len())
+            })?
+        };
         let t_del = t_del_start.elapsed();
 
         // Step 2: UPDATE existing rows where values changed.
-        // For keyed sources using pre-delete + INSERT, the UPDATE is
-        // unnecessary: the pre-delete removes all ST rows matching delta
-        // 'I' row_ids, and the INSERT re-inserts them with updated values.
-        // This also avoids a UNIQUE_VIOLATION that can occur during the
-        // UPDATE FROM join when the delta has overlapping row_ids from
-        // join Part 1/Part 2.
+        // For keyed sources, the unified DELETE in step 1 already removed
+        // all rows matching delta row_ids (both 'D' and 'I'), so the
+        // UPDATE step is unnecessary — the INSERT will re-create them
+        // with updated values.
         let t_upd_start = Instant::now();
         let upd_count = if st.has_keyless_source {
             // Keyless sources still need the UPDATE step
-            let _ = std::fs::write(format!("/tmp/pgt_step_{}.txt", st.pgt_id), "STEP-2-UPDATE");
             Spi::connect_mut(|client| {
                 let result = client
                     .update(&resolved.trigger_update_sql, None, &[])
@@ -5194,66 +5150,22 @@ pub fn execute_differential_refresh(
                 Ok::<usize, PgTrickleError>(result.len())
             })?
         } else {
-            // Keyed sources: skip UPDATE, pre-delete + INSERT handles it
+            // Keyed sources: skip UPDATE, unified DELETE + INSERT handles it
             0
         };
         let t_upd = t_upd_start.elapsed();
 
         // Step 3: INSERT genuinely new rows.
-        // For keyed sources, pre-delete any ST rows whose __pgt_row_id
-        // appears in the delta as 'I', then INSERT.  This handles phantom
-        // rows from Part 1/Part 2 hash mismatches in join deltas where
-        // the same logical row gets different __pgt_row_id values across
-        // refresh cycles.  The pre-delete + INSERT runs in a single SPI
-        // connection to ensure command-counter visibility.
+        // For keyed sources, all conflicting row_ids were removed in step 1,
+        // so no ON CONFLICT clause is needed. DISTINCT ON in the INSERT SQL
+        // (from build_trigger_insert_sql) handles within-delta duplicates.
         let t_ins_start = Instant::now();
-        // Strategy marker: survives longjmp — write FULL SQL for diagnosis
-        let _ = std::fs::write(
-            format!("/tmp/pgt_insert_sql_{}.txt", st.pgt_id),
-            &resolved.trigger_insert_sql,
-        );
-        let _ = std::fs::write(
-            format!("/tmp/pgt_strat_{}.txt", st.pgt_id),
-            format!(
-                "PH-D1-INSERT keyless={} sql_len={}",
-                st.has_keyless_source,
-                resolved.trigger_insert_sql.len()
-            ),
-        );
-        let ins_count = if !st.has_keyless_source {
-            // Keyed sources: pre-delete conflicting rows, then INSERT.
-            let quoted_table = format!(
-                "\"{}\".\"{}\"",
-                schema.replace('"', "\"\""),
-                name.replace('"', "\"\""),
-            );
-            let pre_del_sql = format!(
-                "DELETE FROM {quoted_table} WHERE __pgt_row_id IN (\
-                     SELECT __pgt_row_id FROM __pgt_delta_{pgt_id} WHERE __pgt_action = 'I'\
-                 )",
-                pgt_id = st.pgt_id,
-            );
-            // Use Spi::run for both pre-delete and insert to avoid potential
-            // pgrx SPI wrapper issues with ON CONFLICT.
-            Spi::run(&pre_del_sql)
-                .map_err(|e| PgTrickleError::SpiError(format!("[PH-D1-PRE-DEL] {}", e)))?;
-            // Count pre-deleted rows (approximate — run returns no count)
-            let _ = std::fs::write(
-                format!("/tmp/pgt_predel_{}.txt", st.pgt_id),
-                "pre_deleted=via_spi_run",
-            );
-            Spi::run(&resolved.trigger_insert_sql)
+        let ins_count = Spi::connect_mut(|client| {
+            let result = client
+                .update(&resolved.trigger_insert_sql, None, &[])
                 .map_err(|e| PgTrickleError::SpiError(format!("[PH-D1-INSERT] {}", e)))?;
-            // Row count not available from Spi::run; use 0 as placeholder.
-            0_usize
-        } else {
-            Spi::connect_mut(|client| {
-                let result = client
-                    .update(&resolved.trigger_insert_sql, None, &[])
-                    .map_err(|e| PgTrickleError::SpiError(format!("[PH-D1-INSERT] {}", e)))?;
-                Ok::<usize, PgTrickleError>(result.len())
-            })?
-        };
+            Ok::<usize, PgTrickleError>(result.len())
+        })?;
         let t_ins = t_ins_start.elapsed();
 
         pgrx::info!(
@@ -5272,7 +5184,6 @@ pub fn execute_differential_refresh(
 
         (del_count + upd_count + ins_count, "delete_insert")
     } else if use_agg_fast_path {
-        let _ = std::fs::write(format!("/tmp/pgt_strat_{}.txt", st.pgt_id), "AGG-FAST-PATH");
         // ── B-1: Aggregate fast-path ────────────────────────────────
         // For all-algebraic aggregate queries, use explicit DML
         // (DELETE+UPDATE+INSERT) to avoid the MERGE hash-join cost.
@@ -5336,7 +5247,7 @@ pub fn execute_differential_refresh(
 
         (del_count + upd_count + ins_count, "agg_fast_path")
     } else if use_explicit_dml {
-        let _ = std::fs::write(format!("/tmp/pgt_strat_{}.txt", st.pgt_id), "EXPLICIT-DML"); // ── User-trigger path: explicit DML ─────────────────────────
+        // ── User-trigger path: explicit DML ─────────────────────────
         // Decompose the MERGE into DELETE + UPDATE + INSERT so that
         // user-defined triggers fire with correct TG_OP / OLD / NEW.
 
@@ -5532,57 +5443,20 @@ pub fn execute_differential_refresh(
         let params = build_execute_params(&resolved.source_oids, prev_frontier, new_frontier);
         let execute_sql = format!("EXECUTE {stmt_name}({params})");
 
-        let parameterized_sql_for_debug = resolved.parameterized_merge_sql.clone();
-        let _ = std::fs::write(
-            format!("/tmp/pgt_strat_{}.txt", st.pgt_id),
-            format!(
-                "MERGE-PREPARED sql={}",
-                &resolved.merge_sql[..resolved.merge_sql.len().min(500)]
-            ),
-        );
         let n = Spi::connect_mut(|client| {
             let result = client
                 .update(&execute_sql, None, &[])
                 .map_err(|e| PgTrickleError::SpiError(format!("[MERGE-PREPARED] {}", e)))?;
             Ok::<usize, PgTrickleError>(result.len())
-        })
-        .inspect_err(|_e| {
-            let path = format!("/tmp/pgt_debug_exec_{}.sql", st.pgt_id);
-            let content =
-                format!("-- EXECUTE: {execute_sql}\n-- Template:\n{parameterized_sql_for_debug}");
-            let _ = std::fs::write(&path, &content);
-            pgrx::warning!(
-                "[pg_trickle] EXECUTE failed for pgt_id={}, SQL dumped to {}",
-                st.pgt_id,
-                path
-            );
         })?;
         (n, "merge_prepared")
     } else {
         // ── MERGE path (default for small deltas) ───────────────────
-        let merge_sql_for_debug = resolved.merge_sql.clone();
-        let _ = std::fs::write(
-            format!("/tmp/pgt_strat_{}.txt", st.pgt_id),
-            format!(
-                "MERGE sql_prefix={}",
-                &resolved.merge_sql[..resolved.merge_sql.len().min(200)]
-            ),
-        );
         let n = Spi::connect_mut(|client| {
             let result = client
                 .update(&resolved.merge_sql, None, &[])
                 .map_err(|e| PgTrickleError::SpiError(format!("[MERGE] {}", e)))?;
             Ok::<usize, PgTrickleError>(result.len())
-        })
-        .inspect_err(|_e| {
-            // Dump failing SQL to /tmp for debugging
-            let path = format!("/tmp/pgt_debug_merge_{}.sql", st.pgt_id);
-            let _ = std::fs::write(&path, &merge_sql_for_debug);
-            pgrx::warning!(
-                "[pg_trickle] MERGE failed for pgt_id={}, SQL dumped to {}",
-                st.pgt_id,
-                path
-            );
         })?;
         (n, "merge")
     };

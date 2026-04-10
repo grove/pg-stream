@@ -215,26 +215,35 @@ pub fn diff_inner_join(ctx: &mut DiffContext, op: &OpTree) -> Result<DiffResult,
         .concat()
         .join(", ");
 
-    // Row ID: hash of both child row IDs.
-    // For the delta side, we use __pgt_row_id from the delta CTE.
-    // For the base table side, we hash its PK/non-nullable columns
-    // instead of serializing the entire row with row_to_json().
+    // Row ID: hash of both sides' PK / non-nullable key columns.
     //
-    // S1 optimization: flatten into a single pg_trickle_hash_multi call with
-    // all key columns inline, avoiding nested hash calls.
-    // For nested join children, falls back to row_to_json for the snapshot side.
-    let right_key_exprs = build_base_table_key_exprs(right, "r");
-    let left_key_exprs = build_base_table_key_exprs(left, "l");
+    // CRITICAL: Part 1 and Part 2 MUST produce the SAME row_id for the
+    // same logical output row.  We use direct PK columns from both sides
+    // (always in left-first, right-second order) rather than mixing
+    // pre-computed __pgt_row_id with raw PK columns.  Mixing them leads
+    // to hash(hash(L), R) vs hash(L, hash(R)) which are NOT equal, causing
+    // phantom row accumulation in the stream table (UNIQUE_VIOLATION in the
+    // soak test).
+    //
+    // For Scan nodes: uses non-nullable (PK) columns directly.
+    // For nested join children: falls back to row_to_json for the snapshot
+    // side.
+    let right_key_exprs_r = build_base_table_key_exprs(right, "r");
+    let right_key_exprs_dr = build_base_table_key_exprs(right, "dr");
+    let left_key_exprs_l = build_base_table_key_exprs(left, "l");
+    let left_key_exprs_dl = build_base_table_key_exprs(left, "dl");
 
-    let mut hash1_args = vec!["dl.__pgt_row_id::TEXT".to_string()];
-    hash1_args.extend(right_key_exprs);
+    // Part 1: delta_left ⋈ base_right → hash(left_pks_from_dl, right_pks_from_r)
+    let mut hash1_args = left_key_exprs_dl.clone();
+    hash1_args.extend(right_key_exprs_r.clone());
     let hash_part1 = format!(
         "pgtrickle.pg_trickle_hash_multi(ARRAY[{}])",
         hash1_args.join(", ")
     );
 
-    let mut hash2_args = left_key_exprs;
-    hash2_args.push("dr.__pgt_row_id::TEXT".to_string());
+    // Part 2: base_left ⋈ delta_right → hash(left_pks_from_l, right_pks_from_dr)
+    let mut hash2_args = left_key_exprs_l.clone();
+    hash2_args.extend(right_key_exprs_dr.clone());
     let hash_part2 = format!(
         "pgtrickle.pg_trickle_hash_multi(ARRAY[{}])",
         hash2_args.join(", ")
@@ -502,13 +511,15 @@ pub fn diff_inner_join(ctx: &mut DiffContext, op: &OpTree) -> Result<DiffResult,
             // delta CTEs.  Mark it NOT MATERIALIZED so PG inlines it.
             ctx.mark_cte_not_materialized(&left_result.cte_name);
 
-            // Row ID for correction rows: hash of both delta row IDs.
-            // For aggregate queries (Q03, Q10), the aggregate recomputes row_ids
-            // from GROUP BY columns, so the join-level row_id doesn't need to
-            // match Part 2's exactly.
-            let hash_correction =
-                "pgtrickle.pg_trickle_hash_multi(ARRAY[dl.__pgt_row_id::TEXT, dr.__pgt_row_id::TEXT])"
-                    .to_string();
+            // Row ID for correction rows: hash of both sides' PK columns,
+            // using the same canonical left-first, right-second order as
+            // Part 1 and Part 2 to ensure consistent row_ids.
+            let mut hash_corr_args = left_key_exprs_dl.clone();
+            hash_corr_args.extend(right_key_exprs_dr.clone());
+            let hash_correction = format!(
+                "pgtrickle.pg_trickle_hash_multi(ARRAY[{}])",
+                hash_corr_args.join(", ")
+            );
 
             format!(
                 "

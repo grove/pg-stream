@@ -373,16 +373,6 @@ async fn test_soak_stability() {
 
     let db = E2eDb::new().await.with_extension().await;
 
-    // Enable verbose error logging for diagnostics
-    db.execute("ALTER SYSTEM SET log_min_messages = 'warning'")
-        .await;
-    db.execute("ALTER SYSTEM SET log_error_verbosity = 'verbose'")
-        .await;
-    // Force ALL refreshes to use MERGE (disable PH-D1) to isolate the error source
-    db.execute("ALTER SYSTEM SET pg_trickle.merge_strategy = 'merge'")
-        .await;
-    db.execute("SELECT pg_reload_conf()").await;
-
     // ── Setup ──────────────────────────────────────────────────────────
     println!("  Setting up source tables and stream tables...");
     create_source_tables(&db, n_sources).await;
@@ -456,80 +446,6 @@ async fn test_soak_stability() {
             // Check error states
             if let Err(e) = check_no_error_states(&db).await {
                 println!("FAIL — {e}");
-                // Query catalog for detailed error info + pgt_id
-                let err_detail: Vec<(i64, String, String)> = sqlx::query_as(
-                    "SELECT pgt_id, pgt_name::text, last_error_message \
-                     FROM pgtrickle.pgt_stream_tables \
-                     WHERE status = 'ERROR' AND last_error_message IS NOT NULL",
-                )
-                .fetch_all(&db.pool)
-                .await
-                .unwrap_or_default();
-                for (pgt_id, name, _msg) in &err_detail {
-                    // Read strategy marker file written by the extension
-                    let strat: Option<String> = sqlx::query_scalar(&format!(
-                        "SELECT pg_read_file('/tmp/pgt_strat_{}.txt', true)",
-                        pgt_id
-                    ))
-                    .fetch_one(&db.pool)
-                    .await
-                    .ok()
-                    .flatten();
-                    println!(
-                        "  STRATEGY for {} (pgt_id={}): {}",
-                        name,
-                        pgt_id,
-                        strat.as_deref().unwrap_or("(none)")
-                    );
-                    // Read delta diagnostic
-                    let diag: Option<String> = sqlx::query_scalar(&format!(
-                        "SELECT pg_read_file('/tmp/pgt_delta_diag_{}.txt', true)",
-                        pgt_id
-                    ))
-                    .fetch_one(&db.pool)
-                    .await
-                    .ok()
-                    .flatten();
-                    if let Some(d) = &diag {
-                        println!("  DELTA DIAG: {}", d);
-                    }
-                    // Read pre-delete count
-                    let predel: Option<String> = sqlx::query_scalar(&format!(
-                        "SELECT pg_read_file('/tmp/pgt_predel_{}.txt', true)",
-                        pgt_id
-                    ))
-                    .fetch_one(&db.pool)
-                    .await
-                    .ok()
-                    .flatten();
-                    if let Some(p) = &predel {
-                        println!("  PRE-DELETE: {}", p);
-                    }
-                    // Read step marker
-                    let step: Option<String> = sqlx::query_scalar(&format!(
-                        "SELECT pg_read_file('/tmp/pgt_step_{}.txt', true)",
-                        pgt_id
-                    ))
-                    .fetch_one(&db.pool)
-                    .await
-                    .ok()
-                    .flatten();
-                    if let Some(s) = &step {
-                        println!("  LAST STEP: {}", s);
-                    }
-                    // Read the full INSERT SQL
-                    let insert_sql: Option<String> = sqlx::query_scalar(&format!(
-                        "SELECT pg_read_file('/tmp/pgt_insert_sql_{}.txt', true)",
-                        pgt_id
-                    ))
-                    .fetch_one(&db.pool)
-                    .await
-                    .ok()
-                    .flatten();
-                    if let Some(sql) = &insert_sql {
-                        println!("  INSERT SQL: {}", sql);
-                    }
-                }
                 health_check_failures.push(format!("[{elapsed}s] {e}"));
             } else {
                 print!("states OK, ");
