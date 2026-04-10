@@ -26,7 +26,6 @@ jobs:
     name: Stability soak test
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v5
 
@@ -45,7 +44,6 @@ jobs:
     name: Multi-database isolation test
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v5
 

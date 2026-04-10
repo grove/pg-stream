@@ -300,12 +300,41 @@ async fn get_rss_kb(db: &E2eDb) -> Option<i64> {
 
 /// Verify stream table correctness by comparing contents to defining query.
 async fn verify_correctness(db: &E2eDb, st_name: &str) -> Result<(), String> {
-    // Refresh first to ensure we're comparing against latest data
-    db.try_execute(&format!(
-        "SELECT pgtrickle.refresh_stream_table('{st_name}')"
-    ))
-    .await
-    .map_err(|e| format!("refresh failed for {st_name}: {e}"))?;
+    // Refresh first to ensure we're comparing against latest data.
+    //
+    // Retry up to 5 times with a short back-off because:
+    //   (a) The background worker may hold the catalog row lock, making
+    //       refresh_stream_table return RefreshSkipped (silently as Ok).  A
+    //       second call after the worker commits ensures a real refresh.
+    //   (b) A transient deadlock (cycles 162/167 pattern) can cause the
+    //       refresh to fail; retrying recovers without marking a false
+    //       correctness violation.
+    for attempt in 0u8..5 {
+        match db
+            .try_execute(&format!(
+                "SELECT pgtrickle.refresh_stream_table('{st_name}')"
+            ))
+            .await
+        {
+            Ok(()) => {
+                // Succeeded — but this might have been a silent RefreshSkipped
+                // (background worker still running).  Sleep briefly and retry
+                // once more to give the worker a chance to commit and allow a
+                // real catch-up refresh on the next iteration.
+                if attempt < 4 {
+                    tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
+                    continue;
+                }
+                break;
+            }
+            Err(e) if attempt < 4 => {
+                // Transient failure (deadlock / lock timeout): wait and retry.
+                eprintln!("  [verify_correctness] retry {attempt}: {e}");
+                tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+            }
+            Err(e) => return Err(format!("refresh failed for {st_name}: {e}")),
+        }
+    }
 
     // Get defining query
     let defining_query: String = db
@@ -426,13 +455,23 @@ async fn test_soak_stability() {
         apply_dml_batch(&db, source_idx, batch).await;
         total_dml_ops += 3; // INSERT + UPDATE + DELETE
 
-        // Manual refresh on a rotating stream table
+        // Manual refresh on a rotating stream table.
+        // Retry once on transient deadlock before recording a failure.
         let st_idx = (cycle as usize - 1) % active_sts.len();
         let st = active_sts[st_idx];
-        if let Err(e) = db
-            .try_execute(&format!("SELECT pgtrickle.refresh_stream_table('{st}')"))
-            .await
-        {
+        let refresh_result = {
+            let r = db
+                .try_execute(&format!("SELECT pgtrickle.refresh_stream_table('{st}')"))
+                .await;
+            if r.is_err() {
+                tokio::time::sleep(tokio::time::Duration::from_millis(250)).await;
+                db.try_execute(&format!("SELECT pgtrickle.refresh_stream_table('{st}')"))
+                    .await
+            } else {
+                r
+            }
+        };
+        if let Err(e) = refresh_result {
             health_check_failures.push(format!("Cycle {cycle}: refresh failed for {st}: {e}"));
         } else {
             total_refreshes += 1;
