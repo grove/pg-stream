@@ -1817,6 +1817,38 @@ fn build_weight_agg_using(delta_sql: &str, user_col_list: &str) -> String {
     )
 }
 
+/// EC-06a: Weight-aggregate a keyless delta to cancel within-delta I/D pairs.
+///
+/// Without this, the 3-step DML (DELETE → UPDATE → INSERT) processes D and I
+/// actions independently.  When the EC-02 correction term produces a DELETE
+/// with hash H and another part produces an INSERT with the same H (or vice
+/// versa), the DELETE step searches *storage* (which may not contain H) while
+/// the INSERT step adds a row unconditionally — creating a phantom row.
+///
+/// This wrapper groups delta rows by `(__pgt_row_id, user_cols)`, computes the
+/// net action (INSERT if positive, DELETE if negative, filtered if zero), and
+/// expands back to the correct row count via `generate_series`.
+///
+/// Unlike [`build_weight_agg_using`] (keyed), this does **not** use
+/// `DISTINCT ON (__pgt_row_id)` because keyless tables intentionally allow
+/// multiple rows with the same `__pgt_row_id` but different column values.
+fn build_keyless_weight_agg(delta_sql: &str, user_col_list: &str) -> String {
+    format!(
+        "(SELECT \"__pgt_row_id\", \"__pgt_action\", {user_col_list} \
+         FROM (\
+             SELECT __pgt_row_id, \
+                    CASE WHEN SUM(CASE WHEN __pgt_action = 'I' THEN 1 ELSE -1 END) > 0 \
+                         THEN 'I' ELSE 'D' END AS __pgt_action, \
+                    {user_col_list}, \
+                    ABS(SUM(CASE WHEN __pgt_action = 'I' THEN 1 ELSE -1 END)) AS __pgt_cnt \
+             FROM ({delta_sql}) __raw \
+             GROUP BY __pgt_row_id, {user_col_list} \
+             HAVING SUM(CASE WHEN __pgt_action = 'I' THEN 1 ELSE -1 END) <> 0\
+         ) __w, \
+         LATERAL generate_series(1, __w.__pgt_cnt) __gs)"
+    )
+}
+
 /// EC-06: Build a counted DELETE template for keyless sources.
 ///
 /// For keyless tables, multiple stream table rows can share the same
@@ -2219,9 +2251,13 @@ pub fn prewarm_merge_cache(st: &StreamTableMeta) {
     } else if delta_result.is_deduplicated {
         format!("({delta_sql_template})")
     } else if st.has_keyless_source {
-        // Keyless: do NOT collapse — duplicate row_ids are intentional
-        // (one per net insert/delete).
-        format!("({delta_sql_template})")
+        // EC-06a: Weight-aggregate keyless deltas to cancel within-delta
+        // I/D pairs.  Without this, the 3-step DML (DELETE → INSERT)
+        // processes them independently: the DELETE targets storage rows
+        // (which may not exist for intermediate hashes), while the INSERT
+        // adds unconditionally — creating phantom rows on every refresh
+        // cycle where both join sides change simultaneously (EC-02).
+        build_keyless_weight_agg(&delta_sql_template, &user_col_list)
     } else {
         build_weight_agg_using(&delta_sql_template, &user_col_list)
     };
@@ -4500,17 +4536,20 @@ pub fn execute_differential_refresh(
         };
 
         // Build template USING clause — skip deduplication when deduplicated (G-M1)
-        // EC-06: For keyless sources, never collapse.
+        // EC-06a: For keyless sources, weight-aggregate to cancel within-delta
+        // I/D pairs that would otherwise cause phantom rows.
         // B3-2: Use weight aggregation instead of DISTINCT ON for correctness
         // on diamond-flow queries.
         // A-2: Filter D-side value-only UPDATE rows when __pgt_key_changed is available.
-        let template_using = if (is_dedup || st.has_keyless_source) && has_key_changed {
+        let template_using = if is_dedup && has_key_changed {
             format!(
                 "(SELECT * FROM ({delta_sql_template}) __d \
                  WHERE NOT (__d.__pgt_action = 'D' AND __d.__pgt_key_changed = FALSE))"
             )
-        } else if is_dedup || st.has_keyless_source {
+        } else if is_dedup {
             format!("({delta_sql_template})")
+        } else if st.has_keyless_source {
+            build_keyless_weight_agg(&delta_sql_template, &user_col_list)
         } else {
             build_weight_agg_using(&delta_sql_template, &user_col_list)
         };
@@ -7498,6 +7537,46 @@ mod pg_tests {
         // Net-weight sign decides the action
         assert!(sql.contains("> 0"));
         assert!(sql.contains("<> 0"));
+    }
+
+    // ── build_keyless_weight_agg ────────────────────────────────────────────
+
+    #[test]
+    fn test_build_keyless_weight_agg_contains_delta_sql() {
+        let delta = "SELECT * FROM my_delta";
+        let cols = "\"a\", \"b\"";
+        let sql = build_keyless_weight_agg(delta, cols);
+        assert!(sql.contains(delta));
+        assert!(sql.contains(cols));
+    }
+
+    #[test]
+    fn test_build_keyless_weight_agg_structure() {
+        let sql = build_keyless_weight_agg("SELECT 1", "\"x\"");
+        // Must contain weight-aggregation landmarks
+        assert!(sql.contains("__pgt_row_id"));
+        assert!(sql.contains("__pgt_action"));
+        assert!(sql.contains("SUM"));
+        assert!(sql.contains("HAVING"));
+        assert!(sql.contains("GROUP BY"));
+        // Must use generate_series for count expansion
+        assert!(sql.contains("generate_series"));
+        assert!(sql.contains("__pgt_cnt"));
+        // Must NOT use DISTINCT ON (keyless allows duplicate row_ids)
+        assert!(!sql.contains("DISTINCT ON"));
+    }
+
+    #[test]
+    fn test_build_keyless_weight_agg_cancel_logic() {
+        let sql = build_keyless_weight_agg("SELECT 1", "\"x\"");
+        assert!(sql.contains("'I'"));
+        assert!(sql.contains("'D'"));
+        // Net-weight sign decides the action
+        assert!(sql.contains("> 0"));
+        // HAVING filters out net-zero groups (I/D cancellation)
+        assert!(sql.contains("<> 0"));
+        // ABS for the count expansion
+        assert!(sql.contains("ABS"));
     }
 
     // ── build_keyless_delete_template ────────────────────────────────────────
