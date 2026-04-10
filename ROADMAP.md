@@ -4186,11 +4186,18 @@ Dependencies: None. Schema change: No.
 
 ## v0.19.0 — PGlite Proof of Concept
 
-**Goal:** Validate demand for pg_trickle's incremental view maintenance on
-PGlite by shipping a lightweight JavaScript plugin that demonstrates the
-concept with zero core changes. This is Phase 0 of the PGlite plan — a
-low-risk, low-effort proof of concept that informs whether to invest in
-the full core extraction (v0.20.0) and WASM build (v0.21.0).
+> **Release Theme**
+> This release validates whether PGlite users want real incremental view
+> maintenance by shipping a lightweight TypeScript plugin with zero core
+> changes. The plugin (`@pgtrickle/pglite-lite`) intercepts DML via
+> statement-level AFTER triggers and applies pre-computed delta SQL for
+> simple patterns — single-table aggregates, two-table inner joins, and
+> filtered scans. It deliberately limits scope to 3–5 SQL patterns to
+> keep effort low while generating a concrete demand signal. If adoption
+> materialises, the full core extraction (v0.20.0) and WASM build (v0.21.0)
+> proceed. The main pg_trickle PostgreSQL extension ships no functional
+> changes in this release — only version bumps and upgrade migration
+> plumbing.
 
 See [PLAN_PGLITE.md](plans/ecosystem/PLAN_PGLITE.md) for the full
 feasibility report.
@@ -4216,13 +4223,360 @@ feasibility report.
 
 > **Phase 0 subtotal: ~2–3 weeks**
 
+### Correctness
+
+| ID | Title | Effort | Priority |
+|----|-------|--------|----------|
+| CORR-1 | Delta SQL equivalence for supported patterns | M | P0 |
+| CORR-2 | NULL-key aggregate correctness in JS delta | S | P0 |
+| CORR-3 | Multi-DML transaction atomicity | S | P1 |
+
+**CORR-1 — Delta SQL equivalence for supported patterns**
+
+> **In plain terms:** The TypeScript delta SQL templates must produce the
+> exact same stream table state as a full query re-evaluation, for every
+> combination of INSERT, UPDATE, and DELETE on the supported patterns
+> (single-table GROUP BY + COUNT/SUM/AVG, two-table INNER JOIN, simple
+> WHERE filter). Correctness is proven by running each DML operation,
+> comparing the delta-maintained result against a fresh `SELECT`, and
+> asserting row-for-row equivalence.
+
+Verify: automated test suite runs 100+ randomised DML sequences per pattern;
+zero divergence from full re-evaluation.
+Dependencies: PGL-0-2, PGL-0-3. Schema change: No.
+
+**CORR-2 — NULL-key aggregate correctness in JS delta**
+
+> **In plain terms:** When a GROUP BY key is NULL, SQL three-valued logic
+> means `GROUP BY NULL` forms its own group. The TypeScript delta templates
+> must handle NULL group keys correctly — insertions into the NULL group,
+> deletions that empty it, and updates that move rows in/out of the NULL
+> group. This is the most common correctness pitfall in hand-rolled IVM.
+
+Verify: E2E test with nullable GROUP BY column; assert NULL group appears,
+grows, shrinks, and disappears correctly.
+Dependencies: CORR-1. Schema change: No.
+
+**CORR-3 — Multi-DML transaction atomicity**
+
+> **In plain terms:** PGlite runs in single-connection mode, so a
+> `BEGIN; INSERT ...; DELETE ...; COMMIT` sequence fires two separate
+> statement-level triggers. The plugin must ensure the stream table reflects
+> the net effect of the entire transaction, not an intermediate state. If
+> trigger ordering produces incorrect intermediate results, a
+> post-transaction reconciliation pass is needed.
+
+Verify: test with `BEGIN; INSERT; UPDATE; DELETE; COMMIT` on a single base
+table; stream table matches full re-evaluation after commit.
+Dependencies: PGL-0-3. Schema change: No.
+
+### Stability
+
+| ID | Title | Effort | Priority |
+|----|-------|--------|----------|
+| STAB-1 | Trigger cleanup on dropStreamTable | S | P0 |
+| STAB-2 | Graceful error on unsupported SQL | S | P0 |
+| STAB-3 | Plugin idempotency (create-drop-create cycle) | S | P1 |
+
+**STAB-1 — Trigger cleanup on dropStreamTable**
+
+> **In plain terms:** When a user calls `dropStreamTable()`, all statement-
+> level AFTER triggers registered on source tables must be removed. Orphaned
+> triggers would fire on every subsequent DML and attempt to write to a
+> non-existent stream table, causing errors.
+
+Verify: after `dropStreamTable()`, no pg_trickle-related triggers remain in
+`pg_trigger` for the source tables.
+Dependencies: PGL-0-3. Schema change: No.
+
+**STAB-2 — Graceful error on unsupported SQL**
+
+> **In plain terms:** The PoC supports only 3–5 SQL patterns. If a user
+> passes an unsupported query (e.g., a LEFT JOIN, window function, or
+> recursive CTE), the plugin must throw a clear, actionable error message
+> listing what is supported — not silently produce wrong results or crash.
+
+Verify: `createStreamTable()` with an unsupported query throws an error
+whose message names the unsupported feature and lists supported alternatives.
+Dependencies: PGL-0-2. Schema change: No.
+
+**STAB-3 — Plugin idempotency (create-drop-create cycle)**
+
+> **In plain terms:** Creating a stream table, dropping it, and creating it
+> again with the same name must work without leftover state. Leftover
+> catalog rows, triggers, or temp tables from the first creation must not
+> interfere with the second.
+
+Verify: create-drop-create cycle produces correct results; no duplicate
+triggers or stale catalog entries.
+Dependencies: STAB-1. Schema change: No.
+
+### Performance
+
+| ID | Title | Effort | Priority |
+|----|-------|--------|----------|
+| PERF-1 | Benchmark vs live.incrementalQuery() | M | P0 |
+| PERF-2 | Delta overhead profiling per DML | S | P1 |
+| PERF-3 | Large result set scalability (10K/100K rows) | S | P1 |
+
+**PERF-1 — Benchmark vs `live.incrementalQuery()`** (= PGL-0-5)
+
+> **In plain terms:** The entire value proposition of this PoC depends on
+> being faster than PGlite's built-in `live.incrementalQuery()` for the
+> supported patterns. Produce a public benchmark comparing latency and
+> throughput for single-row inserts into a 10K-row base table across all
+> three supported patterns (aggregate, join, filter).
+
+Verify: delta-maintained stream table refresh latency < 50% of
+`live.incrementalQuery()` latency for all supported patterns at 10K rows.
+Dependencies: PGL-0-3, PGL-0-4. Schema change: No.
+
+**PERF-2 — Delta overhead profiling per DML**
+
+> **In plain terms:** Measure the per-DML overhead added by the statement-
+> level triggers. INSERT-heavy workloads should not suffer more than 2x
+> latency increase compared to the same INSERT without pg_trickle triggers
+> installed. Profile trigger function execution time, temp table creation,
+> and delta DML.
+
+Verify: microbenchmark shows per-DML overhead < 2 ms for aggregate pattern;
+< 5 ms for join pattern at 10K source rows.
+Dependencies: PGL-0-3. Schema change: No.
+
+**PERF-3 — Large result set scalability (10K/100K rows)**
+
+> **In plain terms:** Verify that the delta approach maintains its advantage
+> over full re-evaluation as base table size grows. At 100K rows, the delta
+> path should be significantly faster than full re-evaluation for single-row
+> changes.
+
+Verify: at 100K base table rows, single-row insert refresh latency is
+< 10% of full query re-evaluation latency.
+Dependencies: PERF-1. Schema change: No.
+
+### Scalability
+
+| ID | Title | Effort | Priority |
+|----|-------|--------|----------|
+| SCAL-1 | Multiple stream tables on same source | S | P1 |
+| SCAL-2 | Cascading stream table triggers | M | P2 |
+| SCAL-3 | Concurrent DML with multiple stream tables | S | P2 |
+
+**SCAL-1 — Multiple stream tables on same source**
+
+> **In plain terms:** Verify that 3+ stream tables can be maintained from
+> the same base table simultaneously. Each DML fires one trigger per stream
+> table; ensure triggers do not interfere with each other.
+
+Verify: 3 stream tables on the same source; INSERT + UPDATE + DELETE cycle;
+all 3 produce correct results.
+Dependencies: PGL-0-3. Schema change: No.
+
+**SCAL-2 — Cascading stream table triggers**
+
+> **In plain terms:** If stream table B reads from stream table A's
+> underlying storage, an INSERT into A's source should propagate through
+> A's trigger, update A, and then fire B's trigger to update B — all
+> within the same PGlite transaction. Verify this works in PGlite's
+> single-connection environment without deadlocks or infinite trigger loops.
+
+Verify: A->B cascade produces correct results for INSERT/DELETE on A's
+source. No infinite loops detected.
+Dependencies: SCAL-1. Schema change: No.
+
+**SCAL-3 — Concurrent DML with multiple stream tables**
+
+> **In plain terms:** PGlite is single-connection, but a user could issue
+> rapid sequential DML (`INSERT; INSERT; INSERT`) without explicit
+> transactions. Verify all stream tables converge to the correct state.
+
+Verify: 100 sequential INSERTs with 3 stream tables; final state matches
+full re-evaluation.
+Dependencies: SCAL-1. Schema change: No.
+
+### Ease of Use
+
+| ID | Title | Effort | Priority |
+|----|-------|--------|----------|
+| UX-1 | Getting-started README with copy-paste examples | S | P0 |
+| UX-2 | Supported patterns decision table | XS | P0 |
+| UX-3 | Error messages include remediation hints | S | P1 |
+| UX-4 | TypeScript type definitions | S | P1 |
+| UX-5 | ElectricSQL outreach and collaboration | S | P1 |
+
+**UX-1 — Getting-started README with copy-paste examples**
+
+> **In plain terms:** The npm package README must include 3 complete,
+> copy-pasteable examples — one per supported pattern — that a developer
+> can run in under 2 minutes. Include Node.js and browser (Vite) examples.
+
+Verify: all README examples execute without modification on a fresh PGlite
+instance.
+Dependencies: PGL-0-4. Schema change: No.
+
+**UX-2 — Supported patterns decision table**
+
+> **In plain terms:** A clear table showing which SQL patterns are and are
+> not supported, what error you get for unsupported patterns, and when full
+> support is expected (v0.21.0). This prevents user frustration and sets
+> expectations.
+
+Verify: decision table in README and npm page lists all tested patterns with
+status (supported / unsupported / planned).
+Dependencies: None. Schema change: No.
+
+**UX-3 — Error messages include remediation hints**
+
+> **In plain terms:** Every error thrown by the plugin must include the
+> table name, the failing operation, and a one-sentence hint. Example:
+> `"LEFT JOIN is not supported in pglite-lite. Use @pgtrickle/pglite
+> (v0.21.0+) for full SQL support, or rewrite as INNER JOIN."`
+
+Verify: all error paths tested; every error message includes a remediation
+sentence.
+Dependencies: STAB-2. Schema change: No.
+
+**UX-4 — TypeScript type definitions**
+
+> **In plain terms:** Ship `.d.ts` type definitions so TypeScript users
+> get autocomplete and type checking for `createStreamTable()`,
+> `dropStreamTable()`, and configuration options.
+
+Verify: TypeScript project consumes the plugin with strict mode; no `any`
+types leaked.
+Dependencies: PGL-0-4. Schema change: No.
+
+**UX-5 — ElectricSQL outreach and collaboration**
+
+> **In plain terms:** PGlite is developed by ElectricSQL. Their cooperation
+> is essential for Phase 2 (WASM build). Initiate contact before shipping
+> Phase 0 to gauge interest, validate assumptions about PGlite's trigger
+> infrastructure, and explore potential co-marketing.
+
+Verify: documented exchange with ElectricSQL team (GitHub issue, email, or
+meeting notes).
+Dependencies: None. Schema change: No.
+
+### Test Coverage
+
+| ID | Title | Effort | Priority |
+|----|-------|--------|----------|
+| TEST-1 | Automated correctness suite (all patterns x DML types) | M | P0 |
+| TEST-2 | PGlite version compatibility matrix | S | P1 |
+| TEST-3 | Regression test: trigger firing order | S | P1 |
+| TEST-4 | Bundle size monitoring | XS | P2 |
+| TEST-5 | Extension upgrade path (0.18 to 0.19) | S | P0 |
+
+**TEST-1 — Automated correctness suite (all patterns x DML types)**
+
+> **In plain terms:** For each supported pattern (aggregate, join, filter),
+> run every DML type (INSERT, UPDATE, DELETE, multi-row, TRUNCATE) and
+> assert the stream table matches a fresh full evaluation. This is the
+> primary quality gate.
+
+Verify: Jest/Vitest test suite with > 50 test cases; all pass on PGlite
+latest.
+Dependencies: PGL-0-2, PGL-0-3. Schema change: No.
+
+**TEST-2 — PGlite version compatibility matrix**
+
+> **In plain terms:** PGlite updates frequently. Test the plugin against
+> the last 3 PGlite releases to ensure trigger behavior hasn't changed.
+> Document the minimum supported PGlite version.
+
+Verify: CI matrix runs tests against PGlite N, N-1, N-2.
+Dependencies: TEST-1. Schema change: No.
+
+**TEST-3 — Regression test: trigger firing order**
+
+> **In plain terms:** When multiple triggers exist on the same table,
+> PostgreSQL fires them in alphabetical order by trigger name. Verify that
+> trigger naming conventions prevent ordering conflicts with user-defined
+> triggers.
+
+Verify: test with a user-defined AFTER trigger alongside the plugin's
+trigger; both fire correctly; stream table produces correct results.
+Dependencies: PGL-0-3. Schema change: No.
+
+**TEST-4 — Bundle size monitoring**
+
+> **In plain terms:** The npm package should be small (< 50 KB minified +
+> gzipped) since this is a pure-JS plugin with no WASM. Add a CI check
+> that fails if bundle size exceeds the threshold.
+
+Verify: `npm pack --dry-run` reports < 50 KB gzipped.
+Dependencies: PGL-0-4. Schema change: No.
+
+**TEST-5 — Extension upgrade path (0.18 to 0.19)**
+
+> **In plain terms:** The main pg_trickle PostgreSQL extension ships no
+> functional changes in v0.19.0, but the upgrade migration path must still
+> be tested. `ALTER EXTENSION pg_trickle UPDATE` from 0.18.0 to 0.19.0
+> must leave existing stream tables intact.
+
+Verify: upgrade E2E test confirms all existing stream tables survive and
+refresh correctly after `0.18.0 -> 0.19.0` upgrade.
+Dependencies: None. Schema change: No (PG extension unchanged).
+
+### Conflicts & Risks
+
+1. **Demand uncertainty is the primary risk.** This entire milestone is a bet
+   that PGlite users want IVM beyond what pg_ivm provides. If Phase 0
+   generates no adoption signal, v0.20.0–v0.22.0 should be deprioritised and
+   v1.0.0 proceeds without PGlite. Define a concrete adoption threshold
+   (e.g., > 100 npm weekly downloads within 60 days of publication) as a
+   go/no-go gate for v0.20.0.
+
+2. **PGlite trigger infrastructure is unverified.** PGL-0-1 (trigger
+   validation) is a hard prerequisite for everything else. If statement-level
+   triggers with transition tables do not work in PGlite's single-user mode,
+   the entire Strategy C approach fails and the PoC must pivot to a pure JS
+   diff approach (lower value).
+
+3. **PGlite version mismatch.** PGlite tracks PostgreSQL 17; pg_trickle
+   targets PG 18. The PoC operates at the SQL level and should be unaffected,
+   but if PGlite upgrades to PG 18 mid-cycle, trigger behavior may change.
+   Pin the minimum PGlite version in `package.json`.
+
+4. **No core Rust changes, but version bump required.** The main pg_trickle
+   extension needs a v0.19.0 version bump, upgrade migration SQL, and passing
+   CI even though no functional code changes. This is low-risk but must not
+   be forgotten.
+
+5. **ElectricSQL collaboration timing.** UX-5 (outreach) should happen
+   early — before v0.19.0 ships — to avoid building something ElectricSQL is
+   already working on or would actively resist. If they signal interest in
+   co-development, Phase 2 scope and timeline may shift.
+
+6. **TypeScript delta SQL correctness is harder to prove than Rust.** The
+   main extension uses property-based testing and SQLancer for correctness.
+   The TS plugin lacks these tools. TEST-1 must be rigorously designed to
+   compensate — consider porting the proptest approach to a JS property-
+   testing library (e.g., fast-check).
+
+> **v0.19.0 total: ~2–3 weeks (PGlite plugin) + ~1–2 days (PG extension version bump)**
+
 **Exit criteria:**
 - [ ] PGL-0-1: Statement-level triggers with transition tables confirmed working in PGlite
 - [ ] PGL-0-2: Delta SQL correct for single-table aggregate, two-table join, and filtered query
 - [ ] PGL-0-3: `@pgtrickle/pglite-lite` plugin creates and maintains stream tables in PGlite
 - [ ] PGL-0-4: npm package published with README and usage examples
 - [ ] PGL-0-5: Benchmark shows measurable latency improvement over `live.incrementalQuery()` for supported patterns
-- [ ] Extension upgrade path tested (`0.18.0 → 0.19.0`)
+- [ ] CORR-1: Automated delta SQL equivalence tests pass (100+ DML sequences per pattern)
+- [ ] CORR-2: NULL-key aggregate groups correctly created, updated, and removed
+- [ ] CORR-3: Multi-DML transaction produces correct net result
+- [ ] STAB-1: No orphaned triggers after `dropStreamTable()`
+- [ ] STAB-2: Unsupported SQL patterns produce clear, actionable errors
+- [ ] STAB-3: Create-drop-create cycle produces correct results
+- [ ] PERF-1: Delta refresh latency < 50% of `live.incrementalQuery()` at 10K rows
+- [ ] PERF-3: Delta advantage holds at 100K rows (< 10% of full re-evaluation latency)
+- [ ] SCAL-1: 3+ stream tables on same source produce correct results
+- [ ] UX-1: README examples run unmodified on fresh PGlite instance
+- [ ] UX-2: Supported patterns decision table published
+- [ ] UX-4: TypeScript type definitions ship with strict-mode compatibility
+- [ ] TEST-1: > 50 correctness test cases pass on PGlite latest
+- [ ] TEST-2: CI tests pass against PGlite N, N-1, N-2
+- [ ] TEST-5: Extension upgrade path tested (`0.18.0 -> 0.19.0`)
 - [ ] `just check-version-sync` passes
 
 ---
@@ -4559,7 +4913,7 @@ to keep the pre-1.0 milestones focused on performance and correctness.
 | v0.16.0 — Performance & Refresh Optimization | ~1–2wk MERGE alts + ~4–6wk aggregate fast-path + ~1–2wk append-only + ~2–3wk predicate pushdown + ~2–3wk template cache + ~2–3wk buffer compaction + ~3–6wk test coverage + ~1–2wk bench CI + ~2–3d auto-indexing + ~12–22h quick wins | — | |
 | v0.17.0 — Query Intelligence & Stability | ~2–3wk cost-based strategy + ~3–4wk columnar tracking + ~32–48h TIVM Phase 4 + ~1–2d ROWS FROM + ~2–3wk SQLancer + ~2–3wk incremental DAG + ~4–8h unsafe reduction + ~1–2wk api.rs mod + ~2–3d migration guide + ~3–5d runbook + ~2–3d playground + ~2–3d doc polish | — | |
 | v0.18.0 — Hardening & Delta Performance | ~70–100h | — | |
-| v0.19.0 — PGlite Proof of Concept | ~2–3wk | — | |
+| v0.19.0 — PGlite Proof of Concept | ~2–3wk (plugin) + ~1–2d (version bump) | — | |
 | v0.20.0 — Core Extraction (`pg_trickle_core`) | ~3–4wk | — | |
 | v0.21.0 — PGlite WASM Extension | ~5–7wk | — | |
 | v0.22.0 — PGlite Reactive Integration | ~2–3wk | — | |
