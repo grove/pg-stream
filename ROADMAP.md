@@ -5479,11 +5479,19 @@ Dependencies: PGL-2-3, PERF-2. Schema change: No.
 
 ## v0.22.0 — PGlite Reactive Integration
 
-**Goal:** Integrate pg_trickle's IMMEDIATE mode stream tables with PGlite's
-live query ecosystem, enabling reactive UI bindings for React, Vue, and
-other frameworks. This is Phase 3 of the PGlite plan — the final step that
-makes pg_trickle a first-class citizen in the PGlite/ElectricSQL local-first
-application stack.
+> **Release Theme**
+> This release completes the PGlite story by bridging the gap between
+> database-side incremental view maintenance and front-end UI reactivity.
+> By connecting stream table deltas to PGlite's `live.changes()` API and
+> providing framework-specific hooks (`useStreamTable()` for React and
+> Vue), pg_trickle becomes the first IVM engine to offer truly reactive
+> UI bindings — where DOM updates are proportional to changed rows, not
+> result set size. This is the local-first developer's final mile: from
+> `INSERT` to re-render in a single digit millisecond count, with no
+> polling, no diffing, and no full query re-execution.
+
+See [PLAN_PGLITE.md](plans/ecosystem/PLAN_PGLITE.md) §7 Phase 3 for the
+full reactive integration design.
 
 ### Reactive Bindings (Phase 3)
 
@@ -5505,14 +5513,433 @@ application stack.
 
 > **Phase 3 subtotal: ~2–3 weeks**
 
+### Correctness
+
+| ID | Title | Effort | Priority |
+|----|-------|--------|----------|
+| CORR-1 | Change event fidelity vs stream table state | M | P0 |
+| CORR-2 | Multi-row DML atomicity in reactive stream | S | P0 |
+| CORR-3 | Hook state consistency after rapid mutations | M | P1 |
+| CORR-4 | DELETE/re-INSERT identity stability | S | P1 |
+
+**CORR-1 — Change event fidelity vs stream table state**
+
+> **In plain terms:** The `live.changes()` bridge emits INSERT/UPDATE/DELETE
+> events derived from the IMMEDIATE mode delta application. If an event is
+> missed, duplicated, or misclassified (e.g., an UPDATE emitted as DELETE +
+> INSERT), the React/Vue state will diverge from the actual stream table
+> contents. For every DML operation on every DVM operator type, assert that
+> the sequence of change events, when applied to an empty accumulator,
+> produces a set identical to `SELECT * FROM stream_table`.
+
+Verify: integration test replaying 1,000 random DML operations across all
+operator types; final accumulator state matches `SELECT *`. Any divergence
+is a hard failure.
+Dependencies: PGL-3-1. Schema change: No.
+
+**CORR-2 — Multi-row DML atomicity in reactive stream**
+
+> **In plain terms:** A single `INSERT INTO source SELECT ... FROM
+> generate_series(1, 100)` inserts 100 rows and triggers IMMEDIATE mode
+> delta application. The `live.changes()` bridge must emit all 100 change
+> events as a single batch — not trickle them one-by-one — so that React
+> performs a single re-render, not 100. If events leak across batch
+> boundaries, the UI shows intermediate states that never existed in the
+> database.
+
+Verify: test with 100-row INSERT; assert `useStreamTable()` callback fires
+exactly once with all 100 rows. Intermediate renders counted via React
+profiler must be ≤ 1.
+Dependencies: PGL-3-1, PGL-3-2. Schema change: No.
+
+**CORR-3 — Hook state consistency after rapid mutations**
+
+> **In plain terms:** If a user performs INSERT → DELETE → INSERT on the
+> same row within 10 ms (e.g., optimistic UI with undo), the hook must
+> resolve to the correct final state. Race conditions between the
+> `live.changes()` event stream and React's asynchronous render cycle
+> could show stale data. The hook must use a monotonic sequence number
+> (from the bridge's event stream) to discard stale updates.
+
+Verify: stress test with 50 rapid mutations on the same row at 1 ms
+intervals; final hook state matches `SELECT *`. Test on both React 18
+(concurrent mode) and React 19.
+Dependencies: PGL-3-1, PGL-3-2. Schema change: No.
+
+**CORR-4 — DELETE/re-INSERT identity stability**
+
+> **In plain terms:** When a row is deleted and a new row with the same PK
+> is inserted, the `__pgt_row_id` changes but the PK doesn't. The change
+> bridge must emit a DELETE for the old `__pgt_row_id` and an INSERT for
+> the new one — not an UPDATE — so that React's reconciler correctly
+> unmounts and remounts the component (not just re-renders it). Wrong
+> identity semantics cause stale closures and event handler leaks.
+
+Verify: test DELETE + INSERT with same PK; verify React component lifecycle
+(unmount + mount, not just update). Use React DevTools profiler.
+Dependencies: PGL-3-1, PGL-3-2. Schema change: No.
+
+### Stability
+
+| ID | Title | Effort | Priority |
+|----|-------|--------|----------|
+| STAB-1 | Memory leak prevention in long-lived hooks | M | P0 |
+| STAB-2 | Subscription cleanup on component unmount | S | P0 |
+| STAB-3 | Error boundary integration for hook failures | S | P0 |
+| STAB-4 | Native extension upgrade path (0.21 → 0.22) | S | P0 |
+| STAB-5 | Framework version compatibility matrix | S | P1 |
+
+**STAB-1 — Memory leak prevention in long-lived hooks**
+
+> **In plain terms:** A `useStreamTable()` hook in a long-lived component
+> (e.g., a dashboard that runs for hours) accumulates change events via
+> the `live.changes()` subscription. If the bridge or hook retains
+> references to processed events, memory grows unboundedly. Implement a
+> bounded event buffer (configurable, default 1,000 events) that discards
+> processed events after they are applied to the hook's state snapshot.
+> After the buffer fills, old entries are garbage-collected.
+
+Verify: 4-hour soak test with continuous 1 row/sec mutations. Heap snapshot
+at 1h and 4h shows < 10% growth. No detached DOM nodes or leaked closures.
+Dependencies: PGL-3-1, PGL-3-2. Schema change: No.
+
+**STAB-2 — Subscription cleanup on component unmount**
+
+> **In plain terms:** When a React component using `useStreamTable()` is
+> unmounted (e.g., route change), the `live.changes()` subscription must
+> be cancelled immediately. Failing to clean up causes: (a) memory leaks
+> from the change listener, (b) "setState on unmounted component" warnings,
+> (c) stale event processing after the component is gone. Use
+> `useEffect()` cleanup function with an AbortController pattern.
+
+Verify: mount/unmount cycle test (100 cycles); zero console warnings, zero
+leaked subscriptions (verified via PGlite connection subscription count).
+Dependencies: PGL-3-2. Schema change: No.
+
+**STAB-3 — Error boundary integration for hook failures**
+
+> **In plain terms:** If the `live.changes()` bridge throws (e.g., stream
+> table was dropped while the hook is active), the hook must propagate the
+> error to React's error boundary / Vue's `onErrorCaptured` — not swallow
+> it silently or crash the app. Provide an `onError` callback option and
+> a default that throws to the nearest error boundary.
+
+Verify: test dropping a stream table while `useStreamTable()` is active;
+assert error boundary catches the error with an actionable message.
+Dependencies: PGL-3-2, PGL-3-3. Schema change: No.
+
+**STAB-4 — Native extension upgrade path (0.21 → 0.22)**
+
+> **In plain terms:** v0.22.0 adds reactive bindings at the TypeScript/npm
+> layer only. The native PostgreSQL extension and PGlite WASM extension
+> must continue to work unchanged. The upgrade migration from 0.21.0 to
+> 0.22.0 must leave existing stream tables and the `@pgtrickle/pglite`
+> WASM extension intact.
+
+Verify: upgrade E2E test confirms stream tables survive and refresh
+correctly after `0.21.0 -> 0.22.0`. TypeScript API backward compatibility
+verified.
+Dependencies: None. Schema change: No.
+
+**STAB-5 — Framework version compatibility matrix**
+
+> **In plain terms:** Test `useStreamTable()` against: React 18.x, React
+> 19.x, Vue 3.4+. Document which framework versions are supported. Future
+> consideration: Svelte 5 (runes), SolidJS, Angular signals — document
+> these as "community-contributed" integration points, not first-party.
+
+Verify: CI matrix testing React 18, React 19, Vue 3.4. Published
+compatibility table in npm README.
+Dependencies: PGL-3-2, PGL-3-3. Schema change: No.
+
+### Performance
+
+| ID | Title | Effort | Priority |
+|----|-------|--------|----------|
+| PERF-1 | INSERT-to-render latency benchmark | M | P0 |
+| PERF-2 | Batch rendering efficiency (single re-render) | S | P0 |
+| PERF-3 | Bridge overhead vs raw `live.changes()` | S | P1 |
+
+**PERF-1 — INSERT-to-render latency benchmark**
+
+> **In plain terms:** Measure the end-to-end latency from `INSERT INTO
+> source_table` to the React component's DOM update. The target is
+> < 50% of `live.incrementalQuery()` latency for a 3-table join +
+> aggregate at 10K rows (per PLAN_PGLITE.md). This is the headline
+> metric: if pg_trickle's reactive path is not significantly faster than
+> PGlite's built-in incremental query, the value proposition collapses.
+
+Verify: benchmark suite with 5 complexity levels (scan, filter, join,
+aggregate, window). Publish results as a comparison table against
+`live.incrementalQuery()`. Target: < 50% latency at 10K rows.
+Dependencies: PGL-3-1, PGL-3-2, PGL-3-5. Schema change: No.
+
+**PERF-2 — Batch rendering efficiency (single re-render)**
+
+> **In plain terms:** A bulk INSERT (100 rows) must produce exactly one
+> React re-render, not 100. The change bridge must batch events emitted
+> within the same transaction into a single `live.changes()` notification.
+> Use `queueMicrotask()` or `requestAnimationFrame()` batching in the
+> TypeScript wrapper to coalesce rapid-fire events.
+
+Verify: React profiler shows ≤ 1 render per bulk DML. Test with 1, 10,
+100, 1000-row INSERTs; render count is always 1.
+Dependencies: PGL-3-1, PGL-3-2, CORR-2. Schema change: No.
+
+**PERF-3 — Bridge overhead vs raw `live.changes()`**
+
+> **In plain terms:** The change bridge adds a translation layer between
+> the IMMEDIATE mode delta application and PGlite's `live.changes()` API.
+> Measure the overhead of this translation (serialization, event
+> construction, key mapping) and ensure it is < 5% of total refresh
+> latency. If overhead is higher, optimize the bridge's change event
+> construction (e.g., avoid JSON round-trips, use structured clones).
+
+Verify: micro-benchmark isolating bridge overhead from WASM refresh time.
+Document overhead as percentage of total INSERT-to-event latency.
+Dependencies: PGL-3-1. Schema change: No.
+
+### Scalability
+
+| ID | Title | Effort | Priority |
+|----|-------|--------|----------|
+| SCAL-1 | Multiple concurrent subscriptions | S | P1 |
+| SCAL-2 | Large result set rendering (10K+ rows) | M | P1 |
+| SCAL-3 | Multi-tab / SharedWorker isolation | S | P2 |
+
+**SCAL-1 — Multiple concurrent subscriptions**
+
+> **In plain terms:** A dashboard page may render 5-10 `useStreamTable()`
+> hooks simultaneously, each watching a different stream table. The bridge
+> must not create per-hook subscriptions to `live.changes()` — instead,
+> use a single multiplexed subscription that fans out to registered hooks.
+> Measure performance with 1, 5, 10, 20 concurrent hooks.
+
+Verify: benchmark with 20 concurrent `useStreamTable()` hooks; latency
+degradation < 20% vs single hook. Memory growth linear (not quadratic).
+Dependencies: PGL-3-1, PGL-3-2. Schema change: No.
+
+**SCAL-2 — Large result set rendering (10K+ rows)**
+
+> **In plain terms:** A stream table with 10K+ rows produces a large
+> initial snapshot when `useStreamTable()` mounts. The hook must support
+> virtualized rendering (integrating with libraries like `react-virtual`
+> or `tanstack-virtual`) by providing a stable row identity key
+> (`__pgt_row_id`) and fine-grained change signals (which rows changed,
+> not just "something changed"). Without this, mounting a 10K-row stream
+> table would freeze the UI for seconds.
+
+Verify: demo app with 10K-row stream table using `@tanstack/react-virtual`.
+Mount time < 200 ms. Single-row INSERT re-renders only the affected row,
+not the full list.
+Dependencies: PGL-3-2, PGL-3-4. Schema change: No.
+
+**SCAL-3 — Multi-tab / SharedWorker isolation**
+
+> **In plain terms:** In multi-tab apps using PGlite with SharedWorker,
+> each tab gets its own `useStreamTable()` hooks but shares a single
+> PGlite instance. The bridge must correctly fan out change events to all
+> tabs without cross-tab interference or duplicate processing. Document
+> the SharedWorker architecture and test with 3 concurrent tabs.
+
+Verify: 3-tab test with shared PGlite instance via SharedWorker. INSERT in
+tab 1 causes re-render in all 3 tabs. No duplicate events. No memory leaks
+across tabs.
+Dependencies: PGL-3-1. Schema change: No.
+
+### Ease of Use
+
+| ID | Title | Effort | Priority |
+|----|-------|--------|----------|
+| UX-1 | Local-first app example: collaborative todo | M | P0 |
+| UX-2 | Real-time dashboard example | M | P0 |
+| UX-3 | API reference with interactive playground | S | P1 |
+| UX-4 | Migration guide from `live.incrementalQuery()` | S | P1 |
+
+**UX-1 — Local-first app example: collaborative todo**
+
+> **In plain terms:** A complete, runnable React app demonstrating
+> pg_trickle + PGlite for a collaborative todo list: multiple "users"
+> (simulated in separate components) INSERT/UPDATE/DELETE todos, each
+> user's view updates reactively via `useStreamTable()`. Published in
+> the monorepo under `examples/pglite-todo/` with a CodeSandbox link.
+> This is the primary "show, don't tell" marketing asset.
+
+Verify: example app runs in CodeSandbox with zero local setup. README
+explains every code section. A non-pg_trickle developer can understand it
+in 5 minutes.
+Dependencies: PGL-3-2, PGL-3-4. Schema change: No.
+
+**UX-2 — Real-time dashboard example**
+
+> **In plain terms:** A React dashboard with 3 stream tables: (a) live
+> order count (aggregate), (b) revenue by region (join + aggregate), (c)
+> top products (window function + LIMIT). Data is inserted via a simulated
+> event stream. Each panel updates reactively. Demonstrates the breadth of
+> SQL operators supported in PGlite, beyond what `live.incrementalQuery()`
+> can efficiently handle.
+
+Verify: example app with 3 panels. INSERT 100 orders; all 3 panels update
+with a single render each. Published to CodeSandbox.
+Dependencies: PGL-3-2, PGL-3-4. Schema change: No.
+
+**UX-3 — API reference with interactive playground**
+
+> **In plain terms:** An interactive documentation page (MDX or Storybook)
+> where users can type SQL, create a stream table, insert data, and see
+> the `useStreamTable()` hook update live — all in the browser via PGlite.
+> This replaces the need for a local install for initial exploration.
+
+Verify: playground page loads in < 3 seconds. Users can create a stream
+table and see reactive updates within 30 seconds of page load.
+Dependencies: PGL-3-2, UX-1. Schema change: No.
+
+**UX-4 — Migration guide from `live.incrementalQuery()`**
+
+> **In plain terms:** Users already using PGlite's `live.incrementalQuery()`
+> need a clear guide showing: (a) when to switch to pg_trickle (complex
+> queries, high-throughput writes, large result sets), (b) how to migrate
+> step-by-step (replace `live.incrementalQuery(q)` with
+> `createStreamTable(q)` + `useStreamTable(name)`), (c) what to expect
+> (latency improvement, memory trade-off, SQL surface differences).
+
+Verify: migration guide published in docs. Includes a before/after code
+diff and a decision flowchart.
+Dependencies: PGL-3-4, PERF-1. Schema change: No.
+
+### Test Coverage
+
+| ID | Title | Effort | Priority |
+|----|-------|--------|----------|
+| TEST-1 | Change event fidelity suite (all operators) | L | P0 |
+| TEST-2 | React hook lifecycle tests | M | P0 |
+| TEST-3 | Vue composable lifecycle tests | M | P0 |
+| TEST-4 | Cross-framework render count assertions | S | P0 |
+| TEST-5 | Long-running soak test for memory leaks | M | P1 |
+
+**TEST-1 — Change event fidelity suite (all operators)**
+
+> **In plain terms:** For each of the 23 DVM operators, test that the
+> `live.changes()` bridge emits the correct change events for INSERT,
+> UPDATE, and DELETE on the source table. Replay events into an
+> accumulator and assert it matches `SELECT * FROM stream_table`. This
+> extends v0.21.0 TEST-1 (operator E2E) by adding the reactive layer.
+
+Verify: ≥ 69 tests (23 operators × 3 DML types). Accumulator matches
+`SELECT *` for every test case.
+Dependencies: PGL-3-1, v0.21.0 TEST-1. Schema change: No.
+
+**TEST-2 — React hook lifecycle tests**
+
+> **In plain terms:** Test the full lifecycle of `useStreamTable()`:
+> (a) initial mount returns current stream table state, (b) INSERT on
+> source triggers re-render with new data, (c) unmount cancels
+> subscription, (d) remount re-subscribes and returns current state,
+> (e) rapid mount/unmount (100 cycles) has no leaks. Use React Testing
+> Library with `renderHook()`.
+
+Verify: ≥ 15 tests covering mount, update, unmount, remount, error, and
+stress scenarios. Zero console warnings in test output.
+Dependencies: PGL-3-2. Schema change: No.
+
+**TEST-3 — Vue composable lifecycle tests**
+
+> **In plain terms:** Equivalent of TEST-2 for Vue: mount, update, unmount,
+> remount, error handling. Use Vue Test Utils with `mount()` and
+> `wrapper.unmount()`. Test with both Options API and Composition API
+> usage patterns.
+
+Verify: ≥ 10 tests covering Vue lifecycle. Zero console warnings.
+Dependencies: PGL-3-3. Schema change: No.
+
+**TEST-4 — Cross-framework render count assertions**
+
+> **In plain terms:** For each framework (React, Vue), verify that a bulk
+> INSERT (100 rows) triggers exactly 1 render, not 100. This is the
+> batching correctness test. Use framework-specific profiling APIs (React
+> Profiler, Vue DevTools perf hooks) to count renders.
+
+Verify: render count = 1 for 100-row bulk INSERT in both React and Vue.
+CI assertion.
+Dependencies: PGL-3-2, PGL-3-3, PERF-2. Schema change: No.
+
+**TEST-5 — Long-running soak test for memory leaks**
+
+> **In plain terms:** Run a React app with `useStreamTable()` for 4 hours
+> with 1 mutation/second. Take heap snapshots at 0h, 1h, 2h, 4h. Assert
+> heap growth < 10%. Check for detached DOM nodes, leaked event listeners,
+> and orphaned closures. This validates STAB-1 under real conditions.
+
+Verify: soak test runs in CI (with a 30-min abbreviated version for PR CI).
+Full 4-hour version runs in nightly CI. Heap growth < 10%.
+Dependencies: STAB-1, PGL-3-2. Schema change: No.
+
+### Conflicts & Risks
+
+1. **`live.changes()` API stability.** PGlite's `live.changes()` is
+   relatively new and its event format may change between PGlite releases.
+   Pin the PGlite version and add an adapter layer so the bridge can
+   accommodate event format changes without rewriting the React/Vue hooks.
+   If PGlite deprecates `live.changes()` before v0.22.0 ships, fall back
+   to `LISTEN/NOTIFY` with a custom channel.
+
+2. **CORR-2 (batch atomicity) and PERF-2 (single re-render) are coupled.**
+   The batching mechanism must ensure correctness (all-or-nothing event
+   delivery) AND performance (single render). Using `queueMicrotask()`
+   for batching risks splitting a transaction's events across two
+   microtasks if the event stream straddles a microtask boundary. Consider
+   explicit transaction-boundary markers in the bridge's event protocol.
+
+3. **React concurrent mode complicates CORR-3 (rapid mutations).** React
+   18/19 concurrent features (`startTransition`, `useDeferredValue`) may
+   delay or re-order state updates from `useStreamTable()`. The hook must
+   use `useSyncExternalStore()` (React 18+) to ensure tearing-free reads.
+   This is non-negotiable for correctness.
+
+4. **SCAL-2 (large result set rendering) requires external library
+   integration.** The `useStreamTable()` hook should not bundle a
+   virtualization library — instead, expose stable row keys and
+   fine-grained change signals that integrate with `@tanstack/react-virtual`
+   or similar. Document the pattern but do not create a hard dependency.
+
+5. **SCAL-3 (SharedWorker) is exploratory.** PGlite's SharedWorker support
+   has known limitations (no concurrent transactions). Mark SCAL-3 as P2
+   and scope it to documentation + a proof-of-concept, not production-grade
+   support.
+
+6. **No native extension changes in v0.22.0.** This release is entirely
+   in the TypeScript/npm layer. Any temptation to add native features
+   (e.g., `LISTEN/NOTIFY` bridge, WebSocket push) should be deferred to
+   post-1.0. Keep the scope tight: reactive bindings + examples + docs.
+
+> **v0.22.0 total: ~2–3 weeks (bridge + hooks) + ~1–2 weeks (examples + testing + polish)**
+
 **Exit criteria:**
 - [ ] PGL-3-1: Stream table changes appear in `live.changes()` event stream
 - [ ] PGL-3-2: React `useStreamTable()` hook re-renders on stream table changes
 - [ ] PGL-3-3: Vue `useStreamTable()` composable re-renders on stream table changes
-- [ ] PGL-3-4: At least 2 example apps published with documentation
-- [ ] PGL-3-5: End-to-end latency benchmarked and documented
-- [ ] Extension upgrade path tested (`0.21.0 → 0.22.0`)
-- [ ] `just check-version-sync` passes
+- [ ] PGL-3-4: At least 2 example apps published with documentation and CodeSandbox links
+- [ ] PGL-3-5: End-to-end latency benchmarked and published
+- [ ] CORR-1: 1,000-operation replay test: accumulator matches `SELECT *` for all operators
+- [ ] CORR-2: 100-row bulk INSERT triggers exactly 1 re-render
+- [ ] CORR-3: 50 rapid same-row mutations: final hook state matches `SELECT *`
+- [ ] CORR-4: DELETE + re-INSERT with same PK: correct unmount/mount lifecycle
+- [ ] STAB-1: 4-hour soak test: heap growth < 10%
+- [ ] STAB-2: 100 mount/unmount cycles: zero leaked subscriptions
+- [ ] STAB-3: Stream table dropped while hook active: error boundary catches
+- [ ] STAB-4: Extension upgrade path tested (`0.21.0 -> 0.22.0`)
+- [ ] STAB-5: CI matrix passes for React 18, React 19, Vue 3.4+
+- [ ] PERF-1: INSERT-to-render latency < 50% of `live.incrementalQuery()` at 10K rows
+- [ ] PERF-2: Render count = 1 for bulk DML (1, 10, 100, 1000 rows)
+- [ ] TEST-1: ≥ 69 change event fidelity tests pass (23 operators × 3 DML types)
+- [ ] TEST-2: ≥ 15 React hook lifecycle tests pass
+- [ ] TEST-3: ≥ 10 Vue composable lifecycle tests pass
+- [ ] TEST-4: Cross-framework render count = 1 for bulk DML
+- [ ] TEST-5: 30-min abbreviated soak test passes in PR CI
+- [ ] UX-1: Collaborative todo example published to CodeSandbox
+- [ ] UX-2: Real-time dashboard example published to CodeSandbox
+- [ ] UX-4: Migration guide from `live.incrementalQuery()` published
+- [ ] `just check-version-sync` passes (incl. npm package version)
 
 ---
 
@@ -5725,7 +6152,7 @@ to keep the pre-1.0 milestones focused on performance and correctness.
 | v0.19.0 — PGlite Proof of Concept | ~2–3wk (plugin) + ~1–2d (version bump) | — | |
 | v0.20.0 — Core Extraction (`pg_trickle_core`) | ~3–4wk (extraction) + ~1–2wk (abstraction + testing) | — | |
 | v0.21.0 — PGlite WASM Extension | ~5–7wk (WASM build) + ~2–3wk (testing + polish) | — | |
-| v0.22.0 — PGlite Reactive Integration | ~2–3wk | — | |
+| v0.22.0 — PGlite Reactive Integration | ~2–3wk (bridge + hooks) + ~1–2wk (examples + testing + polish) | — | |
 | v1.0.0 — Stable release (incl. PG 19 compat) | ~36–66h | — | |
 | Post-1.0 (PG compat + Native DDL) | ~38–56h (PG 16–18) + ~13–21d (Native DDL) | — | |
 | Post-1.0 (ecosystem) | 88–134h | — | |
