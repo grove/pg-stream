@@ -185,7 +185,16 @@ pub fn diff_left_join(ctx: &mut DiffContext, op: &OpTree) -> Result<DiffResult, 
     //
     // R₀ = R_current EXCEPT ALL ΔR_inserts UNION ALL ΔR_deletes
     // DI-11: Use same threshold as inner join for deep R₀ reconstruction.
-    let use_r0 = use_pre_change_snapshot(right, ctx.inside_semijoin, 4);
+    //
+    // When use_l0 is true (Part 2 uses L₀), the standard DBSP formula
+    // is already exact — no EC-01 split needed. See diff_inner_join
+    // for the full derivation.
+    let l0_available = use_pre_change_snapshot(left, ctx.inside_semijoin, 4);
+    let use_r0 = if l0_available {
+        false
+    } else {
+        use_pre_change_snapshot(right, ctx.inside_semijoin, 4)
+    };
 
     // Build R₀ for Parts 1b/3b (includes all right_cols for JOIN/anti-join).
     // Separate from r_old_snapshot (used for Parts 4/5 NOT EXISTS only,
@@ -560,22 +569,25 @@ mod tests {
         let result = diff_left_join(&mut ctx, &tree).unwrap();
         let sql = ctx.build_with_query(&result.cte_name);
 
-        // EC-01: Parts 1 and 3 are split when right child is simple (Scan)
-        assert_sql_contains(&sql, "Part 1a");
-        assert_sql_contains(&sql, "Part 1b");
+        // When L₀ is available (Scan children), Part 1 and Part 3 are NOT
+        // split — standard formula is exact, no EC-01 needed.
+        assert_sql_contains(&sql, "Part 1");
+        assert_sql_not_contains(&sql, "Part 1a");
+        assert_sql_not_contains(&sql, "Part 1b");
         assert_sql_contains(&sql, "Part 2");
-        assert_sql_contains(&sql, "Part 3a");
-        assert_sql_contains(&sql, "Part 3b");
+        assert_sql_contains(&sql, "Part 3");
+        assert_sql_not_contains(&sql, "Part 3a");
+        assert_sql_not_contains(&sql, "Part 3b");
         assert_sql_contains(&sql, "Part 4");
         assert_sql_contains(&sql, "Part 5");
-        // EC-02: Part 6 corrects ΔL_D ⋈ ΔR double-counting
-        assert_sql_contains(&sql, "Part 6");
+        // EC-02 correction (Part 6) is NOT needed without EC-01 split.
+        assert_sql_not_contains(&sql, "Part 6");
     }
 
     #[test]
-    fn test_ec01_left_join_r0_uses_except_all() {
-        // For Scan right children, Part 1b and Part 3b should use R₀ via
-        // EXCEPT ALL to find pre-change right partners.
+    fn test_ec01_left_join_no_r0_when_l0_available() {
+        // When L₀ is available (Scan children), R₀ is NOT used — standard
+        // formula is exact. Parts 1 and 3 are unsplit.
         let mut ctx = test_ctx();
         let left = scan(1, "a", "public", "a", &["id", "bid"]);
         let right = scan(2, "b", "public", "b", &["id", "name"]);
@@ -584,12 +596,11 @@ mod tests {
         let result = diff_left_join(&mut ctx, &tree).unwrap();
         let sql = ctx.build_with_query(&result.cte_name);
 
-        // R₀ uses DI-2 NOT EXISTS anti-join pattern
+        // L₀ uses NOT EXISTS anti-join (DI-2)
         assert_sql_contains(&sql, "NOT EXISTS");
-        // Part 1b filters DELETEs only
-        assert_sql_contains(&sql, "Part 1b");
-        // Part 3b filters DELETEs only
-        assert_sql_contains(&sql, "Part 3b");
+        // Part 1 and Part 3 are NOT split
+        assert_sql_not_contains(&sql, "Part 1b");
+        assert_sql_not_contains(&sql, "Part 3b");
     }
 
     #[test]
@@ -768,10 +779,9 @@ mod tests {
     }
 
     #[test]
-    fn test_ec02_left_join_correction_for_scan_children() {
-        // When both left and right are Scan children (use_l0 && use_r0),
-        // EC-02 correction (Part 6) should be emitted to cancel ΔL_D ⋈ ΔR
-        // double-counting between Part 1b and Part 2.
+    fn test_ec02_left_join_no_correction_when_l0_available() {
+        // When L₀ is available (simple Scan children), the standard formula
+        // is exact and no EC-02 correction is needed.
         let mut ctx = test_ctx();
         let left = scan(1, "a", "public", "a", &["id", "key"]);
         let right = scan(2, "b", "public", "b", &["id", "val"]);
@@ -780,13 +790,7 @@ mod tests {
         let result = diff_left_join(&mut ctx, &tree).unwrap();
         let sql = ctx.build_with_query(&result.cte_name);
 
-        // EC-02 Part 6 should flip ΔR action
-        assert_sql_contains(&sql, "Part 6: EC-02 correction");
-        assert_sql_contains(
-            &sql,
-            "CASE WHEN dr.__pgt_action = 'I' THEN 'D' ELSE 'I' END",
-        );
-        // EC-02 only joins ΔL_D rows
-        assert_sql_contains(&sql, "dl.__pgt_action = 'D'");
+        // EC-02 Part 6 should NOT be present.
+        assert_sql_not_contains(&sql, "Part 6: EC-02 correction");
     }
 }
