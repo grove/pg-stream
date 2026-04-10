@@ -2199,12 +2199,16 @@ pub fn prewarm_merge_cache(st: &StreamTableMeta) {
     // Build the USING clause — skip deduplication when the delta is already
     // deduplicated (G-M1 optimization for scan-chain queries).
     //
-    // EC-06: For keyless sources the delta is never deduplicated (multiple
-    // rows can share the same __pgt_row_id). Skip deduplication unconditionally.
-    //
     // B3-2: For non-deduplicated deltas, use weight aggregation instead of
     // DISTINCT ON.  Weight aggregation correctly handles diamond-flow queries
     // where multiple delta branches produce overlapping corrections.
+    //
+    // EC-06b: Join queries with incomplete PK output set has_keyless_source
+    // for storage safety (non-unique index), but their non-deduplicated join
+    // deltas still require weight aggregation for EC-02 correction cross-term
+    // cancellation.  Without weight agg, PostgreSQL MERGE's snapshot semantics
+    // prevent correction DELETEs from seeing rows inserted by earlier USING
+    // rows in the same statement, causing phantom row accumulation.
     //
     // A-2: When `has_key_changed` is available on a deduplicated delta, wrap
     // the USING clause with a filter that suppresses D-side rows for value-only
@@ -2217,10 +2221,6 @@ pub fn prewarm_merge_cache(st: &StreamTableMeta) {
              WHERE NOT (__d.__pgt_action = 'D' AND __d.__pgt_key_changed = FALSE))"
         )
     } else if delta_result.is_deduplicated {
-        format!("({delta_sql_template})")
-    } else if st.has_keyless_source {
-        // Keyless: do NOT collapse — duplicate row_ids are intentional
-        // (one per net insert/delete).
         format!("({delta_sql_template})")
     } else {
         build_weight_agg_using(&delta_sql_template, &user_col_list)
@@ -4500,16 +4500,17 @@ pub fn execute_differential_refresh(
         };
 
         // Build template USING clause — skip deduplication when deduplicated (G-M1)
-        // EC-06: For keyless sources, never collapse.
         // B3-2: Use weight aggregation instead of DISTINCT ON for correctness
         // on diamond-flow queries.
+        // EC-06b: Non-deduplicated keyless join deltas use weight agg for
+        // EC-02 correction cross-term cancellation (see prewarm_merge_cache).
         // A-2: Filter D-side value-only UPDATE rows when __pgt_key_changed is available.
-        let template_using = if (is_dedup || st.has_keyless_source) && has_key_changed {
+        let template_using = if is_dedup && has_key_changed {
             format!(
                 "(SELECT * FROM ({delta_sql_template}) __d \
                  WHERE NOT (__d.__pgt_action = 'D' AND __d.__pgt_key_changed = FALSE))"
             )
-        } else if is_dedup || st.has_keyless_source {
+        } else if is_dedup {
             format!("({delta_sql_template})")
         } else {
             build_weight_agg_using(&delta_sql_template, &user_col_list)
