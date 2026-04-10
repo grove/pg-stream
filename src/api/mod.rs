@@ -1724,91 +1724,6 @@ fn migrate_storage_table_compatible(
     Ok(())
 }
 
-/// Drop and recreate the `__pgt_row_id` index on a storage table.
-///
-/// Called during ALTER QUERY compatible migration to keep the covering
-/// INCLUDE list in sync with the changed column set and to ensure the
-/// index exists — PostgreSQL silently drops an index when one of its
-/// INCLUDE columns is removed via `ALTER TABLE ... DROP COLUMN`.
-fn rebuild_row_id_index(
-    schema: &str,
-    table_name: &str,
-    columns: &[ColumnDef],
-    has_keyless_source: bool,
-    partition_key: Option<&str>,
-) -> Result<(), PgTrickleError> {
-    let quoted_schema = quote_identifier(schema);
-    let quoted_table = quote_identifier(table_name);
-    let pgt_relid = get_table_oid(schema, table_name)?;
-
-    // Find and drop existing __pgt_row_id index(es).
-    let index_names: Vec<String> = Spi::connect(|client| {
-        let table = client
-            .select(
-                "SELECT c.relname::text FROM pg_index i \
-                 JOIN pg_class c ON c.oid = i.indexrelid \
-                 JOIN pg_attribute a ON a.attrelid = i.indexrelid AND a.attnum = 1 \
-                 WHERE i.indrelid = $1 AND a.attname = '__pgt_row_id'",
-                None,
-                &[pgt_relid.into()],
-            )
-            .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
-
-        let mut names = Vec::new();
-        for row in table {
-            if let Some(name) = row
-                .get::<String>(1)
-                .map_err(|e| PgTrickleError::SpiError(e.to_string()))?
-            {
-                names.push(name);
-            }
-        }
-        Ok(names)
-    })?;
-
-    for idx_name in &index_names {
-        Spi::run(&format!(
-            "DROP INDEX IF EXISTS {}.{}",
-            quoted_schema,
-            quote_identifier(idx_name),
-        ))
-        .map_err(|e| {
-            PgTrickleError::SpiError(format!("Failed to drop __pgt_row_id index: {}", e))
-        })?;
-    }
-
-    // Recreate with the updated INCLUDE list (same logic as setup_storage_table).
-    let auto_index = crate::config::pg_trickle_auto_index();
-    const COVERING_INDEX_MAX_COLUMNS: usize = 8;
-    let include_clause =
-        if auto_index && columns.len() <= COVERING_INDEX_MAX_COLUMNS && !columns.is_empty() {
-            let include_cols: Vec<String> = columns
-                .iter()
-                .map(|c| quote_identifier(&c.name).to_string())
-                .collect();
-            format!(" INCLUDE ({})", include_cols.join(", "))
-        } else {
-            String::new()
-        };
-    let is_partitioned = partition_key.is_some();
-    let index_sql = if has_keyless_source || is_partitioned {
-        format!(
-            "CREATE INDEX ON {}.{} (__pgt_row_id){}",
-            quoted_schema, quoted_table, include_clause,
-        )
-    } else {
-        format!(
-            "CREATE UNIQUE INDEX ON {}.{} (__pgt_row_id){}",
-            quoted_schema, quoted_table, include_clause,
-        )
-    };
-    Spi::run(&index_sql).map_err(|e| {
-        PgTrickleError::SpiError(format!("Failed to recreate __pgt_row_id index: {}", e))
-    })?;
-
-    Ok(())
-}
-
 /// Manage auxiliary columns (__pgt_count, __pgt_count_l/r, __pgt_aux_sum_*,
 /// __pgt_aux_count_*, __pgt_aux_sum2_*, __pgt_aux_sumx_*, __pgt_aux_nonnull_*)
 /// during ALTER QUERY when the query type or aggregate composition changes.
@@ -2139,17 +2054,6 @@ fn alter_stream_table_query(
         }
         SchemaChange::Compatible { added, removed } => {
             migrate_storage_table_compatible(schema, table_name, added, removed)?;
-            // AUTO-IDX-2 covering indexes INCLUDE user columns; when columns
-            // are added or removed the INCLUDE list is stale (and PostgreSQL
-            // silently drops the index when an INCLUDE column is removed).
-            // Rebuild the __pgt_row_id index with the updated column set.
-            rebuild_row_id_index(
-                schema,
-                table_name,
-                &vq.columns,
-                vq.has_keyless_source,
-                st.st_partition_key.as_deref(),
-            )?;
             st.pgt_relid
         }
         SchemaChange::Incompatible { reason } => {
