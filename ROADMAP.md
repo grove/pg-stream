@@ -77,9 +77,9 @@ from the v0.1.x series to 1.0 and beyond.
 | v0.13.0 | Scalability foundations, MERGE profiling, multi-tenant scheduling | ✅ Released |
 | v0.14.0 | Tiered scheduling, UNLOGGED buffers & diagnostics | ✅ Released |
 | v0.15.0 | External test suites & integration | ✅ Released |
-| **v0.16.0** | **Performance & refresh optimization** | **✅ Released** |
-| **v0.17.0** | **Query intelligence & stability** | **✅ Released** |
-| v0.18.0 | Hardening & delta performance | Planned |
+| v0.16.0 | Performance & refresh optimization | ✅ Released |
+| v0.17.0 | Query intelligence & stability | ✅ Released |
+| **v0.18.0** | **Hardening & delta performance** | **In Progress** |
 | v0.19.0 | PostgreSQL 17 support | Planned |
 | v0.20.0 | PGlite proof of concept | Planned |
 | v0.21.0 | Core extraction (`pg_trickle_core`) | Planned |
