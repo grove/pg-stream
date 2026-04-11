@@ -38,6 +38,28 @@ For future plans and release milestones, see [ROADMAP.md](ROADMAP.md).
 
 ## [Unreleased]
 
+### Added
+
+- **STAB-3:** Spill detection alerting — `AlertEvent::SpillThresholdExceeded`
+  fires via NOTIFY when delta MERGE spills to temp files for consecutive
+  refreshes exceeding `pg_trickle.spill_consecutive_limit`, so operators are
+  aware before the scheduler forces a FULL refresh fallback.
+
+- **UX-1 (CACHE-OBS):** Template cache observability — new
+  `pgtrickle.cache_stats()` function exposes L1 hits, L2 hits, full misses,
+  evictions, and current L1 cache size from shared memory. L1 hit and
+  eviction counters now tracked in shared memory alongside the existing L2
+  hit/miss counters.
+
+### Verified
+
+- **STAB-1:** All production-path `.unwrap()` calls in `api.rs` and
+  `refresh.rs` were already eliminated in prior releases. No action needed.
+
+- **STAB-2 (Phase 1):** The `pg_cstr_to_str()` safe wrapper in
+  `src/dvm/parser/mod.rs` already covers all ~76 C-string conversion sites.
+  Zero remaining `CStr::from_ptr` calls outside the wrapper implementation.
+
 ---
 
 ## [0.17.0] — 2026-04-08

@@ -25,6 +25,7 @@ Complete reference for all SQL functions, views, and catalog tables provided by 
     - [pgtrickle.get\_refresh\_history](#pgtrickleget_refresh_history)
     - [pgtrickle.get\_staleness](#pgtrickleget_staleness)
     - [pgtrickle.explain\_refresh\_mode](#pgtrickleexplain_refresh_mode)
+    - [pgtrickle.cache\_stats](#pgtricklecache_stats)
   - [CDC Diagnostics](#cdc-diagnostics)
     - [pgtrickle.slot\_health](#pgtrickleslot_health)
     - [pgtrickle.check\_cdc\_health](#pgtricklecheck_cdc_health)
@@ -1266,6 +1267,48 @@ SELECT * FROM pgtrickle.explain_refresh_mode('public.orders_summary');
 | configured_mode | effective_mode | downgrade_reason |
 |---|---|---|
 | AUTO | FULL | The most recent refresh used FULL mode. Possible causes: defining query contains a CTE or unsupported operator, adaptive change-ratio threshold was exceeded, or aggregate saturation occurred. Check pgtrickle.pgt_refresh_history for details. |
+
+---
+
+### pgtrickle.cache_stats
+
+Return template cache statistics from shared memory.
+
+Reports L1 (thread-local) hits, L2 (catalog table) hits, full misses
+(DVM re-parse), evictions (generation flushes), and the current L1 cache
+size for this backend.
+
+```sql
+pgtrickle.cache_stats() → SETOF record(
+    l1_hits    bigint,
+    l2_hits    bigint,
+    misses     bigint,
+    evictions  bigint,
+    l1_size    integer
+)
+```
+
+| Column | Description |
+|--------|-------------|
+| `l1_hits` | Number of delta template cache hits in the thread-local (L1) cache. ~0 ns lookup. |
+| `l2_hits` | Number of delta template cache hits in the catalog table (L2) cache. ~1 ms SPI lookup. |
+| `misses` | Number of full cache misses requiring DVM re-parse (~45 ms). |
+| `evictions` | Number of entries evicted from L1 due to DDL-triggered generation flushes. |
+| `l1_size` | Current number of entries in this backend's L1 cache. |
+
+**Example:**
+
+```sql
+SELECT * FROM pgtrickle.cache_stats();
+```
+
+| l1_hits | l2_hits | misses | evictions | l1_size |
+|---------|---------|--------|-----------|---------|
+| 142 | 3 | 5 | 10 | 8 |
+
+> **Note:** Counters are cluster-wide (shared memory) except `l1_size` which
+> is per-backend. Requires `shared_preload_libraries = 'pg_trickle'`; returns
+> zeros when loaded dynamically.
 
 ---
 

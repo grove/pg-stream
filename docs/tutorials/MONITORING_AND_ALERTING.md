@@ -118,6 +118,7 @@ LISTEN pg_trickle_alert;
 | `refresh_failed` | Refresh failed | Error |
 | `diamond_partial_failure` | One member of an atomic diamond group failed | Warning |
 | `scheduler_falling_behind` | Refresh duration approaching the schedule interval | Warning |
+| `spill_threshold_exceeded` | Delta MERGE spilled to temp files for consecutive refreshes, forcing FULL | Warning |
 
 ### Notification Payload
 

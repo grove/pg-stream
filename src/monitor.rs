@@ -65,6 +65,9 @@ pub enum AlertEvent {
     /// Scheduler is running normally but no upstream source rows have changed
     /// — data_timestamp is frozen because there is genuinely nothing new.
     NoUpstreamChanges,
+    /// STAB-3 / PH-E2: Delta MERGE spilled to temp files, exceeding the
+    /// configured `pg_trickle.spill_threshold_blocks` for consecutive refreshes.
+    SpillThresholdExceeded,
 }
 
 impl AlertEvent {
@@ -85,6 +88,7 @@ impl AlertEvent {
             AlertEvent::CdcTriggerDisabled => "cdc_trigger_disabled",
             AlertEvent::CleanupFailure => "cleanup_failure",
             AlertEvent::NoUpstreamChanges => "no_upstream_changes",
+            AlertEvent::SpillThresholdExceeded => "spill_threshold_exceeded",
         }
     }
 }
@@ -415,6 +419,30 @@ pub fn alert_falling_behind(
     );
 }
 
+/// STAB-3 / PH-E2: Emit a spill-threshold-exceeded alert when a refresh
+/// spills more than `pg_trickle.spill_threshold_blocks` temp blocks to disk
+/// for more than `consecutive` consecutive cycles.
+pub fn alert_spill_threshold_exceeded(
+    pgt_schema: &str,
+    pgt_name: &str,
+    temp_blks_written: i64,
+    threshold_blocks: i64,
+    consecutive: i32,
+    limit: i32,
+    skip_notify: bool,
+) {
+    emit_alert(
+        AlertEvent::SpillThresholdExceeded,
+        pgt_schema,
+        pgt_name,
+        &format!(
+            r#""temp_blks_written":{},"threshold_blocks":{},"consecutive":{},"limit":{}"#,
+            temp_blks_written, threshold_blocks, consecutive, limit,
+        ),
+        skip_notify,
+    );
+}
+
 // ── SQL-exposed monitoring functions ───────────────────────────────────────
 
 /// Return per-ST refresh statistics aggregated from the refresh history table.
@@ -722,6 +750,51 @@ fn slot_health() -> TableIterator<
     ),
 > {
     TableIterator::new(collect_slot_health_rows())
+}
+
+// ── UX-1 / CACHE-OBS: Template cache observability ─────────────────────────
+
+/// Return template cache statistics from shared memory.
+///
+/// Reports L1 (thread-local) hits, L2 (catalog table) hits, full misses
+/// (DVM re-parse), evictions (generation flushes), and the current L1
+/// cache size for this backend.
+///
+/// Exposed as `pgtrickle.cache_stats()`.
+#[pg_extern(schema = "pgtrickle", name = "cache_stats")]
+#[allow(clippy::type_complexity)]
+fn cache_stats() -> TableIterator<
+    'static,
+    (
+        name!(l1_hits, i64),
+        name!(l2_hits, i64),
+        name!(misses, i64),
+        name!(evictions, i64),
+        name!(l1_size, i32),
+    ),
+> {
+    let (l1_hits, l2_hits, misses, evictions) = if crate::shmem::is_shmem_available() {
+        (
+            crate::shmem::TEMPLATE_CACHE_L1_HITS
+                .get()
+                .load(std::sync::atomic::Ordering::Relaxed) as i64,
+            crate::shmem::TEMPLATE_CACHE_L2_HITS
+                .get()
+                .load(std::sync::atomic::Ordering::Relaxed) as i64,
+            crate::shmem::TEMPLATE_CACHE_MISSES
+                .get()
+                .load(std::sync::atomic::Ordering::Relaxed) as i64,
+            crate::shmem::TEMPLATE_CACHE_EVICTIONS
+                .get()
+                .load(std::sync::atomic::Ordering::Relaxed) as i64,
+        )
+    } else {
+        (0, 0, 0, 0)
+    };
+
+    let l1_size = crate::dvm::delta_cache_size() as i32;
+
+    TableIterator::once((l1_hits, l2_hits, misses, evictions, l1_size))
 }
 
 /// Explain the DVM plan for a stream table's defining query.

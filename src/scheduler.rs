@@ -4478,6 +4478,16 @@ fn refresh_single_st(
                             temp_blks,
                             spill_threshold,
                         );
+                        // STAB-3: Emit alert before forcing reinitialize.
+                        monitor::alert_spill_threshold_exceeded(
+                            &st.pgt_schema,
+                            &st.pgt_name,
+                            temp_blks,
+                            spill_threshold as i64,
+                            *count,
+                            limit,
+                            st.pooler_compatibility_mode,
+                        );
                         let _ = StreamTableMeta::mark_for_reinitialize(st.pgt_id);
                         *count = 0;
                     } else {
