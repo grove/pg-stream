@@ -172,6 +172,18 @@ For future plans and release milestones, see [ROADMAP.md](ROADMAP.md).
   with seeded LCG RNG. `sqlancer.yml` CI workflow runs weekly with 2000 cases
   and supports manual dispatch with configurable seed/count.
 
+- **CORR-1:** Cross-source snapshot consistency — verified that both phases
+  are fully implemented: Phase 1 LSN watermark (`tick_watermark_enabled` GUC)
+  caps all change consumption per scheduler tick; Phase 2 declared refresh
+  groups (`pgt_refresh_groups` catalog, `create_refresh_group()` API) with
+  `REPEATABLE READ` isolation for convergence-point stream tables.
+
+- **PERF-4:** Columnar change tracking Phase 1 — verified that the CDC
+  triggers already produce per-column VARBIT `changed_cols` bitmasks for
+  every UPDATE row. The DVM scan operator filters out irrelevant UPDATE rows
+  (P2-5), and the aggregate operator detects value-only UPDATEs (A-2/P5)
+  using key-column masks. Always-on for keyed tables; no GUC needed.
+
 ---
 
 ## [0.17.0] — 2026-04-08

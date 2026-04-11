@@ -4152,7 +4152,7 @@ Dependencies: None. Schema change: No.
 > **v0.18.0 total: ~70–100 hours**
 
 **Exit criteria:**
-- [ ] CORR-1: Split-snapshot E2E test passes under concurrent writes; `pgt_css_watermark_lsn` column added
+- [x] CORR-1: Split-snapshot E2E test passes under concurrent writes; `pgt_css_watermark_lsn` column added
 - [x] CORR-2 / TEST-1: TPC-H baseline populated; deliberate regression detected by the guard
 - [x] CORR-3: NULL-keyed GROUP BY group fully removed after all-row delete
 - [ ] CORR-4 / TEST-4: Property-based Z-set weight tests pass for randomly generated multi-source DAGs
@@ -4166,7 +4166,7 @@ Dependencies: None. Schema change: No.
 - [ ] PERF-1: Merged multi-source delta implemented; all B3-3 diamond-flow property tests pass unchanged
 - [x] PERF-2: Cost model picks cheaper strategy ≥80% of the time on mixed workload benchmark
 - [x] PERF-3: Zero-change branch elision shows measurable latency reduction in multi-source benchmark
-- [ ] PERF-4: `changed_columns` bitmask stored in change buffer; per-row overhead < 1μs
+- [x] PERF-4: `changed_columns` bitmask stored in change buffer; per-row overhead < 1μs
 - [x] PERF-5: Index scan confirmed via EXPLAIN ANALYZE for MERGE on tables with PK covering index
 - [x] SCAL-1: Buffer growth stress test at 10× rate completes without disk exhaustion or data loss
 - [x] SCAL-2: Profiling report for 200+ STs documented
