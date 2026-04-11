@@ -421,7 +421,33 @@ pub fn diff_inner_join(ctx: &mut DiffContext, op: &OpTree) -> Result<DiffResult,
     //
     // The same child-type heuristics as use_l0 apply: Scan and simple
     // children use R₀; SemiJoin-containing deep chains fall back to R₁.
-    let use_r0 = use_pre_change_snapshot(right, ctx.inside_semijoin, DEEP_JOIN_L0_SCAN_THRESHOLD);
+    //
+    // IMPORTANT: When use_l0 is true (Part 2 uses L₀), the standard
+    // DBSP formula ΔL ⋈ R₁ + L₀ ⋈ ΔR is already mathematically exact:
+    //
+    //   ΔL ⋈ R₁ + L₀ ⋈ ΔR
+    //   = (L₁ - L₀) ⋈ R₁ + L₀ ⋈ (R₁ - R₀)
+    //   = L₁⋈R₁ - L₀⋈R₁ + L₀⋈R₁ - L₀⋈R₀
+    //   = J₁ - J₀  ✓
+    //
+    // Splitting Part 1 into 1a (ΔL_I ⋈ R₁) + 1b (ΔL_D ⋈ R₀) when L₀
+    // is already available introduces an uncorrected error of ΔL_D ⋈ ΔR.
+    // The EC-02 correction term cancels this within a single refresh, but
+    // under sustained load with keyless join stream tables (non-unique
+    // __pgt_row_id), the weight aggregation can fail to fully cancel the
+    // phantom rows across many concurrent-change cycles, causing monotonic
+    // row accumulation (G17-SOAK soak_join correctness violation).
+    //
+    // The EC-01 split is only needed when Part 2 uses L₁ (!use_l0),
+    // because in that case the standard formula has its own error term
+    // (ΔL ⋈ ΔR) and the EC-01 split halves the error to ΔL_I ⋈ ΔR
+    // (which Part 3 then corrects).
+    let use_r0 = if use_l0 {
+        // L₀ available → standard formula is exact → no split needed.
+        false
+    } else {
+        use_pre_change_snapshot(right, ctx.inside_semijoin, DEEP_JOIN_L0_SCAN_THRESHOLD)
+    };
 
     let right_part1_source = if use_r0 {
         if is_join_child(right) {
@@ -547,68 +573,11 @@ JOIN {delta_right} dr ON {cond}",
             // This may cause minor drift for very deep semi-join chains.
             String::new()
         }
-    } else if use_r0 && is_simple_child(left) {
-        // EC-02: simultaneous left-key + right-value changes (Scan ⋈ Scan).
-        //
-        // When Part 1 is split into 1a/1b (use_r0=true) AND Part 2 uses
-        // L₀ via EXCEPT ALL (use_l0=true, left is a simple Scan), the
-        // combined formula is:
-        //
-        //   Part 1a: ΔL_I ⋈ R₁  = ΔL_I ⋈ R₀ + ΔL_I ⋈ ΔR_I - ΔL_I ⋈ ΔR_D
-        //   Part 1b: ΔL_D ⋈ R₀
-        //   Part 2:  L₀ ⋈ ΔR_I - L₀ ⋈ ΔR_D
-        //
-        // Summing: ΔL ⋈ R₀ + L₀ ⋈ ΔR + ΔL_I ⋈ ΔR_I - ΔL_I ⋈ ΔR_D
-        //
-        // The correct formula requires: ΔL ⋈ R₀ + L₀ ⋈ ΔR + (ΔL_I - ΔL_D) ⋈ (ΔR_I - ΔR_D)
-        //
-        // Missing term: -ΔL_D ⋈ ΔR_I + ΔL_D ⋈ ΔR_D
-        //
-        // Fix: emit correction rows for each (dl WHERE action='D') ⋈ dr with
-        // flipped dr action, producing the missing -ΔL_D ⋈ ΔR_I + ΔL_D ⋈ ΔR_D.
-        //
-        // Example: d4_left.key 2→4, d4_right.val changes (key stays at 2)
-        //   ΔL = {D(id=3, key=2), I(id=3, key=4)}, ΔR = {D(id=7, key=2), I(id=7, key=2)}
-        //   Part 1b: D(lid=3, rid=7)
-        //   Part 2:  D(lid=3, rid=7) + I(lid=3, rid=7, new_rv)  ← spurious INSERT
-        //   Correction: I(lid=3, rid=7) + D(lid=3, rid=7, new_rv)
-        //   Net: D=−1−1+1=−1 ✓; I(new_rv)=+1−1=0 (cancelled) ✓
-        let cond = rewrite_join_condition(condition, left, "dl", right, "dr");
-        // delta_left is referenced in Part 1a/1b and correction; mark NOT MATERIALIZED.
-        ctx.mark_cte_not_materialized(&left_result.cte_name);
-
-        // Row ID for EC-02 correction rows: hash of both sides' PK columns,
-        // using the same canonical left-first, right-second order as
-        // Part 1 and Part 2 to ensure consistent row_ids.  Using
-        // dl.__pgt_row_id / dr.__pgt_row_id here would produce
-        // hash(hash(L), hash(R)) instead of hash(L_pk, R_pk), causing
-        // phantom row accumulation.
-        let mut hash_corr_args = left_key_exprs_dl.clone();
-        hash_corr_args.extend(right_key_exprs_dr.clone());
-        let hash_correction = format!(
-            "pgtrickle.pg_trickle_hash_multi(ARRAY[{}])",
-            hash_corr_args.join(", ")
-        );
-        format!(
-            "
-
-UNION ALL
-
--- Part 3: EC-02 correction — cancel -ΔL_D ⋈ ΔR_I and add ΔL_D ⋈ ΔR_D.
--- When Part 1 uses R₁ for inserts (1a) and R₀ for deletes (1b), the
--- cross-term ΔL_D ⋈ ΔR is double-counted. Flip dr actions to cancel.
-SELECT {hash_correction} AS __pgt_row_id,
-       CASE WHEN dr.__pgt_action = 'I' THEN 'D' ELSE 'I' END AS __pgt_action,
-       {all_cols_correction}
-FROM {delta_left} dl
-JOIN {delta_right} dr ON {cond}
-WHERE dl.__pgt_action = 'D'",
-            delta_left = left_result.cte_name,
-            delta_right = right_result.cte_name,
-        )
     } else {
-        // L₀ is used directly, Part 1 not split or left is nested join —
-        // no correction needed for this combination.
+        // L₀ is used directly — the standard formula is exact, no
+        // correction needed.  The former EC-02 correction for the EC-01
+        // split is no longer reachable here because use_r0 is now false
+        // whenever use_l0 is true.
         String::new()
     };
 
@@ -921,12 +890,14 @@ mod tests {
         let result = diff_inner_join(&mut ctx, &tree).unwrap();
         let sql = ctx.build_with_query(&result.cte_name);
 
-        // EC-01: Part 1 is now split into 1a (inserts ⋈ R₁) + 1b (deletes ⋈ R₀)
-        assert_sql_contains(&sql, "Part 1a");
-        assert_sql_contains(&sql, "Part 1b");
+        // When L₀ is available (Scan ⋈ Scan), Part 1 is NOT split — standard
+        // formula is exact. Part 1 uses ΔL ⋈ R₁, Part 2 uses L₀ ⋈ ΔR.
+        assert_sql_contains(&sql, "Part 1");
         assert_sql_contains(&sql, "Part 2");
         assert_sql_contains(&sql, "pre-change_left");
-        assert_sql_contains(&sql, "pre-change_right R");
+        // R₀ is not used when L₀ is available (no EC-01 split).
+        assert_sql_not_contains(&sql, "Part 1a");
+        assert_sql_not_contains(&sql, "Part 1b");
     }
 
     #[test]
@@ -939,16 +910,15 @@ mod tests {
         let result = diff_inner_join(&mut ctx, &tree).unwrap();
         let sql = ctx.build_with_query(&result.cte_name);
 
-        // Part 2 should use L₀ via NOT EXISTS anti-join (DI-2)
-        // Part 1b should use R₀ via NOT EXISTS anti-join (DI-2)
+        // Part 2 should use L₀ via NOT EXISTS anti-join (DI-2).
+        // R₀ is NOT used when L₀ is available (standard formula is exact).
         assert_sql_contains(&sql, "NOT EXISTS");
-        assert_sql_contains(&sql, "__pgt_action = 'I'");
         assert_sql_contains(&sql, "__pgt_action = 'D'");
-        // Both L₀ and R₀ should be present (at least two NOT EXISTS occurrences)
+        // Only L₀ needs NOT EXISTS (no R₀ split).
         let ne_count = sql.matches("NOT EXISTS").count();
         assert!(
-            ne_count >= 2,
-            "expected ≥2 NOT EXISTS (L₀ + R₀), got {ne_count}\n{sql}"
+            ne_count >= 1,
+            "expected ≥1 NOT EXISTS (L₀), got {ne_count}\n{sql}"
         );
     }
 
@@ -1172,8 +1142,8 @@ mod tests {
 
     #[test]
     fn test_diff_inner_join_scan_no_correction() {
-        // For Scan ⋈ Scan, EC-02 correction IS present (simultaneous change fix).
-        // The old "Correction for nested join" (L₁ path) should NOT appear.
+        // For Scan ⋈ Scan with L₀ available, NO correction is needed — the
+        // standard formula is exact. Neither EC-02 nor L₁ correction appears.
         let left = scan(1, "orders", "public", "o", &["id", "cust_id"]);
         let right = scan(2, "customers", "public", "c", &["id", "name"]);
         let cond = eq_cond("o", "cust_id", "c", "id");
@@ -1183,9 +1153,8 @@ mod tests {
         let result = diff_inner_join(&mut ctx, &tree).unwrap();
         let sql = ctx.build_with_query(&result.cte_name);
 
-        // EC-02 correction is present for Scan ⋈ Scan (simultaneous-change fix).
-        assert_sql_contains(&sql, "EC-02 correction");
-        // L₁-based correction (for nested join children) should NOT appear.
+        // No correction terms — standard formula is exact when L₀ is used.
+        assert_sql_not_contains(&sql, "EC-02 correction");
         assert_sql_not_contains(&sql, "Correction for nested join");
     }
 
@@ -1479,9 +1448,9 @@ mod tests {
     // ── EC-01: R₀ via EXCEPT ALL tests ──────────────────────────────
 
     #[test]
-    fn test_ec01_simple_join_splits_part1() {
-        // Two simple Scan children → Part 1 split into 1a (inserts ⋈ R₁)
-        // and 1b (deletes ⋈ R₀ via EXCEPT ALL).
+    fn test_ec01_simple_join_no_split_when_l0_available() {
+        // Two simple Scan children → L₀ is available, so Part 1 is NOT
+        // split. The standard formula ΔL ⋈ R₁ + L₀ ⋈ ΔR is exact.
         let left = scan(1, "orders", "public", "o", &["id", "cust_id"]);
         let right = scan(2, "customers", "public", "c", &["id", "name"]);
         let cond = eq_cond("o", "cust_id", "c", "id");
@@ -1491,23 +1460,20 @@ mod tests {
         let result = diff_inner_join(&mut ctx, &tree).unwrap();
         let sql = ctx.build_with_query(&result.cte_name);
 
-        // Part 1a: inserts → R₁ (current right)
-        assert_sql_contains(&sql, "Part 1a");
-        assert_sql_contains(&sql, "INSERTS JOIN current_right R");
+        // Part 1 is unsplit: ΔL ⋈ R₁ (no action filter)
+        assert_sql_contains(&sql, "Part 1");
+        assert_sql_not_contains(&sql, "Part 1a");
+        assert_sql_not_contains(&sql, "Part 1b");
+        assert_sql_not_contains(&sql, "EC-01 fix");
 
-        // Part 1b: deletes → R₀ (pre-change right via EXCEPT ALL)
-        assert_sql_contains(&sql, "Part 1b");
-        assert_sql_contains(&sql, "DELETES JOIN pre-change_right R");
-        assert_sql_contains(&sql, "EC-01 fix");
-
-        // Part 1a filters by action = 'I', Part 1b filters by action = 'D'
-        assert_sql_contains(&sql, "__pgt_action = 'I'");
-        assert_sql_contains(&sql, "__pgt_action = 'D'");
+        // Part 2 uses L₀
+        assert_sql_contains(&sql, "Part 2");
+        assert_sql_contains(&sql, "pre-change_left");
     }
 
     #[test]
-    fn test_ec01_r0_uses_except_all() {
-        // Verify R₀ is built via EXCEPT ALL from the right snapshot.
+    fn test_ec01_no_r0_when_l0_available() {
+        // When L₀ is available, R₀ is not used — standard formula is exact.
         let left = scan(1, "a", "public", "a", &["id", "key"]);
         let right = scan(2, "b", "public", "b", &["id", "val"]);
         let cond = eq_cond("a", "key", "b", "id");
@@ -1517,29 +1483,23 @@ mod tests {
         let result = diff_inner_join(&mut ctx, &tree).unwrap();
         let sql = ctx.build_with_query(&result.cte_name);
 
-        // Should have at least 2 NOT EXISTS occurrences: one for L₀, one for R₀.
-        let ne_count = sql.matches("NOT EXISTS").count();
-        assert!(
-            ne_count >= 2,
-            "expected ≥2 NOT EXISTS (L₀ + R₀), got {ne_count}"
-        );
-
-        // R₀ references the right-side table ("b")
-        assert_sql_contains(&sql, "\"public\".\"b\"");
+        // L₀ uses NOT EXISTS anti-join (DI-2)
+        assert_sql_contains(&sql, "NOT EXISTS");
+        // Only L₀ needs NOT EXISTS (no R₀ split)
+        assert_sql_not_contains(&sql, "Part 1a");
+        assert_sql_not_contains(&sql, "Part 1b");
     }
 
     #[test]
-    fn test_ec01_nested_right_child_3_scans_uses_r0() {
-        // EC01B-1: the ≤2-scan threshold was removed.  A right child with
-        // 3 scan nodes now uses the per-leaf CTE-based R₀ snapshot, so
-        // Part 1 IS split into 1a (inserts ⋈ R₁) and 1b (deletes ⋈ R₀).
+    fn test_ec01_nested_right_child_3_scans_no_split_when_l0() {
+        // Left child is a simple Scan → L₀ is available → Part 1 is NOT
+        // split at the outer join level. The standard formula is exact.
         let a = scan(1, "a", "public", "a", &["id"]);
         let b = scan(2, "b", "public", "b", &["id"]);
         let c = scan(3, "c", "public", "c", &["id"]);
         let right_inner = inner_join(eq_cond("b", "id", "c", "id"), b, c);
         let d = scan(4, "d", "public", "d", &["id"]);
         let right_deep = inner_join(eq_cond("b", "id", "d", "id"), right_inner, d);
-        // right has 3 scans → EC01B-1: use_r0 = true → Part 1 is split
         let tree = inner_join(eq_cond("a", "id", "b", "id"), a, right_deep);
 
         let mut ctx = test_ctx();
@@ -1548,15 +1508,16 @@ mod tests {
 
         let outer_cte_marker = format!("{} AS", result.cte_name);
         let outer_sql = sql.split(&outer_cte_marker).last().unwrap_or("");
-        // Per-leaf CTE R₀ → Part 1 is split
-        assert_sql_contains(outer_sql, "Part 1a");
-        assert_sql_contains(outer_sql, "Part 1b");
+        // L₀ available → no EC-01 split at the outer join
+        assert_sql_not_contains(outer_sql, "Part 1a");
+        assert_sql_not_contains(outer_sql, "Part 1b");
+        assert_sql_contains(outer_sql, "Part 1");
     }
 
     #[test]
-    fn test_ec01_nested_right_child_2_scans_uses_r0() {
-        // When right child is a nested join with ≤2 scan nodes and no
-        // SemiJoin, use_r0 is true → Part 1 is split.
+    fn test_ec01_nested_right_child_2_scans_no_split_when_l0() {
+        // Left child is a simple Scan → L₀ is available → Part 1 is NOT
+        // split even though the right child is a nested join.
         let a = scan(1, "a", "public", "a", &["id"]);
         let b = scan(2, "b", "public", "b", &["id"]);
         let c = scan(3, "c", "public", "c", &["id"]);
@@ -1567,14 +1528,15 @@ mod tests {
         let result = diff_inner_join(&mut ctx, &tree).unwrap();
         let sql = ctx.build_with_query(&result.cte_name);
 
-        // Right has 2 scans → use_r0 = true → Part 1 split
-        assert_sql_contains(&sql, "Part 1a");
-        assert_sql_contains(&sql, "Part 1b");
+        // L₀ available → no EC-01 split
+        assert_sql_not_contains(&sql, "Part 1a");
+        assert_sql_not_contains(&sql, "Part 1b");
     }
 
     #[test]
-    fn test_ec01_three_union_all_arms() {
-        // Simple 2-table join: Part 1a + Part 1b + Part 2 = 3 arms
+    fn test_ec01_two_union_all_arms_when_l0_available() {
+        // Simple 2-table join with L₀ available: Part 1 + Part 2 = 2 arms
+        // (no EC-01 split when standard formula is exact)
         let left = scan(1, "l", "public", "l", &["id"]);
         let right = scan(2, "r", "public", "r", &["id"]);
         let tree = inner_join(eq_cond("l", "id", "r", "id"), left, right);
@@ -1583,13 +1545,13 @@ mod tests {
         let result = diff_inner_join(&mut ctx, &tree).unwrap();
         let sql = ctx.build_with_query(&result.cte_name);
 
-        // The join CTE should contain Part 1a, 1b, and Part 2 markers.
+        // The join CTE should contain Part 1 and Part 2.
         let outer_cte_marker = format!("{} AS", result.cte_name);
         let outer_sql = sql.split(&outer_cte_marker).last().unwrap_or("");
         let union_count = outer_sql.matches("UNION ALL").count();
         assert!(
-            union_count >= 2,
-            "expected ≥2 UNION ALL (1a+1b+Part2), got {union_count}"
+            union_count >= 1,
+            "expected ≥1 UNION ALL (Part1+Part2), got {union_count}"
         );
     }
 
