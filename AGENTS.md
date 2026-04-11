@@ -62,11 +62,9 @@ previous session's file at the same path.
    rm -f /tmp/pr_TICKETNAME.md
    ```
 
-2. Use the `create_file` tool to write the description.  Keep the text
-   **ASCII-only** — avoid Unicode math symbols (Δ, ⋈, ₁, →) and em-dashes
-   in the body; use plain ASCII equivalents (`delta`, `JOIN`, `_1`, `->`)
-   instead.  GitHub renders them fine but shell pipelines and gh can corrupt
-   non-ASCII bytes.
+2. Use the `create_file` tool to write the description.  The file is written
+   in UTF-8 and read directly by `gh --body-file`, so Unicode characters
+   (math symbols, em-dashes, etc.) are safe to use.
 
 3. Verify the file is clean before using it:
    ```bash
