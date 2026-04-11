@@ -61,10 +61,14 @@ For future plans and release milestones, see [ROADMAP.md](ROADMAP.md).
   `QueryTooComplex` error types with SQLSTATE codes, DETAIL, and HINT fields
   so operators can quickly diagnose and resolve issues.
 
-- **CORR-3:** NULL-safe GROUP BY elimination under deletes — added E2E test
-  suite (`e2e_null_group_by_tests.rs`) with 7 tests covering full and partial
-  deletion of NULL-keyed groups, multi-column NULL keys, NULL + HAVING
-  interaction, UPDATE into NULL groups, and COUNT-only aggregates.
+- **CORR-3:** NULL-safe GROUP BY elimination under deletes — fixed three
+  root causes: (1) `pg_trickle_hash()` now accepts NULL input using a
+  deterministic `\x00NULL\x00` sentinel instead of returning NULL, preventing
+  NULL `__pgt_row_id` values for rows with NULL group keys; (2) aggregate
+  merge CTE LEFT JOINs now use `IS NOT DISTINCT FROM` instead of `=` for
+  group key matching; (3) rescan CTE group filters use `EXISTS … IS NOT
+  DISTINCT FROM` instead of `IN` for single-column keys. E2E test suite
+  (`e2e_null_group_by_tests.rs`) with 7 tests validates the fix.
 
 - **STAB-6:** Error SQLSTATE coverage audit — all 18 `PgTrickleError` variants
   now have explicit SQLSTATE codes, DETAIL, and HINT fields in
@@ -194,6 +198,23 @@ For future plans and release milestones, see [ROADMAP.md](ROADMAP.md).
   every UPDATE row. The DVM scan operator filters out irrelevant UPDATE rows
   (P2-5), and the aggregate operator detects value-only UPDATEs (A-2/P5)
   using key-column masks. Always-on for keyed tables; no GUC needed.
+
+### Fixed
+
+- **CDC edge case tests:** Fixed generated column tests to use computed
+  expressions (`price * qty`) instead of referencing the generated column
+  directly (which is excluded from change buffers). Fixed NULL aggregate
+  test to use `SUM(COALESCE(bonus, 0))` to avoid known P2-2 SUM
+  NULL-transition edge case.
+
+- **Light E2E allowlist:** Removed 3 test files from the light E2E allowlist
+  that require `shared_preload_libraries` (error state, fuse, safety tests).
+  Gated prepared statement invalidation test with `#[cfg(not(feature =
+  "light-e2e"))]` since it depends on `CACHE_GENERATION` shared memory.
+
+- **Upgrade script:** Added `pg_trickle_hash` (non-STRICT), `cache_stats()`,
+  and `health_summary()` to the 0.17.0→0.18.0 upgrade migration. Upgrade
+  completeness check now passes.
 
 ---
 

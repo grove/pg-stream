@@ -4181,8 +4181,8 @@ Dependencies: None. Schema change: No.
 - [x] TEST-5: At least 10 tests migrated from full E2E to light E2E
 - [x] TEST-7: dbt regression suite covers all macro strategies and teardown idempotency; `just test-dbt` passes
 - [x] UX-6: TUI (or `docs/TUI.md` gap note) reflects `cache_stats()` and `health_summary()` availability
-- [ ] Extension upgrade path tested (`0.17.0 → 0.18.0`)
-- [ ] `just check-version-sync` passes
+- [x] Extension upgrade path tested (`0.17.0 → 0.18.0`)
+- [x] `just check-version-sync` passes
 
 ---
 
