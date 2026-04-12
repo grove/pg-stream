@@ -99,3 +99,23 @@ models:
         description: "Number of orders"
         tests:
           - not_null
+
+  - name: order_totals_auto
+    description: "Order totals using AUTO refresh mode (TEST-7 regression coverage)"
+    tests:
+      - dbt_pgtrickle.stream_table_healthy:
+          warn_seconds: 600
+    columns:
+      - name: customer_id
+        description: "Customer identifier"
+        tests:
+          - not_null
+          - unique
+      - name: total_amount
+        description: "Sum of all order amounts"
+        tests:
+          - not_null
+      - name: order_count
+        description: "Number of orders"
+        tests:
+          - not_null

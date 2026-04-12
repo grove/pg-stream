@@ -20,11 +20,13 @@ Complete reference for all SQL functions, views, and catalog tables provided by 
   - [Status & Monitoring](#status--monitoring)
     - [pgtrickle.pgt\_status](#pgtricklepgt_status)
     - [pgtrickle.health\_check](#pgtricklehealth_check)
+    - [pgtrickle.health\_summary](#pgtricklehealth_summary)
     - [pgtrickle.refresh\_timeline](#pgtricklerefresh_timeline)
     - [pgtrickle.st\_refresh\_stats](#pgtricklest_refresh_stats)
     - [pgtrickle.get\_refresh\_history](#pgtrickleget_refresh_history)
     - [pgtrickle.get\_staleness](#pgtrickleget_staleness)
     - [pgtrickle.explain\_refresh\_mode](#pgtrickleexplain_refresh_mode)
+    - [pgtrickle.cache\_stats](#pgtricklecache_stats)
   - [CDC Diagnostics](#cdc-diagnostics)
     - [pgtrickle.slot\_health](#pgtrickleslot_health)
     - [pgtrickle.check\_cdc\_health](#pgtricklecheck_cdc_health)
@@ -1119,6 +1121,41 @@ Checks: `scheduler_running`, `error_tables`, `stale_tables`, `needs_reinit`,
 
 ---
 
+### pgtrickle.health_summary
+
+Single-row summary of the entire pg_trickle deployment's health. Designed for
+monitoring dashboards that want one endpoint to poll instead of joining
+multiple views.
+
+```sql
+pgtrickle.health_summary() → SETOF record(
+    total_stream_tables   int,
+    active_count          int,
+    error_count           int,
+    suspended_count       int,
+    stale_count           int,
+    reinit_pending        int,
+    max_staleness_seconds float8,    -- NULL if no stream tables
+    scheduler_status      text,      -- 'ACTIVE', 'STOPPED', or 'NOT_LOADED'
+    cache_hit_rate        float8     -- NULL if no cache lookups yet
+)
+```
+
+**Example:**
+
+```sql
+SELECT * FROM pgtrickle.health_summary();
+```
+
+| total_stream_tables | active_count | error_count | suspended_count | stale_count | reinit_pending | max_staleness_seconds | scheduler_status | cache_hit_rate |
+|---|---|---|---|---|---|---|---|---|
+| 12 | 11 | 0 | 1 | 0 | 0 | 45.2 | ACTIVE | 0.94 |
+
+> **Tip:** Use this in a Grafana single-stat panel or a Prometheus exporter
+> to surface fleet-level health at a glance.
+
+---
+
 ### pgtrickle.refresh_timeline
 
 Return recent refresh records across **all** stream tables in a single chronological view.
@@ -1266,6 +1303,48 @@ SELECT * FROM pgtrickle.explain_refresh_mode('public.orders_summary');
 | configured_mode | effective_mode | downgrade_reason |
 |---|---|---|
 | AUTO | FULL | The most recent refresh used FULL mode. Possible causes: defining query contains a CTE or unsupported operator, adaptive change-ratio threshold was exceeded, or aggregate saturation occurred. Check pgtrickle.pgt_refresh_history for details. |
+
+---
+
+### pgtrickle.cache_stats
+
+Return template cache statistics from shared memory.
+
+Reports L1 (thread-local) hits, L2 (catalog table) hits, full misses
+(DVM re-parse), evictions (generation flushes), and the current L1 cache
+size for this backend.
+
+```sql
+pgtrickle.cache_stats() → SETOF record(
+    l1_hits    bigint,
+    l2_hits    bigint,
+    misses     bigint,
+    evictions  bigint,
+    l1_size    integer
+)
+```
+
+| Column | Description |
+|--------|-------------|
+| `l1_hits` | Number of delta template cache hits in the thread-local (L1) cache. ~0 ns lookup. |
+| `l2_hits` | Number of delta template cache hits in the catalog table (L2) cache. ~1 ms SPI lookup. |
+| `misses` | Number of full cache misses requiring DVM re-parse (~45 ms). |
+| `evictions` | Number of entries evicted from L1 due to DDL-triggered generation flushes. |
+| `l1_size` | Current number of entries in this backend's L1 cache. |
+
+**Example:**
+
+```sql
+SELECT * FROM pgtrickle.cache_stats();
+```
+
+| l1_hits | l2_hits | misses | evictions | l1_size |
+|---------|---------|--------|-----------|---------|
+| 142 | 3 | 5 | 10 | 8 |
+
+> **Note:** Counters are cluster-wide (shared memory) except `l1_size` which
+> is per-backend. Requires `shared_preload_libraries = 'pg_trickle'`; returns
+> zeros when loaded dynamically.
 
 ---
 

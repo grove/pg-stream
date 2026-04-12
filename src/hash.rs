@@ -10,11 +10,16 @@ use xxhash_rust::xxh64;
 ///
 /// This function is exposed as a SQL function for use in INSERT statements
 /// and delta query generation.
+///
+/// NULL input is mapped to a deterministic sentinel (`\x00NULL\x00`) —
+/// the same encoding used by [`pg_trickle_hash_multi`] — so that rows
+/// with NULL-valued group keys receive a non-NULL `__pgt_row_id`.
 #[pg_extern(schema = "pgtrickle", immutable, parallel_safe)]
-fn pg_trickle_hash(input: &str) -> i64 {
+fn pg_trickle_hash(input: Option<&str>) -> i64 {
     // Use a fixed seed for deterministic hashing
     const SEED: u64 = 0x517cc1b727220a95;
-    let hash = xxh64::xxh64(input.as_bytes(), SEED);
+    let text = input.unwrap_or("\x00NULL\x00");
+    let hash = xxh64::xxh64(text.as_bytes(), SEED);
     hash as i64
 }
 

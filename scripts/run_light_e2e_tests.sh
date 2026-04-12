@@ -105,6 +105,23 @@ LIGHT_E2E_TESTS=(
     e2e_mixed_pg_objects_tests
     e2e_tier_scheduling_tests
     e2e_unlogged_buffer_tests
+    # ── TEST-5 v0.18.0 additions (light-eligible, 0 scheduler dependencies) ──
+    e2e_null_group_by_tests
+    e2e_cdc_edge_case_tests
+    e2e_join_tests
+    e2e_alter_query_tests
+    e2e_append_only_tests
+    e2e_diff_full_equivalence_tests
+    e2e_multi_column_in_tests
+    e2e_ddl_event_tests
+    e2e_diagnostics_tests
+    e2e_schema_evolution_tests
+    e2e_differential_gaps_tests
+    e2e_multi_cycle_tests
+    e2e_guc_variation_tests
+    e2e_immediate_concurrency_tests
+    e2e_merge_template_tests
+    e2e_rls_tests
 )
 
 usage() {

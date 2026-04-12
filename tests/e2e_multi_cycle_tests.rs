@@ -272,6 +272,8 @@ async fn test_multi_cycle_prepared_statement_cache() {
     }
 }
 
+// Requires shared_preload_libraries for CACHE_GENERATION shared memory.
+#[cfg(not(feature = "light-e2e"))]
 #[tokio::test]
 async fn test_prepared_statements_cleared_after_cache_invalidation() {
     let db = E2eDb::new().await.with_extension().await;

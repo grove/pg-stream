@@ -76,6 +76,14 @@ All metrics are prefixed `pg_trickle_`.
 | `pg_trickle_cdc_buffer_bytes` | gauge | CDC change buffer size in bytes |
 | `pg_trickle_scheduler_running` | gauge | 1 if scheduler background worker is alive |
 | `pg_trickle_health_status` | gauge | Overall health: 0=OK, 1=WARNING, 2=CRITICAL |
+| `pg_trickle_cache_l1_hits` | counter | Template cache L1 hits (avoids delta SQL regeneration) |
+| `pg_trickle_cache_l1_evictions` | counter | Template cache L1 evictions |
+| `pg_trickle_cache_delta_cache_entries` | gauge | Current delta template cache entries |
+| `pg_trickle_health_summary_cache_hit_rate` | gauge | Template cache hit rate (0.0–1.0) |
+| `pg_trickle_health_summary_p99_refresh_ms_1h` | gauge | P99 refresh latency over 1 hour (ms) |
+| `pg_trickle_health_summary_avg_refresh_ms_1h` | gauge | Average refresh latency over 1 hour (ms) |
+| `pg_trickle_health_summary_total_refreshes_1h` | gauge | Total refreshes in last hour |
+| `pg_trickle_health_summary_failed_refreshes_1h` | gauge | Failed refreshes in last hour |
 
 ## Alerting
 

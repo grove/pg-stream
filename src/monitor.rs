@@ -65,6 +65,9 @@ pub enum AlertEvent {
     /// Scheduler is running normally but no upstream source rows have changed
     /// — data_timestamp is frozen because there is genuinely nothing new.
     NoUpstreamChanges,
+    /// STAB-3 / PH-E2: Delta MERGE spilled to temp files, exceeding the
+    /// configured `pg_trickle.spill_threshold_blocks` for consecutive refreshes.
+    SpillThresholdExceeded,
 }
 
 impl AlertEvent {
@@ -85,6 +88,7 @@ impl AlertEvent {
             AlertEvent::CdcTriggerDisabled => "cdc_trigger_disabled",
             AlertEvent::CleanupFailure => "cleanup_failure",
             AlertEvent::NoUpstreamChanges => "no_upstream_changes",
+            AlertEvent::SpillThresholdExceeded => "spill_threshold_exceeded",
         }
     }
 }
@@ -415,6 +419,30 @@ pub fn alert_falling_behind(
     );
 }
 
+/// STAB-3 / PH-E2: Emit a spill-threshold-exceeded alert when a refresh
+/// spills more than `pg_trickle.spill_threshold_blocks` temp blocks to disk
+/// for more than `consecutive` consecutive cycles.
+pub fn alert_spill_threshold_exceeded(
+    pgt_schema: &str,
+    pgt_name: &str,
+    temp_blks_written: i64,
+    threshold_blocks: i64,
+    consecutive: i32,
+    limit: i32,
+    skip_notify: bool,
+) {
+    emit_alert(
+        AlertEvent::SpillThresholdExceeded,
+        pgt_schema,
+        pgt_name,
+        &format!(
+            r#""temp_blks_written":{},"threshold_blocks":{},"consecutive":{},"limit":{}"#,
+            temp_blks_written, threshold_blocks, consecutive, limit,
+        ),
+        skip_notify,
+    );
+}
+
 // ── SQL-exposed monitoring functions ───────────────────────────────────────
 
 /// Return per-ST refresh statistics aggregated from the refresh history table.
@@ -722,6 +750,51 @@ fn slot_health() -> TableIterator<
     ),
 > {
     TableIterator::new(collect_slot_health_rows())
+}
+
+// ── UX-1 / CACHE-OBS: Template cache observability ─────────────────────────
+
+/// Return template cache statistics from shared memory.
+///
+/// Reports L1 (thread-local) hits, L2 (catalog table) hits, full misses
+/// (DVM re-parse), evictions (generation flushes), and the current L1
+/// cache size for this backend.
+///
+/// Exposed as `pgtrickle.cache_stats()`.
+#[pg_extern(schema = "pgtrickle", name = "cache_stats")]
+#[allow(clippy::type_complexity)]
+fn cache_stats() -> TableIterator<
+    'static,
+    (
+        name!(l1_hits, i64),
+        name!(l2_hits, i64),
+        name!(misses, i64),
+        name!(evictions, i64),
+        name!(l1_size, i32),
+    ),
+> {
+    let (l1_hits, l2_hits, misses, evictions) = if crate::shmem::is_shmem_available() {
+        (
+            crate::shmem::TEMPLATE_CACHE_L1_HITS
+                .get()
+                .load(std::sync::atomic::Ordering::Relaxed) as i64,
+            crate::shmem::TEMPLATE_CACHE_L2_HITS
+                .get()
+                .load(std::sync::atomic::Ordering::Relaxed) as i64,
+            crate::shmem::TEMPLATE_CACHE_MISSES
+                .get()
+                .load(std::sync::atomic::Ordering::Relaxed) as i64,
+            crate::shmem::TEMPLATE_CACHE_EVICTIONS
+                .get()
+                .load(std::sync::atomic::Ordering::Relaxed) as i64,
+        )
+    } else {
+        (0, 0, 0, 0)
+    };
+
+    let l1_size = crate::dvm::delta_cache_size() as i32;
+
+    TableIterator::once((l1_hits, l2_hits, misses, evictions, l1_size))
 }
 
 /// Explain the DVM plan for a stream table's defining query.
@@ -2237,6 +2310,138 @@ fn health_check() -> TableIterator<
     });
 
     TableIterator::new(rows)
+}
+
+// ── UX-4: Single-endpoint health summary ────────────────────────────────────
+
+/// Return a single-row summary of the entire pg_trickle deployment's health.
+///
+/// Aggregates key metrics into one place so monitoring dashboards can
+/// poll a single endpoint instead of joining multiple views.
+///
+/// Exposed as `pgtrickle.health_summary()`.
+#[pg_extern(schema = "pgtrickle", name = "health_summary")]
+#[allow(clippy::type_complexity)]
+fn health_summary() -> TableIterator<
+    'static,
+    (
+        name!(total_stream_tables, i32),
+        name!(active_count, i32),
+        name!(error_count, i32),
+        name!(suspended_count, i32),
+        name!(stale_count, i32),
+        name!(reinit_pending, i32),
+        name!(max_staleness_seconds, Option<f64>),
+        name!(scheduler_status, String),
+        name!(cache_hit_rate, Option<f64>),
+    ),
+> {
+    let row = Spi::connect(|client| {
+        // ── Stream table status counts ──────────────────────────────────
+        let counts = client
+            .select(
+                "SELECT \
+                     count(*)::int AS total, \
+                     count(*) FILTER (WHERE status = 'ACTIVE')::int AS active, \
+                     count(*) FILTER (WHERE status = 'ERROR')::int AS errors, \
+                     count(*) FILTER (WHERE status = 'SUSPENDED')::int AS suspended, \
+                     count(*) FILTER (WHERE needs_reinit = true)::int AS reinit \
+                 FROM pgtrickle.pgt_stream_tables",
+                None,
+                &[],
+            )
+            .ok();
+
+        let (total, active, errors, suspended, reinit) = counts
+            .map(|r| {
+                let row = r.first();
+                (
+                    row.get::<i32>(1).unwrap_or(None).unwrap_or(0),
+                    row.get::<i32>(2).unwrap_or(None).unwrap_or(0),
+                    row.get::<i32>(3).unwrap_or(None).unwrap_or(0),
+                    row.get::<i32>(4).unwrap_or(None).unwrap_or(0),
+                    row.get::<i32>(5).unwrap_or(None).unwrap_or(0),
+                )
+            })
+            .unwrap_or((0, 0, 0, 0, 0));
+
+        // ── Stale count and max staleness ───────────────────────────────
+        let stale_info = client
+            .select(
+                "SELECT \
+                     count(*) FILTER (WHERE stale = true)::int, \
+                     max(staleness_seconds)::float8 \
+                 FROM pgtrickle.stream_tables_info",
+                None,
+                &[],
+            )
+            .ok();
+
+        let (stale_count, max_staleness) = stale_info
+            .map(|r| {
+                let row = r.first();
+                (
+                    row.get::<i32>(1).unwrap_or(None).unwrap_or(0),
+                    row.get::<f64>(2).unwrap_or(None),
+                )
+            })
+            .unwrap_or((0, None));
+
+        // ── Scheduler status ────────────────────────────────────────────
+        let scheduler_running = client
+            .select(
+                "SELECT count(*)::int FROM pg_stat_activity \
+                 WHERE backend_type = 'pg_trickle scheduler'",
+                None,
+                &[],
+            )
+            .ok()
+            .and_then(|r| r.first().get::<i32>(1).unwrap_or(None))
+            .unwrap_or(0);
+
+        let scheduler_status = if scheduler_running > 0 {
+            "ACTIVE".to_string()
+        } else if crate::shmem::is_shmem_available() {
+            "STOPPED".to_string()
+        } else {
+            "NOT_LOADED".to_string()
+        };
+
+        // ── Cache hit rate from shared memory ───────────────────────────
+        let cache_hit_rate = if crate::shmem::is_shmem_available() {
+            let l1 = crate::shmem::TEMPLATE_CACHE_L1_HITS
+                .get()
+                .load(std::sync::atomic::Ordering::Relaxed) as f64;
+            let l2 = crate::shmem::TEMPLATE_CACHE_L2_HITS
+                .get()
+                .load(std::sync::atomic::Ordering::Relaxed) as f64;
+            let misses = crate::shmem::TEMPLATE_CACHE_MISSES
+                .get()
+                .load(std::sync::atomic::Ordering::Relaxed) as f64;
+            let total_lookups = l1 + l2 + misses;
+            if total_lookups > 0.0 {
+                Some((l1 + l2) / total_lookups)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        (
+            total,
+            active,
+            errors,
+            suspended,
+            stale_count,
+            reinit,
+            max_staleness,
+            scheduler_status,
+            cache_hit_rate,
+        )
+    });
+
+    TableIterator::once(row)
 }
 
 /// Cross-stream-table refresh timeline, most recent first.

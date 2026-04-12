@@ -126,6 +126,16 @@ pub static TEMPLATE_CACHE_L2_HITS: PgAtomic<AtomicU64> =
 pub static TEMPLATE_CACHE_MISSES: PgAtomic<AtomicU64> =
     unsafe { PgAtomic::new(c"pg_trickle_template_cache_misses") };
 
+/// UX-1 / CACHE-OBS: Number of delta template cache L1 hits (thread-local).
+// SAFETY: PgAtomic::new requires a static CStr name.
+pub static TEMPLATE_CACHE_L1_HITS: PgAtomic<AtomicU64> =
+    unsafe { PgAtomic::new(c"pg_trickle_template_cache_l1_hits") };
+
+/// UX-1 / CACHE-OBS: Number of delta template cache evictions (generation flush).
+// SAFETY: PgAtomic::new requires a static CStr name.
+pub static TEMPLATE_CACHE_EVICTIONS: PgAtomic<AtomicU64> =
+    unsafe { PgAtomic::new(c"pg_trickle_template_cache_evictions") };
+
 /// Register shared memory allocations. Called from `_PG_init()`.
 pub fn init_shared_memory() {
     pg_shmem_init!(PGS_STATE);
@@ -137,6 +147,8 @@ pub fn init_shared_memory() {
     pg_shmem_init!(DEDUP_NEEDED_REFRESHES);
     pg_shmem_init!(TEMPLATE_CACHE_L2_HITS);
     pg_shmem_init!(TEMPLATE_CACHE_MISSES);
+    pg_shmem_init!(TEMPLATE_CACHE_L1_HITS);
+    pg_shmem_init!(TEMPLATE_CACHE_EVICTIONS);
     SHMEM_INITIALIZED.store(true, std::sync::atomic::Ordering::Relaxed);
 }
 

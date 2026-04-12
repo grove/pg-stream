@@ -162,3 +162,71 @@ pg_trickle_recent_refresh_stats:
     - recent_max_duration_ms:
         usage: GAUGE
         description: "Maximum refresh duration (ms) over the last hour"
+
+# ── Template cache statistics (UX-1) ──────────────────────────────────────────
+
+pg_trickle_cache:
+  query: |
+    SELECT
+        l1_hits,
+        l1_evictions,
+        delta_cache_entries
+    FROM pgtrickle.cache_stats()
+  metrics:
+    - l1_hits:
+        usage: COUNTER
+        description: "Total L1 template cache hits (avoids delta query regeneration)"
+    - l1_evictions:
+        usage: COUNTER
+        description: "Total L1 template cache evictions"
+    - delta_cache_entries:
+        usage: GAUGE
+        description: "Current number of entries in the delta template cache"
+
+# ── Deployment health summary (UX-4) ──────────────────────────────────────────
+
+pg_trickle_health_summary:
+  query: |
+    SELECT
+        total_stream_tables,
+        active_tables,
+        error_tables,
+        stale_tables,
+        CASE WHEN scheduler_running THEN 1 ELSE 0 END AS scheduler_running,
+        total_refreshes_1h,
+        failed_refreshes_1h,
+        COALESCE(avg_refresh_ms_1h, 0) AS avg_refresh_ms_1h,
+        COALESCE(p99_refresh_ms_1h, 0) AS p99_refresh_ms_1h,
+        cache_hit_rate
+    FROM pgtrickle.health_summary()
+  metrics:
+    - total_stream_tables:
+        usage: GAUGE
+        description: "Total registered stream tables"
+    - active_tables:
+        usage: GAUGE
+        description: "Tables in ACTIVE state"
+    - error_tables:
+        usage: GAUGE
+        description: "Tables in ERROR state"
+    - stale_tables:
+        usage: GAUGE
+        description: "Stale stream tables"
+    - scheduler_running:
+        usage: GAUGE
+        description: "1 if the scheduler is alive"
+    - total_refreshes_1h:
+        usage: GAUGE
+        description: "Total refreshes in the last hour"
+    - failed_refreshes_1h:
+        usage: GAUGE
+        description: "Failed refreshes in the last hour"
+    - avg_refresh_ms_1h:
+        usage: GAUGE
+        description: "Average refresh latency (ms) over the last hour"
+    - p99_refresh_ms_1h:
+        usage: GAUGE
+        description: "P99 refresh latency (ms) over the last hour"
+    - cache_hit_rate:
+        usage: GAUGE
+        description: "Template cache hit rate (0.0–1.0)"

@@ -978,8 +978,13 @@ fn build_rescan_cte(
         let group_filter = if group_output.is_empty() {
             String::new()
         } else if group_output.len() == 1 {
+            // Use EXISTS with IS NOT DISTINCT FROM instead of IN to
+            // correctly match NULL group-key values (NULL IN (...) → NULL).
             let col = &group_output[0];
-            format!("{col} IN (SELECT {} FROM {delta_cte})", quote_ident(col),)
+            format!(
+                "EXISTS (SELECT 1 FROM {delta_cte} __pgt_d2 WHERE {col} IS NOT DISTINCT FROM __pgt_d2.{})",
+                quote_ident(col),
+            )
         } else {
             // Multi-column group key: use EXISTS with IS NOT DISTINCT FROM
             // to correctly handle NULL group-key values.
@@ -1024,11 +1029,12 @@ fn build_rescan_cte(
         let where_clause = if group_output.is_empty() {
             String::new()
         } else if group_output.len() == 1 {
+            // Use EXISTS with IS NOT DISTINCT FROM instead of IN to
+            // correctly match NULL group-key values (NULL IN (...) → NULL).
             let col = &group_output[0];
             format!(
-                "\nWHERE __pgt_dq.{} IN (SELECT {} FROM {delta_cte})",
-                quote_ident(col),
-                quote_ident(col),
+                "\nWHERE EXISTS (SELECT 1 FROM {delta_cte} __pgt_d2 WHERE __pgt_dq.{qc} IS NOT DISTINCT FROM __pgt_d2.{qc})",
+                qc = quote_ident(col),
             )
         } else {
             let corr: Vec<String> = group_output
@@ -1830,7 +1836,7 @@ END AS __pgt_meta_action"
             .map(|c| {
                 let st_c = st_col_name(c);
                 format!(
-                    "st.{st_qc} = d.{d_qc}",
+                    "st.{st_qc} IS NOT DISTINCT FROM d.{d_qc}",
                     st_qc = quote_ident(&st_c),
                     d_qc = quote_ident(c),
                 )
@@ -1846,7 +1852,7 @@ END AS __pgt_meta_action"
         } else {
             group_output
                 .iter()
-                .map(|c| format!("r.{qc} = d.{qc}", qc = quote_ident(c)))
+                .map(|c| format!("r.{qc} IS NOT DISTINCT FROM d.{qc}", qc = quote_ident(c)))
                 .collect::<Vec<_>>()
                 .join(" AND ")
         };

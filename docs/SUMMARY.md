@@ -12,6 +12,7 @@
 - [Pre-Deployment Checklist](PRE_DEPLOYMENT.md)
 - [SQL Reference](SQL_REFERENCE.md)
 - [Configuration](CONFIGURATION.md)
+- [Scaling Guide](SCALING.md)
 - [Installation](installation.md)
 - [Upgrading](UPGRADING.md)
 - [Backup and Restore](BACKUP_AND_RESTORE.md)

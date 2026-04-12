@@ -750,6 +750,31 @@ SET pg_trickle.merge_work_mem_mb = 128;
 
 ---
 
+### pg_trickle.delta_work_mem_cap_mb
+
+Maximum `work_mem` (in MB) that planner hints are allowed to set during delta MERGE execution. When the deep-join or large-delta path would set `work_mem` above this cap, the refresh falls back to FULL instead of risking OOM.
+
+| Property | Value |
+|---|---|
+| Type | `int` |
+| Default | `0` (disabled — no cap) |
+| Range | `0` – `8192` (0 to 8 GB) |
+| Context | `SUSET` |
+| Restart Required | No |
+
+Set to `0` to disable the cap entirely (default). When enabled, the cap is checked before any `SET LOCAL work_mem` in `apply_planner_hints()`. If the configured or computed `work_mem` exceeds the cap, the refresh emits a `NOTICE` and falls back to FULL refresh.
+
+**Tuning Guidance:**
+- **Production servers with tight memory budgets**: Set to `256`–`512` to prevent runaway hash joins.
+- **Servers with ample RAM** (64+ GB): Leave at `0` (disabled) or set high (`2048`+).
+- **If you see SCAL-3 fallback notices**: Either raise the cap or investigate why delta sizes are unexpectedly large.
+
+```sql
+SET pg_trickle.delta_work_mem_cap_mb = 512;
+```
+
+---
+
 ### pg_trickle.merge_seqscan_threshold
 
 Delta-to-ST row ratio below which sequential scans are disabled for the MERGE transaction. Requires [planner hints](#pg_tricklemerge_planner_hints) to be enabled.

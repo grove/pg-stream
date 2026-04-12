@@ -2423,7 +2423,7 @@ dependencies = [
 
 [[package]]
 name = "pg_trickle"
-version = "0.17.0"
+version = "0.18.0"
 dependencies = [
  "chrono",
  "criterion",
@@ -2576,7 +2576,7 @@ dependencies = [
 
 [[package]]
 name = "pgtrickle-tui"
-version = "0.17.0"
+version = "0.18.0"
 dependencies = [
  "chrono",
  "clap",

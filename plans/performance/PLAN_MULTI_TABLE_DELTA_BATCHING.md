@@ -35,10 +35,10 @@ final_delta AS (
 *Why:* To formally prove that `SUM(weight)*Why:* To formally prove that `SUM(weight)*Why:* To formally prove that `SUM(weihat `DISTINCT ON` introduced.
 *Where:* `tests/e2e_diamond_tests.rs` (Added `test_diamond_flow_simultaneous_multi_source_update`).
 
-### 2. Merged-Delta Generation (B3-2) `🔴 Not Started`
+### 2. Merged-Delta Generation (B3-2) `✅ Done`
 *What:* Implement the true multi-source delta engine in `src/dvm/diff.rs`.
 *Why:* Generates the `UNION ALL` + `GROUP BY` logic dynamically.
-*Where:* `DiffEngine::diff_node()`.
+*Where:* `src/refresh.rs` — `build_weight_agg_using()` wraps the multi-source delta in `GROUP BY __pgt_row_id, SUM(weight) + HAVING <> 0`; `build_keyless_weight_agg()` handles keyless tables with `generate_series` expansion.
 
 ### 3. Intra-query Delta-Branch Pruning (B3-1) `🟢 Done`
 *What:* Optimize the generated `UNION ALL` statements. If 3 tables are in a join but only 1 changed, completely skip gen*What:* Optimize the generated `UNION ALL` statements. Ifar*What:* Optimize tPo*What:* Optimize the gand execution latency.

@@ -9,6 +9,37 @@ causes, and suggested fixes. If you encounter an error not listed here, please
 
 ---
 
+## SQLSTATE Code Reference
+
+Every pg_trickle error includes a PostgreSQL SQLSTATE code for programmatic
+error handling. Use `SQLSTATE` in PL/pgSQL `EXCEPTION WHEN` blocks or check
+the error code in your client library.
+
+| Error Variant | SQLSTATE | Code Name |
+|---------------|----------|-----------|
+| QueryParseError | `42000` | SYNTAX_ERROR_OR_ACCESS_RULE_VIOLATION |
+| TypeMismatch | `42804` | DATATYPE_MISMATCH |
+| UnsupportedOperator | `0A000` | FEATURE_NOT_SUPPORTED |
+| CycleDetected | `3F000` | INVALID_SCHEMA_DEFINITION |
+| NotFound | `42P01` | UNDEFINED_TABLE |
+| AlreadyExists | `42P07` | DUPLICATE_TABLE |
+| InvalidArgument | `22023` | INVALID_PARAMETER_VALUE |
+| QueryTooComplex | `54000` | PROGRAM_LIMIT_EXCEEDED |
+| UpstreamTableDropped | `42P01` | UNDEFINED_TABLE |
+| UpstreamSchemaChanged | `42P17` | INVALID_TABLE_DEFINITION |
+| LockTimeout | `55P03` | LOCK_NOT_AVAILABLE |
+| ReplicationSlotError | `55000` | OBJECT_NOT_IN_PREREQUISITE_STATE |
+| WalTransitionError | `55000` | OBJECT_NOT_IN_PREREQUISITE_STATE |
+| SpiError | `XX000` | INTERNAL_ERROR |
+| SpiPermissionError | `42501` | INSUFFICIENT_PRIVILEGE |
+| WatermarkBackwardMovement | `22000` | DATA_EXCEPTION |
+| WatermarkGroupNotFound | `42704` | UNDEFINED_OBJECT |
+| WatermarkGroupAlreadyExists | `42710` | DUPLICATE_OBJECT |
+| RefreshSkipped | `55000` | OBJECT_NOT_IN_PREREQUISITE_STATE |
+| InternalError | `XX000` | INTERNAL_ERROR |
+
+---
+
 ## Error Categories
 
 pg_trickle classifies errors into four categories that determine retry behavior:

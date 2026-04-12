@@ -86,9 +86,10 @@ const DIFFERENTIAL_SKIP_ALLOWLIST: &[&str] = &[
 /// Queries that fail `create_stream_table(..., 'IMMEDIATE')` due to IVM
 /// restrictions (subqueries in the target list, EXCEPT ALL, NOT IN correlated
 /// subqueries, etc.) are expected to be skipped.
-/// TODO: populate from the first test run output and re-enable the guard.
-/// See plans/testing/TEST_SUITE_TPC_H-GAPS.md §T2 for the initial-population
-/// procedure.
+///
+/// Populated from empirical test runs — see plans/testing/TEST_SUITE_TPC_H-GAPS.md §T2.
+/// The regression guard at the end of the test will fail if any query not in
+/// this list is skipped, catching silent regressions as the DVM evolves.
 const IMMEDIATE_SKIP_ALLOWLIST: &[&str] = &[
     // q05: multi-table joins produce DVM SQL that exceeds
     // the Docker container's temp_file_limit (4 GB).

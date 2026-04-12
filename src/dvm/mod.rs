@@ -188,6 +188,12 @@ pub fn invalidate_delta_cache(pgt_id: i64) {
     });
 }
 
+/// UX-1 / CACHE-OBS: Return the current number of entries in the L1
+/// (thread-local) delta template cache for this backend connection.
+pub fn delta_cache_size() -> usize {
+    DELTA_TEMPLATE_CACHE.with(|cache| cache.borrow().len())
+}
+
 /// Retrieve the raw delta SQL template (with placeholder tokens) for a ST.
 ///
 /// Returns `None` if the template has not been generated yet.
@@ -440,7 +446,17 @@ pub fn generate_delta_query_cached(
     let shared_gen = crate::shmem::current_cache_generation();
     LOCAL_DELTA_CACHE_GEN.with(|local| {
         if local.get() < shared_gen {
-            DELTA_TEMPLATE_CACHE.with(|cache| cache.borrow_mut().clear());
+            DELTA_TEMPLATE_CACHE.with(|cache| {
+                let mut map = cache.borrow_mut();
+                // UX-1 / CACHE-OBS: Track evictions before clearing.
+                let evicted = map.len() as u64;
+                map.clear();
+                if evicted > 0 && crate::shmem::is_shmem_available() {
+                    crate::shmem::TEMPLATE_CACHE_EVICTIONS
+                        .get()
+                        .fetch_add(evicted, std::sync::atomic::Ordering::Relaxed);
+                }
+            });
             local.set(shared_gen);
         }
     });
@@ -455,6 +471,12 @@ pub fn generate_delta_query_cached(
 
     if let Some(entry) = cached {
         // Cache hit — resolve placeholders and return.
+        // UX-1 / CACHE-OBS: Track L1 hit.
+        if crate::shmem::is_shmem_available() {
+            crate::shmem::TEMPLATE_CACHE_L1_HITS
+                .get()
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         let delta_sql = resolve_delta_template(
             &entry.delta_sql_template,
             &entry.source_oids,

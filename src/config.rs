@@ -111,6 +111,17 @@ pub static PGS_MERGE_PLANNER_HINTS: GucSetting<bool> = GucSetting::<bool>::new(t
 /// join, avoiding disk-spilling sort/merge strategies on large deltas.
 pub static PGS_MERGE_WORK_MEM_MB: GucSetting<i32> = GucSetting::<i32>::new(64);
 
+/// SCAL-3: Maximum `work_mem` (in MB) allowed during delta MERGE execution.
+///
+/// When the planner hints would set `work_mem` above this cap (for deep
+/// joins or large deltas), the refresh falls back to FULL instead. This
+/// prevents OOM on unexpectedly large deltas where hash joins would
+/// allocate unbounded memory.
+///
+/// Set to 0 to disable the cap (default — no limit enforced).
+/// Recommended range: 128–1024 depending on available system memory.
+pub static PGS_DELTA_WORK_MEM_CAP_MB: GucSetting<i32> = GucSetting::<i32>::new(0);
+
 /// Whether to use SQL PREPARE / EXECUTE for MERGE statements.
 ///
 /// When enabled, the refresh executor issues `PREPARE __pgt_merge_{id}`
@@ -936,6 +947,20 @@ pub fn register_gucs() {
         GucFlags::default(),
     );
 
+    // SCAL-3: Delta working-set memory cap.
+    GucRegistry::define_int_guc(
+        c"pg_trickle.delta_work_mem_cap_mb",
+        c"Max work_mem (MB) allowed during delta MERGE (0 = no cap).",
+        c"When the planner hints would set work_mem above this cap, the refresh \
+           falls back to FULL instead of executing a potentially OOM-inducing delta \
+           MERGE. Set to 0 to disable. Recommended: 128–1024.",
+        &PGS_DELTA_WORK_MEM_CAP_MB,
+        0,    // min (0 = disabled)
+        8192, // max (8 GB)
+        GucContext::Suset,
+        GucFlags::default(),
+    );
+
     GucRegistry::define_bool_guc(
         c"pg_trickle.use_prepared_statements",
         c"Use SQL PREPARE/EXECUTE for MERGE during differential refresh.",
@@ -1582,6 +1607,11 @@ pub fn pg_trickle_merge_planner_hints() -> bool {
 /// Returns the work_mem value (in MB) for large-delta MERGE.
 pub fn pg_trickle_merge_work_mem_mb() -> i32 {
     PGS_MERGE_WORK_MEM_MB.get()
+}
+
+/// SCAL-3: Returns the delta work_mem cap (MB). 0 = disabled.
+pub fn pg_trickle_delta_work_mem_cap_mb() -> i32 {
+    PGS_DELTA_WORK_MEM_CAP_MB.get()
 }
 
 /// Returns whether prepared statements are enabled for MERGE.

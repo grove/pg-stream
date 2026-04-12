@@ -505,6 +505,24 @@ sends commands (refresh, create, drop, alter) through the same SQL functions
 you would call from `psql`. It does not require any special privileges beyond
 what the pg_trickle SQL API requires.
 
+### Planned: cache_stats() and health_summary() Integration
+
+> **Status:** Not yet surfaced in the TUI (v0.18.0 gap).
+
+The following SQL functions are available but not yet integrated into the TUI:
+
+- `pgtrickle.cache_stats()` — template cache hit rate, L1 hits, evictions,
+  delta cache entries. Useful for monitoring cache effectiveness.
+- `pgtrickle.health_summary()` — single-row deployment overview with
+  total/active/error/stale stream table counts, P99 refresh latency,
+  scheduler status, and cache hit rate.
+
+**Lightest integration path:** Add cache hit rate to the Dashboard status
+ribbon (currently shows scheduler status from `quick_health`). The Health
+Checks view (`8`) could display `health_summary()` fields alongside the
+existing `health_check()` results. Both functions are already available via
+raw SQL (`psql`, Grafana, or the Prometheus exporter).
+
 ### Tech Stack
 
 | Component | Crate | Purpose |
