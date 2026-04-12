@@ -4680,6 +4680,7 @@ Dependencies: None. Schema change: No.
 | TEST-5 | Read-replica guard integration test | S | P1 |
 | TEST-6 | Ownership-check privilege tests for SEC-1 | S | P1 |
 | TEST-7 | Scheduler dispatch benchmark (500+ STs) | S | P1 |
+| TEST-8 | Upgrade E2E tests (`e2e_migration_tests.rs`) | M | P1 |
 
 **TEST-1 — E2E tests for CORR-2 (JOIN delta R₀ fix)**
 
@@ -4755,6 +4756,143 @@ Verify: `cargo bench --bench scheduler_bench` runs and reports P50/P99 tick
 latency. Baseline saved for Criterion regression gate.
 Dependencies: PERF-5. Schema change: No.
 
+**TEST-8 — Upgrade E2E tests (`e2e_migration_tests.rs`)**
+
+> **In plain terms:** The upgrade path from 0.18.0 → 0.19.0 is currently
+> tested only by verifying `ALTER EXTENSION pg_trickle UPDATE` runs without
+> error. There are no tests that verify (a) existing stream tables continue to
+> function after upgrade, (b) the new catalog schema items (DB-2 FK, DB-3
+> version table, DB-5 history retention) are present and correct, or (c)
+> stream table data is preserved. Add a Testcontainers-based upgrade E2E test.
+
+Verify: `tests/e2e_migration_tests.rs` tests: fresh install, upgrade from
+previous version with populated stream tables, catalog integrity check,
+post-upgrade refresh cycle. All pass.
+Dependencies: DB-1, DB-2, DB-3. Schema change: No (tests existing schema).
+
+### Schema Stability
+
+| ID | Title | Effort | Priority |
+|----|-------|--------|----------|
+| DB-1 | Fix duplicate `'DIFFERENTIAL'` in two CHECK constraints | XS | P0 |
+| DB-2 | Add `ON DELETE CASCADE` FK on `pgt_refresh_history.pgt_id` | XS | P0 |
+| DB-3 | Add `pgtrickle.pgt_schema_version` version tracking table | XS | P0 |
+| DB-4 | Rename `pgtrickle_refresh` NOTIFY channel → `pg_trickle_refresh` | XS | P0 |
+| DB-5 | `pg_trickle.history_retention_days` GUC + scheduler daily cleanup | S | P1 |
+| DB-6 | Document public API stability contract in `docs/SQL_REFERENCE.md` | XS | P1 |
+| DB-7 | Add migration script template to `sql/` | XS | P1 |
+| DB-8 | Validate orphan cleanup in `drop_stream_table` | XS | P1 |
+| DB-9 | `pgtrickle.migrate()` utility function | S | P2 |
+
+**DB-1 — Fix duplicate `'DIFFERENTIAL'` in CHECK constraints**
+
+> **In plain terms:** Both `pgt_stream_tables.refresh_mode` and
+> `pgt_refresh_history.action` have `'DIFFERENTIAL'` listed twice in their
+> CHECK constraints. While logically harmless, it signals sloppiness and
+> produces confusing output in dumps. Both from `REPORT_DB_SCHEMA_STABILITY.md §3.1`.
+
+Verify: `\d+ pgtrickle.pgt_stream_tables` and `\d+ pgtrickle.pgt_refresh_history`
+show their CHECK constraints with no duplicate values.
+Dependencies: None. Schema change: Yes (upgrade SQL drops/recreates constraints).
+
+**DB-2 — Add `ON DELETE CASCADE` FK on `pgt_refresh_history.pgt_id`**
+
+> **In plain terms:** `pgt_refresh_history.pgt_id` references
+> `pgt_stream_tables.pgt_id` logically but has no formal FK. When a stream
+> table is dropped, orphan history rows accumulate indefinitely. Adding
+> `FOREIGN KEY (pgt_id) REFERENCES pgtrickle.pgt_stream_tables(pgt_id)
+> ON DELETE CASCADE` cleans up automatically.
+
+Verify: Drop a stream table; `SELECT count(*) FROM pgtrickle.pgt_refresh_history
+WHERE pgt_id = <dropped_id>` returns 0.
+Dependencies: None. Schema change: Yes.
+
+**DB-3 — Add `pgtrickle.pgt_schema_version` version tracking table**
+
+> **In plain terms:** There is currently no way for migration scripts to
+> verify which schema version is installed before applying changes. Add a
+> `pgt_schema_version(version TEXT PRIMARY KEY, applied_at TIMESTAMPTZ,
+> description TEXT)` table seeded with the current version. Every future
+> migration script will check this table and insert its target version.
+
+Verify: `SELECT version FROM pgtrickle.pgt_schema_version ORDER BY applied_at DESC
+LIMIT 1` returns the current extension version after upgrade.
+Dependencies: None. Schema change: Yes.
+
+**DB-4 — Rename `pgtrickle_refresh` NOTIFY channel → `pg_trickle_refresh`**
+
+> **In plain terms:** Two existing NOTIFY channels use `pg_trickle_*` naming
+> (`pg_trickle_alert`, `pg_trickle_cdc_transition`). The third uses
+> inconsistent `pgtrickle_refresh` (no separator). Rename before 1.0 while
+> still pre-1.0. Any external `LISTEN pgtrickle_refresh` in application code
+> must be updated. Document as a breaking change in CHANGELOG.
+
+Verify: `LISTEN pg_trickle_refresh` receives notifications on refresh events.
+`LISTEN pgtrickle_refresh` receives none.
+Dependencies: None. Schema change: No (code change only).
+
+**DB-5 — `pg_trickle.history_retention_days` GUC + scheduler cleanup**
+
+> **In plain terms:** `pgt_refresh_history` has no retention policy.
+> Production deployments running daily refreshes on 100+ stream tables will
+> accumulate millions of rows within months. Add a GUC (default: 30 days)
+> and a daily cleanup step in the scheduler: `DELETE FROM
+> pgtrickle.pgt_refresh_history WHERE start_time < now() - make_interval(...)`.
+
+Verify: `SET pg_trickle.history_retention_days = 1` and run the cleanup;
+rows older than 1 day are removed. Default retains 30 days.
+Dependencies: None. Schema change: No (new GUC + cleanup logic only).
+
+**DB-6 — Document public API stability contract**
+
+> **In plain terms:** The stability contract defined in
+> `REPORT_DB_SCHEMA_STABILITY.md §5` (Tier 1/2/3 surfaces) is not yet
+> published anywhere users can find it. Add a "Stability Guarantees" section
+> to `docs/SQL_REFERENCE.md` covering: which function signatures are stable,
+> which view columns can be added without a major version, and which internal
+> objects may change with migration scripts.
+
+Verify: `docs/SQL_REFERENCE.md` has a §Stability Guarantees section linked
+from the TOC.
+Dependencies: None. Schema change: No.
+
+**DB-7 — Add migration script template to `sql/`**
+
+> **In plain terms:** The `sql/pg_trickle--0.18.0--0.19.0.sql` file is
+> currently empty (stub). Populate it with: (a) the DB-1 CHECK constraint
+> fixes, (b) the DB-2 FK addition, (c) the DB-3 schema version table
+> creation, and (d) the DB-4 NOTIFY channel rename notice. Also create a
+> reusable migration script template comment header for future versions.
+
+Verify: `ALTER EXTENSION pg_trickle UPDATE` on a 0.18.0 instance applies
+all schema changes correctly. `check_upgrade_completeness.sh` passes.
+Dependencies: DB-1, DB-2, DB-3, DB-4. Schema change: Yes (this IS the migration script).
+
+**DB-8 — Validate orphan cleanup in `drop_stream_table`**
+
+> **In plain terms:** When a stream table is dropped, `pgt_change_tracking`
+> rows with the dropped `pgt_id` in `tracked_by_pgt_ids` (a `BIGINT[]`
+> column) may not be cleaned up if the array contains other IDs. Add an
+> explicit sweep: remove the dropped `pgt_id` from all `tracked_by_pgt_ids`
+> arrays; delete rows where the array becomes empty.
+
+Verify: Create a shared-source ST pair, drop one; `SELECT * FROM
+pgtrickle.pgt_change_tracking` shows correct state.
+Dependencies: None. Schema change: No.
+
+**DB-9 — `pgtrickle.migrate()` utility function**
+
+> **In plain terms:** Add a `pgtrickle.migrate()` SQL function that iterates
+> over all registered stream tables and applies any pending dynamic object
+> migrations (change buffer schema updates, CDC trigger function regeneration).
+> This is called automatically at the end of `ALTER EXTENSION UPDATE` and can
+> also be called manually after an upgrade to repair STs that were being
+> refreshed during the upgrade window.
+
+Verify: `SELECT pgtrickle.migrate()` completes without error on a fresh
+install and after a version upgrade. Returns a summary of migrated objects.
+Dependencies: DB-3 (uses schema version to determine needed migrations). Schema change: No.
+
 > **v0.19.0 total: ~3–4 weeks**
 
 **Exit criteria:**
@@ -4791,6 +4929,15 @@ Dependencies: PERF-5. Schema change: No.
 - [ ] TEST-5: Read-replica guard integration test passes
 - [ ] TEST-6: 3 ownership-check privilege E2E tests pass
 - [ ] TEST-7: Scheduler dispatch benchmark baseline saved
+- [ ] TEST-8: Upgrade E2E tests pass (pre- and post-upgrade stream table correctness)
+- [ ] DB-1: No duplicate `'DIFFERENTIAL'` in CHECK constraints
+- [ ] DB-2: `pgt_refresh_history.pgt_id` FK with `ON DELETE CASCADE` added
+- [ ] DB-3: `pgtrickle.pgt_schema_version` table present and seeded
+- [ ] DB-4: `pgtrickle_refresh` channel renamed to `pg_trickle_refresh`
+- [ ] DB-5: `pg_trickle.history_retention_days` GUC active; daily cleanup deletes old rows
+- [ ] DB-6: `docs/SQL_REFERENCE.md` stability contract section published
+- [ ] DB-7: `sql/pg_trickle--0.18.0--0.19.0.sql` applies DB-1 through DB-4 changes
+- [ ] DB-8: `drop_stream_table` leaves no orphan rows in `pgt_change_tracking`
 - [ ] Extension upgrade path tested (`0.18.0 → 0.19.0`)
 - [ ] `just check-version-sync` passes
 
@@ -4833,6 +4980,15 @@ Dependencies: PERF-5. Schema change: No.
    be added to `sql/pg_trickle--0.18.0--0.19.0.sql`. Index creation on a
    busy system may briefly lock the catalog tables (millisecond-range for
    small catalogs; document in upgrade notes).
+
+9. **DB-4 renames the `pgtrickle_refresh` NOTIFY channel.** Any application
+   code using `LISTEN pgtrickle_refresh` will stop receiving notifications
+   after upgrade. The old channel name ceases to exist. Document prominently
+   in CHANGELOG and UPGRADING.md.
+
+10. **DB-2 adds a CASCADE FK.** If any external tooling holds open
+    transactions when a stream table is dropped, the cascade may fail under
+    lock. Test in upgrade E2E (TEST-8) before shipping.
 
 ---
 
