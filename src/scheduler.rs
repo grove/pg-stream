@@ -3942,17 +3942,13 @@ fn has_table_source_changes(st: &StreamTableMeta) -> bool {
     }
 
     // PERF-6: Build a single UNION ALL EXISTS query for all sources.
-    // Each arm is `SELECT 1 FROM <schema>.changes_<oid> LIMIT 1`.
-    // The outer EXISTS returns true if ANY source has pending rows.
+    // Note: LIMIT 1 is omitted from individual branches because
+    // `SELECT ... LIMIT 1 UNION ALL SELECT ...` is a syntax error in
+    // PostgreSQL (LIMIT binds at the top level, not per-branch).
+    // EXISTS already short-circuits on the first row found.
     let union_arms: Vec<String> = source_oids
         .iter()
-        .map(|oid| {
-            format!(
-                "SELECT 1 FROM {}.changes_{} LIMIT 1",
-                change_schema,
-                oid.to_u32(),
-            )
-        })
+        .map(|oid| format!("SELECT 1 FROM {}.changes_{}", change_schema, oid.to_u32(),))
         .collect();
     let batched_sql = format!("SELECT EXISTS({})", union_arms.join(" UNION ALL "));
 
