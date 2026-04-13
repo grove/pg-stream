@@ -66,6 +66,10 @@ harness = false
 name = "diff_operators"
 harness = false
 
+[[bench]]
+name = "scheduler_bench"
+harness = false
+
 [profile.dev]
 panic = "unwind"
 

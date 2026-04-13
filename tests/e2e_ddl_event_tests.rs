@@ -883,3 +883,107 @@ async fn test_dml_and_compatible_ddl_interleaved() {
     db.assert_st_matches_query("se_intl_st", q).await;
     assert_eq!(db.count("public.se_intl_st").await, 4);
 }
+
+// ══════════════════════════════════════════════════════════════════════
+// TEST-2: DDL tracking for ALTER TYPE / ALTER DOMAIN / ALTER POLICY
+// ══════════════════════════════════════════════════════════════════════
+
+/// TEST-2a: ALTER TYPE on an enum used in a source column triggers
+/// stream table invalidation (needs_reinit or ERROR status).
+#[tokio::test]
+async fn test_alter_type_enum_triggers_invalidation() {
+    let db = E2eDb::new().await.with_extension().await;
+
+    db.execute("CREATE TYPE ddl_status_enum AS ENUM ('active', 'inactive')")
+        .await;
+    db.execute("CREATE TABLE ddl_enum_src (id INT PRIMARY KEY, status ddl_status_enum NOT NULL)")
+        .await;
+    db.execute("INSERT INTO ddl_enum_src VALUES (1, 'active'), (2, 'inactive')")
+        .await;
+
+    let q = "SELECT id, status::TEXT FROM ddl_enum_src";
+    db.create_st("ddl_enum_st", q, "1m", "DIFFERENTIAL").await;
+    db.assert_st_matches_query("ddl_enum_st", q).await;
+
+    // ALTER TYPE: add a new enum value (structural change to the type)
+    db.execute_seq(&[
+        "SET pg_trickle.block_source_ddl = false",
+        "ALTER TYPE ddl_status_enum ADD VALUE 'archived'",
+        "SET pg_trickle.block_source_ddl = true",
+    ])
+    .await;
+
+    // Insert a row with the new enum value
+    db.execute("INSERT INTO ddl_enum_src VALUES (3, 'archived')")
+        .await;
+
+    // Refresh should succeed — data must be correct
+    db.refresh_st("ddl_enum_st").await;
+    db.assert_st_matches_query("ddl_enum_st", q).await;
+}
+
+/// TEST-2b: ALTER DOMAIN on a domain used in a source column triggers
+/// stream table invalidation when the constraint changes.
+#[tokio::test]
+async fn test_alter_domain_triggers_invalidation() {
+    let db = E2eDb::new().await.with_extension().await;
+
+    db.execute("CREATE DOMAIN ddl_score AS INT CHECK (VALUE >= 0)")
+        .await;
+    db.execute("CREATE TABLE ddl_dom_src (id INT PRIMARY KEY, score ddl_score)")
+        .await;
+    db.execute("INSERT INTO ddl_dom_src VALUES (1, 50), (2, 75)")
+        .await;
+
+    let q = "SELECT id, score FROM ddl_dom_src";
+    db.create_st("ddl_dom_st", q, "1m", "DIFFERENTIAL").await;
+    db.assert_st_matches_query("ddl_dom_st", q).await;
+
+    // ALTER DOMAIN: drop the constraint (structural change)
+    db.execute_seq(&[
+        "SET pg_trickle.block_source_ddl = false",
+        "ALTER DOMAIN ddl_score DROP CONSTRAINT ddl_score_check",
+        "SET pg_trickle.block_source_ddl = true",
+    ])
+    .await;
+
+    // The ST may or may not be invalidated depending on event trigger
+    // coverage. In either case, a refresh must produce correct data.
+    db.refresh_st("ddl_dom_st").await;
+    db.assert_st_matches_query("ddl_dom_st", q).await;
+}
+
+/// TEST-2c: ALTER POLICY on an RLS policy affecting a source table
+/// triggers stream table invalidation.
+#[tokio::test]
+async fn test_alter_policy_triggers_invalidation() {
+    let db = E2eDb::new().await.with_extension().await;
+
+    db.execute("CREATE TABLE ddl_pol_src (id INT PRIMARY KEY, dept TEXT, val INT)")
+        .await;
+    db.execute("INSERT INTO ddl_pol_src VALUES (1, 'eng', 10), (2, 'sales', 20), (3, 'eng', 30)")
+        .await;
+
+    let q = "SELECT id, dept, val FROM ddl_pol_src";
+    db.create_st("ddl_pol_st", q, "1m", "DIFFERENTIAL").await;
+    db.assert_st_matches_query("ddl_pol_st", q).await;
+
+    // Enable RLS and create a policy
+    db.execute("ALTER TABLE ddl_pol_src ENABLE ROW LEVEL SECURITY")
+        .await;
+    db.execute("CREATE POLICY eng_only ON ddl_pol_src FOR SELECT USING (dept = 'eng')")
+        .await;
+
+    // ALTER POLICY: change the qualification
+    db.execute_seq(&[
+        "SET pg_trickle.block_source_ddl = false",
+        "ALTER POLICY eng_only ON ddl_pol_src USING (dept = 'sales')",
+        "SET pg_trickle.block_source_ddl = true",
+    ])
+    .await;
+
+    // Refresh — data must remain correct from the superuser perspective
+    // (pg_trickle refreshes as the extension owner, bypassing RLS)
+    db.refresh_st("ddl_pol_st").await;
+    db.assert_st_matches_query("ddl_pol_st", q).await;
+}

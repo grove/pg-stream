@@ -1925,6 +1925,75 @@ mod tests {
 
     // ── parse_pgoutput_old_columns tests (G2.2) ───────────────────
 
+    // ── TEST-3: Additional WAL decoder coverage ────────────────────
+
+    /// TEST-3a: old_col_* extraction for UPDATE with REPLICA IDENTITY FULL
+    /// returns all old column values, not just PK columns.
+    #[test]
+    fn test_old_columns_full_replica_identity_all_values() {
+        let data = "table public.products: UPDATE: old-key: id[integer]:5 name[text]:'Widget' price[numeric]:9.99 new-tuple: id[integer]:5 name[text]:'Gadget' price[numeric]:19.99";
+        let old = parse_pgoutput_old_columns(data);
+        assert_eq!(old.get("id").map(|s| s.as_str()), Some("5"));
+        assert_eq!(old.get("name").map(|s| s.as_str()), Some("Widget"));
+        assert_eq!(old.get("price").map(|s| s.as_str()), Some("9.99"));
+        assert_eq!(
+            old.len(),
+            3,
+            "FULL replica identity should return all old columns"
+        );
+    }
+
+    /// TEST-3b: old_col_* returns empty for INSERT (no old tuple exists).
+    #[test]
+    fn test_old_columns_insert_returns_empty() {
+        let data = "table public.products: INSERT: id[integer]:1 name[text]:'New'";
+        let old = parse_pgoutput_old_columns(data);
+        assert!(old.is_empty(), "INSERT should have no old columns");
+    }
+
+    /// TEST-3c: pk_hash for keyless table (empty PK) returns "0".
+    #[test]
+    fn test_pk_hash_keyless_table_returns_zero() {
+        // Keyless tables have no PK columns, so pk_hash must be "0"
+        let pk_cols: Vec<String> = vec![];
+        let mut parsed = std::collections::HashMap::new();
+        parsed.insert("val".to_string(), "hello".to_string());
+        parsed.insert("num".to_string(), "42".to_string());
+        assert_eq!(
+            build_pk_hash_from_values(&pk_cols, &parsed),
+            "0",
+            "Keyless table pk_hash must be 0"
+        );
+    }
+
+    /// TEST-3d: Action string parsing uses exact position-based comparison,
+    /// not substring search (table named "DELETE_LOG" must parse correctly).
+    #[test]
+    fn test_action_exact_matching_not_substring() {
+        // Table named "DELETE_LOG" — action is INSERT, not DELETE
+        let data = "table public.DELETE_LOG: INSERT: id[integer]:1 msg[text]:'row deleted'";
+        assert_eq!(parse_pgoutput_action(data), Some('I'));
+
+        // Table named "UPDATE_AUDIT" — action is DELETE
+        let data2 = "table public.UPDATE_AUDIT: DELETE: id[integer]:99";
+        assert_eq!(parse_pgoutput_action(data2), Some('D'));
+    }
+
+    /// TEST-3e: pk_hash with special characters in PK values are properly
+    /// escaped to prevent SQL injection in generated expressions.
+    #[test]
+    fn test_pk_hash_special_chars_escaped() {
+        let pk = vec!["name".to_string()];
+        let mut parsed = std::collections::HashMap::new();
+        parsed.insert("name".to_string(), "O'Brien".to_string());
+        let result = build_pk_hash_from_values(&pk, &parsed);
+        // The single quote should be doubled for SQL safety
+        assert!(
+            result.contains("O''Brien"),
+            "Single quotes in PK values must be escaped: {result}"
+        );
+    }
+
     #[test]
     fn test_parse_old_columns_update_with_old_key() {
         let data = "table public.users: UPDATE: old-key: id[integer]:1 name[text]:'Alice' new-tuple: id[integer]:1 name[text]:'Bob'";

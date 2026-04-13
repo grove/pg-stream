@@ -300,3 +300,111 @@ async fn test_three_table_join_middle_delete() {
     db.refresh_st("tj_mid_st").await;
     db.assert_st_matches_query("tj_mid_st", q).await;
 }
+
+// ── TEST-1: JOIN delta R₀ co-delete tests (CORR-2) ─────────────────────
+//
+// Validate the co-delete scenario: UPDATE join key + DELETE join partner
+// in the same refresh cycle. These verify that the R₀ fix correctly
+// handles simultaneous key reassignment and partner removal.
+
+/// TEST-1a: Simultaneous key change + right-side delete in same cycle.
+///
+/// Scenario: Order 10 changes customer from Alice to Charlie,
+/// and Bob (customer 2) is deleted, all before a single refresh.
+#[tokio::test]
+async fn test_join_r0_key_change_plus_partner_delete() {
+    let db = E2eDb::new().await.with_extension().await;
+    db.execute("CREATE TABLE r0_orders (id INT PRIMARY KEY, customer_id INT, amount INT)")
+        .await;
+    db.execute("CREATE TABLE r0_customers (id INT PRIMARY KEY, name TEXT)")
+        .await;
+    db.execute("INSERT INTO r0_customers VALUES (1, 'Alice'), (2, 'Bob'), (3, 'Charlie')")
+        .await;
+    db.execute("INSERT INTO r0_orders VALUES (10, 1, 100), (11, 2, 200)")
+        .await;
+
+    let q = "SELECT o.id AS oid, c.name, o.amount \
+             FROM r0_orders o JOIN r0_customers c ON o.customer_id = c.id";
+    db.create_st("r0_codelete_st", q, "1m", "DIFFERENTIAL")
+        .await;
+    db.assert_st_matches_query("r0_codelete_st", q).await;
+
+    // Same cycle: reassign order 10 to Charlie + delete Bob
+    db.execute("UPDATE r0_orders SET customer_id = 3 WHERE id = 10")
+        .await;
+    db.execute("DELETE FROM r0_customers WHERE id = 2").await;
+    db.refresh_st("r0_codelete_st").await;
+    db.assert_st_matches_query("r0_codelete_st", q).await;
+}
+
+/// TEST-1b: UPDATE key + DELETE multiple right-side rows in same cycle.
+///
+/// Scenario: An order switches customer while two other customers are
+/// deleted simultaneously, removing their associated order rows.
+#[tokio::test]
+async fn test_join_r0_key_change_plus_multi_partner_delete() {
+    let db = E2eDb::new().await.with_extension().await;
+    db.execute("CREATE TABLE r0m_orders (id INT PRIMARY KEY, cust_id INT, amt INT)")
+        .await;
+    db.execute("CREATE TABLE r0m_custs (id INT PRIMARY KEY, name TEXT)")
+        .await;
+    db.execute("INSERT INTO r0m_custs VALUES (1, 'A'), (2, 'B'), (3, 'C'), (4, 'D')")
+        .await;
+    db.execute("INSERT INTO r0m_orders VALUES (10, 1, 10), (11, 2, 20), (12, 3, 30), (13, 4, 40)")
+        .await;
+
+    let q = "SELECT o.id AS oid, c.name, o.amt \
+             FROM r0m_orders o JOIN r0m_custs c ON o.cust_id = c.id";
+    db.create_st("r0m_st", q, "1m", "DIFFERENTIAL").await;
+    db.assert_st_matches_query("r0m_st", q).await;
+
+    // Same cycle: order 10 moves to D, delete customers B and C
+    db.execute("UPDATE r0m_orders SET cust_id = 4 WHERE id = 10")
+        .await;
+    db.execute("DELETE FROM r0m_custs WHERE id IN (2, 3)").await;
+    db.refresh_st("r0m_st").await;
+    db.assert_st_matches_query("r0m_st", q).await;
+}
+
+/// TEST-1c: Multi-cycle correctness after R₀ co-delete scenario.
+///
+/// Verifies that subsequent refresh cycles remain correct after an
+/// initial co-delete cycle (no stale state lingers in change buffers).
+#[tokio::test]
+async fn test_join_r0_multi_cycle_after_codelete() {
+    let db = E2eDb::new().await.with_extension().await;
+    db.execute("CREATE TABLE r0c_items (id INT PRIMARY KEY, cat_id INT, val INT)")
+        .await;
+    db.execute("CREATE TABLE r0c_cats (id INT PRIMARY KEY, label TEXT)")
+        .await;
+    db.execute("INSERT INTO r0c_cats VALUES (1, 'X'), (2, 'Y'), (3, 'Z')")
+        .await;
+    db.execute("INSERT INTO r0c_items VALUES (10, 1, 100), (11, 2, 200)")
+        .await;
+
+    let q = "SELECT i.id AS iid, c.label, i.val \
+             FROM r0c_items i JOIN r0c_cats c ON i.cat_id = c.id";
+    db.create_st("r0c_st", q, "1m", "DIFFERENTIAL").await;
+    db.assert_st_matches_query("r0c_st", q).await;
+
+    // Cycle 1: co-delete — move item 10 to Z, delete Y
+    db.execute("UPDATE r0c_items SET cat_id = 3 WHERE id = 10")
+        .await;
+    db.execute("DELETE FROM r0c_cats WHERE id = 2").await;
+    db.refresh_st("r0c_st").await;
+    db.assert_st_matches_query("r0c_st", q).await;
+
+    // Cycle 2: normal insert
+    db.execute("INSERT INTO r0c_cats VALUES (4, 'W')").await;
+    db.execute("INSERT INTO r0c_items VALUES (12, 4, 300)")
+        .await;
+    db.refresh_st("r0c_st").await;
+    db.assert_st_matches_query("r0c_st", q).await;
+
+    // Cycle 3: update + delete again
+    db.execute("UPDATE r0c_items SET val = 999 WHERE id = 10")
+        .await;
+    db.execute("DELETE FROM r0c_items WHERE id = 12").await;
+    db.refresh_st("r0c_st").await;
+    db.assert_st_matches_query("r0c_st", q).await;
+}

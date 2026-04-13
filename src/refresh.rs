@@ -8381,4 +8381,71 @@ mod pg_tests {
                 < QueryComplexityClass::JoinAggregate.diff_cost_factor()
         );
     }
+
+    // ── TEST-9: Unit tests for classify_query_complexity ──────────────
+
+    #[test]
+    fn test_classify_plain_scan() {
+        assert_eq!(
+            classify_query_complexity("SELECT id, val FROM my_table"),
+            QueryComplexityClass::Scan
+        );
+    }
+
+    #[test]
+    fn test_classify_filter() {
+        assert_eq!(
+            classify_query_complexity("SELECT id FROM t WHERE id > 10"),
+            QueryComplexityClass::Filter
+        );
+    }
+
+    #[test]
+    fn test_classify_aggregate() {
+        assert_eq!(
+            classify_query_complexity("SELECT dept, count(*) FROM emp GROUP BY dept"),
+            QueryComplexityClass::Aggregate
+        );
+    }
+
+    #[test]
+    fn test_classify_join() {
+        assert_eq!(
+            classify_query_complexity(
+                "SELECT a.id, b.name FROM orders a JOIN customers b ON a.cust_id = b.id"
+            ),
+            QueryComplexityClass::Join
+        );
+    }
+
+    #[test]
+    fn test_classify_join_aggregate() {
+        assert_eq!(
+            classify_query_complexity(
+                "SELECT c.name, sum(o.amount) FROM orders o \
+                 JOIN customers c ON o.cust_id = c.id GROUP BY c.name"
+            ),
+            QueryComplexityClass::JoinAggregate
+        );
+    }
+
+    #[test]
+    fn test_classify_left_join() {
+        assert_eq!(
+            classify_query_complexity("SELECT a.id, b.val FROM t1 a LEFT JOIN t2 b ON a.id = b.id"),
+            QueryComplexityClass::Join
+        );
+    }
+
+    #[test]
+    fn test_classify_case_insensitive() {
+        assert_eq!(
+            classify_query_complexity("select id from t where id > 0"),
+            QueryComplexityClass::Filter
+        );
+        assert_eq!(
+            classify_query_complexity("SELECT a.x FROM t1 a inner join t2 b on a.id = b.id"),
+            QueryComplexityClass::Join
+        );
+    }
 }

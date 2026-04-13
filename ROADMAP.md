@@ -5130,21 +5130,21 @@ Dependencies: DB-3 (uses schema version to determine needed migrations). Schema 
 - [x] PERF-6: `has_table_source_changes()` executes single SPI query regardless of source count
 - [x] SCAL-1: `docs/SCALING.md` replica section added
 - [x] UX-1: `META.json` `release_status` → `"stable"`; PGXN listing updated
-- [ ] UX-2: Docker Hub release automation wired in GitHub Actions
+- [x] UX-2: Docker Hub release automation wired in GitHub Actions
 - [ ] UX-3: apt/rpm packages available via PGDG
 - [x] UX-4: `docs/PRE_DEPLOYMENT.md` connection pooler compatibility guide added
 - [x] UX-6: `drop_stream_table` defaults to `cascade => false`
 - [x] UX-7: `UpstreamTableDropped`/`UpstreamSchemaChanged` show table name instead of raw OID
 - [x] UX-8: `refresh_stream_table` emits NOTICE when refresh is skipped
 - [x] UX-9: CONFIGURATION.md TOC complete; no duplicate entries
-- [ ] TEST-1: 3 JOIN delta R₀ E2E tests pass
-- [ ] TEST-2: 3 DDL tracking E2E tests pass
-- [ ] TEST-3: 5+ WAL decoder unit tests pass with `wal_enabled = true`
-- [ ] TEST-4: PgBouncer transaction-mode integration test passes
-- [ ] TEST-5: Read-replica guard integration test passes
-- [ ] TEST-6: 3 ownership-check privilege E2E tests pass
-- [ ] TEST-7: Scheduler dispatch benchmark baseline saved
-- [ ] TEST-8: Upgrade E2E tests pass (pre- and post-upgrade stream table correctness)
+- [x] TEST-1: 3 JOIN delta R₀ E2E tests pass
+- [x] TEST-2: 3 DDL tracking E2E tests pass
+- [x] TEST-3: 5+ WAL decoder unit tests pass with `wal_enabled = true`
+- [x] TEST-4: PgBouncer transaction-mode integration test passes
+- [x] TEST-5: Read-replica guard integration test passes
+- [x] TEST-6: 3 ownership-check privilege E2E tests pass
+- [x] TEST-7: Scheduler dispatch benchmark baseline saved
+- [x] TEST-8: Upgrade E2E tests pass (pre- and post-upgrade stream table correctness)
 - [x] DB-1: No duplicate `'DIFFERENTIAL'` in CHECK constraints
 - [x] DB-2: `pgt_refresh_history.pgt_id` FK with `ON DELETE CASCADE` added
 - [x] DB-3: `pgtrickle.pgt_schema_version` table present and seeded
@@ -5161,11 +5161,11 @@ Dependencies: DB-3 (uses schema version to determine needed migrations). Schema 
 - [x] PERF-7: Delta branch pruning skips zero-change source arms in multi-JOIN
 - [x] PERF-8: Index-aware MERGE uses nested loop for small deltas on indexed tables
 - [x] SCAL-3: `docs/SCALING.md` CNPG/Kubernetes section published
-- [ ] SCAL-4: Partitioning spike report written with concrete findings
+- [x] SCAL-4: Partitioning spike report written with concrete findings
 - [x] UX-10: TUI sparkline column visible for refresh latency trend
 - [x] UX-11: `pgtrickle.version()` returns extension, library, and PG versions
-- [ ] TEST-9: 5+ unit tests extracted from E2E-only refresh/scheduler logic
-- [ ] TEST-10: TPC-H nightly runs at SF-1 and SF-10 with correct results
+- [x] TEST-9: 5+ unit tests extracted from E2E-only refresh/scheduler logic
+- [x] TEST-10: TPC-H nightly runs at SF-1 and SF-10 with correct results
 - [ ] Extension upgrade path tested (`0.18.0 → 0.19.0`)
 - [ ] `just check-version-sync` passes
 

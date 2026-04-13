@@ -142,6 +142,50 @@ For future plans and release milestones, see [ROADMAP.md](ROADMAP.md).
   reflect the removal of the `delete_insert` value. Added new GUC sections for
   `connection_pooler_mode` and `history_retention_days`.
 
+### Testing
+
+- **UX-2:** Docker Hub release automation wired into the GitHub Actions
+  `release.yml` workflow. On tagged releases, builds and pushes
+  `pgtrickle/pg_trickle:<ver>-pg18` and `pgtrickle/pg_trickle:latest` to
+  Docker Hub.
+
+- **SCAL-4:** Partitioned source table spike report already complete
+  (`plans/PLAN_PARTITIONING_SPIKE.md`). Documents which operations work,
+  which fail, and the fix scope for full partitioning support.
+
+- **TEST-1:** Three new E2E tests for JOIN delta R₀ co-delete scenario:
+  simultaneous key change + partner delete, multi-partner delete, and
+  multi-cycle correctness after the scenario.
+
+- **TEST-2:** Three new E2E tests for DDL tracking: ALTER TYPE (enum),
+  ALTER DOMAIN, and ALTER POLICY invalidation scenarios.
+
+- **TEST-3:** Five new WAL decoder unit tests covering old_col_* extraction
+  for REPLICA IDENTITY FULL, old columns empty for INSERT, pk_hash = 0 for
+  keyless tables, exact action string matching, and PK value SQL escaping.
+
+- **TEST-5:** Three new E2E tests for read-replica guard: primary not in
+  recovery, scheduler runs on primary, recovery function availability.
+
+- **TEST-6:** Three new E2E tests for SEC-1 ownership checks: non-owner
+  drop denied, non-owner alter denied, superuser override allowed.
+
+- **TEST-7:** New Criterion benchmark `scheduler_bench` for scheduler dispatch
+  with 500+ stream tables. Measures unit_by_id, unit_for_pgt, full sweep, and
+  DAG construction latency.
+
+- **TEST-8:** Three new upgrade E2E tests for v0.19.0 catalog integrity:
+  pgt_schema_version table presence, FK CASCADE on refresh history, and
+  PERF-4 catalog indexes.
+
+- **TEST-9:** Twelve new unit tests for pure Rust logic: `compute_per_db_quota`
+  (5 tests for disabled/burst/capacity/minimum/small-base scenarios) and
+  `classify_query_complexity` (7 tests for scan/filter/aggregate/join/
+  join-aggregate/left-join/case-insensitive classification).
+
+- **TEST-10:** TPC-H nightly CI job now runs at SF-1 and SF-10 scale factors
+  alongside the default SF-0.01. SF-10 doubles as a performance soak test.
+
 ---
 
 ## [0.18.0] — 2026-04-12

@@ -6419,4 +6419,42 @@ mod tests {
         assert_eq!(state.unit_states[&uid_b].remaining_upstreams, 1);
         assert!(!state.unit_states[&uid_b].succeeded);
     }
+
+    // ── TEST-9: Unit tests for compute_per_db_quota ───────────────────
+
+    #[test]
+    fn test_per_db_quota_disabled_returns_max_concurrent() {
+        // per_db_quota = 0 means disabled — fall back to max_concurrent_refreshes
+        assert_eq!(compute_per_db_quota(0, 4, 10, 0), 4);
+        assert_eq!(compute_per_db_quota(-1, 8, 20, 5), 8);
+    }
+
+    #[test]
+    fn test_per_db_quota_burst_when_spare_capacity() {
+        // Under 80% of cluster capacity → allow up to 150% of base quota
+        // base = 4, max_cluster = 20, burst_threshold = ceil(20*0.8) = 16
+        // current_active = 5 (< 16) → burst = max(4*3/2, 4+1) = 6
+        assert_eq!(compute_per_db_quota(4, 8, 20, 5), 6);
+    }
+
+    #[test]
+    fn test_per_db_quota_no_burst_at_capacity() {
+        // At or above 80% of cluster capacity → return base quota
+        // base = 4, max_cluster = 20, burst_threshold = 16, current_active = 16
+        assert_eq!(compute_per_db_quota(4, 8, 20, 16), 4);
+        assert_eq!(compute_per_db_quota(4, 8, 20, 20), 4);
+    }
+
+    #[test]
+    fn test_per_db_quota_minimum_one() {
+        // Even with per_db_quota = 0 and max_concurrent = 0, at least 1
+        assert_eq!(compute_per_db_quota(0, 0, 10, 0), 1);
+    }
+
+    #[test]
+    fn test_per_db_quota_small_base_still_bursts() {
+        // base = 1, max_cluster = 10, threshold = 8, active = 0
+        // burst = max(1*3/2=1, 1+1=2) = 2
+        assert_eq!(compute_per_db_quota(1, 4, 10, 0), 2);
+    }
 }

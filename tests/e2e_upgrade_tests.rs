@@ -1004,3 +1004,106 @@ async fn test_upgrade_schema_additions_from_sql() {
         eprintln!("Verified {checks} schema object(s) from upgrade SQL scripts");
     }
 }
+
+// ══════════════════════════════════════════════════════════════════════
+// TEST-8: v0.19.0-specific catalog integrity checks
+// ══════════════════════════════════════════════════════════════════════
+
+/// TEST-8a: Verify DB-3 pgt_schema_version table exists and is seeded.
+#[tokio::test]
+async fn test_upgrade_schema_version_table_present() {
+    let db = E2eDb::new().await.with_extension().await;
+
+    let exists: bool = db
+        .query_scalar(
+            "SELECT EXISTS( \
+                SELECT 1 FROM information_schema.tables \
+                WHERE table_schema = 'pgtrickle' AND table_name = 'pgt_schema_version' \
+            )",
+        )
+        .await;
+    assert!(
+        exists,
+        "pgt_schema_version table should exist after install"
+    );
+
+    // Should have at least one row (the initial version)
+    let count: i64 = db
+        .query_scalar("SELECT count(*)::bigint FROM pgtrickle.pgt_schema_version")
+        .await;
+    assert!(
+        count >= 1,
+        "pgt_schema_version should be seeded with initial version"
+    );
+}
+
+/// TEST-8b: Verify DB-2 FK ON DELETE CASCADE on pgt_refresh_history.pgt_id.
+/// Dropping a stream table should cascade-delete its refresh history.
+#[tokio::test]
+async fn test_upgrade_refresh_history_fk_cascade() {
+    let db = E2eDb::new().await.with_extension().await;
+
+    db.execute("CREATE TABLE fk_src (id INT PRIMARY KEY, v INT)")
+        .await;
+    db.execute("INSERT INTO fk_src VALUES (1, 10)").await;
+    db.create_st("fk_st", "SELECT id, v FROM fk_src", "1m", "FULL")
+        .await;
+
+    // Verify history exists
+    let has_history: bool = db
+        .query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM pgtrickle.pgt_refresh_history \
+             WHERE pgt_id = (SELECT pgt_id FROM pgtrickle.pgt_stream_tables \
+             WHERE pgt_name = 'fk_st'))",
+        )
+        .await;
+    assert!(has_history, "Refresh history should exist after create");
+
+    // Get pgt_id before drop
+    let pgt_id: i64 = db
+        .query_scalar("SELECT pgt_id FROM pgtrickle.pgt_stream_tables WHERE pgt_name = 'fk_st'")
+        .await;
+
+    // Drop the stream table
+    db.execute("SELECT pgtrickle.drop_stream_table('fk_st')")
+        .await;
+
+    // History should be cascade-deleted
+    let orphan_history: bool = db
+        .query_scalar(&format!(
+            "SELECT EXISTS(SELECT 1 FROM pgtrickle.pgt_refresh_history WHERE pgt_id = {pgt_id})"
+        ))
+        .await;
+    assert!(
+        !orphan_history,
+        "Refresh history should be cascade-deleted after drop_stream_table"
+    );
+}
+
+/// TEST-8c: Verify PERF-4 catalog indexes exist.
+#[tokio::test]
+async fn test_upgrade_v019_catalog_indexes_present() {
+    let db = E2eDb::new().await.with_extension().await;
+
+    // idx_pgt_relid on pgt_stream_tables(pgt_relid)
+    let relid_idx: bool = db
+        .query_scalar(
+            "SELECT EXISTS( \
+                SELECT 1 FROM pg_indexes \
+                WHERE schemaname = 'pgtrickle' AND indexname = 'idx_pgt_relid' \
+            )",
+        )
+        .await;
+    assert!(relid_idx, "idx_pgt_relid index should exist");
+
+    // idx_deps_pgt_id on pgt_dependencies(pgt_id)
+    let deps_idx: bool = db
+        .query_scalar(
+            "SELECT EXISTS( \
+                SELECT 1 FROM pg_indexes \
+                WHERE schemaname = 'pgtrickle' AND indexname = 'idx_deps_pgt_id' \
+            )",
+        )
+        .await;
+    assert!(deps_idx, "idx_deps_pgt_id index should exist");
+}
