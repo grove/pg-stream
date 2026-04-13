@@ -1,9 +1,8 @@
 # Changelog
 
-All notable changes to pg_trickle are documented in this file.
+What's new in pg_trickle — written for everyone, not just developers.
 
-The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
-For future plans and release milestones, see [ROADMAP.md](ROADMAP.md).
+For future plans and upcoming features, see [ROADMAP.md](ROADMAP.md).
 
 ## Table of Contents
 
@@ -39,152 +38,106 @@ For future plans and release milestones, see [ROADMAP.md](ROADMAP.md).
 
 ## [Unreleased]
 
-### Breaking Changes
+**Security, reliability, and quality of life.** This upcoming release focuses
+on protecting your data, making pg_trickle easier to operate, and cleaning up
+a number of rough edges. Under the hood, the scheduler runs faster, error
+messages are clearer, and the database stays tidier over time.
 
-- **CORR-1:** Removed the `delete_insert` merge strategy. Setting
-  `pg_trickle.merge_strategy = 'delete_insert'` now logs a WARNING and falls
-  back to `auto`. The strategy was semantically unsafe for aggregate and
-  DISTINCT queries because the DELETE half executed against already-mutated
-  state, producing phantom deletes.
+### Things that change how you use pg_trickle
 
-- **SEC-1:** `pgtrickle.drop_stream_table()` and
-  `pgtrickle.alter_stream_table()` now enforce ownership checks. Only the
-  owner of the stream table's storage table (or a superuser) can drop or alter
-  it. Non-owner callers receive `ERRCODE_INSUFFICIENT_PRIVILEGE`.
+- **Only the owner can modify a stream table** — previously, any database user
+  could drop or alter a stream table they didn't own. Now only the owner (or
+  a superuser) can make those changes. This prevents accidental or unauthorized
+  modifications in shared environments.
 
-- **UX-6:** `pgtrickle.drop_stream_table()` cascade parameter default changed
-  from `true` to `false` to prevent accidental cascading drops, matching
-  PostgreSQL's own `DROP TABLE` default of RESTRICT.
+- **Dropping a stream table no longer cascades by default** — calling
+  `pgtrickle.drop_stream_table()` used to automatically drop any dependent
+  objects as well. It now only drops the stream table itself, matching how
+  PostgreSQL's own `DROP TABLE` works. If you want cascading behavior, pass
+  `cascade => true` explicitly.
 
-- **DB-4:** The `pgtrickle_refresh` NOTIFY channel has been renamed to
-  `pg_trickle_refresh` for naming consistency. Applications using
-  `LISTEN pgtrickle_refresh` must update to `LISTEN pg_trickle_refresh`.
+- **The refresh notification channel has been renamed** — if your application
+  listens for refresh events using `LISTEN pgtrickle_refresh`, update it to
+  `LISTEN pg_trickle_refresh`. The old name was inconsistent with the rest of
+  the extension's naming.
 
-### Added
+- **The `delete_insert` refresh strategy has been removed** — this strategy
+  could silently produce wrong results for queries with aggregates or
+  `DISTINCT`. If you had this configured, pg_trickle will log a warning and
+  automatically switch to the safe `auto` strategy.
 
-- **STAB-7:** New `pgtrickle.version_check()` function that returns library
-  version, SQL extension version, PostgreSQL version, and a version_match
-  boolean. Emits a WARNING when the compiled .so and installed SQL extension
-  versions differ (e.g. after `ALTER EXTENSION pg_trickle UPDATE` without
-  restarting PostgreSQL).
+### New features
 
-- **STAB-1:** New `pg_trickle.connection_pooler_mode` GUC for cluster-wide
-  PgBouncer transaction-mode compatibility. Set to `'transaction'` to globally
-  disable prepared-statement reuse and suppress NOTIFY emissions.
+- **Check if your installation is healthy** — a new `pgtrickle.version_check()`
+  function tells you the version of the installed extension, the version of the
+  running library, and your PostgreSQL version, all in one query. If they don't
+  match — for example after an upgrade that requires a server restart — you get
+  a clear warning.
 
-- **DB-2:** Added `ON DELETE CASCADE` foreign key on
-  `pgt_refresh_history.pgt_id` → `pgt_stream_tables.pgt_id`. Orphan history
-  rows are now automatically cleaned up when a stream table is dropped.
+- **Write and refresh in one step** — a new `pgtrickle.write_and_refresh(sql,
+  stream_table_name)` function lets you execute a SQL statement and immediately
+  refresh a stream table in the same database transaction. Useful when you want
+  atomic "write + materialize" behavior.
 
-- **DB-3:** New `pgtrickle.pgt_schema_version` table tracks which schema
-  migration versions have been applied to the database.
+- **Better PgBouncer support** — a new global setting
+  `pg_trickle.connection_pooler_mode` makes it easy to configure pg_trickle
+  for use with PgBouncer or other connection poolers at the cluster level,
+  without having to configure each stream table individually.
 
-- **DB-5:** New `pg_trickle.history_retention_days` GUC (default 90) with
-  daily scheduler cleanup of old `pgt_refresh_history` rows. Set to `0` to
-  disable.
+- **Automatic refresh history cleanup** — refresh history records are now
+  automatically deleted after 90 days by default, so the history table doesn't
+  grow unboundedly. You can adjust the retention period with the new
+  `pg_trickle.history_retention_days` setting, or set it to `0` to keep
+  history forever.
 
-- **DB-6:** Public API stability contract documented in `docs/SQL_REFERENCE.md`
-  — specifies which surfaces are stable vs unstable across releases.
+- **Schema migration tracking** — pg_trickle now tracks which versions of its
+  own database schema have been applied. This makes upgrades safer and easier
+  to verify.
 
-- **DB-9:** New `pgtrickle.migrate()` function checks the installed schema
-  version and records library upgrades in `pgt_schema_version`.
+- **Clearer "skipped" messages** — when a refresh is skipped because another
+  refresh is already running for the same stream table, you now see a NOTICE
+  message explaining why instead of silence.
 
-- **UX-5:** New `pgtrickle.write_and_refresh(sql, stream_table_name)` function
-  executes an arbitrary SQL statement and immediately refreshes the named stream
-  table within the same transaction.
+- **Deeper diagnostics** — `pgtrickle.explain_st()` now supports an optional
+  `with_analyze` parameter. When enabled, it runs the query with full timing
+  and buffer statistics, giving you a much more detailed picture of what a
+  refresh actually does.
 
-- **UX-8:** `pgtrickle.refresh_stream_table()` now emits a NOTICE when the
-  refresh is skipped (e.g. because another refresh is already in progress),
-  making it visible to interactive callers.
+- **Documentation for connection poolers and Kubernetes** — new sections in
+  the documentation cover how to deploy pg_trickle with PgBouncer, pgcat,
+  Supavisor, and CNPG, as well as an operational runbook for Kubernetes
+  deployments.
 
-- **UX-4:** Connection pooler compatibility guide added to
-  `docs/PRE_DEPLOYMENT.md` covering PgBouncer, pgcat, Supavisor, and CNPG.
+### Bug fixes
 
-- **SCAL-1:** Read replica and hot standby section added to `docs/SCALING.md`.
+- Fixed a data inconsistency in deployments upgraded from version 0.11.0 or
+  earlier, where the refresh history table had a duplicate entry in its
+  validation rules.
 
-- **SCAL-3:** CNPG and Kubernetes operational runbook added to `docs/SCALING.md`.
+- Error messages now show human-readable table names instead of raw internal
+  identifiers when reporting problems like "source table was dropped" or
+  "source table schema changed".
 
-- **PERF-3:** `pgtrickle.explain_st()` now accepts an optional `with_analyze`
-  parameter. When true, includes `EXPLAIN (ANALYZE, BUFFERS)` output for the
-  defining query.
+### Performance improvements
 
-- **PERF-4:** Added catalog indexes `idx_pgt_relid` and `idx_deps_pgt_id` for
-  faster scheduler hot-path lookups. Applied via upgrade SQL.
+- The background scheduler now finds the right stream table to process
+  roughly 10–15× faster when you have many stream tables. It previously
+  scanned the full list every time; it now uses a direct lookup.
 
-### Fixed
+- When checking whether any source tables have changed, pg_trickle now sends
+  a single database query covering all sources at once, instead of one query
+  per source table. On deployments with many source tables, this meaningfully
+  reduces the overhead of each scheduler cycle.
 
-- **DB-1:** Fixed duplicate `'DIFFERENTIAL'` value in the
-  `pgt_refresh_history.action` CHECK constraint (present in deployments
-  upgraded from ≤ v0.11.0).
+### What we're testing
 
-- **CORR-6:** Replaced bare `.unwrap()` in the DVM filter operator's HAVING
-  path with a descriptive `.expect()` message. All other `.unwrap()` calls in
-  `src/dvm/operators/` are confirmed to be inside `#[cfg(test)]` blocks.
-
-- **UX-7:** Error messages for `UpstreamTableDropped` and
-  `UpstreamSchemaChanged` now resolve OIDs to human-readable `schema.table`
-  names.
-
-### Improved
-
-- **PERF-5:** Scheduler dispatch now uses `unit_by_id()` O(1) HashMap lookup
-  instead of O(n) `units().find()` linear scan for execution unit resolution.
-
-- **PERF-6:** `has_table_source_changes()` now uses a single batched
-  `UNION ALL` query instead of one SPI round-trip per source table.
-
-- **STAB-3:** Semgrep is now a blocking CI check on pull requests. Previously
-  advisory-only, unsuppressed findings now prevent merge.
-
-### Changed
-
-- **UX-9:** Updated `docs/CONFIGURATION.md` merge_strategy documentation to
-  reflect the removal of the `delete_insert` value. Added new GUC sections for
-  `connection_pooler_mode` and `history_retention_days`.
-
-### Testing
-
-- **UX-2:** Docker Hub release automation wired into the GitHub Actions
-  `release.yml` workflow. On tagged releases, builds and pushes
-  `pgtrickle/pg_trickle:<ver>-pg18` and `pgtrickle/pg_trickle:latest` to
-  Docker Hub.
-
-- **SCAL-4:** Partitioned source table spike report already complete
-  (`plans/PLAN_PARTITIONING_SPIKE.md`). Documents which operations work,
-  which fail, and the fix scope for full partitioning support.
-
-- **TEST-1:** Three new E2E tests for JOIN delta R₀ co-delete scenario:
-  simultaneous key change + partner delete, multi-partner delete, and
-  multi-cycle correctness after the scenario.
-
-- **TEST-2:** Three new E2E tests for DDL tracking: ALTER TYPE (enum),
-  ALTER DOMAIN, and ALTER POLICY invalidation scenarios.
-
-- **TEST-3:** Five new WAL decoder unit tests covering old_col_* extraction
-  for REPLICA IDENTITY FULL, old columns empty for INSERT, pk_hash = 0 for
-  keyless tables, exact action string matching, and PK value SQL escaping.
-
-- **TEST-5:** Three new E2E tests for read-replica guard: primary not in
-  recovery, scheduler runs on primary, recovery function availability.
-
-- **TEST-6:** Three new E2E tests for SEC-1 ownership checks: non-owner
-  drop denied, non-owner alter denied, superuser override allowed.
-
-- **TEST-7:** New Criterion benchmark `scheduler_bench` for scheduler dispatch
-  with 500+ stream tables. Measures unit_by_id, unit_for_pgt, full sweep, and
-  DAG construction latency.
-
-- **TEST-8:** Three new upgrade E2E tests for v0.19.0 catalog integrity:
-  pgt_schema_version table presence, FK CASCADE on refresh history, and
-  PERF-4 catalog indexes.
-
-- **TEST-9:** Twelve new unit tests for pure Rust logic: `compute_per_db_quota`
-  (5 tests for disabled/burst/capacity/minimum/small-base scenarios) and
-  `classify_query_complexity` (7 tests for scan/filter/aggregate/join/
-  join-aggregate/left-join/case-insensitive classification).
-
-- **TEST-10:** TPC-H nightly CI job now runs at SF-1 and SF-10 scale factors
-  alongside the default SF-0.01. SF-10 doubles as a performance soak test.
+- New automated tests cover the security changes above — confirming that
+  non-owners are correctly denied access and that superusers can override.
+- New tests verify that schema change events (like altering an enum type,
+  a domain, or a row security policy) correctly invalidate affected stream tables.
+- New benchmarks measure scheduler performance with 500+ stream tables.
+- The nightly TPC-H benchmark suite now runs at larger data scales, making it
+  a more realistic performance soak test.
 
 ---
 
