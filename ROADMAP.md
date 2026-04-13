@@ -4211,10 +4211,13 @@ Dependencies: None. Schema change: No.
 > scheduler dispatch overhead, and ships pg_trickle on standard package
 > registries for the first time. The JOIN delta R₀ fix for simultaneous
 > key-change + right-side delete is the highest-value correctness improvement
-> remaining before 1.0. Three to four weeks of focused work delivers measurable
-> correctness improvements, privilege enforcement, catalog index optimizations,
-> a PgBouncer transaction-mode compatibility fix, read-replica safety, and
-> PGXN/apt/rpm distribution.
+> remaining before 1.0. CDC ordering guarantees, parallel worker crash
+> recovery, delta branch pruning for zero-change sources, and an index-aware
+> MERGE path round out a release that strengthens every layer of the stack.
+> Four to five weeks of focused work delivers measurable correctness
+> improvements, privilege enforcement, catalog index optimizations, a PgBouncer
+> transaction-mode compatibility fix, read-replica safety, and PGXN/apt/rpm
+> distribution.
 
 ### Correctness
 
@@ -4226,6 +4229,8 @@ Dependencies: None. Schema change: No.
 | CORR-4 | Track `ALTER POLICY` DDL events for RLS source tables | S | P1 |
 | CORR-5 | Fix keyless content-hash collision on identical-content rows | S | P1 |
 | CORR-6 | Harden guarded `.unwrap()` calls in DVM operators | XS | P2 |
+| CORR-7 | TRUNCATE + INSERT CDC ordering guarantee | S | P1 |
+| CORR-8 | NULL join-key delta handling for INNER/OUTER joins | S | P1 |
 
 **CORR-1 — Remove unsafe `delete_insert` merge strategy**
 
@@ -4318,11 +4323,42 @@ Verify: `grep -rn '\.unwrap()' src/dvm/operators/` returns zero hits outside
 test modules. All existing unit tests pass.
 Dependencies: None. Schema change: No.
 
+**CORR-7 — TRUNCATE + INSERT CDC ordering guarantee**
+
+> **In plain terms:** When a `TRUNCATE` and subsequent `INSERT` occur within
+> the same transaction on a source table, the change buffer must preserve their
+> ordering. If the refresh engine processes the INSERT before the TRUNCATE, the
+> stream table loses all rows including the newly inserted ones. The trigger-
+> based CDC path records operations in `ctid` order within a statement, but
+> cross-statement ordering within a single transaction relies on the change
+> buffer’s `op_seq` column. Verify that `op_seq` is monotonically increasing
+> across statements and that the refresh engine applies TRUNCATE before INSERT.
+
+Verify: E2E test: `BEGIN; TRUNCATE src; INSERT INTO src VALUES (1); COMMIT;`
+followed by refresh — stream table contains exactly 1 row.
+Dependencies: None. Schema change: No.
+
+**CORR-8 — NULL join-key delta handling for INNER/OUTER joins**
+
+> **In plain terms:** When a join key column contains NULL, the INNER JOIN
+> delta should produce zero matching rows (NULL ≠ NULL in SQL), and LEFT/FULL
+> OUTER JOIN deltas should produce NULL-extended rows. The v0.18.0 NULL GROUP
+> BY fix addressed aggregate grouping but the JOIN delta path’s NULL-key
+> behavior is exercised only indirectly by existing tests. Add explicit
+> coverage: INSERT a row with NULL join key, UPDATE it to a non-NULL key,
+> DELETE it — verify each delta cycle produces correct results under both
+> INNER and LEFT JOIN.
+
+Verify: E2E tests with NULL join keys for INNER JOIN, LEFT JOIN, and FULL
+JOIN — all delta cycles produce correct results matching a full recompute.
+Dependencies: None. Schema change: No.
+
 ### Security
 
 | ID | Title | Effort | Priority |
 |----|-------|--------|----------|
 | SEC-1 | Add ownership checks to `drop_stream_table` / `alter_stream_table` | S | P0 |
+| SEC-2 | SQL injection audit for dynamic refresh SQL | XS | P1 |
 
 **SEC-1 — Add ownership checks to `drop_stream_table` / `alter_stream_table`**
 
@@ -4341,6 +4377,21 @@ receives `ERROR: must be owner of stream table "other_users_st"`. Superuser
 can still drop any stream table. E2E test with two roles confirms.
 Dependencies: None. Schema change: No.
 
+**SEC-2 — SQL injection audit for dynamic refresh SQL**
+
+> **In plain terms:** The refresh engine builds SQL strings dynamically using
+> `format!()` with user-provided table names, column names, and schema names.
+> While pgrx’s `quote_identifier()` and `quote_literal()` are used in most
+> places, a focused audit of every `format!()` call site in `refresh.rs`,
+> `diff.rs`, and the `operators/` directory ensures no path allows unquoted
+> user input into executable SQL. This is a review-only item — fix any
+> findings immediately as P0.
+
+Verify: Audit checklist signed off — every `format!()` that incorporates
+catalog-derived names uses `quote_identifier()` or parameterised SPI queries.
+Zero unquoted interpolations outside test code.
+Dependencies: None. Schema change: No.
+
 ### Stability
 
 | ID | Title | Effort | Priority |
@@ -4350,6 +4401,8 @@ Dependencies: None. Schema change: No.
 | STAB-3 | Elevate Semgrep to blocking in CI | XS | P1 |
 | STAB-4 | `auto_backoff` GUC — double interval after 3 falling-behind cycles | S | P2 |
 | STAB-5 | Harden `unwrap()` in scheduler hot path | XS | P2 |
+| STAB-6 | Parallel worker crash recovery sweep | M | P1 |
+| STAB-7 | Extension version mismatch detection at load | XS | P2 |
 
 **STAB-1 — PgBouncer transaction-mode compatibility guard**
 
@@ -4418,6 +4471,39 @@ Verify: `grep -n '\.unwrap()' src/scheduler.rs` returns zero hits outside
 test-only code. All scheduler integration tests pass.
 Dependencies: PERF-5 (HashMap replaces `.find().unwrap()` pattern). Schema change: No.
 
+**STAB-6 — Parallel worker crash recovery sweep**
+
+> **In plain terms:** If a background worker is killed (OOM, SIGKILL) or
+> crashes mid-refresh, it may leave behind: (a) orphaned advisory locks that
+> block the next refresh of that stream table, (b) partially consumed rows in
+> the change buffer (consumed but not committed), or (c) incomplete catalog
+> state. Add a startup recovery sweep to the scheduler: on launch, scan for
+> advisory locks held by PIDs that no longer exist (`pg_stat_activity`), roll
+> back any `xact_status = 'in progress'` from dead backends, and reset
+> stream tables stuck in `REFRESHING` state with no active backend.
+
+Verify: Integration test: kill a worker PID mid-refresh via
+`pg_terminate_backend()`; restart the scheduler; the affected stream table
+recovers without manual intervention within one scheduler cycle.
+Dependencies: None. Schema change: No.
+
+**STAB-7 — Extension version mismatch detection at load**
+
+> **In plain terms:** Running `ALTER EXTENSION pg_trickle UPDATE` updates
+> the SQL objects but the shared library (`pg_trickle.so`) remains loaded from
+> the previous version until the server is restarted. This mismatch can cause
+> subtle failures (wrong function signatures, missing struct fields). Add a
+> version check in `_PG_init()` that compares the compiled-in version string
+> against the SQL-level `extversion` from `pg_extension`. Emit a WARNING if
+> they differ and refuse to start background workers until the server is
+> reloaded.
+
+Verify: After `ALTER EXTENSION pg_trickle UPDATE` without server restart,
+the extension log shows `WARNING: pg_trickle shared library version (X)
+does not match installed extension version (Y) — restart PostgreSQL`.
+Background workers do not start.
+Dependencies: None. Schema change: No.
+
 ### Performance
 
 | ID | Title | Effort | Priority |
@@ -4428,6 +4514,8 @@ Dependencies: PERF-5 (HashMap replaces `.find().unwrap()` pattern). Schema chang
 | PERF-4 | Add catalog indexes on `pgt_relid` and `pgt_dependencies(pgt_id)` | XS | P1 |
 | PERF-5 | Eliminate O(n²) `units().find()` in scheduler dispatch | S | P1 |
 | PERF-6 | Batch `has_table_source_changes()` into single query | S | P2 |
+| PERF-7 | Delta branch pruning for zero-change sources | S | P1 |
+| PERF-8 | Index-aware MERGE path selection | S | P2 |
 
 **PERF-1 — Fix WAL decoder: `old_*` columns always NULL on UPDATE**
 
@@ -4508,12 +4596,47 @@ Verify: SPI call count for `has_table_source_changes()` is 1 regardless of
 source table count. Scheduler integration tests pass.
 Dependencies: None. Schema change: No.
 
+**PERF-7 — Delta branch pruning for zero-change sources**
+
+> **In plain terms:** In a multi-source JOIN stream table
+> (`SELECT * FROM a JOIN b ON ...`), the delta has two arms: Δ_a ⋈ b and
+> a ⋈ Δ_b. If only source `a` has changes, the second arm (a ⋈ Δ_b) reads
+> an empty change buffer and produces zero rows — but the engine still
+> executes the full SQL including the join against `a`. Short-circuit: check
+> `has_table_source_changes()` per source before building each delta arm.
+> Skip arms where the source has zero changes. For a 5-source star join with
+> only 1 changing source, this eliminates 4 of 5 delta arms entirely.
+
+Verify: Benchmark with 5-source JOIN where only 1 source changes; observe
+4 of 5 delta arms skipped in `explain_st()` output. Refresh latency drops
+proportionally.
+Dependencies: PERF-6 (batched source-change check). Schema change: No.
+
+**PERF-8 — Index-aware MERGE path selection**
+
+> **In plain terms:** The MERGE statement used during differential refresh
+> joins the delta against the stream table on `__pgt_row_id`. If the stream
+> table has a covering index on the row ID column (which pg_trickle creates
+> by default), the planner should use an index nested-loop join. However,
+> PostgreSQL’s cost model sometimes prefers a hash join for large deltas. Add
+> a targeted `SET LOCAL enable_hashjoin = off` within the refresh transaction
+> when the delta cardinality is below a configurable threshold
+> (`pg_trickle.merge_index_threshold`, default 10,000 rows) to steer the
+> planner toward the index path for small deltas.
+
+Verify: `EXPLAIN` of the MERGE with delta < 10,000 rows shows Index Nested
+Loop instead of Hash Join. Benchmark shows improved P99 latency for small
+deltas on large stream tables.
+Dependencies: None. Schema change: No.
+
 ### Scalability
 
 | ID | Title | Effort | Priority |
 |----|-------|--------|----------|
 | SCAL-1 | Read replica compatibility section in `docs/SCALING.md` | S | P1 |
 | SCAL-2 | Multi-database GUC stub (`pg_trickle.database_list`) | S | P2 |
+| SCAL-3 | CNPG operational runbook in `docs/SCALING.md` | S | P2 |
+| SCAL-4 | Partitioned source table impact assessment | M | P2 |
 
 **SCAL-1 — Read replica compatibility documentation**
 
@@ -4539,6 +4662,35 @@ Verify: `SHOW pg_trickle.database_list` returns `''`. Setting a non-empty
 value emits a WARNING: "pg_trickle.database_list is not yet implemented."
 Dependencies: None. Schema change: No.
 
+**SCAL-3 — CNPG operational runbook in `docs/SCALING.md`**
+
+> **In plain terms:** The CNPG (CloudNativePG) smoke test in CI validates that
+> pg_trickle loads and functions on a CNPG-managed cluster, but the operational
+> patterns are not documented. Add a §CNPG / Kubernetes section to
+> `docs/SCALING.md` covering: `cluster-example.yaml` annotations for loading
+> the extension, pod restart behavior when the background worker crashes, WAL
+> volume sizing for CDC, recommended `shared_preload_libraries` configuration,
+> and health check integration with Kubernetes liveness/readiness probes.
+
+Verify: `docs/SCALING.md` has a CNPG/Kubernetes section. Content reviewed
+against actual CNPG deployment behavior.
+Dependencies: None. Schema change: No.
+
+**SCAL-4 — Partitioned source table impact assessment**
+
+> **In plain terms:** Stream tables backed by partitioned source tables
+> (inheritance or declarative partitioning) are untested and likely broken:
+> CDC triggers may be installed only on the parent, change buffers may miss
+> partition-routed inserts, and `ALTER TABLE ... ATTACH/DETACH PARTITION` DDL
+> events are unhandled. This item is a time-boxed spike (2 days): create a
+> partitioned source, attach a stream table, run INSERT/UPDATE/DELETE through
+> various partitions, and document what works, what breaks, and what the fix
+> scope is. Output: a `plans/PLAN_PARTITIONING_SPIKE.md` update.
+
+Verify: Spike report documents concrete findings. At minimum: which operations
+work, which fail, and a rough estimate for full partitioning support.
+Dependencies: None. Schema change: No.
+
 ### Ease of Use
 
 | ID | Title | Effort | Priority |
@@ -4552,6 +4704,8 @@ Dependencies: None. Schema change: No.
 | UX-7 | Resolve OIDs to table names in error messages | S | P1 |
 | UX-8 | Emit NOTICE when `refresh_stream_table` is skipped | XS | P1 |
 | UX-9 | Fix CONFIGURATION.md TOC gaps for 3 undocumented GUCs | XS | P2 |
+| UX-10 | TUI per-table refresh latency sparkline | S | P2 |
+| UX-11 | `pgtrickle.version()` diagnostic function | XS | P2 |
 
 **UX-1 — PGXN `release_status` → `"stable"`**
 
@@ -4669,6 +4823,35 @@ Verify: All `### pg_trickle.*` headings in CONFIGURATION.md have a
 corresponding TOC link. No duplicate entries.
 Dependencies: None. Schema change: No.
 
+**UX-10 — TUI per-table refresh latency sparkline**
+
+> **In plain terms:** The `pgtrickle` TUI dashboard shows each stream table’s
+> current status and last refresh duration, but operators cannot see at a
+> glance whether latency is trending up or down. Add a sparkline column (last
+> 20 refresh latencies, ~80 chars wide) to the stream table list view. The
+> data is already available in `pgt_refresh_history`; the TUI polls it on each
+> tick. This makes performance degradation and recovery immediately visible
+> without switching to Grafana.
+
+Verify: TUI stream table view shows a sparkline column. Sparkline updates
+after each refresh cycle. Values match `pgt_refresh_history` entries.
+Dependencies: None. Schema change: No.
+
+**UX-11 — `pgtrickle.version()` diagnostic function**
+
+> **In plain terms:** A `SELECT pgtrickle.version()` function that returns the
+> installed extension version, the shared library version, and the target
+> PostgreSQL major version as a composite record. This is standard practice
+> for PostgreSQL extensions (cf. `postgis_full_version()`) and simplifies
+> remote diagnostics — support can ask a user to run one query instead of
+> checking `pg_available_extensions`, `pg_config`, and `SHOW server_version`
+> separately.
+
+Verify: `SELECT * FROM pgtrickle.version()` returns three fields:
+`extension_version`, `library_version`, `pg_major_version`. Values match the
+installed state.
+Dependencies: None. Schema change: No.
+
 ### Test Coverage
 
 | ID | Title | Effort | Priority |
@@ -4681,6 +4864,8 @@ Dependencies: None. Schema change: No.
 | TEST-6 | Ownership-check privilege tests for SEC-1 | S | P1 |
 | TEST-7 | Scheduler dispatch benchmark (500+ STs) | S | P1 |
 | TEST-8 | Upgrade E2E tests (`e2e_migration_tests.rs`) | M | P1 |
+| TEST-9 | Extract unit-testable logic from E2E-only paths | M | P1 |
+| TEST-10 | TPC-H scale factor coverage (SF-1, SF-10) | S | P2 |
 
 **TEST-1 — E2E tests for CORR-2 (JOIN delta R₀ fix)**
 
@@ -4769,6 +4954,36 @@ Verify: `tests/e2e_migration_tests.rs` tests: fresh install, upgrade from
 previous version with populated stream tables, catalog integrity check,
 post-upgrade refresh cycle. All pass.
 Dependencies: DB-1, DB-2, DB-3. Schema change: No (tests existing schema).
+
+**TEST-9 — Extract unit-testable logic from E2E-only paths**
+
+> **In plain terms:** Several core functions in `refresh.rs` and `scheduler.rs`
+> are currently exercised only through end-to-end tests that require a
+> PostgreSQL container. Extracting pure logic from SPI-dependent code and
+> adding direct unit tests makes regressions detectable in seconds instead of
+> minutes. Target: identify 5+ functions (refresh strategy selection, delta
+> cardinality estimation, backoff calculation, topo-sort cycle detection, merge
+> strategy costing) that operate on plain Rust data structures and can be
+> tested with `#[cfg(test)]` modules.
+
+Verify: 5+ new `#[cfg(test)]` unit tests in `src/refresh.rs` or
+`src/scheduler.rs`. `just test-unit` runs them in < 5 seconds.
+Dependencies: None. Schema change: No.
+
+**TEST-10 — TPC-H scale factor coverage (SF-1, SF-10)**
+
+> **In plain terms:** The v0.18.0 TPC-H regression guard runs all 22 queries
+> at a single scale factor. Real-world correctness bugs sometimes only
+> manifest at higher cardinalities where hash collisions, sort spill, and
+> parallel execution change the code path. Add nightly runs at SF-1 (6M rows)
+> and SF-10 (60M rows) alongside the existing default. The SF-10 run doubles
+> as a performance soak test — flag any query whose refresh time regresses by
+> more than 20% compared to the previous nightly.
+
+Verify: CI nightly job runs TPC-H at SF-1 and SF-10. All 22 queries produce
+correct results at both scales. SF-10 timing baseline saved for regression
+detection.
+Dependencies: None. Schema change: No.
 
 ### Schema Stability
 
@@ -4893,7 +5108,7 @@ Verify: `SELECT pgtrickle.migrate()` completes without error on a fresh
 install and after a version upgrade. Returns a summary of migrated objects.
 Dependencies: DB-3 (uses schema version to determine needed migrations). Schema change: No.
 
-> **v0.19.0 total: ~3–4 weeks**
+> **v0.19.0 total: ~4–5 weeks**
 
 **Exit criteria:**
 - [ ] CORR-1: `delete_insert` strategy removed; `ERROR` raised on old GUC value
@@ -4938,6 +5153,19 @@ Dependencies: DB-3 (uses schema version to determine needed migrations). Schema 
 - [ ] DB-6: `docs/SQL_REFERENCE.md` stability contract section published
 - [ ] DB-7: `sql/pg_trickle--0.18.0--0.19.0.sql` applies DB-1 through DB-4 changes
 - [ ] DB-8: `drop_stream_table` leaves no orphan rows in `pgt_change_tracking`
+- [ ] CORR-7: TRUNCATE + INSERT in same transaction — stream table correct after refresh
+- [ ] CORR-8: NULL join-key delta correct for INNER, LEFT, and FULL JOIN
+- [ ] SEC-2: SQL injection audit complete — zero unquoted interpolations in refresh SQL
+- [ ] STAB-6: Worker crash recovery sweep cleans orphaned locks and stuck REFRESHING state
+- [ ] STAB-7: Version mismatch WARNING emitted after `ALTER EXTENSION` without restart
+- [ ] PERF-7: Delta branch pruning skips zero-change source arms in multi-JOIN
+- [ ] PERF-8: Index-aware MERGE uses nested loop for small deltas on indexed tables
+- [ ] SCAL-3: `docs/SCALING.md` CNPG/Kubernetes section published
+- [ ] SCAL-4: Partitioning spike report written with concrete findings
+- [ ] UX-10: TUI sparkline column visible for refresh latency trend
+- [ ] UX-11: `pgtrickle.version()` returns extension, library, and PG versions
+- [ ] TEST-9: 5+ unit tests extracted from E2E-only refresh/scheduler logic
+- [ ] TEST-10: TPC-H nightly runs at SF-1 and SF-10 with correct results
 - [ ] Extension upgrade path tested (`0.18.0 → 0.19.0`)
 - [ ] `just check-version-sync` passes
 
@@ -4989,6 +5217,21 @@ Dependencies: DB-3 (uses schema version to determine needed migrations). Schema 
 10. **DB-2 adds a CASCADE FK.** If any external tooling holds open
     transactions when a stream table is dropped, the cascade may fail under
     lock. Test in upgrade E2E (TEST-8) before shipping.
+
+11. **STAB-6 touches the scheduler startup path.** A bug in the recovery
+    sweep could incorrectly reset a stream table that is still being
+    refreshed on a live backend. The sweep must verify that the PID is truly
+    dead via `pg_stat_activity` before taking corrective action.
+
+12. **PERF-8 disables `hashjoin` within the refresh transaction.** If the
+    threshold is set too high, large deltas will use a slower nested-loop
+    path. Make the `merge_index_threshold` GUC tunable and document clearly
+    that it only affects the MERGE step, not the delta SQL.
+
+13. **SCAL-4 (partitioning spike) may uncover scope too large for v0.19.0.**
+    If the spike reveals that full partitioning support requires CDC
+    architectural changes, defer the implementation to a later release and
+    document findings in the spike report.
 
 ---
 
@@ -7016,7 +7259,7 @@ to keep the pre-1.0 milestones focused on performance and correctness.
 | v0.16.0 — Performance & Refresh Optimization | ~1–2wk MERGE alts + ~4–6wk aggregate fast-path + ~1–2wk append-only + ~2–3wk predicate pushdown + ~2–3wk template cache + ~2–3wk buffer compaction + ~3–6wk test coverage + ~1–2wk bench CI + ~2–3d auto-indexing + ~12–22h quick wins | — | |
 | v0.17.0 — Query Intelligence & Stability | ~2–3wk cost-based strategy + ~3–4wk columnar tracking + ~32–48h TIVM Phase 4 + ~1–2d ROWS FROM + ~2–3wk SQLancer + ~2–3wk incremental DAG + ~4–8h unsafe reduction + ~1–2wk api.rs mod + ~2–3d migration guide + ~3–5d runbook + ~2–3d playground + ~2–3d doc polish | — | |
 | v0.18.0 — Hardening & Delta Performance | ~70–100h | — | |
-| v0.19.0 — Production Gap Closure & Distribution | ~3–4 weeks | — | |
+| v0.19.0 — Production Gap Closure & Distribution | ~4–5 weeks | — | |
 | v0.20.0 — PostgreSQL 17 Support | ~2–4d | — | |
 | v0.21.0 — PGlite Proof of Concept | ~2–3wk (plugin) + ~1–2d (version bump) | — | |
 | v0.22.0 — Core Extraction (`pg_trickle_core`) | ~3–4wk (extraction) + ~1–2wk (abstraction + testing) | — | |
