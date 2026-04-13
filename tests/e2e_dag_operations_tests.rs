@@ -338,8 +338,8 @@ async fn test_drop_middle_layer_cascades() {
     setup_ops_pipeline(&db).await;
     assert_ops_pipeline_correct(&db).await;
 
-    // Drop L2 — L3's underlying storage depends on L2's table
-    db.drop_st("ops_l2").await;
+    // Drop L2 with cascade — L3 depends on L2 so cascade is required
+    db.drop_st_cascade("ops_l2").await;
 
     // L2 should be gone from catalog
     let l2_exists: bool = db

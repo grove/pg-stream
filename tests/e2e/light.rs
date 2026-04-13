@@ -728,6 +728,14 @@ impl E2eDb {
             .await;
     }
 
+    /// Drop a stream table with cascade.
+    pub async fn drop_st_cascade(&self, name: &str) {
+        self.execute(&format!(
+            "SELECT pgtrickle.drop_stream_table('{name}', cascade => true)"
+        ))
+        .await;
+    }
+
     /// Alter a stream table via `pgtrickle.alter_stream_table()`.
     pub async fn alter_st(&self, name: &str, args: &str) {
         self.execute(&format!(
