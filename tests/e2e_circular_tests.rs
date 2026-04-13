@@ -300,7 +300,12 @@ async fn test_circular_nonmonotone_cycle_rejected() {
         .await;
 
     // This should NOT create a cycle since cyc_nm_a doesn't reference back to
-    // cyc_nm_b in a cycle. Let's set up a proper cycle scenario:
+    // cyc_nm_b in a cycle. Let's set up a proper cycle scenario.
+    // cyc_nm_a (just created above) references cyc_nm_b, so drop A first to
+    // avoid the "has dependent stream tables" error when dropping B.
+    let _ = db
+        .try_execute("SELECT pgtrickle.drop_stream_table('cyc_nm_a')")
+        .await;
     db.execute("SELECT pgtrickle.drop_stream_table('cyc_nm_b')")
         .await;
 
@@ -591,10 +596,16 @@ async fn test_circular_drop_member_clears_scc_id() {
         .await;
     assert!(scc_a.is_some(), "cyc_drop_a should have scc_id before drop");
 
-    // Drop one member — CASCADE will drop cyc_drop_a since it depends on
-    // cyc_drop_b. So drop B (which depends on A), breaking the cycle.
-    // Actually, drop_stream_table cascades to dependents. Let's check:
-    // B depends on A (B's query references A). Dropping B removes the cycle.
+    // To drop B we must first remove A's back-reference to B.
+    // Both A and B reference each other (true cycle), so dropping B directly
+    // fails because A depends on B.  Break the A→B direction first via ALTER,
+    // then drop B (A no longer depends on it; only B still depends on A, which
+    // is perfectly fine since we are dropping B, not A).
+    db.execute(
+        "SELECT pgtrickle.alter_stream_table('cyc_drop_a', \
+         query => $$SELECT id, val FROM cyc_drop_src$$)",
+    )
+    .await;
     db.execute("SELECT pgtrickle.drop_stream_table('cyc_drop_b')")
         .await;
 
