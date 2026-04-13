@@ -1,8 +1,8 @@
 # pg_trickle — Project Roadmap
 
-> **Last updated:** 2026-04-12
-> **Latest release:** 0.18.0 (2026-04-12)
-> **Current milestone:** v0.19.0 — Production Gap Closure & Distribution
+> **Last updated:** 2026-04-13
+> **Latest release:** 0.19.0 (2026-04-13)
+> **Current milestone:** v0.20.0 — PostgreSQL 17 Support
 
 For a concise description of what pg_trickle is and why it exists, read
 [ESSENCE.md](ESSENCE.md) — it explains the core problem (full `REFRESH
@@ -81,7 +81,7 @@ from the v0.1.x series to 1.0 and beyond.
 | v0.16.0 | Performance & refresh optimization | ✅ Released |
 | v0.17.0 | Query intelligence & stability | ✅ Released |
 | **v0.18.0** | **Hardening & delta performance** | **✅ Released** |
-| v0.19.0 | Production gap closure & distribution | Planned |
+| **v0.19.0** | **Production gap closure & distribution** | **✅ Released** |
 | v0.20.0 | PostgreSQL 17 support | Planned |
 | v0.21.0 | PGlite proof of concept | Planned |
 | v0.22.0 | Core extraction (`pg_trickle_core`) | Planned |
@@ -4202,6 +4202,8 @@ Dependencies: None. Schema change: No.
 
 ## v0.19.0 — Production Gap Closure & Distribution
 
+**Status: Released (2026-04-13).**
+
 > **Release Theme**
 > This release closes the most impactful correctness, security, stability, and
 > performance gaps identified in the Phase 7 deep-dive and subsequent audits
@@ -4218,6 +4220,9 @@ Dependencies: None. Schema change: No.
 > improvements, privilege enforcement, catalog index optimizations, a PgBouncer
 > transaction-mode compatibility fix, read-replica safety, and PGXN/apt/rpm
 > distribution.
+
+<details>
+<summary>Completed items (click to expand)</summary>
 
 ### Correctness
 
@@ -5232,6 +5237,8 @@ Dependencies: DB-3 (uses schema version to determine needed migrations). Schema 
     If the spike reveals that full partitioning support requires CDC
     architectural changes, defer the implementation to a later release and
     document findings in the spike report.
+
+</details>
 
 ---
 

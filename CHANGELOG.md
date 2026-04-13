@@ -8,6 +8,7 @@ For future plans and upcoming features, see [ROADMAP.md](ROADMAP.md).
 
 <!-- TOC start -->
 - [Unreleased](#unreleased)
+- [0.19.0 — 2026-04-13](#0190--2026-04-13)
 - [0.18.0 — 2026-04-12](#0180--2026-04-12)
 - [0.17.0 — 2026-04-08](#0170--2026-04-08)
 - [0.16.0 — 2026-04-06](#0160--2026-04-06)
@@ -37,6 +38,12 @@ For future plans and upcoming features, see [ROADMAP.md](ROADMAP.md).
 ---
 
 ## [Unreleased]
+
+<!-- No unreleased changes yet. -->
+
+---
+
+## [0.19.0] — 2026-04-13
 
 **Security, reliability, and quality of life.** This upcoming release focuses
 on protecting your data, making pg_trickle easier to operate, and cleaning up
