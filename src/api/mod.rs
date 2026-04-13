@@ -2054,65 +2054,57 @@ fn migrate_aux_columns(
 
     // Transition: __pgt_count
     if !old_needs_pgt_count && new_storage_needs_pgt_count && !new_needs_dual_count {
-        Spi::run(&format!(
-            // nosemgrep: rust.spi.run.dynamic-format — ALTER TABLE DDL cannot be parameterized; quoted_table is a PostgreSQL-quoted identifier.
+        let sql = format!(
             "ALTER TABLE {} ADD COLUMN IF NOT EXISTS __pgt_count BIGINT NOT NULL DEFAULT 0",
             quoted_table
-        ))
-        .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
+        );
+        Spi::run(&sql).map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
     } else if old_needs_pgt_count && !new_storage_needs_pgt_count && !new_needs_dual_count {
-        Spi::run(&format!(
-            // nosemgrep: rust.spi.run.dynamic-format — ALTER TABLE DDL cannot be parameterized; quoted_table is a PostgreSQL-quoted identifier.
+        let sql = format!(
             "ALTER TABLE {} DROP COLUMN IF EXISTS __pgt_count",
             quoted_table
-        ))
-        .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
+        );
+        Spi::run(&sql).map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
     }
 
     // Transition: __pgt_count_l / __pgt_count_r
     if !old_needs_dual_count && new_needs_dual_count {
-        Spi::run(&format!(
-            // nosemgrep: rust.spi.run.dynamic-format — ALTER TABLE DDL cannot be parameterized; quoted_table is a PostgreSQL-quoted identifier.
+        let sql = format!(
             "ALTER TABLE {} ADD COLUMN IF NOT EXISTS __pgt_count_l BIGINT NOT NULL DEFAULT 0",
             quoted_table
-        ))
-        .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
-        Spi::run(&format!(
-            // nosemgrep: rust.spi.run.dynamic-format — ALTER TABLE DDL cannot be parameterized; quoted_table is a PostgreSQL-quoted identifier.
+        );
+        Spi::run(&sql).map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
+        let sql = format!(
             "ALTER TABLE {} ADD COLUMN IF NOT EXISTS __pgt_count_r BIGINT NOT NULL DEFAULT 0",
             quoted_table
-        ))
-        .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
+        );
+        Spi::run(&sql).map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
         // Drop __pgt_count if it was there and no longer needed
         if old_needs_pgt_count {
-            Spi::run(&format!(
-                // nosemgrep: rust.spi.run.dynamic-format — ALTER TABLE DDL cannot be parameterized; quoted_table is a PostgreSQL-quoted identifier.
+            let sql = format!(
                 "ALTER TABLE {} DROP COLUMN IF EXISTS __pgt_count",
                 quoted_table
-            ))
-            .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
+            );
+            Spi::run(&sql).map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
         }
     } else if old_needs_dual_count && !new_needs_dual_count {
-        Spi::run(&format!(
-            // nosemgrep: rust.spi.run.dynamic-format — ALTER TABLE DDL cannot be parameterized; quoted_table is a PostgreSQL-quoted identifier.
+        let sql = format!(
             "ALTER TABLE {} DROP COLUMN IF EXISTS __pgt_count_l",
             quoted_table
-        ))
-        .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
-        Spi::run(&format!(
-            // nosemgrep: rust.spi.run.dynamic-format — ALTER TABLE DDL cannot be parameterized; quoted_table is a PostgreSQL-quoted identifier.
+        );
+        Spi::run(&sql).map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
+        let sql = format!(
             "ALTER TABLE {} DROP COLUMN IF EXISTS __pgt_count_r",
             quoted_table
-        ))
-        .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
+        );
+        Spi::run(&sql).map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
         // Add __pgt_count if newly needed
         if new_storage_needs_pgt_count {
-            Spi::run(&format!(
-                // nosemgrep: rust.spi.run.dynamic-format — ALTER TABLE DDL cannot be parameterized; quoted_table is a PostgreSQL-quoted identifier.
+            let sql = format!(
                 "ALTER TABLE {} ADD COLUMN IF NOT EXISTS __pgt_count BIGINT NOT NULL DEFAULT 0",
                 quoted_table
-            ))
-            .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
+            );
+            Spi::run(&sql).map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
         }
     }
 
@@ -2128,35 +2120,35 @@ fn migrate_aux_columns(
     // Add new AVG aux columns
     for (sum_col, count_col, _) in new_avg_aux {
         if !old_avg_names.contains(&(sum_col.as_str(), count_col.as_str())) {
-            Spi::run(&format!(
+            let sql = format!(
                 "ALTER TABLE {} ADD COLUMN IF NOT EXISTS {} NUMERIC NOT NULL DEFAULT 0",
                 quoted_table,
                 quote_identifier(sum_col),
-            ))
-            .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
-            Spi::run(&format!(
+            );
+            Spi::run(&sql).map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
+            let sql = format!(
                 "ALTER TABLE {} ADD COLUMN IF NOT EXISTS {} BIGINT NOT NULL DEFAULT 0",
                 quoted_table,
                 quote_identifier(count_col),
-            ))
-            .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
+            );
+            Spi::run(&sql).map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
         }
     }
     // Drop removed AVG aux columns
     for (sum_col, count_col, _) in old_avg_aux {
         if !new_avg_names.contains(&(sum_col.as_str(), count_col.as_str())) {
-            Spi::run(&format!(
+            let sql = format!(
                 "ALTER TABLE {} DROP COLUMN IF EXISTS {}",
                 quoted_table,
                 quote_identifier(sum_col),
-            ))
-            .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
-            Spi::run(&format!(
+            );
+            Spi::run(&sql).map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
+            let sql = format!(
                 "ALTER TABLE {} DROP COLUMN IF EXISTS {}",
                 quoted_table,
                 quote_identifier(count_col),
-            ))
-            .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
+            );
+            Spi::run(&sql).map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
         }
     }
 
@@ -2168,23 +2160,23 @@ fn migrate_aux_columns(
     // Add new sum2 aux columns
     for (col_name, _) in new_sum2_aux {
         if !old_sum2_names.contains(col_name.as_str()) {
-            Spi::run(&format!(
+            let sql = format!(
                 "ALTER TABLE {} ADD COLUMN IF NOT EXISTS {} NUMERIC NOT NULL DEFAULT 0",
                 quoted_table,
                 quote_identifier(col_name),
-            ))
-            .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
+            );
+            Spi::run(&sql).map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
         }
     }
     // Drop removed sum2 aux columns
     for (col_name, _) in old_sum2_aux {
         if !new_sum2_names.contains(col_name.as_str()) {
-            Spi::run(&format!(
+            let sql = format!(
                 "ALTER TABLE {} DROP COLUMN IF EXISTS {}",
                 quoted_table,
                 quote_identifier(col_name),
-            ))
-            .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
+            );
+            Spi::run(&sql).map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
         }
     }
 
@@ -2197,23 +2189,23 @@ fn migrate_aux_columns(
     // Add new covar aux columns
     for (col_name, _) in new_covar_aux {
         if !old_covar_names.contains(col_name.as_str()) {
-            Spi::run(&format!(
+            let sql = format!(
                 "ALTER TABLE {} ADD COLUMN IF NOT EXISTS {} NUMERIC NOT NULL DEFAULT 0",
                 quoted_table,
                 quote_identifier(col_name),
-            ))
-            .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
+            );
+            Spi::run(&sql).map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
         }
     }
     // Drop removed covar aux columns
     for (col_name, _) in old_covar_aux {
         if !new_covar_names.contains(col_name.as_str()) {
-            Spi::run(&format!(
+            let sql = format!(
                 "ALTER TABLE {} DROP COLUMN IF EXISTS {}",
                 quoted_table,
                 quote_identifier(col_name),
-            ))
-            .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
+            );
+            Spi::run(&sql).map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
         }
     }
 
@@ -2226,23 +2218,23 @@ fn migrate_aux_columns(
     // Add new nonnull aux columns
     for (col_name, _) in new_nonnull_aux {
         if !old_nonnull_names.contains(col_name.as_str()) {
-            Spi::run(&format!(
+            let sql = format!(
                 "ALTER TABLE {} ADD COLUMN IF NOT EXISTS {} BIGINT NOT NULL DEFAULT 0",
                 quoted_table,
                 quote_identifier(col_name),
-            ))
-            .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
+            );
+            Spi::run(&sql).map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
         }
     }
     // Drop removed nonnull aux columns
     for (col_name, _) in old_nonnull_aux {
         if !new_nonnull_names.contains(col_name.as_str()) {
-            Spi::run(&format!(
+            let sql = format!(
                 "ALTER TABLE {} DROP COLUMN IF EXISTS {}",
                 quoted_table,
                 quote_identifier(col_name),
-            ))
-            .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
+            );
+            Spi::run(&sql).map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
         }
     }
 
@@ -4146,11 +4138,11 @@ fn execute_manual_refresh(
         let updated = reinit_rewrite_if_needed(st)?;
 
         // Clear the reinit flag after successful refresh.
-        Spi::run(&format!(
+        let sql = format!(
             "UPDATE pgtrickle.pgt_stream_tables SET needs_reinit = FALSE WHERE pgt_id = {}",
             updated.pgt_id,
-        ))
-        .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
+        );
+        Spi::run(&sql).map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
 
         Ok((0i64, 0i64))
     } else {
