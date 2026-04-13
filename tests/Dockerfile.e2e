@@ -44,6 +44,7 @@ RUN mkdir -p src/bin src/dvm/operators benches pgtrickle-tui/src && \
     echo '' > src/ivm.rs && \
     echo 'fn main() {}' > benches/refresh_bench.rs && \
     echo 'fn main() {}' > benches/diff_operators.rs && \
+    echo 'fn main() {}' > benches/scheduler_bench.rs && \
     echo 'fn main() {}' > pgtrickle-tui/src/main.rs
 
 # Pre-fetch all crates.  Cache mount keeps the registry between builds so
