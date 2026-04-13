@@ -4867,13 +4867,9 @@ pub fn execute_differential_refresh(
                 schema.replace('"', "\"\""),
                 name.replace('"', "\"\""),
             );
-            if ao_suppress
-                && let Err(e) = Spi::run(&format!(
-                    // nosemgrep: rust.spi.run.dynamic-format — ALTER TABLE DDL cannot be parameterized; ao_quoted_table uses manual double-quote escaping.
-                    "ALTER TABLE {} DISABLE TRIGGER USER",
-                    ao_quoted_table
-                ))
-            {
+            let ao_disable_sql = format!("ALTER TABLE {} DISABLE TRIGGER USER", ao_quoted_table);
+            let ao_enable_sql = format!("ALTER TABLE {} ENABLE TRIGGER USER", ao_quoted_table);
+            if ao_suppress && let Err(e) = Spi::run(&ao_disable_sql) {
                 pgrx::debug1!(
                     "[pg_trickle] A-3a: failed to disable triggers for {}.{}: {}",
                     schema,
@@ -4889,13 +4885,7 @@ pub fn execute_differential_refresh(
                 Ok::<i64, PgTrickleError>(result.len() as i64)
             })?;
 
-            if ao_suppress
-                && let Err(e) = Spi::run(&format!(
-                    // nosemgrep: rust.spi.run.dynamic-format — ALTER TABLE DDL cannot be parameterized; ao_quoted_table uses manual double-quote escaping.
-                    "ALTER TABLE {} ENABLE TRIGGER USER",
-                    ao_quoted_table
-                ))
-            {
+            if ao_suppress && let Err(e) = Spi::run(&ao_enable_sql) {
                 pgrx::debug1!(
                     "[pg_trickle] A-3a: failed to re-enable triggers for {}.{}: {}",
                     schema,
