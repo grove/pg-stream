@@ -2441,14 +2441,18 @@ pub extern "C-unwind" fn pg_trickle_scheduler_main(_arg: pg_sys::Datum) {
                 let retention_days = config::pg_trickle_history_retention_days();
                 if retention_days > 0 {
                     BackgroundWorker::transaction(AssertUnwindSafe(|| {
-                        let deleted = Spi::get_one::<i64>(&format!(
+                        // Use a parameterised query (no format!) to avoid any
+                        // dynamic-SQL concerns raised by static analysis tools.
+                        // make_interval(days => $1) accepts the i32 GUC value
+                        // through the standard SPI bind-parameter path.
+                        let deleted = Spi::get_one_with_args::<i64>(
                             "WITH deleted AS (\
                                 DELETE FROM pgtrickle.pgt_refresh_history \
-                                WHERE start_time < now() - interval '{} days' \
+                                WHERE start_time < now() - make_interval(days => $1) \
                                 RETURNING 1\
                             ) SELECT count(*) FROM deleted",
-                            retention_days
-                        )) // nosemgrep: rust.spi.get-one.dynamic-format — retention_days is a validated i32 GUC
+                            &[retention_days.into()],
+                        )
                         .unwrap_or(Some(0))
                         .unwrap_or(0);
                         if deleted > 0 {
