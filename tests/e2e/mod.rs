@@ -392,10 +392,26 @@ async fn shared_container() -> &'static SharedContainer {
                 }
             }
 
-            let port = container
-                .get_host_port_ipv4(5432)
-                .await
-                .expect("Failed to get mapped port");
+            // Retry getting the mapped port — Docker's port-mapping metadata is
+            // occasionally not yet published immediately after the "ready"
+            // log line, causing a transient `PortNotExposed` error.
+            let port = {
+                let mut attempt = 0u32;
+                loop {
+                    match container.get_host_port_ipv4(5432).await {
+                        Ok(p) => break p,
+                        Err(e) if attempt < 5 => {
+                            attempt += 1;
+                            tokio::time::sleep(std::time::Duration::from_millis(
+                                500 * u64::from(attempt),
+                            ))
+                            .await;
+                            let _ = e; // suppress unused-variable warning
+                        }
+                        Err(e) => panic!("Failed to get mapped port after retries: {e}"),
+                    }
+                }
+            };
             let admin_connection_string = connection_string(port, "postgres");
 
             // Pre-seed a template database with the extension installed once.
