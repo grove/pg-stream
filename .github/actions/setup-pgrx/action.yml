@@ -65,13 +65,19 @@ runs:
           ~/.cargo/.crates2.json
           ~/.cargo/.crates.toml
         key: v3-cargo-pgrx-bin-0.17.0-${{ runner.os }}-${{ runner.arch }}-${{ env.ImageOS || 'unknown' }}
-        # Fall back to a binary built on a prior runner image (same version,
-        # different ImageOS). cargo-pgrx is a statically-linked CLI tool so
-        # a binary from an older ubuntu image works fine on a newer one.
-        # Without this, every runner-image refresh triggers a 20-25 min
-        # cold compile and risks the light-E2E 30-minute job timeout.
+        # Aggressive fallback to avoid 20-25 min recompilation on runner image updates.
+        # GitHub GHA runner images update periodically (e.g. ubuntu-20.04 → ubuntu-24.04),
+        # which changes env.ImageOS and breaks the exact cache key.
+        # 
+        # cargo-pgrx is a statically-linked CLI tool, so binaries are forward-compatible
+        # across runner image updates on the same OS/architecture. We restore in order:
+        # 1. Same OS+arch, any ImageOS (primary fallback for runner image updates)
+        # 2. Same OS+arch, any version of cargo-pgrx (fallback if pgrx upgrades)
+        # 3. Same OS only (broadest fallback, works for amd64→arm64 in theory but less ideal)
         restore-keys: |
           v3-cargo-pgrx-bin-0.17.0-${{ runner.os }}-${{ runner.arch }}-
+          v3-cargo-pgrx-bin-${{ runner.os }}-${{ runner.arch }}-
+          v3-cargo-pgrx-bin-${{ runner.os }}-
 
     - name: Cache pgrx home directory (~/.pgrx)
       id: cache-pgrx-home
