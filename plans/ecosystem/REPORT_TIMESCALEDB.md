@@ -413,4 +413,4 @@ robust for error scenarios where refreshes fail repeatedly.
 - [DBSP paper (Budiu et al., 2022)](https://arxiv.org/abs/2203.16684)
 - pg_trickle [ARCHITECTURE.md](../../docs/ARCHITECTURE.md)
 - pg_trickle [PLAN_TRANSACTIONAL_IVM.md](../sql/PLAN_TRANSACTIONAL_IVM.md)
-- pg_trickle [PLAN_CITUS.md](../infra/PLAN_CITUS.md) — similar extension-compat plan
+- pg_trickle [PLAN_CITUS.md](./PLAN_CITUS.md) — similar extension-compat plan

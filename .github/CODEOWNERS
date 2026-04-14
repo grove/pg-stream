@@ -10,13 +10,31 @@
 # Core Rust extension
 src/                        @grove @BaardBouvet
 Cargo.toml                  @grove @BaardBouvet
+benches/                    @grove @BaardBouvet
+
+# Tests
+tests/                      @grove @BaardBouvet
+
+# SQL migration scripts
+sql/                        @grove @BaardBouvet
+pg_trickle.control          @grove @BaardBouvet
 
 # CI / release infrastructure
 .github/                    @grove @BaardBouvet
 justfile                    @grove @BaardBouvet
+scripts/                    @grove @BaardBouvet
+
+# TUI
+pgtrickle-tui/              @grove @BaardBouvet
 
 # dbt macro package
-dbt-pgtrickle/               @grove @BaardBouvet
+dbt-pgtrickle/              @grove @BaardBouvet
+
+# Deployment / infrastructure
+cnpg/                       @grove @BaardBouvet
+docker/                     @grove @BaardBouvet
+monitoring/                 @grove @BaardBouvet
+playground/                 @grove @BaardBouvet
 
 # Documentation — lighter touch, any maintainer can approve
 docs/                       @grove

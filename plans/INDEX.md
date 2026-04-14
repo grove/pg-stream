@@ -46,7 +46,7 @@ new entries when creating documents.
 
 | File | Type | Status | Summary |
 |------|------|--------|---------|
-| [PLAN_CITUS.md](infra/PLAN_CITUS.md) | PLAN | — | Citus distributed table compatibility |
+| [PLAN_CITUS.md](ecosystem/PLAN_CITUS.md) | PLAN | — | Citus distributed table compatibility |
 | [PLAN_CODECOV.md](infra/PLAN_CODECOV.md) | PLAN | Implementing | Codecov integration for coverage reporting |
 | [PLAN_GITHUB_ACTIONS_COST.md](infra/PLAN_GITHUB_ACTIONS_COST.md) | PLAN | — | Reduce GitHub Actions resource consumption |
 | [PLAN_DOCKER_IMAGE.md](infra/PLAN_DOCKER_IMAGE.md) | PLAN | Draft | Official Docker image |

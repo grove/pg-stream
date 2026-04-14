@@ -843,7 +843,7 @@ FROM + LATERAL covers all practical use cases.
 |-------|-------|
 | **Status** | Not Started |
 | **Category** | PostgreSQL Integration |
-| **Sources** | `plans/infra/PLAN_CITUS.md` |
+| **Sources** | `plans/ecosystem/PLAN_CITUS.md` |
 | **Effort** | Very High (~6 months) |
 
 **Context:** pg_trickle has zero multi-node awareness. Every core module assumes

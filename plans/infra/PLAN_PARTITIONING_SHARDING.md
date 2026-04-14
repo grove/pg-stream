@@ -3,7 +3,7 @@
 **Status:** Implemented (PT1–PT5 in v0.6.0)  
 **Date:** 2026-03-01  
 **Updated:** 2026-03-14 — PT1–PT5 implemented. E2E tests, ATTACH PARTITION detection, WAL publish_via_partition_root, foreign table info, and user-facing tutorial all shipped.  
-**Related:** [PLAN_CITUS.md](PLAN_CITUS.md) · [REPORT_TIMESCALEDB.md](../ecosystem/REPORT_TIMESCALEDB.md) · [REPORT_TRIGGERS_VS_REPLICATION.md](../sql/REPORT_TRIGGERS_VS_REPLICATION.md)
+**Related:** [PLAN_CITUS.md](../ecosystem/PLAN_CITUS.md) · [REPORT_TIMESCALEDB.md](../ecosystem/REPORT_TIMESCALEDB.md) · [REPORT_TRIGGERS_VS_REPLICATION.md](../sql/REPORT_TRIGGERS_VS_REPLICATION.md)
 
 ---
 
@@ -30,7 +30,7 @@ sharding solutions (Citus, pg_partman). It covers three scenarios:
   non-trivial changes to the storage table creation, MERGE/delta application,
   and row ID management paths.
 - **Distributed sharding (Citus)** is a much larger problem with a dedicated
-  plan already in [PLAN_CITUS.md](PLAN_CITUS.md). The core issues (OID
+  plan already in [PLAN_CITUS.md](../ecosystem/PLAN_CITUS.md). The core issues (OID
   locality, WAL LSN incomparability, trigger propagation) are architectural.
 - The most impactful near-term improvement is **validating and documenting**
   the native partitioning story, and adding targeted tests.
@@ -289,7 +289,7 @@ partitioning. While native partitioning keeps all data on a single PostgreSQL
 instance with transparent query routing, Citus distributes data across
 multiple independent PostgreSQL nodes.
 
-A comprehensive plan exists in [PLAN_CITUS.md](PLAN_CITUS.md). The key
+A comprehensive plan exists in [PLAN_CITUS.md](../ecosystem/PLAN_CITUS.md). The key
 incompatibilities are:
 
 | Component | Native Partitioning | Citus Distributed |
@@ -324,7 +324,7 @@ entirely separate features** with different timelines:
 1. **Native partitioning** — Near-term; mostly works today. Needs testing,
    ATTACH PARTITION detection, and WAL publication configuration.
 2. **Citus** — Long-term; architectural changes needed. Follow the phased
-   plan in [PLAN_CITUS.md](PLAN_CITUS.md).
+   plan in [PLAN_CITUS.md](../ecosystem/../ecosystem/PLAN_CITUS.md).
 
 ---
 
@@ -420,7 +420,7 @@ file with tests covering the scenarios above.
 
 | # | Action | Component | Effort |
 |---|--------|-----------|--------|
-| 9 | Citus distributed table support | All modules | ~6 months (see [PLAN_CITUS.md](PLAN_CITUS.md)) |
+| 9 | Citus distributed table support | All modules | ~6 months (see [PLAN_CITUS.md](../ecosystem/PLAN_CITUS.md)) |
 | 10 | FDW-sharded source support with remote CDC | New module | Research needed |
 
 ---
@@ -433,7 +433,7 @@ file with tests covering the scenarios above.
 | **Sub-partitioning** | Works (same as above) | Not supported | Untested |
 | **pg_partman managed** | Works (triggers propagate to new partitions) | Not supported | Untested |
 | **TimescaleDB hypertables** | Works (see [REPORT_TIMESCALEDB.md](../ecosystem/REPORT_TIMESCALEDB.md)) | Not supported | Research |
-| **Citus distributed** | Not supported | Not supported | See [PLAN_CITUS.md](PLAN_CITUS.md) |
+| **Citus distributed** | Not supported | Not supported | See [PLAN_CITUS.md](../ecosystem/PLAN_CITUS.md) |
 | **Citus reference tables** | Works (coordinator-local triggers) | Possible | Untested |
 | **FDW foreign tables** | Full refresh only | N/A | Needs implementation |
 | **Mixed local + foreign partitions** | Full refresh only | N/A | Needs implementation |
