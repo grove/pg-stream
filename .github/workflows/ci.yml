@@ -6,6 +6,9 @@
 #   push → main    : + light E2E tests, + coverage upload
 #   Weekly (Mon)   : full unit matrix (Linux + macOS), E2E, dbt, CNPG smoke
 #   Manual         : all jobs, all platforms (including Windows + benchmarks)
+#
+# TPC-H nightly (TEST-10) is in tpch-nightly.yml — it can take up to 3–5 h
+# and must not block PRs or push-to-main gating.
 # =============================================================================
 name: CI
 
@@ -928,39 +931,6 @@ jobs:
 
           echo "CNPG smoke test passed!"
 
-  # ── TEST-10: TPC-H nightly at SF-1 and SF-10 ──────────────────────────
-  # Runs TPC-H correctness tests at higher scale factors to catch issues
-  # that only manifest with larger datasets (hash collisions, sort spill,
-  # parallel execution). SF-10 also serves as a performance soak test.
-  tpch-nightly:
-    name: TPC-H nightly (${{ matrix.scale }})
-    runs-on: ubuntu-latest
-    timeout-minutes: 120
-    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
-    needs: [e2e-tests]
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - scale: "SF-1"
-            tpch_scale: "1.0"
-            tpch_cycles: "3"
-          - scale: "SF-10"
-            tpch_scale: "10.0"
-            tpch_cycles: "2"
-    steps:
-      - uses: actions/checkout@v5
-
-      - name: Setup pgrx environment
-        uses: ./.github/actions/setup-pgrx
-
-      - name: Build E2E Docker image
-        run: ./tests/build_e2e_image.sh
-
-      - name: Run TPC-H at ${{ matrix.scale }}
-        env:
-          TPCH_SCALE: ${{ matrix.tpch_scale }}
-          TPCH_CYCLES: ${{ matrix.tpch_cycles }}
-        run: |
-          cargo nextest run --profile ci --test e2e_tpch_tests \
-            --run-ignored all --no-capture
+  # TEST-10 (TPC-H nightly SF-1 + SF-10) has been moved to
+  # .github/workflows/tpch-nightly.yml because it can exceed 120 min and
+  # must not block the ci.yml gate.

@@ -1,0 +1,77 @@
+# =============================================================================
+# TPC-H Nightly — TEST-10: correctness at SF-1 and SF-10
+#
+# Separated from ci.yml because these jobs can take up to ~3 hours each and
+# must not block PRs or push-to-main gating.  They run daily and on manual
+# dispatch, matching the pattern established by stability-tests.yml.
+#
+#   SF-1  (600K lineitem rows, 3 cycles): timeout 180 min
+#   SF-10 (6M lineitem rows,  2 cycles): timeout 300 min
+# =============================================================================
+name: TPC-H Nightly
+
+on:
+  schedule:
+    - cron: '0 5 * * *'  # Daily 05:00 UTC (after ci.yml at 03:00)
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  NEXTEST_PROFILE: ci
+  PG_VERSION: "18"
+
+jobs:
+  # ── TEST-10: TPC-H nightly at SF-1 and SF-10 ─────────────────────────
+  # Runs TPC-H correctness tests at higher scale factors to catch issues
+  # that only manifest with larger datasets (hash collisions, sort spill,
+  # parallel execution). SF-10 also serves as a performance soak test.
+  tpch-nightly:
+    name: TPC-H nightly (${{ matrix.scale }})
+    runs-on: ubuntu-latest
+    timeout-minutes: ${{ matrix.timeout_minutes }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - scale: "SF-1"
+            tpch_scale: "1.0"
+            tpch_cycles: "3"
+            timeout_minutes: 180
+          - scale: "SF-10"
+            tpch_scale: "10.0"
+            tpch_cycles: "2"
+            timeout_minutes: 300
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Setup pgrx environment
+        uses: ./.github/actions/setup-pgrx
+
+      - name: Build E2E Docker image
+        run: ./tests/build_e2e_image.sh
+
+      - name: Run TPC-H at ${{ matrix.scale }}
+        env:
+          TPCH_SCALE: ${{ matrix.tpch_scale }}
+          TPCH_CYCLES: ${{ matrix.tpch_cycles }}
+        run: |
+          cargo nextest run --profile ci --test e2e_tpch_tests \
+            --run-ignored all --no-capture
+
+  # ── Final gate ────────────────────────────────────────────────────────
+  check:
+    name: TPC-H nightly gate
+    runs-on: ubuntu-latest
+    needs: [tpch-nightly]
+    if: always()
+    steps:
+      - name: Fail if any TPC-H job failed
+        if: contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled')
+        run: |
+          echo "One or more TPC-H nightly jobs failed:"
+          echo "  tpch-nightly: ${{ needs.tpch-nightly.result }}"
+          exit 1
