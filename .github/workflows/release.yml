@@ -479,6 +479,7 @@ jobs:
   publish-docker-hub:
     name: Publish Docker Hub image
     needs: [build-release, test-release]
+    if: ${{ secrets.DOCKERHUB_USERNAME != '' && secrets.DOCKERHUB_TOKEN != '' }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
