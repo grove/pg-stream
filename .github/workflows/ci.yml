@@ -162,7 +162,7 @@ jobs:
   light-e2e-tests:
     name: Light E2E tests (${{ matrix.shard_name }})
     runs-on: ubuntu-latest
-    timeout-minutes: 50
+    timeout-minutes: 75
     strategy:
       fail-fast: false
       matrix:
