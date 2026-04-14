@@ -100,8 +100,6 @@ async fn test_replica_guard_recovery_function_available() {
 
     // Also verify the extension's version function works (sanity check
     // that the extension is loaded correctly on this primary)
-    let version: String = db
-        .query_scalar("SELECT (pgtrickle.version()).extension_version")
-        .await;
+    let version: String = db.query_scalar("SELECT pgtrickle.version()").await;
     assert!(!version.is_empty(), "Extension version should be non-empty");
 }

@@ -16,16 +16,18 @@ use e2e::E2eDb;
 
 /// Helper: create the two test roles and a source table owned by sec1_owner.
 async fn setup_ownership_test(db: &E2eDb) {
-    // Create roles
+    // Create roles — use EXCEPTION to handle the race where parallel tests try
+    // to create the same cluster-level role simultaneously.  IF NOT EXISTS inside
+    // a DO block is not atomic; we catch both duplicate_object (42710, role
+    // already exists) and unique_violation (23505, concurrent INSERT race).
     db.execute(
-        "DO $$ BEGIN \
-           IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'sec1_owner') THEN \
-             CREATE ROLE sec1_owner LOGIN; \
-           END IF; \
-           IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'sec1_other') THEN \
-             CREATE ROLE sec1_other LOGIN; \
-           END IF; \
-         END $$",
+        "DO $$ BEGIN CREATE ROLE sec1_owner LOGIN; \
+         EXCEPTION WHEN duplicate_object OR unique_violation THEN NULL; END $$",
+    )
+    .await;
+    db.execute(
+        "DO $$ BEGIN CREATE ROLE sec1_other LOGIN; \
+         EXCEPTION WHEN duplicate_object OR unique_violation THEN NULL; END $$",
     )
     .await;
 
@@ -57,12 +59,14 @@ async fn test_ownership_nonowner_drop_denied() {
     let db = E2eDb::new().await.with_extension().await;
     setup_ownership_test(&db).await;
 
-    // Attempt to drop as sec1_other (non-owner, non-superuser)
+    // Attempt to drop as sec1_other (non-owner, non-superuser).
+    // Use try_execute_with_role to run SET ROLE / target / RESET ROLE on the
+    // same connection (sqlx rejects multi-statement prepared statements).
     let result = db
-        .try_execute(
-            "SET ROLE sec1_other; \
-             SELECT pgtrickle.drop_stream_table('sec1_st'); \
-             RESET ROLE;",
+        .try_execute_with_role(
+            "SET ROLE sec1_other",
+            "SELECT pgtrickle.drop_stream_table('sec1_st')",
+            "RESET ROLE",
         )
         .await;
 
@@ -83,12 +87,13 @@ async fn test_ownership_nonowner_alter_denied() {
     let db = E2eDb::new().await.with_extension().await;
     setup_ownership_test(&db).await;
 
-    // Attempt to alter as sec1_other (non-owner, non-superuser)
+    // Attempt to alter as sec1_other (non-owner, non-superuser).
+    // Use try_execute_with_role to avoid multi-statement prepared-statement error.
     let result = db
-        .try_execute(
-            "SET ROLE sec1_other; \
-             SELECT pgtrickle.alter_stream_table('sec1_st', schedule => '30s'); \
-             RESET ROLE;",
+        .try_execute_with_role(
+            "SET ROLE sec1_other",
+            "SELECT pgtrickle.alter_stream_table('sec1_st', schedule => '30s')",
+            "RESET ROLE",
         )
         .await;
 

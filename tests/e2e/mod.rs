@@ -839,6 +839,37 @@ impl E2eDb {
         }
     }
 
+    /// Execute `setup_sql` on a connection, then try `target_sql` and return its
+    /// result, then run `teardown_sql` unconditionally.  All three statements use
+    /// the **same** connection so session state (e.g. `SET ROLE`) is preserved.
+    ///
+    /// Use this instead of multi-statement strings passed to `try_execute`,
+    /// which sqlx rejects with "cannot insert multiple commands into a prepared
+    /// statement".
+    pub async fn try_execute_with_role(
+        &self,
+        setup_sql: &str,
+        target_sql: &str,
+        teardown_sql: &str,
+    ) -> Result<(), sqlx::Error> {
+        let mut conn = self
+            .pool
+            .acquire()
+            .await
+            .expect("Failed to acquire DB connection for try_execute_with_role");
+        sqlx::query(setup_sql)
+            .execute(&mut *conn)
+            .await
+            .unwrap_or_else(|e| panic!("setup SQL failed: {}\nSQL: {}", e, setup_sql));
+        let result = sqlx::query(target_sql)
+            .execute(&mut *conn)
+            .await
+            .map(|_| ());
+        // Always reset, even if target failed.
+        let _ = sqlx::query(teardown_sql).execute(&mut *conn).await;
+        result
+    }
+
     /// Reload PostgreSQL configuration and wait briefly for SIGHUP settings to apply.
     pub async fn reload_config_and_wait(&self) {
         self.execute("SELECT pg_reload_conf()").await;

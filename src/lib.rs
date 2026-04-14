@@ -311,7 +311,8 @@ CREATE INDEX IF NOT EXISTS idx_deps_pgt_id ON pgtrickle.pgt_dependencies (pgt_id
 -- Refresh history / audit log
 CREATE TABLE IF NOT EXISTS pgtrickle.pgt_refresh_history (
     refresh_id      BIGSERIAL PRIMARY KEY,
-    pgt_id           BIGINT NOT NULL,
+    pgt_id           BIGINT NOT NULL
+                     REFERENCES pgtrickle.pgt_stream_tables(pgt_id) ON DELETE CASCADE,
     data_timestamp  TIMESTAMPTZ NOT NULL,
     start_time      TIMESTAMPTZ NOT NULL,
     end_time        TIMESTAMPTZ,

@@ -417,6 +417,14 @@ async fn run_break_cycle_trace(seed: u64) {
         .await;
     db.execute("SELECT pg_reload_conf()").await;
     tokio::time::sleep(Duration::from_secs(1)).await;
+
+    // Break the cycle: the survivor still references drop_name, so ALTER it
+    // to remove that back-reference before we attempt the drop.
+    db.execute(&format!(
+        "SELECT pgtrickle.alter_stream_table('{survivor_name}', \
+         query => $$SELECT id, val FROM prop_brk_src$$)",
+    ))
+    .await;
     db.drop_st(drop_name).await;
 
     // The survivor must have scc_id cleared (no longer in a cycle).
