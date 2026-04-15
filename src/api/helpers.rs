@@ -1855,8 +1855,12 @@ pub fn inject_avg_aux(query: &str, avg_aux_columns: &[(String, String, String)])
     if let Some(pos) = find_top_level_keyword(query, "FROM") {
         let mut extra = String::new();
         for (sum_col, count_col, arg_sql) in avg_aux_columns {
+            // COALESCE ensures the NOT NULL aux-sum column receives 0 rather
+            // than NULL when every row in a group has a NULL expression value
+            // (e.g. NULLIF returning NULL for all rows).  COUNT already
+            // returns 0 for zero non-NULL values, so no COALESCE needed there.
             extra.push_str(&format!(
-                ", SUM({arg_sql}) AS {}, COUNT({arg_sql}) AS {}",
+                ", COALESCE(SUM({arg_sql}), 0) AS {}, COUNT({arg_sql}) AS {}",
                 quote_identifier(sum_col),
                 quote_identifier(count_col),
             ));
@@ -1879,8 +1883,9 @@ pub fn inject_sum2_aux(query: &str, sum2_aux_columns: &[(String, String)]) -> St
     if let Some(pos) = find_top_level_keyword(query, "FROM") {
         let mut extra = String::new();
         for (sum2_col, arg_sql) in sum2_aux_columns {
+            // COALESCE guards against NULL (e.g. when arg_sql is NULL for all rows).
             extra.push_str(&format!(
-                ", SUM(({arg_sql}) * ({arg_sql})) AS {}",
+                ", COALESCE(SUM(({arg_sql}) * ({arg_sql})), 0) AS {}",
                 quote_identifier(sum2_col),
             ));
         }
@@ -1933,6 +1938,8 @@ pub fn inject_covar_aux(query: &str, covar_aux_columns: &[(String, String)]) -> 
     if let Some(pos) = find_top_level_keyword(query, "FROM") {
         let mut extra = String::new();
         for (col_name, arg_sql) in covar_aux_columns {
+            // COALESCE guards each SUM against NULL when all values in a group
+            // are NULL (e.g. NULL arguments to CORR/COVAR/REGR_*).
             let expr = if col_name.starts_with("__pgt_aux_sumxy_") {
                 // arg_sql is "x_expr|y_expr"
                 let parts: Vec<&str> = arg_sql.splitn(2, '|').collect();
@@ -1941,14 +1948,14 @@ pub fn inject_covar_aux(query: &str, covar_aux_columns: &[(String, String)]) -> 
                 } else {
                     (arg_sql.as_str(), arg_sql.as_str())
                 };
-                format!("SUM(({x}) * ({y}))")
+                format!("COALESCE(SUM(({x}) * ({y})), 0)")
             } else if col_name.starts_with("__pgt_aux_sumx2_")
                 || col_name.starts_with("__pgt_aux_sumy2_")
             {
-                format!("SUM(({arg_sql}) * ({arg_sql}))")
+                format!("COALESCE(SUM(({arg_sql}) * ({arg_sql})), 0)")
             } else {
                 // sumx_ or sumy_ — simple SUM
-                format!("SUM({arg_sql})")
+                format!("COALESCE(SUM({arg_sql}), 0)")
             };
             extra.push_str(&format!(", {} AS {}", expr, quote_identifier(col_name)));
         }

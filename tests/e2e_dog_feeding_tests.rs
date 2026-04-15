@@ -607,11 +607,13 @@ async fn test_auto_apply_initiated_by_dog_feed() {
     db.refresh_st("user_st").await;
 
     // Insert a DOG_FEED audit row directly to test CHECK constraint.
+    // data_timestamp is NOT NULL in pgt_refresh_history (used for
+    // ST-on-ST cascade logic); use now() as a stand-in for a SKIP row.
     db.execute(
         "INSERT INTO pgtrickle.pgt_refresh_history \
-         (pgt_id, start_time, action, status, delta_row_count, \
+         (pgt_id, data_timestamp, start_time, action, status, delta_row_count, \
           rows_inserted, initiated_by, error_message) \
-         SELECT pgt_id, now(), 'SKIP', 'COMPLETED', 0, 0, 'DOG_FEED', \
+         SELECT pgt_id, now(), now(), 'SKIP', 'COMPLETED', 0, 0, 'DOG_FEED', \
                 'auto_threshold 0.10 → 0.15' \
          FROM pgtrickle.pgt_stream_tables WHERE pgt_name = 'user_st'",
     )
@@ -637,24 +639,23 @@ async fn test_auto_apply_guc_values() {
     let db = E2eDb::new().await.with_extension().await;
 
     // Test all valid GUC values.
-    db.execute("SET pg_trickle.dog_feeding_auto_apply = 'off'")
-        .await;
+    // Use set_config() which sets the GUC and returns its new value in a
+    // single round-trip, avoiding connection-pool ambiguity (SET on one
+    // backend is not visible to a SHOW on a different backend).
     let v1: String = db
-        .query_scalar("SHOW pg_trickle.dog_feeding_auto_apply")
+        .query_scalar("SELECT set_config('pg_trickle.dog_feeding_auto_apply', 'off', false)")
         .await;
     assert_eq!(v1, "off");
 
-    db.execute("SET pg_trickle.dog_feeding_auto_apply = 'threshold_only'")
-        .await;
     let v2: String = db
-        .query_scalar("SHOW pg_trickle.dog_feeding_auto_apply")
+        .query_scalar(
+            "SELECT set_config('pg_trickle.dog_feeding_auto_apply', 'threshold_only', false)",
+        )
         .await;
     assert_eq!(v2, "threshold_only");
 
-    db.execute("SET pg_trickle.dog_feeding_auto_apply = 'full'")
-        .await;
     let v3: String = db
-        .query_scalar("SHOW pg_trickle.dog_feeding_auto_apply")
+        .query_scalar("SELECT set_config('pg_trickle.dog_feeding_auto_apply', 'full', false)")
         .await;
     assert_eq!(v3, "full");
 }
