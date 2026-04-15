@@ -5309,6 +5309,9 @@ Dependencies: DB-3 (uses schema version to determine needed migrations). Schema 
 | OPS-3 | **`pgtrickle.scheduler_overhead()` diagnostic function.** Returns busy-time ratio, queue depth, avg dispatch latency, and fraction of CPU spent on DF STs vs user STs. | 2–4h | — |
 | OPS-4 | **`pgtrickle.explain_dag()` — Mermaid/DOT output.** Returns DAG as Mermaid markdown with node colours: user=blue, dog-feeding=green, suspended=red. | 3–4h | — |
 | OPS-5 | **`sql/dog_feeding_setup.sql` quick-start template.** Runnable script: call `setup_dog_feeding()`, set `dog_feeding_auto_apply = 'threshold_only'`, configure LISTEN, query initial recommendations. | 1h | — |
+| OPS-6 | **Workload-aware poll intervals via DF-5 signal.** Replace `compute_adaptive_poll_ms()` exponential backoff with pre-emptive dispatch interval widening when `df_scheduling_interference` detects contention. | 2–4h | [PLAN_DOG_FEEDING.md](plans/PLAN_DOG_FEEDING.md) §10.2 |
+| DASH-1 | **Grafana Dog-Feeding Dashboard.** New `monitoring/grafana/dashboards/pg_trickle_dog_feeding.json` — 5 panels reading from DF-1 through DF-5. | 4–6h | [PLAN_DOG_FEEDING.md](plans/PLAN_DOG_FEEDING.md) §10.5 |
+| DBT-1 | **dbt `pgtrickle_enable_monitoring` post-hook macro.** Calls `setup_dog_feeding()` automatically after a successful `dbt run`; documented in `dbt-pgtrickle/`. | 2h | — |
 
 **OPS-1 — `pgtrickle.recommend_refresh_mode(st_name text)`**
 
@@ -5372,6 +5375,48 @@ Dependencies: DB-3 (uses schema version to determine needed migrations). Schema 
 > Verify: script executes without errors on a fresh install; produces visible
 > output showing 5 active DF STs. Dependencies: DF-F4, DF-G1, UX-4.
 > Schema change: No.
+
+**OPS-6 — Workload-aware poll intervals via DF-5 signal**
+
+> Currently `compute_adaptive_poll_ms()` uses pure exponential backoff that
+> reacts to contention only after it occurs. Replace this with a pre-emptive
+> signal: after each scheduler tick, read the latest `overlap_count` from
+> `df_scheduling_interference`; if `overlap_count >= 2`, increase the dispatch
+> interval for the next tick by 20% before dispatching (capped at
+> `pg_trickle.max_poll_interval_ms`). This closes the dog-feeding feedback loop
+> by letting the analytics directly influence scheduling policy, reducing
+> contention on write-heavy deployments without waiting for timeouts.
+>
+> Verify: soak test with known-contending STs shows lower `overlap_count` in
+> DF-5 with signal enabled vs disabled. `scheduler_overhead()` shows reduced
+> busy-time ratio. Dependencies: DF-C2, OPS-3. Schema change: No.
+
+**DASH-1 — Grafana Dog-Feeding Dashboard**
+
+> Add `monitoring/grafana/dashboards/pg_trickle_dog_feeding.json` alongside
+> the existing `pg_trickle_overview.json`. Five panels: (1) Refresh throughput
+> timeline (DF-1 `avg_diff_ms` over time), (2) Anomaly heatmap (DF-2 per-ST
+> anomaly type grid), (3) Threshold calibration scatter (DF-3 current vs
+> recommended threshold), (4) CDC buffer growth sparklines (DF-4 per-source
+> growth rate), (5) Interference matrix (DF-5 overlap heatmap). Provisioned
+> automatically in `monitoring/grafana/provisioning/`.
+>
+> Verify: `docker compose up` in `monitoring/` loads both dashboards;
+> all five panels resolve without `No data` errors using the postgres-exporter
+> queries. Dependencies: DF-F2, DF-A1, DF-A2, DF-C1, DF-C2. Schema change: No.
+
+**DBT-1 — `pgtrickle_enable_monitoring` dbt post-hook macro**
+
+> Add a `pgtrickle_enable_monitoring` macro to `dbt-pgtrickle/macros/` that
+> calls `{{ pgtrickle.setup_dog_feeding() }}` and emits a `log()` message
+> confirming activation. Documented in `dbt-pgtrickle/README.md`. Users add
+> `+post-hook: "{{ pgtrickle_enable_monitoring() }}"` to `dbt_project.yml`
+> to auto-enable monitoring after any `dbt run`. Idempotent — safe to call on
+> every run because `setup_dog_feeding()` is already idempotent (STAB-1).
+>
+> Verify: `just test-dbt` includes a test case that runs the macro twice;
+> asserts `dog_feeding_status()` shows 5 active STs after both calls.
+> Dependencies: DF-F4, STAB-1. Schema change: No.
 
 ### Documentation & Safety
 
@@ -5672,6 +5717,7 @@ Dependencies: DB-3 (uses schema version to determine needed migrations). Schema 
 | UX-5 | `explain_st()` shows if a DF ST covers the queried stream table | XS | P2 |
 | UX-6 | `recommend_refresh_mode()` exposed in `explain_st()` JSON output | XS | P2 |
 | UX-7 | `scheduler_overhead()` output included in TUI diagnostics panel | XS | P2 |
+| UX-8 | `df_threshold_advice` extended with SLA headroom column | S | P2 |
 
 **UX-1 — `pgtrickle.dog_feeding_status()` diagnostic function**
 
@@ -5732,6 +5778,19 @@ Dependencies: DB-3 (uses schema version to determine needed migrations). Schema 
 >
 > Verify: `SELECT explain_st('any_table')` output includes a `dog_feeding`
 > field in the JSON output. Dependencies: UX-1. Schema change: No.
+
+**UX-8 — `df_threshold_advice` extended with SLA headroom column**
+
+> Extend the DF-3 defining query to include a computed `sla_headroom_ms`
+> column: `freshness_deadline_ms - avg_diff_ms` from `pgt_refresh_history`.
+> When `sla_headroom_ms < 0`, add a boolean `sla_breach_risk = true` flag so
+> operators can see at a glance which STs risk missing their freshness SLA on
+> the next DIFFERENTIAL cycle. The `freshness_deadline` column already exists
+> in `pgt_refresh_history` (since v0.2.3). No schema change required.
+>
+> Verify: create an ST with a tight `freshness_deadline`; run slow synthetic
+> refreshes; assert `df_threshold_advice.sla_breach_risk = true`.
+> Dependencies: DF-A2. Schema change: No (view column addition only).
 
 **UX-6 — `recommend_refresh_mode()` exposed in `explain_st()` JSON output**
 
@@ -5881,7 +5940,24 @@ Dependencies: DB-3 (uses schema version to determine needed migrations). Schema 
    arguments to constrain output. Default `format => 'mermaid'` with a
    `NOTICE` when DAG has > 20 nodes.
 
-> **v0.20.0 total: ~2–3 weeks**
+9. **OPS-6 (workload-aware poll) writes to the scheduler hot path.** The
+   `compute_adaptive_poll_ms()` function is called on every scheduler tick.
+   The DF-5 read must be a single O(1) catalog lookup (latest row only), not
+   a full table scan. Guard with `LIMIT 1 ORDER BY collected_at DESC`. If
+   the DF-5 table does not exist (dog-feeding not set up), fall back to the
+   old backoff logic without error.
+
+10. **DASH-1 (Grafana) depends on postgres-exporter SQL queries.** The
+    dashboard panels use custom SQL collectors in the postgres-exporter config.
+    Verify that `monitoring/` docker-compose already mounts query config;
+    if not, add a `pg_trickle_df_queries.yaml` collector file alongside
+    the existing exporter config.
+
+11. **DBT-1 macro idempotency.** The `pgtrickle_enable_monitoring` macro
+    calls `setup_dog_feeding()` on every `dbt run`. Document that this is
+    intentionally safe (STAB-1) and adds < 5 ms overhead per run.
+
+> **v0.20.0 total: ~3–4 weeks**
 
 **Exit criteria:**
 - [ ] DF-F1: `pgt_refresh_history` receives CDC INSERT triggers when `create_stream_table()` is called
@@ -5921,6 +5997,10 @@ Dependencies: DB-3 (uses schema version to determine needed migrations). Schema 
 - [ ] OPS-5: `sql/dog_feeding_setup.sql` executes without errors on a fresh install
 - [ ] PERF-5: Concurrent history purge + DF CDC INSERT produces no lock wait timeouts in soak test
 - [ ] PERF-6: `changed_columns` bitmask stored in change buffer for UPDATE rows when `columnar_tracking = on` (if included)
+- [ ] OPS-6: Soak test shows lower `overlap_count` in DF-5 with workload-aware poll enabled vs disabled
+- [ ] DASH-1: `docker compose up` in `monitoring/` loads pg_trickle_dog_feeding dashboard; all 5 panels show data
+- [ ] DBT-1: `pgtrickle_enable_monitoring` macro runs twice without error; `dog_feeding_status()` shows 5 active STs after both calls
+- [ ] UX-8: `df_threshold_advice.sla_breach_risk = true` when `avg_diff_ms > freshness_deadline_ms` on synthetic data
 - [ ] Extension upgrade path tested (`0.19.0 → 0.20.0`)
 - [ ] `just check-version-sync` passes
 
@@ -7949,7 +8029,7 @@ to keep the pre-1.0 milestones focused on performance and correctness.
 | v0.17.0 — Query Intelligence & Stability | ~2–3wk cost-based strategy + ~3–4wk columnar tracking + ~32–48h TIVM Phase 4 + ~1–2d ROWS FROM + ~2–3wk SQLancer + ~2–3wk incremental DAG + ~4–8h unsafe reduction + ~1–2wk api.rs mod + ~2–3d migration guide + ~3–5d runbook + ~2–3d playground + ~2–3d doc polish | — | |
 | v0.18.0 — Hardening & Delta Performance | ~70–100h | — | |
 | v0.19.0 — Production Gap Closure & Distribution | ~4–5 weeks | — | |
-| v0.20.0 — Dog-Feeding (pg_trickle monitors itself) | ~2–3wk | — | |
+| v0.20.0 — Dog-Feeding (pg_trickle monitors itself) | ~3–4wk | — | |
 | v0.21.0 — PostgreSQL 17 Support | ~2–4d | — | |
 | v0.22.0 — PGlite Proof of Concept | ~2–3wk (plugin) + ~1–2d (version bump) | — | |
 | v0.23.0 — Core Extraction (`pg_trickle_core`) | ~3–4wk (extraction) + ~1–2wk (abstraction + testing) | — | |
