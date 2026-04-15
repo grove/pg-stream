@@ -3371,8 +3371,10 @@ fn dog_feeding_anomaly_notify() {
             anomaly_str.replace('"', r#"\""#),
             failures,
         );
-        let escaped = payload.replace('\'', "''");
-        let _ = Spi::run(&format!("SELECT pg_notify('pgtrickle_alert', '{escaped}')"));
+        let _ = Spi::run_with_args(
+            "SELECT pg_notify('pgtrickle_alert', $1)",
+            &[payload.as_str().into()],
+        );
     }
 }
 
