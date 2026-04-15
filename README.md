@@ -355,7 +355,7 @@ CREATE EXTENSION pg_trickle;
 pg_trickle is distributed as a minimal OCI extension image for [CloudNativePG Image Volume Extensions](https://cloudnative-pg.io/docs/1.28/imagevolume_extensions/). The image is `scratch`-based (< 10 MB) and contains only the extension files — no PostgreSQL server, no OS.
 
 ```bash
-docker pull ghcr.io/grove/pg_trickle-ext:0.12.0
+docker pull ghcr.io/grove/pg_trickle-ext:0.20.0
 ```
 
 Deploy with the official CNPG PostgreSQL 18 operand image:
@@ -369,7 +369,7 @@ spec:
     extensions:
       - name: pg-trickle
         image:
-          reference: ghcr.io/grove/pg_trickle-ext:0.12.0
+          reference: ghcr.io/grove/pg_trickle-ext:0.20.0
 ```
 
 See [cnpg/cluster-example.yaml](cnpg/cluster-example.yaml) and [cnpg/database-example.yaml](cnpg/database-example.yaml) for complete examples. Requires Kubernetes 1.33+ and CNPG 1.28+.
@@ -479,7 +479,7 @@ The `dbt-pgtrickle` package provides a custom `stream_table` materialization for
 # packages.yml
 packages:
   - git: "https://github.com/grove/pg-trickle.git"
-    revision: v0.15.0
+    revision: v0.20.0
     subdirectory: "dbt-pgtrickle"
 ```
 
