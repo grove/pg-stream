@@ -5300,6 +5300,79 @@ Dependencies: DB-3 (uses schema version to determine needed migrations). Schema 
 | DF-G4 | **E2E test: auto-apply threshold.** Enable `threshold_only`, inject history making DIFF consistently faster, verify threshold increases automatically. | 2–4h | [PLAN_DOG_FEEDING.md](plans/PLAN_DOG_FEEDING.md) §8 |
 | DF-G5 | **E2E test: rate limiting.** Verify no more than 1 threshold change per ST per 10 minutes. | 1–2h | [PLAN_DOG_FEEDING.md](plans/PLAN_DOG_FEEDING.md) §8 |
 
+### Phase 5 — Operational Diagnostics
+
+| Item | Description | Effort | Ref |
+|------|-------------|--------|-----|
+| OPS-1 | **`pgtrickle.recommend_refresh_mode(st_name)`** Reads `df_threshold_advice` to return a structured recommendation `{ mode, confidence, reason }` rather than computing on demand. | 2–4h | [PLAN_DOG_FEEDING.md](plans/PLAN_DOG_FEEDING.md) §10.6 |
+| OPS-2 | **`check_cdc_health()` spill-risk enrichment.** Query `df_cdc_buffer_trends` growth rate; emit a `spill_risk` alert when buffer growth will breach `spill_threshold_blocks` within 2 cycles. | 2–4h | [PLAN_DOG_FEEDING.md](plans/PLAN_DOG_FEEDING.md) §10.3 |
+| OPS-3 | **`pgtrickle.scheduler_overhead()` diagnostic function.** Returns busy-time ratio, queue depth, avg dispatch latency, and fraction of CPU spent on DF STs vs user STs. | 2–4h | — |
+| OPS-4 | **`pgtrickle.explain_dag()` — Mermaid/DOT output.** Returns DAG as Mermaid markdown with node colours: user=blue, dog-feeding=green, suspended=red. | 3–4h | — |
+| OPS-5 | **`sql/dog_feeding_setup.sql` quick-start template.** Runnable script: call `setup_dog_feeding()`, set `dog_feeding_auto_apply = 'threshold_only'`, configure LISTEN, query initial recommendations. | 1h | — |
+
+**OPS-1 — `pgtrickle.recommend_refresh_mode(st_name text)`**
+
+> Reads directly from `df_threshold_advice` instead of computing a
+> single-cycle cost comparison on demand (PLAN_DOG_FEEDING.md §10.6). Returns
+> `TABLE(mode text, confidence text, reason text)`. When confidence is LOW
+> (< 10 history rows), emits a fallback with mode=`'AUTO'` and a reason
+> explaining insufficient data. Integrates with `explain_st()` output.
+>
+> Verify: call on an ST with ≥ 20 history cycles; assert `mode` ∈
+> `{'DIFFERENTIAL','FULL','AUTO'}` and `confidence` ∈ `{'HIGH','MEDIUM','LOW'}`.
+> Dependencies: DF-A2. Schema change: No.
+
+**OPS-2 — `check_cdc_health()` spill-risk enrichment**
+
+> Currently `check_cdc_health()` performs full-table scans to detect anomalies.
+> When DF-C1 is active, query `df_cdc_buffer_trends` growth rate instead.
+> Emit a `spill_risk = 'IMMINENT'` row when the 1-cycle growth rate extrapolated
+> 2 cycles ahead exceeds `spill_threshold_blocks`. Falls back to full scan
+> when dog-feeding is not set up.
+>
+> Verify: inject 80% of `spill_threshold_blocks` worth of buffer rows with a
+> steep growth rate; assert `check_cdc_health()` returns a spill-risk alert.
+> Dependencies: DF-C1. Schema change: No.
+
+**OPS-3 — `pgtrickle.scheduler_overhead()` diagnostic function**
+
+> Returns a snapshot of scheduler efficiency: `scheduler_busy_ratio` (fraction
+> of wall-clock time spent executing refreshes), `queue_depth` (STs waiting
+> to be dispatched), `avg_dispatch_latency_ms`, `df_refresh_fraction` (fraction
+> of busy time attributable to DF STs). This makes PERF-3's < 1% CPU target
+> observable in production without custom monitoring.
+>
+> Verify: function returns non-NULL values after 5+ refresh cycles; assert
+> `df_refresh_fraction < 0.01` in the soak test context.
+> Dependencies: DF-D4. Schema change: No (new function only).
+
+**OPS-4 — `pgtrickle.explain_dag()` — Mermaid / DOT graph output**
+
+> Returns the full refresh DAG as a Mermaid markdown string (default) or
+> Graphviz DOT (via `format => 'dot'` argument). Node labels show ST name,
+> current mode, and refresh interval. Node colours: user STs = blue,
+> dog-feeding STs = green, suspended = red, fused = orange. Edges show
+> dependency direction. Validates that DF-1 → DF-2 → DF-3 ordering is
+> correct post-setup.
+>
+> Verify: `SELECT pgtrickle.explain_dag()` after `setup_dog_feeding()` returns
+> a string containing all five `df_` nodes in green with correct edges.
+> Dependencies: None. Schema change: No (new function only).
+
+**OPS-5 — `sql/dog_feeding_setup.sql` quick-start template**
+
+> A standalone SQL script in `sql/` that an operator can run with
+> `psql -f sql/dog_feeding_setup.sql`. Contents: calls `setup_dog_feeding()`,
+> sets `pg_trickle.dog_feeding_auto_apply = 'threshold_only'`, runs
+> `LISTEN pg_trickle_alert`, queries `dog_feeding_status()` for a status
+> summary, and queries `df_threshold_advice` for initial recommendations
+> with a warm-up note. Referenced from GETTING_STARTED.md Day 2 operations
+> section (UX-4).
+>
+> Verify: script executes without errors on a fresh install; produces visible
+> output showing 5 active DF STs. Dependencies: DF-F4, DF-G1, UX-4.
+> Schema change: No.
+
 ### Documentation & Safety
 
 | Item | Description | Effort | Ref |
@@ -5461,6 +5534,8 @@ Dependencies: DB-3 (uses schema version to determine needed migrations). Schema 
 | PERF-2 | Benchmark DF-1 vs `refresh_efficiency()` on 10 K history rows | S | P0 |
 | PERF-3 | Dog-feeding scheduler overhead target: < 1% of total CPU | S | P1 |
 | PERF-4 | DF-5 self-join uses bounded index scan, not seq-scan | S | P1 |
+| PERF-5 | History pruning batch-DELETE with short transactions (no CDC lock contention) | S | P1 |
+| PERF-6 | Columnar change tracking Phase 1 — CDC bitmask (deferred from v0.17/v0.18) | M | P1 |
 
 **PERF-1 — Index on `pgt_refresh_history(pgt_id, start_time)` for DF queries**
 
@@ -5510,6 +5585,34 @@ Dependencies: DB-3 (uses schema version to determine needed migrations). Schema 
 >
 > Verify: EXPLAIN of DF-5 query shows index scans on both sides of the JOIN.
 > Dependencies: PERF-1, DF-C2. Schema change: No.
+
+**PERF-5 — History pruning batch-DELETE with short transactions**
+
+> `pg_trickle.history_retention_days` cleanup (shipped in v0.19.0) currently
+> deletes rows in a single long transaction. Under dog-feeding, that transaction
+> holds a lock on `pgt_refresh_history` that can delay CDC trigger INSERTs.
+> Rewrite the purge as batched DELETEs: delete at most 500 rows per
+> transaction, commit between batches, sleep 50 ms between batches. The index
+> from PERF-1 ensures each batch is an index-range scan, not a seq-scan.
+>
+> Verify: soak test running history purge concurrently with DF CDC trigger
+> INSERTs; no lock wait timeout observed. Batch size configurable via
+> `pg_trickle.history_purge_batch_size` GUC (default 500).
+> Dependencies: PERF-1. Schema change: No.
+
+**PERF-6 — Columnar change tracking Phase 1 — CDC bitmask**
+
+> *Deferred from v0.17.0 (twice) and v0.18.0.* Dog-feeding now provides
+> concrete internal workload data that justifies the schema change. Phase 1
+> only: compute `changed_columns` bitmask (`old.col IS DISTINCT FROM new.col`)
+> in the CDC trigger for UPDATE rows; store as `int8` in the change buffer.
+> Phase 2 (delta-scan filtering using the bitmask) deferred to v0.22.0.
+> Gate behind `pg_trickle.columnar_tracking` GUC (default `off`). This is the
+> foundation for 50–90% delta volume reduction on wide-table UPDATE workloads.
+>
+> Verify: UPDATE a 20-column row, changing 2 columns; assert `changed_columns`
+> bitmask has exactly 2 bits set. `just check-upgrade-all` passes.
+> Dependencies: None. Schema change: Yes (change buffer schema addition + migration script).
 
 ---
 
@@ -5567,6 +5670,8 @@ Dependencies: DB-3 (uses schema version to determine needed migrations). Schema 
 | UX-3 | NOTIFY on anomaly via `pg_trickle_alert` channel | S | P1 |
 | UX-4 | GETTING_STARTED.md: "Day 2 operations" section | S | P1 |
 | UX-5 | `explain_st()` shows if a DF ST covers the queried stream table | XS | P2 |
+| UX-6 | `recommend_refresh_mode()` exposed in `explain_st()` JSON output | XS | P2 |
+| UX-7 | `scheduler_overhead()` output included in TUI diagnostics panel | XS | P2 |
 
 **UX-1 — `pgtrickle.dog_feeding_status()` diagnostic function**
 
@@ -5627,6 +5732,28 @@ Dependencies: DB-3 (uses schema version to determine needed migrations). Schema 
 >
 > Verify: `SELECT explain_st('any_table')` output includes a `dog_feeding`
 > field in the JSON output. Dependencies: UX-1. Schema change: No.
+
+**UX-6 — `recommend_refresh_mode()` exposed in `explain_st()` JSON output**
+
+> `explain_st()` already shows dog-feeding coverage (UX-5). Extend its JSON
+> output with a `recommended_mode` field reading from `df_threshold_advice`
+> (OPS-1). If OPS-1 is not available (no DF setup), fall back to `null` with
+> a `setup_dog_feeding()` hint. Keeps the single-function diagnostic surface
+> comprehensive without requiring separate calls.
+>
+> Verify: `SELECT explain_st('any_table')` JSON includes `recommended_mode`
+> and `mode_confidence` fields. Dependencies: OPS-1. Schema change: No.
+
+**UX-7 — `scheduler_overhead()` output included in TUI diagnostics panel**
+
+> The TUI (`pgtrickle-tui`) already shows refresh latency sparklines and ST
+> status. Add a diagnostics panel (toggle key `D`) showing the fields from
+> `scheduler_overhead()`: busy ratio, queue depth, and DF fraction as a
+> percentage. Gives operators hands-on observability without needing psql.
+>
+> Verify: TUI diagnostics panel shows all three scheduler overhead fields;
+> `df_refresh_fraction` updates after each DF refresh cycle.
+> Dependencies: OPS-3. Schema change: No.
 
 ---
 
@@ -5738,7 +5865,23 @@ Dependencies: DB-3 (uses schema version to determine needed migrations). Schema 
    may prefer a seq-scan. Consider adding `SET enable_seqscan = off` inside
    the DF stream table queries if plan stability is a concern.
 
-> **v0.20.0 total: ~1–2 weeks**
+6. **PERF-6 (columnar tracking) is a schema change — deferred twice already.**
+   The `changed_columns` column addition to all change buffer tables requires
+   a migration script. Gate strictly behind `pg_trickle.columnar_tracking = off`
+   default. If capacity is tight, PERF-6 can be cut from v0.20.0 without
+   affecting any other item — it shares no code paths with the DF pipeline.
+
+7. **OPS-2 (`check_cdc_health()` enrichment) has a fallback requirement.**
+   When `setup_dog_feeding()` has not been called, the function must fall back
+   to the old full-scan path without error. Guard with a catalog check for
+   `df_cdc_buffer_trends` existence before querying it.
+
+8. **OPS-4 (`explain_dag()`) output size.** At 100+ user STs the Mermaid output
+   may exceed typical terminal width. Offer `format => 'dot'` and `limit => N`
+   arguments to constrain output. Default `format => 'mermaid'` with a
+   `NOTICE` when DAG has > 20 nodes.
+
+> **v0.20.0 total: ~2–3 weeks**
 
 **Exit criteria:**
 - [ ] DF-F1: `pgt_refresh_history` receives CDC INSERT triggers when `create_stream_table()` is called
@@ -5771,6 +5914,13 @@ Dependencies: DB-3 (uses schema version to determine needed migrations). Schema 
 - [ ] TEST-2: Light E2E full cycle test passes
 - [ ] TEST-3: Upgrade E2E: history rows intact and index present after `0.19.0 → 0.20.0`
 - [ ] TEST-4: `check_cdc_health()` reports no anomalies for `df_*` tables after setup
+- [ ] OPS-1: `recommend_refresh_mode()` returns `mode` ∈ `{'DIFFERENTIAL','FULL','AUTO'}` and `confidence` ∈ `{'HIGH','MEDIUM','LOW'}`
+- [ ] OPS-2: `check_cdc_health()` returns spill-risk alert when buffer growth rate extrapolates to breach threshold within 2 cycles
+- [ ] OPS-3: `scheduler_overhead()` returns non-NULL fields after ≥ 5 refresh cycles; `df_refresh_fraction < 0.01` in soak test
+- [ ] OPS-4: `explain_dag()` output contains all five `df_*` nodes after `setup_dog_feeding()`
+- [ ] OPS-5: `sql/dog_feeding_setup.sql` executes without errors on a fresh install
+- [ ] PERF-5: Concurrent history purge + DF CDC INSERT produces no lock wait timeouts in soak test
+- [ ] PERF-6: `changed_columns` bitmask stored in change buffer for UPDATE rows when `columnar_tracking = on` (if included)
 - [ ] Extension upgrade path tested (`0.19.0 → 0.20.0`)
 - [ ] `just check-version-sync` passes
 
@@ -7799,7 +7949,7 @@ to keep the pre-1.0 milestones focused on performance and correctness.
 | v0.17.0 — Query Intelligence & Stability | ~2–3wk cost-based strategy + ~3–4wk columnar tracking + ~32–48h TIVM Phase 4 + ~1–2d ROWS FROM + ~2–3wk SQLancer + ~2–3wk incremental DAG + ~4–8h unsafe reduction + ~1–2wk api.rs mod + ~2–3d migration guide + ~3–5d runbook + ~2–3d playground + ~2–3d doc polish | — | |
 | v0.18.0 — Hardening & Delta Performance | ~70–100h | — | |
 | v0.19.0 — Production Gap Closure & Distribution | ~4–5 weeks | — | |
-| v0.20.0 — Dog-Feeding (pg_trickle monitors itself) | ~1–2wk | — | |
+| v0.20.0 — Dog-Feeding (pg_trickle monitors itself) | ~2–3wk | — | |
 | v0.21.0 — PostgreSQL 17 Support | ~2–4d | — | |
 | v0.22.0 — PGlite Proof of Concept | ~2–3wk (plugin) + ~1–2d (version bump) | — | |
 | v0.23.0 — Core Extraction (`pg_trickle_core`) | ~3–4wk (extraction) + ~1–2wk (abstraction + testing) | — | |
