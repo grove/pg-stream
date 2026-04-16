@@ -298,12 +298,20 @@ async fn test_dog_feeding_auto_apply_guc_exists() {
         .await;
     assert_eq!(value, "off", "default should be 'off'");
 
-    // Should accept valid values.
-    db.execute("SET pg_trickle.dog_feeding_auto_apply = 'threshold_only'")
-        .await;
-    let value: String = db
-        .query_scalar("SHOW pg_trickle.dog_feeding_auto_apply")
-        .await;
+    // Should accept valid values — acquire a single connection so the SET is
+    // visible to the subsequent SHOW (connection-pool dispatch can route them
+    // to different backends otherwise).
+    let value: String = {
+        let mut conn = db.pool.acquire().await.expect("acquire connection");
+        sqlx::query("SET pg_trickle.dog_feeding_auto_apply = 'threshold_only'")
+            .execute(&mut *conn)
+            .await
+            .expect("SET pg_trickle.dog_feeding_auto_apply");
+        sqlx::query_scalar("SHOW pg_trickle.dog_feeding_auto_apply")
+            .fetch_one(&mut *conn)
+            .await
+            .expect("SHOW pg_trickle.dog_feeding_auto_apply")
+    };
     assert_eq!(value, "threshold_only");
 }
 

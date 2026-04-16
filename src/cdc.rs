@@ -60,6 +60,24 @@ fn resolve_relation_name(source_oid: pg_sys::Oid) -> Result<Option<String>, PgTr
     .map_err(|e| PgTrickleError::SpiError(e.to_string()))
 }
 
+/// Returns true when the source table is INSERT-only by design and therefore
+/// requires only an INSERT CDC trigger (no UPDATE / DELETE triggers).
+///
+/// CORR-4: `pgtrickle.pgt_refresh_history` is an append-only audit log.
+/// Creating UPDATE/DELETE triggers on it would register non-insert CDC
+/// triggers, violating the invariant checked by `test_cdc_insert_only_trigger_on_refresh_history`.
+fn is_insert_only_table(source_oid: pg_sys::Oid) -> bool {
+    Spi::get_one_with_args::<bool>(
+        "SELECT n.nspname = 'pgtrickle' AND c.relname = 'pgt_refresh_history' \
+         FROM pg_class c \
+         JOIN pg_namespace n ON n.oid = c.relnamespace \
+         WHERE c.oid = $1",
+        &[source_oid.into()],
+    )
+    .unwrap_or(Some(false))
+    .unwrap_or(false)
+}
+
 /// Create a CDC trigger on a source table.
 ///
 /// Dispatches to statement-level (`FOR EACH STATEMENT … REFERENCING NEW TABLE
@@ -98,6 +116,10 @@ pub fn create_change_trigger(
     // PostgreSQL does NOT allow combining INSERT OR UPDATE OR DELETE in a single
     // FOR EACH STATEMENT trigger that also declares REFERENCING transition tables.
     // Statement mode therefore creates 3 per-event triggers.
+    //
+    // CORR-4: INSERT-only tables (e.g. pgt_refresh_history) must not receive
+    // UPDATE or DELETE CDC triggers — only an INSERT trigger is registered.
+    let insert_only = is_insert_only_table(source_oid);
     let mode = config::pg_trickle_cdc_trigger_mode();
     match mode {
         config::CdcTriggerMode::Statement => {
@@ -109,18 +131,20 @@ pub fn create_change_trigger(
                     e
                 ))
             })?;
-            Spi::run(&upd_fn).map_err(|e| {
-                PgTrickleError::SpiError(format!(
-                    "Failed to create CDC UPDATE trigger function: {}",
-                    e
-                ))
-            })?;
-            Spi::run(&del_fn).map_err(|e| {
-                PgTrickleError::SpiError(format!(
-                    "Failed to create CDC DELETE trigger function: {}",
-                    e
-                ))
-            })?;
+            if !insert_only {
+                Spi::run(&upd_fn).map_err(|e| {
+                    PgTrickleError::SpiError(format!(
+                        "Failed to create CDC UPDATE trigger function: {}",
+                        e
+                    ))
+                })?;
+                Spi::run(&del_fn).map_err(|e| {
+                    PgTrickleError::SpiError(format!(
+                        "Failed to create CDC DELETE trigger function: {}",
+                        e
+                    ))
+                })?;
+            }
             Spi::run(&format!(
                 "CREATE TRIGGER pg_trickle_cdc_ins_{oid} \
                  AFTER INSERT ON {table} \
@@ -136,47 +160,55 @@ pub fn create_change_trigger(
                     source_table, e
                 ))
             })?;
-            Spi::run(&format!(
-                "CREATE TRIGGER pg_trickle_cdc_upd_{oid} \
-                 AFTER UPDATE ON {table} \
-                 REFERENCING NEW TABLE AS __pgt_new OLD TABLE AS __pgt_old \
-                 FOR EACH STATEMENT EXECUTE FUNCTION {cs}.pg_trickle_cdc_upd_fn_{oid}()",
-                oid = oid_u32,
-                table = source_table,
-                cs = change_schema,
-            ))
-            .map_err(|e| {
-                PgTrickleError::SpiError(format!(
-                    "Failed to create CDC UPDATE trigger on {}: {}",
-                    source_table, e
+            if !insert_only {
+                Spi::run(&format!(
+                    "CREATE TRIGGER pg_trickle_cdc_upd_{oid} \
+                     AFTER UPDATE ON {table} \
+                     REFERENCING NEW TABLE AS __pgt_new OLD TABLE AS __pgt_old \
+                     FOR EACH STATEMENT EXECUTE FUNCTION {cs}.pg_trickle_cdc_upd_fn_{oid}()",
+                    oid = oid_u32,
+                    table = source_table,
+                    cs = change_schema,
                 ))
-            })?;
-            Spi::run(&format!(
-                "CREATE TRIGGER pg_trickle_cdc_del_{oid} \
-                 AFTER DELETE ON {table} \
-                 REFERENCING OLD TABLE AS __pgt_old \
-                 FOR EACH STATEMENT EXECUTE FUNCTION {cs}.pg_trickle_cdc_del_fn_{oid}()",
-                oid = oid_u32,
-                table = source_table,
-                cs = change_schema,
-            ))
-            .map_err(|e| {
-                PgTrickleError::SpiError(format!(
-                    "Failed to create CDC DELETE trigger on {}: {}",
-                    source_table, e
+                .map_err(|e| {
+                    PgTrickleError::SpiError(format!(
+                        "Failed to create CDC UPDATE trigger on {}: {}",
+                        source_table, e
+                    ))
+                })?;
+                Spi::run(&format!(
+                    "CREATE TRIGGER pg_trickle_cdc_del_{oid} \
+                     AFTER DELETE ON {table} \
+                     REFERENCING OLD TABLE AS __pgt_old \
+                     FOR EACH STATEMENT EXECUTE FUNCTION {cs}.pg_trickle_cdc_del_fn_{oid}()",
+                    oid = oid_u32,
+                    table = source_table,
+                    cs = change_schema,
                 ))
-            })?;
+                .map_err(|e| {
+                    PgTrickleError::SpiError(format!(
+                        "Failed to create CDC DELETE trigger on {}: {}",
+                        source_table, e
+                    ))
+                })?;
+            }
         }
         config::CdcTriggerMode::Row => {
             let fn_sql = build_row_trigger_fn_sql(change_schema, oid_u32, pk_columns, columns);
             Spi::run(&fn_sql).map_err(|e| {
                 PgTrickleError::SpiError(format!("Failed to create CDC trigger function: {}", e))
             })?;
+            let dml_events = if insert_only {
+                "INSERT"
+            } else {
+                "INSERT OR UPDATE OR DELETE"
+            };
             Spi::run(&format!(
                 "CREATE TRIGGER {trigger} \
-                 AFTER INSERT OR UPDATE OR DELETE ON {table} \
+                 AFTER {events} ON {table} \
                  FOR EACH ROW EXECUTE FUNCTION {cs}.pg_trickle_cdc_fn_{oid}()",
                 trigger = trigger_name,
+                events = dml_events,
                 table = source_table,
                 cs = change_schema,
                 oid = oid_u32,
@@ -1997,6 +2029,9 @@ pub fn rebuild_cdc_trigger(
         let _ = Spi::run(&format!("DROP TRIGGER IF EXISTS {trig} ON {source_table}")); // nosemgrep: rust.spi.run.dynamic-format — DDL cannot be parameterized; trig is an oid_u32 integer, source_table is a regclass-quoted identifier.
     }
 
+    // CORR-4: pgt_refresh_history is INSERT-only; skip UPDATE/DELETE triggers.
+    let insert_only = is_insert_only_table(source_oid);
+
     // 3. Create new trigger(s) matching the current mode.
     match mode {
         config::CdcTriggerMode::Statement => {
@@ -2015,43 +2050,51 @@ pub fn rebuild_cdc_trigger(
                     source_table, e
                 ))
             })?;
-            Spi::run(&format!(
-                "CREATE TRIGGER pg_trickle_cdc_upd_{oid} \
-                 AFTER UPDATE ON {table} \
-                 REFERENCING NEW TABLE AS __pgt_new OLD TABLE AS __pgt_old \
-                 FOR EACH STATEMENT EXECUTE FUNCTION {cs}.pg_trickle_cdc_upd_fn_{oid}()",
-                oid = oid_u32,
-                table = source_table,
-                cs = change_schema,
-            ))
-            .map_err(|e| {
-                PgTrickleError::SpiError(format!(
-                    "Failed to create CDC UPDATE trigger on {}: {}",
-                    source_table, e
+            if !insert_only {
+                Spi::run(&format!(
+                    "CREATE TRIGGER pg_trickle_cdc_upd_{oid} \
+                     AFTER UPDATE ON {table} \
+                     REFERENCING NEW TABLE AS __pgt_new OLD TABLE AS __pgt_old \
+                     FOR EACH STATEMENT EXECUTE FUNCTION {cs}.pg_trickle_cdc_upd_fn_{oid}()",
+                    oid = oid_u32,
+                    table = source_table,
+                    cs = change_schema,
                 ))
-            })?;
-            Spi::run(&format!(
-                "CREATE TRIGGER pg_trickle_cdc_del_{oid} \
-                 AFTER DELETE ON {table} \
-                 REFERENCING OLD TABLE AS __pgt_old \
-                 FOR EACH STATEMENT EXECUTE FUNCTION {cs}.pg_trickle_cdc_del_fn_{oid}()",
-                oid = oid_u32,
-                table = source_table,
-                cs = change_schema,
-            ))
-            .map_err(|e| {
-                PgTrickleError::SpiError(format!(
-                    "Failed to create CDC DELETE trigger on {}: {}",
-                    source_table, e
+                .map_err(|e| {
+                    PgTrickleError::SpiError(format!(
+                        "Failed to create CDC UPDATE trigger on {}: {}",
+                        source_table, e
+                    ))
+                })?;
+                Spi::run(&format!(
+                    "CREATE TRIGGER pg_trickle_cdc_del_{oid} \
+                     AFTER DELETE ON {table} \
+                     REFERENCING OLD TABLE AS __pgt_old \
+                     FOR EACH STATEMENT EXECUTE FUNCTION {cs}.pg_trickle_cdc_del_fn_{oid}()",
+                    oid = oid_u32,
+                    table = source_table,
+                    cs = change_schema,
                 ))
-            })?;
+                .map_err(|e| {
+                    PgTrickleError::SpiError(format!(
+                        "Failed to create CDC DELETE trigger on {}: {}",
+                        source_table, e
+                    ))
+                })?;
+            }
         }
         config::CdcTriggerMode::Row => {
+            let dml_events = if insert_only {
+                "INSERT"
+            } else {
+                "INSERT OR UPDATE OR DELETE"
+            };
             Spi::run(&format!(
                 "CREATE TRIGGER pg_trickle_cdc_{oid} \
-                 AFTER INSERT OR UPDATE OR DELETE ON {table} \
+                 AFTER {events} ON {table} \
                  FOR EACH ROW EXECUTE FUNCTION {cs}.pg_trickle_cdc_fn_{oid}()",
                 oid = oid_u32,
+                events = dml_events,
                 table = source_table,
                 cs = change_schema,
             ))
