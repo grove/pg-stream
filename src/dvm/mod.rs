@@ -910,28 +910,26 @@ fn split_top_level_union_all(query: &str) -> Option<Vec<String>> {
             b'"' => in_double_quote = true,
             b'(' => depth += 1,
             b')' => depth -= 1,
-            _ if depth == 0 => {
-                // Look for keyword UNION at a word boundary.
-                if i + 5 <= len
-                    && bytes[i..i + 5].eq_ignore_ascii_case(b"UNION")
-                    && (i == 0 || !(bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_'))
+            _ if depth == 0
+                && i + 5 <= len
+                && bytes[i..i + 5].eq_ignore_ascii_case(b"UNION")
+                && (i == 0 || !(bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_')) =>
+            {
+                // Skip whitespace after "UNION"
+                let mut j = i + 5;
+                while j < len && bytes[j].is_ascii_whitespace() {
+                    j += 1;
+                }
+                // Check for "ALL" keyword
+                if j + 3 <= len
+                    && bytes[j..j + 3].eq_ignore_ascii_case(b"ALL")
+                    && (j + 3 >= len
+                        || !(bytes[j + 3].is_ascii_alphanumeric() || bytes[j + 3] == b'_'))
                 {
-                    // Skip whitespace after "UNION"
-                    let mut j = i + 5;
-                    while j < len && bytes[j].is_ascii_whitespace() {
-                        j += 1;
-                    }
-                    // Check for "ALL" keyword
-                    if j + 3 <= len
-                        && bytes[j..j + 3].eq_ignore_ascii_case(b"ALL")
-                        && (j + 3 >= len
-                            || !(bytes[j + 3].is_ascii_alphanumeric() || bytes[j + 3] == b'_'))
-                    {
-                        parts.push(query[last_split..i].trim().to_string());
-                        last_split = j + 3;
-                        i = j + 3;
-                        continue;
-                    }
+                    parts.push(query[last_split..i].trim().to_string());
+                    last_split = j + 3;
+                    i = j + 3;
+                    continue;
                 }
             }
             _ => {}
@@ -991,31 +989,30 @@ fn replace_top_level_union_with_union_all(query: &str) -> Option<String> {
             b'"' => in_double_quote = true,
             b'(' => depth += 1,
             b')' => depth -= 1,
-            _ if depth == 0 => {
+            _ if depth == 0
                 // Look for UNION keyword at word boundary
-                if i + 5 <= len
-                    && bytes[i..i + 5].eq_ignore_ascii_case(b"UNION")
-                    && (i == 0 || !(bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_'))
-                    && (i + 5 >= len
-                        || !(bytes[i + 5].is_ascii_alphanumeric() || bytes[i + 5] == b'_'))
-                {
-                    // Skip whitespace after UNION
-                    let mut j = i + 5;
-                    while j < len && bytes[j].is_ascii_whitespace() {
-                        j += 1;
-                    }
-                    // Check if NOT followed by ALL
-                    let has_all = j + 3 <= len
-                        && bytes[j..j + 3].eq_ignore_ascii_case(b"ALL")
-                        && (j + 3 >= len
-                            || !(bytes[j + 3].is_ascii_alphanumeric() || bytes[j + 3] == b'_'));
-                    if !has_all {
-                        // Insert " ALL" after UNION
-                        result.push_str(&query[last_copy..i + 5]);
-                        result.push_str(" ALL");
-                        last_copy = i + 5;
-                        found = true;
-                    }
+                && i + 5 <= len
+                && bytes[i..i + 5].eq_ignore_ascii_case(b"UNION")
+                && (i == 0 || !(bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_'))
+                && (i + 5 >= len
+                    || !(bytes[i + 5].is_ascii_alphanumeric() || bytes[i + 5] == b'_')) =>
+            {
+                // Skip whitespace after UNION
+                let mut j = i + 5;
+                while j < len && bytes[j].is_ascii_whitespace() {
+                    j += 1;
+                }
+                // Check if NOT followed by ALL
+                let has_all = j + 3 <= len
+                    && bytes[j..j + 3].eq_ignore_ascii_case(b"ALL")
+                    && (j + 3 >= len
+                        || !(bytes[j + 3].is_ascii_alphanumeric() || bytes[j + 3] == b'_'));
+                if !has_all {
+                    // Insert " ALL" after UNION
+                    result.push_str(&query[last_copy..i + 5]);
+                    result.push_str(" ALL");
+                    last_copy = i + 5;
+                    found = true;
                 }
             }
             _ => {}

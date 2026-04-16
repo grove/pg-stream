@@ -329,27 +329,12 @@ pub(crate) fn deparse_select_stmt_with_view_subs(
     // Handle set operations: deparse each arm separately
     if s.op != pg_sys::SetOperation::SETOP_NONE {
         let op_str = match s.op {
-            pg_sys::SetOperation::SETOP_UNION => {
-                if s.all {
-                    "UNION ALL"
-                } else {
-                    "UNION"
-                }
-            }
-            pg_sys::SetOperation::SETOP_INTERSECT => {
-                if s.all {
-                    "INTERSECT ALL"
-                } else {
-                    "INTERSECT"
-                }
-            }
-            pg_sys::SetOperation::SETOP_EXCEPT => {
-                if s.all {
-                    "EXCEPT ALL"
-                } else {
-                    "EXCEPT"
-                }
-            }
+            pg_sys::SetOperation::SETOP_UNION if s.all => "UNION ALL",
+            pg_sys::SetOperation::SETOP_UNION => "UNION",
+            pg_sys::SetOperation::SETOP_INTERSECT if s.all => "INTERSECT ALL",
+            pg_sys::SetOperation::SETOP_INTERSECT => "INTERSECT",
+            pg_sys::SetOperation::SETOP_EXCEPT if s.all => "EXCEPT ALL",
+            pg_sys::SetOperation::SETOP_EXCEPT => "EXCEPT",
             _ => "UNION",
         };
 
@@ -632,34 +617,14 @@ fn deparse_from_item_with_view_subs(
         let right = deparse_from_item_with_view_subs(join.rarg, subs)?;
 
         let join_type = match join.jointype {
-            pg_sys::JoinType::JOIN_INNER => {
-                if join.isNatural {
-                    "NATURAL JOIN"
-                } else {
-                    "JOIN"
-                }
-            }
-            pg_sys::JoinType::JOIN_LEFT => {
-                if join.isNatural {
-                    "NATURAL LEFT JOIN"
-                } else {
-                    "LEFT JOIN"
-                }
-            }
-            pg_sys::JoinType::JOIN_FULL => {
-                if join.isNatural {
-                    "NATURAL FULL JOIN"
-                } else {
-                    "FULL JOIN"
-                }
-            }
-            pg_sys::JoinType::JOIN_RIGHT => {
-                if join.isNatural {
-                    "NATURAL RIGHT JOIN"
-                } else {
-                    "RIGHT JOIN"
-                }
-            }
+            pg_sys::JoinType::JOIN_INNER if join.isNatural => "NATURAL JOIN",
+            pg_sys::JoinType::JOIN_INNER => "JOIN",
+            pg_sys::JoinType::JOIN_LEFT if join.isNatural => "NATURAL LEFT JOIN",
+            pg_sys::JoinType::JOIN_LEFT => "LEFT JOIN",
+            pg_sys::JoinType::JOIN_FULL if join.isNatural => "NATURAL FULL JOIN",
+            pg_sys::JoinType::JOIN_FULL => "FULL JOIN",
+            pg_sys::JoinType::JOIN_RIGHT if join.isNatural => "NATURAL RIGHT JOIN",
+            pg_sys::JoinType::JOIN_RIGHT => "RIGHT JOIN",
             _ => "JOIN",
         };
 
@@ -816,30 +781,26 @@ fn check_from_item_for_matview_or_foreign(node: *mut pg_sys::Node) -> Result<(),
         let relkind = resolve_relkind(&schema, &relname)?;
 
         match relkind.as_deref() {
-            Some("m") => {
-                if !crate::config::pg_trickle_matview_polling() {
-                    return Err(PgTrickleError::UnsupportedOperator(format!(
-                        "Materialized view '{schema}.{relname}' cannot be used as a source in \
-                         DIFFERENTIAL mode. Materialized views are stale snapshots — CDC triggers \
-                         cannot track REFRESH MATERIALIZED VIEW. Use the underlying query directly, \
-                         or switch to FULL refresh mode. \
-                         Alternatively, enable polling-based CDC with: \
-                         SET pg_trickle.matview_polling = on;"
-                    )));
-                }
+            Some("m") if !crate::config::pg_trickle_matview_polling() => {
+                return Err(PgTrickleError::UnsupportedOperator(format!(
+                    "Materialized view '{schema}.{relname}' cannot be used as a source in \
+                     DIFFERENTIAL mode. Materialized views are stale snapshots — CDC triggers \
+                     cannot track REFRESH MATERIALIZED VIEW. Use the underlying query directly, \
+                     or switch to FULL refresh mode. \
+                     Alternatively, enable polling-based CDC with: \
+                     SET pg_trickle.matview_polling = on;"
+                )));
             }
-            Some("f") => {
-                if !crate::config::pg_trickle_foreign_table_polling() {
-                    return Err(PgTrickleError::UnsupportedOperator(format!(
-                        "Foreign table '{schema}.{relname}' cannot be used as a source in \
-                         DIFFERENTIAL or IMMEDIATE mode. Row-level triggers cannot be created \
-                         on foreign tables. Use FULL refresh mode instead, which re-queries \
-                         the foreign table on each refresh cycle. For postgres_fdw tables, \
-                         consider using IMPORT FOREIGN SCHEMA to keep the local schema in sync. \
-                         Alternatively, enable polling-based CDC with: \
-                         SET pg_trickle.foreign_table_polling = on;"
-                    )));
-                }
+            Some("f") if !crate::config::pg_trickle_foreign_table_polling() => {
+                return Err(PgTrickleError::UnsupportedOperator(format!(
+                    "Foreign table '{schema}.{relname}' cannot be used as a source in \
+                     DIFFERENTIAL or IMMEDIATE mode. Row-level triggers cannot be created \
+                     on foreign tables. Use FULL refresh mode instead, which re-queries \
+                     the foreign table on each refresh cycle. For postgres_fdw tables, \
+                     consider using IMPORT FOREIGN SCHEMA to keep the local schema in sync. \
+                     Alternatively, enable polling-based CDC with: \
+                     SET pg_trickle.foreign_table_polling = on;"
+                )));
             }
             _ => {}
         }
@@ -3977,13 +3938,8 @@ fn rewrite_from_item_rows_from(node: *mut pg_sys::Node) -> Result<String, PgTric
             pg_sys::JoinType::JOIN_LEFT => "LEFT JOIN",
             pg_sys::JoinType::JOIN_FULL => "FULL JOIN",
             pg_sys::JoinType::JOIN_RIGHT => "RIGHT JOIN",
-            pg_sys::JoinType::JOIN_INNER => {
-                if join.quals.is_null() {
-                    "CROSS JOIN"
-                } else {
-                    "JOIN"
-                }
-            }
+            pg_sys::JoinType::JOIN_INNER if join.quals.is_null() => "CROSS JOIN",
+            pg_sys::JoinType::JOIN_INNER => "JOIN",
             _ => "JOIN",
         };
         let on_clause = if join.quals.is_null() {
@@ -4034,27 +3990,12 @@ fn rewrite_rows_from_in_set_op(select: &pg_sys::SelectStmt) -> Result<String, Pg
     };
 
     let op_str = match select.op {
-        pg_sys::SetOperation::SETOP_UNION => {
-            if select.all {
-                "UNION ALL"
-            } else {
-                "UNION"
-            }
-        }
-        pg_sys::SetOperation::SETOP_INTERSECT => {
-            if select.all {
-                "INTERSECT ALL"
-            } else {
-                "INTERSECT"
-            }
-        }
-        pg_sys::SetOperation::SETOP_EXCEPT => {
-            if select.all {
-                "EXCEPT ALL"
-            } else {
-                "EXCEPT"
-            }
-        }
+        pg_sys::SetOperation::SETOP_UNION if select.all => "UNION ALL",
+        pg_sys::SetOperation::SETOP_UNION => "UNION",
+        pg_sys::SetOperation::SETOP_INTERSECT if select.all => "INTERSECT ALL",
+        pg_sys::SetOperation::SETOP_INTERSECT => "INTERSECT",
+        pg_sys::SetOperation::SETOP_EXCEPT if select.all => "EXCEPT ALL",
+        pg_sys::SetOperation::SETOP_EXCEPT => "EXCEPT",
         _ => "UNION",
     };
 
@@ -4726,13 +4667,8 @@ fn from_item_to_sql(node: *mut pg_sys::Node) -> Result<String, PgTrickleError> {
             pg_sys::JoinType::JOIN_LEFT => "LEFT JOIN",
             pg_sys::JoinType::JOIN_FULL => "FULL JOIN",
             pg_sys::JoinType::JOIN_RIGHT => "RIGHT JOIN",
-            pg_sys::JoinType::JOIN_INNER => {
-                if join.quals.is_null() {
-                    "CROSS JOIN"
-                } else {
-                    "JOIN"
-                }
-            }
+            pg_sys::JoinType::JOIN_INNER if join.quals.is_null() => "CROSS JOIN",
+            pg_sys::JoinType::JOIN_INNER => "JOIN",
             _ => "JOIN",
         };
         let on_clause = if join.quals.is_null() {
@@ -5033,21 +4969,19 @@ pub(crate) fn strip_order_by_and_limit(query: &str) -> String {
                     i += 1;
                 }
             }
-            b'O' if depth == 0 => {
+            b'O' if depth == 0 && upper[i..].starts_with("ORDER") => {
                 // Check for "ORDER BY" at this position
-                if upper[i..].starts_with("ORDER") {
-                    let after_order = i + 5;
-                    if after_order < bytes.len() && bytes[after_order].is_ascii_whitespace() {
-                        // Skip whitespace
-                        let mut j = after_order;
-                        while j < bytes.len() && bytes[j].is_ascii_whitespace() {
-                            j += 1;
-                        }
-                        if upper[j..].starts_with("BY")
-                            && (j + 2 >= bytes.len() || !bytes[j + 2].is_ascii_alphanumeric())
-                        {
-                            last_order_by_pos = Some(i);
-                        }
+                let after_order = i + 5;
+                if after_order < bytes.len() && bytes[after_order].is_ascii_whitespace() {
+                    // Skip whitespace
+                    let mut j = after_order;
+                    while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+                        j += 1;
+                    }
+                    if upper[j..].starts_with("BY")
+                        && (j + 2 >= bytes.len() || !bytes[j + 2].is_ascii_alphanumeric())
+                    {
+                        last_order_by_pos = Some(i);
                     }
                 }
             }
@@ -5548,11 +5482,8 @@ fn collect_expr_source_aliases(expr: &Expr, tree: &OpTree, aliases: &mut Vec<Str
         Expr::ColumnRef {
             table_alias: Some(tbl),
             column_name: _,
-        } => {
-            // Verify the alias exists somewhere in the tree
-            if scan_has_alias(tree, tbl) {
-                aliases.push(tbl.clone());
-            }
+        } if scan_has_alias(tree, tbl) => {
+            aliases.push(tbl.clone());
         }
         Expr::ColumnRef {
             table_alias: None,

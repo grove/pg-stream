@@ -307,7 +307,7 @@ pub fn replace_column_refs_in_raw(sql: &str, child_cols: &[String]) -> String {
 
     // Sort by length descending to replace longer names first (avoid
     // partial matches, e.g., "o_orderkey" before "o_order")
-    col_map.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
+    col_map.sort_by_key(|b| std::cmp::Reverse(b.0.len()));
 
     // Deduplicate: if multiple CTE columns map to the same base name
     // (ambiguous), skip those entries.
