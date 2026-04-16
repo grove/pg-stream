@@ -1378,6 +1378,106 @@ AS 'MODULE_PATHNAME', 'export_definition_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
+
+-- src/api/diagnostics.rs:61
+-- pg_trickle::api::diagnostics::migrate
+CREATE  FUNCTION pgtrickle."migrate"() RETURNS TEXT /* alloc::string::String */
+STRICT 
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'migrate_wrapper';
+/* </end connected objects> */
+
+/* <begin connected objects> */
+
+-- src/api/diagnostics.rs:19
+-- pg_trickle::api::diagnostics::version_check
+CREATE  FUNCTION pgtrickle."version_check"() RETURNS TEXT /* alloc::string::String */
+STRICT 
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'version_check_wrapper';
+/* </end connected objects> */
+
+/* <begin connected objects> */
+
+-- src/api/mod.rs:3993
+-- pg_trickle::api::write_and_refresh
+CREATE  FUNCTION pgtrickle."write_and_refresh"(
+        "sql" TEXT, /* &str */
+        "stream_table_name" TEXT /* &str */
+) RETURNS void
+STRICT 
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'write_and_refresh_wrapper';
+/* </end connected objects> */
+
+/* <begin connected objects> */
+
+-- src/api/dog_feeding.rs
+-- pg_trickle::api::dog_feeding::setup_dog_feeding
+CREATE  FUNCTION pgtrickle."setup_dog_feeding"() RETURNS void
+STRICT 
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'setup_dog_feeding_wrapper';
+/* </end connected objects> */
+
+/* <begin connected objects> */
+
+-- src/api/dog_feeding.rs
+-- pg_trickle::api::dog_feeding::teardown_dog_feeding
+CREATE  FUNCTION pgtrickle."teardown_dog_feeding"() RETURNS void
+STRICT 
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'teardown_dog_feeding_wrapper';
+/* </end connected objects> */
+
+/* <begin connected objects> */
+
+-- src/api/dog_feeding.rs
+-- pg_trickle::api::dog_feeding::dog_feeding_status
+CREATE  FUNCTION pgtrickle."dog_feeding_status"() RETURNS TABLE (
+        "st_name" TEXT,  /* alloc::string::String */
+        "exists" bool,  /* bool */
+        "status" TEXT,  /* core::option::Option<alloc::string::String> */
+        "refresh_mode" TEXT,  /* core::option::Option<alloc::string::String> */
+        "last_refresh_at" TEXT,  /* core::option::Option<alloc::string::String> */
+        "total_refreshes" bigint  /* core::option::Option<i64> */
+)
+STRICT  
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'dog_feeding_status_wrapper';
+/* </end connected objects> */
+
+/* <begin connected objects> */
+
+-- src/api/dog_feeding.rs
+-- pg_trickle::api::dog_feeding::scheduler_overhead
+CREATE  FUNCTION pgtrickle."scheduler_overhead"() RETURNS TABLE (
+        "total_refreshes_1h" bigint,  /* i64 */
+        "df_refreshes_1h" bigint,  /* i64 */
+        "df_refresh_fraction" float8,  /* core::option::Option<f64> */
+        "avg_refresh_ms" float8,  /* core::option::Option<f64> */
+        "avg_df_refresh_ms" float8,  /* core::option::Option<f64> */
+        "total_refresh_time_s" float8,  /* core::option::Option<f64> */
+        "df_refresh_time_s" float8  /* core::option::Option<f64> */
+)
+STRICT  
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'scheduler_overhead_wrapper';
+/* </end connected objects> */
+
+/* <begin connected objects> */
+
+-- src/api/dog_feeding.rs
+-- pg_trickle::api::dog_feeding::explain_dag
+CREATE  FUNCTION pgtrickle."explain_dag"(
+        "format" TEXT DEFAULT 'mermaid' /* core::option::Option<&str> */
+) RETURNS TEXT /* core::option::Option<alloc::string::String> */
+STRICT  
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'explain_dag_wrapper';
+/* </end connected objects> */
+
+/* <begin connected objects> */
 -- src/lib.rs:614
 -- requires:
 --   _signal_launcher_rescan

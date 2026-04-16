@@ -31,3 +31,70 @@ END $$;
 ALTER TABLE pgtrickle.pgt_refresh_history
     ADD CONSTRAINT pgt_refresh_history_initiated_by_check
     CHECK (initiated_by IN ('SCHEDULER', 'MANUAL', 'INITIAL', 'DOG_FEED'));
+
+-- ── New functions in 0.20.0 ────────────────────────────────────────────────
+-- These functions were added in 0.19.0 (migrate, version_check, write_and_refresh)
+-- and 0.20.0 (dog-feeding API). Use CREATE OR REPLACE so the script is
+-- idempotent for upgrade chains that already passed through 0.18→0.19.
+
+CREATE OR REPLACE FUNCTION pgtrickle."migrate"() RETURNS TEXT
+STRICT
+LANGUAGE c
+AS 'MODULE_PATHNAME', 'migrate_wrapper';
+
+CREATE OR REPLACE FUNCTION pgtrickle."version_check"() RETURNS TEXT
+STRICT
+LANGUAGE c
+AS 'MODULE_PATHNAME', 'version_check_wrapper';
+
+CREATE OR REPLACE FUNCTION pgtrickle."write_and_refresh"(
+    "sql" TEXT,
+    "stream_table_name" TEXT
+) RETURNS void
+STRICT
+LANGUAGE c
+AS 'MODULE_PATHNAME', 'write_and_refresh_wrapper';
+
+-- ── DF: Dog-feeding API (0.20.0) ───────────────────────────────────────────
+
+CREATE OR REPLACE FUNCTION pgtrickle."setup_dog_feeding"() RETURNS void
+STRICT
+LANGUAGE c
+AS 'MODULE_PATHNAME', 'setup_dog_feeding_wrapper';
+
+CREATE OR REPLACE FUNCTION pgtrickle."teardown_dog_feeding"() RETURNS void
+STRICT
+LANGUAGE c
+AS 'MODULE_PATHNAME', 'teardown_dog_feeding_wrapper';
+
+CREATE OR REPLACE FUNCTION pgtrickle."dog_feeding_status"() RETURNS TABLE (
+    "st_name" TEXT,
+    "exists" bool,
+    "status" TEXT,
+    "refresh_mode" TEXT,
+    "last_refresh_at" TEXT,
+    "total_refreshes" bigint
+)
+STRICT
+LANGUAGE c
+AS 'MODULE_PATHNAME', 'dog_feeding_status_wrapper';
+
+CREATE OR REPLACE FUNCTION pgtrickle."scheduler_overhead"() RETURNS TABLE (
+    "total_refreshes_1h" bigint,
+    "df_refreshes_1h" bigint,
+    "df_refresh_fraction" float8,
+    "avg_refresh_ms" float8,
+    "avg_df_refresh_ms" float8,
+    "total_refresh_time_s" float8,
+    "df_refresh_time_s" float8
+)
+STRICT
+LANGUAGE c
+AS 'MODULE_PATHNAME', 'scheduler_overhead_wrapper';
+
+CREATE OR REPLACE FUNCTION pgtrickle."explain_dag"(
+    "format" TEXT DEFAULT 'mermaid'
+) RETURNS TEXT
+STRICT
+LANGUAGE c
+AS 'MODULE_PATHNAME', 'explain_dag_wrapper';

@@ -90,10 +90,9 @@ async fn run_id_cancellation(seed: u64, config: TraceConfig) {
         // Insert some rows, then immediately delete them — all within one
         // refresh window. The net change is zero.
         let n_phantom = rng.usize_range(1, 6);
-        let mut next_phantom_id = (cycle as i32) * 100_000;
-        for _ in 0..n_phantom {
-            next_phantom_id += 1;
-            let pid = next_phantom_id;
+        let phantom_id_base = (cycle as i32) * 100_000;
+        for (i, _) in (0..n_phantom).enumerate() {
+            let pid = phantom_id_base + (i as i32) + 1;
             let grp = *rng.choose(&groups);
             let val = rng.i32_range(1, 100);
             db.execute(&format!(

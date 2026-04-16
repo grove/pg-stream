@@ -1377,6 +1377,39 @@ AS 'MODULE_PATHNAME', 'export_definition_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
+
+-- src/api/diagnostics.rs:61
+-- pg_trickle::api::diagnostics::migrate
+CREATE  FUNCTION pgtrickle."migrate"() RETURNS TEXT /* alloc::string::String */
+STRICT 
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'migrate_wrapper';
+/* </end connected objects> */
+
+/* <begin connected objects> */
+
+-- src/api/diagnostics.rs:19
+-- pg_trickle::api::diagnostics::version_check
+CREATE  FUNCTION pgtrickle."version_check"() RETURNS TEXT /* alloc::string::String */
+STRICT 
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'version_check_wrapper';
+/* </end connected objects> */
+
+/* <begin connected objects> */
+
+-- src/api/mod.rs:3993
+-- pg_trickle::api::write_and_refresh
+CREATE  FUNCTION pgtrickle."write_and_refresh"(
+        "sql" TEXT, /* &str */
+        "stream_table_name" TEXT /* &str */
+) RETURNS void
+STRICT 
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'write_and_refresh_wrapper';
+/* </end connected objects> */
+
+/* <begin connected objects> */
 -- src/lib.rs:614
 -- requires:
 --   _signal_launcher_rescan
