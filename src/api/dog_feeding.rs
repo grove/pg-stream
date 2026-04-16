@@ -449,12 +449,24 @@ fn scheduler_overhead_impl() -> Result<
     )>,
     PgTrickleError,
 > {
+    // Use a flat subquery instead of a CTE to avoid potential pgrx SPI
+    // issues with CTE materialization in certain execution contexts.
     Spi::connect(|client| {
         let result = client
             .select(
-                "WITH stats AS (
+                "SELECT
+                    total_refs,
+                    df_refs,
+                    CASE WHEN total_refs > 0
+                         THEN df_refs::float8 / total_refs::float8
+                         ELSE NULL END AS df_fraction,
+                    avg_ms,
+                    avg_df_ms,
+                    total_s,
+                    df_total_s
+                 FROM (
                     SELECT
-                        count(*) AS total_refreshes,
+                        count(*)::bigint AS total_refs,
                         count(*) FILTER (
                             WHERE EXISTS (
                                 SELECT 1 FROM pgtrickle.pgt_stream_tables st
@@ -462,9 +474,9 @@ fn scheduler_overhead_impl() -> Result<
                                   AND st.pgt_schema = 'pgtrickle'
                                   AND st.pgt_name LIKE 'df_%'
                             )
-                        ) AS df_refreshes,
-                        avg(EXTRACT(EPOCH FROM (h.end_time - h.start_time)) * 1000) AS avg_ms,
-                        avg(EXTRACT(EPOCH FROM (h.end_time - h.start_time)) * 1000) FILTER (
+                        )::bigint AS df_refs,
+                        avg(EXTRACT(EPOCH FROM (h.end_time - h.start_time)) * 1000.0) AS avg_ms,
+                        avg(EXTRACT(EPOCH FROM (h.end_time - h.start_time)) * 1000.0) FILTER (
                             WHERE EXISTS (
                                 SELECT 1 FROM pgtrickle.pgt_stream_tables st
                                 WHERE st.pgt_id = h.pgt_id
@@ -484,18 +496,7 @@ fn scheduler_overhead_impl() -> Result<
                     FROM pgtrickle.pgt_refresh_history h
                     WHERE h.status = 'COMPLETED'
                       AND h.start_time > now() - interval '1 hour'
-                )
-                SELECT
-                    total_refreshes,
-                    df_refreshes,
-                    CASE WHEN total_refreshes > 0
-                         THEN df_refreshes::float / total_refreshes
-                         ELSE NULL END,
-                    avg_ms,
-                    avg_df_ms,
-                    total_s,
-                    df_total_s
-                FROM stats",
+                 ) sub",
                 None,
                 &[],
             )

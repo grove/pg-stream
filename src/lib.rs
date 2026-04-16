@@ -334,6 +334,8 @@ CREATE TABLE IF NOT EXISTS pgtrickle.pgt_refresh_history (
 );
 
 CREATE INDEX IF NOT EXISTS idx_hist_pgt_ts ON pgtrickle.pgt_refresh_history (pgt_id, data_timestamp);
+-- PERF-1: Fast lookup by (pgt_id, start_time) for dog-feeding and scheduler_overhead queries.
+CREATE INDEX IF NOT EXISTS idx_hist_pgt_start ON pgtrickle.pgt_refresh_history (pgt_id, start_time);
 
 -- Per-source CDC slot tracking
 CREATE TABLE IF NOT EXISTS pgtrickle.pgt_change_tracking (

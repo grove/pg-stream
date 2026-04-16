@@ -590,11 +590,10 @@ async fn test_scheduling_interference_detects_overlap() {
     db.refresh_st("pgtrickle.df_scheduling_interference").await;
 
     // The interference table should exist and be queryable.
+    // Use EXISTS rather than LIMIT … UNION ALL which is invalid PostgreSQL syntax
+    // (LIMIT before UNION requires parentheses around the first SELECT).
     let queryable: bool = db
-        .query_scalar(
-            "SELECT true FROM pgtrickle.df_scheduling_interference LIMIT 1 \
-             UNION ALL SELECT true LIMIT 1",
-        )
+        .query_scalar("SELECT EXISTS (SELECT 1 FROM pgtrickle.df_scheduling_interference)")
         .await;
     assert!(
         queryable,
