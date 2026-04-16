@@ -181,7 +181,7 @@ fn df_st_config(name: &str) -> (&'static str, &'static str) {
         "df_efficiency_rolling" => ("48s", "AUTO"),
         "df_anomaly_signals" => ("48s", "AUTO"),
         "df_threshold_advice" => ("96s", "AUTO"),
-        "df_cdc_buffer_trends" => ("48s", "AUTO"),
+        "df_cdc_buffer_trends" => ("48s", "FULL"),
         "df_scheduling_interference" => ("96s", "FULL"),
         _ => ("60s", "AUTO"),
     }
