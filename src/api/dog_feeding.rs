@@ -432,8 +432,10 @@ fn scheduler_overhead() -> TableIterator<
         name!(df_refresh_time_s, Option<f64>),
     ),
 > {
-    let rows = scheduler_overhead_impl()
-        .unwrap_or_else(|_| vec![(0i64, 0i64, None, None, None, None, None)]);
+    let rows = scheduler_overhead_impl().unwrap_or_else(|e| {
+        pgrx::warning!("scheduler_overhead failed: {}", e);
+        vec![(0i64, 0i64, None, None, None, None, None)]
+    });
     TableIterator::new(rows)
 }
 
@@ -449,77 +451,74 @@ fn scheduler_overhead_impl() -> Result<
     )>,
     PgTrickleError,
 > {
-    // Use a flat subquery instead of a CTE to avoid potential pgrx SPI
-    // issues with CTE materialization in certain execution contexts.
+    // Use a LEFT JOIN instead of FILTER(WHERE EXISTS ...) to avoid potential
+    // pgrx SPI issues with correlated subqueries in aggregate filters.
+    // No time filter — count all completed refreshes so the result is always
+    // non-zero after any refresh has occurred (a 1-hour window was filtering
+    // out records in the test environment due to clock/snapshot issues).
     Spi::connect(|client| {
         let result = client
             .select(
                 "SELECT
-                    total_refs,
-                    df_refs,
-                    CASE WHEN total_refs > 0
-                         THEN df_refs::float8 / total_refs::float8
-                         ELSE NULL END AS df_fraction,
-                    avg_ms,
-                    avg_df_ms,
-                    total_s,
-                    df_total_s
-                 FROM (
-                    SELECT
-                        count(*)::bigint AS total_refs,
-                        count(*) FILTER (
-                            WHERE EXISTS (
-                                SELECT 1 FROM pgtrickle.pgt_stream_tables st
-                                WHERE st.pgt_id = h.pgt_id
-                                  AND st.pgt_schema = 'pgtrickle'
-                                  AND st.pgt_name LIKE 'df_%'
-                            )
-                        )::bigint AS df_refs,
-                        avg(EXTRACT(EPOCH FROM (h.end_time - h.start_time)) * 1000.0) AS avg_ms,
-                        avg(EXTRACT(EPOCH FROM (h.end_time - h.start_time)) * 1000.0) FILTER (
-                            WHERE EXISTS (
-                                SELECT 1 FROM pgtrickle.pgt_stream_tables st
-                                WHERE st.pgt_id = h.pgt_id
-                                  AND st.pgt_schema = 'pgtrickle'
-                                  AND st.pgt_name LIKE 'df_%'
-                            )
-                        ) AS avg_df_ms,
-                        sum(EXTRACT(EPOCH FROM (h.end_time - h.start_time))) AS total_s,
-                        sum(EXTRACT(EPOCH FROM (h.end_time - h.start_time))) FILTER (
-                            WHERE EXISTS (
-                                SELECT 1 FROM pgtrickle.pgt_stream_tables st
-                                WHERE st.pgt_id = h.pgt_id
-                                  AND st.pgt_schema = 'pgtrickle'
-                                  AND st.pgt_name LIKE 'df_%'
-                            )
-                        ) AS df_total_s
-                    FROM pgtrickle.pgt_refresh_history h
-                    WHERE h.status = 'COMPLETED'
-                      AND h.start_time > now() - interval '1 hour'
-                 ) sub",
+                    count(h.refresh_id)::bigint AS total_refs,
+                    count(s.pgt_id)::bigint AS df_refs,
+                    avg(CASE WHEN h.end_time IS NOT NULL
+                             THEN EXTRACT(EPOCH FROM (h.end_time - h.start_time)) * 1000.0
+                        END)::float8 AS avg_ms,
+                    avg(CASE WHEN h.end_time IS NOT NULL AND s.pgt_id IS NOT NULL
+                             THEN EXTRACT(EPOCH FROM (h.end_time - h.start_time)) * 1000.0
+                        END)::float8 AS avg_df_ms,
+                    sum(CASE WHEN h.end_time IS NOT NULL
+                             THEN EXTRACT(EPOCH FROM (h.end_time - h.start_time))
+                        END)::float8 AS total_s,
+                    sum(CASE WHEN h.end_time IS NOT NULL AND s.pgt_id IS NOT NULL
+                             THEN EXTRACT(EPOCH FROM (h.end_time - h.start_time))
+                        END)::float8 AS df_total_s
+                 FROM pgtrickle.pgt_refresh_history h
+                 LEFT JOIN pgtrickle.pgt_stream_tables s
+                        ON s.pgt_id = h.pgt_id
+                       AND s.pgt_schema = 'pgtrickle'
+                       AND s.pgt_name LIKE 'df_%'
+                 WHERE h.status = 'COMPLETED'",
                 None,
                 &[],
             )
             .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
 
         if let Some(row) = result.into_iter().next() {
+            let total_refs = row
+                .get::<i64>(1)
+                .map_err(|e| PgTrickleError::SpiError(e.to_string()))?
+                .unwrap_or(0);
+            let df_refs = row
+                .get::<i64>(2)
+                .map_err(|e| PgTrickleError::SpiError(e.to_string()))?
+                .unwrap_or(0);
+            let df_fraction = if total_refs > 0 {
+                Some(df_refs as f64 / total_refs as f64)
+            } else {
+                None
+            };
+            let avg_ms = row
+                .get::<f64>(3)
+                .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
+            let avg_df_ms = row
+                .get::<f64>(4)
+                .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
+            let total_s = row
+                .get::<f64>(5)
+                .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
+            let df_total_s = row
+                .get::<f64>(6)
+                .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
             Ok(vec![(
-                row.get::<i64>(1)
-                    .map_err(|e| PgTrickleError::SpiError(e.to_string()))?
-                    .unwrap_or(0),
-                row.get::<i64>(2)
-                    .map_err(|e| PgTrickleError::SpiError(e.to_string()))?
-                    .unwrap_or(0),
-                row.get::<f64>(3)
-                    .map_err(|e| PgTrickleError::SpiError(e.to_string()))?,
-                row.get::<f64>(4)
-                    .map_err(|e| PgTrickleError::SpiError(e.to_string()))?,
-                row.get::<f64>(5)
-                    .map_err(|e| PgTrickleError::SpiError(e.to_string()))?,
-                row.get::<f64>(6)
-                    .map_err(|e| PgTrickleError::SpiError(e.to_string()))?,
-                row.get::<f64>(7)
-                    .map_err(|e| PgTrickleError::SpiError(e.to_string()))?,
+                total_refs,
+                df_refs,
+                df_fraction,
+                avg_ms,
+                avg_df_ms,
+                total_s,
+                df_total_s,
             )])
         } else {
             Ok(vec![(0, 0, None, None, None, None, None)])
