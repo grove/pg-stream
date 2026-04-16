@@ -435,11 +435,12 @@ async fn test_upgrade_preserves_refresh_history() {
     assert!(hist >= 1, "TEST-3: history rows must survive upgrade");
 
     // Verify initiated_by CHECK allows DOG_FEED.
+    // data_timestamp is NOT NULL in pgt_refresh_history; use now() for a SKIP row.
     db.execute(
         "INSERT INTO pgtrickle.pgt_refresh_history \
-         (pgt_id, start_time, action, status, delta_row_count, \
+         (pgt_id, data_timestamp, start_time, action, status, delta_row_count, \
           rows_inserted, initiated_by) \
-         SELECT pgt_id, now(), 'SKIP', 'COMPLETED', 0, 0, 'DOG_FEED' \
+         SELECT pgt_id, now(), now(), 'SKIP', 'COMPLETED', 0, 0, 'DOG_FEED' \
          FROM pgtrickle.pgt_stream_tables LIMIT 1",
     )
     .await;
