@@ -1,12 +1,15 @@
 """
 pg_trickle demo — e-commerce scenario generator.
 
-Inserts ~1 order per second continuously.  Occasional "flash sale" bursts
-drive a spike of orders for one category (mirrors the fraud burst pattern).
+Demonstrates differential refresh effectiveness by generating:
+  - Slow, steady order stream (1 order every 2-4 seconds)
+  - Skewed customer/product distribution (80/20 rule: 20% of customers/products
+    account for 80% of orders)
+  - Infrequent price updates (every ~300 cycles, ~15+ minutes)
+  - Occasional "flash sale" bursts to show spikes in specific categories
 
-Also updates one product's price in product_catalog every ~30 cycles,
-demonstrating differential efficiency in catalog_price_impact
-(change ratio ~0.07 — only 1 of 15 product rows changes per cycle).
+Result: Stream table aggregates have low change ratios (~0.1-0.3) where
+differential refresh significantly outperforms full refresh.
 """
 
 import random
@@ -15,14 +18,18 @@ import time
 import psycopg2
 
 # Price multiplier range (discount/premium) applied during normal orders
-PRICE_VARIANCE = 0.15  # ±15% from current catalog price
+PRICE_VARIANCE = 0.10  # ±10% from current catalog price (reduced for stability)
 
 # Price drift applied when a product "reprices" (slowly-changing dimension)
-PRICE_DRIFT_PCT = (-0.20, 0.20)  # –20% to +20% from base_price
+PRICE_DRIFT_PCT = (-0.10, 0.10)  # –10% to +10% from base_price (reduced range)
 
-PRICE_UPDATE_INTERVAL = 30  # reprice one product every ~N cycles
-FLASH_SALE_INTERVAL   = 45  # trigger a flash sale every ~N cycles
-FLASH_SALE_SIZE       = (8, 18)  # orders in a flash sale burst
+PRICE_UPDATE_INTERVAL = 300  # reprice one product every ~N cycles (~15 min)
+FLASH_SALE_INTERVAL   = 180  # trigger a flash sale every ~N cycles (~9 min)
+FLASH_SALE_SIZE       = (12, 25)  # orders in a flash sale burst
+
+# Order generation intervals (seconds) — slowed down significantly
+ORDER_INTERVAL_NORMAL = (2.0, 4.0)  # normal orders: every 2-4 seconds
+ORDER_INTERVAL_FLASH  = (0.15, 0.35)  # flash sale burst: rapid sequence
 
 
 def fetch_lookups(conn):
@@ -88,9 +95,19 @@ def run(conn) -> None:
     product_by_id = {p[0]: p for p in products}  # id → (id, base, current, cat_id)
     all_product_ids = [p[0] for p in products]
 
+    # Implement 80/20 distribution: 20% of customers/products drive 80% of activity.
+    # This creates stable aggregates where only a few rows change per cycle,
+    # showcasing differential refresh effectiveness.
+    top_20pct = int(max(1, len(customers) * 0.20))
+    active_customers = customers[:top_20pct]  # First 20% (typically lower IDs)
+    
+    top_20pct_prod = int(max(1, len(products) * 0.20))
+    active_products = all_product_ids[:top_20pct_prod]
+
     print(
-        f"[GENERATOR] ecommerce: {len(customers)} customers, "
-        f"{len(products)} products. Starting stream…",
+        f"[GENERATOR] ecommerce: {len(customers)} total customers "
+        f"({len(active_customers)} active), {len(products)} total products "
+        f"({len(active_products)} active). Starting stream…",
         flush=True,
     )
 
@@ -115,6 +132,7 @@ def run(conn) -> None:
                 )
 
         # Price update: slowly-changing dimension
+        # Much less frequent to keep catalog_price_impact more stable
         if cycle % PRICE_UPDATE_INTERVAL == 0:
             pid, base, current, cat_id = random.choice(products)
             try:
@@ -125,24 +143,26 @@ def run(conn) -> None:
 
         try:
             if flash_remaining > 0 and flash_products:
+                # During flash sale: use any customer, but flash sale products
                 customer_id  = random.choice(customers)
                 product_id   = random.choice(flash_products)
                 quantity     = random.randint(1, 3)
                 _, base, current, _ = product_by_id[product_id]
-                # Flash sale = discounted price (70–90% of current)
-                unit_price   = current * random.uniform(0.70, 0.90)
+                # Flash sale = discounted price (70–85% of current, slightly tighter)
+                unit_price   = current * random.uniform(0.70, 0.85)
                 flash_remaining -= 1
                 if flash_remaining == 0:
                     flash_category = None
                     flash_products = []
-                sleep_s = random.uniform(0.10, 0.35)
+                sleep_s = random.uniform(*ORDER_INTERVAL_FLASH)
             else:
-                customer_id  = random.choice(customers)
-                product_id   = random.choice(all_product_ids)
+                # Normal orders: prefer active customers and products (80/20 rule)
+                customer_id  = random.choice(active_customers)
+                product_id   = random.choice(active_products)
                 quantity     = random.randint(1, 2)
                 _, base, current, _ = product_by_id[product_id]
                 unit_price   = sample_price(current)
-                sleep_s = random.uniform(0.7, 1.5)
+                sleep_s = random.uniform(*ORDER_INTERVAL_NORMAL)
 
             order_id = insert_order(conn, customer_id, product_id, quantity, unit_price)
             print(
