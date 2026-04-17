@@ -6052,7 +6052,37 @@ Dependencies: DB-3 (uses schema version to determine needed migrations). Schema 
 | PG17-12 | **Update docs and README.** Change "PostgreSQL 18 extension" to "PostgreSQL 17/18 extension" in `README.md`, `INSTALL.md`, `src/lib.rs` doc comments, and `ARCHITECTURE.md`. | 1–2h | — |
 | PG17-13 | **Docker Hub image variants.** Publish images tagged with both PG versions (e.g., `:0.20.0-pg17`, `:0.20.0-pg18`). | 2–4h | — |
 
-> **v0.21.0 total: ~2–4 days**
+### PostgreSQL 18/19 Feature Integration
+
+Low-hanging PostgreSQL feature opportunities identified in [plans/sql/PLAN_POSTGRESQL_FEATURES.md](plans/sql/PLAN_POSTGRESQL_FEATURES.md). These are quick wins with minimal code effort or documentation-only updates.
+
+#### Documentation-Only Items (Zero Code)
+
+| Item | Description | Effort | Ref |
+|------|-------------|--------|-----|
+| PGFEAT-1 | **Document `extension_control_path` in INSTALL.md.** Add `extension_control_path` GUC as an alternative to the default `sharedir` for non-standard installations (NixOS, custom Kubernetes init containers). | 30min | [PLAN_POSTGRESQL_FEATURES.md](plans/sql/PLAN_POSTGRESQL_FEATURES.md#low-extension_control_path) |
+| PGFEAT-2 | **Update CONFIGURATION.md for idle replication slot timeout.** Document PG 18's `idle_replication_slot_timeout` GUC and its interaction with pg_trickle's WAL-mode CDC. Add health check note. | 1h | [PLAN_POSTGRESQL_FEATURES.md](plans/sql/PLAN_POSTGRESQL_FEATURES.md#low-idle-replication-slot-timeout) |
+| PGFEAT-3 | **Verify & document logical replication of generated columns.** Confirm WAL decoder correctly handles stored generated columns in change buffer schemas. Add E2E test and documentation note. | 1–2h | [PLAN_POSTGRESQL_FEATURES.md](plans/sql/PLAN_POSTGRESQL_FEATURES.md#low-logical-replication-of-generated-columns) |
+
+#### Code Changes (Low Effort)
+
+| Item | Description | Effort | Ref |
+|------|-------------|--------|-----|
+| PGFEAT-4 | **Add NOT ENFORCED constraints to storage tables.** Add `NOT ENFORCED` foreign keys and check constraints during `CREATE EXTENSION` and stream table creation to document relationships (FK to source) and invariants (`__pgt_count > 0`) without runtime overhead. | 2–3h | [PLAN_POSTGRESQL_FEATURES.md](plans/sql/PLAN_POSTGRESQL_FEATURES.md#high-not-enforced-constraints) |
+| PGFEAT-5 | **AIO subsystem benchmarking.** Re-run E2E refresh benchmarks on PG 18 with `io_method = io_uring` (Linux) enabled. Document recommended settings in CONFIGURATION.md and BENCHMARK.md. | 3–4h | [PLAN_POSTGRESQL_FEATURES.md](plans/sql/PLAN_POSTGRESQL_FEATURES.md#high-asynchronous-io-subsystem) |
+
+#### Additional PostgreSQL 18 Features
+
+| Item | Description | Effort | Ref |
+|------|-------------|--------|-----|
+| PGFEAT-6 | **PG_MODULE_MAGIC_EXT support.** Adopt `PG_MODULE_MAGIC_EXT` in `lib.rs` to expose pg_trickle's version via the standard PostgreSQL interface. Enables third-party monitoring tools (pgwatch, Datadog, cloud providers) to discover pg_trickle version. Requires pgrx 0.17.x support first (verify). | 1h | [PLAN_POSTGRESQL_FEATURES.md](plans/sql/PLAN_POSTGRESQL_FEATURES.md#medium-pg_module_magic_ext) |
+| PGFEAT-7 | **Skip Scan index optimization evaluation.** Evaluate multi-column B-tree indexes on change buffer tables `(source_relid, change_lsn)` to enable skip scan for multi-source delta lookups. Run `EXPLAIN` benchmarks on existing delta queries to quantify benefit. Create indexes if beneficial. | 2–3h | [PLAN_POSTGRESQL_FEATURES.md](plans/sql/PLAN_POSTGRESQL_FEATURES.md#medium-skip-scan-for-b-tree-indexes) |
+| PGFEAT-8 | **OLD/NEW in MERGE RETURNING integration.** Refactor `build_merge_sql()` in `src/refresh.rs` to use `MERGE ... RETURNING OLD.*, NEW.*` for capturing displaced rows in a single round-trip. Eliminates separate pre-refresh snapshots for ST-to-ST change buffers. Improves full-refresh delta computation performance. | 4–6h | [PLAN_POSTGRESQL_FEATURES.md](plans/sql/PLAN_POSTGRESQL_FEATURES.md#high-oldnew-in-returning-for-merge) |
+| PGFEAT-9 | **Virtual generated columns CDC support.** Verify and test that pg_trickle's trigger-based CDC correctly excludes virtual generated columns from change buffer schemas. Update `resolve_referenced_column_defs()` function if needed. Add E2E tests with virtual generated column sources and storage tables. | 4–6h | [PLAN_POSTGRESQL_FEATURES.md](plans/sql/PLAN_POSTGRESQL_FEATURES.md#high-virtual-generated-columns) |
+
+> **PostgreSQL feature integration subtotal: ~4–5 hours** (PGFEAT-1 through PGFEAT-5) **+ ~10–18 hours** (PGFEAT-6 through PGFEAT-9, optional but recommended)
+
+> **v0.21.0 total: ~2–4 days** (PG 17 support) **+ ~14–23 hours** (PostgreSQL feature integration, all items)
 
 **Exit criteria:**
 - [ ] PG17-1: `cargo build --features pg17 --no-default-features` compiles cleanly
@@ -6063,6 +6093,15 @@ Dependencies: DB-3 (uses schema version to determine needed migrations). Schema 
 - [ ] PG17-10: TPC-H differential refresh matches full refresh on PG 17
 - [ ] PG17-11: Extension upgrade path works on both PG 17 and PG 18
 - [ ] PG17-12: Documentation reflects PG 17/18 dual support
+- [ ] PGFEAT-1: INSTALL.md documents `extension_control_path` alternative
+- [ ] PGFEAT-2: CONFIGURATION.md documents `idle_replication_slot_timeout` interaction
+- [ ] PGFEAT-3: WAL decoder tested with stored generated columns; E2E test passes
+- [ ] PGFEAT-4: Storage tables have NOT ENFORCED FK and CHECK constraints; no runtime overhead
+- [ ] PGFEAT-5: E2E refresh benchmarks run with `io_method = io_uring`; CONFIGURATION.md updated with recommended settings
+- [ ] PGFEAT-6: `PG_MODULE_MAGIC_EXT` integrated (once pgrx supports it); version discoverable via `pg_get_loaded_modules()`
+- [ ] PGFEAT-7: Skip scan index optimization evaluated; benchmarks quantify benefit; indexes created if beneficial
+- [ ] PGFEAT-8: `MERGE ... RETURNING OLD.*, NEW.*` integrated in `build_merge_sql()`; ST-to-ST change buffer performance improved
+- [ ] PGFEAT-9: Virtual generated columns correctly excluded from CDC change buffer schemas; E2E tests pass with virtual column sources
 - [ ] Extension upgrade path tested (`0.20.0 → 0.21.0`)
 - [ ] `just check-version-sync` passes
 
