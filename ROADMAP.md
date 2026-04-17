@@ -1,7 +1,7 @@
 # pg_trickle — Project Roadmap
 
-> **Last updated:** 2026-04-13
-> **Latest release:** 0.19.0 (2026-04-13)
+> **Last updated:** 2026-04-17
+> **Latest release:** 0.20.0 (2026-04-15)
 > **Current milestone:** v0.21.0 — Correctness, Safety & Test Hardening
 
 For a concise description of what pg_trickle is and why it exists, read
@@ -5967,49 +5967,49 @@ Dependencies: DB-3 (uses schema version to determine needed migrations). Schema 
 > **v0.20.0 total: ~3–4 weeks**
 
 **Exit criteria:**
-- [ ] DF-F1: `pgt_refresh_history` receives CDC INSERT triggers when `create_stream_table()` is called
-- [ ] DF-F2: `df_efficiency_rolling` created and refreshes correctly in DIFFERENTIAL mode
-- [ ] DF-F3: DF-1 output matches `refresh_efficiency()` results on synthetic history
-- [ ] DF-F4: `setup_dog_feeding()` creates all five `df_*` stream tables in one call
-- [ ] DF-F5: `teardown_dog_feeding()` drops all `df_*` tables cleanly with no orphaned triggers
-- [ ] DF-A1: `df_anomaly_signals` created and detects 3× duration spikes
-- [ ] DF-A2: `df_threshold_advice` provides HIGH-confidence recommendations after ≥ 20 refresh cycles
-- [ ] DF-A3: DAG ensures DF-1 refreshes before DF-2 and DF-3 in every scheduler tick
-- [ ] DF-C1: `df_cdc_buffer_trends` created (FULL or DIFFERENTIAL mode)
-- [ ] DF-C2: `df_scheduling_interference` detects overlapping concurrent refreshes
-- [ ] DF-G1: `pg_trickle.dog_feeding_auto_apply` GUC registered with default `off`
-- [ ] DF-G2: Auto-apply adjusts threshold with ≥ 1 confirmed change in E2E test
-- [ ] DF-G5: Rate limiting verified — no more than 1 change per ST per 10 minutes
-- [ ] DF-D3: Suspending all `df_*` STs does not affect control-plane operation
-- [ ] CORR-1: `df_threshold_advice` output always within [0.01, 0.80] (property test)
-- [ ] CORR-2: No false-positive DURATION_SPIKE on first-ever refresh of a new ST
-- [ ] CORR-3: `avg_change_ratio` is NULL or in [0, 1] for zero-delta sources
-- [ ] CORR-4: Only INSERT triggers (no UPDATE/DELETE) on `pgt_refresh_history`
-- [ ] STAB-1: `setup_dog_feeding()` called 3× produces no errors and no duplicates
-- [ ] STAB-2: Auto-apply worker logs WARNING (not panic) when ALTER target disappears
-- [ ] STAB-3: DROP EXTENSION + CREATE EXTENSION + `setup_dog_feeding()` cycle works cleanly
-- [ ] PERF-1: `pgt_refresh_history(pgt_id, start_time)` index exists and is used by DF queries
-- [ ] PERF-2: DF-1 read ≥ 5× faster than `refresh_efficiency()` at 10 K history rows
-- [ ] UX-1: `pgtrickle.dog_feeding_status()` returns correct status for all five DF STs
-- [ ] UX-2: `setup_dog_feeding()` emits warm-up NOTICE when history has < 50 rows
-- [ ] UX-3: `pg_trickle_alert` NOTIFY received within one DF cycle after a 3× duration spike
-- [ ] TEST-1: Proptest for DF-3 threshold bounds passes 10,000 iterations
-- [ ] TEST-2: Light E2E full cycle test passes
-- [ ] TEST-3: Upgrade E2E: history rows intact and index present after `0.19.0 → 0.20.0`
-- [ ] TEST-4: `check_cdc_health()` reports no anomalies for `df_*` tables after setup
-- [ ] OPS-1: `recommend_refresh_mode()` returns `mode` ∈ `{'DIFFERENTIAL','FULL','AUTO'}` and `confidence` ∈ `{'HIGH','MEDIUM','LOW'}`
-- [ ] OPS-2: `check_cdc_health()` returns spill-risk alert when buffer growth rate extrapolates to breach threshold within 2 cycles
-- [ ] OPS-3: `scheduler_overhead()` returns non-NULL fields after ≥ 5 refresh cycles; `df_refresh_fraction < 0.01` in soak test
-- [ ] OPS-4: `explain_dag()` output contains all five `df_*` nodes after `setup_dog_feeding()`
-- [ ] OPS-5: `sql/dog_feeding_setup.sql` executes without errors on a fresh install
-- [ ] PERF-5: Concurrent history purge + DF CDC INSERT produces no lock wait timeouts in soak test
-- [ ] PERF-6: `changed_columns` bitmask stored in change buffer for UPDATE rows when `columnar_tracking = on` (if included)
-- [ ] OPS-6: Soak test shows lower `overlap_count` in DF-5 with workload-aware poll enabled vs disabled
-- [ ] DASH-1: `docker compose up` in `monitoring/` loads pg_trickle_dog_feeding dashboard; all 5 panels show data
-- [ ] DBT-1: `pgtrickle_enable_monitoring` macro runs twice without error; `dog_feeding_status()` shows 5 active STs after both calls
-- [ ] UX-8: `df_threshold_advice.sla_breach_risk = true` when `avg_diff_ms > freshness_deadline_ms` on synthetic data
-- [ ] Extension upgrade path tested (`0.19.0 → 0.20.0`)
-- [ ] `just check-version-sync` passes
+- [x] DF-F1: `pgt_refresh_history` receives CDC INSERT triggers when `create_stream_table()` is called
+- [x] DF-F2: `df_efficiency_rolling` created and refreshes correctly in DIFFERENTIAL mode
+- [x] DF-F3: DF-1 output matches `refresh_efficiency()` results on synthetic history
+- [x] DF-F4: `setup_dog_feeding()` creates all five `df_*` stream tables in one call
+- [x] DF-F5: `teardown_dog_feeding()` drops all `df_*` tables cleanly with no orphaned triggers
+- [x] DF-A1: `df_anomaly_signals` created and detects 3× duration spikes
+- [x] DF-A2: `df_threshold_advice` provides HIGH-confidence recommendations after ≥ 20 refresh cycles
+- [x] DF-A3: DAG ensures DF-1 refreshes before DF-2 and DF-3 in every scheduler tick
+- [x] DF-C1: `df_cdc_buffer_trends` created (FULL or DIFFERENTIAL mode)
+- [x] DF-C2: `df_scheduling_interference` detects overlapping concurrent refreshes
+- [x] DF-G1: `pg_trickle.dog_feeding_auto_apply` GUC registered with default `off`
+- [x] DF-G2: Auto-apply adjusts threshold with ≥ 1 confirmed change in E2E test
+- [x] DF-G5: Rate limiting verified — no more than 1 change per ST per 10 minutes
+- [x] DF-D3: Suspending all `df_*` STs does not affect control-plane operation
+- [x] CORR-1: `df_threshold_advice` output always within [0.01, 0.80] (property test)
+- [x] CORR-2: No false-positive DURATION_SPIKE on first-ever refresh of a new ST
+- [x] CORR-3: `avg_change_ratio` is NULL or in [0, 1] for zero-delta sources
+- [x] CORR-4: Only INSERT triggers (no UPDATE/DELETE) on `pgt_refresh_history`
+- [x] STAB-1: `setup_dog_feeding()` called 3× produces no errors and no duplicates
+- [x] STAB-2: Auto-apply worker logs WARNING (not panic) when ALTER target disappears
+- [x] STAB-3: DROP EXTENSION + CREATE EXTENSION + `setup_dog_feeding()` cycle works cleanly
+- [x] PERF-1: `pgt_refresh_history(pgt_id, start_time)` index exists and is used by DF queries
+- [x] PERF-2: DF-1 read ≥ 5× faster than `refresh_efficiency()` at 10 K history rows
+- [x] UX-1: `pgtrickle.dog_feeding_status()` returns correct status for all five DF STs
+- [x] UX-2: `setup_dog_feeding()` emits warm-up NOTICE when history has < 50 rows
+- [x] UX-3: `pg_trickle_alert` NOTIFY received within one DF cycle after a 3× duration spike
+- [x] TEST-1: Proptest for DF-3 threshold bounds passes 10,000 iterations
+- [x] TEST-2: Light E2E full cycle test passes
+- [x] TEST-3: Upgrade E2E: history rows intact and index present after `0.19.0 → 0.20.0`
+- [x] TEST-4: `check_cdc_health()` reports no anomalies for `df_*` tables after setup
+- [x] OPS-1: `recommend_refresh_mode()` returns `mode` ∈ `{'DIFFERENTIAL','FULL','AUTO'}` and `confidence` ∈ `{'HIGH','MEDIUM','LOW'}`
+- [x] OPS-2: `check_cdc_health()` returns spill-risk alert when buffer growth rate extrapolates to breach threshold within 2 cycles
+- [x] OPS-3: `scheduler_overhead()` returns non-NULL fields after ≥ 5 refresh cycles; `df_refresh_fraction < 0.01` in soak test
+- [x] OPS-4: `explain_dag()` output contains all five `df_*` nodes after `setup_dog_feeding()`
+- [x] OPS-5: `sql/dog_feeding_setup.sql` executes without errors on a fresh install
+- [x] PERF-5: Concurrent history purge + DF CDC INSERT produces no lock wait timeouts in soak test
+- [x] PERF-6: `changed_columns` bitmask stored in change buffer for UPDATE rows when `columnar_tracking = on` (if included)
+- [x] OPS-6: Soak test shows lower `overlap_count` in DF-5 with workload-aware poll enabled vs disabled
+- [x] DASH-1: `docker compose up` in `monitoring/` loads pg_trickle_dog_feeding dashboard; all 5 panels show data
+- [x] DBT-1: `pgtrickle_enable_monitoring` macro runs twice without error; `dog_feeding_status()` shows 5 active STs after both calls
+- [x] UX-8: `df_threshold_advice.sla_breach_risk = true` when `avg_diff_ms > freshness_deadline_ms` on synthetic data
+- [x] Extension upgrade path tested (`0.19.0 → 0.20.0`)
+- [x] `just check-version-sync` passes
 
 ---
 
