@@ -38,12 +38,13 @@ coverage, all in plain language.
 - [v0.19.0 — Production Gap Closure & Distribution](#v0190--production-gap-closure--distribution)
 - [v0.20.0 — Dog-Feeding](#v0200--dog-feeding-pg_trickle-monitors-itself)
 - [v0.21.0 — Correctness, Safety & Test Hardening](#v0210--correctness-safety--test-hardening)
-- [v0.22.0 — TUI Dog-Feeding Integration](#v0220--tui-dog-feeding-integration)
-- [v0.23.0 — PostgreSQL 17 Support](#v0230--postgresql-17-support)
-- [v0.24.0 — PGlite Proof of Concept](#v0240--pglite-proof-of-concept)
-- [v0.25.0 — Core Extraction (`pg_trickle_core`)](#v0250--core-extraction-pg_trickle_core)
-- [v0.26.0 — PGlite WASM Extension](#v0260--pglite-wasm-extension)
-- [v0.27.0 — PGlite Reactive Integration](#v0270--pglite-reactive-integration)
+- [v0.22.0 — Production Scalability & Downstream Integration](#v0220--production-scalability--downstream-integration)
+- [v0.23.0 — TUI Dog-Feeding Integration](#v0230--tui-dog-feeding-integration)
+- [v0.24.0 — PostgreSQL 17 Support](#v0240--postgresql-17-support)
+- [v0.25.0 — PGlite Proof of Concept](#v0250--pglite-proof-of-concept)
+- [v0.26.0 — Core Extraction (`pg_trickle_core`)](#v0260--core-extraction-pg_trickle_core)
+- [v0.27.0 — PGlite WASM Extension](#v0270--pglite-wasm-extension)
+- [v0.28.0 — PGlite Reactive Integration](#v0280--pglite-reactive-integration)
 - [v1.0.0 — Stable Release](#v100--stable-release)
 - [Post-1.0 — Scale, Ecosystem & Platform Expansion](#post-10--scale-ecosystem--platform-expansion)
 - [Effort Summary](#effort-summary)
@@ -87,12 +88,13 @@ from the v0.1.x series to 1.0 and beyond.
 | **v0.19.0** | **Production gap closure & distribution** | **✅ Released** |
 | **v0.20.0** | **Dog-feeding (pg_trickle monitors itself)** | **✅ Released** |
 | v0.21.0 | Correctness, safety & test hardening | Planned |
-| v0.22.0 | TUI dog-feeding integration | Planned |
-| v0.23.0 | PostgreSQL 17 support | Planned |
-| v0.24.0 | PGlite proof of concept | Planned |
-| v0.25.0 | Core extraction (`pg_trickle_core`) | Planned |
-| v0.26.0 | PGlite WASM extension | Planned |
-| v0.27.0 | PGlite reactive integration | Planned |
+| v0.22.0 | Production scalability & downstream integration | Planned |
+| v0.23.0 | TUI dog-feeding integration | Planned |
+| v0.24.0 | PostgreSQL 17 support | Planned |
+| v0.25.0 | PGlite proof of concept | Planned |
+| v0.26.0 | Core extraction (`pg_trickle_core`) | Planned |
+| v0.27.0 | PGlite WASM extension | Planned |
+| v0.28.0 | PGlite reactive integration | Planned |
 | v1.0.0 | Stable release (incl. PG 19 compatibility) | Planned |
 
 ---
@@ -6116,7 +6118,141 @@ Dependencies: DB-3 (uses schema version to determine needed migrations). Schema 
 
 ---
 
-## v0.22.0 — TUI Dog-Feeding Integration
+## v0.22.0 — Production Scalability & Downstream Integration
+
+**Status: Planned.** Driven by [PLAN_OVERALL_ASSESSMENT.md](plans/PLAN_OVERALL_ASSESSMENT.md) P1 items not addressed in v0.21.0 and the highest-value P2 items.
+
+> **Release Theme**
+> This release delivers the two highest-impact items from the overall
+> assessment deferred from v0.21.0: a minimal-viable in-database parallel
+> refresh worker pool (the single largest scalability unlock) and a downstream
+> CDC publication so stream table changes can drive Kafka, Debezium, and
+> event-sourcing pipelines without a second replication slot. Three P2 items
+> ship alongside: a predictive cost model for adaptive refresh, SLA-driven
+> tier auto-assignment, and a transactional outbox helper for zero-copy
+> dual-write elimination.
+
+### Downstream CDC Publication (P1 — §9.2)
+
+> **In plain terms:** pg_trickle consumes CDC from source tables but cannot
+> *emit* changes downstream. This adds `stream_table_to_publication()` — a
+> helper that exposes every row applied to a stream table as a PostgreSQL
+> logical replication publication so Kafka Connect, Debezium, and
+> event-sourcing pipelines can subscribe with zero code and no second
+> replication slot.
+
+| Item | Description | Effort | Ref |
+|------|-------------|--------|-----|
+| CDC-PUB-1 | **`stream_table_to_publication(name TEXT)` SQL function.** Creates a logical replication publication for the target stream table using `pgt_inserted_rows`/`pgt_deleted_rows` output from the MERGE step. Catalog column `downstream_publication_name` tracks the association. | 2–3d | [PLAN_OVERALL_ASSESSMENT.md](plans/PLAN_OVERALL_ASSESSMENT.md) §9.2 |
+| CDC-PUB-2 | **Lifecycle management.** `drop_stream_table_publication(name)`, auto-drop on `drop_stream_table()`, recreation on schema-change rebuild. | 1d | [PLAN_OVERALL_ASSESSMENT.md](plans/PLAN_OVERALL_ASSESSMENT.md) §9.2 |
+| CDC-PUB-3 | **`pg_stat_stream_tables` — `downstream_publication` column.** Surface publication name (or NULL) in the monitoring view. | 0.5d | [PLAN_OVERALL_ASSESSMENT.md](plans/PLAN_OVERALL_ASSESSMENT.md) §9.2 |
+| CDC-PUB-4 | **E2E tests.** Create publication; verify subscriber receives insert/update/delete events; drop and verify cleanup. | 1d | [PLAN_OVERALL_ASSESSMENT.md](plans/PLAN_OVERALL_ASSESSMENT.md) §9.2 |
+| CDC-PUB-5 | **Documentation.** `docs/SQL_REFERENCE.md` section on downstream publications; tutorial showing Kafka Connect integration pattern. | 1d | — |
+
+> **Downstream CDC publication subtotal: ~1–1.5 weeks**
+
+### In-Database Parallel Refresh Worker Pool — Minimal Viable Slice (P1 — §3.1)
+
+> **In plain terms:** The scheduler today runs one refresh at a time per
+> tick. This installs a dynamic bgworker pool — a coordinator owns the DAG,
+> workers execute refreshes — so independent stream tables at the same DAG
+> level refresh simultaneously. Deployments with 200+ STs or long refresh
+> queues get immediate throughput gains. Opt-in via `max_parallel_workers`;
+> default 0 preserves existing serial behaviour.
+
+| Item | Description | Effort | Ref |
+|------|-------------|--------|-----|
+| PAR-1 | **Coordinator / worker process split.** Coordinator BGW manages the tick; dispatches ready-to-run STs to a `PgLwLock`-protected shared work queue; worker BGWs pop entries and execute refresh transactions. | 1.5–2wk | [plans/sql/PLAN_PARALLELISM.md](plans/sql/PLAN_PARALLELISM.md) §3 |
+| PAR-2 | **`pg_trickle.max_parallel_workers` GUC** (default 0 = serial, range 0–32). Gate the entire parallel path so deployments can opt in incrementally. | 1d | [plans/sql/PLAN_PARALLELISM.md](plans/sql/PLAN_PARALLELISM.md) §4 |
+| PAR-3 | **DAG level extraction.** Re-use `topological_levels()` already in `dag.rs` to identify STs that can run concurrently (same level, no intra-level edges). | 0.5d | [plans/sql/PLAN_PARALLELISM.md](plans/sql/PLAN_PARALLELISM.md) §3 |
+| PAR-4 | **Worker crash recovery.** Coordinator marks the ST `ERROR` in `pgt_refresh_history` on worker crash (same behaviour as serial crash); respawns the worker slot. | 1d | [plans/sql/PLAN_PARALLELISM.md](plans/sql/PLAN_PARALLELISM.md) §5 |
+| PAR-5 | **E2E tests: correctness + throughput.** Diamond DAG with concurrent same-level refreshes; verify no partial-consistency window. Benchmark: wall-clock tick latency vs serial at 50-ST scale. | 1d | [plans/sql/PLAN_PARALLELISM.md](plans/sql/PLAN_PARALLELISM.md) §6 |
+
+> **Parallel refresh subtotal: ~3–4 weeks**
+
+### Predictive Refresh Cost Model (P2 — §9.3)
+
+> **In plain terms:** The current adaptive threshold reacts *after* a slow
+> differential refresh. This extends dog-feeding to *predict* `duration_ms`
+> from `rows_inserted + rows_deleted` via linear regression over the last
+> hour. When the forecast exceeds `last_full_ms × 1.5`, pg_trickle switches
+> to FULL pre-emptively — eliminating the one-bad-cycle latency spike entirely.
+
+| Item | Description | Effort | Ref |
+|------|-------------|--------|-----|
+| PRED-1 | **Linear regression forecaster.** Fit `duration_ms ~ delta_rows` over `pg_trickle.prediction_window` minutes of `pgt_refresh_history` per ST. Expose fitted slope and intercept as columns in `df_threshold_advice`. | 1–2d | [PLAN_OVERALL_ASSESSMENT.md](plans/PLAN_OVERALL_ASSESSMENT.md) §9.3 |
+| PRED-2 | **Pre-emptive FULL switch.** If `predicted_diff_ms > last_full_ms × pg_trickle.prediction_ratio` (default 1.5), override strategy to FULL; log `refresh_reason = 'predicted_cost_exceeds_full'`. | 1d | [PLAN_OVERALL_ASSESSMENT.md](plans/PLAN_OVERALL_ASSESSMENT.md) §9.3 |
+| PRED-3 | **Cold-start fallback.** When fewer than `pg_trickle.prediction_min_samples` (default 5) history rows exist, fall back to the existing fixed-threshold logic. | 0.5d | — |
+| PRED-4 | **E2E test + proptest.** Verify pre-emptive switch fires under synthetic cost spike; proptest checks cold-start fallback boundary (0–4 samples). | 1d | — |
+
+> **Predictive cost model subtotal: ~1 week**
+
+### SLA-Driven Tier Auto-Assignment (P2 — §9.7)
+
+> **In plain terms:** `alter_stream_table(name, sla => interval '30 seconds')`
+> lets the scheduler pick the right tier automatically — no manual tier
+> tuning required. Removes the expert-knowledge barrier to tiered scheduling.
+
+| Item | Description | Effort | Ref |
+|------|-------------|--------|-----|
+| SLA-1 | **`sla` parameter on `create_stream_table` / `alter_stream_table`.** Accepts an `INTERVAL`; stored as `freshness_deadline_ms` in `pgt_stream_tables`. | 0.5d | [PLAN_OVERALL_ASSESSMENT.md](plans/PLAN_OVERALL_ASSESSMENT.md) §9.7 |
+| SLA-2 | **Initial tier assignment.** On creation or `alter_stream_table` with `sla` set, assign to the tier whose `dispatch_gap ≤ sla`, considering current queue depth. | 1d | [PLAN_OVERALL_ASSESSMENT.md](plans/PLAN_OVERALL_ASSESSMENT.md) §9.7 |
+| SLA-3 | **Dynamic re-assignment.** After each tick, check whether the ST's tier still meets the SLA given measured queue depth; bump one tier up or down if the gap is consistently exceeded or under-utilised by >2×. | 1d | [PLAN_OVERALL_ASSESSMENT.md](plans/PLAN_OVERALL_ASSESSMENT.md) §9.7 |
+| SLA-4 | **E2E test.** Create ST with 30 s SLA; inject artificial tick delay; verify tier promotion within 3 cycles. | 0.5d | — |
+
+> **SLA-driven tier subtotal: ~3–4 days**
+
+### Transactional Outbox Helper (P2 — §9.12)
+
+> **In plain terms:** After each refresh cycle, pg_trickle writes a row to
+> `pgtrickle.outbox_<st>` with a JSON payload `{inserted:[…], deleted:[…]}`.
+> Eliminates the dual-write problem for downstream event buses without a
+> CDC connector or external replication slot.
+
+| Item | Description | Effort | Ref |
+|------|-------------|--------|-----|
+| OUTBOX-1 | **`enable_outbox(name TEXT)` / `disable_outbox(name TEXT)`.** Create/drop `pgtrickle.outbox_<st>` table (`id BIGSERIAL`, `pgt_id`, `created_at`, `payload JSONB`). | 0.5d | [PLAN_OVERALL_ASSESSMENT.md](plans/PLAN_OVERALL_ASSESSMENT.md) §9.12 |
+| OUTBOX-2 | **Refresh-path outbox write.** After successful MERGE, if outbox is enabled, INSERT into `outbox_<st>` within the same transaction with `{inserted:[…], deleted:[…]}`. | 1d | [PLAN_OVERALL_ASSESSMENT.md](plans/PLAN_OVERALL_ASSESSMENT.md) §9.12 |
+| OUTBOX-3 | **Retention management.** `pg_trickle.outbox_retention_hours` GUC (default 24); scheduler drains expired outbox rows during the cleanup phase. | 0.5d | — |
+| OUTBOX-4 | **E2E test.** Enable outbox; trigger refresh; verify payload rows; test retention drain. | 0.5d | — |
+
+> **Transactional outbox subtotal: ~2–3 days**
+
+### Implementation Phases
+
+| Phase | Description | Duration |
+|-------|-------------|----------|
+| CDC-PUB | Downstream CDC publication: SQL function, lifecycle, monitoring, tests, docs | Days 1–8 |
+| PAR | Parallel refresh: coordinator/worker split, GUC, DAG levels, recovery, tests | Days 9–28 |
+| PRED | Predictive cost model: regression, pre-emptive switch, cold-start fallback, tests | Days 29–33 |
+| SLA | SLA-driven tier: `sla` param, initial assignment, dynamic re-assignment, tests | Days 34–37 |
+| OUTBOX | Transactional outbox: SQL functions, refresh-path write, retention, tests | Days 38–40 |
+
+> **v0.22.0 total: ~5–6 weeks** (downstream CDC + parallel refresh + predictive cost + SLA tier + outbox)
+
+**Exit criteria:**
+- [ ] CDC-PUB-1: `stream_table_to_publication(name)` creates a working logical publication
+- [ ] CDC-PUB-2: Publication is dropped automatically when the stream table is dropped
+- [ ] CDC-PUB-3: `downstream_publication` column visible in `pg_stat_stream_tables`
+- [ ] CDC-PUB-4: Subscriber receives correct insert/update/delete events; E2E test passes
+- [ ] PAR-2: `max_parallel_workers = 0` (default) produces identical results to serial mode
+- [ ] PAR-1/PAR-3: `max_parallel_workers ≥ 1` dispatches independent same-level STs concurrently
+- [ ] PAR-4: Worker crash marks ST `ERROR`; coordinator respawns worker slot
+- [ ] PAR-5: Diamond DAG concurrent correctness test passes; throughput improvement benchmarked
+- [ ] PRED-1: Fitted coefficients visible in `df_threshold_advice`
+- [ ] PRED-2: Pre-emptive FULL switch fires under synthetic spike; `refresh_reason = 'predicted_cost_exceeds_full'` logged
+- [ ] PRED-3: Cold-start fallback active when fewer than `prediction_min_samples` history rows exist
+- [ ] SLA-1: `create_stream_table(..., sla => '30 seconds')` stores `freshness_deadline_ms`
+- [ ] SLA-2: Initial tier assignment matches SLA requirement on creation
+- [ ] SLA-3: Tier auto-adjusts within 3 cycles when queue depth breaches SLA
+- [ ] OUTBOX-1/2: `enable_outbox()` creates table; refresh populates payload within same transaction
+- [ ] OUTBOX-3: Retention drain removes rows older than `outbox_retention_hours`
+- [ ] Extension upgrade path tested (`0.21.0 → 0.22.0`)
+- [ ] `just check-version-sync` passes
+
+---
+
+## v0.23.0 — TUI Dog-Feeding Integration
 
 **Status: Planned.** See [plans/ui/PLAN_TUI_PART_3.md](plans/ui/PLAN_TUI_PART_3.md) for the full design.
 
@@ -6233,12 +6369,12 @@ TUI/CLI visualization enhancement for the dog-feeding views. Recommended from [P
 - [ ] CLI-1: `pgtrickle dog-feeding enable/disable/status` functional
 - [ ] CLI-2: `pgtrickle graph --format mermaid` outputs valid Mermaid
 - [ ] TUI-D1/DOC-21/DOC-22: Documentation updated
-- [ ] Extension upgrade path tested (`0.21.0 → 0.22.0`)
+- [ ] Extension upgrade path tested (`0.22.0 → 0.23.0`)
 - [ ] `just check-version-sync` passes
 
 ---
 
-## v0.23.0 — PostgreSQL 17 Support
+## v0.24.0 — PostgreSQL 17 Support
 
 > **Release Theme**
 > This release adds PostgreSQL 17 as a supported target alongside
@@ -6331,12 +6467,12 @@ Low-hanging PostgreSQL feature opportunities identified in [plans/sql/PLAN_POSTG
 - [ ] PGFEAT-7: Skip scan index optimization evaluated; benchmarks quantify benefit; indexes created if beneficial
 - [ ] PGFEAT-8: `MERGE ... RETURNING OLD.*, NEW.*` integrated in `build_merge_sql()`; ST-to-ST change buffer performance improved
 - [ ] PGFEAT-9: Virtual generated columns correctly excluded from CDC change buffer schemas; E2E tests pass with virtual column sources
-- [ ] Extension upgrade path tested (`0.22.0 → 0.23.0`)
+- [ ] Extension upgrade path tested (`0.23.0 → 0.24.0`)
 - [ ] `just check-version-sync` passes
 
 ---
 
-## v0.24.0 — PGlite Proof of Concept
+## v0.25.0 — PGlite Proof of Concept
 
 > **Release Theme**
 > This release validates whether PGlite users want real incremental view
@@ -6728,12 +6864,12 @@ Dependencies: None. Schema change: No (PG extension unchanged).
 - [ ] UX-4: TypeScript type definitions ship with strict-mode compatibility
 - [ ] TEST-1: > 50 correctness test cases pass on PGlite latest
 - [ ] TEST-2: CI tests pass against PGlite N, N-1, N-2
-- [ ] TEST-5: Extension upgrade path tested (`0.23.0 -> 0.24.0`)
+- [ ] TEST-5: Extension upgrade path tested (`0.24.0 -> 0.25.0`)
 - [ ] `just check-version-sync` passes
 
 ---
 
-## v0.25.0 — Core Extraction (`pg_trickle_core`)
+## v0.26.0 — Core Extraction (`pg_trickle_core`)
 
 > **Release Theme**
 > This release surgically separates pg_trickle's "brain" — the DVM engine,
@@ -7144,7 +7280,7 @@ Dependencies: PGL-1-1. Schema change: No.
 - [ ] STAB-1: Zero `pg_sys::` references in `pg_trickle_core/src/`
 - [ ] STAB-2: `cargo build -p pg_trickle_core --no-default-features` passes in CI
 - [ ] STAB-3: `cargo pgrx package` and `cargo pgrx test` succeed with workspace layout
-- [ ] STAB-4: Extension upgrade path tested (`0.23.0 -> 0.24.0`)
+- [ ] STAB-4: Extension upgrade path tested (`0.25.0 -> 0.26.0`)
 - [ ] STAB-5: WASM target builds in CI
 - [ ] PERF-1: Criterion shows < 1% regression on `diff_operators` benchmark
 - [ ] PERF-2: Full benchmark suite passes with < 5% regression threshold
@@ -7159,7 +7295,7 @@ Dependencies: PGL-1-1. Schema change: No.
 
 ---
 
-## v0.26.0 — PGlite WASM Extension
+## v0.27.0 — PGlite WASM Extension
 
 > **Release Theme**
 > This release delivers the first working PGlite extension — the moment
@@ -7611,7 +7747,7 @@ Dependencies: PGL-2-3, PERF-2. Schema change: No.
 - [ ] STAB-1: OOM stress test: PGlite survives with actionable error
 - [ ] STAB-2: Panic from invalid SQL returns SQL error, not WASM trap
 - [ ] STAB-3: Load/unload/reload lifecycle test: zero leaked allocations
-- [ ] STAB-4: Extension upgrade path tested (`0.24.0 -> 0.25.0`)
+- [ ] STAB-4: Extension upgrade path tested (`0.26.0 -> 0.27.0`)
 - [ ] PERF-1: WASM vs native benchmark report published (≤ 3× overhead)
 - [ ] PERF-2: WASM bundle ≤ 2 MB (CI gated)
 - [ ] PERF-3: Cold-start load time < 500 ms browser, < 200 ms Node.js
@@ -7627,7 +7763,7 @@ Dependencies: PGL-2-3, PERF-2. Schema change: No.
 
 ---
 
-## v0.27.0 — PGlite Reactive Integration
+## v0.28.0 — PGlite Reactive Integration
 
 > **Release Theme**
 > This release completes the PGlite story by bridging the gap between
@@ -8077,7 +8213,7 @@ Dependencies: STAB-1, PGL-3-2. Schema change: No.
 - [ ] STAB-1: 4-hour soak test: heap growth < 10%
 - [ ] STAB-2: 100 mount/unmount cycles: zero leaked subscriptions
 - [ ] STAB-3: Stream table dropped while hook active: error boundary catches
-- [ ] STAB-4: Extension upgrade path tested (`0.24.0 -> 0.25.0`)
+- [ ] STAB-4: Extension upgrade path tested (`0.27.0 -> 0.28.0`)
 - [ ] STAB-5: CI matrix passes for React 18, React 19, Vue 3.4+
 - [ ] PERF-1: INSERT-to-render latency < 50% of `live.incrementalQuery()` at 10K rows
 - [ ] PERF-2: Render count = 1 for bulk DML (1, 10, 100, 1000 rows)
@@ -8302,12 +8438,13 @@ to keep the pre-1.0 milestones focused on performance and correctness.
 | v0.19.0 — Production Gap Closure & Distribution | ~4–5 weeks | — | |
 | v0.20.0 — Dog-Feeding (pg_trickle monitors itself) | ~3–4wk | — | |
 | v0.21.0 — Correctness, Safety & Test Hardening | ~6–8wk | — | |
-| v0.22.0 — TUI Dog-Feeding Integration | ~3–4wk (TUI + architecture + backend + CLI) | — | |
-| v0.23.0 — PostgreSQL 17 Support | ~2–4d | — | |
-| v0.24.0 — PGlite Proof of Concept | ~2–3wk (plugin) + ~1–2d (version bump) | — | |
-| v0.25.0 — Core Extraction (`pg_trickle_core`) | ~3–4wk (extraction) + ~1–2wk (abstraction + testing) | — | |
-| v0.26.0 — PGlite WASM Extension | ~5–7wk (WASM build) + ~2–3wk (testing + polish) | — | |
-| v0.27.0 — PGlite Reactive Integration | ~2–3wk (bridge + hooks) + ~1–2wk (examples + testing + polish) | — | |
+| v0.22.0 — Production Scalability & Downstream Integration | ~5–6wk (parallel refresh + downstream CDC + predictive cost + SLA tier + outbox) | — | |
+| v0.23.0 — TUI Dog-Feeding Integration | ~3–4wk (TUI + architecture + backend + CLI) | — | |
+| v0.24.0 — PostgreSQL 17 Support | ~2–4d | — | |
+| v0.25.0 — PGlite Proof of Concept | ~2–3wk (plugin) + ~1–2d (version bump) | — | |
+| v0.26.0 — Core Extraction (`pg_trickle_core`) | ~3–4wk (extraction) + ~1–2wk (abstraction + testing) | — | |
+| v0.27.0 — PGlite WASM Extension | ~5–7wk (WASM build) + ~2–3wk (testing + polish) | — | |
+| v0.28.0 — PGlite Reactive Integration | ~2–3wk (bridge + hooks) + ~1–2wk (examples + testing + polish) | — | |
 | v1.0.0 — Stable release (incl. PG 19 compat) | ~36–66h | — | |
 | Post-1.0 (PG compat + Native DDL) | ~38–56h (PG 16–18) + ~13–21d (Native DDL) | — | |
 | Post-1.0 (ecosystem) | 88–134h | — | |
