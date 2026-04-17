@@ -365,17 +365,21 @@ the layered approach:
 
 ### Why is `risk_scores` FULL and not DIFFERENTIAL?
 
-DIFFERENTIAL requires pg_trickle to derive a delta query (ΔQ) that tracks what
-changed in each source and computes only the affected output rows. With three
-input sources — a base table plus two stream tables — the algebra for computing
-a correct delta is more complex than the current engine implements for that
-particular join shape. FULL mode re-evaluates the whole query, which is still
-fast because it runs infrequently (only when L1 signals a change) and on a
-table that is not enormous.
+`risk_scores` is a **1:1 projection of `transactions`** — one output row per
+input transaction, with enrichment from the L1 stream tables. Since
+`transactions` is append-only, the **change ratio is ~1.0**: every refresh adds
+roughly as many new rows as existed before, making DIFFERENTIAL no more
+efficient than FULL. Additionally, FULL mode simplifies the refresh logic
+(avoiding complex multi-source delta algebra) while remaining fast because the
+table is small and updates are infrequent (only triggered when L1 feeds new
+data).
+
+pg_trickle's diagnostic system (`recommend_refresh_mode()`) confirms this
+choice: it observed an avg change ratio of 1.0 and recommended to KEEP FULL.
 
 The L3 tables (`alert_summary`, `top_risky_merchants`) are purely
 single-upstream aggregates over `risk_scores` and therefore support
-DIFFERENTIAL perfectly.
+DIFFERENTIAL efficiently — the change ratio there is much lower.
 
 ### Why `schedule => 'calculated'` for L2 and L3?
 
@@ -392,3 +396,12 @@ configuration, no `wal_level = logical` requirement. For production deployments
 with very high write throughput, WAL-based CDC is more efficient. pg_trickle
 can switch modes transparently; see [CONFIGURATION.md](CONFIGURATION.md) for
 details.
+
+### Empirical optimization: FULL vs DIFFERENTIAL by change ratio
+
+The demo illustrates a practical rule of thumb: when a stream table's **change
+ratio** (fraction of rows that are new or modified per refresh cycle) is high
+(>0.5), FULL mode is often faster than DIFFERENTIAL because the delta overhead
+dominates the benefit. Use `pgtrickle.recommend_refresh_mode(table_name)` to
+check — it analyzes actual refresh history and recommends the best mode with
+confidence scores.
