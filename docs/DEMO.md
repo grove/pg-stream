@@ -4,12 +4,13 @@ This demo shows pg_trickle doing real work: a continuous stream of events
 flows into PostgreSQL, and a **DAG of stream tables** keeps a live view of
 that data up to date — automatically, incrementally, and within seconds.
 
-Two scenarios are available via the `DEMO_SCENARIO` environment variable:
+Three scenarios are available via the `DEMO_SCENARIO` environment variable:
 
 | Scenario | Default? | Pipeline |
 |----------|----------|----------|
 | `fraud` | — | Financial fraud detection — 9-node, 4-layer DAG over a transaction stream |
 | `ecommerce` | ✅ | E-commerce analytics — 6-node DAG over a continuous order stream |
+| `finance` | — | Financial risk analytics — 10-level deep DAG with only leaf schedules (CALCULATED throughout) |
 
 Each scenario includes two purpose-built **differential efficiency showcases**:
 stream tables with sub-1.0 change ratios that demonstrate when DIFFERENTIAL
@@ -30,6 +31,9 @@ docker compose up --build
 
 # Fraud detection
 DEMO_SCENARIO=fraud docker compose up --build
+
+# Financial risk analytics (10-level DAG with deep calculated dependencies)
+DEMO_SCENARIO=finance docker compose up --build
 ```
 
 Open **http://localhost:8080** — the dashboard refreshes every 2 seconds.
@@ -43,8 +47,9 @@ docker compose down -v
 > **Switching scenarios** requires removing the old data volume:
 > ```bash
 > docker compose down -v
-> DEMO_SCENARIO=ecommerce docker compose up
+> DEMO_SCENARIO=fraud docker compose up
 > ```
+> Or use any of the three: `fraud`, `ecommerce`, `finance`.
 
 ---
 
@@ -414,10 +419,14 @@ demo/
 │   │   ├── 01_schema.sql       # Base tables + seed data (30 users, 15 merchants,
 │   │   │                       # 40 initial transactions, merchant_risk_tier)
 │   │   └── 02_stream_tables.sql# All 9 stream table definitions (Layers 1–3 + showcases)
-│   └── ecommerce/
-│       ├── 01_schema.sql       # Base tables + seed data (customers, products,
-│       │                       # categories, orders, product_catalog)
-│       └── 02_stream_tables.sql# All 6 stream table definitions (Layers 1–3 + showcases)
+│   ├── ecommerce/
+│   │   ├── 01_schema.sql       # Base tables + seed data (customers, products,
+│   │   │                       # categories, orders, product_catalog)
+│   │   └── 02_stream_tables.sql# All 6 stream table definitions (Layers 1–3 + showcases)
+│   └── finance/
+│       ├── 01_schema.sql       # Base tables + seed data (30 instruments, 50 accounts,
+│       │                       # 5 portfolios, 8 sectors, seed trades/prices)
+│       └── 02_stream_tables.sql# All 10 stream table definitions (L1–L10 cascade)
 │
 ├── generator/
 │   ├── Dockerfile
@@ -425,7 +434,8 @@ demo/
 │   ├── generate.py             # Scenario dispatcher; reads DEMO_SCENARIO
 │   └── scenarios/
 │       ├── fraud.py            # Transaction generator (normal + burst mode)
-│       └── ecommerce.py        # Order generator (normal + flash sale mode)
+│       ├── ecommerce.py        # Order generator (normal + flash sale mode)
+│       └── finance.py          # Trade + price tick generator (normal + algo burst mode)
 │
 └── dashboard/
     ├── Dockerfile
@@ -434,7 +444,8 @@ demo/
     │                           #   /api/internals → stream table metadata (shared)
     └── scenarios/
         ├── fraud.py            # Fraud HTML, DAG diagram, and data queries
-        └── ecommerce.py        # E-commerce HTML, DAG diagram, and data queries
+        ├── ecommerce.py        # E-commerce HTML, DAG diagram, and data queries
+        └── finance.py          # Finance HTML, DAG diagram, and data queries
 ```
 
 ---
@@ -636,3 +647,214 @@ FROM   catalog_price_impact ORDER BY ABS(pct_change) DESC;
 SELECT pgt_name, avg_diff_ms, diff_speedup, avg_change_ratio
 FROM   pgtrickle.refresh_efficiency() ORDER BY pgt_name;
 ```
+
+---
+
+## Scenario: finance
+
+The finance scenario models a real-time **financial risk analytics pipeline**
+demonstrating a **10-level deep DAG** where only the leaf tables have fixed
+schedules, and all downstream layers cascade with `schedule => 'calculated'`.
+This showcases pg_trickle's strength in maintaining deep computation graphs
+where derived data automatically flows upward through the layers.
+
+```bash
+cd demo
+DEMO_SCENARIO=finance docker compose up --build
+```
+
+### Source Data
+
+| Table | Contents |
+|-------|----------|
+| `sectors` | 8 financial sectors (Technology, Healthcare, Finance, Energy, etc.) |
+| `instruments` | 30 financial instruments (stocks, bonds, commodities) |
+| `accounts` | 50 trading accounts |
+| `portfolios` | 5 portfolios (institutional investors) |
+| `trades` | The live stream — the generator inserts here continuously with buy/sell orders |
+| `market_prices` | Slowly-changing OHLC prices per instrument; the generator updates one instrument per cycle with realistic bid/ask/mid prices |
+
+`trades` is append-only; `market_prices` updates continuously (one instrument per
+generator cycle). Everything else is static reference data.
+
+### Real-Time Market Activity
+
+**Normal trading** — the generator randomly selects accounts and instruments,
+inserting buy/sell trades at current market prices (~1 trade per second). Buy
+quantities are positive; sell quantities are negative. This creates a natural,
+continuous flow of position changes.
+
+**Algo bursts** — every ~60 seconds, the generator triggers an algorithmic burst
+(0.05–0.20s between trades, 8–20 trades) concentrated on a few instruments,
+simulating realistic high-frequency trading patterns that stress-test the
+differential calculation pipeline.
+
+### The DAG of Stream Tables (finance)
+
+All 10 stream tables are defined in
+[demo/postgres/finance/02_stream_tables.sql](../demo/postgres/finance/02_stream_tables.sql).
+
+This is the **deepest DAG in all three scenarios** — a 10-level cascade where each
+level reads only from the previous level (plus static reference data), creating
+a linear dependency chain. The two leaf tables (`price_snapshot` at 2s and
+`net_positions` at 1s) are the only ones with fixed schedules; all nine downstream
+layers use `schedule => 'calculated'` to propagate changes automatically.
+
+```
+  Base tables          Layer 1          Layer 2          ...         Layer 10
+  ────────────         ────────           ────────                   ─────────
+
+  ┌──────────────┐     ┌──────────────────────┐
+  │market_prices │────►│  price_snapshot      │
+  │(stream, 2s)  │     │  DIFFERENTIAL 2s     │
+  └──────────────┘     └─────────┬────────────┘
+                                 │
+  ┌──────────────┐               │     ┌────────────────┐
+  │   trades     │──────────┐    └────►│position_values │  L2 (calculated)
+  │(stream, 1s)  │          │          │ DIFFERENTIAL   │
+  └──────────────┘          │          └─────────┬──────┘
+         │                  │                    │
+         │                  ▼                    ▼
+         │          ┌────────────────┐   ┌───────────────┐
+         │          │net_positions   │   │ account_pnl   │  L3 (calculated)
+         │          │DIFFERENTIAL 1s │   │ DIFFERENTIAL  │
+         │          └────────────────┘   └───────┬───────┘
+         │                                       │
+         │                  ┌──────────────────────┤
+         │                  │                      │
+         │                  ▼                      ▼
+         └─────────────────►┌────────────────────────────────┐
+                            │ portfolio_pnl, sector_exposure │  L4–L5 (calculated)
+                            │ DIFFERENTIAL                   │
+                            └────────────────┬───────────────┘
+                                             │
+                                             ▼
+                            ┌────────────────────────────┐
+                            │  var_contributions         │  L6 (calculated)
+                            │  account_var, portfolio_var│  L7–L8 (calculated)
+                            │  DIFFERENTIAL throughout   │
+                            └────────────────┬───────────┘
+                                             │
+                                             ▼
+                            ┌────────────────────────────┐
+                            │ regulatory_capital         │  L9 (calculated)
+                            │ DIFFERENTIAL               │
+                            └────────────────┬───────────┘
+                                             │
+                                             ▼
+                            ┌────────────────────────────┐
+                            │ breach_dashboard           │  L10 (calculated)
+                            │ DIFFERENTIAL, LIMIT 10     │  Fixed cardinality
+                            └────────────────────────────┘
+```
+
+### Stream Tables (finance)
+
+| Layer | Name | Mode | Schedule | What it computes |
+|-------|------|------|----------|-----------------|
+| L1 | `price_snapshot` | DIFFERENTIAL | 2s (fixed) | Per-instrument: current bid/ask/mid, sector affinity |
+| L1 | `net_positions` | DIFFERENTIAL | 1s (fixed) | Per-account-instrument: net quantity, position status |
+| L2 | `position_values` | DIFFERENTIAL | calculated | Per-account-instrument: marked-to-market value (qty × mid) |
+| L3 | `account_pnl` | DIFFERENTIAL | calculated | Per-account: total P&L, position count, exposure |
+| L4 | `portfolio_pnl` | DIFFERENTIAL | calculated | Per-portfolio: aggregate P&L from accounts |
+| L5 | `sector_exposure` | DIFFERENTIAL | calculated | Per-sector: total exposure, position count |
+| L6 | `var_contributions` | DIFFERENTIAL | calculated | Per-position: parametric Value-at-Risk (95% & 99%) |
+| L7 | `account_var` | DIFFERENTIAL | calculated | Per-account: aggregated VaR, diversification |
+| L8 | `portfolio_var` | DIFFERENTIAL | calculated | Per-portfolio: total VaR + stressed scenario (99%) |
+| L9 | `regulatory_capital` | DIFFERENTIAL | calculated | Per-portfolio: Basel simplified capital requirement |
+| L10 | `breach_dashboard` | DIFFERENTIAL | calculated | Top 10 portfolios by capital utilization ratio (LIMIT 10) |
+
+### Why This DAG Demonstrates Differential Efficiency
+
+The finance scenario is built specifically to show how **DIFFERENTIAL mode
+excels in deep DAGs**:
+
+1. **High cardinality at L1** — The 30 × 50 instrument-account combinations yield
+   up to 1,500 potential positions. A price tick affects ~30 positions (change
+   ratio ≈ 0.02).
+
+2. **Compressing cardinality downstream** — As data aggregates up the layers
+   (L2 → L3 → L4 ...), the output cardinality shrinks. By L5 (sector exposure),
+   there are only 8 rows max. By L10 (top 10 portfolios), there are ≤10 rows.
+
+3. **Sub-1.0 change ratios throughout** — Because each layer reads only from the
+   previous layer and applies aggregation or filtering:
+   - L2 (`position_values`): change ratio ≈ 0.02 (only changed positions)
+   - L5 (`sector_exposure`): change ratio ~1 row per tick (typically only 1–2 sectors affected)
+   - L10 (`breach_dashboard`): change ratio ≈ 0–0.1 (typically 0–1 row changes per cycle; fixed cardinality means rank shifts are rare)
+
+4. **All-DIFFERENTIAL cascade** — Unlike the fraud scenario (which uses one FULL
+   table), finance uses DIFFERENTIAL throughout. This is valid because each
+   layer is a simple aggregate or filtered view of the previous layer (no complex
+   diamond joins with multiple independent sources).
+
+### The Dashboard
+
+Open http://localhost:8080. Panels update every 2 seconds.
+
+**Key metrics:**
+
+- **Top KPIs** — Total positions tracked, total book exposure (USD), portfolio P&L, aggregate portfolio VaR
+- **Breach Dashboard** — Top 10 portfolios by capital utilization ratio (regulatory capital used / capital limit). Highlights portfolios approaching regulatory constraints.
+- **Sector Exposure** — Per-sector breakdown of position count and net exposure.
+- **Portfolio Metrics** — Per-portfolio P&L and 95% VaR.
+- **Market Snapshot** — Current bid/ask/mid prices for all 30 instruments with sector labels.
+- **Stream Table Status** — Refresh mode, schedule, and population status for all 10 tables.
+- **DAG Topology** — ASCII diagram showing the 10-level cascade and dependency flow.
+
+### Exploring the Database (finance)
+
+```bash
+docker compose exec postgres psql -U demo -d finance_demo
+```
+
+```sql
+-- See all stream table status
+SELECT pgt_name, refresh_mode, schedule, is_populated
+FROM   pgtrickle.pgt_status()
+ORDER BY pgt_id;
+
+-- View the full 10-level dependency graph
+SELECT tree_line FROM pgtrickle.dependency_tree()
+ORDER BY tree_line;
+
+-- Current market snapshot (L1)
+SELECT symbol, sector, bid, ask, mid
+FROM   price_snapshot
+ORDER BY symbol;
+
+-- Net positions per account-instrument (L1)
+SELECT account_id, instrument_symbol, net_quantity, position_value
+FROM   net_positions
+WHERE  net_quantity != 0
+ORDER BY account_id, instrument_symbol;
+
+-- Top-10 portfolio risk ranking (L10)
+SELECT portfolio_name, capital_required, capital_limit, utilization_ratio
+FROM   breach_dashboard
+ORDER BY utilization_ratio DESC;
+
+-- Watch differential efficiency in action
+-- This shows very low change ratios at the top levels (L1) and even lower at L10
+SELECT pgt_name, avg_change_ratio, avg_diff_ms, diff_speedup
+FROM   pgtrickle.refresh_efficiency()
+ORDER BY pgt_id;
+```
+
+### Differential Efficiency at Work
+
+Open a terminal and watch the refresh history:
+
+```bash
+docker compose exec postgres psql -U demo -d finance_demo -c "
+SELECT 
+  st.pgt_name,
+  rh.action,
+  (rh.end_time - rh.start_time)::int8 AS duration_ms,
+  rh.start_time
+FROM pgtrickle.pgt_refresh_history rh
+JOIN pgtrickle.pgt_stream_tables st ON st.pgt_id = rh.pgt_id
+WHERE rh.start_time > now() - interval '10 seconds'
+ORDER BY rh.start_time DESC
+LIMIT 50;
+" --watch

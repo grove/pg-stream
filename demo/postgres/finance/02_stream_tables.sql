@@ -337,33 +337,29 @@ SELECT pgtrickle.create_stream_table(
             pv.total_pnl,
             pv.portfolio_var_95,
             -- Basel simplified: 10-day VaR × multiplier (3.0)
-            ROUND(pv.portfolio_var_95 * 3.162 * 3.0, 2)  AS required_capital,
+            ROUND(pv.portfolio_var_95 * 3.162 * 3.0, 2)       AS required_capital,
             -- Capital ratio: required_capital / total_market_value
             ROUND(
                 pv.portfolio_var_95 * 3.162 * 3.0
                 / NULLIF(ABS(pv.total_market_value), 0) * 100, 4)
-                                                           AS capital_ratio_pct,
-            -- Available headroom: compare against per-portfolio limit
-            -- (simplification: use sum of account limits via a subquery)
-            (SELECT SUM(a.capital_limit)
-             FROM accounts a
-             WHERE a.portfolio_id = pv.portfolio_id)       AS capital_limit,
-            (SELECT SUM(a.capital_limit)
-             FROM accounts a
-             WHERE a.portfolio_id = pv.portfolio_id)
-            - ROUND(pv.portfolio_var_95 * 3.162 * 3.0, 2) AS capital_headroom,
+                                                               AS capital_ratio_pct,
+            -- Capital limits joined from accounts (avoids correlated subqueries)
+            al.capital_limit,
+            al.capital_limit
+            - ROUND(pv.portfolio_var_95 * 3.162 * 3.0, 2)     AS capital_headroom,
             CASE
-                WHEN ROUND(pv.portfolio_var_95 * 3.162 * 3.0, 2) >
-                     (SELECT SUM(a.capital_limit)
-                      FROM accounts a WHERE a.portfolio_id = pv.portfolio_id)
+                WHEN ROUND(pv.portfolio_var_95 * 3.162 * 3.0, 2) > al.capital_limit
                 THEN 'BREACH'
-                WHEN ROUND(pv.portfolio_var_95 * 3.162 * 3.0, 2) >
-                     0.8 * (SELECT SUM(a.capital_limit)
-                            FROM accounts a WHERE a.portfolio_id = pv.portfolio_id)
+                WHEN ROUND(pv.portfolio_var_95 * 3.162 * 3.0, 2) > 0.8 * al.capital_limit
                 THEN 'WARNING'
                 ELSE 'OK'
-            END                                            AS capital_status
+            END                                                AS capital_status
         FROM portfolio_var pv
+        JOIN (
+            SELECT portfolio_id, SUM(capital_limit) AS capital_limit
+            FROM accounts
+            GROUP BY portfolio_id
+        ) al ON al.portfolio_id = pv.portfolio_id
     $$,
     schedule     => 'calculated',
     refresh_mode => 'DIFFERENTIAL'

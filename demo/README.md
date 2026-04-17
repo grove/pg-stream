@@ -4,13 +4,14 @@ A self-contained Docker Compose demo showing real data flowing through stream
 tables built on top of a continuous event feed.  Two showcase tables in each
 scenario demonstrate differential refresh efficiency at sub-1.0 change ratios.
 
-Two scenarios are available, selectable via the `DEMO_SCENARIO` environment
+Three scenarios are available, selectable via the `DEMO_SCENARIO` environment
 variable:
 
 | Scenario | Default? | Description |
 |----------|----------|-------------|
 | `fraud` | — | Financial fraud detection pipeline — 9-node DAG over a transaction stream |
 | `ecommerce` | ✅ | E-commerce analytics — 6-node DAG over a continuous order stream |
+| `finance` | — | Financial risk analytics — 10-level deep DAG with only leaf schedules (CALCULATED throughout) |
 
 ## Quick start
 
@@ -22,6 +23,9 @@ docker compose up
 
 # Fraud detection
 DEMO_SCENARIO=fraud docker compose up
+
+# Financial risk analytics (10-level DAG with deep calculated dependencies)
+DEMO_SCENARIO=finance docker compose up
 ```
 
 Then open **http://localhost:8080** in your browser.
@@ -30,8 +34,9 @@ The dashboard auto-refreshes every 2 seconds.
 > **Switching scenarios** requires removing the old data volume:
 > ```bash
 > docker compose down -v
-> DEMO_SCENARIO=ecommerce docker compose up
+> DEMO_SCENARIO=fraud docker compose up
 > ```
+> Or use any of the three: `fraud`, `ecommerce`, `finance`.
 
 ---
 
@@ -317,6 +322,112 @@ ORDER  BY ABS(pct_change) DESC;
 SELECT pgt_name, avg_diff_ms, diff_speedup, avg_change_ratio
 FROM   pgtrickle.refresh_efficiency()
 ORDER  BY pgt_name;
+```
+
+---
+
+## Scenario: finance
+
+The finance scenario models a real-time **financial risk analytics pipeline** with
+a **10-level deep DAG** showing how DIFFERENTIAL mode excels in deeply-nested
+stream table cascades. Only the two leaf tables have fixed schedules (2s and 1s);
+all downstream layers use `schedule => 'calculated'` to propagate changes
+automatically through the full computation graph.
+
+```bash
+cd demo
+DEMO_SCENARIO=finance docker compose up
+```
+
+Every generator cycle, one of 30 instruments updates its bid/ask/mid prices with
+realistic market movement (Gaussian walk + mean reversion). Trades flow in
+continuously at ~1/second, with occasional algorithmic bursts (every ~60 seconds).
+
+### The 10-Level Cascade
+
+```
+L1 — price_snapshot (2s)  +  net_positions (1s)  ← Two leaf tables with fixed schedules
+  ↓
+L2 — position_values (CALCULATED)  ← All downstream layers cascade automatically
+  ↓
+L3 — account_pnl (CALCULATED)
+  ↓
+L4 — portfolio_pnl (CALCULATED)
+  ↓
+L5 — sector_exposure (CALCULATED)
+  ↓
+L6 — var_contributions (CALCULATED, parametric VaR per position)
+  ↓
+L7 — account_var (CALCULATED, aggregated VaR)
+  ↓
+L8 — portfolio_var (CALCULATED, Basel scenario VaR)
+  ↓
+L9 — regulatory_capital (CALCULATED, capital requirement)
+  ↓
+L10 — breach_dashboard (CALCULATED, LIMIT 10, top capital-constrained portfolios)
+```
+
+### Stream Tables (finance)
+
+| Layer | Name | Mode | Schedule | Cardinality |
+|-------|------|------|----------|-------------|
+| L1 | `price_snapshot` | DIFFERENTIAL | 2s | 30 instruments |
+| L1 | `net_positions` | DIFFERENTIAL | 1s | ≤ 1,500 account-instrument pairs |
+| L2 | `position_values` | DIFFERENTIAL | calculated | ≤ 1,500 positions (marked-to-market) |
+| L3 | `account_pnl` | DIFFERENTIAL | calculated | ≤ 50 accounts |
+| L4 | `portfolio_pnl` | DIFFERENTIAL | calculated | 5 portfolios |
+| L5 | `sector_exposure` | DIFFERENTIAL | calculated | 8 sectors |
+| L6 | `var_contributions` | DIFFERENTIAL | calculated | ≤ 1,500 positions (VaR per position) |
+| L7 | `account_var` | DIFFERENTIAL | calculated | ≤ 50 accounts |
+| L8 | `portfolio_var` | DIFFERENTIAL | calculated | 5 portfolios |
+| L9 | `regulatory_capital` | DIFFERENTIAL | calculated | 5 portfolios |
+| L10 | `breach_dashboard` | DIFFERENTIAL | calculated | ≤ 10 portfolios (ranked by capital ratio) |
+
+### Differential Efficiency: Cardinality Compression
+
+This DAG beautifully demonstrates DIFFERENTIAL's strength in deep pipelines:
+
+- **L1 → L2**: 30 instruments feed 1,500 positions. Each price tick changes ~30 positions (ratio ≈ 0.02).
+- **L2 → L5**: Position changes aggregate and compress. By L5 (sector exposure), only 8 rows, typically 1 changes per tick.
+- **L5 → L10**: Further aggregation to 5 portfolios at L8, then filtered to top 10 by rank at L10. L10 changes are rare (typically 0–1 row per tick).
+
+All layers use DIFFERENTIAL because each depends on only one upstream source and
+applies straightforward aggregation or filtering — no complex multi-source joins.
+
+### Playing with the finance demo
+
+```bash
+docker compose exec postgres psql -U demo -d finance_demo
+```
+
+```sql
+-- Current market prices (L1)
+SELECT symbol, sector, bid, ask, mid FROM price_snapshot ORDER BY symbol;
+
+-- Account net positions (L1)
+SELECT account_id, instrument_symbol, net_quantity, position_value
+FROM   net_positions WHERE net_quantity != 0;
+
+-- Portfolio P&L and VaR (L4 and L8)
+SELECT portfolio_name, pnl, portfolio_var_95pct
+FROM   portfolio_var ORDER BY portfolio_name;
+
+-- Top 10 capital-constrained portfolios (L10)
+SELECT rank, portfolio_name, capital_required, capital_limit, utilization_ratio
+FROM   breach_dashboard ORDER BY rank;
+
+-- Observe change ratios: L1 high, L10 very low
+SELECT pgt_name, avg_change_ratio, diff_speedup
+FROM   pgtrickle.refresh_efficiency()
+WHERE  pgt_id <= 10
+ORDER  BY pgt_id;
+
+-- Watch real-time refresh cascade (one-liner to see last 5 seconds)
+SELECT st.pgt_name, rh.action, (rh.end_time - rh.start_time)::int8 AS ms
+FROM pgtrickle.pgt_refresh_history rh
+JOIN pgtrickle.pgt_stream_tables st ON st.pgt_id = rh.pgt_id
+WHERE rh.start_time > now() - interval '5 seconds'
+ORDER BY rh.start_time DESC;
 ```
 
 ---
