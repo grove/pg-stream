@@ -28,8 +28,8 @@ COPY . /build
 # Build extension (cargo-pgrx v0.17+ requires Rust nightly for edition2024)
 # Initialize pgrx to use system PostgreSQL, then package the extension
 RUN cargo install cargo-pgrx && \
-    PGRX_HOME=/pgrx \
-    PG_CONFIG=/usr/lib/postgresql/18/bin/pg_config \
+    export PGRX_HOME=/pgrx && \
+    export PG_CONFIG=/usr/lib/postgresql/18/bin/pg_config && \
     cargo pgrx init --pg18 /usr/lib/postgresql/18/bin/pg_config && \
     cargo pgrx package
 
