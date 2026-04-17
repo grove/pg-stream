@@ -789,8 +789,8 @@ def api_internals():
         """)
 
         latest_ref = safe_query(conn, """
-            SELECT DISTINCT ON (st.name)
-                st.name,
+            SELECT DISTINCT ON (st.pgt_schema, st.pgt_name)
+                st.pgt_schema || '.' || st.pgt_name AS name,
                 h.start_time  AS last_refresh,
                 ROUND(EXTRACT(EPOCH FROM (h.end_time - h.start_time)) * 1000)::bigint
                               AS duration_ms,
@@ -798,7 +798,7 @@ def api_internals():
             FROM pgtrickle.pgt_refresh_history h
             JOIN pgtrickle.pgt_stream_tables   st ON st.pgt_id = h.pgt_id
             WHERE h.status = 'COMPLETED'
-            ORDER BY st.name, h.start_time DESC
+            ORDER BY st.pgt_schema, st.pgt_name, h.start_time DESC
         """)
 
         dep_tree = safe_query(conn, """
@@ -806,7 +806,7 @@ def api_internals():
         """)
 
         refresh_hist = safe_query(conn, """
-            SELECT st.name,
+            SELECT st.pgt_schema || '.' || st.pgt_name AS name,
                    h.action          AS refresh_mode,
                    h.start_time,
                    ROUND(EXTRACT(EPOCH FROM (h.end_time - h.start_time)) * 1000)::bigint
