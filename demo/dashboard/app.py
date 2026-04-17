@@ -121,6 +121,26 @@ HTML = r"""<!DOCTYPE html>
 
     /* risk bar */
     .risk-bar { height: 8px; border-radius: 4px; }
+
+    /* nav tabs dark theme */
+    .nav-tabs { border-bottom-color: var(--border); }
+    .nav-tabs .nav-link { color: var(--muted); border: 1px solid transparent;
+                          border-radius: 6px 6px 0 0; padding: 6px 16px; }
+    .nav-tabs .nav-link:hover { color: var(--text); border-color: var(--border);
+                                background: var(--hdr); }
+    .nav-tabs .nav-link.active { color: var(--text); background: var(--card);
+                                 border-color: var(--border) var(--border) var(--card); }
+    /* inline code in card headers */
+    .g-card-hdr code { font-size: 11px; background: rgba(99,110,123,0.2);
+                       border-radius: 3px; padding: 1px 5px; font-weight: 400; }
+    /* g-table td code */
+    .g-table td code { font-size: 11px; }
+    /* score colours */
+    .score-keep   { color: var(--muted); }
+    .score-switch { color: var(--yellow); }
+    .conf-high    { color: var(--green); }
+    .conf-medium  { color: var(--yellow); }
+    .conf-low     { color: var(--muted); }
   </style>
 </head>
 <body>
@@ -135,6 +155,23 @@ HTML = r"""<!DOCTYPE html>
     </div>
     <span class="ms-auto text-muted" id="ts" style="font-size:12px;">connecting…</span>
   </div>
+
+  <!-- Tab navigation -->
+  <ul class="nav nav-tabs mb-3" id="mainTabs" role="tablist">
+    <li class="nav-item" role="presentation">
+      <button class="nav-link active" id="tab-fraud-btn"
+              data-bs-toggle="tab" data-bs-target="#tab-fraud"
+              type="button" role="tab">🔍 Fraud Detection</button>
+    </li>
+    <li class="nav-item" role="presentation">
+      <button class="nav-link" id="tab-internals-btn"
+              data-bs-toggle="tab" data-bs-target="#tab-internals"
+              type="button" role="tab">⚙️ pg_trickle Internals</button>
+    </li>
+  </ul>
+
+  <div class="tab-content">
+  <div class="tab-pane fade show active" id="tab-fraud" role="tabpanel">
 
   <!-- KPI row -->
   <div class="row g-3 mb-3">
@@ -306,6 +343,80 @@ HTML = r"""<!DOCTYPE html>
     </div>
   </div>
 
+  </div><!-- /tab-pane tab-fraud -->
+
+  <!-- ═══════════════════ TAB 2: pg_trickle Internals ═══════════════════ -->
+  <div class="tab-pane fade" id="tab-internals" role="tabpanel">
+
+    <!-- I-1: Stream table health (full width) -->
+    <div class="g-card mb-3">
+      <div class="g-card-hdr">🏥 Stream Table Health — <code>pgtrickle.pgt_status()</code></div>
+      <div class="overflow-auto">
+        <table class="g-table">
+          <thead>
+            <tr><th>Name</th><th>Mode</th><th>Schedule</th><th>Populated</th>
+                <th>Last Refresh</th><th>Duration</th><th>Rows Δ</th><th>Status</th></tr>
+          </thead>
+          <tbody id="tb-int-health"></tbody>
+        </table>
+      </div>
+    </div>
+
+    <!-- I-2: Dep tree + Refresh history -->
+    <div class="row g-3 mb-3">
+      <div class="col-4">
+        <div class="g-card h-100">
+          <div class="g-card-hdr">🌳 Dependency Tree — <code>pgtrickle.dependency_tree()</code></div>
+          <pre class="dag-pre" id="pre-dep-tree">loading…</pre>
+        </div>
+      </div>
+      <div class="col-8">
+        <div class="g-card h-100">
+          <div class="g-card-hdr">📜 Refresh History — <code>pgtrickle.pgt_refresh_history</code></div>
+          <div class="overflow-auto" style="max-height:320px;">
+            <table class="g-table">
+              <thead>
+                <tr><th>Table</th><th>Action</th><th>Started</th><th>ms</th><th>Rows Δ</th><th>Status</th></tr>
+              </thead>
+              <tbody id="tb-int-history"></tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- I-3: Efficiency (full width) -->
+    <div class="g-card mb-3">
+      <div class="g-card-hdr">⚡ Refresh Efficiency — <code>pgtrickle.refresh_efficiency()</code></div>
+      <div class="overflow-auto">
+        <table class="g-table">
+          <thead>
+            <tr><th>Table</th><th>Total</th><th>DIFF</th><th>FULL</th>
+                <th>Avg DIFF ms</th><th>Avg FULL ms</th><th>Speedup</th><th>Avg Change Ratio</th></tr>
+          </thead>
+          <tbody id="tb-int-eff"></tbody>
+        </table>
+      </div>
+    </div>
+
+    <!-- I-4: Mode advisor (full width) -->
+    <div class="g-card">
+      <div class="g-card-hdr">🤖 Refresh Mode Advisor — <code>pgtrickle.recommend_refresh_mode()</code></div>
+      <div class="overflow-auto">
+        <table class="g-table">
+          <thead>
+            <tr><th>Table</th><th>Current</th><th>Effective</th><th>Recommendation</th>
+                <th>Confidence</th><th>Reason</th></tr>
+          </thead>
+          <tbody id="tb-int-advisor"></tbody>
+        </table>
+      </div>
+    </div>
+
+  </div><!-- /tab-pane tab-internals -->
+
+  </div><!-- /tab-content -->
+
 </div><!-- /container -->
 
 <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
@@ -447,8 +558,93 @@ async function refresh() {
   }).join(''));
 }
 
+// ── Internals tab ────────────────────────────────────────────────────────────
+async function refreshInternals() {
+  let d;
+  try {
+    const r = await fetch('/api/internals');
+    d = await r.json();
+  } catch(e) { return; }
+
+  // Health
+  setRows('tb-int-health', (d.st_health||[]).map(r => {
+    const dot = r.is_populated
+      ? '<span style="color:var(--green)">●</span>'
+      : '<span style="color:var(--yellow)">○</span>';
+    const ts  = r.last_refresh  ? new Date(r.last_refresh).toLocaleTimeString()  : '—';
+    const dur = r.duration_ms   != null ? r.duration_ms + ' ms' : '—';
+    const rows = r.rows_affected != null ? fmt(r.rows_affected)  : '—';
+    return `<tr>
+       <td style="font-family:monospace">${esc(r.name)}</td>
+       <td><code>${esc(r.refresh_mode)}</code></td>
+       <td style="color:var(--muted);font-size:11px">${esc(r.schedule||'calc')}</td>
+       <td>${dot}</td>
+       <td style="color:var(--muted);font-size:11px">${ts}</td>
+       <td style="text-align:right;color:var(--muted)">${dur}</td>
+       <td style="text-align:right">${rows}</td>
+       <td style="font-size:11px">${esc(r.status)}</td>
+     </tr>`;
+  }).join(''));
+
+  // Dependency tree
+  document.getElementById('pre-dep-tree').textContent =
+    (d.dep_tree||[]).join('\n') || '(no dependency data)';
+
+  // Refresh history
+  setRows('tb-int-history', (d.refresh_history||[]).map(r => {
+    const fallback = r.was_full_fallback
+      ? ' <span style="color:var(--yellow);font-size:10px" title="fell back to FULL">▲</span>' : '';
+    const statusCol = r.status === 'FAILED' ? 'color:var(--red)' : 'color:var(--muted)';
+    const ts = r.start_time ? new Date(r.start_time).toLocaleTimeString() : '—';
+    return `<tr>
+       <td style="font-family:monospace;font-size:12px">${esc(r.name)}</td>
+       <td><code>${esc(r.refresh_mode)}</code>${fallback}</td>
+       <td style="color:var(--muted);font-size:11px">${ts}</td>
+       <td style="text-align:right">${r.duration_ms != null ? r.duration_ms : '—'}</td>
+       <td style="text-align:right">${r.rows_affected != null ? fmt(r.rows_affected) : '—'}</td>
+       <td style="${statusCol};font-size:11px">${esc(r.status)}</td>
+     </tr>`;
+  }).join(''));
+
+  // Efficiency
+  setRows('tb-int-eff', (d.efficiency||[]).map(r =>
+    `<tr>
+       <td style="font-family:monospace">${esc(r.name)}</td>
+       <td style="text-align:right">${fmt(r.total_refreshes)}</td>
+       <td style="text-align:right;color:var(--green)">${fmt(r.diff_count)}</td>
+       <td style="text-align:right;color:var(--yellow)">${fmt(r.full_count)}</td>
+       <td style="text-align:right">${r.avg_diff_ms != null ? Number(r.avg_diff_ms).toFixed(1) : '—'}</td>
+       <td style="text-align:right">${r.avg_full_ms != null ? Number(r.avg_full_ms).toFixed(1) : '—'}</td>
+       <td style="text-align:right;color:var(--green)">${esc(r.diff_speedup||'—')}</td>
+       <td style="text-align:right">${r.avg_change_ratio != null ? Number(r.avg_change_ratio).toFixed(3) : '—'}</td>
+     </tr>`).join(''));
+
+  // Mode advisor
+  setRows('tb-int-advisor', (d.opt_hints||[]).map(r => {
+    const keep = r.recommended_mode === 'KEEP';
+    const recHtml = keep
+      ? `<span class="score-keep">✓ KEEP <code>${esc(r.current_mode)}</code></span>`
+      : `<span class="score-switch">→ SWITCH TO <code>${esc(r.recommended_mode)}</code></span>`;
+    const confClass = r.confidence === 'high' ? 'conf-high'
+                    : r.confidence === 'medium' ? 'conf-medium' : 'conf-low';
+    return `<tr>
+       <td style="font-family:monospace">${esc(r.name)}</td>
+       <td><code>${esc(r.current_mode)}</code></td>
+       <td style="color:var(--muted)"><code>${esc(r.effective_mode||'—')}</code></td>
+       <td>${recHtml}</td>
+       <td class="${confClass}" style="font-size:11px">${esc(r.confidence||'—')}</td>
+       <td style="color:var(--muted);font-size:11px">${esc(r.reason||'')}</td>
+     </tr>`;
+  }).join(''));
+}
+
+// fetch internals immediately when the tab is opened
+document.getElementById('tab-internals-btn')
+  .addEventListener('shown.bs.tab', refreshInternals);
+
 refresh();
 setInterval(refresh, 2000);
+setInterval(refreshInternals, 5000);
 </script>
 </body>
 </html>
@@ -573,6 +769,91 @@ def api_data():
                 "risk_by_category":    serialize(risk_by_category),
             }
         )
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 500
+    finally:
+        if conn:
+            conn.close()
+
+
+@app.route("/api/internals")
+def api_internals():
+    conn = None
+    try:
+        conn = get_conn()
+
+        st_health = safe_query(conn, """
+            SELECT name, status, refresh_mode, is_populated, schedule
+            FROM   pgtrickle.pgt_status()
+            ORDER  BY name
+        """)
+
+        latest_ref = safe_query(conn, """
+            SELECT DISTINCT ON (st.name)
+                st.name,
+                h.start_time  AS last_refresh,
+                ROUND(EXTRACT(EPOCH FROM (h.end_time - h.start_time)) * 1000)::bigint
+                              AS duration_ms,
+                (h.rows_inserted + h.rows_deleted) AS rows_affected
+            FROM pgtrickle.pgt_refresh_history h
+            JOIN pgtrickle.pgt_stream_tables   st ON st.pgt_id = h.pgt_id
+            WHERE h.status = 'COMPLETED'
+            ORDER BY st.name, h.start_time DESC
+        """)
+
+        dep_tree = safe_query(conn, """
+            SELECT tree_line FROM pgtrickle.dependency_tree()
+        """)
+
+        refresh_hist = safe_query(conn, """
+            SELECT st.name,
+                   h.action          AS refresh_mode,
+                   h.start_time,
+                   ROUND(EXTRACT(EPOCH FROM (h.end_time - h.start_time)) * 1000)::bigint
+                                     AS duration_ms,
+                   (h.rows_inserted + h.rows_deleted) AS rows_affected,
+                   h.status,
+                   h.was_full_fallback
+            FROM pgtrickle.pgt_refresh_history h
+            JOIN pgtrickle.pgt_stream_tables   st ON st.pgt_id = h.pgt_id
+            WHERE h.status IN ('COMPLETED', 'FAILED')
+            ORDER BY h.start_time DESC
+            LIMIT 40
+        """)
+
+        efficiency = safe_query(conn, """
+            SELECT pgt_name AS name, total_refreshes, diff_count, full_count,
+                   avg_diff_ms, avg_full_ms, avg_change_ratio, diff_speedup
+            FROM pgtrickle.refresh_efficiency()
+            ORDER BY pgt_name
+        """)
+
+        opt_hints = safe_query(conn, """
+            SELECT pgt_name AS name, current_mode, effective_mode,
+                   recommended_mode, confidence, reason
+            FROM pgtrickle.recommend_refresh_mode()
+            ORDER BY pgt_name
+        """)
+
+        # Enrich health rows with latest refresh timing
+        latest_by_name = {r['name']: r for r in serialize(latest_ref)}
+        health_out = []
+        for row in serialize(st_health):
+            enriched = dict(row)
+            if row['name'] in latest_by_name:
+                lr = latest_by_name[row['name']]
+                enriched['last_refresh']  = lr.get('last_refresh')
+                enriched['duration_ms']   = lr.get('duration_ms')
+                enriched['rows_affected'] = lr.get('rows_affected')
+            health_out.append(enriched)
+
+        return jsonify({
+            "st_health":       health_out,
+            "dep_tree":        [r['tree_line'] for r in dep_tree],
+            "refresh_history": serialize(refresh_hist),
+            "efficiency":      serialize(efficiency),
+            "opt_hints":       serialize(opt_hints),
+        })
     except Exception as exc:
         return jsonify({"error": str(exc)}), 500
     finally:
