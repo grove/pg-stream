@@ -2,7 +2,7 @@
 
 > **Last updated:** 2026-04-13
 > **Latest release:** 0.19.0 (2026-04-13)
-> **Current milestone:** v0.21.0 — TUI Dog-Feeding Integration
+> **Current milestone:** v0.21.0 — Correctness, Safety & Test Hardening
 
 For a concise description of what pg_trickle is and why it exists, read
 [ESSENCE.md](ESSENCE.md) — it explains the core problem (full `REFRESH
@@ -37,12 +37,13 @@ coverage, all in plain language.
 - [v0.18.0 — Hardening & Delta Performance](#v0180--hardening--delta-performance)
 - [v0.19.0 — Production Gap Closure & Distribution](#v0190--production-gap-closure--distribution)
 - [v0.20.0 — Dog-Feeding](#v0200--dog-feeding-pg_trickle-monitors-itself)
-- [v0.21.0 — TUI Dog-Feeding Integration](#v0210--tui-dog-feeding-integration)
-- [v0.22.0 — PostgreSQL 17 Support](#v0220--postgresql-17-support)
-- [v0.23.0 — PGlite Proof of Concept](#v0230--pglite-proof-of-concept)
-- [v0.24.0 — Core Extraction (`pg_trickle_core`)](#v0240--core-extraction-pg_trickle_core)
-- [v0.25.0 — PGlite WASM Extension](#v0250--pglite-wasm-extension)
-- [v0.26.0 — PGlite Reactive Integration](#v0260--pglite-reactive-integration)
+- [v0.21.0 — Correctness, Safety & Test Hardening](#v0210--correctness-safety--test-hardening)
+- [v0.22.0 — TUI Dog-Feeding Integration](#v0220--tui-dog-feeding-integration)
+- [v0.23.0 — PostgreSQL 17 Support](#v0230--postgresql-17-support)
+- [v0.24.0 — PGlite Proof of Concept](#v0240--pglite-proof-of-concept)
+- [v0.25.0 — Core Extraction (`pg_trickle_core`)](#v0250--core-extraction-pg_trickle_core)
+- [v0.26.0 — PGlite WASM Extension](#v0260--pglite-wasm-extension)
+- [v0.27.0 — PGlite Reactive Integration](#v0270--pglite-reactive-integration)
 - [v1.0.0 — Stable Release](#v100--stable-release)
 - [Post-1.0 — Scale, Ecosystem & Platform Expansion](#post-10--scale-ecosystem--platform-expansion)
 - [Effort Summary](#effort-summary)
@@ -85,12 +86,13 @@ from the v0.1.x series to 1.0 and beyond.
 | **v0.18.0** | **Hardening & delta performance** | **✅ Released** |
 | **v0.19.0** | **Production gap closure & distribution** | **✅ Released** |
 | **v0.20.0** | **Dog-feeding (pg_trickle monitors itself)** | **✅ Released** |
-| v0.21.0 | TUI dog-feeding integration | Planned |
-| v0.22.0 | PostgreSQL 17 support | Planned |
-| v0.23.0 | PGlite proof of concept | Planned |
-| v0.24.0 | Core extraction (`pg_trickle_core`) | Planned |
-| v0.25.0 | PGlite WASM extension | Planned |
-| v0.26.0 | PGlite reactive integration | Planned |
+| v0.21.0 | Correctness, safety & test hardening | Planned |
+| v0.22.0 | TUI dog-feeding integration | Planned |
+| v0.23.0 | PostgreSQL 17 support | Planned |
+| v0.24.0 | PGlite proof of concept | Planned |
+| v0.25.0 | Core extraction (`pg_trickle_core`) | Planned |
+| v0.26.0 | PGlite WASM extension | Planned |
+| v0.27.0 | PGlite reactive integration | Planned |
 | v1.0.0 | Stable release (incl. PG 19 compatibility) | Planned |
 
 ---
@@ -6011,7 +6013,110 @@ Dependencies: DB-3 (uses schema version to determine needed migrations). Schema 
 
 ---
 
-## v0.21.0 — TUI Dog-Feeding Integration
+## v0.21.0 — Correctness, Safety & Test Hardening
+
+**Status: Planned.** Driven by findings in [PLAN_OVERALL_ASSESSMENT.md](plans/PLAN_OVERALL_ASSESSMENT.md).
+
+> **Release Theme**
+> This release closes the last known data-correctness gap (EC-01 JOIN delta
+> phantom rows), reduces the `unsafe` code surface, expands unit-test coverage
+> in three large untested modules, adds a parser fuzz target, and adds a
+> crash-recovery test for the bgworker. A shadow/canary mode for
+> `alter_stream_table` makes migrations of critical stream tables safer, and a
+> `refresh.rs` module split into focused sub-modules reduces change risk.
+> A Performance Tuning Cookbook consolidates scattered advice into an operator
+> reference.
+
+### EC-01 Fix — JOIN Delta Phantom Rows
+
+| Item | Description | Effort | Ref |
+|------|-------------|--------|-----|
+| EC01-0 | **Q15 IMMEDIATE-mode stop-gap.** Add Q15 to `IMMEDIATE_SKIP_ALLOWLIST` pending the EC-01 fix; superseded by EC01-3 which removes it once the fix lands. | XS (1h) | [PLAN_OVERALL_ASSESSMENT.md](plans/PLAN_OVERALL_ASSESSMENT.md) §6.4 |
+| EC01-1 | **Fix Part 1 row-id hash collision.** When EC-01 splits Part 1 into 1a (ΔQ⋈R₁) and 1b (ΔQ⋈R₀), hash only the left-side PK on Part 1b so both halves produce the same `__pgt_row_id` and weight aggregation cancels them correctly. | 3–5d | [PLAN_EDGE_CASES.md](plans/PLAN_EDGE_CASES.md) §EC-01; `src/dvm/operators/join.rs` L234–245 |
+| EC01-2 | **PH-D1 phantom cleanup.** Verify PH-D1 DELETE+INSERT handles converged row ids from EC01-1; extend to cover prior-cycle phantom rows already in the stream table. | 1–2d | `src/refresh.rs` L4991–5005 |
+| EC01-3 | **TPC-H Q07 + Q15 regression gate.** Remove Q07 from DIFFERENTIAL skip list; remove Q15 from IMMEDIATE skip list. Add `test_tpch_q07_ec01b_combined_delete` deterministic pass assertion. | 1d | `tests/e2e_tpch_tests.rs` L92–104 |
+| EC01-4 | **Multi-cycle phantom property test.** 5,000-iteration proptest: delete right-side row while left changes; verify zero phantom accumulation after N cycles. | 1d | `src/dvm/operators/join.rs` |
+
+### Safety & Code Quality
+
+| Item | Description | Effort | Ref |
+|------|-------------|--------|-----|
+| SAF-1 | **Convert production `.unwrap()` in `sublinks.rs` to `?`.** 28 sites in `src/dvm/parser/sublinks.rs` (e.g. `from_list.head().unwrap()`, `get_ptr(i).unwrap()`) converted to `ok_or(PgTrickleError::UnsupportedPattern)`. | 2d | [PLAN_OVERALL_ASSESSMENT.md](plans/PLAN_OVERALL_ASSESSMENT.md) §2.2 |
+| SAF-2 | **Unsafe reduction half-pass.** Add `list_nth_safe<T>()` helper returning `Option<PgBox<T>>`; group repeated `pg_sys::*` FFI calls into safe façades in `src/dvm/parser/types.rs`. Target: ≥40% reduction in `unsafe` block count. | 1wk | [plans/safety/PLAN_REDUCED_UNSAFE.md](plans/safety/PLAN_REDUCED_UNSAFE.md) |
+| SAF-3 | **`clippy::unwrap_used` lint gate.** Add `#![deny(clippy::unwrap_used)]` in `lib.rs` outside `#[cfg(test)]`, with `#[allow]` on justified invariant sites in `dag.rs`. | 1d | [PLAN_OVERALL_ASSESSMENT.md](plans/PLAN_OVERALL_ASSESSMENT.md) §2.2 |
+| OP-6 | **Non-deterministic function warning / rejection.** Reject or warn at `create_stream_table` time if query uses `now()`, `random()`, volatile UDFs without explicit `non_deterministic => true`. Pre-v1.0 safety gate. | S (2d) | [PLAN_OVERALL_ASSESSMENT.md](plans/PLAN_OVERALL_ASSESSMENT.md) §2.6 |
+
+### Test Coverage
+
+| Item | Description | Effort | Ref |
+|------|-------------|--------|-----|
+| TEST-1 | **Unit tests for `src/api/helpers.rs` (2.5k LOC).** 25+ unit tests covering query validation, schema helpers, and CDC orchestration utilities. | 3d | [PLAN_OVERALL_ASSESSMENT.md](plans/PLAN_OVERALL_ASSESSMENT.md) §6.1 |
+| TEST-2 | **Unit tests for `src/api/diagnostics.rs` (1.5k LOC).** 15+ unit tests covering `explain_st`, `health_summary`, and `cache_stats` formatting logic. | 2d | [PLAN_OVERALL_ASSESSMENT.md](plans/PLAN_OVERALL_ASSESSMENT.md) §6.1 |
+| TEST-3 | **Unit tests for `src/dvm/parser/rewrites.rs` (5.9k LOC).** 30+ unit tests covering each of the 7 rewrite passes: view inlining, DISTINCT ON, GROUPING SETS, scalar SSQ in WHERE, correlated SSQ in SELECT, SubLinks in OR, multi-PARTITION BY windows. | 3d | [PLAN_OVERALL_ASSESSMENT.md](plans/PLAN_OVERALL_ASSESSMENT.md) §6.1 |
+| TEST-4 | **Parser fuzz target (`cargo-fuzz`).** Differential fuzz: feed random SQL to the pg_trickle parser and verify it never panics; compare accepted/rejected decisions against plain `SELECT`. Target: 1h of fuzzing with zero panics. | 1wk | [PLAN_OVERALL_ASSESSMENT.md](plans/PLAN_OVERALL_ASSESSMENT.md) §6.2 |
+| TEST-5 | **Crash-recovery bgworker resilience test.** `pg_ctl stop -m immediate` mid-refresh; verify: no unfinalised `pgt_refresh_history` entries, WAL decoder resumes from `confirmed_lsn`, change buffer is consistent. | 3d | [PLAN_OVERALL_ASSESSMENT.md](plans/PLAN_OVERALL_ASSESSMENT.md) §6.3 |
+
+### Architecture
+
+| Item | Description | Effort | Ref |
+|------|-------------|--------|-----|
+| ARCH-1 | **Split `src/refresh.rs` (8.4k LOC) into 4 sub-modules.** `refresh/orchestrator.rs` (dispatch, status), `refresh/codegen.rs` (delta SQL generation), `refresh/phd1.rs` (PH-D1 phantom delete), `refresh/merge.rs` (MERGE strategy). Zero behaviour change — pure reorganisation. | 1wk | [PLAN_OVERALL_ASSESSMENT.md](plans/PLAN_OVERALL_ASSESSMENT.md) §2.4 |
+| ARCH-2 | **Recursive CTE fallback observability.** Log `NOTICE: falling back to FULL refresh — defining query contains WITH RECURSIVE`; expose `refresh_reason = 'recursive_cte_fallback'` tag in Prometheus metrics and `pgt_refresh_history`. | 1d | [PLAN_OVERALL_ASSESSMENT.md](plans/PLAN_OVERALL_ASSESSMENT.md) §2.5 |
+
+### Operational Features
+
+| Item | Description | Effort | Ref |
+|------|-------------|--------|-----|
+| OPS-1 | **Shadow/canary mode for `alter_stream_table`.** Optional `dry_run_shadow => true` parameter: materialises new query into `pgt_shadow_<name>` on the same schedule; `pgtrickle.canary_diff(name)` diffs against the live table. `pgtrickle.canary_promote(name)` atomically swaps. | 1wk | [PLAN_OVERALL_ASSESSMENT.md](plans/PLAN_OVERALL_ASSESSMENT.md) §9.5 |
+| OP-2 | **Prometheus HTTP endpoint in bgworker.** Tiny HTTP server (port configurable via `pg_trickle.metrics_port`) emitting all monitoring metrics in OpenMetrics format. Removes "bring your own exporter" hurdle. | S (1w) | [PLAN_OVERALL_ASSESSMENT.md](plans/PLAN_OVERALL_ASSESSMENT.md) §9.6 |
+| OP-3 | **`pgtrickle.pause_all()` / `resume_all()` helpers.** Idempotent SQL wrappers for suspending all stream tables during maintenance (e.g. `pg_dump` of source tables). | XS (1d) | [PLAN_OVERALL_ASSESSMENT.md](plans/PLAN_OVERALL_ASSESSMENT.md) §9.1 |
+| OP-4 | **`pgtrickle.refresh_if_stale(name, max_age)` convenience wrapper.** Application-level staleness gating without custom procedural code. | XS (1d) | [PLAN_OVERALL_ASSESSMENT.md](plans/PLAN_OVERALL_ASSESSMENT.md) §9.1 |
+| OP-5 | **`pgtrickle.stream_table_definition(name)` helper.** Single-row fetch of original query, refresh mode, schedule, and status for auditing / blue-green migrations. | XS (1d) | [PLAN_OVERALL_ASSESSMENT.md](plans/PLAN_OVERALL_ASSESSMENT.md) §9.1 |
+
+### Documentation
+
+| Item | Description | Effort | Ref |
+|------|-------------|--------|-----|
+| DOC-1 | **Performance Tuning Cookbook.** New `docs/PERFORMANCE_COOKBOOK.md`: symptom → likely cause → GUC to tune → measurement rows. Consolidates advice from FAQ, TROUBLESHOOTING, SCALING, and BENCHMARK. | 3d | [PLAN_OVERALL_ASSESSMENT.md](plans/PLAN_OVERALL_ASSESSMENT.md) §7.2 |
+
+### Implementation Phases
+
+| Phase | Description | Duration |
+|-------|-------------|----------|
+| EC01 | EC-01 fix: Q15 stop-gap + `join.rs` hash + `refresh.rs` PH-D1 + TPC-H validation | Days 1–8 |
+| SAF | Safety pass: `unwrap`→`?`, unsafe reduction, lint gate, volatile-fn warning | Days 9–15 |
+| TEST | Unit test campaign (3 files) + fuzz target + resilience test | Days 16–24 |
+| ARCH | `refresh.rs` split + recursive CTE observability | Days 25–29 |
+| OPS+DOC | Shadow/canary mode + Prometheus endpoint + API helpers + Performance Cookbook | Days 30–40 |
+
+> **v0.21.0 total: ~6–8 weeks** (EC-01 fix + safety hardening + API ergonomics + Prometheus endpoint + test coverage + module refactor + shadow mode + docs)
+
+**Exit criteria:**
+- [ ] EC01-0: Q15 added to `IMMEDIATE_SKIP_ALLOWLIST` as stop-gap
+- [ ] EC01-1/EC01-2: `test_tpch_q07_ec01b_combined_delete` passes deterministically
+- [ ] EC01-3: Q07 and Q15 removed from IMMEDIATE/DIFFERENTIAL skip allowlists
+- [ ] EC01-4: Multi-cycle phantom proptest passes 5,000 iterations
+- [ ] SAF-1: All 28 production `.unwrap()` sites in `sublinks.rs` converted to `?`
+- [ ] SAF-2: `unsafe` block count reduced by ≥40%
+- [ ] SAF-3: `clippy::unwrap_used` lint gate passes with zero violations in non-test code
+- [ ] OP-6: `create_stream_table` warns or rejects queries using `now()`, `random()`, volatile UDFs without `non_deterministic => true`
+- [ ] TEST-1/2/3: ≥70 new unit tests across 3 previously-untested files
+- [ ] TEST-4: Fuzz target runs 1h with zero panics
+- [ ] TEST-5: Crash-recovery test passes deterministically
+- [ ] ARCH-1: `refresh.rs` split into 4 sub-modules; all existing tests pass unchanged
+- [ ] ARCH-2: `refresh_reason = 'recursive_cte_fallback'` visible in Prometheus/NOTIFY
+- [ ] OPS-1: `canary_diff()` / `canary_promote()` API functional with E2E tests
+- [ ] OP-2: Prometheus HTTP endpoint accessible at `pg_trickle.metrics_port`; all monitoring metrics present
+- [ ] OP-3: `pgtrickle.pause_all()` / `resume_all()` work idempotently; E2E test passes
+- [ ] OP-4: `pgtrickle.refresh_if_stale(name, max_age)` correctly gates refresh by age
+- [ ] OP-5: `pgtrickle.stream_table_definition(name)` returns accurate single-row result
+- [ ] DOC-1: `docs/PERFORMANCE_COOKBOOK.md` published
+- [ ] Extension upgrade path tested (`0.20.0 → 0.21.0`)
+- [ ] `just check-version-sync` passes
+
+---
+
+## v0.22.0 — TUI Dog-Feeding Integration
 
 **Status: Planned.** See [plans/ui/PLAN_TUI_PART_3.md](plans/ui/PLAN_TUI_PART_3.md) for the full design.
 
@@ -6085,6 +6190,14 @@ Dependencies: DB-3 (uses schema version to determine needed migrations). Schema 
 | DOC-21 | **`docs/GETTING_STARTED.md` Day 2 update.** Document dog-feeding CLI and TUI integration for new users. | 1h | [PLAN_TUI_PART_3.md](plans/ui/PLAN_TUI_PART_3.md) §T20 |
 | DOC-22 | **`docs/SQL_REFERENCE.md` update.** Document `df_threshold_advice.sla_breach_risk` column. | 0.5h | [PLAN_TUI_PART_3.md](plans/ui/PLAN_TUI_PART_3.md) §T20 |
 
+### Phase 6 — TUI/CLI Visualization Polish
+
+TUI/CLI visualization enhancement for the dog-feeding views. Recommended from [PLAN_OVERALL_ASSESSMENT.md](plans/PLAN_OVERALL_ASSESSMENT.md) §9.11.
+
+| Item | Description | Effort | Ref |
+|------|-------------|--------|-----|
+| OP-1 | **DAG runtime overlay in `explain_dag()`.** Colour nodes by p95 latency, width by rows/refresh using `pgt_refresh_history`. Enhances `explain_dag()` visualization for TUI/CLI. | XS (2d) | [PLAN_OVERALL_ASSESSMENT.md](plans/PLAN_OVERALL_ASSESSMENT.md) §9.11 |
+
 ### Implementation Phases
 
 | Phase | Description | Duration |
@@ -6095,8 +6208,9 @@ Dependencies: DB-3 (uses schema version to determine needed migrations). Schema 
 | T18 | Backend Enhancements — DF-21 through DF-24, proptest, upgrade SQL | Days 9–12 |
 | T19 | CLI Integration — `pgtrickle dog-feeding`, `pgtrickle graph --format` | Days 12–13 |
 | T20 | Documentation, Polish & Final Testing — docs, cross-cutting tests, coverage audit | Days 13–15 |
+| T21 (OP) | TUI/CLI Polish — DAG runtime overlay in `explain_dag()` | Days 15–16 (parallel or interleaved) |
 
-> **v0.21.0 total: ~3–4 weeks** (TUI dog-feeding integration: architecture + 16 views + 4 backend items + 2 CLI commands + tests + docs)
+> **v0.22.0 total: ~3–4 weeks** (TUI dog-feeding integration + DAG visualization polish: architecture + 16 views + 4 backend items + 2 CLI commands + tests + docs)
 
 **Exit criteria:**
 - [ ] T15: `AppState` uses 8 domain structs; all existing tests pass; `just lint` clean
@@ -6119,17 +6233,17 @@ Dependencies: DB-3 (uses schema version to determine needed migrations). Schema 
 - [ ] CLI-1: `pgtrickle dog-feeding enable/disable/status` functional
 - [ ] CLI-2: `pgtrickle graph --format mermaid` outputs valid Mermaid
 - [ ] TUI-D1/DOC-21/DOC-22: Documentation updated
-- [ ] Extension upgrade path tested (`0.20.0 → 0.21.0`)
+- [ ] Extension upgrade path tested (`0.21.0 → 0.22.0`)
 - [ ] `just check-version-sync` passes
 
 ---
 
-## v0.22.0 — PostgreSQL 17 Support
+## v0.23.0 — PostgreSQL 17 Support
 
 > **Release Theme**
 > This release adds PostgreSQL 17 as a supported target alongside
 > PostgreSQL 18. PGlite is built on PostgreSQL 17, so this is a hard
-> prerequisite for the PGlite proof of concept (v0.23.0). The pgrx 0.17.x
+> prerequisite for the PGlite proof of concept (v0.24.0). The pgrx 0.17.x
 > framework already supports PG 17 — the work is enabling the feature flag,
 > adapting version-sensitive code paths, expanding the CI matrix, and
 > validating the full test suite against a PG 17 instance.
@@ -6158,14 +6272,14 @@ Dependencies: DB-3 (uses schema version to determine needed migrations). Schema 
 |------|-------------|--------|-----|
 | PG17-9 | **Full E2E suite against PG 17.** Run the complete E2E test suite against a PG 17 instance. Fix any parser or catalog incompatibilities that surface. | 1–2d | — |
 | PG17-10 | **TPC-H validation on PG 17.** Run TPC-H benchmark queries on PG 17 to verify differential refresh correctness for complex queries. | 4–8h | — |
-| PG17-11 | **Upgrade path test.** Verify `ALTER EXTENSION pg_trickle UPDATE` from 0.21.0 to 0.22.0 works on both PG 17 and PG 18. | 2–4h | — |
+| PG17-11 | **Upgrade path test.** Verify `ALTER EXTENSION pg_trickle UPDATE` from 0.22.0 to 0.23.0 works on both PG 17 and PG 18. | 2–4h | — |
 
 ### Documentation
 
 | Item | Description | Effort | Ref |
 |------|-------------|--------|-----|
 | PG17-12 | **Update docs and README.** Change "PostgreSQL 18 extension" to "PostgreSQL 17/18 extension" in `README.md`, `INSTALL.md`, `src/lib.rs` doc comments, and `ARCHITECTURE.md`. | 1–2h | — |
-| PG17-13 | **Docker Hub image variants.** Publish images tagged with both PG versions (e.g., `:0.22.0-pg17`, `:0.22.0-pg18`). | 2–4h | — |
+| PG17-13 | **Docker Hub image variants.** Publish images tagged with both PG versions (e.g., `:0.23.0-pg17`, `:0.23.0-pg18`). | 2–4h | — |
 
 ### PostgreSQL 18/19 Feature Integration
 
@@ -6197,7 +6311,7 @@ Low-hanging PostgreSQL feature opportunities identified in [plans/sql/PLAN_POSTG
 
 > **PostgreSQL feature integration subtotal: ~4–5 hours** (PGFEAT-1 through PGFEAT-5) **+ ~10–18 hours** (PGFEAT-6 through PGFEAT-9, optional but recommended)
 
-> **v0.22.0 total: ~2–4 days** (PG 17 support) **+ ~14–23 hours** (PostgreSQL feature integration, all items)
+> **v0.23.0 total: ~2–4 days** (PG 17 support) **+ ~14–23 hours** (PostgreSQL feature integration, all items)
 
 **Exit criteria:**
 - [ ] PG17-1: `cargo build --features pg17 --no-default-features` compiles cleanly
@@ -6217,12 +6331,12 @@ Low-hanging PostgreSQL feature opportunities identified in [plans/sql/PLAN_POSTG
 - [ ] PGFEAT-7: Skip scan index optimization evaluated; benchmarks quantify benefit; indexes created if beneficial
 - [ ] PGFEAT-8: `MERGE ... RETURNING OLD.*, NEW.*` integrated in `build_merge_sql()`; ST-to-ST change buffer performance improved
 - [ ] PGFEAT-9: Virtual generated columns correctly excluded from CDC change buffer schemas; E2E tests pass with virtual column sources
-- [ ] Extension upgrade path tested (`0.21.0 → 0.22.0`)
+- [ ] Extension upgrade path tested (`0.22.0 → 0.23.0`)
 - [ ] `just check-version-sync` passes
 
 ---
 
-## v0.23.0 — PGlite Proof of Concept
+## v0.24.0 — PGlite Proof of Concept
 
 > **Release Theme**
 > This release validates whether PGlite users want real incremental view
@@ -6592,7 +6706,7 @@ Dependencies: None. Schema change: No (PG extension unchanged).
    compensate — consider porting the proptest approach to a JS property-
    testing library (e.g., fast-check).
 
-> **v0.23.0 total: ~2–3 weeks (PGlite plugin) + ~1–2 days (PG extension version bump)**
+> **v0.24.0 total: ~2–3 weeks (PGlite plugin) + ~1–2 days (PG extension version bump)**
 
 **Exit criteria:**
 - [ ] PGL-0-1: Statement-level triggers with transition tables confirmed working in PGlite
@@ -6614,12 +6728,12 @@ Dependencies: None. Schema change: No (PG extension unchanged).
 - [ ] UX-4: TypeScript type definitions ship with strict-mode compatibility
 - [ ] TEST-1: > 50 correctness test cases pass on PGlite latest
 - [ ] TEST-2: CI tests pass against PGlite N, N-1, N-2
-- [ ] TEST-5: Extension upgrade path tested (`0.21.0 -> 0.22.0`)
+- [ ] TEST-5: Extension upgrade path tested (`0.23.0 -> 0.24.0`)
 - [ ] `just check-version-sync` passes
 
 ---
 
-## v0.24.0 — Core Extraction (`pg_trickle_core`)
+## v0.25.0 — Core Extraction (`pg_trickle_core`)
 
 > **Release Theme**
 > This release surgically separates pg_trickle's "brain" — the DVM engine,
@@ -7045,7 +7159,7 @@ Dependencies: PGL-1-1. Schema change: No.
 
 ---
 
-## v0.25.0 — PGlite WASM Extension
+## v0.26.0 — PGlite WASM Extension
 
 > **Release Theme**
 > This release delivers the first working PGlite extension — the moment
@@ -7513,7 +7627,7 @@ Dependencies: PGL-2-3, PERF-2. Schema change: No.
 
 ---
 
-## v0.26.0 — PGlite Reactive Integration
+## v0.27.0 — PGlite Reactive Integration
 
 > **Release Theme**
 > This release completes the PGlite story by bridging the gap between
@@ -8187,12 +8301,13 @@ to keep the pre-1.0 milestones focused on performance and correctness.
 | v0.18.0 — Hardening & Delta Performance | ~70–100h | — | |
 | v0.19.0 — Production Gap Closure & Distribution | ~4–5 weeks | — | |
 | v0.20.0 — Dog-Feeding (pg_trickle monitors itself) | ~3–4wk | — | |
-| v0.21.0 — TUI Dog-Feeding Integration | ~3–4wk (TUI + architecture + backend + CLI) | — | |
-| v0.22.0 — PostgreSQL 17 Support | ~2–4d | — | |
-| v0.23.0 — PGlite Proof of Concept | ~2–3wk (plugin) + ~1–2d (version bump) | — | |
-| v0.24.0 — Core Extraction (`pg_trickle_core`) | ~3–4wk (extraction) + ~1–2wk (abstraction + testing) | — | |
-| v0.25.0 — PGlite WASM Extension | ~5–7wk (WASM build) + ~2–3wk (testing + polish) | — | |
-| v0.26.0 — PGlite Reactive Integration | ~2–3wk (bridge + hooks) + ~1–2wk (examples + testing + polish) | — | |
+| v0.21.0 — Correctness, Safety & Test Hardening | ~6–8wk | — | |
+| v0.22.0 — TUI Dog-Feeding Integration | ~3–4wk (TUI + architecture + backend + CLI) | — | |
+| v0.23.0 — PostgreSQL 17 Support | ~2–4d | — | |
+| v0.24.0 — PGlite Proof of Concept | ~2–3wk (plugin) + ~1–2d (version bump) | — | |
+| v0.25.0 — Core Extraction (`pg_trickle_core`) | ~3–4wk (extraction) + ~1–2wk (abstraction + testing) | — | |
+| v0.26.0 — PGlite WASM Extension | ~5–7wk (WASM build) + ~2–3wk (testing + polish) | — | |
+| v0.27.0 — PGlite Reactive Integration | ~2–3wk (bridge + hooks) + ~1–2wk (examples + testing + polish) | — | |
 | v1.0.0 — Stable release (incl. PG 19 compat) | ~36–66h | — | |
 | Post-1.0 (PG compat + Native DDL) | ~38–56h (PG 16–18) + ~13–21d (Native DDL) | — | |
 | Post-1.0 (ecosystem) | 88–134h | — | |
