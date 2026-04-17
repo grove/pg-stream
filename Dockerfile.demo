@@ -26,8 +26,10 @@ WORKDIR /build
 COPY . /build
 
 # Build extension (cargo-pgrx v0.17+ requires Rust nightly for edition2024)
+# Use cargo pgrx package to build against the installed PostgreSQL dev headers
 RUN cargo install cargo-pgrx && \
-    cargo pgrx install --release
+    PG_CONFIG=/usr/lib/postgresql/18/bin/pg_config \
+    cargo pgrx package --release
 
 # Final stage: PostgreSQL with built extension
 FROM postgres:18.3-bookworm
@@ -38,6 +40,6 @@ RUN apt-get update && apt-get install -y \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy built extension from builder
-# pgrx installs to /usr/lib/postgresql/18/lib/ and /usr/share/postgresql/18/extension/
-COPY --from=builder /usr/lib/postgresql/18/lib/pg_trickle*.so /usr/lib/postgresql/18/lib/
-COPY --from=builder /usr/share/postgresql/18/extension/pg_trickle* /usr/share/postgresql/18/extension/
+# cargo pgrx package outputs to target/release/pg_trickle-pg18/
+COPY --from=builder /build/target/release/pg_trickle-pg18/usr/share/postgresql/18/extension/* /usr/share/postgresql/18/extension/
+COPY --from=builder /build/target/release/pg_trickle-pg18/usr/lib/postgresql/18/lib/*.so /usr/lib/postgresql/18/lib/
