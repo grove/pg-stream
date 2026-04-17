@@ -275,25 +275,30 @@ SELECT name, status, refresh_mode, is_populated, staleness
 FROM pgtrickle.pgt_status();
 ```
 
-**Inspect the DAG dependency graph:**
+**Inspect the DAG dependency graph (full tree):**
 
 ```sql
-SELECT * FROM pgtrickle.dependency_tree('risk_scores');
+SELECT tree_line FROM pgtrickle.dependency_tree()
+ORDER BY tree_line;
 ```
 
 **See the most recent refresh history:**
 
 ```sql
-SELECT stream_table, action, status, duration_ms, refreshed_at
-FROM pgtrickle.pgt_refresh_history
-ORDER BY refreshed_at DESC
+SELECT st.pgt_name, rh.action, rh.status, 
+       (rh.end_time - rh.start_time) AS duration, rh.start_time
+FROM pgtrickle.pgt_refresh_history rh
+JOIN pgtrickle.pgt_stream_tables st ON st.pgt_id = rh.pgt_id
+ORDER BY rh.start_time DESC
 LIMIT 20;
 ```
 
-**Spot the diamond groups:**
+**Spot the diamond groups (stream tables with shared sources):**
 
 ```sql
-SELECT * FROM pgtrickle.diamond_groups();
+SELECT group_id, member_name, is_convergence, schedule_policy
+FROM pgtrickle.diamond_groups()
+ORDER BY group_id, is_convergence DESC;
 ```
 
 **Watch a HIGH-risk alert appear:**
