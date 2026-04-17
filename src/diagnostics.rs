@@ -1483,7 +1483,7 @@ pub fn gather_change_ratio(st: &StreamTableMeta) -> Option<f64> {
 
 /// Gather refresh history statistics for a stream table.
 #[allow(clippy::field_reassign_with_default)]
-pub fn gather_history_stats(pgt_id: i64) -> HistoryStats {
+pub fn gather_history_stats(pgt_id: i64, target_relid: pg_sys::Oid) -> HistoryStats {
     let mut stats = HistoryStats::default();
 
     // Total history row count
@@ -1495,16 +1495,22 @@ pub fn gather_history_stats(pgt_id: i64) -> HistoryStats {
     .unwrap_or(Some(0))
     .unwrap_or(0);
 
-    // Average change ratio from history
+    // Average change ratio from history: fraction of output rows that change
+    // per differential refresh.  We divide by the stream table's current
+    // reltuples so the ratio is meaningful (0 = nothing changes, 1 = every row
+    // changes every refresh).  The old denominator (delta_row_count =
+    // rows_inserted + rows_deleted) was a tautology — always 1.0.
     stats.avg_change_ratio = Spi::get_one_with_args::<f64>(
-        "SELECT AVG(CASE WHEN delta_row_count > 0 THEN \
-           (rows_inserted + rows_deleted)::float / GREATEST(delta_row_count, 1) \
+        "SELECT AVG(CASE WHEN (rows_inserted + rows_deleted) > 0 THEN \
+           (rows_inserted + rows_deleted)::float / \
+           GREATEST((SELECT GREATEST(reltuples, 1.0) \
+                     FROM pg_class WHERE oid = $2), 1.0) \
            ELSE NULL END) \
-         FROM (SELECT rows_inserted, rows_deleted, delta_row_count \
+         FROM (SELECT rows_inserted, rows_deleted \
                FROM pgtrickle.pgt_refresh_history \
                WHERE pgt_id = $1 AND status = 'COMPLETED' \
                ORDER BY start_time DESC LIMIT 100) sub",
-        &[pgt_id.into()],
+        &[pgt_id.into(), target_relid.into()],
     )
     .unwrap_or(None);
 
@@ -1725,7 +1731,7 @@ pub fn gather_index_coverage(target_relid: pg_sys::Oid) -> Option<bool> {
 /// Build a complete DiagnosticsInput for a stream table by gathering all signals.
 pub fn gather_all_signals(st: &StreamTableMeta) -> DiagnosticsInput {
     let change_ratio_current = gather_change_ratio(st);
-    let history = gather_history_stats(st.pgt_id);
+    let history = gather_history_stats(st.pgt_id, st.pgt_relid);
     let (join_count, agg_depth, has_window, subquery_count) = gather_query_complexity(st);
     let target_size_bytes = gather_target_size(st.pgt_relid);
     let has_covering_index = gather_index_coverage(st.pgt_relid);

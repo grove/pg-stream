@@ -299,14 +299,15 @@ HTML = r"""<!DOCTYPE html>
         <div class="overflow-auto" style="max-height:220px;">
           <table class="g-table">
             <thead>
-              <tr><th>Merchant</th><th>Tier</th><th>Txns</th><th>Avg $</th><th>Users</th></tr>
+              <tr><th>Merchant</th><th>Cat.</th><th>Tier</th><th>Risk</th><th>Last Changed</th></tr>
             </thead>
             <tbody id="tb-tier-stats"></tbody>
           </table>
         </div>
         <div class="p-2" style="font-size:11px;color:var(--muted);border-top:1px solid var(--border)">
-          Only 1 of 15 rows changes per cycle (1 transaction hits 1 merchant).
-          Tier rotates ~every 30 cycles. The Mode Advisor recommends
+          Only tier rotations trigger output changes (~every 30 cycles). No
+          fast-growing sources — only <code>merchant_risk_tier</code> (15 rows).
+          Mode Advisor recommends
           <span style="color:var(--green)">KEEP DIFFERENTIAL</span> here.
         </div>
       </div>
@@ -602,12 +603,13 @@ async function refresh() {
   const tierColors = { HIGH: 'var(--red)', ELEVATED: 'var(--yellow)', STANDARD: 'var(--green)' };
   setRows('tb-tier-stats', (d.merchant_tier_stats||[]).map(r => {
     const col = tierColors[r.merchant_tier] || 'inherit';
+    const ts = r.tier_last_changed ? new Date(r.tier_last_changed).toLocaleTimeString() : '—';
     return `<tr>
        <td>${esc(r.merchant_name)}</td>
+       <td style="color:var(--muted);font-size:11px">${esc(r.category||'')}</td>
        <td style="color:${col};font-weight:bold">${esc(r.merchant_tier)}</td>
-       <td>${fmt(r.txn_count)}</td>
-       <td>${fmtM(r.avg_amount)}</td>
-       <td>${r.unique_users}</td>
+       <td style="text-align:right;color:var(--muted)">${r.risk_score}</td>
+       <td style="color:var(--muted);font-size:11px">${ts}</td>
      </tr>`;
   }).join(''));
 
@@ -743,17 +745,19 @@ DAG_DIAGRAM = r"""
   └────────────┘         │  (DIFFERENTIAL)  │
                          └──────────────────┘
 
-  ┌───────────────────┐
-  │ merchant_risk_tier│──┐
-  │ (slowly-changing) │  │  ┌─────────────────────┐
-  └───────────────────┘  └─►│ merchant_tier_stats │  ← DIFFERENTIAL SHOWCASE
-  transactions ─────────────►│   (DIFFERENTIAL 5s) │    change ratio ~0.07
-                             └─────────────────────┘
+  ┌───────────────────┐   ┌─────────────────────┐
+  │ merchant_risk_tier│──►│ merchant_tier_stats │  ← DIFFERENTIAL SHOWCASE
+  │ (slowly-changing) │   │   (DIFFERENTIAL 5s) │    change ratio ~0.07
+  └───────────────────┘   │                     │    (no fast-change sources)
+  ┌────────────┐           │                     │
+  │ merchants  │──────────►│                     │
+  │  (static)  │           └─────────────────────┘
+  └────────────┘
 
   transactions feeds user_velocity AND merchant_stats — a genuine diamond.
   risk_scores is the convergence node that joins both Layer 1 outputs.
-  merchant_tier_stats demonstrates low change ratio: only 1/15 rows changes
-  per cycle (1 transaction touches 1 merchant; tier rotates ~every 30 cycles).
+  merchant_tier_stats has NO fast-growing sources: only merchant_risk_tier
+  changes (~1 of 15 rows per 30 cycles), giving change ratio ≈ 0.07.
 """
 
 
@@ -830,12 +834,10 @@ def api_data():
         """)
 
         merchant_tier_stats = safe_query(conn, """
-            SELECT mts.merchant_id, m.name AS merchant_name, m.category,
-                   mts.merchant_tier, mts.txn_count, mts.total_amount,
-                   mts.avg_amount, mts.unique_users
-            FROM   merchant_tier_stats mts
-            JOIN   merchants m ON m.id = mts.merchant_id
-            ORDER  BY mts.merchant_id
+            SELECT merchant_id, merchant_name, category,
+                   merchant_tier, risk_score, tier_last_changed
+            FROM   merchant_tier_stats
+            ORDER  BY merchant_id
         """)
 
         merchant_tiers = safe_query(conn, """

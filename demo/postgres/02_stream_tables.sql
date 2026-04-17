@@ -195,30 +195,35 @@ SELECT pgtrickle.create_stream_table(
 -- ─────────────────────────────────────────────────────────────────────────────
 -- DIFFERENTIAL EFFICIENCY SHOWCASE
 -- ─────────────────────────────────────────────────────────────────────────────
--- merchant_tier_stats demonstrates a low change ratio by reading from
+-- merchant_tier_stats demonstrates a low change ratio by depending ONLY on
 -- merchant_risk_tier — a slowly-changing lookup that the generator updates
--- for only one merchant every ~30 cycles (roughly once per minute).
+-- for one merchant every ~30 cycles (roughly once per minute).
 --
 -- Per-cycle change profile:
---   • 1 new transaction is inserted → only that merchant's row changes.
---   • ~every 30 cycles, one merchant's tier is rotated → only that row changes.
+--   • merchant_risk_tier: 1 row updated every ~30 cycles → 1 of 15 rows changes.
+--   • merchants: static lookup — never updated, 0 changes ever.
+--   • transactions is intentionally NOT included to keep the source fast-change
+--     free.  Joining it would force every output row to update every cycle.
 --
--- Result: change ratio ≈ 0.07 (1 of 15 rows per cycle), compared to 1.0
--- for the aggregation tables above.  The Refresh Mode Advisor will show
--- KEEP DIFFERENTIAL here while recommending FULL for the others.
+-- Result: change ratio ≈ 1/15 ≈ 0.07 — the Refresh Mode Advisor will show
+-- KEEP DIFFERENTIAL here while recommending FULL for tables that join the
+-- ever-growing transactions stream.
 SELECT pgtrickle.create_stream_table(
     name     => 'merchant_tier_stats',
     query    => $$
         SELECT
             mrt.merchant_id,
-            mrt.tier                                     AS merchant_tier,
-            COUNT(t.id)                                  AS txn_count,
-            COALESCE(SUM(t.amount),           0)         AS total_amount,
-            COALESCE(ROUND(AVG(t.amount), 2), 0)         AS avg_amount,
-            COUNT(DISTINCT t.user_id)                    AS unique_users
+            m.name           AS merchant_name,
+            m.category,
+            mrt.tier         AS merchant_tier,
+            CASE mrt.tier
+                WHEN 'HIGH'     THEN 3
+                WHEN 'ELEVATED' THEN 2
+                ELSE                 1
+            END              AS risk_score,
+            mrt.updated_at   AS tier_last_changed
         FROM merchant_risk_tier mrt
-        LEFT JOIN transactions t ON t.merchant_id = mrt.merchant_id
-        GROUP BY mrt.merchant_id, mrt.tier
+        JOIN merchants m ON m.id = mrt.merchant_id
     $$,
     schedule     => '5s',
     refresh_mode => 'DIFFERENTIAL'
