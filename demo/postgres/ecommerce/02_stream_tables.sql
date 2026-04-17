@@ -17,7 +17,7 @@ SELECT pgtrickle.create_stream_table(
         SELECT
             p.id                                            AS product_id,
             p.name                                         AS product_name,
-            cat.name                                       AS category,
+            cat.name                                       AS category_name,
             COUNT(o.id)                                    AS order_count,
             COALESCE(SUM(o.quantity), 0)                   AS units_sold,
             COALESCE(SUM(o.quantity * o.unit_price), 0)    AS revenue,
@@ -25,7 +25,7 @@ SELECT pgtrickle.create_stream_table(
         FROM products p
         JOIN categories cat ON cat.id = p.category_id
         LEFT JOIN orders o ON o.product_id = p.id
-        GROUP BY p.id, p.name, cat.name
+        GROUP BY p.id, p.name, cat.id, cat.name
     $$,
     schedule     => '1s',
     refresh_mode => 'DIFFERENTIAL'
@@ -58,7 +58,8 @@ SELECT pgtrickle.create_stream_table(
     name     => 'category_revenue',
     query    => $$
         SELECT
-            cat.name                                        AS category,
+            cat.id                                          AS category_id,
+            cat.name                                        AS category_name,
             COUNT(o.id)                                     AS order_count,
             COALESCE(SUM(o.quantity), 0)                    AS units_sold,
             COALESCE(SUM(o.quantity * o.unit_price), 0)     AS revenue,
@@ -67,7 +68,7 @@ SELECT pgtrickle.create_stream_table(
         FROM categories cat
         LEFT JOIN products p   ON p.category_id = cat.id
         LEFT JOIN orders   o   ON o.product_id  = p.id
-        GROUP BY cat.name
+        GROUP BY cat.id, cat.name
     $$,
     schedule     => '1s',
     refresh_mode => 'DIFFERENTIAL'
@@ -115,7 +116,7 @@ SELECT pgtrickle.create_stream_table(
         SELECT
             pc.product_id,
             p.name                                         AS product_name,
-            cat.name                                       AS category,
+            cat.name                                       AS category_name,
             p.base_price,
             pc.current_price,
             ROUND(pc.current_price - p.base_price, 2)     AS price_delta,

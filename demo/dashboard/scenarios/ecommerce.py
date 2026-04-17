@@ -566,13 +566,13 @@ DAG_DIAGRAM = r"""
 
 def get_data(conn, safe_query, serialize) -> dict:
     category_revenue = safe_query(conn, """
-        SELECT category, order_count, units_sold, revenue, avg_price, unique_customers
+        SELECT category_name AS category, order_count, units_sold, revenue, avg_price, unique_customers
         FROM   category_revenue
         ORDER  BY revenue DESC NULLS LAST
     """)
 
     product_sales = safe_query(conn, """
-        SELECT product_name, category, order_count, units_sold, revenue, avg_selling_price
+        SELECT product_name, category_name AS category, order_count, units_sold, revenue, avg_selling_price
         FROM   product_sales
         ORDER  BY revenue DESC NULLS LAST
     """)
@@ -596,7 +596,7 @@ def get_data(conn, safe_query, serialize) -> dict:
     """)
 
     catalog_price_impact = safe_query(conn, """
-        SELECT product_name, category, base_price, current_price,
+        SELECT product_name, category_name AS category, base_price, current_price,
                price_delta, pct_change, price_last_updated
         FROM   catalog_price_impact
         ORDER  BY product_name
