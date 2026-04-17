@@ -119,8 +119,9 @@ Useful queries:
 -- See all stream table status
 SELECT * FROM pgtrickle.pgt_status();
 
--- Inspect the DAG dependency graph
-SELECT * FROM pgtrickle.dependency_tree('risk_scores');
+-- Inspect the DAG dependency graph (full tree)
+SELECT tree_line FROM pgtrickle.dependency_tree()
+ORDER BY tree_line;
 
 -- Most recent HIGH-risk alerts
 SELECT txn_id, user_name, merchant_name, amount, risk_level
@@ -132,8 +133,11 @@ ORDER  BY txn_id DESC LIMIT 10;
 SELECT pgtrickle.refresh_stream_table('risk_scores');
 
 -- See refresh history
-SELECT * FROM pgtrickle.pgt_refresh_history
-ORDER  BY refreshed_at DESC LIMIT 20;
+SELECT st.pgt_name, rh.action, rh.status, 
+       (rh.end_time - rh.start_time) AS duration, rh.start_time
+FROM pgtrickle.pgt_refresh_history rh
+JOIN pgtrickle.pgt_stream_tables st ON st.pgt_id = rh.pgt_id
+ORDER  BY rh.start_time DESC LIMIT 20;
 ```
 
 ---
