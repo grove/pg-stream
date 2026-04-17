@@ -24,7 +24,7 @@ DATABASE_URL = os.environ.get(
 )
 DEMO_SCENARIO = os.environ.get("DEMO_SCENARIO", "fraud")
 
-KNOWN_SCENARIOS = ("fraud", "ecommerce")
+KNOWN_SCENARIOS = ("fraud", "ecommerce", "finance")
 
 if DEMO_SCENARIO not in KNOWN_SCENARIOS:
     raise ValueError(
@@ -34,6 +34,8 @@ if DEMO_SCENARIO not in KNOWN_SCENARIOS:
 
 if DEMO_SCENARIO == "ecommerce":
     from scenarios.ecommerce import HTML, DAG_DIAGRAM, get_data as _get_scenario_data
+elif DEMO_SCENARIO == "finance":
+    from scenarios.finance import HTML, DAG_DIAGRAM, get_data as _get_scenario_data
 else:
     from scenarios.fraud import HTML, DAG_DIAGRAM, get_data as _get_scenario_data
 

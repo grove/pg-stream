@@ -16,7 +16,7 @@ DATABASE_URL = os.environ.get(
 )
 DEMO_SCENARIO = os.environ.get("DEMO_SCENARIO", "fraud")
 
-KNOWN_SCENARIOS = ("fraud", "ecommerce")
+KNOWN_SCENARIOS = ("fraud", "ecommerce", "finance")
 
 
 def connect(url: str):
@@ -47,6 +47,8 @@ def main() -> None:
 
     if DEMO_SCENARIO == "fraud":
         from scenarios.fraud import run
+    elif DEMO_SCENARIO == "finance":
+        from scenarios.finance import run
     else:
         from scenarios.ecommerce import run
 
