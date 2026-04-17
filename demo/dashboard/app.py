@@ -250,6 +250,34 @@ HTML = r"""<!DOCTYPE html>
     </div>
   </div>
 
+  <!-- Row 4: alert_summary + risk_scores by category -->
+  <div class="row g-3 mb-3">
+    <div class="col-5">
+      <div class="g-card h-100">
+        <div class="g-card-hdr">🎯 Alert Summary</div>
+        <table class="g-table">
+          <thead>
+            <tr><th>Risk Level</th><th>Transactions</th><th>Avg Amount</th><th>Total Volume</th></tr>
+          </thead>
+          <tbody id="tb-alert-summary"></tbody>
+        </table>
+      </div>
+    </div>
+    <div class="col-7">
+      <div class="g-card h-100">
+        <div class="g-card-hdr">🔍 Risk Distribution by Category</div>
+        <div class="overflow-auto" style="max-height:200px;">
+          <table class="g-table">
+            <thead>
+              <tr><th>Category</th><th>Low</th><th>Medium</th><th>High</th><th>High%</th></tr>
+            </thead>
+            <tbody id="tb-risk-by-cat"></tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  </div>
+
   <!-- Stream table status + DAG -->
   <div class="row g-3">
     <div class="col-5">
@@ -383,6 +411,28 @@ async function refresh() {
        <td>${r.unique_users}</td>
      </tr>`).join(''));
 
+  // ── Alert summary detail ──────────────────────────────────────────────
+  const riskColors = { HIGH: 'var(--red)', MEDIUM: 'var(--yellow)', LOW: 'var(--green)' };
+  setRows('tb-alert-summary', (d.alert_summary||[]).map(r => {
+    const col = riskColors[r.risk_level] || 'inherit';
+    return `<tr>
+       <td><span class="rbadge rbadge-${esc(r.risk_level)}">${esc(r.risk_level)}</span></td>
+       <td style="color:${col}">${fmt(r.txn_count)}</td>
+       <td>${fmtM(r.avg_amount)}</td>
+       <td>${fmtM(r.total_amount)}</td>
+     </tr>`;
+  }).join(''));
+
+  // ── Risk distribution by category ─────────────────────────────────────
+  setRows('tb-risk-by-cat', (d.risk_by_category||[]).map(r =>
+    `<tr>
+       <td><span class="rbadge" style="background:#21262d;color:#ccc">${esc(r.merchant_category)}</span></td>
+       <td style="color:var(--green)">${fmt(r.low_count)}</td>
+       <td style="color:var(--yellow)">${fmt(r.medium_count)}</td>
+       <td style="color:var(--red)">${fmt(r.high_count)}</td>
+       <td>${r.high_pct}%</td>
+     </tr>`).join(''));
+
   // ── Stream table status ────────────────────────────────────────────────
   setRows('tb-sts', (d.st_status||[]).map(r => {
     const dot = r.is_populated
@@ -499,6 +549,18 @@ def api_data():
             ORDER  BY name
         """)
 
+        risk_by_category = safe_query(conn, """
+            SELECT merchant_category,
+                   COUNT(*) FILTER (WHERE risk_level = 'LOW')    AS low_count,
+                   COUNT(*) FILTER (WHERE risk_level = 'MEDIUM') AS medium_count,
+                   COUNT(*) FILTER (WHERE risk_level = 'HIGH')   AS high_count,
+                   ROUND(100.0 * COUNT(*) FILTER (WHERE risk_level = 'HIGH')
+                         / NULLIF(COUNT(*), 0), 1)               AS high_pct
+            FROM   risk_scores
+            GROUP  BY merchant_category
+            ORDER  BY high_pct DESC NULLS LAST
+        """)
+
         return jsonify(
             {
                 "recent_alerts":       serialize(recent_alerts),
@@ -508,6 +570,7 @@ def api_data():
                 "country_risk":        serialize(country_risk),
                 "category_volume":     serialize(category_volume),
                 "st_status":           serialize(st_status),
+                "risk_by_category":    serialize(risk_by_category),
             }
         )
     except Exception as exc:
