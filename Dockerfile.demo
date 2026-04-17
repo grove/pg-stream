@@ -1,7 +1,10 @@
 # Build pg_trickle from source for demo/testing
 # Usage: docker build -t pg_trickle:demo -f Dockerfile.demo .
 
-FROM rust:nightly AS builder
+FROM rust:latest AS builder
+
+# Install Rust nightly toolchain (required for cargo-pgrx v0.17 edition2024)
+RUN rustup install nightly && rustup default nightly
 
 # Install PostgreSQL 18 dev dependencies
 # Add PostgreSQL official repository for PG 18
