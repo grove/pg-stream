@@ -1,7 +1,7 @@
 # pg_trickle — Project Roadmap
 
 > **Last updated:** 2026-04-17
-> **Latest release:** 0.20.0 (2026-04-16)
+> **Latest release:** 0.20.0 (2026-04-15)
 > **Current milestone:** v0.21.0 — Correctness, Safety & Test Hardening
 
 For a concise description of what pg_trickle is and why it exists, read
