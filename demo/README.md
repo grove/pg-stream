@@ -15,22 +15,47 @@ docker compose up
 Then open **http://localhost:8080** in your browser.
 The dashboard auto-refreshes every 2 seconds.
 
-### Using a locally-built pg_trickle extension
+---
 
-To build pg_trickle from your current source code and use it in the demo:
+## Building the Docker image from source
+
+By default, the demo uses the pre-built `ghcr.io/grove/pg_trickle:latest` image from the GitHub Container Registry. This provides the fastest startup experience.
+
+To test changes to the pg_trickle extension without waiting for an official release, you can build the Docker image from your current source code:
+
+### Build the image
+
+From the project root:
 
 ```bash
-# From project root
 just build-demo
+```
 
-# From demo directory, use the locally-built image
+This builds a multi-stage Docker image named `pg_trickle:demo` that:
+1. Compiles pg_trickle from your source code using Rust nightly
+2. Installs it into PostgreSQL 18
+3. Ready to use with the demo
+
+The build takes 5–10 minutes depending on your system (Rust compilation is slow).
+
+### Use the locally-built image
+
+Once built, run the demo with your custom image:
+
+```bash
 cd demo
 PG_TRICKLE_IMAGE=pg_trickle:demo docker compose down -v
 PG_TRICKLE_IMAGE=pg_trickle:demo docker compose up
 ```
 
-This is useful for testing changes to the extension without waiting for a new
-official release.
+The `PG_TRICKLE_IMAGE` environment variable overrides the default pre-built image. The `-v` flag removes old volumes so the database reinitializes with the new extension.
+
+### Available images
+
+| Image | Usage | Notes |
+|-------|-------|-------|
+| `ghcr.io/grove/pg_trickle:latest` (default) | Pre-built from latest release | Fast startup (no build needed) |
+| `pg_trickle:demo` | Build with `just build-demo` | Tests uncommitted source changes |
 
 ---
 
