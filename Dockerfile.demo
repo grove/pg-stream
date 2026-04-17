@@ -1,7 +1,7 @@
 # Build pg_trickle from source for demo/testing
-# Usage: docker build -t pg_trickle:dev -f Dockerfile.demo .
+# Usage: docker build -t pg_trickle:demo -f Dockerfile.demo .
 
-FROM rust:1.82-bookworm AS builder
+FROM rust:nightly-bookworm AS builder
 
 # Install PostgreSQL 18 dev dependencies
 # Add PostgreSQL official repository for PG 18
@@ -19,7 +19,7 @@ RUN apt-get update && apt-get install -y curl && \
 WORKDIR /build
 COPY . /build
 
-# Build extension
+# Build extension (cargo-pgrx v0.17+ requires Rust nightly for edition2024)
 RUN cargo install cargo-pgrx && \
     cargo pgrx install --release
 
