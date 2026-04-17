@@ -17,7 +17,6 @@ dbt-pgtrickle/
 cnpg/
 tests/
 scripts/
-benches/
 
 # Misc large/noisy files
 *.log
