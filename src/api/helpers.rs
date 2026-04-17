@@ -2370,7 +2370,7 @@ pub(super) fn refresh_efficiency() -> Result<
     let mut rows = Vec::new();
 
     for st in &stream_tables {
-        let history = diagnostics::gather_history_stats(st.pgt_id);
+        let history = diagnostics::gather_history_stats(st.pgt_id, st.pgt_relid);
 
         let speedup = match (history.diff_avg_ms, history.full_avg_ms) {
             (Some(diff), Some(full)) if diff > 0.0 => Some(format!("{:.1}x", full / diff)),
