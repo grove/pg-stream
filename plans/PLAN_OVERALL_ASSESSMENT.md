@@ -6,6 +6,12 @@
 **Scope:** Repository-wide review of pg_trickle at v0.20.0 (main @ `cfacdc0`)
 **Target audience:** Maintainers planning v0.21+ and v1.0
 
+> **Roadmap cross-reference:** All items from §10 (Prioritised Action Plan) have been
+> assigned to milestones in [ROADMAP.md](../ROADMAP.md). P0 items land in **v0.21.0**;
+> P1 #8 and #11 land in **v0.22.0** (Production Scalability & Downstream Integration);
+> remaining P1 items and selected P2 items are distributed across **v0.21.0** and
+> **v0.22.0**. P3 items are tracked in Post-1.0. See §10 for per-item milestone tags.
+
 ---
 
 ## Executive Summary
@@ -118,6 +124,8 @@ pre-image columns already captured by the CDC trigger (see EC-01
 [PLAN_EDGE_CASES.md](PLAN_EDGE_CASES.md)). Either approach keeps the
 EXCEPT ALL snapshot logic that ships today.
 
+> **→ Roadmap:** [v0.21.0 §EC-01 Fix](../ROADMAP.md#ec-01-fix--join-delta-phantom-rows) — items EC01-0 through EC01-4.
+
 ### 2.2 HIGH — `.unwrap()` in production parser hot paths
 
 `src/` contains 513 `.unwrap()` calls total. Most are in `#[cfg(test)]`
@@ -138,6 +146,8 @@ wrapper per site; do it opportunistically when touching each function.
 Add a clippy `deny(clippy::unwrap_used)` lint gate outside of test
 modules, with an `allow` on `dag.rs` invariant-justified lines.
 
+> **→ Roadmap:** [v0.21.0 §Safety & Code Quality](../ROADMAP.md#safety--code-quality) — items SAF-1 and SAF-3.
+
 ### 2.3 HIGH — 547 `unsafe` blocks, reduction plan still "Proposed"
 
 [plans/safety/PLAN_REDUCED_UNSAFE.md](safety/PLAN_REDUCED_UNSAFE.md) has
@@ -153,6 +163,8 @@ the counter. A targeted pass to:
    safe façades in `src/dvm/parser/types.rs`.
 
 would likely halve the count and create a reviewable audit unit.
+
+> **→ Roadmap:** [v0.21.0 §Safety & Code Quality](../ROADMAP.md#safety--code-quality) — item SAF-2.
 
 ### 2.4 MEDIUM — Monolithic modules invite silent coupling
 
@@ -173,6 +185,8 @@ more. Splitting them into focused submodules (e.g. `refresh/{merge.rs,
 phd1.rs, codegen.rs, orchestrator.rs}`) reduces reviewer cognitive load
 and merge-conflict friction.
 
+> **→ Roadmap:** [v0.21.0 §Architecture](../ROADMAP.md#architecture) — item ARCH-1 (`refresh.rs` split into 4 sub-modules).
+
 ### 2.5 MEDIUM — Incremental recursive CTE refresh falls back to FULL
 
 [plans/PLAN.md](PLAN.md) records P2-1 (Recursive CTE DRed for
@@ -185,6 +199,8 @@ latency death for transitive closures over anything nontrivial.
 the recomputation cost in `EXPLAIN` output and add a Prometheus metric
 tagged `refresh_reason="recursive_cte_fallback"` so operators can see
 what is happening.
+
+> **→ Roadmap:** [v0.21.0 §Architecture](../ROADMAP.md#architecture) — item ARCH-2 (recursive CTE fallback observability).
 
 ### 2.6 MEDIUM — `PLAN_NON_DETERMINISM.md` is still "Not started"
 
@@ -199,6 +215,8 @@ would. This is a data-correctness footgun.
 `pg_proc.provolatile = 'v'` and either (a) reject with a clear error
 or (b) emit a `WARNING` and force `FULL` mode unless the user passes
 `non_deterministic => true`.
+
+> **→ Roadmap:** [v0.21.0 §Safety & Code Quality](../ROADMAP.md#safety--code-quality) — item OP-6.
 
 ### 2.7 LOW — One `FIXME`, zero `TODO`/`HACK`/`XXX`
 
@@ -229,6 +247,8 @@ can provide. Deployments with 200+ stream tables see serialised tails.
 Minimal viable slice: dynamic bgworker pool per database, with
 coordinator owning the DAG and the pool owning refresh execution.
 
+> **→ Roadmap:** [v0.22.0 §In-Database Parallel Refresh Worker Pool](../ROADMAP.md#in-database-parallel-refresh-worker-pool--minimal-viable-slice-p1--31) — items PAR-1 through PAR-5.
+
 ### 3.2 Gap — No downstream CDC emitter
 
 pg_trickle consumes CDC (trigger or WAL) but cannot *emit* changes to
@@ -242,12 +262,16 @@ Redis Streams, or event sourcing without a separate replication slot.
 
 **Recommendation:** see §9.2 (feature proposal "ST→logical publication").
 
+> **→ Roadmap:** [v0.22.0 §Downstream CDC Publication](../ROADMAP.md#downstream-cdc-publication-p1--92) — items CDC-PUB-1 through CDC-PUB-5.
+
 ### 3.3 Gap — Multi-database / multi-tenant isolation
 
 [plans/infra/PLAN_MULTI_DATABASE.md](infra/PLAN_MULTI_DATABASE.md) is
 *Draft*. The shmem state (`src/shmem.rs`) currently tracks stream
 tables globally; the bgworker attaches per-database but cross-DB
 accounting is absent. For managed offerings this is a blocker.
+
+> **→ Roadmap:** Post-1.0 — [Scale §S3](../ROADMAP.md#scale) (deferred; scope is large).
 
 ### 3.4 Gap — Cost model does not include network/disk pressure
 
@@ -272,6 +296,8 @@ v0.20's self-monitoring identifies anomalies *after* they occur (3×
 baseline duration spike, error burst). A predictive model — linear
 regression on the last hour of delta sizes vs. duration — could preempt
 spills and recommend mode switches before a single bad refresh fires.
+
+> **→ Roadmap:** [v0.22.0 §Predictive Refresh Cost Model](../ROADMAP.md#predictive-refresh-cost-model-p2--93) — items PRED-1 through PRED-4.
 
 ### 3.7 Strength — Hybrid CDC is well separated
 
@@ -398,12 +424,16 @@ covering each rewrite pass (view inlining, DISTINCT ON, GROUPING SETS,
 scalar subquery in WHERE, correlated SSQ in SELECT, SubLinks in OR,
 multi-PARTITION BY windows).
 
+> **→ Roadmap:** [v0.21.0 §Test Coverage](../ROADMAP.md#test-coverage) — items TEST-1, TEST-2, TEST-3.
+
 ### 6.2 Gap — No fuzz target for the parser
 
 `cargo-fuzz` is not configured. Given that `PLAN_NON_DETERMINISM` is
 *Not started* and the parser is 18k LOC, a week of differential
 fuzzing (pg_trickle parser vs. plain `SELECT`) would likely uncover
 rejection bugs and panic-on-malformed cases.
+
+> **→ Roadmap:** [v0.21.0 §Test Coverage](../ROADMAP.md#test-coverage) — item TEST-4.
 
 ### 6.3 Gap — No kill-switch / crash-recovery test for bgworker
 
@@ -416,6 +446,8 @@ rejection bugs and panic-on-malformed cases.
 
 …would close a class of "what happens if…" questions.
 
+> **→ Roadmap:** [v0.21.0 §Test Coverage](../ROADMAP.md#test-coverage) — item TEST-5.
+
 ### 6.4 Gap — TPC-H IMMEDIATE mode correctness still gated by allowlist
 
 The skip-allowlist in
@@ -423,6 +455,8 @@ The skip-allowlist in
 excludes q05/q07/q08/q09 (join size). Repo memory identifies q15 as
 *also* failing under IMMEDIATE mode but *not* in the allowlist — either
 add it (test hygiene) or fix the underlying EC-01 issue (correctness).
+
+> **→ Roadmap:** [v0.21.0 §EC-01 Fix](../ROADMAP.md#ec-01-fix--join-delta-phantom-rows) — item EC01-0 (Q15 stop-gap) and EC01-3 (permanent fix).
 
 ### 6.5 Strength — Property tests + TPC-H nightly + SQLancer
 
@@ -448,6 +482,8 @@ upgrading / benchmarking guides.
 *symptom → likely cause → GUC to tune → measurement* rows would round
 out the operator experience. Most of the content already exists
 distributed across FAQ / TROUBLESHOOTING.
+
+> **→ Roadmap:** [v0.21.0 §Documentation](../ROADMAP.md#documentation) — item DOC-1.
 
 ### 7.3 Gap — Dog-feeding recipes are new; examples light
 
@@ -488,6 +524,8 @@ dashboard, but Prometheus consumes metrics either via
 HTTP endpoint on a bgworker exposing OpenMetrics
 (`/metrics`) would remove the "bring your own exporter" hurdle.
 
+> **→ Roadmap:** [v0.21.0 §Operational Features](../ROADMAP.md#operational-features) — item OP-2.
+
 ### 8.4 Gap — No canary / shadow mode
 
 When changing a defining query via `alter_stream_table`, the stream
@@ -495,12 +533,16 @@ table is rebuilt and exposed immediately. A "shadow" mode that writes
 to a hidden sibling table and diffs against the live table would make
 migrations of critical STs safer.
 
+> **→ Roadmap:** [v0.21.0 §Operational Features](../ROADMAP.md#operational-features) — item OPS-1.
+
 ### 8.5 Gap — `explain_dag()` is Mermaid/DOT; no runtime profile
 
 v0.20 renders the DAG topology. The natural next step is to overlay
 per-node *refresh latency* and *change volume* so operators can see
 where time is being spent at a glance. Data already exists in
 `pgt_refresh_history`.
+
+> **→ Roadmap:** [v0.23.0 §TUI/CLI Visualization Polish](../ROADMAP.md#phase-6--tuicli-visualization-polish) — item OP-1.
 
 ---
 
@@ -515,6 +557,8 @@ Trivial wrapper on existing building blocks. Unblocks every
 application that wants "refresh-on-read with a grace period" semantics
 without writing their own procedural code. Also useful in dbt hooks.
 
+> **→ Roadmap:** [v0.21.0 §Operational Features](../ROADMAP.md#operational-features) — item OP-4.
+
 ### 9.2 Downstream CDC publication — `stream_table_to_publication()` (M effort — 1–2 weeks)
 
 Emit changes applied to each stream table as a PostgreSQL logical
@@ -526,6 +570,8 @@ capture layer needed.
 **Value:** unlocks streaming-to-Kafka / event sourcing use cases that
 are currently blocked on users setting up a second slot.
 
+> **→ Roadmap:** [v0.22.0 §Downstream CDC Publication](../ROADMAP.md#downstream-cdc-publication-p1--92) — items CDC-PUB-1 through CDC-PUB-5.
+
 ### 9.3 Predictive refresh cost model (M effort — 1–2 weeks)
 
 Extend dog-feeding to forecast `duration_ms` from
@@ -533,6 +579,8 @@ Extend dog-feeding to forecast `duration_ms` from
 hour. When the forecast exceeds `last_full_ms × 1.5`, pre-emptively
 switch to FULL. Keeps adaptive fallback from *reacting* to a slow
 diff and instead *predicts* it.
+
+> **→ Roadmap:** [v0.22.0 §Predictive Refresh Cost Model](../ROADMAP.md#predictive-refresh-cost-model-p2--93) — items PRED-1 through PRED-4.
 
 ### 9.4 Stream-table checkpoint / snapshot restore (M effort — 2–3 weeks)
 
@@ -548,11 +596,15 @@ is materialised into `pgt_shadow_<name>` on the same schedule; a
 diff function (`pgtrickle.canary_diff(name)`) compares against the
 live table. Flip atomically when confident.
 
+> **→ Roadmap:** [v0.21.0 §Operational Features](../ROADMAP.md#operational-features) — item OPS-1.
+
 ### 9.6 Prometheus HTTP endpoint in bgworker (S effort — 1 week)
 
 Tiny `tiny_http` (or `hyper`) server bound to a port configured via
 `pg_trickle.metrics_port` (default `0` = off). Emits all existing
 monitor metrics in OpenMetrics format. No sidecar needed.
+
+> **→ Roadmap:** [v0.21.0 §Operational Features](../ROADMAP.md#operational-features) — item OP-2.
 
 ### 9.7 SLA-driven tier auto-assignment (M effort — 1–2 weeks)
 
@@ -561,11 +613,15 @@ scheduler assigns the ST to the tier whose worst-case dispatch gap is
 ≤ SLA, considering current queue depth. Makes the tiered scheduler
 usable without operator expertise.
 
+> **→ Roadmap:** [v0.22.0 §SLA-Driven Tier Auto-Assignment](../ROADMAP.md#sla-driven-tier-auto-assignment-p2--97) — items SLA-1 through SLA-4.
+
 ### 9.8 Native streaming SQL dialect — `CREATE STREAM TABLE … WATERMARK …` (L effort — 4–6 weeks)
 
 Already drafted in [PLAN_NATIVE_SYNTAX.md](sql/PLAN_NATIVE_SYNTAX.md).
 Customers asking for "Materialize-compatible syntax" get a familiar
 API; the function layer remains as a compatibility shim.
+
+> **→ Roadmap:** Post-1.0 — [PG Backward Compatibility & Native DDL](../ROADMAP.md#pg-backward-compatibility-pg-16-18) (deferred; large scope).
 
 ### 9.9 pgvector stream-table operator (M effort — 2–3 weeks)
 
@@ -586,6 +642,8 @@ Colour each node by *p95 latency* and width by *rows per refresh*
 using existing `pgt_refresh_history` data. One SQL aggregate plus a
 Mermaid template tweak.
 
+> **→ Roadmap:** [v0.23.0 §TUI/CLI Visualization Polish](../ROADMAP.md#phase-6--tuicli-visualization-polish) — item OP-1.
+
 ### 9.12 Transactional outbox helper (S effort — 1 week)
 
 Already planned in
@@ -593,6 +651,8 @@ Already planned in
 `pgtrickle.outbox_<st>` receives a row per refresh cycle with JSON
 payload `{inserted:[…], deleted:[…]}`. Eliminates the dual-write
 problem for downstream event buses.
+
+> **→ Roadmap:** [v0.22.0 §Transactional Outbox Helper](../ROADMAP.md#transactional-outbox-helper-p2--912) — items OUTBOX-1 through OUTBOX-4.
 
 ---
 
@@ -602,50 +662,50 @@ problem for downstream event buses.
 
 ### P0 — Land before v1.0
 
-| # | Item | Kind | Impact | Effort | Notes |
-|---|---|---|---|---|---|
-| 1 | Fix EC-01 Part 1 row-id hash (single-left-pk hash OR pre-image reconstruction) | Bug | 5 | L | §2.1 — correctness gate for TPC-H Q07/Q15 |
-| 2 | Reject or warn on volatile functions in defining query | Bug | 4 | S | §2.6 — silent wrong-answer risk |
-| 3 | Add Q15 to `IMMEDIATE_SKIP_ALLOWLIST` (interim) | Test | 3 | XS | §6.4 — until #1 ships |
-| 4 | Convert remaining production `.unwrap()` sites in `sublinks.rs` to `?` | Bug | 3 | S | §2.2 — 28 sites |
+| # | Item | Kind | Impact | Effort | Notes | Milestone |
+|---|---|---|---|---|---|---|
+| 1 | Fix EC-01 Part 1 row-id hash (single-left-pk hash OR pre-image reconstruction) | Bug | 5 | L | §2.1 — correctness gate for TPC-H Q07/Q15 | [v0.21.0 EC01-1/2](../ROADMAP.md#ec-01-fix--join-delta-phantom-rows) |
+| 2 | Reject or warn on volatile functions in defining query | Bug | 4 | S | §2.6 — silent wrong-answer risk | [v0.21.0 OP-6](../ROADMAP.md#safety--code-quality) |
+| 3 | Add Q15 to `IMMEDIATE_SKIP_ALLOWLIST` (interim) | Test | 3 | XS | §6.4 — until #1 ships | [v0.21.0 EC01-0](../ROADMAP.md#ec-01-fix--join-delta-phantom-rows) |
+| 4 | Convert remaining production `.unwrap()` sites in `sublinks.rs` to `?` | Bug | 3 | S | §2.2 — 28 sites | [v0.21.0 SAF-1](../ROADMAP.md#safety--code-quality) |
 
 ### P1 — Next two releases
 
-| # | Item | Kind | Impact | Effort | Notes |
-|---|---|---|---|---|---|
-| 5 | Shard `refresh.rs` (8.4k LOC) into 4 submodules | Arch | 4 | M | §2.4 |
-| 6 | `PLAN_REDUCED_UNSAFE` half-pass (list helpers + façades) | Safety | 4 | M | §2.3 |
-| 7 | Prometheus HTTP endpoint in bgworker | Ops | 4 | S | §9.6 |
-| 8 | Downstream CDC publication (`stream_table_to_publication`) | Feature | 5 | M | §9.2 |
-| 9 | Unit-test campaign for `parser/rewrites.rs` + `api/helpers.rs` + `api/diagnostics.rs` | Test | 3 | M | §6.1 |
-| 10 | Parser fuzz target (`cargo-fuzz`) | Test | 3 | S | §6.2 |
-| 11 | In-database parallel refresh pool (PLAN_PARALLELISM minimal slice) | Arch | 5 | L | §3.1 |
+| # | Item | Kind | Impact | Effort | Notes | Milestone |
+|---|---|---|---|---|---|---|
+| 5 | Shard `refresh.rs` (8.4k LOC) into 4 submodules | Arch | 4 | M | §2.4 | [v0.21.0 ARCH-1](../ROADMAP.md#architecture) |
+| 6 | `PLAN_REDUCED_UNSAFE` half-pass (list helpers + façades) | Safety | 4 | M | §2.3 | [v0.21.0 SAF-2](../ROADMAP.md#safety--code-quality) |
+| 7 | Prometheus HTTP endpoint in bgworker | Ops | 4 | S | §9.6 | [v0.21.0 OP-2](../ROADMAP.md#operational-features) |
+| 8 | Downstream CDC publication (`stream_table_to_publication`) | Feature | 5 | M | §9.2 | [v0.22.0 CDC-PUB](../ROADMAP.md#downstream-cdc-publication-p1--92) |
+| 9 | Unit-test campaign for `parser/rewrites.rs` + `api/helpers.rs` + `api/diagnostics.rs` | Test | 3 | M | §6.1 | [v0.21.0 TEST-1/2/3](../ROADMAP.md#test-coverage) |
+| 10 | Parser fuzz target (`cargo-fuzz`) | Test | 3 | S | §6.2 | [v0.21.0 TEST-4](../ROADMAP.md#test-coverage) |
+| 11 | In-database parallel refresh pool (PLAN_PARALLELISM minimal slice) | Arch | 5 | L | §3.1 | [v0.22.0 PAR](../ROADMAP.md#in-database-parallel-refresh-worker-pool--minimal-viable-slice-p1--31) |
 
 ### P2 — Opportunistic
 
-| # | Item | Kind | Impact | Effort |
-|---|---|---|---|---|
-| 12 | `refresh_if_stale`, `pause_all`, `resume_all`, `stream_table_definition` | API | 2 | XS |
-| 13 | Predictive refresh cost model | Feature | 3 | M |
-| 14 | Shared-memory template cache | Perf | 3 | M |
-| 15 | Shadow/canary `alter_stream_table` | Ops | 3 | S |
-| 16 | DAG runtime overlay in `explain_dag()` | Ops | 2 | XS |
-| 17 | SLA-driven tier assignment | Feature | 3 | M |
-| 18 | Stream-table checkpoint | Feature | 3 | M |
-| 19 | Native `CREATE STREAM TABLE` syntax | Feature | 4 | L |
-| 20 | pgvector TopK support | Feature | 3 | M |
-| 21 | Auto-denormalisation advisor | Feature | 2 | M |
-| 22 | Transactional outbox helper | Feature | 3 | S |
-| 23 | Performance Tuning Cookbook doc | Docs | 2 | S |
-| 24 | Chaos/crash-recovery test for bgworker | Test | 3 | M |
+| # | Item | Kind | Impact | Effort | Milestone |
+|---|---|---|---|---|---|
+| 12 | `refresh_if_stale`, `pause_all`, `resume_all`, `stream_table_definition` | API | 2 | XS | [v0.21.0 OP-3/4/5](../ROADMAP.md#operational-features) |
+| 13 | Predictive refresh cost model | Feature | 3 | M | [v0.22.0 PRED](../ROADMAP.md#predictive-refresh-cost-model-p2--93) |
+| 14 | Shared-memory template cache | Perf | 3 | M | Post-1.0 |
+| 15 | Shadow/canary `alter_stream_table` | Ops | 3 | S | [v0.21.0 OPS-1](../ROADMAP.md#operational-features) |
+| 16 | DAG runtime overlay in `explain_dag()` | Ops | 2 | XS | [v0.23.0 OP-1](../ROADMAP.md#phase-6--tuicli-visualization-polish) |
+| 17 | SLA-driven tier assignment | Feature | 3 | M | [v0.22.0 SLA](../ROADMAP.md#sla-driven-tier-auto-assignment-p2--97) |
+| 18 | Stream-table checkpoint | Feature | 3 | M | Post-1.0 |
+| 19 | Native `CREATE STREAM TABLE` syntax | Feature | 4 | L | Post-1.0 |
+| 20 | pgvector TopK support | Feature | 3 | M | Post-1.0 |
+| 21 | Auto-denormalisation advisor | Feature | 2 | M | Post-1.0 |
+| 22 | Transactional outbox helper | Feature | 3 | S | [v0.22.0 OUTBOX](../ROADMAP.md#transactional-outbox-helper-p2--912) |
+| 23 | Performance Tuning Cookbook doc | Docs | 2 | S | [v0.21.0 DOC-1](../ROADMAP.md#documentation) |
+| 24 | Chaos/crash-recovery test for bgworker | Test | 3 | M | [v0.21.0 TEST-5](../ROADMAP.md#test-coverage) |
 
 ### P3 — Track, don't build yet
 
-| # | Item | Notes |
-|---|---|---|
-| 25 | Multi-database support (PLAN_MULTI_DATABASE Draft) | Scope is large; stays Draft until a customer demand forces prioritisation |
-| 26 | Recursive CTE DRed (P2-1 from PLAN.md) | Documented fallback; instrument, don't build |
-| 27 | Downgrade SQL scripts | Policy decision first (support forward-only?) |
+| # | Item | Notes | Milestone |
+|---|---|---|---|
+| 25 | Multi-database support (PLAN_MULTI_DATABASE Draft) | Scope is large; stays Draft until a customer demand forces prioritisation | Post-1.0 S3 |
+| 26 | Recursive CTE DRed (P2-1 from PLAN.md) | Documented fallback; instrument, don't build | [v0.21.0 ARCH-2](../ROADMAP.md#architecture) (observability only) |
+| 27 | Downgrade SQL scripts | Policy decision first (support forward-only?) | Post-1.0 |
 
 ---
 
