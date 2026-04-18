@@ -754,6 +754,16 @@ SELECT pgtrickle.enable_inbox_priority(
 -- Errors: InboxNotFound, InboxColumnMissing, InboxOrderingPriorityConflict
 --         (if enable_inbox_ordering was already called on this inbox)
 
+-- Disable priority processing (teardown)
+SELECT pgtrickle.disable_inbox_priority(
+    inbox_name TEXT,
+    if_exists  BOOLEAN DEFAULT false
+) RETURNS void;
+-- Drops all pending_<inbox>_<tier> stream tables and the pgt_inbox_priority_config row.
+-- The original unified pending_<inbox> stream table is restored (re-created if it was
+-- dropped by enable_inbox_priority). Returns InboxNotFound if if_exists = false and
+-- priority is not enabled.
+
 -- Inspect ordering gaps
 SELECT * FROM pgtrickle.inbox_ordering_gaps(
     inbox_name TEXT
@@ -879,6 +889,12 @@ SELECT pgtrickle.create_stream_table(
 
 The original `pending_<inbox>` stream table is preserved as a unified view
 across all priorities.
+
+When `disable_inbox_priority()` is called:
+1. All `pending_<inbox>_<tier>` stream tables are dropped.
+2. The `pgt_inbox_priority_config` config row is deleted.
+3. The original unified `pending_<inbox>` stream table is restored (using the
+   same DDL as at `create_inbox()` time, sourced from `pgt_inbox_config`).
 
 ### B.6 Competing Workers with Partition Affinity
 

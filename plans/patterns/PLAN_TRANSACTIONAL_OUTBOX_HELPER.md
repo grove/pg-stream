@@ -277,6 +277,35 @@ fn run_differential_refresh(...) -> Result<RefreshResult> {
 - Payload serialisation reuses the in-memory `Vec<DeltaRow>` already
   computed for the MERGE — no extra round trips.
 
+#### FULL-Refresh Fallback
+
+When a stream table is in AUTO mode and pg_trickle falls back to a FULL
+refresh (e.g. when the IVM cost exceeds the threshold), the outbox must
+still write a correct payload — but its semantics differ from a differential
+row:
+
+- The `inserted` array contains **all current rows** of the stream table.
+- The `deleted` array is **empty**.
+- The payload sets **`"full_refresh": true`** at the top level as a sentinel.
+- A `pg_trickle_alert` event of type **`outbox_full_refresh`** is emitted so
+  operators and monitoring pipelines can detect the event independently.
+
+Relays **must** inspect `payload.full_refresh` before publishing to a broker.
+A relay that treats a FULL-refresh payload as incremental events will publish
+every current row as a spurious new event. The reference relay
+(`examples/relay/outbox_relay.py`) demonstrates the correct check:
+
+```python
+if row["payload"].get("full_refresh"):
+    # Apply snapshot semantics: upsert all rows, do not send as new events
+    handle_full_refresh_snapshot(row["payload"]["inserted"])
+else:
+    publish_delta(row["payload"])
+```
+
+The `full_refresh` flag is also set on truncation markers (see A.5) whenever
+a FULL-refresh payload exceeds `outbox_max_payload_bytes`.
+
 ### A.5 Payload Format
 
 The JSONB payload follows a stable, versioned schema:
@@ -294,6 +323,20 @@ The JSONB payload follows a stable, versioned schema:
   ]
 }
 ```
+
+For FULL-refresh fallbacks (see A.4), the payload additionally includes
+`"full_refresh": true`:
+
+```json
+{
+  "v": 1,
+  "full_refresh": true,
+  "inserted": [ { ... all current rows ... } ],
+  "deleted": []
+}
+```
+
+Relays must check for `full_refresh` before routing to a broker.
 
 #### Versioning
 
@@ -477,6 +520,16 @@ SELECT pgtrickle.consumer_heartbeat(
     group_name   TEXT,
     consumer_id  TEXT
 ) RETURNS void;
+-- Updates last_heartbeat_at only. Does NOT extend active leases.
+-- Use extend_lease() to renew a lease for a long-running batch.
+
+-- Lease renewal for long-running batches
+SELECT pgtrickle.extend_lease(
+    group_name        TEXT,
+    consumer_id       TEXT,
+    extension_seconds INT DEFAULT 30
+) RETURNS TIMESTAMPTZ;              -- new visibility_until timestamp
+-- Extends visibility_until of ALL active leases held by this consumer.
 
 -- Replay
 SELECT pgtrickle.seek_offset(
@@ -574,11 +627,44 @@ First call to `poll_outbox()` for a new `consumer_id` creates a row in
 - If `auto_offset_reset = 'latest'`: `last_offset` set to current `MAX(id)`.
 - If `auto_offset_reset = 'earliest'`: `last_offset` set to 0.
 
+#### Lease Renewal
+
+If a relay's batch processing takes longer than `visibility_seconds`
+(e.g. slow broker publish, large payloads, business logic), it should call
+`extend_lease()` before the lease expires to prevent another relay from
+re-polling the same rows:
+
+```python
+# In relay loop, after poll_outbox() returns a batch:
+new_deadline = execute_scalar(
+    "SELECT pgtrickle.extend_lease($1, $2, 30)",
+    group, consumer_id
+)
+# Process batch ... publish to broker ...
+execute("SELECT pgtrickle.commit_offset($1, $2, $3)", group, consumer_id, max_id)
+```
+
+`extend_lease()` updates `visibility_until` for **all** active leases held
+by the named consumer. It does **not** affect `last_heartbeat_at` — heartbeat
+and lease lifetime are independent concerns.
+
+If the consumer has no active leases (e.g. called after `commit_offset()`),
+`extend_lease()` is a no-op and returns the current timestamp.
+
 ### B.5 Heartbeat & Liveness
 
 - Relays call `consumer_heartbeat()` periodically (recommended every 10 s).
 - A consumer is **healthy** if `last_heartbeat_at > now() - interval '60 seconds'`.
-- The view `consumer_lag` exposes the `healthy` boolean for monitoring.
+- `consumer_heartbeat()` updates **only** `last_heartbeat_at`; it does **not**
+  extend active lease timeouts. Call `extend_lease()` (see B.4) to renew
+  leases for long-running batches.
+- `consumer_lag()` is a **live SQL function** (executes against `pgt_consumer_offsets`
+  directly, always current) suitable for ad-hoc inspection and application
+  code health checks. It exposes per-consumer `lag_rows`, `healthy`, and
+  `heartbeat_age_seconds`.
+- `pgt_consumer_group_lag` (see B.7) is a **DIFFERENTIAL stream table**
+  materialized every 10 s, suitable for Grafana dashboards and alerting rules.
+  Use `consumer_lag()` for programmatic checks; use the ST for monitoring.
 - A `pg_trickle_alert` event of type `consumer_unhealthy` is emitted when a
   registered consumer transitions from healthy → unhealthy.
 
