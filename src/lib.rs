@@ -661,7 +661,6 @@ COMMENT ON FUNCTION pgtrickle."resume_all"() IS
     'Re-activate all stream tables that were paused with pgtrickle.pause_all().';
 "#,
     name = "pg_trickle_pause_resume",
-    requires = [pg_trickle_catalog],
 );
 
 // ── OP-4: refresh_if_stale ────────────────────────────────────────────
@@ -701,7 +700,7 @@ COMMENT ON FUNCTION pgtrickle."refresh_if_stale"(text, interval) IS
     'triggered, FALSE when the table was fresh enough.';
 "#,
     name = "pg_trickle_refresh_if_stale",
-    requires = [pg_trickle_catalog, refresh_stream_table],
+    requires = [refresh_stream_table],
 );
 
 // ── OP-5: stream_table_definition ────────────────────────────────────
@@ -886,12 +885,7 @@ COMMENT ON FUNCTION pgtrickle."canary_promote"(text) IS
     'Run pgtrickle.canary_diff(name) first to confirm the result set matches.';
 "#,
     name = "pg_trickle_canary",
-    requires = [
-        pg_trickle_catalog,
-        create_stream_table,
-        drop_stream_table,
-        alter_stream_table
-    ],
+    requires = [create_stream_table, drop_stream_table, alter_stream_table],
 );
 
 // ── Launcher notification (must be last) ──────────────────────────────
