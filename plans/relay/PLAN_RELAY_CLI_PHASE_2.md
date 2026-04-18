@@ -166,6 +166,10 @@ and merges.
 SQS + RabbitMQ for Microsoft ecosystem customers. Supports queues, topics,
 and subscriptions with advanced features (sessions, dead-letter, scheduling).
 
+**Protocol note:** Uses AMQP 1.0 natively (different from RabbitMQ's AMQP 0-9-1).
+If AMQP 1.0 backend is prioritized in Phase 3, Service Bus could use the generic
+AMQP 1.0 implementation.
+
 **Crate:** `azure_messaging_servicebus`
 
 **Direction:** Source + Sink (bidirectional)
@@ -1214,8 +1218,9 @@ header = "X-Webhook-Signature"            # header containing the signature
 | RELAY-P3-3 | Relay TUI dashboard | Nice-to-have, operators can use Grafana |
 | RELAY-P3-4 | Plugin system (WASM backends) | High complexity, unclear demand |
 | RELAY-P3-5 | Encryption envelope (KMS integration) | Niche compliance requirement |
-| RELAY-P3-6 | MongoDB sink | Lower priority than streaming/analytics backends |
-| RELAY-P3-7 | Snowflake / BigQuery sink | Cloud data warehouse integration |
+| RELAY-P3-6 | AMQP 1.0 backend (Azure Service Bus, Qpid, etc.) | Unlocks additional brokers; requires separate SDK from RabbitMQ AMQP 0-9-1 |
+| RELAY-P3-7 | MongoDB sink | Lower priority than streaming/analytics backends |
+| RELAY-P3-8 | Snowflake / BigQuery sink | Cloud data warehouse integration |
 
 ---
 

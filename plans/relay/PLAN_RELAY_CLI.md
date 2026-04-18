@@ -1055,6 +1055,10 @@ ON CONFLICT (event_id) DO NOTHING;
 
 **Crate:** `lapin`
 
+**Protocol note:** Targets AMQP 0-9-1, the native RabbitMQ protocol and
+production standard. AMQP 1.0 support can be added in Phase 2 (see Phase 2
+plan) to reach Azure Service Bus, Apache Qpid, and other AMQP 1.0 brokers.
+
 ```toml
 [sink.rabbitmq]
 url = "amqp://guest:guest@localhost:5672"
@@ -1219,6 +1223,9 @@ timeout provides implicit retry on failure.
 ### C.7 RabbitMQ Consumer
 
 **Crate:** `lapin`
+
+**Protocol note:** Targets AMQP 0-9-1 (RabbitMQ native). AMQP 1.0 support
+for Azure Service Bus and other AMQP 1.0 brokers planned for Phase 2.
 
 ```toml
 [source.rabbitmq]
