@@ -884,6 +884,31 @@ All functions are schema-qualified and raise exceptions with clear messages on
 missing pipelines or invalid configs. The underlying table names are not part
 of the public API.
 
+#### Access Control
+
+Direct table access is revoked; all mutations go through the API functions.
+The migration includes:
+
+```sql
+-- Revoke direct table access from the relay role
+REVOKE ALL ON pgtrickle.relay_outbox_config FROM pgtrickle_relay;
+REVOKE ALL ON pgtrickle.relay_inbox_config  FROM pgtrickle_relay;
+
+-- Grant execute on the API functions only
+GRANT EXECUTE ON FUNCTION pgtrickle.set_relay_outbox(TEXT, JSONB, BOOLEAN)  TO pgtrickle_relay;
+GRANT EXECUTE ON FUNCTION pgtrickle.set_relay_inbox(TEXT, JSONB, BOOLEAN)   TO pgtrickle_relay;
+GRANT EXECUTE ON FUNCTION pgtrickle.enable_relay(TEXT)                      TO pgtrickle_relay;
+GRANT EXECUTE ON FUNCTION pgtrickle.disable_relay(TEXT)                     TO pgtrickle_relay;
+GRANT EXECUTE ON FUNCTION pgtrickle.delete_relay(TEXT)                      TO pgtrickle_relay;
+GRANT EXECUTE ON FUNCTION pgtrickle.get_relay_config(TEXT)                  TO pgtrickle_relay;
+GRANT EXECUTE ON FUNCTION pgtrickle.list_relay_configs()                    TO pgtrickle_relay;
+```
+
+The functions run with `SECURITY DEFINER` so they can access the underlying
+tables on behalf of any caller granted `EXECUTE`, without exposing the tables
+directly. Superusers and the `pgtrickle` role (extension owner) retain full
+table access for administrative purposes.
+
 ---
 
 ## Part B — Sink Backends (Forward Mode)
