@@ -489,9 +489,7 @@ async fn test_crash_recovery_no_stale_running_records() {
     ).await;
 
     let pgt_id: i64 = db
-        .query_scalar(
-            "SELECT pgt_id FROM pgtrickle.pgt_stream_tables WHERE pgt_name = 'stale_st'",
-        )
+        .query_scalar("SELECT pgt_id FROM pgtrickle.pgt_stream_tables WHERE pgt_name = 'stale_st'")
         .await;
 
     // Inject three RUNNING records as if the bgworker was killed mid-refresh.
@@ -511,8 +509,9 @@ async fn test_crash_recovery_no_stale_running_records() {
          SET status = 'FAILED',
              finished_at = now(),
              error_message = 'Recovered from unclean shutdown (pg_ctl stop -m immediate)'
-         WHERE status = 'RUNNING'"
-    ).await;
+         WHERE status = 'RUNNING'",
+    )
+    .await;
 
     // No RUNNING records should remain.
     let running_count: i64 = db
@@ -557,14 +556,10 @@ async fn test_crash_recovery_covers_all_stream_tables() {
     ).await;
 
     let id_a: i64 = db
-        .query_scalar(
-            "SELECT pgt_id FROM pgtrickle.pgt_stream_tables WHERE pgt_name = 'crash_a'",
-        )
+        .query_scalar("SELECT pgt_id FROM pgtrickle.pgt_stream_tables WHERE pgt_name = 'crash_a'")
         .await;
     let id_b: i64 = db
-        .query_scalar(
-            "SELECT pgt_id FROM pgtrickle.pgt_stream_tables WHERE pgt_name = 'crash_b'",
-        )
+        .query_scalar("SELECT pgt_id FROM pgtrickle.pgt_stream_tables WHERE pgt_name = 'crash_b'")
         .await;
 
     // One stale RUNNING record for each ST.
@@ -584,13 +579,12 @@ async fn test_crash_recovery_covers_all_stream_tables() {
          SET status = 'FAILED',
              finished_at = now(),
              error_message = 'Recovered from unclean shutdown'
-         WHERE status = 'RUNNING'"
-    ).await;
+         WHERE status = 'RUNNING'",
+    )
+    .await;
 
     let total_running: i64 = db
-        .query_scalar(
-            "SELECT count(*) FROM pgtrickle.pgt_refresh_history WHERE status = 'RUNNING'",
-        )
+        .query_scalar("SELECT count(*) FROM pgtrickle.pgt_refresh_history WHERE status = 'RUNNING'")
         .await;
     assert_eq!(
         total_running, 0,
@@ -635,8 +629,9 @@ async fn test_crash_recovery_does_not_suspend_stream_table() {
          SET status = 'FAILED',
              finished_at = now(),
              error_message = 'Recovered from unclean shutdown'
-         WHERE status = 'RUNNING'"
-    ).await;
+         WHERE status = 'RUNNING'",
+    )
+    .await;
 
     // The ST itself must still be ACTIVE.
     let st_status: String = db

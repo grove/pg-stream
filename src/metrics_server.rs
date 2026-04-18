@@ -54,9 +54,7 @@ impl MetricsServer {
                     );
                     return None;
                 }
-                pgrx::log!(
-                    "[pg_trickle] OP-2: metrics endpoint started on http://{addr}/metrics"
-                );
+                pgrx::log!("[pg_trickle] OP-2: metrics endpoint started on http://{addr}/metrics");
                 Some(Self { listener })
             }
             Err(e) => {
