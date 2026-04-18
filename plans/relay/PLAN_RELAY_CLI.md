@@ -28,6 +28,7 @@
   - [A.12 Observability](#a12-observability)
   - [A.13 Error Handling & Retries](#a13-error-handling--retries)
   - [A.14 Catalog Schema (Config Tables)](#a14-catalog-schema-config-tables)
+  - [A.15 Horizontal Scaling & Work Distribution](#a15-horizontal-scaling--work-distribution)
 - [Part B — Sink Backends (Forward Mode)](#part-b--sink-backends-forward-mode)
   - [B.1 NATS JetStream](#b1-nats-jetstream)
   - [B.2 HTTP Webhook](#b2-http-webhook)
@@ -147,6 +148,14 @@ Redis/etc. code serves both directions.
                         │       REVERSE MODE                      │
                         │                                         │
                         │  ┌──────────────────────────────────┐   │
+                        │  │  Coordinator (1 pinned PG conn)  │   │
+                        │  │  advisory locks, hot-reload      │   │
+                        │  └────────────────┬─────────────────┘   │
+                        │     ┌─────────────▼─────────────────┐   │
+                        │     │  Worker pool (N tokio tasks)   │   │
+                        │     │  each with its own PG conn     │   │
+                        │     └───────────────────────────────┘   │
+                        │  ┌──────────────────────────────────┐   │
                         │  │  Shared: metrics, health, config, │   │
                         │  │  shutdown, error handling, retries │   │
                         │  └──────────────────────────────────┘   │
@@ -158,6 +167,12 @@ The inbox writer is just another Sink implementation. External systems
 (NATS, Kafka, etc.) implement *both* Source and Sink. This lets users
 compose any source with any sink, even though the two primary modes are
 the most common.
+
+**Horizontal scaling:** Multiple relay pods can run simultaneously as a
+Kubernetes Deployment (not StatefulSet). Each pod runs one coordinator
+that races for pipeline ownership using PostgreSQL advisory locks. Work
+is automatically distributed across pods with no external coordinator or
+ZooKeeper-style consensus.
 
 ---
 
@@ -174,6 +189,7 @@ pgtrickle-relay/
 │   ├── main.rs           # Entry point, CLI parsing, signal handling
 │   ├── cli.rs            # clap derive definitions
 │   ├── config.rs         # TOML / YAML / JSON + env + CLI merging
+│   ├── coordinator.rs    # Advisory-lock coordinator, worker dispatch, hot-reload
 │   ├── error.rs          # RelayError enum
 │   ├── envelope.rs       # RelayMessage envelope type
 │   ├── metrics.rs        # Prometheus metrics + health endpoint
@@ -354,12 +370,50 @@ The relay has two primary modes that compose Sources and Sinks:
 | **Forward** | pg-trickle outbox | NATS / Kafka / webhook / Redis / SQS / RabbitMQ / PG / stdout | Publish outbox deltas to external systems |
 | **Reverse** | NATS / Kafka / webhook / Redis / SQS / RabbitMQ / stdin | pg-trickle inbox | Consume external events into inbox for stream processing |
 
-The core relay loop is the same in both modes:
+#### Process topology
+
+Each relay process contains a **coordinator** and a **worker pool**:
+
+```
+Process (pod)
+├── Coordinator task  (1 long-lived, pinned PG connection)
+│   ├── On startup: load enabled pipelines from relay_*_config
+│   ├── Every tick: pg_try_advisory_lock(hashtext(group_id), pipeline_id)
+│   │   for each unowned pipeline
+│   ├── On lock acquired: read consumer_offsets, dispatch to worker pool
+│   ├── On lock lost (coordinator conn drop or another pod stole it):
+│   │   cancel the corresponding worker task
+│   └── LISTEN pgtrickle_relay_config for hot-reload (enable/disable/update)
+│
+└── Worker pool (N tokio tasks, bounded channel from coordinator)
+    ├── Worker 1 → pipeline A  (own PG conn for data reads + offset writes)
+    ├── Worker 2 → pipeline B  (own PG conn for data reads + offset writes)
+    └── Worker N → idle / available
+```
+
+The coordinator's PG connection **must not be pooled or returned between
+operations** — it is the lease heartbeat for all advisory locks held by this
+process. If the connection drops, every lock is released and other pods
+immediately race to acquire them.
+
+Lock key uses the two-argument form so different relay groups use isolated
+namespaces and never collide with each other:
+
+```sql
+SELECT pg_try_advisory_lock(
+    hashtext(relay_group_id),   -- namespace per group/deployment
+    pipeline_id::int            -- individual pipeline within the group
+)
+```
+
+#### Core worker loop (per pipeline)
 
 ```rust
-async fn relay_loop(
+async fn worker_loop(
+    pipeline: PipelineConfig,
     source: &dyn Source,
     sink: &dyn Sink,
+    db: &Client,
     shutdown: CancellationToken,
 ) -> Result<(), RelayError> {
     loop {
@@ -371,6 +425,8 @@ async fn relay_loop(
                 }
                 sink.publish(&batch).await?;
                 source.acknowledge(&batch).await?;
+                // Write durable offset atomically after each batch
+                update_consumer_offset(&db, &pipeline, batch.last_id()).await?;
             }
             _ = shutdown.cancelled() => {
                 break;
@@ -485,21 +541,27 @@ The outbox poller implements the `Source` trait. It operates in two modes:
 
 #### Simple Mode (no consumer group)
 
-Used when `--group` is not specified. Tracks offset locally in memory
-(lost on restart — consumers re-read from latest or a configured position).
+Used when `--group` is not specified. On startup the worker reads the last
+committed offset from `relay_consumer_offsets` (durable across restarts and
+pod failures) and polls from that position forward.
 
 ```rust
 async fn poll_simple(
     db: &Client,
-    outbox_name: &str,
+    pipeline: &PipelineConfig,
     batch_size: i64,
 ) -> Result<Vec<RelayMessage>, RelayError> {
-    let mut last_offset: i64 = 0; // or query MAX(id) on startup
+    // Read durable offset — survives pod restarts and coordinator failover
+    let last_offset: i64 = db.query_opt(
+        "SELECT last_change_id FROM pgtrickle.relay_consumer_offsets
+         WHERE relay_group_id = $1 AND pipeline_id = $2",
+        &[&pipeline.group_id, &pipeline.id],
+    ).await?.map(|r| r.get(0)).unwrap_or(0i64);
 
     let rows = db.query(
         &format!(
             "SELECT id, payload FROM pgtrickle.{} WHERE id > $1 ORDER BY id LIMIT $2",
-            outbox_name  // validated at startup against catalog
+            pipeline.outbox_name  // validated at startup against catalog
         ),
         &[&last_offset, &batch_size],
     ).await?;
@@ -508,12 +570,38 @@ async fn poll_simple(
     for row in &rows {
         let id: i64 = row.get("id");
         let payload: serde_json::Value = row.get("payload");
-        let batch = decode_payload(&payload, db, outbox_name, id).await?;
+        let batch = decode_payload(&payload, db, &pipeline.outbox_name, id).await?;
         messages.extend(batch_to_messages(&batch));
     }
     Ok(messages)
 }
 ```
+
+After each batch is published and acknowledged, the worker writes the offset
+atomically:
+
+```rust
+async fn update_consumer_offset(
+    db: &Client,
+    pipeline: &PipelineConfig,
+    last_id: i64,
+) -> Result<(), RelayError> {
+    db.execute(
+        "INSERT INTO pgtrickle.relay_consumer_offsets
+             (relay_group_id, pipeline_id, last_change_id, worker_id, updated_at)
+         VALUES ($1, $2, $3, $4, now())
+         ON CONFLICT (relay_group_id, pipeline_id)
+         DO UPDATE SET last_change_id = EXCLUDED.last_change_id,
+                       worker_id      = EXCLUDED.worker_id,
+                       updated_at     = EXCLUDED.updated_at",
+        &[&pipeline.group_id, &pipeline.id, &last_id, &pipeline.worker_id],
+    ).await?;
+    Ok(())
+}
+```
+
+`worker_id` is set to `"<pod_name>:<thread_index>"` at startup (e.g.
+`"relay-6b7f9-0:3"`), useful for debugging stalls in multi-pod deployments.
 
 #### Consumer Group Mode
 
@@ -806,6 +894,23 @@ CREATE TABLE pgtrickle.relay_inbox_config (
     config   JSONB NOT NULL  -- {source_type, source, sink_type, sink}
 );
 
+-- Durable per-pipeline offset tracking.
+-- Written atomically after each committed batch so that any pod can take
+-- over from exactly the right position when the coordinator lock moves.
+-- relay_group_id  = namespaces separate relay deployments (e.g. "orders-kafka").
+-- pipeline_id     = unique pipeline row PK (name from relay_*_config).
+-- last_change_id  = last outbox row id successfully published (simple mode)
+--                   or last broker offset (reverse mode).
+-- worker_id       = "<pod-name>:<thread>" for operational diagnostics.
+CREATE TABLE pgtrickle.relay_consumer_offsets (
+    relay_group_id  TEXT        NOT NULL,
+    pipeline_id     TEXT        NOT NULL,
+    last_change_id  BIGINT      NOT NULL DEFAULT 0,
+    worker_id       TEXT,
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (relay_group_id, pipeline_id)
+);
+
 -- One shared trigger function; TG_TABLE_NAME identifies the direction
 CREATE OR REPLACE FUNCTION pgtrickle.relay_config_notify()
 RETURNS TRIGGER LANGUAGE plpgsql AS $$
@@ -891,8 +996,9 @@ The migration includes:
 
 ```sql
 -- Revoke direct table access from the relay role
-REVOKE ALL ON pgtrickle.relay_outbox_config FROM pgtrickle_relay;
-REVOKE ALL ON pgtrickle.relay_inbox_config  FROM pgtrickle_relay;
+REVOKE ALL ON pgtrickle.relay_outbox_config    FROM pgtrickle_relay;
+REVOKE ALL ON pgtrickle.relay_inbox_config     FROM pgtrickle_relay;
+REVOKE ALL ON pgtrickle.relay_consumer_offsets FROM pgtrickle_relay;
 
 -- Grant execute on the API functions only
 GRANT EXECUTE ON FUNCTION pgtrickle.set_relay_outbox(TEXT, JSONB, BOOLEAN)  TO pgtrickle_relay;
@@ -908,6 +1014,142 @@ The functions run with `SECURITY DEFINER` so they can access the underlying
 tables on behalf of any caller granted `EXECUTE`, without exposing the tables
 directly. Superusers and the `pgtrickle` role (extension owner) retain full
 table access for administrative purposes.
+
+---
+
+### A.15 Horizontal Scaling & Work Distribution
+
+The relay is designed to scale horizontally on Kubernetes with **zero external
+coordination**, using PostgreSQL advisory locks as the exclusive work lease.
+
+#### Distributed ownership via advisory locks
+
+Each pod runs a **coordinator task** that continuously races to acquire
+advisory locks for all enabled pipelines:
+
+```sql
+SELECT pg_try_advisory_lock(
+    hashtext(relay_group_id),   -- namespace per relay group/deployment
+    pipeline_id::int            -- individual pipeline within group
+);
+```
+
+- If the lock is acquired → this pod owns that pipeline; spawn a worker task.
+- If the lock is already held → another pod owns it; skip.
+- If the pod crashes or its coordinator connection drops → all locks are
+  automatically released, and other pods immediately race to acquire them.
+
+Lock acquisition is **serialized by PostgreSQL**, so split-brain (two pods
+processing the same pipeline simultaneously) is impossible.
+
+**Design rationale:** Session-level advisory locks are:
+- Atomic and scoped to a PG connection (no external etcd or ZK).
+- Automatically released on disconnect or connection failure.
+- Idiomatic for PostgreSQL HA patterns (pgBouncer, Patroni, logical replication).
+- Zero operational overhead — no new infrastructure to deploy.
+
+#### Multi-pod failover
+
+When Pod A crashes:
+
+1. Pod A's coordinator connection (which held all locks) is severed by PostgreSQL.
+2. All advisory locks held by Pod A are instantly released.
+3. Pod B's coordinator (running in the background on a timer) immediately
+   detects and acquires the released locks.
+4. Pod B dispatches workers to the affected pipelines.
+5. Workers read `relay_consumer_offsets` to resume from the last committed offset
+   (written atomically after each batch).
+
+**Result:** Zero data loss, no manual intervention, no wait for heartbeat timeout.
+
+#### Stateless pod design
+
+Each pod stores **no pipeline state** — all state lives in the database:
+
+| State | Location | Durability |
+|-------|----------|------------|
+| Pipeline config | `relay_*_config` tables | Durable |
+| Ownership | `pg_locks` (advisory locks) | Session-scoped |
+| Offsets | `relay_consumer_offsets` | Durable (atomically updated per batch) |
+| Metrics | In-process | Ephemeral (regenerated on pod restart) |
+
+Pods are identical and can be shut down / restarted / scaled in/out at any time.
+
+#### Configuration
+
+On process startup:
+1. Connect to PostgreSQL.
+2. Load all rows from `relay_outbox_config` and `relay_inbox_config` where
+   `enabled = true`.
+3. Assign a unique `relay_group_id` (derived from hostname + deploy version).
+4. Start the coordinator task.
+
+To enable/disable a pipeline without restarting the pod:
+1. Update the config row: `UPDATE relay_outbox_config SET enabled = false ...`
+2. The database trigger fires `NOTIFY pgtrickle_relay_config`.
+3. All pods' coordinators receive the notification and reload the config.
+4. Pods automatically stop or start workers as needed.
+
+#### Performance implications
+
+- **Poll overhead:** Advisory lock acquisition is ~1ms per tick per pod (negligible).
+- **Offset writes:** `INSERT ... ON CONFLICT DO UPDATE` (1-2ms per batch).
+- **Concurrency:** Multiple pods polling the same source is **safe** because
+  the outbox source tracks offsets per relay group, not globally.
+
+#### Example Kubernetes Deployment
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pgtrickle-relay
+spec:
+  replicas: 3                           # horizontal scale
+  selector:
+    matchLabels:
+      app: pgtrickle-relay
+  template:
+    metadata:
+      labels:
+        app: pgtrickle-relay
+    spec:
+      containers:
+      - name: relay
+        image: grove/pgtrickle-relay:0.24.0
+        env:
+        - name: PGTRICKLE_RELAY_POSTGRES_URL
+          valueFrom:
+            secretKeyRef:
+              name: pg-credentials
+              key: relay-url
+        ports:
+        - name: metrics
+          containerPort: 9090
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: metrics
+          initialDelaySeconds: 5
+          periodSeconds: 10
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: metrics
+          initialDelaySeconds: 5
+          periodSeconds: 10
+        resources:
+          requests:
+            cpu: 100m
+            memory: 256Mi
+          limits:
+            cpu: 500m
+            memory: 512Mi
+```
+
+Scaling up → new pods join and acquire available locks.
+Scaling down → evicted pods release locks; remaining pods acquire them.
+Rolling updates → replace pods one at a time; work rebalances automatically.
 
 ---
 
@@ -1477,14 +1719,14 @@ containers:
 
 ## Part G — Implementation Roadmap
 
-### Phase 1 — Core Framework + Forward Tier 1 Sinks (10.5 days)
+### Phase 1 — Core Framework + Forward Tier 1 Sinks (12 days)
 
 | Item | Description | Effort |
 |------|-------------|--------|
-| RELAY-CAT | **Catalog schema + SQL API.** `sql/pg_trickle--0.23.0--0.24.0.sql`: create `relay_outbox_config` + `relay_inbox_config` tables, shared `relay_config_notify()` trigger, and 7 SQL wrapper functions (`set_relay_outbox`, `set_relay_inbox`, `enable_relay`, `disable_relay`, `delete_relay`, `get_relay_config`, `list_relay_configs`). | 0.5d |
-| RELAY-1 | Crate scaffold, CLI parsing (`--postgres-url`, `config` subcommands), DB bootstrap (load tables, LISTEN/NOTIFY), error types, RelayMessage envelope | 1.5d |
-| RELAY-2 | Source + Sink traits, relay loop, cancellation token plumbing | 1d |
-| RELAY-3 | Outbox poller source (simple mode + consumer group mode) | 2d |
+| RELAY-CAT | **Catalog schema + SQL API + offset tracking.** `sql/pg_trickle--0.23.0--0.24.0.sql`: create `relay_outbox_config`, `relay_inbox_config`, and `relay_consumer_offsets` tables; shared `relay_config_notify()` trigger; 7 SQL wrapper functions. | 0.5d |
+| RELAY-1 | Crate scaffold, CLI parsing (`--postgres-url`), DB bootstrap (load tables, LISTEN/NOTIFY), coordinator task setup, error types, RelayMessage envelope | 2d |
+| RELAY-2 | Source + Sink traits, coordinator loop (advisory locks), worker pool dispatch, cancellation token plumbing | 1.5d |
+| RELAY-3 | Outbox poller source (simple mode with durable offsets + consumer group mode) | 2.5d |
 | RELAY-4 | Payload decoder (inline + claim-check + full-refresh) | 1d |
 | RELAY-5 | Sink: stdout/file backend | 0.5d |
 | RELAY-6 | Sink: NATS JetStream | 1d |
@@ -1559,7 +1801,7 @@ containers:
 
 | # | Question | Options | Recommendation |
 |---|----------|---------|----------------|
-| 1 | Should the relay support multiple outboxes/sources in one process? | (a) One source per process (simpler, Kubernetes-native scaling), (b) Multi-source config (fewer processes) | **(a)** — one source per process. Scale via replicas. Simpler operationally. |
+| 1 | Should the relay support multiple pipelines in one process? | (a) One pipeline per process (simpler), (b) Multi-pipeline coordinator (more throughput per pod) | **(b)** — one process runs a coordinator that manages all enabled pipelines via advisory locks. Multiple pods scale horizontally with zero external coordination. This is more resource-efficient and operationally simpler. See [A.15](#a15-horizontal-scaling--work-distribution). |
 | 2 | Should we support custom transforms (e.g. JMESPath, JSONata)? | (a) No transforms in v0.24.0, (b) JMESPath filter | **(a)** — out of scope. The stream table query itself is the transform layer. |
 | 3 | Dead-letter queue for the relay? | (a) Skip poison events + log, (b) DLQ table in PostgreSQL | **(a)** for v0.24.0. Log + metric is sufficient. DLQ can be added later. |
 | 4 | Should `pgtrickle-relay` be a workspace member or a separate repo? | (a) Workspace member (shared CI, version lock), (b) Separate repo | **(a)** — workspace member alongside `pgtrickle-tui`. Shared version, single release. |
