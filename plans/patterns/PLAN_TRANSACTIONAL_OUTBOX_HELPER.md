@@ -1,0 +1,1116 @@
+# Transactional Outbox Helper & Consumer Offset Extension
+
+> **Status:** Implementation Plan (DRAFT)
+> **Created:** 2026-04-18
+> **Category:** Integration Pattern — Implementation
+> **Related:** [PLAN_TRANSACTIONAL_OUTBOX.md](PLAN_TRANSACTIONAL_OUTBOX.md) ·
+> [PLAN_OVERALL_ASSESSMENT.md §9.12](../PLAN_OVERALL_ASSESSMENT.md#912-transactional-outbox-helper-s-effort--1-week) ·
+> [ROADMAP v0.22.0 OUTBOX](../../ROADMAP.md#transactional-outbox-helper-p2--912)
+
+---
+
+## Table of Contents
+
+- [Executive Summary](#executive-summary)
+- [Goals & Non-Goals](#goals--non-goals)
+- [Background](#background)
+- [Part A — Outbox Helper (v0.22.0)](#part-a--outbox-helper-v0220)
+  - [A.1 SQL API](#a1-sql-api)
+  - [A.2 Catalog Schema](#a2-catalog-schema)
+  - [A.3 Outbox Table Schema](#a3-outbox-table-schema)
+  - [A.4 Refresh-Path Integration](#a4-refresh-path-integration)
+  - [A.5 Payload Format](#a5-payload-format)
+  - [A.6 Retention Management](#a6-retention-management)
+  - [A.7 Lifecycle & Drop Cascade](#a7-lifecycle--drop-cascade)
+  - [A.8 GUCs](#a8-gucs)
+  - [A.9 Failure Handling](#a9-failure-handling)
+  - [A.10 Performance Considerations](#a10-performance-considerations)
+  - [A.11 Migration & Upgrade](#a11-migration--upgrade)
+- [Part B — Consumer Offset Extension (v0.23.0)](#part-b--consumer-offset-extension-v0230)
+  - [B.1 Goals](#b1-goals)
+  - [B.2 SQL API](#b2-sql-api)
+  - [B.3 Catalog Schema](#b3-catalog-schema)
+  - [B.4 Polling Semantics](#b4-polling-semantics)
+  - [B.5 Heartbeat & Liveness](#b5-heartbeat--liveness)
+  - [B.6 Offset Reset & Replay](#b6-offset-reset--replay)
+  - [B.7 Monitoring Stream Tables](#b7-monitoring-stream-tables)
+  - [B.8 Concurrency & Isolation](#b8-concurrency--isolation)
+  - [B.9 Auto-Cleanup of Dead Consumers](#b9-auto-cleanup-of-dead-consumers)
+- [Part C — Reference Relay Implementation](#part-c--reference-relay-implementation)
+- [Part D — Testing Strategy](#part-d--testing-strategy)
+- [Part E — Documentation Plan](#part-e--documentation-plan)
+- [Part F — Implementation Roadmap](#part-f--implementation-roadmap)
+- [Part G — Open Questions](#part-g--open-questions)
+- [Appendix — End-to-End Worked Example](#appendix--end-to-end-worked-example)
+
+---
+
+## Executive Summary
+
+This plan specifies two complementary features for pg_trickle:
+
+1. **Outbox Helper (v0.22.0):** A built-in, minimal-API mechanism that
+   captures the per-refresh delta `{inserted, deleted}` of any DIFFERENTIAL
+   stream table into a dedicated audit-style table
+   `pgtrickle.outbox_<st>`. This eliminates the dual-write problem for
+   downstream event buses **without an additional CDC connector or
+   replication slot**.
+
+2. **Consumer Offset Extension (v0.23.0):** An optional layer on top of the
+   Outbox Helper that adds Kafka-style consumer groups, per-consumer offset
+   tracking, lag visibility, heartbeats, and replay primitives so that
+   multiple relay processes can safely share a single outbox table with
+   first-class operational tooling.
+
+Both features compose: Part A is shippable on its own, gives users an
+immediate productivity win, and provides the substrate Part B builds on.
+
+---
+
+## Goals & Non-Goals
+
+### Goals
+
+- **Eliminate dual-writes** for stream-table-driven event publication.
+- **Zero additional cost** in the refresh hot path when outbox is disabled.
+- **Stable, durable contract**: outbox rows are written in the same
+  transaction as the MERGE; either both succeed or neither does.
+- **Operationally safe defaults** (24 h retention, automatic cleanup, no
+  unbounded growth).
+- **Composable with existing relays**: the outbox table is a plain SQL table
+  any relay (Python, Go, NATS, Kafka) can consume.
+- **Optional consumer-group semantics** for multi-relay deployments without
+  forcing the complexity on simple deployments.
+
+### Non-Goals
+
+- pg_trickle does **not** become a message broker. Publishing to NATS, Kafka,
+  RabbitMQ, etc. remains the relay's job.
+- pg_trickle does **not** maintain consumer-side state by default — only when
+  the optional consumer offset extension is enabled.
+- The Outbox Helper is **not** a replacement for logical replication or
+  Debezium for high-throughput, multi-table CDC topologies.
+- IMMEDIATE-mode stream tables with outbox enabled are out of scope for the
+  initial release (see Open Questions).
+
+---
+
+## Background
+
+The Transactional Outbox Pattern (see
+[PLAN_TRANSACTIONAL_OUTBOX.md](PLAN_TRANSACTIONAL_OUTBOX.md)) guarantees that
+domain events are published if and only if the originating transaction
+commits. The traditional implementation requires applications to write
+*twice*: once to the business table, once to an outbox table. pg_trickle's
+DIFFERENTIAL refresh already computes the delta of every change to a stream
+table — making it perfectly positioned to write the outbox automatically as
+a byproduct of refresh.
+
+This plan formalises that observation into a concrete implementation.
+
+---
+
+## Part A — Outbox Helper (v0.22.0)
+
+### A.1 SQL API
+
+```sql
+-- Enable outbox capture for a stream table
+SELECT pgtrickle.enable_outbox(
+    stream_table_name TEXT,            -- name of the stream table
+    retention_hours   INT DEFAULT NULL -- override the global GUC if set
+) RETURNS void;
+
+-- Disable outbox capture (drops the outbox table)
+SELECT pgtrickle.disable_outbox(
+    stream_table_name TEXT,
+    if_exists         BOOLEAN DEFAULT false
+) RETURNS void;
+
+-- Inspect outbox status for one or all stream tables
+SELECT * FROM pgtrickle.outbox_status(
+    stream_table_name TEXT DEFAULT NULL
+);
+-- Columns: pgt_name, outbox_table, enabled_at, retention_hours,
+--          row_count, oldest_row_at, newest_row_at, total_bytes
+```
+
+#### Argument Validation
+
+| Function | Validation |
+|----------|------------|
+| `enable_outbox` | Stream table must exist; refresh mode must be `DIFFERENTIAL` or `AUTO` (when AUTO resolves to DIFFERENTIAL); refresh mode must **not** be `IMMEDIATE` — returns `OutboxRequiresNotImmediateMode`; outbox must not already be enabled (idempotent if same retention). |
+| `disable_outbox` | Stream table must exist; outbox must be enabled (or `if_exists := true`). |
+| `outbox_status` | Returns empty set if argument provided but no match. |
+
+#### Errors
+
+All errors use existing `PgTrickleError` variants:
+- `StreamTableNotFound { name }`
+- `OutboxAlreadyEnabled { name }` (new variant)
+- `OutboxRequiresNotImmediateMode { name }` (new variant) — rejected with message: _"Outbox capture is not supported for IMMEDIATE-mode stream tables. The outbox integrates with DIFFERENTIAL refresh to write one row per refresh cycle within the same transaction. For zero-lag downstream events from IMMEDIATE tables, use LISTEN/NOTIFY or logical replication directly."_
+- `OutboxNotEnabled { name }` (new variant)
+- `OutboxRequiresDifferential { name }` (new variant)
+
+### A.2 Catalog Schema
+
+A new metadata table tracks per-stream-table outbox configuration:
+
+```sql
+CREATE TABLE pgtrickle.pgt_outbox_config (
+    pgt_id            UUID PRIMARY KEY REFERENCES pgtrickle.pgt_stream_tables(pgt_id) ON DELETE CASCADE,
+    outbox_table_name TEXT NOT NULL UNIQUE,    -- e.g. "outbox_pending_order_events"
+    enabled_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+    retention_hours   INT,                     -- NULL = use global GUC
+    last_drained_at   TIMESTAMPTZ,             -- last successful retention sweep
+    last_drained_count BIGINT NOT NULL DEFAULT 0
+);
+```
+
+This is the source of truth for "is outbox enabled for ST X?" — checked
+once per refresh in the hot path via a small in-memory cache.
+
+### A.3 Outbox Table Schema
+
+For a stream table named `pending_order_events`, `enable_outbox()` creates:
+
+```sql
+CREATE TABLE pgtrickle.outbox_pending_order_events (
+    id              BIGSERIAL PRIMARY KEY,
+    pgt_id          UUID NOT NULL,
+    refresh_id      UUID NOT NULL,             -- correlates to pgt_refresh_history
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+    inserted_count  INT NOT NULL,
+    deleted_count   INT NOT NULL,
+    payload         JSONB NOT NULL             -- {inserted: [...], deleted: [...]}
+);
+
+CREATE INDEX idx_outbox_<st>_created_at
+    ON pgtrickle.outbox_<st> (created_at);
+
+-- Optional partial index when the consumer offset extension is loaded:
+-- CREATE INDEX idx_outbox_<st>_unprocessed
+--     ON pgtrickle.outbox_<st> (id)
+--     WHERE processed_at IS NULL;
+```
+
+#### Why These Columns?
+
+| Column | Purpose |
+|--------|---------|
+| `id` | Monotonic offset; primary key for relay polling (`WHERE id > $last`). |
+| `pgt_id` | Links back to `pgt_stream_tables` for joinable diagnostics. |
+| `refresh_id` | Correlates to `pgt_refresh_history` for end-to-end tracing. |
+| `created_at` | Enables time-based queries and retention drain. |
+| `inserted_count` / `deleted_count` | Cheap statistics without parsing JSONB; useful for dashboards. |
+| `payload` | The delta itself; JSONB for downstream flexibility. |
+
+#### Naming Rules
+
+- Outbox table name = `outbox_` + `<stream_table_name>`, truncated so the
+  combined identifier fits within PostgreSQL's 63-byte limit.
+- Truncation algorithm: the `outbox_` prefix is 7 bytes; the stream table
+  name is truncated to at most **56 bytes**, yielding a maximum 63-byte
+  identifier.
+- If the resulting name collides with an existing table in the `pgtrickle`
+  schema (possible after migrations or short name reuse), a 7-character hex
+  suffix derived from `left(md5(stream_table_name), 7)` is appended:
+  `outbox_<name_truncated_to_48>_<hex7>` (7 + 48 + 1 + 7 = 63).
+- Final name is stored in `pgt_outbox_config.outbox_table_name` so callers
+  never need to re-derive it.
+- Always lives in schema `pgtrickle`.
+
+#### Deduplicated View (Automatically Created)
+
+Alongside `outbox_<st>`, `enable_outbox()` also creates a **zero-cost
+deduplicated view** for clients that want only the latest state per source
+primary key rather than the full delta log:
+
+```sql
+-- Auto-created alongside the outbox table:
+CREATE VIEW pgtrickle.pgt_outbox_dedup_<st> AS
+SELECT DISTINCT ON (pgt_id) *
+FROM pgtrickle.outbox_<st>
+ORDER BY pgt_id, id DESC;  -- pgt_id is the stream table row identity
+```
+
+| Consumer | Which view to query |
+|----------|-----------------------|
+| Full audit trail, event sourcing, replay testing | `outbox_<st>` — all rows, in insertion order |
+| Cache invalidation, read-model sync, state propagation | `pgt_outbox_dedup_<st>` — latest state per row, no intermediate states |
+
+No extra storage. Dropped automatically when `disable_outbox()` is called.
+
+### A.4 Refresh-Path Integration
+
+The outbox write hooks into the existing refresh transaction in
+[`src/refresh.rs`](../../src/refresh.rs) immediately after the MERGE
+completes successfully and before `COMMIT`:
+
+```text
+fn run_differential_refresh(...) -> Result<RefreshResult> {
+    // ... existing delta computation and MERGE ...
+
+    if outbox_enabled_for(pgt_id) {
+        write_outbox_row(
+            pgt_id,
+            refresh_id,
+            inserted_rows,    // already in memory
+            deleted_rows,
+        )?;
+    }
+
+    // Same transaction commits MERGE + outbox row atomically
+    Ok(result)
+}
+```
+
+#### Hot-Path Cost When Disabled
+
+- One in-memory hash lookup per refresh: `outbox_enabled_set.contains(pgt_id)`.
+- Cache invalidated on any DDL via the existing event-trigger hook.
+- Target: < 50 ns per refresh when disabled. Benchmark with `criterion`.
+
+#### Hot-Path Cost When Enabled
+
+- One additional INSERT into `pgtrickle.outbox_<st>` per refresh cycle.
+- Payload serialisation reuses the in-memory `Vec<DeltaRow>` already
+  computed for the MERGE — no extra round trips.
+
+#### FULL-Refresh Fallback
+
+When a stream table is in AUTO mode and pg_trickle falls back to a FULL
+refresh (e.g. when the IVM cost exceeds the threshold), the outbox must
+still write a correct payload — but its semantics differ from a differential
+row:
+
+- The `inserted` array contains **all current rows** of the stream table.
+- The `deleted` array is **empty**.
+- The payload sets **`"full_refresh": true`** at the top level as a sentinel.
+- A `pg_trickle_alert` event of type **`outbox_full_refresh`** is emitted so
+  operators and monitoring pipelines can detect the event independently.
+
+Relays **must** inspect `payload.full_refresh` before publishing to a broker.
+A relay that treats a FULL-refresh payload as incremental events will publish
+every current row as a spurious new event. The reference relay
+(`examples/relay/outbox_relay.py`) demonstrates the correct check:
+
+```python
+if row["payload"].get("full_refresh"):
+    # Apply snapshot semantics: upsert all rows, do not send as new events
+    handle_full_refresh_snapshot(row["payload"]["inserted"])
+else:
+    publish_delta(row["payload"])
+```
+
+The `full_refresh` flag is also set on truncation markers (see A.5) whenever
+a FULL-refresh payload exceeds `outbox_max_payload_bytes`.
+
+### A.5 Payload Format
+
+The JSONB payload follows a stable, versioned schema:
+
+```json
+{
+  "v": 1,
+  "inserted": [
+    { "<col1>": <val>, "<col2>": <val>, ... },
+    ...
+  ],
+  "deleted": [
+    { "<col1>": <val>, "<col2>": <val>, ... },
+    ...
+  ]
+}
+```
+
+For FULL-refresh fallbacks (see A.4), the payload additionally includes
+`"full_refresh": true`:
+
+```json
+{
+  "v": 1,
+  "full_refresh": true,
+  "inserted": [ { ... all current rows ... } ],
+  "deleted": []
+}
+```
+
+Relays must check for `full_refresh` before routing to a broker.
+
+#### Versioning
+
+- Top-level `v` field allows schema evolution without breaking consumers.
+- Initial release ships `v: 1`.
+- Documented as a stable contract in `docs/SQL_REFERENCE.md`.
+
+#### Row Encoding
+
+- Each row is an object keyed by column name.
+- PostgreSQL types are converted via `to_jsonb()` rules (numeric → number,
+  text → string, timestamps → ISO 8601 strings, etc.).
+- `NULL` values are emitted as JSON `null`.
+
+#### Size Limits
+
+- A configurable GUC `pg_trickle.outbox_max_payload_bytes` (default 8 MiB)
+  caps the payload size. If exceeded, the refresh **still succeeds** but
+  the outbox row records a **truncated** marker:
+  ```json
+  { "v": 1, "truncated": true, "reason": "payload_too_large",
+    "inserted_count": 12345, "deleted_count": 0 }
+  ```
+  Relays can detect truncation and fall back to direct stream-table reads.
+
+### A.6 Retention Management
+
+#### Per-Stream-Table Retention
+
+`enable_outbox(name, retention_hours)` accepts an optional override.
+If `NULL`, the global GUC `pg_trickle.outbox_retention_hours` (default 24)
+applies.
+
+#### Drain Mechanism
+
+The existing scheduler cleanup phase (see
+[`src/scheduler.rs`](../../src/scheduler.rs)) gains a new step that runs
+once per cleanup cycle:
+
+```sql
+DELETE FROM pgtrickle.outbox_<st>
+WHERE created_at < now() - INTERVAL '<retention_hours> hours'
+RETURNING 1
+LIMIT pg_trickle.outbox_drain_batch_size;  -- default 10000
+```
+
+- Batched to avoid long locks.
+- Loops until the batch returns < `outbox_drain_batch_size` rows.
+- Updates `pgt_outbox_config.last_drained_at` and
+  `last_drained_count`.
+
+#### Edge Cases
+
+- If the consumer offset extension is loaded, retention drain **skips rows
+  with offsets greater than the slowest consumer's `last_offset`** to avoid
+  data loss for active consumers (see B.6).
+- If retention is set to `0` hours, no drain runs (useful for archive-only
+  outboxes).
+
+### A.7 Lifecycle & Drop Cascade
+
+| Event | Effect |
+|-------|--------|
+| `pgtrickle.create_stream_table(...)` | No outbox created; opt-in via `enable_outbox()`. |
+| `pgtrickle.enable_outbox(name)` | Creates `pgtrickle.outbox_<st>` and metadata row. |
+| `pgtrickle.alter_stream_table(name, ...)` | Outbox preserved if column set unchanged; else `ERROR` requiring `disable_outbox()` first. |
+| `pgtrickle.disable_outbox(name)` | Drops the outbox table and metadata row. |
+| `pgtrickle.drop_stream_table(name)` | Cascades: outbox metadata row + outbox table dropped automatically. |
+| `DROP EXTENSION pg_trickle` | All `pgtrickle.outbox_*` tables dropped via extension membership. |
+
+### A.8 GUCs
+
+| GUC | Type | Default | Description |
+|-----|------|---------|-------------|
+| `pg_trickle.outbox_enabled` | bool | `true` | Master switch. When `false`, refresh skips outbox writes even if enabled per ST. |
+| `pg_trickle.outbox_retention_hours` | int | `24` | Default retention for outbox rows. |
+| `pg_trickle.outbox_drain_batch_size` | int | `10000` | Max rows deleted per drain pass. |
+| `pg_trickle.outbox_max_payload_bytes` | int | `8388608` (8 MiB) | Truncation threshold. |
+| `pg_trickle.outbox_drain_interval_seconds` | int | `60` | Minimum interval between drain passes. |
+| `pg_trickle.consumer_dead_threshold_hours` | int | `24` | Hours since last heartbeat before a consumer is considered dead and its leases released. Reduce to `1` for high-criticality systems. |
+| `pg_trickle.consumer_stale_offset_threshold_days` | int | `7` | Days since last commit before a dead consumer's offset row is permanently removed. |
+
+All GUCs are `SUSET` (require superuser to change).
+
+### A.9 Failure Handling
+
+| Failure | Behaviour |
+|---------|-----------|
+| Outbox table missing (DDL drift) | Refresh **fails**; ST marked `ERROR`; alert emitted. Recovery: `disable_outbox()` then `enable_outbox()`. |
+| Outbox INSERT fails (e.g. disk full) | Refresh transaction **rolls back**; both MERGE and outbox row reverted. ST returns `ERROR`. This is the correct behaviour — never let outbox and view drift. |
+| Payload exceeds `outbox_max_payload_bytes` | Truncation marker written (see A.5); refresh succeeds. Relay detects `payload.truncated = true` and falls back to querying the stream table directly: `SELECT * FROM pgtrickle.<st> WHERE pgt_id = $1` using the `pgt_id` from the outbox row header. This fallback pattern is implemented in the reference relay (`examples/relay/outbox_relay.py`) and must be replicated in any custom relay. |
+| Drain loop fails | Logged via `pgrx::warning!`; retried next cleanup cycle. Does not block refresh. |
+| `pg_trickle.outbox_enabled = false` mid-refresh | Refresh completes normally; subsequent refreshes skip outbox until re-enabled. |
+| `enable_outbox()` on IMMEDIATE-mode stream table | Rejected immediately with `OutboxRequiresNotImmediateMode`; no partial state created. |
+
+### A.10 Performance Considerations
+
+#### Write Amplification
+
+For every refresh that enables outbox:
+- 1 additional INSERT (~1 KB row + payload size).
+- 1 index entry on `created_at`.
+
+Expected overhead at 1 refresh/sec: ~5–10 µs/refresh. Benchmark with
+`benches/refresh_bench.rs` extended to cover outbox-enabled and
+outbox-disabled cases.
+
+#### Storage Growth
+
+- 86,400 rows/day per ST at 1 Hz refresh.
+- Average row size: 200 bytes (header) + payload (typically 1–10 KB).
+- ~1 GB/day per ST at modest payload sizes.
+- Bounded by retention drain.
+
+#### Bloat Mitigation
+
+- Outbox tables are append-mostly; `autovacuum` settings should be tuned
+  via the existing `pgtrickle_changes` template:
+  - `autovacuum_vacuum_scale_factor = 0.05`
+  - `autovacuum_vacuum_cost_limit = 1000`
+
+### A.11 Migration & Upgrade
+
+#### v0.21.0 → v0.22.0
+
+- New catalog table `pgtrickle.pgt_outbox_config` created via
+  `sql/upgrade--0.21.0--0.22.0.sql`.
+- New SQL functions registered.
+- Existing stream tables unaffected; outbox is opt-in.
+
+#### Downgrade
+
+Not supported in initial release. Users must:
+1. `disable_outbox()` for all stream tables.
+2. `DROP EXTENSION pg_trickle CASCADE; CREATE EXTENSION pg_trickle VERSION '0.21.0';`.
+
+---
+
+## Part B — Consumer Offset Extension (v0.23.0)
+
+### B.1 Goals
+
+- Support **multiple relay instances** sharing a single outbox table without
+  duplicate publication.
+- Provide **lag visibility** ("how far behind is each consumer?").
+- Enable **replay** for disaster recovery and onboarding new consumers.
+- Detect and reclaim resources from **crashed consumers**.
+- Stay **opt-in** — simple deployments using `FOR UPDATE SKIP LOCKED` don't
+  need this.
+
+### B.2 SQL API
+
+```sql
+-- Group lifecycle
+SELECT pgtrickle.create_consumer_group(
+    group_name        TEXT,
+    outbox_table_name TEXT,                        -- e.g. "outbox_pending_order_events"
+    auto_offset_reset TEXT DEFAULT 'latest'        -- 'latest' | 'earliest'
+) RETURNS UUID;                                    -- group_id
+
+SELECT pgtrickle.drop_consumer_group(group_name TEXT) RETURNS void;
+
+-- Polling (called by relay)
+SELECT * FROM pgtrickle.poll_outbox(
+    group_name   TEXT,
+    consumer_id  TEXT,
+    batch_size   INT DEFAULT 100,
+    visibility_seconds INT DEFAULT 30              -- like SQS visibility timeout
+);
+-- Returns: TABLE(id BIGINT, created_at TIMESTAMPTZ, payload JSONB)
+
+-- Commit progress
+SELECT pgtrickle.commit_offset(
+    group_name   TEXT,
+    consumer_id  TEXT,
+    last_offset  BIGINT
+) RETURNS void;
+
+-- Liveness
+SELECT pgtrickle.consumer_heartbeat(
+    group_name   TEXT,
+    consumer_id  TEXT
+) RETURNS void;
+-- Updates last_heartbeat_at only. Does NOT extend active leases.
+-- Use extend_lease() to renew a lease for a long-running batch.
+
+-- Lease renewal for long-running batches
+SELECT pgtrickle.extend_lease(
+    group_name        TEXT,
+    consumer_id       TEXT,
+    extension_seconds INT DEFAULT 30
+) RETURNS TIMESTAMPTZ;              -- new visibility_until timestamp
+-- Extends visibility_until of ALL active leases held by this consumer.
+
+-- Replay
+SELECT pgtrickle.seek_offset(
+    group_name   TEXT,
+    consumer_id  TEXT,
+    new_offset   BIGINT                            -- 0 = beginning, NULL = end
+) RETURNS void;
+
+-- Inspection
+SELECT * FROM pgtrickle.consumer_lag(
+    group_name TEXT DEFAULT NULL                   -- NULL = all groups
+);
+-- Columns: group_name, consumer_id, last_offset, lag_rows,
+--          last_heartbeat, heartbeat_age_seconds, healthy
+```
+
+### B.3 Catalog Schema
+
+```sql
+CREATE TABLE pgtrickle.pgt_consumer_groups (
+    group_id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    group_name          TEXT NOT NULL UNIQUE,
+    outbox_table_name   TEXT NOT NULL,
+    auto_offset_reset   TEXT NOT NULL DEFAULT 'latest'
+        CHECK (auto_offset_reset IN ('latest', 'earliest')),
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE pgtrickle.pgt_consumer_offsets (
+    group_id            UUID NOT NULL REFERENCES pgtrickle.pgt_consumer_groups ON DELETE CASCADE,
+    consumer_id         TEXT NOT NULL,
+    last_offset         BIGINT NOT NULL DEFAULT 0,
+    last_commit_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    last_heartbeat_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (group_id, consumer_id)
+);
+
+CREATE TABLE pgtrickle.pgt_consumer_leases (
+    group_id            UUID NOT NULL,
+    consumer_id         TEXT NOT NULL,
+    leased_id_min       BIGINT NOT NULL,           -- inclusive
+    leased_id_max       BIGINT NOT NULL,           -- inclusive
+    leased_at           TIMESTAMPTZ NOT NULL DEFAULT now(),
+    visibility_until    TIMESTAMPTZ NOT NULL,
+    PRIMARY KEY (group_id, leased_id_min)
+);
+```
+
+### B.4 Polling Semantics
+
+`poll_outbox()` is implemented as a single SQL function that:
+
+1. Validates the group exists and the consumer is registered (auto-registers
+   if first call).
+2. Acquires a lease over the next `batch_size` outbox rows whose `id` is
+   greater than `last_offset` and not currently leased by another consumer:
+
+   ```sql
+   WITH next_batch AS (
+       SELECT o.id, o.created_at, o.payload
+       FROM pgtrickle.outbox_<st> o
+       WHERE o.id > (SELECT last_offset FROM pgt_consumer_offsets
+                     WHERE group_id = $g AND consumer_id = $c)
+         AND NOT EXISTS (
+             SELECT 1 FROM pgt_consumer_leases l
+             WHERE l.group_id = $g
+               AND o.id BETWEEN l.leased_id_min AND l.leased_id_max
+               AND l.visibility_until > now()
+         )
+       ORDER BY o.id
+       LIMIT $batch_size
+       FOR UPDATE OF o SKIP LOCKED
+   )
+   INSERT INTO pgt_consumer_leases (group_id, consumer_id,
+                                    leased_id_min, leased_id_max,
+                                    visibility_until)
+   SELECT $g, $c, MIN(id), MAX(id), now() + interval '$visibility_seconds seconds'
+   FROM next_batch
+   HAVING COUNT(*) > 0
+   RETURNING leased_id_min, leased_id_max;
+   ```
+
+3. Returns the batch rows.
+
+#### Visibility Timeout
+
+If the relay doesn't call `commit_offset()` within `visibility_seconds`,
+the lease expires and the rows become available to other consumers. This
+mimics SQS / pgmq semantics.
+
+#### Auto-Registration
+
+First call to `poll_outbox()` for a new `consumer_id` creates a row in
+`pgt_consumer_offsets`:
+- If `auto_offset_reset = 'latest'`: `last_offset` set to current `MAX(id)`.
+- If `auto_offset_reset = 'earliest'`: `last_offset` set to 0.
+
+#### Lease Renewal
+
+If a relay's batch processing takes longer than `visibility_seconds`
+(e.g. slow broker publish, large payloads, business logic), it should call
+`extend_lease()` before the lease expires to prevent another relay from
+re-polling the same rows:
+
+```python
+# In relay loop, after poll_outbox() returns a batch:
+new_deadline = execute_scalar(
+    "SELECT pgtrickle.extend_lease($1, $2, 30)",
+    group, consumer_id
+)
+# Process batch ... publish to broker ...
+execute("SELECT pgtrickle.commit_offset($1, $2, $3)", group, consumer_id, max_id)
+```
+
+`extend_lease()` updates `visibility_until` for **all** active leases held
+by the named consumer. It does **not** affect `last_heartbeat_at` — heartbeat
+and lease lifetime are independent concerns.
+
+If the consumer has no active leases (e.g. called after `commit_offset()`),
+`extend_lease()` is a no-op and returns the current timestamp.
+
+### B.5 Heartbeat & Liveness
+
+- Relays call `consumer_heartbeat()` periodically (recommended every 10 s).
+- A consumer is **healthy** if `last_heartbeat_at > now() - interval '60 seconds'`.
+- `consumer_heartbeat()` updates **only** `last_heartbeat_at`; it does **not**
+  extend active lease timeouts. Call `extend_lease()` (see B.4) to renew
+  leases for long-running batches.
+- `consumer_lag()` is a **live SQL function** (executes against `pgt_consumer_offsets`
+  directly, always current) suitable for ad-hoc inspection and application
+  code health checks. It exposes per-consumer `lag_rows`, `healthy`, and
+  `heartbeat_age_seconds`.
+- `pgt_consumer_group_lag` (see B.7) is a **DIFFERENTIAL stream table**
+  materialized every 10 s, suitable for Grafana dashboards and alerting rules.
+  Use `consumer_lag()` for programmatic checks; use the ST for monitoring.
+- A `pg_trickle_alert` event of type `consumer_unhealthy` is emitted when a
+  registered consumer transitions from healthy → unhealthy.
+
+### B.6 Offset Reset & Replay
+
+`seek_offset(group, consumer, n)`:
+- Sets `last_offset = n` for the named consumer.
+- Releases all active leases held by that consumer.
+- Emits `pg_trickle_alert` event `consumer_seeked`.
+
+#### Retention Interaction
+
+When the consumer offset extension is loaded, retention drain refuses to
+delete rows whose `id > MIN(last_offset across all consumers)`. This
+prevents silent data loss for slow consumers.
+
+A separate GUC `pg_trickle.outbox_force_retention` (default `false`) allows
+operators to override this safety check when a consumer is permanently
+abandoned.
+
+### B.7 Monitoring Stream Tables
+
+Three pg_trickle-managed stream tables (auto-created on first
+`create_consumer_group()` call) provide always-fresh dashboards:
+
+```sql
+-- Per-consumer status
+SELECT pgtrickle.create_stream_table(
+    'pgt_consumer_status',
+    $$SELECT g.group_name, o.consumer_id, o.last_offset,
+             o.last_heartbeat_at,
+             EXTRACT(EPOCH FROM (now() - o.last_heartbeat_at)) AS heartbeat_age_sec,
+             (now() - o.last_heartbeat_at) < interval '60 seconds' AS healthy
+      FROM pgtrickle.pgt_consumer_groups g
+      JOIN pgtrickle.pgt_consumer_offsets o USING (group_id)$$,
+    schedule => '5 seconds',
+    refresh_mode => 'DIFFERENTIAL'
+);
+
+-- Per-group aggregate lag
+SELECT pgtrickle.create_stream_table(
+    'pgt_consumer_group_lag',
+    $$...$$,
+    schedule => '10 seconds',
+    refresh_mode => 'DIFFERENTIAL'
+);
+
+-- Active leases
+SELECT pgtrickle.create_stream_table(
+    'pgt_consumer_active_leases',
+    $$SELECT * FROM pgtrickle.pgt_consumer_leases
+      WHERE visibility_until > now()$$,
+    schedule => '5 seconds',
+    refresh_mode => 'DIFFERENTIAL'
+);
+```
+
+### B.8 Concurrency & Isolation
+
+- All catalog updates use `READ COMMITTED`.
+- `poll_outbox()` uses `FOR UPDATE SKIP LOCKED` on the outbox table to
+  prevent two concurrent polls from leasing overlapping ranges.
+- `commit_offset()` is idempotent: monotonically advances `last_offset`,
+  rejects regression with a warning.
+- Per-consumer rows in `pgt_consumer_offsets` are isolated; no cross-consumer
+  contention.
+
+#### Delivery Guarantee
+
+The consumer group mechanism provides **at-least-once delivery per consumer
+instance** within a group. End-to-end exactly-once requires all three layers:
+
+| Layer | Mechanism |
+|-------|-----------|
+| pg_trickle outbox | One row per DIFFERENTIAL refresh; committed atomically with MERGE. Never lost once committed. |
+| Relay | Publishes with broker idempotency key (`Nats-Msg-Id`, Kafka record key, etc.). Re-poll after crash re-publishes; broker deduplicates. |
+| Inbox | `ON CONFLICT (event_id) DO NOTHING` deduplicates at the consumer. |
+
+If a relay crashes after `poll_outbox()` but before `commit_offset()`, its
+lease expires after `consumer_dead_threshold_hours`. Another relay then
+re-polls the same batch. Any rows the first relay had already published are
+dedup'd by the broker; any unpublished rows are published fresh. **The inbox
+always provides the final deduplication layer regardless.** This three-layer
+design means no single layer needs to be perfectly reliable — correctness is
+achieved by composition.
+
+### B.9 Auto-Cleanup of Dead Consumers
+
+A new scheduler step (gated by GUC
+`pg_trickle.consumer_cleanup_enabled`, default `true`):
+
+1. Find consumers with `last_heartbeat_at < now() - interval '<N> hours'`
+   where `<N>` = `pg_trickle.consumer_dead_threshold_hours` (default `24`).
+2. Release all their leases.
+3. Optionally remove from `pgt_consumer_offsets` if also
+   `last_commit_at < now() - interval '<D> days'`
+   where `<D>` = `pg_trickle.consumer_stale_offset_threshold_days` (default `7`).
+4. Emit `pg_trickle_alert` event `consumer_reaped`.
+
+> **Tuning for high-criticality systems:** Set
+> `pg_trickle.consumer_dead_threshold_hours = 1` to reduce the lease-hold
+> window for crashed relays. Relays should call `consumer_heartbeat()` every
+> 10 s (at most every 30 s) so the 1-hour dead threshold gives 120× the
+> normal heartbeat interval as buffer.
+
+---
+
+## Part C — Reference Relay Implementation
+
+A canonical Python relay shipped under `examples/relay/outbox_relay.py`:
+
+```python
+import asyncio, asyncpg, json, os, signal
+import nats
+
+GROUP_NAME    = os.environ['RELAY_GROUP']        # e.g. "order-publisher"
+CONSUMER_ID   = os.environ['RELAY_CONSUMER_ID']  # e.g. "relay-1"
+OUTBOX_NAME   = os.environ['RELAY_OUTBOX']       # e.g. "outbox_pending_order_events"
+NATS_URL      = os.environ['NATS_URL']
+PG_DSN        = os.environ['PG_DSN']
+
+async def main():
+    db = await asyncpg.connect(PG_DSN)
+    nc = await nats.connect(NATS_URL)
+    js = nc.jetstream()
+
+    # Auto-register (idempotent)
+    await db.execute(
+        "SELECT pgtrickle.create_consumer_group($1, $2, 'latest') "
+        "ON CONFLICT (group_name) DO NOTHING",
+        GROUP_NAME, OUTBOX_NAME,
+    )
+
+    stop = asyncio.Event()
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        asyncio.get_running_loop().add_signal_handler(sig, stop.set)
+
+    while not stop.is_set():
+        rows = await db.fetch(
+            "SELECT * FROM pgtrickle.poll_outbox($1, $2, 100, 30)",
+            GROUP_NAME, CONSUMER_ID,
+        )
+        if not rows:
+            await db.execute(
+                "SELECT pgtrickle.consumer_heartbeat($1, $2)",
+                GROUP_NAME, CONSUMER_ID,
+            )
+            await asyncio.wait([stop.wait()], timeout=1.0)
+            continue
+
+        last_id = None
+        for row in rows:
+            payload = row['payload']
+            if payload.get('truncated'):
+                # Fall back to direct stream-table query (see A.5)
+                continue
+            for ev in payload.get('inserted', []):
+                await js.publish(
+                    f"orders.{ev['event_type'].lower()}",
+                    json.dumps(ev).encode(),
+                    headers={"Nats-Msg-Id": ev['event_id']},
+                )
+            last_id = row['id']
+
+        if last_id is not None:
+            await db.execute(
+                "SELECT pgtrickle.commit_offset($1, $2, $3)",
+                GROUP_NAME, CONSUMER_ID, last_id,
+            )
+
+    await nc.close()
+    await db.close()
+
+if __name__ == '__main__':
+    asyncio.run(main())
+```
+
+A Rust equivalent (`examples/relay/outbox_relay.rs`) ships alongside.
+
+---
+
+## Part D — Testing Strategy
+
+### D.1 Unit Tests
+
+- `enable_outbox()` / `disable_outbox()` happy paths and validation errors.
+- Outbox table naming with truncation and collision handling.
+- Payload serialisation for diverse PostgreSQL types (numeric, jsonb,
+  timestamptz, arrays, NULL).
+- Truncation marker emitted when payload exceeds limit.
+- Drop cascade: `drop_stream_table` removes outbox table and metadata.
+
+### D.2 Integration Tests (Testcontainers)
+
+- End-to-end: create ST → enable outbox → INSERT into source → assert
+  outbox row appears with correct payload.
+- Retention drain removes rows older than threshold but preserves rows
+  needed by active consumers.
+- Refresh failure rolls back outbox row.
+- Outbox INSERT failure (simulated via tablespace exhaustion) rolls back
+  refresh.
+- Concurrent refreshes on multiple STs each write their own outbox rows
+  atomically.
+
+### D.3 E2E Tests
+
+- Full Docker stack with NATS sidecar; reference relay publishes events;
+  consumer verifies exactly-once delivery via `Nats-Msg-Id`.
+- Relay crash mid-batch: visibility timeout expires, second relay picks up
+  the same batch, broker dedup absorbs the duplicate.
+- Replay: `seek_offset(0)` causes relay to re-publish all events; verify
+  consumer receives expected count after broker dedup.
+
+### D.4 Property-Based Tests
+
+- `proptest` over arbitrary refresh sequences ensures:
+  - Sum of `inserted_count` − sum of `deleted_count` across all outbox rows
+    equals current ST row count.
+  - Reconstructing ST state by replaying outbox payloads matches the
+    materialised view.
+
+### D.5 Benchmark
+
+Extend `benches/refresh_bench.rs`:
+- `refresh_no_outbox` (baseline)
+- `refresh_outbox_enabled_small_payload` (10 rows)
+- `refresh_outbox_enabled_large_payload` (10,000 rows)
+
+Acceptance criteria: < 10 % overhead vs. baseline at small payloads,
+< 25 % at large payloads. Tracked in CI via
+`scripts/criterion_regression_check.py`.
+
+### D.6 Chaos Tests
+
+- Kill the bgworker mid-drain; verify next cycle resumes correctly.
+- Force `outbox_max_payload_bytes` to a tiny value and verify truncation.
+- Partition the outbox table via `pg_partman` and verify drain still works.
+
+### D.7 Concurrent Relay Stress Test
+
+A critical correctness gate for Part B:
+
+- Spawn 10 concurrent relay goroutines/tasks against a single consumer group.
+- Insert 100 000 outbox rows via rapid source table mutations.
+- Verify: (a) every row published exactly once across all relays (set
+  equality); (b) no row published more than once within the broker (idempotency
+  key check); (c) `pg_trickle_alert consumer_reaped` fires correctly when a
+  relay is killed mid-batch and not replaced.
+
+Acceptance: < 0.1% duplicate rate at the broker before dedup; 0% after
+broker dedup. Total throughput > 10 000 rows/sec across 10 relays.
+
+---
+
+## Part E — Documentation Plan
+
+| File | Sections to Add |
+|------|-----------------|
+| [docs/SQL_REFERENCE.md](../../docs/SQL_REFERENCE.md) | `pgtrickle.enable_outbox()`, `disable_outbox()`, `outbox_status()`, payload schema (with version), `pgt_outbox_dedup_<st>` view usage, consumer group API |
+| [docs/CONFIGURATION.md](../../docs/CONFIGURATION.md) | All seven outbox+consumer GUCs with defaults and effect descriptions |
+| [docs/PATTERNS.md](../../docs/PATTERNS.md) | New section "Transactional Outbox" linking to PLAN_TRANSACTIONAL_OUTBOX.md; "Handling Truncated Payloads" fallback guide; "Latest-State Consumers" (dedup view); "Monitoring Outbox Health" (custom ST example); "Multi-Relay Consumer Groups" (competing consumers) |
+| [docs/ARCHITECTURE.md](../../docs/ARCHITECTURE.md) | Diagram of refresh path with optional outbox write step |
+| [docs/TROUBLESHOOTING.md](../../docs/TROUBLESHOOTING.md) | Common outbox issues: bloat, truncation, failed drains, lease starvation, dead consumer cleanup |
+| [CHANGELOG.md](../../CHANGELOG.md) | v0.23.0 entry for OUTBOX-1 through OUTBOX-8 and OUTBOX-B1 through OUTBOX-B9 |
+| [dbt-pgtrickle/](../../dbt-pgtrickle/) | `outbox_enabled` property in dbt model config; `pgtrickle_outbox_config` macro; dbt docs update |
+| [examples/](../../examples/) | `outbox_relay.py`, `outbox_relay.rs`, `outbox_relay_nats.py` |
+
+---
+
+## Part F — Implementation Roadmap
+
+### Part A — v0.22.0 (Days 38–40 in the v0.22.0 plan)
+
+| Item | Description | Effort |
+|------|-------------|--------|
+| OUTBOX-1 | Catalog table, `enable_outbox` / `disable_outbox` SQL functions, validation, error variants | 0.5d |
+| OUTBOX-2 | Refresh-path integration, payload serialisation, hot-path cache, truncation handling | 1d |
+| OUTBOX-3 | Retention drain in scheduler cleanup phase, GUCs, batched DELETE | 0.5d |
+| OUTBOX-4 | Unit + integration + E2E tests, benchmark, docs updates | 0.5d |
+
+**Total: ~2.5–3 days** (matches existing roadmap estimate).
+
+### Part B — v0.23.0 (same milestone)
+
+| Item | Description | Effort |
+|------|-------------|--------|
+| CG-1 | Catalog tables for groups, offsets, leases | 0.5d |
+| CG-2 | `create_consumer_group`, `drop_consumer_group`, `poll_outbox`, `commit_offset` | 2d |
+| CG-3 | `consumer_heartbeat`, `seek_offset`, monitoring stream tables | 1d |
+| CG-4 | Visibility timeout enforcement, auto-cleanup of dead consumers | 1d |
+| CG-5 | Retention safety (refuse to drain rows below slowest consumer) | 0.5d |
+| CG-6 | Reference relay (Python + Rust), examples, docs | 1d |
+| CG-7 | E2E tests (multi-relay, crash recovery, replay), proptest, benchmarks | 1.5d |
+
+**Total: ~7–8 days.** Suggested for v0.24.0 or v1.1.0.
+
+---
+
+## Part G — Open Questions
+
+1. **IMMEDIATE-mode outbox.** ✅ **Resolved (v0.23.0):** `enable_outbox()`
+   is disallowed for `IMMEDIATE`-mode stream tables and returns
+   `OutboxRequiresNotImmediateMode` with an explanatory message. IMMEDIATE
+   mode hooks into the source write transaction; adding an outbox INSERT
+   there would impose that cost on every application transaction. Revisit
+   post-1.0 with an explicit opt-in parameter if demand is high.
+
+2. **Per-row vs per-refresh granularity.** Current design writes one outbox
+   row per refresh. Alternative: one outbox row per inserted/deleted source
+   row. **Proposal:** stick with per-refresh for v0.22.0 (matches DIFFERENTIAL
+   semantics, lower write amplification). Add per-row mode if user demand
+   appears.
+
+3. **Outbox compression.** Should large payloads be compressed (e.g.
+   `pg_lz`)? **Proposal:** rely on PostgreSQL's TOAST compression for now;
+   revisit if profiling shows JSONB inflation is a real cost.
+
+4. **Cross-database outbox.** Multi-database support is post-1.0 (S3). Outbox
+   table lives in the same database as the ST. **Proposal:** no change.
+
+5. **Logical replication of the outbox table itself.** Some users may want
+   to publish `pgtrickle.outbox_*` via PostgreSQL logical replication
+   instead of an external relay. **Proposal:** document but don't build —
+   the table is ordinary SQL and `CREATE PUBLICATION` works out of the box.
+
+6. **Schema evolution.** What happens if the ST's column set changes via
+   `alter_stream_table` while outbox is enabled? **Proposal:** require
+   `disable_outbox()` first; error otherwise. Document in upgrade guide.
+
+7. **Consumer offset extension naming.** Should it ship as part of
+   `pg_trickle` core or a separate extension `pg_trickle_consumer`?
+   **Proposal:** core — too tightly coupled to outbox internals to split.
+
+---
+
+## Appendix — End-to-End Worked Example
+
+### Setup
+
+```sql
+-- Source business table
+CREATE TABLE orders (
+    id          SERIAL PRIMARY KEY,
+    customer_id INT NOT NULL,
+    total       NUMERIC(10,2) NOT NULL,
+    status      TEXT NOT NULL DEFAULT 'pending',
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    published_at TIMESTAMPTZ
+);
+
+-- Stream table for unpublished orders
+SELECT pgtrickle.create_stream_table(
+    'pending_order_events',
+    $$SELECT id, customer_id, total, status, created_at
+      FROM orders
+      WHERE published_at IS NULL$$,
+    schedule => '1 second',
+    refresh_mode => 'DIFFERENTIAL'
+);
+
+-- Enable outbox capture
+SELECT pgtrickle.enable_outbox('pending_order_events');
+
+-- Optional: enable consumer groups (Part B)
+SELECT pgtrickle.create_consumer_group(
+    'order-publisher',
+    'outbox_pending_order_events',
+    'earliest'
+);
+```
+
+### Application Write (No Dual-Write!)
+
+```sql
+-- Application only writes to the business table:
+INSERT INTO orders (customer_id, total) VALUES (42, 99.95);
+-- pg_trickle handles the outbox automatically on the next refresh.
+```
+
+### Outbox Table After 3 Refreshes
+
+```sql
+SELECT id, created_at, inserted_count, deleted_count, payload
+FROM pgtrickle.outbox_pending_order_events;
+```
+
+| id | created_at | inserted_count | deleted_count | payload |
+|----|------------|---------------:|--------------:|---------|
+| 1 | 10:00:01 | 1 | 0 | `{"v":1,"inserted":[{"id":1,"customer_id":42,"total":99.95,"status":"pending","created_at":"2026-04-18T10:00:00Z"}],"deleted":[]}` |
+| 2 | 10:00:02 | 0 | 0 | `{"v":1,"inserted":[],"deleted":[]}` |
+| 3 | 10:00:03 | 0 | 1 | `{"v":1,"inserted":[],"deleted":[{"id":1,"customer_id":42,"total":99.95,"status":"pending","created_at":"2026-04-18T10:00:00Z"}]}` |
+
+Row 3 appears because the relay (running separately) marked order 1 as
+`published_at = now()`, which removed it from the stream table.
+
+### Relay Polls
+
+```sql
+SELECT * FROM pgtrickle.poll_outbox(
+    'order-publisher', 'relay-1', 100, 30
+);
+-- Returns rows 1, 2, 3 (in order)
+
+-- Relay publishes to NATS, then:
+SELECT pgtrickle.commit_offset('order-publisher', 'relay-1', 3);
+```
+
+### Inspection
+
+```sql
+-- Lag visibility
+SELECT * FROM pgtrickle.consumer_lag('order-publisher');
+--  group_name      | consumer_id | last_offset | lag_rows | healthy
+-- -----------------+-------------+-------------+----------+---------
+--  order-publisher | relay-1     |           3 |        0 | t
+
+-- Outbox status
+SELECT * FROM pgtrickle.outbox_status('pending_order_events');
+--  pgt_name              | outbox_table                       | row_count | total_bytes
+-- -----------------------+------------------------------------+-----------+-------------
+--  pending_order_events  | outbox_pending_order_events        |         3 |        2048
+```
+
+---
+
+## Cross-References
+
+- [PLAN_TRANSACTIONAL_OUTBOX.md](PLAN_TRANSACTIONAL_OUTBOX.md) — research
+  background and pattern overview.
+- [PLAN_TRANSACTIONAL_INBOX.md](PLAN_TRANSACTIONAL_INBOX.md) — companion
+  pattern for inbound events.
+- [PLAN_OVERALL_ASSESSMENT.md §9.12](../PLAN_OVERALL_ASSESSMENT.md#912-transactional-outbox-helper-s-effort--1-week) —
+  original proposal.
+- [ROADMAP.md v0.23.0 §Transactional Inbox & Outbox](../../ROADMAP.md#v0230--transactional-inbox--outbox-patterns) —
+  scheduled OUTBOX-1 through OUTBOX-8 and OUTBOX-B1 through OUTBOX-B9 items.
+
+---
+
+## Part H — Design Review Checklist
+
+Five critical questions resolved before implementation begins:
+
+| # | Question | Decision | Rationale |
+|---|----------|----------|-----------|
+| 1 | Should `enable_outbox()` work for IMMEDIATE-mode STs? | **No — hard error** (`OutboxRequiresNotImmediateMode`) | IMMEDIATE refreshes inside the source transaction; an extra INSERT on every write is unacceptable overhead. Exactly-once downstream semantics require a separate commit point. |
+| 2 | Outbox deduplication — whose responsibility? | **Relay + inbox** (not outbox) | Outbox is an append-only audit log. Relay uses broker idempotency keys; inbox uses `ON CONFLICT DO NOTHING`. pg_trickle provides `pgt_outbox_dedup_<st>` view as a zero-cost helper for latest-state clients only. |
+| 3 | Consumer lease hold time after crash — configurable? | **Yes — `pg_trickle.consumer_dead_threshold_hours`** (default 24) | High-criticality systems can set this to 1 hour. Relay heartbeat interval (recommended 10 s) gives 360× buffer even at 1-hour threshold. |
+| 4 | Truncated payload recovery path | **Relay falls back to direct ST query** | When `payload.truncated = true`, relay reads `SELECT * FROM pgtrickle.<st> WHERE pgt_id = $1`. Documented in reference relay + PATTERNS.md. |
+| 5 | Naming collision resolution algorithm | **Exact 56-byte truncation + 7-char hex suffix** | Deterministic, reproducible, and stored in `pgt_outbox_config.outbox_table_name` so no re-derivation is needed at runtime. |

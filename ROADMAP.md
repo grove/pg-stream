@@ -39,12 +39,13 @@ coverage, all in plain language.
 - [v0.20.0 — Dog-Feeding](#v0200--dog-feeding-pg_trickle-monitors-itself)
 - [v0.21.0 — Correctness, Safety & Test Hardening](#v0210--correctness-safety--test-hardening)
 - [v0.22.0 — Production Scalability & Downstream Integration](#v0220--production-scalability--downstream-integration)
-- [v0.23.0 — TUI Dog-Feeding Integration](#v0230--tui-dog-feeding-integration)
-- [v0.24.0 — PostgreSQL 17 Support](#v0240--postgresql-17-support)
-- [v0.25.0 — PGlite Proof of Concept](#v0250--pglite-proof-of-concept)
-- [v0.26.0 — Core Extraction (`pg_trickle_core`)](#v0260--core-extraction-pg_trickle_core)
-- [v0.27.0 — PGlite WASM Extension](#v0270--pglite-wasm-extension)
-- [v0.28.0 — PGlite Reactive Integration](#v0280--pglite-reactive-integration)
+- [v0.23.0 — Transactional Inbox & Outbox Patterns](#v0230--transactional-inbox--outbox-patterns)
+- [v0.24.0 — TUI Dog-Feeding Integration](#v0240--tui-dog-feeding-integration)
+- [v0.25.0 — PostgreSQL 17 Support](#v0250--postgresql-17-support)
+- [v0.26.0 — PGlite Proof of Concept](#v0260--pglite-proof-of-concept)
+- [v0.27.0 — Core Extraction (`pg_trickle_core`)](#v0270--core-extraction-pg_trickle_core)
+- [v0.28.0 — PGlite WASM Extension](#v0280--pglite-wasm-extension)
+- [v0.29.0 — PGlite Reactive Integration](#v0290--pglite-reactive-integration)
 - [v1.0.0 — Stable Release](#v100--stable-release)
 - [Post-1.0 — Scale, Ecosystem & Platform Expansion](#post-10--scale-ecosystem--platform-expansion)
 - [Effort Summary](#effort-summary)
@@ -89,12 +90,13 @@ from the v0.1.x series to 1.0 and beyond.
 | **v0.20.0** | **Dog-feeding (pg_trickle monitors itself)** | **✅ Released** |
 | v0.21.0 | Correctness, safety & test hardening | ✅ Released |
 | v0.22.0 | Production scalability & downstream integration | Planned |
-| v0.23.0 | TUI dog-feeding integration | Planned |
-| v0.24.0 | PostgreSQL 17 support | Planned |
-| v0.25.0 | PGlite proof of concept | Planned |
-| v0.26.0 | Core extraction (`pg_trickle_core`) | Planned |
-| v0.27.0 | PGlite WASM extension | Planned |
-| v0.28.0 | PGlite reactive integration | Planned |
+| v0.23.0 | Transactional inbox & outbox patterns | Planned |
+| v0.24.0 | TUI dog-feeding integration | Planned |
+| v0.25.0 | PostgreSQL 17 support | Planned |
+| v0.26.0 | PGlite proof of concept | Planned |
+| v0.27.0 | Core extraction (`pg_trickle_core`) | Planned |
+| v0.28.0 | PGlite WASM extension | Planned |
+| v0.29.0 | PGlite reactive integration | Planned |
 | v1.0.0 | Stable release (incl. PG 19 compatibility) | Planned |
 
 ---
@@ -6127,10 +6129,11 @@ Dependencies: DB-3 (uses schema version to determine needed migrations). Schema 
 > assessment deferred from v0.21.0: a minimal-viable in-database parallel
 > refresh worker pool (the single largest scalability unlock) and a downstream
 > CDC publication so stream table changes can drive Kafka, Debezium, and
-> event-sourcing pipelines without a second replication slot. Three P2 items
-> ship alongside: a predictive cost model for adaptive refresh, SLA-driven
-> tier auto-assignment, and a transactional outbox helper for zero-copy
-> dual-write elimination.
+> event-sourcing pipelines without a second replication slot. Two P2 items
+> ship alongside: a predictive cost model for adaptive refresh and SLA-driven
+> tier auto-assignment. The transactional outbox helper moves to v0.23.0
+> where it ships alongside a companion inbox helper as a complete
+> transactional messaging solution.
 
 ### Downstream CDC Publication (P1 — §9.2)
 
@@ -6202,22 +6205,6 @@ Dependencies: DB-3 (uses schema version to determine needed migrations). Schema 
 
 > **SLA-driven tier subtotal: ~3–4 days**
 
-### Transactional Outbox Helper (P2 — §9.12)
-
-> **In plain terms:** After each refresh cycle, pg_trickle writes a row to
-> `pgtrickle.outbox_<st>` with a JSON payload `{inserted:[…], deleted:[…]}`.
-> Eliminates the dual-write problem for downstream event buses without a
-> CDC connector or external replication slot.
-
-| Item | Description | Effort | Ref |
-|------|-------------|--------|-----|
-| OUTBOX-1 | **`enable_outbox(name TEXT)` / `disable_outbox(name TEXT)`.** Create/drop `pgtrickle.outbox_<st>` table (`id BIGSERIAL`, `pgt_id`, `created_at`, `payload JSONB`). | 0.5d | [PLAN_OVERALL_ASSESSMENT.md](plans/PLAN_OVERALL_ASSESSMENT.md) §9.12 |
-| OUTBOX-2 | **Refresh-path outbox write.** After successful MERGE, if outbox is enabled, INSERT into `outbox_<st>` within the same transaction with `{inserted:[…], deleted:[…]}`. | 1d | [PLAN_OVERALL_ASSESSMENT.md](plans/PLAN_OVERALL_ASSESSMENT.md) §9.12 |
-| OUTBOX-3 | **Retention management.** `pg_trickle.outbox_retention_hours` GUC (default 24); scheduler drains expired outbox rows during the cleanup phase. | 0.5d | — |
-| OUTBOX-4 | **E2E test.** Enable outbox; trigger refresh; verify payload rows; test retention drain. | 0.5d | — |
-
-> **Transactional outbox subtotal: ~2–3 days**
-
 ### Implementation Phases
 
 | Phase | Description | Duration |
@@ -6226,9 +6213,8 @@ Dependencies: DB-3 (uses schema version to determine needed migrations). Schema 
 | PAR | Parallel refresh: coordinator/worker split, GUC, DAG levels, recovery, tests | Days 9–28 |
 | PRED | Predictive cost model: regression, pre-emptive switch, cold-start fallback, tests | Days 29–33 |
 | SLA | SLA-driven tier: `sla` param, initial assignment, dynamic re-assignment, tests | Days 34–37 |
-| OUTBOX | Transactional outbox: SQL functions, refresh-path write, retention, tests | Days 38–40 |
 
-> **v0.22.0 total: ~5–6 weeks** (downstream CDC + parallel refresh + predictive cost + SLA tier + outbox)
+> **v0.22.0 total: ~5 weeks** (downstream CDC + parallel refresh + predictive cost + SLA tier)
 
 **Exit criteria:**
 - [ ] CDC-PUB-1: `stream_table_to_publication(name)` creates a working logical publication
@@ -6245,14 +6231,233 @@ Dependencies: DB-3 (uses schema version to determine needed migrations). Schema 
 - [ ] SLA-1: `create_stream_table(..., sla => '30 seconds')` stores `freshness_deadline_ms`
 - [ ] SLA-2: Initial tier assignment matches SLA requirement on creation
 - [ ] SLA-3: Tier auto-adjusts within 3 cycles when queue depth breaches SLA
-- [ ] OUTBOX-1/2: `enable_outbox()` creates table; refresh populates payload within same transaction
-- [ ] OUTBOX-3: Retention drain removes rows older than `outbox_retention_hours`
 - [ ] Extension upgrade path tested (`0.21.0 → 0.22.0`)
 - [ ] `just check-version-sync` passes
 
 ---
 
-## v0.23.0 — TUI Dog-Feeding Integration
+## v0.23.0 — Transactional Inbox & Outbox Patterns
+
+**Status: Planned.** Driven by [PLAN_TRANSACTIONAL_OUTBOX_HELPER.md](plans/patterns/PLAN_TRANSACTIONAL_OUTBOX_HELPER.md) and [PLAN_TRANSACTIONAL_INBOX_HELPER.md](plans/patterns/PLAN_TRANSACTIONAL_INBOX_HELPER.md). Outbox helper moved here from v0.22.0 to ship alongside the inbox helper and production-grade advanced features as a complete transactional messaging solution.
+
+> **Release Theme**
+> This release delivers a **complete, production-grade solution** for the two
+> most common event-driven integration patterns in microservice architectures.
+> **Part A (Essential)** ships the Transactional Outbox (reliable atomic event
+> publication) and Transactional Inbox (reliable idempotent event consumption)
+> as zero-boilerplate SQL helpers. **Part B (Advanced)** adds Consumer Groups
+> for coordinated multi-relay outbox polling with Kafka-style offset tracking,
+> visibility timeouts, and lag monitoring — and Ordered Processing for the
+> inbox, including per-aggregate sequence ordering, gap detection, priority
+> queues, and partition-affinity helpers for competing workers. Together,
+> Parts A and B let pg_trickle users build reliable, exactly-once event
+> pipelines that scale from a single relay to multi-instance deployments,
+> using nothing but PostgreSQL.
+>
+> See [PLAN_TRANSACTIONAL_OUTBOX_HELPER.md](plans/patterns/PLAN_TRANSACTIONAL_OUTBOX_HELPER.md)
+> and [PLAN_TRANSACTIONAL_INBOX_HELPER.md](plans/patterns/PLAN_TRANSACTIONAL_INBOX_HELPER.md)
+> for the full architecture and API design.
+
+---
+
+### Known Limitations in v0.23.0
+
+| Limitation | Rationale | Future Path |
+|------------|-----------|-------------|
+| **Outbox requires DIFFERENTIAL mode.** `enable_outbox()` on `IMMEDIATE`-mode stream tables returns `OutboxRequiresNotImmediateMode`. | Outbox writes one row per refresh cycle inside the refresh transaction. IMMEDIATE refreshes fire inside every source transaction; adding an outbox INSERT there imposes that cost on every application write. | Post-1.0 opt-in GUC if demand justifies. |
+| **Ordering and priority are mutually exclusive per inbox.** Calling both `enable_inbox_ordering()` and `enable_inbox_priority()` on the same inbox returns `InboxOrderingPriorityConflict`. | Per-aggregate sequence ordering must surface the next message in sequence regardless of priority level; priority tiers violate that guarantee. | Use separate inboxes per priority class, each with `enable_inbox_ordering()` applied independently. |
+| **Gap detection degrades above ~100K aggregates.** The `gaps_<inbox>` stream table uses `generate_series` over the full sequence range per aggregate. | Manageable up to ~10K aggregates at 30 s schedule. Above 100K, auto-refresh is disabled and `inbox_ordering_gaps()` is available for on-demand checks only. | Post-v0.23.0: delta-based gap detection scanning only recently-active aggregates. |
+| **Consumer groups provide at-least-once delivery per consumer instance, not exactly-once globally.** | Exactly-once is achieved by composition: relay uses broker idempotency keys; inbox uses `ON CONFLICT (event_id) DO NOTHING`. Three-layer deduplication is more resilient than a monolithic exactly-once guarantee. | Design decision. Documented in PATTERNS.md and SQL_REFERENCE.md. |
+| **AUTO mode may fall back to FULL refresh while outbox is enabled.** When AUTO refresh falls back to FULL, the outbox payload includes `"full_refresh": true` and contains all current rows as `"inserted"` with an empty `"deleted"` list. A `pg_trickle_alert outbox_full_refresh` event is also emitted. Relays must detect this flag and apply snapshot semantics (e.g. upsert rather than publish-as-new). | AUTO refresh adapts to IVM cost at runtime; blocking the FULL fallback permanently would compromise the adaptation that makes AUTO useful. Emitting the sentinel flag preserves correctness and lets each relay decide its own handling semantics. | Reference relay updated in OUTBOX-8 to demonstrate `full_refresh` handling. Post-v0.23.0: consider a GUC to disable FULL fallback per ST when outbox is enabled. |
+
+---
+
+### Part A — Essential Patterns
+
+#### Transactional Outbox Helper (P2 — §9.12)
+
+> **In plain terms:** After each DIFFERENTIAL refresh cycle, pg_trickle
+> writes a row to `pgtrickle.outbox_<st>` with a versioned JSON payload
+> `{"v":1, "inserted":[…], "deleted":[…]}`. This happens in the same
+> transaction as the MERGE — either both succeed or neither does.
+> Eliminates the dual-write problem for downstream event buses without a
+> CDC connector or external replication slot.
+
+| Item | Description | Effort | Ref |
+|------|-------------|--------|-----|
+| OUTBOX-1 | **Catalog + SQL functions.** `pgt_outbox_config` catalog table. `enable_outbox(name, retention_hours)` / `disable_outbox(name, if_exists)` SQL functions. `OutboxAlreadyEnabled`, `OutboxNotEnabled`, `OutboxRequiresNotImmediateMode` error variants. | 0.5d | [PLAN_TRANSACTIONAL_OUTBOX_HELPER.md](plans/patterns/PLAN_TRANSACTIONAL_OUTBOX_HELPER.md) §A.1–A.2 |
+| OUTBOX-2 | **Outbox table creation.** `pgtrickle.outbox_<st>` with `id BIGSERIAL`, `pgt_id UUID`, `refresh_id UUID`, `created_at`, `inserted_count INT`, `deleted_count INT`, `payload JSONB`. Index on `created_at`. Naming: 7-byte `outbox_` prefix + up to 56-byte stream table name; collision resolution appends 7-char hex suffix derived from `left(md5(name), 7)`. Final name stored in `pgt_outbox_config.outbox_table_name`. Also creates zero-cost **deduplicated view** `pgtrickle.pgt_outbox_dedup_<st>` (`DISTINCT ON (pgt_id) ORDER BY pgt_id, id DESC`) for latest-state-only consumers; dropped alongside the outbox table. | 0.5d | [PLAN_TRANSACTIONAL_OUTBOX_HELPER.md](plans/patterns/PLAN_TRANSACTIONAL_OUTBOX_HELPER.md) §A.3 |
+| OUTBOX-3 | **Refresh-path integration.** After successful MERGE, if outbox is enabled, INSERT outbox row within the same transaction. In-memory `outbox_enabled_set` cache with DDL-triggered invalidation. Hot-path cost < 50 ns when disabled. Payload serialisation reuses existing `Vec<DeltaRow>`. **FULL-refresh fallback:** when AUTO mode falls back to FULL refresh, the outbox row is written with `"full_refresh": true` and all current rows as `"inserted"` (empty `"deleted"`); a `pg_trickle_alert outbox_full_refresh` event is emitted so relays can apply snapshot semantics instead of publishing spurious new-event notifications. | 1d | [PLAN_TRANSACTIONAL_OUTBOX_HELPER.md](plans/patterns/PLAN_TRANSACTIONAL_OUTBOX_HELPER.md) §A.4 |
+| OUTBOX-4 | **Versioned payload format.** `{"v":1, "inserted":[…], "deleted":[…]}` with `to_jsonb()` type mapping. Configurable `outbox_max_payload_bytes` GUC (default 8 MiB); oversized payloads emit truncation marker `{"v":1, "truncated":true, …}`. FULL-fallback payloads additionally set `"full_refresh": true`; relays must check this flag before publishing to avoid spurious events. | 0.5d | [PLAN_TRANSACTIONAL_OUTBOX_HELPER.md](plans/patterns/PLAN_TRANSACTIONAL_OUTBOX_HELPER.md) §A.5 |
+| OUTBOX-5 | **Retention drain.** Scheduler cleanup step: batched DELETE with `outbox_drain_batch_size` GUC (default 10 000). Per-ST or global `outbox_retention_hours` (default 24). `last_drained_at` / `last_drained_count` tracked in catalog. | 0.5d | [PLAN_TRANSACTIONAL_OUTBOX_HELPER.md](plans/patterns/PLAN_TRANSACTIONAL_OUTBOX_HELPER.md) §A.6 |
+| OUTBOX-6 | **Lifecycle & cascade.** `drop_stream_table()` cascades to outbox table + metadata. `alter_stream_table()` errors if column set changed while outbox enabled. `outbox_status()` monitoring function. 5 GUCs (`outbox_enabled`, `outbox_retention_hours`, `outbox_drain_batch_size`, `outbox_max_payload_bytes`, `outbox_drain_interval_seconds`). | 0.5d | [PLAN_TRANSACTIONAL_OUTBOX_HELPER.md](plans/patterns/PLAN_TRANSACTIONAL_OUTBOX_HELPER.md) §A.7–A.8 |
+| OUTBOX-7 | **Tests & benchmark.** Unit: enable/disable/validation/naming/cascade. Integration: end-to-end outbox write, retention drain, rollback on INSERT failure. Benchmark: `refresh_no_outbox` vs `refresh_outbox_enabled` (< 10 % overhead target). | 1d | [PLAN_TRANSACTIONAL_OUTBOX_HELPER.md](plans/patterns/PLAN_TRANSACTIONAL_OUTBOX_HELPER.md) §D |
+| OUTBOX-8 | **Documentation & examples.** SQL_REFERENCE.md: outbox API + payload schema. CONFIGURATION.md: 5 GUCs. PATTERNS.md: Transactional Outbox section. Reference Python relay (`examples/relay/outbox_relay.py`). | 0.5d | [PLAN_TRANSACTIONAL_OUTBOX_HELPER.md](plans/patterns/PLAN_TRANSACTIONAL_OUTBOX_HELPER.md) §C, §E |
+
+> **Outbox essential subtotal: ~5 days**
+
+#### Transactional Inbox Helper
+
+> **In plain terms:** `create_inbox('payment_inbox')` creates a
+> production-grade inbox table with auto-managed stream tables for the
+> pending-message queue, dead-letter queue, and processing statistics.
+> Applications write to the inbox (`ON CONFLICT DO NOTHING` for dedup),
+> process messages from the pending stream table, and pg_trickle handles
+> DLQ routing, alerts, retention, and monitoring automatically.
+> `enable_inbox_tracking()` adopts an existing inbox table into pg_trickle's
+> monitoring without schema changes.
+
+| Item | Description | Effort | Ref |
+|------|-------------|--------|-----|
+| INBOX-1 | **Catalog + `create_inbox()`.** `pgt_inbox_config` catalog table with column mapping (`id_column`, `processed_at_column`, `retry_count_column`, `error_column`, `received_at_column`, `event_type_column`). `create_inbox(name, max_retries, schedule, with_dead_letter, with_stats, retention_hours)` creates inbox table + metadata. `InboxAlreadyExists`, `InboxNotFound`, `InboxTableNotFound`, `InboxColumnMissing` error variants. | 1d | [PLAN_TRANSACTIONAL_INBOX_HELPER.md](plans/patterns/PLAN_TRANSACTIONAL_INBOX_HELPER.md) §A.1–A.3 |
+| INBOX-2 | **Inbox table DDL.** Standard schema: `event_id TEXT PK`, `event_type`, `source`, `aggregate_id`, `payload JSONB`, `received_at`, `processed_at`, `error`, `retry_count`, `trace_id`. Partial indexes for pending, DLQ, and processed rows. Autovacuum tuning. | 0.5d | [PLAN_TRANSACTIONAL_INBOX_HELPER.md](plans/patterns/PLAN_TRANSACTIONAL_INBOX_HELPER.md) §A.3 |
+| INBOX-3 | **Auto-created stream tables.** Pending ST (`WHERE processed_at IS NULL AND retry_count < max_retries`, DIFFERENTIAL, user-defined schedule). DLQ ST (`WHERE processed_at IS NULL AND retry_count >= max_retries`, DIFFERENTIAL, 30 s). Stats ST (GROUP BY `event_type` with pending/processed/dead_letter/avg latency/max age). All STs use column-mapped SQL from `pgt_inbox_config`. | 1d | [PLAN_TRANSACTIONAL_INBOX_HELPER.md](plans/patterns/PLAN_TRANSACTIONAL_INBOX_HELPER.md) §A.4 |
+| INBOX-4 | **`enable_inbox_tracking()`.** Adopt existing table: validate columns exist with compatible types, validate PK/UNIQUE on id column, create stream tables using mapped column names, insert metadata with `is_managed = false`. Gracefully omit optional columns (`source`, `aggregate_id`, `trace_id`) if not present. | 0.5d | [PLAN_TRANSACTIONAL_INBOX_HELPER.md](plans/patterns/PLAN_TRANSACTIONAL_INBOX_HELPER.md) §A.6 |
+| INBOX-5 | **DLQ alert mechanism.** Post-refresh hook on DLQ stream table: when `rows_inserted > 0`, emit `pg_trickle_alert` event `inbox_dlq_message` per new entry (capped at `inbox_dlq_alert_max_per_refresh`, default 10; excess batched into summary alert). | 0.5d | [PLAN_TRANSACTIONAL_INBOX_HELPER.md](plans/patterns/PLAN_TRANSACTIONAL_INBOX_HELPER.md) §A.5 |
+| INBOX-6 | **`inbox_health()` + `inbox_status()`.** `inbox_health(name)` returns JSONB with `pending_count`, `dead_letter_count`, `avg_processing_time_sec`, `oldest_pending_age_sec`, `throughput_per_sec`, `health_status` (`healthy`/`degraded`/`critical`). `inbox_status(name)` returns tabular overview of all inboxes. | 0.5d | [PLAN_TRANSACTIONAL_INBOX_HELPER.md](plans/patterns/PLAN_TRANSACTIONAL_INBOX_HELPER.md) §A.1 |
+| INBOX-7 | **Retention drain + `replay_inbox_messages()`.** Processed message drain via scheduler (batched DELETE, `inbox_processed_retention_hours` default 72 h). DLQ messages kept forever by default (`inbox_dlq_retention_hours` default 0). `replay_inbox_messages(name, where_clause, event_ids)` resets `processed_at` + `retry_count` for selected messages; `where_clause` validated via `EXPLAIN` to prevent SQL injection. | 0.5d | [PLAN_TRANSACTIONAL_INBOX_HELPER.md](plans/patterns/PLAN_TRANSACTIONAL_INBOX_HELPER.md) §A.7–A.8 |
+| INBOX-8 | **`drop_inbox()` + lifecycle.** `drop_inbox(name, if_exists, cascade)`: always drops stream tables + metadata; drops inbox table only if `cascade := true` AND `is_managed = true`. `DROP EXTENSION` cascades managed tables; adopted tables survive. 6 GUCs (`inbox_enabled`, `inbox_processed_retention_hours`, `inbox_dlq_retention_hours`, `inbox_drain_batch_size`, `inbox_drain_interval_seconds`, `inbox_dlq_alert_max_per_refresh`). | 0.5d | [PLAN_TRANSACTIONAL_INBOX_HELPER.md](plans/patterns/PLAN_TRANSACTIONAL_INBOX_HELPER.md) §A.9–A.10 |
+| INBOX-9 | **Tests & benchmark.** Unit: create/drop/enable_tracking/replay/health. Integration: end-to-end inbox lifecycle, DLQ routing, DLQ alert, retention drain, concurrent processors with `FOR UPDATE SKIP LOCKED`, `enable_inbox_tracking()` with non-standard columns. Benchmark: pending ST refresh < 5 ms at 100 pending, < 50 ms at 10K pending. | 1d | [PLAN_TRANSACTIONAL_INBOX_HELPER.md](plans/patterns/PLAN_TRANSACTIONAL_INBOX_HELPER.md) §D |
+| INBOX-10 | **Documentation & examples.** SQL_REFERENCE.md: inbox API. CONFIGURATION.md: 6 GUCs. PATTERNS.md: Transactional Inbox section + "Bidirectional Event Pipeline" (inbox → business logic → outbox) worked example. Reference examples: `inbox_writer_nats.py`, `inbox_processor.py`, `webhook_receiver.py`. | 0.5d | [PLAN_TRANSACTIONAL_INBOX_HELPER.md](plans/patterns/PLAN_TRANSACTIONAL_INBOX_HELPER.md) §C, §E |
+
+> **Inbox essential subtotal: ~6.5 days**
+
+#### Shared Infrastructure (Part A)
+
+| Item | Description | Effort | Ref |
+|------|-------------|--------|-----|
+| SHARED-1 | **Upgrade SQL.** `sql/pg_trickle--0.22.0--0.23.0.sql`: create `pgt_outbox_config` and `pgt_inbox_config` catalog tables, register all new SQL functions. | 0.5d | — |
+| SHARED-2 | **PATTERNS.md integration guide.** New "Event-Driven Integration Patterns" chapter in `docs/PATTERNS.md` covering: when to use outbox vs inbox vs both, transport comparison (NATS/Kafka/pgmq), bidirectional pipeline (inbox → business logic → outbox), and competing consumer patterns (`FOR UPDATE SKIP LOCKED`). | 0.5d | [PLAN_TRANSACTIONAL_OUTBOX.md](plans/patterns/PLAN_TRANSACTIONAL_OUTBOX.md), [PLAN_TRANSACTIONAL_INBOX.md](plans/patterns/PLAN_TRANSACTIONAL_INBOX.md) |
+| SHARED-3 | **E2E integration test.** Full pipeline: inbox receives event → processor creates business entity → outbox captures delta → verify end-to-end exactly-once delivery. | 0.5d | — |
+
+> **Part A subtotal: ~13 days**
+
+---
+
+### Part B — Production Patterns
+
+#### Consumer Groups for Outbox
+
+> **In plain terms:** Multiple relay processes can share a single outbox
+> table safely using consumer groups — the same concept as Kafka consumer
+> groups or SQS consumer groups, but implemented entirely in PostgreSQL.
+> Each group has its own offset pointer. Relays call `poll_outbox()` to
+> claim a batch under a visibility timeout (like SQS), then call
+> `commit_offset()` when done. If a relay crashes, its lease expires and
+> another relay picks up the batch. `consumer_lag()` shows how far behind
+> each consumer is. Dead relays are reaped automatically after 24 h.
+
+| Item | Description | Effort | Ref |
+|------|-------------|--------|-----|
+| OUTBOX-B1 | **Consumer group catalog + lifecycle.** `pgt_consumer_groups` + `pgt_consumer_offsets` + `pgt_consumer_leases` catalog tables. `create_consumer_group(name, outbox, auto_offset_reset)` / `drop_consumer_group(name)` SQL functions. `auto_offset_reset` values: `latest` (default) or `earliest`. `ConsumerGroupAlreadyExists`, `ConsumerGroupNotFound` error variants. | 1d | [PLAN_TRANSACTIONAL_OUTBOX_HELPER.md](plans/patterns/PLAN_TRANSACTIONAL_OUTBOX_HELPER.md) §B.2–B.3 |
+| OUTBOX-B2 | **`poll_outbox()` with visibility timeout and lease management.** Returns next batch for `(group, consumer_id)` using `FOR UPDATE SKIP LOCKED`. Acquires lease in `pgt_consumer_leases` with configurable `visibility_seconds` (default 30). Auto-registers new consumer_id on first call based on `auto_offset_reset`. Skips rows already leased by other consumers. | 1.5d | [PLAN_TRANSACTIONAL_OUTBOX_HELPER.md](plans/patterns/PLAN_TRANSACTIONAL_OUTBOX_HELPER.md) §B.4 |
+| OUTBOX-B2a | **`extend_lease()` — lease renewal for long-running relays.** `extend_lease(group, consumer, extension_seconds INT DEFAULT 30)` extends the `visibility_until` of all active leases held by the named consumer, returning the new `visibility_until` timestamp. Prevents spurious re-delivery when broker publish or business logic takes longer than the original `visibility_seconds`. Calling `consumer_heartbeat()` does **not** extend leases — heartbeat and lease lifetime are separate concerns. | 0.5d | [PLAN_TRANSACTIONAL_OUTBOX_HELPER.md](plans/patterns/PLAN_TRANSACTIONAL_OUTBOX_HELPER.md) §B.4 |
+| OUTBOX-B3 | **`commit_offset()` + `seek_offset()`.** `commit_offset(group, consumer, last_offset)` monotonically advances offset, releases lease, rejects regression with warning. `seek_offset(group, consumer, new_offset)` resets to any position and clears leases; emits `pg_trickle_alert` event `consumer_seeked`. | 0.5d | [PLAN_TRANSACTIONAL_OUTBOX_HELPER.md](plans/patterns/PLAN_TRANSACTIONAL_OUTBOX_HELPER.md) §B.4, §B.6 |
+| OUTBOX-B4 | **Heartbeat + liveness.** `consumer_heartbeat(group, consumer)` updates `last_heartbeat_at` (liveness only — does **not** extend active leases; use `extend_lease()` for that). Consumer is healthy when `last_heartbeat_at > now() - 60 s`. `pg_trickle_alert` event `consumer_unhealthy` when consumer transitions healthy → unhealthy. `consumer_lag()` **live SQL function** (always-fresh, suitable for ad-hoc inspection) exposes per-consumer `healthy` boolean, current lag, and offset. | 0.5d | [PLAN_TRANSACTIONAL_OUTBOX_HELPER.md](plans/patterns/PLAN_TRANSACTIONAL_OUTBOX_HELPER.md) §B.5 |
+| OUTBOX-B5 | **Monitoring stream tables.** Three auto-created STs on first `create_consumer_group()`: `pgt_consumer_status` (per-consumer offset + heartbeat age + healthy, 5 s), `pgt_consumer_group_lag` (per-group aggregate lag, 10 s), `pgt_consumer_active_leases` (current leases + expiry, 5 s). All DIFFERENTIAL mode. Use `consumer_lag()` for ad-hoc inspection of live data; use `pgt_consumer_group_lag` ST for Grafana dashboards and alerting rules (materialized every 10 s). | 1d | [PLAN_TRANSACTIONAL_OUTBOX_HELPER.md](plans/patterns/PLAN_TRANSACTIONAL_OUTBOX_HELPER.md) §B.7 |
+| OUTBOX-B6 | **Dead consumer auto-cleanup.** Scheduler step (GUC `consumer_cleanup_enabled`, default `true`): reap consumers with `last_heartbeat_at < now() - consumer_dead_threshold_hours` (GUC, default 24 h), release their leases. Remove from offsets if also `last_commit_at < now() - consumer_stale_offset_threshold_days` (GUC, default 7 d). Emit `pg_trickle_alert` event `consumer_reaped`. | 0.5d | [PLAN_TRANSACTIONAL_OUTBOX_HELPER.md](plans/patterns/PLAN_TRANSACTIONAL_OUTBOX_HELPER.md) §B.9 |
+| OUTBOX-B7 | **Retention safety guard.** When consumer groups are enabled, retention drain refuses to delete rows with `id > MIN(last_offset across all consumers)` to prevent silent data loss for slow relays. GUC `outbox_force_retention` (default `false`) allows operator override for permanently abandoned consumers. | 0.5d | [PLAN_TRANSACTIONAL_OUTBOX_HELPER.md](plans/patterns/PLAN_TRANSACTIONAL_OUTBOX_HELPER.md) §B.6 |
+| OUTBOX-B8 | **Tests.** Integration: multi-relay group creation, visibility timeout expiry + re-poll, `commit_offset` idempotency, `seek_offset` replay, heartbeat → unhealthy transition, dead consumer reaping, retention guard prevents early drain. Benchmark: `poll_outbox` latency < 5 ms at 10K outbox rows. | 1.5d | [PLAN_TRANSACTIONAL_OUTBOX_HELPER.md](plans/patterns/PLAN_TRANSACTIONAL_OUTBOX_HELPER.md) §D |
+| OUTBOX-B9 | **Documentation & reference relay.** SQL_REFERENCE.md: consumer group API + delivery guarantee section (at-least-once per consumer; exactly-once by composition). CONFIGURATION.md: `consumer_cleanup_enabled`, `outbox_force_retention`, `consumer_dead_threshold_hours` (default 24), `consumer_stale_offset_threshold_days` (default 7) GUCs. Reference Python relay with group coordination (`examples/relay/outbox_relay.py`). Rust equivalent (`examples/relay/outbox_relay.rs`). PATTERNS.md: multi-relay competing consumers section + truncated payload fallback guide + latest-state consumer section (dedup view). | 1d | [PLAN_TRANSACTIONAL_OUTBOX_HELPER.md](plans/patterns/PLAN_TRANSACTIONAL_OUTBOX_HELPER.md) §B, §C |
+
+> **Consumer groups subtotal: ~8 days**
+
+#### Ordered Processing for Inbox
+
+> **In plain terms:** For financial, order management, and audit-trail
+> use-cases, messages about the same entity (customer, order, account)
+> must be processed in the order they were produced. `enable_inbox_ordering()`
+> creates a `next_<inbox>` stream table that surfaces only the *next expected*
+> message per aggregate — preventing out-of-order processing automatically.
+> Gap detection alerts when a message is missing too long. Priority queues
+> let critical messages use a 1-second refresh schedule while background
+> messages use 30 seconds. Worker partition affinity reduces contention when
+> multiple processors share an inbox.
+
+| Item | Description | Effort | Ref |
+|------|-------------|--------|-----|
+| INBOX-B1 | **`enable_inbox_ordering()` + aggregate-ordered stream table.** `pgt_inbox_ordering_config` catalog table. `enable_inbox_ordering(inbox, aggregate_id_col, sequence_num_col)` creates `next_<inbox>` ST: `DISTINCT ON (aggregate_id)` selecting only the row where `sequence_num = last_processed_seq + 1`. Ensures only the next expected message per aggregate is surfaced. `disable_inbox_ordering(inbox)` drops the ST + config row. **Mutually exclusive with `enable_inbox_priority()`** — returns `InboxOrderingPriorityConflict` if priority is already enabled on this inbox (and vice versa). | 1.5d | [PLAN_TRANSACTIONAL_INBOX_HELPER.md](plans/patterns/PLAN_TRANSACTIONAL_INBOX_HELPER.md) §B.2–B.3 |
+| INBOX-B2 | **Gap detection stream table + alert.** `gaps_<inbox>` ST: CTE generates expected sequence range per aggregate; LEFT JOIN finds missing rows; surfaces `{aggregate_id, missing_sequence, gap_age_sec}`. Emits `pg_trickle_alert` event `inbox_ordering_gap` when new gaps appear. `inbox_ordering_gaps(inbox_name)` SQL function for ad-hoc inspection. 30 s refresh schedule. | 1d | [PLAN_TRANSACTIONAL_INBOX_HELPER.md](plans/patterns/PLAN_TRANSACTIONAL_INBOX_HELPER.md) §B.4 |
+| INBOX-B3 | **`enable_inbox_priority()` + tier-based stream tables.** `pgt_inbox_priority_config` catalog table. `enable_inbox_priority(inbox, priority_col, tiers JSONB)` creates one `pending_<inbox>_<tier>` ST per priority tier with per-tier `schedule` and `WHERE priority BETWEEN min AND max`. Default 3 tiers: critical (1–2, 1 s), normal (3–6, 5 s), background (7–9, 30 s). Original `pending_<inbox>` preserved as unified view. `disable_inbox_priority(inbox, if_exists)` drops all tier STs + config row; original unified `pending_<inbox>` is restored. | 1d | [PLAN_TRANSACTIONAL_INBOX_HELPER.md](plans/patterns/PLAN_TRANSACTIONAL_INBOX_HELPER.md) §B.5 |
+| INBOX-B4 | **`inbox_worker_partition()` helper.** SQL function returning a WHERE-clause fragment `abs(hashtext(<aggregate_id_col>)) % <total_workers> = <worker_id>` for partition-affinity polling. Advisory only — workers can still process any message; the filter makes each worker prefer its subset for cache locality. Documented in PATTERNS.md with Python + SQL usage example. | 0.5d | [PLAN_TRANSACTIONAL_INBOX_HELPER.md](plans/patterns/PLAN_TRANSACTIONAL_INBOX_HELPER.md) §B.6 |
+| INBOX-B5 | **Tests.** Integration: ordered ST surfaces only next-sequence messages; out-of-order arrivals withheld until preceding sequence processed; gap detection fires alert after configurable delay; priority tier routing; partition affinity correctness (no messages lost). Benchmark gate: `gaps_<inbox>` ST refresh at 1M messages across 10K aggregates must complete in < 1 s at 30 s schedule (uses `generate_series`; exceeding 100K aggregates triggers performance warning and disables auto-refresh). Chaos: processor crash mid-processing + replay recovery; concurrent processors with `FOR UPDATE SKIP LOCKED` (no duplicate processing at 10 concurrent workers). | 1.5d | [PLAN_TRANSACTIONAL_INBOX_HELPER.md](plans/patterns/PLAN_TRANSACTIONAL_INBOX_HELPER.md) §D |
+| INBOX-B6 | **Documentation & examples.** SQL_REFERENCE.md: ordering + priority API. CONFIGURATION.md: ordering GUCs. PATTERNS.md: per-aggregate ordering, gap recovery, priority queue, and competing workers with partition affinity sections. Reference `examples/inbox/inbox_processor_ordered.py`. | 0.5d | [PLAN_TRANSACTIONAL_INBOX_HELPER.md](plans/patterns/PLAN_TRANSACTIONAL_INBOX_HELPER.md) §B, §C |
+
+> **Ordered processing subtotal: ~6 days**
+
+#### Shared Infrastructure (Part B)
+
+| Item | Description | Effort | Ref |
+|------|-------------|--------|-----|
+| SHARED-B1 | **Upgrade SQL additions.** Extend `sql/pg_trickle--0.22.0--0.23.0.sql`: create `pgt_consumer_groups`, `pgt_consumer_offsets`, `pgt_consumer_leases`, `pgt_inbox_ordering_config`, `pgt_inbox_priority_config` tables; register all Part B SQL functions. | 0.5d | — |
+| SHARED-B2 | **Advanced PATTERNS.md sections.** Add to "Event-Driven Integration Patterns" chapter: competing relays with consumer groups, ordered inbox processing end-to-end, priority queues (when to use), partition-affinity for high-throughput inboxes, truncated payload fallback strategy, latest-state consumer pattern (dedup view), and FULL-refresh fallback handling for relay authors. Note in PATTERNS.md: add Grafana dashboard panel recommendations for consumer lag (`pgt_consumer_group_lag` ST), DLQ growth rate (`dlq_<inbox>` ST), inbox pending backlog (`pending_<inbox>` ST), and inbox throughput (`stats_<inbox>` ST). | 0.5d | — |
+| SHARED-B3 | **Advanced E2E tests.** (1) Multi-relay group test: 3 relays share one outbox group, verify each row published exactly once, simulate relay crash + visibility timeout redelivery. (2) Ordered inbox test: publish 10 messages out-of-order per aggregate, verify processor receives them in sequence order. (3) Concurrent stress: 10 relay workers + 100K outbox rows; verify < 0.1% duplicate rate at broker. | 1d | — |
+| SHARED-B4 | **dbt adapter updates.** Add `outbox_enabled`, `consumer_group` and `inbox_config` properties to dbt model config; add `pgtrickle_outbox_config` and `pgtrickle_create_inbox` macros; update dbt-pgtrickle docs and integration tests. | 0.5d | [dbt-pgtrickle/AGENTS.md](dbt-pgtrickle/AGENTS.md) |
+
+> **Part B subtotal: ~17.5 days**
+
+---
+
+### Implementation Phases
+
+| Phase | Description | Duration |
+|-------|-------------|----------|
+| A-SHARED | Upgrade SQL, shared Part A catalog infrastructure | Day 1 |
+| A-OUTBOX | Outbox helper: catalog, table DDL, refresh-path hook, payload format, retention, lifecycle, GUCs | Days 1–5 |
+| A-INBOX | Inbox helper: catalog, table DDL, stream tables, `enable_inbox_tracking`, DLQ alerts, health, replay, retention, lifecycle, GUCs | Days 5–11 |
+| A-TEST | Part A integration tests, E2E pipeline test, benchmarks | Days 11–13 |
+| A-DOC | Part A documentation, PATTERNS.md guide, reference examples | Days 13–14 |
+| B-OUTBOX | Consumer groups: catalog, `poll_outbox`, `commit_offset`, `seek_offset`, heartbeat, monitoring STs, dead consumer cleanup, retention guard | Days 14–22 |
+| B-INBOX | Ordered processing: `enable_inbox_ordering`, gap detection, priority queues, worker partition helper | Days 22–28 |
+| B-TEST | Part B integration tests, multi-relay E2E, ordered inbox E2E | Days 28–31 |
+| B-DOC | Part B documentation, advanced PATTERNS.md sections, reference relay implementations | Days 31–33 |
+
+> **v0.23.0 total: ~6–7 weeks solo / ~4–5 weeks with two developers working Part A and Part B tracks in parallel** (Part A: essential patterns + Part B: production patterns)
+
+**Exit criteria:**
+- [ ] OUTBOX-1/2: `enable_outbox()` creates outbox table + `pgt_outbox_dedup_<st>` view with correct schema; catalog row present
+- [ ] OUTBOX-1: `enable_outbox()` on IMMEDIATE-mode stream table returns `OutboxRequiresNotImmediateMode` with clear message
+- [ ] OUTBOX-2: Naming collision resolution: truncation + hex suffix tested end-to-end; final name stored in catalog
+- [ ] OUTBOX-3: Refresh populates outbox payload within same transaction; rollback on outbox INSERT failure
+- [ ] OUTBOX-4: Payload follows `{"v":1, "inserted":[…], "deleted":[…]}` format; truncation marker emitted for oversized payloads; relay fallback to direct ST query documented + tested
+- [ ] OUTBOX-5: Retention drain removes rows older than `outbox_retention_hours`; respects batch size
+- [ ] OUTBOX-6: `drop_stream_table()` cascades to outbox + dedup view; `outbox_status()` returns correct data
+- [ ] OUTBOX-7: Benchmark shows < 10 % overhead vs baseline at small payloads
+- [ ] INBOX-1/2: `create_inbox()` creates inbox table + 3 stream tables + metadata
+- [ ] INBOX-3: Pending ST reflects unprocessed messages; DLQ ST reflects poisoned messages
+- [ ] INBOX-4: `enable_inbox_tracking()` works with non-standard column names on existing tables
+- [ ] INBOX-5: `pg_trickle_alert` fires when new DLQ entries appear
+- [ ] INBOX-6: `inbox_health()` returns correct health status; `inbox_status()` lists all inboxes
+- [ ] INBOX-7: `replay_inbox_messages()` resets messages; retention drain respects DLQ; processor crash + replay recovery path documented
+- [ ] INBOX-8: `drop_inbox(cascade := true)` drops managed table; preserves adopted tables
+- [ ] SHARED-3: End-to-end inbox → business logic → outbox pipeline test passes
+- [ ] SHARED-4: dbt adapter updated with `outbox_enabled` and `inbox_config` properties; integration tests pass
+- [ ] OUTBOX-B1: `create_consumer_group()` creates group + offset + lease tables; idempotent re-create
+- [ ] OUTBOX-3/4: FULL-refresh fallback writes `"full_refresh": true` payload + emits `outbox_full_refresh` alert; reference relay handles the flag correctly
+- [ ] OUTBOX-B2: `poll_outbox()` returns correct batch; no overlap between concurrent relays; visibility timeout expires and row re-delivered
+- [ ] OUTBOX-B2a: `extend_lease()` extends visibility_until for all active consumer leases; re-delivery does not occur when relay calls extend_lease before timeout
+- [ ] OUTBOX-B3: `commit_offset()` advances monotonically; `seek_offset()` enables replay from any position
+- [ ] OUTBOX-B4: Heartbeat tracks liveness; `consumer_unhealthy` alert fires on timeout
+- [ ] OUTBOX-B5: Three monitoring STs (status, group lag, active leases) refresh correctly
+- [ ] OUTBOX-B6: Dead relay reaped after `consumer_dead_threshold_hours` (default 24 h, configurable); leases released; `consumer_reaped` alert emitted
+- [ ] OUTBOX-B7: Retention drain respects `MIN(last_offset)`; `outbox_force_retention` override works
+- [ ] OUTBOX-B8: Multi-relay group E2E: each outbox row published exactly once across 3 concurrent relays
+- [ ] OUTBOX-B8b: Concurrent relay stress test: 10 relays, 100K outbox rows, < 0.1% duplicate rate before broker dedup; 0% after
+- [ ] INBOX-B1: `next_<inbox>` ST surfaces only next expected sequence per aggregate; withholds future sequences
+- [ ] INBOX-B1: `enable_inbox_ordering()` + `enable_inbox_priority()` together returns `InboxOrderingPriorityConflict` with clear message
+- [ ] INBOX-B2: `gaps_<inbox>` ST detects missing sequences; `inbox_ordering_gap` alert fires; gap detection benchmark passes (< 1 s at 10K aggregates, 1M messages)
+- [ ] INBOX-B3: Priority tier STs refresh at configured schedules; messages route to correct tier
+- [ ] INBOX-B3: `disable_inbox_priority()` drops all tier STs + config row; unified `pending_<inbox>` is restored
+- [ ] INBOX-B1: `disable_inbox_ordering()` drops `next_<inbox>` ST + config row; inbox resumes normal pending behaviour
+- [ ] INBOX-B4: `inbox_worker_partition()` returns valid WHERE fragment; no messages lost across N workers
+- [ ] SHARED-B3: Ordered inbox E2E: 10 out-of-order arrivals per aggregate delivered to processor in order
+- [ ] SHARED-B4: dbt adapter updated with consumer group and inbox ordering properties
+- [ ] Extension upgrade path tested (`0.22.0 → 0.23.0`) — `sql/pg_trickle--0.22.0--0.23.0.sql` validated by `scripts/check_upgrade_completeness.sh`
+- [ ] `just check-version-sync` passes
+
+---
+
+## v0.24.0 — TUI Dog-Feeding Integration
 
 **Status: Planned.** See [plans/ui/PLAN_TUI_PART_3.md](plans/ui/PLAN_TUI_PART_3.md) for the full design.
 
@@ -6369,17 +6574,17 @@ TUI/CLI visualization enhancement for the dog-feeding views. Recommended from [P
 - [ ] CLI-1: `pgtrickle dog-feeding enable/disable/status` functional
 - [ ] CLI-2: `pgtrickle graph --format mermaid` outputs valid Mermaid
 - [ ] TUI-D1/DOC-21/DOC-22: Documentation updated
-- [ ] Extension upgrade path tested (`0.22.0 → 0.23.0`)
+- [ ] Extension upgrade path tested (`0.23.0 → 0.24.0`)
 - [ ] `just check-version-sync` passes
 
 ---
 
-## v0.24.0 — PostgreSQL 17 Support
+## v0.25.0 — PostgreSQL 17 Support
 
 > **Release Theme**
 > This release adds PostgreSQL 17 as a supported target alongside
 > PostgreSQL 18. PGlite is built on PostgreSQL 17, so this is a hard
-> prerequisite for the PGlite proof of concept (v0.24.0). The pgrx 0.17.x
+> prerequisite for the PGlite proof of concept (v0.26.0). The pgrx 0.17.x
 > framework already supports PG 17 — the work is enabling the feature flag,
 > adapting version-sensitive code paths, expanding the CI matrix, and
 > validating the full test suite against a PG 17 instance.
@@ -6408,14 +6613,14 @@ TUI/CLI visualization enhancement for the dog-feeding views. Recommended from [P
 |------|-------------|--------|-----|
 | PG17-9 | **Full E2E suite against PG 17.** Run the complete E2E test suite against a PG 17 instance. Fix any parser or catalog incompatibilities that surface. | 1–2d | — |
 | PG17-10 | **TPC-H validation on PG 17.** Run TPC-H benchmark queries on PG 17 to verify differential refresh correctness for complex queries. | 4–8h | — |
-| PG17-11 | **Upgrade path test.** Verify `ALTER EXTENSION pg_trickle UPDATE` from 0.22.0 to 0.23.0 works on both PG 17 and PG 18. | 2–4h | — |
+| PG17-11 | **Upgrade path test.** Verify `ALTER EXTENSION pg_trickle UPDATE` from 0.24.0 to 0.25.0 works on both PG 17 and PG 18. | 2–4h | — |
 
 ### Documentation
 
 | Item | Description | Effort | Ref |
 |------|-------------|--------|-----|
 | PG17-12 | **Update docs and README.** Change "PostgreSQL 18 extension" to "PostgreSQL 17/18 extension" in `README.md`, `INSTALL.md`, `src/lib.rs` doc comments, and `ARCHITECTURE.md`. | 1–2h | — |
-| PG17-13 | **Docker Hub image variants.** Publish images tagged with both PG versions (e.g., `:0.23.0-pg17`, `:0.23.0-pg18`). | 2–4h | — |
+| PG17-13 | **Docker Hub image variants.** Publish images tagged with both PG versions (e.g., `:0.25.0-pg17`, `:0.25.0-pg18`). | 2–4h | — |
 
 ### PostgreSQL 18/19 Feature Integration
 
@@ -6447,7 +6652,7 @@ Low-hanging PostgreSQL feature opportunities identified in [plans/sql/PLAN_POSTG
 
 > **PostgreSQL feature integration subtotal: ~4–5 hours** (PGFEAT-1 through PGFEAT-5) **+ ~10–18 hours** (PGFEAT-6 through PGFEAT-9, optional but recommended)
 
-> **v0.23.0 total: ~2–4 days** (PG 17 support) **+ ~14–23 hours** (PostgreSQL feature integration, all items)
+> **v0.25.0 total: ~2–4 days** (PG 17 support) **+ ~14–23 hours** (PostgreSQL feature integration, all items)
 
 **Exit criteria:**
 - [ ] PG17-1: `cargo build --features pg17 --no-default-features` compiles cleanly
@@ -6467,12 +6672,12 @@ Low-hanging PostgreSQL feature opportunities identified in [plans/sql/PLAN_POSTG
 - [ ] PGFEAT-7: Skip scan index optimization evaluated; benchmarks quantify benefit; indexes created if beneficial
 - [ ] PGFEAT-8: `MERGE ... RETURNING OLD.*, NEW.*` integrated in `build_merge_sql()`; ST-to-ST change buffer performance improved
 - [ ] PGFEAT-9: Virtual generated columns correctly excluded from CDC change buffer schemas; E2E tests pass with virtual column sources
-- [ ] Extension upgrade path tested (`0.23.0 → 0.24.0`)
+- [ ] Extension upgrade path tested (`0.24.0 → 0.25.0`)
 - [ ] `just check-version-sync` passes
 
 ---
 
-## v0.25.0 — PGlite Proof of Concept
+## v0.26.0 — PGlite Proof of Concept
 
 > **Release Theme**
 > This release validates whether PGlite users want real incremental view
@@ -6482,7 +6687,7 @@ Low-hanging PostgreSQL feature opportunities identified in [plans/sql/PLAN_POSTG
 > simple patterns — single-table aggregates, two-table inner joins, and
 > filtered scans. It deliberately limits scope to 3–5 SQL patterns to
 > keep effort low while generating a concrete demand signal. If adoption
-> materialises, the full core extraction (v0.24.0) and WASM build (v0.25.0)
+> materialises, the full core extraction (v0.27.0) and WASM build (v0.28.0)
 > proceed. The main pg_trickle PostgreSQL extension ships no functional
 > changes in this release — only version bumps and upgrade migration
 > plumbing.
@@ -6706,7 +6911,7 @@ Dependencies: PGL-0-4. Schema change: No.
 
 > **In plain terms:** A clear table showing which SQL patterns are and are
 > not supported, what error you get for unsupported patterns, and when full
-> support is expected (v0.25.0). This prevents user frustration and sets
+> support is expected (v0.28.0). This prevents user frustration and sets
 > expectations.
 
 Verify: decision table in README and npm page lists all tested patterns with
@@ -6718,7 +6923,7 @@ Dependencies: None. Schema change: No.
 > **In plain terms:** Every error thrown by the plugin must include the
 > table name, the failing operation, and a one-sentence hint. Example:
 > `"LEFT JOIN is not supported in pglite-lite. Use @pgtrickle/pglite
-> (v0.25.0+) for full SQL support, or rewrite as INNER JOIN."` 
+> (v0.28.0+) for full SQL support, or rewrite as INNER JOIN."` 
 
 Verify: all error paths tested; every error message includes a remediation
 sentence.
@@ -6798,22 +7003,22 @@ Dependencies: PGL-0-4. Schema change: No.
 **TEST-5 — Extension upgrade path (0.18 to 0.19)**
 
 > **In plain terms:** The main pg_trickle PostgreSQL extension ships no
-> functional changes in v0.23.0, but the upgrade migration path must still
-> be tested. `ALTER EXTENSION pg_trickle UPDATE` from 0.22.0 to 0.23.0
+> functional changes in v0.26.0, but the upgrade migration path must still
+> be tested. `ALTER EXTENSION pg_trickle UPDATE` from 0.25.0 to 0.26.0
 > must leave existing stream tables intact.
 
 Verify: upgrade E2E test confirms all existing stream tables survive and
-refresh correctly after `0.22.0 -> 0.23.0` upgrade.
+refresh correctly after `0.25.0 -> 0.26.0` upgrade.
 Dependencies: None. Schema change: No (PG extension unchanged).
 
 ### Conflicts & Risks
 
 1. **Demand uncertainty is the primary risk.** This entire milestone is a bet
    that PGlite users want IVM beyond what pg_ivm provides. If Phase 0
-   generates no adoption signal, v0.24.0–v0.26.0 should be deprioritised and
+   generates no adoption signal, v0.27.0–v0.29.0 should be deprioritised and
    v1.0.0 proceeds without PGlite. Define a concrete adoption threshold
    (e.g., > 100 npm weekly downloads within 60 days of publication) as a
-   go/no-go gate for v0.24.0.
+   go/no-go gate for v0.27.0.
 
 2. **PGlite trigger infrastructure is unverified.** PGL-0-1 (trigger
    validation) is a hard prerequisite for everything else. If statement-level
@@ -6827,12 +7032,12 @@ Dependencies: None. Schema change: No (PG extension unchanged).
    Pin the minimum PGlite version in `package.json`.
 
 4. **No core Rust changes, but version bump required.** The main pg_trickle
-   extension needs a v0.23.0 version bump, upgrade migration SQL, and passing
+   extension needs a v0.26.0 version bump, upgrade migration SQL, and passing
    CI even though no functional code changes. This is low-risk but must not
    be forgotten.
 
 5. **ElectricSQL collaboration timing.** UX-5 (outreach) should happen
-   early — before v0.23.0 ships — to avoid building something ElectricSQL is
+   early — before v0.26.0 ships — to avoid building something ElectricSQL is
    already working on or would actively resist. If they signal interest in
    co-development, Phase 2 scope and timeline may shift.
 
@@ -6842,7 +7047,7 @@ Dependencies: None. Schema change: No (PG extension unchanged).
    compensate — consider porting the proptest approach to a JS property-
    testing library (e.g., fast-check).
 
-> **v0.24.0 total: ~2–3 weeks (PGlite plugin) + ~1–2 days (PG extension version bump)**
+> **v0.26.0 total: ~2–3 weeks (PGlite plugin) + ~1–2 days (PG extension version bump)**
 
 **Exit criteria:**
 - [ ] PGL-0-1: Statement-level triggers with transition tables confirmed working in PGlite
@@ -6864,12 +7069,12 @@ Dependencies: None. Schema change: No (PG extension unchanged).
 - [ ] UX-4: TypeScript type definitions ship with strict-mode compatibility
 - [ ] TEST-1: > 50 correctness test cases pass on PGlite latest
 - [ ] TEST-2: CI tests pass against PGlite N, N-1, N-2
-- [ ] TEST-5: Extension upgrade path tested (`0.24.0 -> 0.25.0`)
+- [ ] TEST-5: Extension upgrade path tested (`0.25.0 -> 0.26.0`)
 - [ ] `just check-version-sync` passes
 
 ---
 
-## v0.26.0 — Core Extraction (`pg_trickle_core`)
+## v0.27.0 — Core Extraction (`pg_trickle_core`)
 
 > **Release Theme**
 > This release surgically separates pg_trickle's "brain" — the DVM engine,
@@ -6878,7 +7083,7 @@ Dependencies: None. Schema change: No (PG extension unchanged).
 > The extraction touches ~51,000 lines of code across 30+ source files but
 > produces zero user-visible behavior change: every existing test must pass
 > unchanged. The payoff is threefold: the core crate compiles to WASM
-> (enabling the PGlite extension in v0.25.0), pure-logic unit tests run
+> (enabling the PGlite extension in v0.28.0), pure-logic unit tests run
 > without a PostgreSQL instance (10x faster CI), and the main extension
 > gains a cleaner internal architecture. Approximately 500 unsafe blocks in
 > the parser require an abstraction layer over raw `pg_sys` node traversal,
@@ -7019,13 +7224,13 @@ Dependencies: PGL-1-1. Schema change: No.
 
 **STAB-4 — Extension upgrade path (0.19 to 0.20)**
 
-> **In plain terms:** v0.24.0 makes no SQL-visible changes (same functions,
+> **In plain terms:** v0.27.0 makes no SQL-visible changes (same functions,
 > same catalog schema), but the upgrade migration must still be tested.
-> `ALTER EXTENSION pg_trickle UPDATE` from 0.22.0 to 0.23.0 must leave
+> `ALTER EXTENSION pg_trickle UPDATE` from 0.26.0 to 0.27.0 must leave
 > existing stream tables intact and refreshable.
 
 Verify: upgrade E2E test confirms stream tables survive and refresh
- correctly after `0.23.0 -> 0.24.0`.
+ correctly after `0.26.0 -> 0.27.0`.
 
 **STAB-5 — Feature-flag isolation for WASM target**
 
@@ -7101,7 +7306,7 @@ Dependencies: PGL-1-1. Schema change: No.
 
 **SCAL-2 — Core crate binary size for WASM budget**
 
-> **In plain terms:** v0.25.0 targets < 2 MB WASM bundle. Measure the
+> **In plain terms:** v0.28.0 targets < 2 MB WASM bundle. Measure the
 > compiled size of `pg_trickle_core` for the WASM target now so the budget
 > is known before Phase 2. If > 5 MB, investigate `wasm-opt` stripping and
 > feature-gating large operator modules.
@@ -7232,8 +7437,8 @@ Dependencies: PGL-1-1. Schema change: No.
    item. If the abstraction proves too leaky (e.g., too many pg_sys node
    types to wrap), consider leaving `rewrites.rs` and `sublinks.rs` in the
    extension crate and extracting only operators + DAG + types to the core
-   crate. This reduces v0.24.0 scope but still delivers the WASM-compilable
-   operator engine for v0.25.0.
+   crate. This reduces v0.27.0 scope but still delivers the WASM-compilable
+   operator engine for v0.28.0.
 
 2. **PERF-1 must be validated before merging.** Introducing a
    `trait DatabaseBackend` could add vtable dispatch overhead on the hot
@@ -7263,7 +7468,7 @@ Dependencies: PGL-1-1. Schema change: No.
    extraction order: types -> operators -> DAG -> diff -> rewrites ->
    sublinks.
 
-> **v0.24.0 total: ~3–4 weeks (extraction) + ~1–2 weeks (abstraction layer + testing)**
+> **v0.27.0 total: ~3–4 weeks (extraction) + ~1–2 weeks (abstraction layer + testing)**
 
 **Exit criteria:**
 - [ ] PGL-1-1: `pg_trickle_core` crate exists as a workspace member with zero pgrx dependencies
@@ -7280,7 +7485,7 @@ Dependencies: PGL-1-1. Schema change: No.
 - [ ] STAB-1: Zero `pg_sys::` references in `pg_trickle_core/src/`
 - [ ] STAB-2: `cargo build -p pg_trickle_core --no-default-features` passes in CI
 - [ ] STAB-3: `cargo pgrx package` and `cargo pgrx test` succeed with workspace layout
-- [ ] STAB-4: Extension upgrade path tested (`0.25.0 -> 0.26.0`)
+- [ ] STAB-4: Extension upgrade path tested (`0.26.0 -> 0.27.0`)
 - [ ] STAB-5: WASM target builds in CI
 - [ ] PERF-1: Criterion shows < 1% regression on `diff_operators` benchmark
 - [ ] PERF-2: Full benchmark suite passes with < 5% regression threshold
@@ -7295,12 +7500,12 @@ Dependencies: PGL-1-1. Schema change: No.
 
 ---
 
-## v0.27.0 — PGlite WASM Extension
+## v0.28.0 — PGlite WASM Extension
 
 > **Release Theme**
 > This release delivers the first working PGlite extension — the moment
 > pg_trickle's incremental view maintenance runs in the browser. By
-> wrapping `pg_trickle_core` (extracted in v0.24.0) in a thin C/FFI shim
+> wrapping `pg_trickle_core` (extracted in v0.27.0) in a thin C/FFI shim
 > and compiling to WASM via PGlite's Emscripten toolchain, we ship an npm
 > package (`@pgtrickle/pglite`) that gives PGlite users the full DVM
 > operator vocabulary — outer joins, window functions, subqueries,
@@ -7315,7 +7520,7 @@ Phase 2 for the full architecture.
 ### PGlite WASM Build (Phase 2)
 
 > **In plain terms:** This takes the `pg_trickle_core` crate extracted in
-> v0.24.0 and wraps it in a thin C shim that PGlite's Emscripten-based
+> v0.27.0 and wraps it in a thin C shim that PGlite's Emscripten-based
 > extension build system can compile to WASM. The result is a PGlite
 > extension package (`@pgtrickle/pglite`) that provides
 > `create_stream_table()`, `drop_stream_table()`, and `alter_stream_table()`
@@ -7444,19 +7649,19 @@ Verify: lifecycle test with memory profiling shows zero leaked allocations
 after unload/reload cycle.
 Dependencies: PGL-2-1, PGL-2-4. Schema change: No.
 
-**STAB-4 — Native extension upgrade path (0.24 → 0.25)**
+**STAB-4 — Native extension upgrade path (0.27 → 0.28)**
 
-> **In plain terms:** v0.25.0 adds PGlite support but makes no SQL-visible
-> changes to the native extension. The upgrade migration from 0.24.0 to
-> 0.25.0 must leave existing stream tables intact and refreshable.
+> **In plain terms:** v0.28.0 adds PGlite support but makes no SQL-visible
+> changes to the native extension. The upgrade migration from 0.27.0 to
+> 0.28.0 must leave existing stream tables intact and refreshable.
 
 Verify: upgrade E2E test confirms stream tables survive and refresh
- correctly after `0.24.0 -> 0.25.0`.
+ correctly after `0.27.0 -> 0.28.0`.
 
 **STAB-5 — npm package version synchronization**
 
 > **In plain terms:** The `@pgtrickle/pglite` npm package version must
-> match the extension version (0.25.0). Add a CI check that verifies
+> match the extension version (0.28.0). Add a CI check that verifies
 > `package.json` version matches `pg_trickle.control` version, similar to
 > the existing `just check-version-sync` target.
 
@@ -7731,7 +7936,7 @@ Dependencies: PGL-2-3, PERF-2. Schema change: No.
    Add it to the existing CI matrix as a separate job that only runs when
    `pg_trickle_pglite/` or `pg_trickle_core/` files are modified.
 
-> **v0.25.0 total: ~5–7 weeks (WASM build) + ~2–3 weeks (testing + polish)**
+> **v0.28.0 total: ~5–7 weeks (WASM build) + ~2–3 weeks (testing + polish)**
 
 **Exit criteria:**
 - [ ] PGL-2-1: C shim compiles and links against PGlite's WASM PostgreSQL headers
@@ -7747,7 +7952,7 @@ Dependencies: PGL-2-3, PERF-2. Schema change: No.
 - [ ] STAB-1: OOM stress test: PGlite survives with actionable error
 - [ ] STAB-2: Panic from invalid SQL returns SQL error, not WASM trap
 - [ ] STAB-3: Load/unload/reload lifecycle test: zero leaked allocations
-- [ ] STAB-4: Extension upgrade path tested (`0.26.0 -> 0.27.0`)
+- [ ] STAB-4: Extension upgrade path tested (`0.27.0 -> 0.28.0`)
 - [ ] PERF-1: WASM vs native benchmark report published (≤ 3× overhead)
 - [ ] PERF-2: WASM bundle ≤ 2 MB (CI gated)
 - [ ] PERF-3: Cold-start load time < 500 ms browser, < 200 ms Node.js
@@ -7763,7 +7968,7 @@ Dependencies: PGL-2-3, PERF-2. Schema change: No.
 
 ---
 
-## v0.28.0 — PGlite Reactive Integration
+## v0.29.0 — PGlite Reactive Integration
 
 > **Release Theme**
 > This release completes the PGlite story by bridging the gap between
@@ -7914,16 +8119,16 @@ Verify: test dropping a stream table while `useStreamTable()` is active;
 assert error boundary catches the error with an actionable message.
 Dependencies: PGL-3-2, PGL-3-3. Schema change: No.
 
-**STAB-4 — Native extension upgrade path (0.25 → 0.26)**
+**STAB-4 — Native extension upgrade path (0.28 → 0.29)**
 
-> **In plain terms:** v0.26.0 adds reactive bindings at the TypeScript/npm
+> **In plain terms:** v0.29.0 adds reactive bindings at the TypeScript/npm
 > layer only. The native PostgreSQL extension and PGlite WASM extension
-> must continue to work unchanged. The upgrade migration from 0.25.0 to
-> 0.26.0 must leave existing stream tables and the `@pgtrickle/pglite`
+> must continue to work unchanged. The upgrade migration from 0.28.0 to
+> 0.29.0 must leave existing stream tables and the `@pgtrickle/pglite`
 > WASM extension intact.
 
 Verify: upgrade E2E test confirms stream tables survive and refresh
-correctly after `0.25.0 -> 0.26.0`. TypeScript API backward compatibility
+correctly after `0.28.0 -> 0.29.0`. TypeScript API backward compatibility
 verified.
 Dependencies: None. Schema change: No.
 
@@ -8109,11 +8314,11 @@ Dependencies: PGL-3-4, PERF-1. Schema change: No.
 > `live.changes()` bridge emits the correct change events for INSERT,
 > UPDATE, and DELETE on the source table. Replay events into an
 > accumulator and assert it matches `SELECT * FROM stream_table`. This
-> extends v0.25.0 TEST-1 (operator E2E) by adding the reactive layer.
+> extends v0.28.0 TEST-1 (operator E2E) by adding the reactive layer.
 
 Verify: ≥ 69 tests (23 operators × 3 DML types). Accumulator matches
 `SELECT *` for every test case.
-Dependencies: PGL-3-1, v0.25.0 TEST-1. Schema change: No.
+Dependencies: PGL-3-1, v0.28.0 TEST-1. Schema change: No.
 
 **TEST-2 — React hook lifecycle tests**
 
@@ -8166,7 +8371,7 @@ Dependencies: STAB-1, PGL-3-2. Schema change: No.
    relatively new and its event format may change between PGlite releases.
    Pin the PGlite version and add an adapter layer so the bridge can
    accommodate event format changes without rewriting the React/Vue hooks.
-   If PGlite deprecates `live.changes()` before v0.26.0 ships, fall back
+   If PGlite deprecates `live.changes()` before v0.29.0 ships, fall back
    to `LISTEN/NOTIFY` with a custom channel.
 
 2. **CORR-2 (batch atomicity) and PERF-2 (single re-render) are coupled.**
@@ -8193,12 +8398,12 @@ Dependencies: STAB-1, PGL-3-2. Schema change: No.
    and scope it to documentation + a proof-of-concept, not production-grade
    support.
 
-6. **No native extension changes in v0.26.0.** This release is entirely
+6. **No native extension changes in v0.29.0.** This release is entirely
    in the TypeScript/npm layer. Any temptation to add native features
    (e.g., `LISTEN/NOTIFY` bridge, WebSocket push) should be deferred to
    post-1.0. Keep the scope tight: reactive bindings + examples + docs.
 
-> **v0.26.0 total: ~2–3 weeks (bridge + hooks) + ~1–2 weeks (examples + testing + polish)**
+> **v0.29.0 total: ~2–3 weeks (bridge + hooks) + ~1–2 weeks (examples + testing + polish)**
 
 **Exit criteria:**
 - [ ] PGL-3-1: Stream table changes appear in `live.changes()` event stream
@@ -8213,7 +8418,7 @@ Dependencies: STAB-1, PGL-3-2. Schema change: No.
 - [ ] STAB-1: 4-hour soak test: heap growth < 10%
 - [ ] STAB-2: 100 mount/unmount cycles: zero leaked subscriptions
 - [ ] STAB-3: Stream table dropped while hook active: error boundary catches
-- [ ] STAB-4: Extension upgrade path tested (`0.27.0 -> 0.28.0`)
+- [ ] STAB-4: Extension upgrade path tested (`0.28.0 -> 0.29.0`)
 - [ ] STAB-5: CI matrix passes for React 18, React 19, Vue 3.4+
 - [ ] PERF-1: INSERT-to-render latency < 50% of `live.incrementalQuery()` at 10K rows
 - [ ] PERF-2: Render count = 1 for bulk DML (1, 10, 100, 1000 rows)
@@ -8243,7 +8448,7 @@ forward-compatibility.
 > audits every internal `pg_sys::*` API call for breaking changes, adds
 > conditional compilation gates, and validates the WAL decoder against any
 > pgoutput format changes introduced in PG 19. Moved here from the
-> earlier v0.23.0 milestone because PG 19 beta availability is uncertain.
+> earlier v0.25.0 milestone because PG 19 beta availability is uncertain.
 
 | Item | Description | Effort | Ref |
 |------|-------------|--------|-----|
@@ -8438,13 +8643,14 @@ to keep the pre-1.0 milestones focused on performance and correctness.
 | v0.19.0 — Production Gap Closure & Distribution | ~4–5 weeks | — | |
 | v0.20.0 — Dog-Feeding (pg_trickle monitors itself) | ~3–4wk | — | |
 | v0.21.0 — Correctness, Safety & Test Hardening | ~6–8wk | 2026-07-16 | ✅ Released |
-| v0.22.0 — Production Scalability & Downstream Integration | ~5–6wk (parallel refresh + downstream CDC + predictive cost + SLA tier + outbox) | — | |
-| v0.23.0 — TUI Dog-Feeding Integration | ~3–4wk (TUI + architecture + backend + CLI) | — | |
-| v0.24.0 — PostgreSQL 17 Support | ~2–4d | — | |
-| v0.25.0 — PGlite Proof of Concept | ~2–3wk (plugin) + ~1–2d (version bump) | — | |
-| v0.26.0 — Core Extraction (`pg_trickle_core`) | ~3–4wk (extraction) + ~1–2wk (abstraction + testing) | — | |
-| v0.27.0 — PGlite WASM Extension | ~5–7wk (WASM build) + ~2–3wk (testing + polish) | — | |
-| v0.28.0 — PGlite Reactive Integration | ~2–3wk (bridge + hooks) + ~1–2wk (examples + testing + polish) | — | |
+| v0.22.0 — Production Scalability & Downstream Integration | ~5–6wk (parallel refresh + downstream CDC + predictive cost + SLA tier) | — | |
+| v0.23.0 — Transactional Inbox & Outbox Patterns | ~4–5wk (outbox + inbox + consumer groups + ordered processing) | — | |
+| v0.24.0 — TUI Dog-Feeding Integration | ~3–4wk (TUI + architecture + backend + CLI) | — | |
+| v0.25.0 — PostgreSQL 17 Support | ~2–4d | — | |
+| v0.26.0 — PGlite Proof of Concept | ~2–3wk (plugin) + ~1–2d (version bump) | — | |
+| v0.27.0 — Core Extraction (`pg_trickle_core`) | ~3–4wk (extraction) + ~1–2wk (abstraction + testing) | — | |
+| v0.28.0 — PGlite WASM Extension | ~5–7wk (WASM build) + ~2–3wk (testing + polish) | — | |
+| v0.29.0 — PGlite Reactive Integration | ~2–3wk (bridge + hooks) + ~1–2wk (examples + testing + polish) | — | |
 | v1.0.0 — Stable release (incl. PG 19 compat) | ~36–66h | — | |
 | Post-1.0 (PG compat + Native DDL) | ~38–56h (PG 16–18) + ~13–21d (Native DDL) | — | |
 | Post-1.0 (ecosystem) | 88–134h | — | |
