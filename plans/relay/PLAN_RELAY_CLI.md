@@ -1,0 +1,1551 @@
+# Relay CLI — Implementation Plan
+
+> **Status:** Implementation Plan (DRAFT)
+> **Created:** 2026-04-18
+> **Category:** Tooling — Bidirectional Relay
+> **Related:** [PLAN_TRANSACTIONAL_OUTBOX_HELPER.md](../patterns/PLAN_TRANSACTIONAL_OUTBOX_HELPER.md) ·
+> [ROADMAP v0.23.0](../../ROADMAP.md#v0230--transactional-inbox--outbox-patterns)
+
+---
+
+## Table of Contents
+
+- [Executive Summary](#executive-summary)
+- [Goals & Non-Goals](#goals--non-goals)
+- [Architecture Overview](#architecture-overview)
+- [Part A — Core Framework](#part-a--core-framework)
+  - [A.1 Crate Structure](#a1-crate-structure)
+  - [A.2 CLI Interface](#a2-cli-interface)
+  - [A.3 Configuration](#a3-configuration)
+  - [A.4 Relay Modes (Forward & Reverse)](#a4-relay-modes-forward--reverse)
+  - [A.5 Source Trait](#a5-source-trait)
+  - [A.6 Sink Trait](#a6-sink-trait)
+  - [A.7 Message Envelope](#a7-message-envelope)
+  - [A.8 Outbox Poller (Forward Mode Source)](#a8-outbox-poller-forward-mode-source)
+  - [A.9 Payload Handling (Inline + Claim-Check)](#a9-payload-handling-inline--claim-check)
+  - [A.10 Consumer Group Integration](#a10-consumer-group-integration)
+  - [A.11 Graceful Shutdown & Signal Handling](#a11-graceful-shutdown--signal-handling)
+  - [A.12 Observability](#a12-observability)
+  - [A.13 Error Handling & Retries](#a13-error-handling--retries)
+- [Part B — Sink Backends (Forward Mode)](#part-b--sink-backends-forward-mode)
+  - [B.1 NATS JetStream](#b1-nats-jetstream)
+  - [B.2 HTTP Webhook](#b2-http-webhook)
+  - [B.3 Apache Kafka](#b3-apache-kafka)
+  - [B.4 stdout / File](#b4-stdout--file)
+  - [B.5 Redis Streams](#b5-redis-streams)
+  - [B.6 Amazon SQS](#b6-amazon-sqs)
+  - [B.7 PostgreSQL (Inbox)](#b7-postgresql-inbox)
+  - [B.8 RabbitMQ (AMQP 0-9-1)](#b8-rabbitmq-amqp-0-9-1)
+- [Part C — Source Backends (Reverse Mode)](#part-c--source-backends-reverse-mode)
+  - [C.1 NATS JetStream Source](#c1-nats-jetstream-source)
+  - [C.2 HTTP Webhook Receiver](#c2-http-webhook-receiver)
+  - [C.3 Apache Kafka Consumer](#c3-apache-kafka-consumer)
+  - [C.4 stdin / File Source](#c4-stdin--file-source)
+  - [C.5 Redis Streams Consumer](#c5-redis-streams-consumer)
+  - [C.6 Amazon SQS Consumer](#c6-amazon-sqs-consumer)
+  - [C.7 RabbitMQ Consumer](#c7-rabbitmq-consumer)
+- [Part D — PostgreSQL Inbox Sink (Reverse Mode)](#part-d--postgresql-inbox-sink-reverse-mode)
+- [Part E — Testing Strategy](#part-e--testing-strategy)
+- [Part F — Documentation & Distribution](#part-f--documentation--distribution)
+- [Part G — Implementation Roadmap](#part-g--implementation-roadmap)
+- [Open Questions](#open-questions)
+
+---
+
+## Executive Summary
+
+`pgtrickle-relay` is a standalone Rust CLI binary that bridges pg-trickle
+outboxes and inboxes with popular messaging systems and destinations. It
+ships as a separate crate in the pg-trickle workspace (`pgtrickle-relay/`),
+alongside the existing `pgtrickle-tui` crate.
+
+The relay operates in two modes:
+
+- **Forward mode** (`relay forward`): Polls pg-trickle outbox tables and
+  publishes deltas to external sinks (NATS, Kafka, webhooks, Redis, SQS,
+  RabbitMQ, PostgreSQL inbox, stdout/file).
+- **Reverse mode** (`relay reverse`): Consumes messages from external sources
+  (NATS, Kafka, webhooks, Redis, SQS, RabbitMQ, stdin/file) and writes them
+  into pg-trickle inbox tables.
+
+Both directions share the same Source/Sink trait abstractions, config system,
+observability, shutdown logic, and error handling. Each backend implements
+both the Source and Sink traits where it makes sense, so the same NATS/Kafka/
+Redis/etc. code serves both directions.
+
+**Primary use-cases:**
+1. Operators enable an outbox on a stream table, point `pgtrickle-relay
+   forward` at it, and deltas flow to Kafka / NATS / webhooks / etc.
+   without writing any relay code.
+2. Operators point `pgtrickle-relay reverse` at a Kafka topic (or NATS
+   subject, or Redis stream, etc.) and messages arrive in a pg-trickle
+   inbox table — ready for stream table processing — without writing any
+   consumer code.
+
+---
+
+## Goals & Non-Goals
+
+### Goals
+
+- **Bidirectional:** Forward (outbox → sinks) and reverse (sources → inbox)
+  in a single binary.
+- **Zero custom code required** to relay events in either direction.
+- **Symmetric abstractions:** Source trait + Sink trait compose freely;
+  any Source can feed any Sink (though the primary use-cases are
+  outbox → external and external → inbox).
+- **Correct handling of all outbox payload modes:** inline, claim-check,
+  and full-refresh fallback — including the combined `full_refresh` +
+  `claim_check` case.
+- **At-least-once delivery** via consumer groups + broker-side dedup keys
+  (forward) and inbox `ON CONFLICT DO NOTHING` (reverse).
+- **Multi-instance safe** — multiple relay instances share a consumer group
+  (forward) or a broker consumer group (reverse).
+- **Observable** — structured logging, Prometheus metrics endpoint, health
+  check endpoint.
+- **Configurable via file, env vars, and CLI flags** — 12-factor friendly.
+- **Small binary, fast startup** — suitable for sidecar containers.
+
+### Non-Goals
+
+- The relay is **not a message broker**. It is a poll-and-forward /
+  consume-and-write bridge.
+- **Exactly-once delivery is not guaranteed by the relay alone**. Exactly-once
+  is achieved by composition (relay dedup keys + broker dedup + inbox
+  `ON CONFLICT DO NOTHING`), per the pg-trickle outbox design.
+- **Complex routing / transformation / filtering** beyond subject/topic
+  mapping is not in scope. Users needing ETL should compose the relay with
+  downstream stream processors.
+- **No embedded PostgreSQL client library** — uses `tokio-postgres` (same as
+  `pgtrickle-tui`).
+- **Message format conversion** (e.g. Avro → JSON) is not in scope for
+  v0.24.0. The relay passes JSON payloads through as-is.
+
+---
+
+## Architecture Overview
+
+```
+                        ┌─────────────────────────────────────────┐
+                        │              pgtrickle-relay             │
+                        │                                         │
+   ┌─────────────┐      │  ┌──────────┐       ┌──────────┐       │      ┌─────────────┐
+   │  pg-trickle │      │  │  Source   │       │   Sink   │       │      │  pg-trickle │
+   │   outbox    │─────▶│  │  trait    │──────▶│  trait   │──────▶│─────▶│   (ext.)    │
+   │             │      │  └──────────┘       └──────────┘       │      │  Kafka/NATS │
+   └─────────────┘      │                                         │      │  Redis/etc. │
+                        │       FORWARD MODE                      │      └─────────────┘
+                        │                                         │
+                        ├─────────────────────────────────────────┤
+                        │                                         │
+   ┌─────────────┐      │  ┌──────────┐       ┌──────────┐       │      ┌─────────────┐
+   │  Kafka/NATS │      │  │  Source   │       │   Sink   │       │      │  pg-trickle │
+   │  Redis/SQS  │─────▶│  │  trait    │──────▶│  trait   │──────▶│─────▶│   inbox     │
+   │  Webhooks   │      │  └──────────┘       └──────────┘       │      │             │
+   └─────────────┘      │                                         │      └─────────────┘
+                        │       REVERSE MODE                      │
+                        │                                         │
+                        │  ┌──────────────────────────────────┐   │
+                        │  │  Shared: metrics, health, config, │   │
+                        │  │  shutdown, error handling, retries │   │
+                        │  └──────────────────────────────────┘   │
+                        └─────────────────────────────────────────┘
+```
+
+**Key insight:** The outbox poller is just another Source implementation.
+The inbox writer is just another Sink implementation. External systems
+(NATS, Kafka, etc.) implement *both* Source and Sink. This lets users
+compose any source with any sink, even though the two primary modes are
+the most common.
+
+---
+
+## Part A — Core Framework
+
+### A.1 Crate Structure
+
+A new workspace member at `pgtrickle-relay/`:
+
+```
+pgtrickle-relay/
+├── Cargo.toml
+├── src/
+│   ├── main.rs           # Entry point, CLI parsing, signal handling
+│   ├── cli.rs            # clap derive definitions
+│   ├── config.rs         # TOML / YAML / JSON + env + CLI merging
+│   ├── error.rs          # RelayError enum
+│   ├── envelope.rs       # RelayMessage envelope type
+│   ├── metrics.rs        # Prometheus metrics + health endpoint
+│   ├── source/
+│   │   ├── mod.rs        # Source trait definition
+│   │   ├── outbox.rs     # pg-trickle outbox poller (forward mode)
+│   │   ├── nats.rs       # NATS JetStream consumer
+│   │   ├── webhook.rs    # HTTP webhook receiver (axum listener)
+│   │   ├── kafka.rs      # Apache Kafka consumer
+│   │   ├── stdin.rs      # stdin / file reader
+│   │   ├── redis.rs      # Redis Streams consumer
+│   │   ├── sqs.rs        # Amazon SQS consumer
+│   │   └── rabbitmq.rs   # RabbitMQ AMQP consumer
+│   ├── sink/
+│   │   ├── mod.rs        # Sink trait definition
+│   │   ├── inbox.rs      # pg-trickle inbox writer (reverse mode)
+│   │   ├── nats.rs       # NATS JetStream publisher
+│   │   ├── webhook.rs    # HTTP webhook POST client
+│   │   ├── kafka.rs      # Apache Kafka producer
+│   │   ├── stdout.rs     # stdout / file writer
+│   │   ├── redis.rs      # Redis Streams XADD
+│   │   ├── sqs.rs        # Amazon SQS sender
+│   │   ├── pg_outbox.rs  # PostgreSQL outbox/inbox on remote PG
+│   │   └── rabbitmq.rs   # RabbitMQ AMQP publisher
+│   └── transforms.rs     # Subject/topic templating, key extraction
+└── tests/
+    ├── common/
+    │   └── mod.rs         # Test helpers, Testcontainers setup
+    ├── forward/           # Forward-mode tests
+    │   ├── poller_tests.rs
+    │   ├── nats_tests.rs
+    │   ├── webhook_tests.rs
+    │   └── kafka_tests.rs
+    └── reverse/           # Reverse-mode tests
+        ├── nats_inbox_tests.rs
+        ├── kafka_inbox_tests.rs
+        ├── webhook_inbox_tests.rs
+        └── redis_inbox_tests.rs
+```
+
+#### Cargo.toml — Feature Flags
+
+Each backend is gated behind a Cargo feature so users compile only what
+they need. A default feature set covers the most common backends.
+
+```toml
+[package]
+name = "pgtrickle-relay"
+version = "0.24.0"
+edition = "2024"
+
+[[bin]]
+name = "pgtrickle-relay"
+path = "src/main.rs"
+
+[features]
+default = ["nats", "webhook", "kafka", "stdout"]
+nats     = ["dep:async-nats"]
+webhook  = ["dep:reqwest"]           # also enables axum webhook receiver
+kafka    = ["dep:rdkafka"]
+stdout   = []                        # no extra deps
+redis    = ["dep:redis"]
+sqs      = ["dep:aws-sdk-sqs"]
+pg-inbox = []                        # uses tokio-postgres (already a dep)
+rabbitmq = ["dep:lapin"]
+
+[dependencies]
+# Core
+clap = { version = "4", features = ["derive", "env"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "time", "sync"] }
+tokio-postgres = "0.7"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+toml = "1.1"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+
+# Metrics / health + webhook receiver
+axum = "0.8"
+prometheus = "0.14"
+
+# Sinks + Sources (optional)
+async-nats = { version = "0.40", optional = true }
+reqwest = { version = "0.12", features = ["json"], optional = true }
+rdkafka = { version = "0.37", features = ["cmake-build"], optional = true }
+redis = { version = "0.28", features = ["tokio-comp", "streams"], optional = true }
+aws-sdk-sqs = { version = "1", optional = true }
+lapin = { version = "2", optional = true }
+```
+
+### A.2 CLI Interface
+
+```
+pgtrickle-relay <COMMAND> [OPTIONS]
+
+COMMANDS:
+  forward     Relay outbox → external sinks (default)
+  reverse     Relay external sources → inbox
+  validate    Validate config, test connections, exit
+  schema      Print JSON schema of the relay message envelope
+  completion  Generate shell completions
+
+COMMON OPTIONS:
+  -c, --config <FILE>           Path to config file (TOML, YAML, or JSON;
+                                format auto-detected by extension:
+                                .toml, .yaml/.yml, .json)
+      --pg-url <URL>            PostgreSQL connection string [env: PG_URL]
+      --metrics-addr <ADDR>     Prometheus metrics + health endpoint
+                                (default: 0.0.0.0:9090) [env: RELAY_METRICS_ADDR]
+      --log-format <FMT>        Log format: text, json (default: text)
+                                [env: RELAY_LOG_FORMAT]
+      --log-level <LEVEL>       Log level (default: info) [env: RELAY_LOG_LEVEL]
+  -V, --version                 Print version
+  -h, --help                    Print help
+
+FORWARD-SPECIFIC OPTIONS:
+      --outbox <NAME>           Stream table name to relay [env: RELAY_OUTBOX]
+      --sink <SINK>             Sink backend: nats, webhook, kafka, stdout,
+                                redis, sqs, pg-inbox, rabbitmq [env: RELAY_SINK]
+      --group <NAME>            Consumer group name (enables group mode)
+                                [env: RELAY_GROUP]
+      --consumer-id <ID>        Consumer ID within group (default: hostname)
+                                [env: RELAY_CONSUMER_ID]
+      --batch-size <N>          Rows per poll (default: 100) [env: RELAY_BATCH_SIZE]
+      --poll-interval <MS>      Milliseconds between empty polls (default: 1000)
+                                [env: RELAY_POLL_INTERVAL_MS]
+      --visibility-seconds <N>  Lease visibility timeout (default: 30)
+                                [env: RELAY_VISIBILITY_SECONDS]
+
+REVERSE-SPECIFIC OPTIONS:
+      --source <SOURCE>         Source backend: nats, webhook, kafka, stdin,
+                                redis, sqs, rabbitmq [env: RELAY_SOURCE]
+      --inbox <NAME>            Inbox table name to write to [env: RELAY_INBOX]
+      --inbox-schema <SCHEMA>   Schema for inbox table (default: public)
+                                [env: RELAY_INBOX_SCHEMA]
+
+BACKEND-SPECIFIC OPTIONS (passed via config file or --source-opt/--sink-opt KEY=VALUE):
+  See documentation for each backend.
+```
+
+### A.3 Configuration
+
+Configuration is resolved in priority order (highest wins):
+
+1. CLI flags
+2. Environment variables
+3. Config file (TOML, YAML, or JSON — format auto-detected from extension:
+   `.toml`, `.yaml` / `.yml`, `.json`; default filename searched in order:
+   `relay.toml`, `relay.yaml`, `relay.yml`, `relay.json`)
+4. Built-in defaults
+
+All three formats are equivalent at runtime; TOML is the recommended default
+because it is already used throughout the pg-trickle workspace.
+
+#### Config File Examples
+
+**TOML** (`relay.toml` — recommended):
+
+##### Forward Mode Example
+
+```toml
+[postgres]
+url = "postgres://user:password@localhost/mydb"
+
+[forward]
+outbox = "order_events"
+sink = "nats"
+group = "order-publisher"
+consumer_id = "relay-1"       # default: hostname
+batch_size = 100
+poll_interval_ms = 1000
+visibility_seconds = 30
+
+[metrics]
+addr = "0.0.0.0:9090"
+enabled = true
+
+[logging]
+format = "json"     # text | json
+level = "info"
+
+# Subject/topic template — available variables:
+#   {stream_table}, {event_type}, {outbox_id}, {refresh_id}
+[routing]
+subject_template = "pgtrickle.{stream_table}"
+# Optional per-event-type override:
+# [routing.overrides]
+# "order.created" = "orders.created"
+# "order.shipped" = "orders.shipped"
+
+# Sink-specific configuration
+[sink.nats]
+url = "nats://localhost:4222"
+# See B.1 for full options
+```
+
+##### Reverse Mode Example
+
+```toml
+[postgres]
+url = "postgres://user:password@localhost/mydb"
+
+[reverse]
+source = "kafka"
+inbox = "external_events"
+inbox_schema = "public"
+
+[metrics]
+addr = "0.0.0.0:9090"
+enabled = true
+
+[logging]
+format = "json"
+level = "info"
+
+# Source-specific configuration
+[source.kafka]
+brokers = "localhost:9092"
+topic = "external-events"
+group_id = "pgtrickle-inbox-writer"
+# See C.3 for full options
+```
+
+**YAML** (`relay.yaml`):
+
+##### Forward Mode Example
+
+```yaml
+postgres:
+  url: postgres://user:password@localhost/mydb
+
+forward:
+  outbox: order_events
+  sink: nats
+  group: order-publisher
+  consumer_id: relay-1
+  batch_size: 100
+  poll_interval_ms: 1000
+  visibility_seconds: 30
+
+routing:
+  subject_template: "pgtrickle.{stream_table}"
+
+sink:
+  nats:
+    url: nats://localhost:4222
+```
+
+##### Reverse Mode Example
+
+```yaml
+postgres:
+  url: postgres://user:password@localhost/mydb
+
+reverse:
+  source: kafka
+  inbox: external_events
+  inbox_schema: public
+
+source:
+  kafka:
+    brokers: localhost:9092
+    topic: external-events
+    group_id: pgtrickle-inbox-writer
+```
+
+**JSON** (`relay.json`) — Forward Mode Example:
+
+```json
+{
+  "postgres": { "url": "postgres://user:password@localhost/mydb" },
+  "forward": {
+    "outbox": "order_events",
+    "sink": "nats",
+    "group": "order-publisher",
+    "batch_size": 100
+  },
+  "sink": {
+    "nats": { "url": "nats://localhost:4222" }
+  }
+}
+```
+
+### A.4 Relay Modes (Forward & Reverse)
+
+The relay has two primary modes that compose Sources and Sinks:
+
+| Mode | Source | Sink | Primary use-case |
+|------|--------|------|------------------|
+| **Forward** | pg-trickle outbox | NATS / Kafka / webhook / Redis / SQS / RabbitMQ / PG / stdout | Publish outbox deltas to external systems |
+| **Reverse** | NATS / Kafka / webhook / Redis / SQS / RabbitMQ / stdin | pg-trickle inbox | Consume external events into inbox for stream processing |
+
+The core relay loop is the same in both modes:
+
+```rust
+async fn relay_loop(
+    source: &dyn Source,
+    sink: &dyn Sink,
+    shutdown: CancellationToken,
+) -> Result<(), RelayError> {
+    loop {
+        tokio::select! {
+            batch = source.poll() => {
+                let batch = batch?;
+                if batch.is_empty() {
+                    continue;
+                }
+                sink.publish(&batch).await?;
+                source.acknowledge(&batch).await?;
+            }
+            _ = shutdown.cancelled() => {
+                break;
+            }
+        }
+    }
+    Ok(())
+}
+```
+
+### A.5 Source Trait
+
+```rust
+#[async_trait]
+pub trait Source: Send + Sync {
+    /// Human-readable source name for logs and metrics.
+    fn name(&self) -> &str;
+
+    /// Establish connection to the source. Called on startup and reconnect.
+    async fn connect(&mut self) -> Result<(), RelayError>;
+
+    /// Poll for the next batch of messages. Returns empty vec if none
+    /// available (caller should sleep before retrying).
+    async fn poll(&self) -> Result<Vec<RelayMessage>, RelayError>;
+
+    /// Acknowledge successful processing of a batch. For outbox sources
+    /// this commits the offset; for broker sources this acks the messages.
+    async fn acknowledge(&self, batch: &[RelayMessage]) -> Result<(), RelayError>;
+
+    /// Check if the source connection is healthy.
+    async fn is_healthy(&self) -> bool;
+
+    /// Graceful close.
+    async fn close(&mut self) -> Result<(), RelayError>;
+}
+```
+
+### A.6 Sink Trait
+
+```rust
+#[async_trait]
+pub trait Sink: Send + Sync {
+    /// Human-readable sink name for logs and metrics.
+    fn name(&self) -> &str;
+
+    /// Establish connection to the sink. Called on startup and reconnect.
+    async fn connect(&mut self) -> Result<(), RelayError>;
+
+    /// Publish a batch of messages. The sink must handle dedup keys.
+    /// Returns the number of messages successfully published.
+    async fn publish(&self, batch: &[RelayMessage]) -> Result<usize, RelayError>;
+
+    /// Check if the sink connection is healthy.
+    async fn is_healthy(&self) -> bool;
+
+    /// Graceful close.
+    async fn close(&mut self) -> Result<(), RelayError>;
+}
+```
+
+### A.7 Message Envelope
+
+Both directions use a common message envelope:
+
+```rust
+/// Unified message envelope used by both forward and reverse relay.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RelayMessage {
+    /// Dedup key for idempotent delivery.
+    /// Forward: "{outbox}:{outbox_id}:{row_index}"
+    /// Reverse: source-specific (e.g. Kafka offset, NATS msg ID)
+    pub dedup_key: String,
+
+    /// Resolved subject/topic (forward) or inbox event_type (reverse).
+    pub subject: String,
+
+    /// The row/event payload as JSON.
+    pub payload: serde_json::Value,
+
+    /// Operation: "insert", "delete", or "event" (reverse generic).
+    pub op: String,
+
+    /// Whether this batch is a full-refresh snapshot (forward only).
+    pub is_full_refresh: bool,
+
+    /// pg-trickle outbox metadata (forward only, None in reverse).
+    pub outbox_id: Option<i64>,
+    pub refresh_id: Option<Uuid>,
+
+    /// Source-specific metadata for acknowledgement (not serialized).
+    #[serde(skip)]
+    pub ack_token: Option<AckToken>,
+}
+
+/// Opaque token that the Source uses to acknowledge a message.
+/// Each source backend stores whatever it needs here.
+#[derive(Debug, Clone)]
+pub enum AckToken {
+    OutboxOffset(i64),
+    KafkaOffset { partition: i32, offset: i64 },
+    NatsAckHandle(/* async-nats ack handle */),
+    SqsReceiptHandle(String),
+    RabbitMqDeliveryTag(u64),
+    RedisStreamId(String),
+    None,
+}
+```
+
+### A.8 Outbox Poller (Forward Mode Source)
+
+The outbox poller implements the `Source` trait. It operates in two modes:
+
+#### Simple Mode (no consumer group)
+
+Used when `--group` is not specified. Tracks offset locally in memory
+(lost on restart — consumers re-read from latest or a configured position).
+
+```rust
+async fn poll_simple(
+    db: &Client,
+    outbox_name: &str,
+    batch_size: i64,
+) -> Result<Vec<RelayMessage>, RelayError> {
+    let mut last_offset: i64 = 0; // or query MAX(id) on startup
+
+    let rows = db.query(
+        &format!(
+            "SELECT id, payload FROM pgtrickle.{} WHERE id > $1 ORDER BY id LIMIT $2",
+            outbox_name  // validated at startup against catalog
+        ),
+        &[&last_offset, &batch_size],
+    ).await?;
+
+    let mut messages = Vec::new();
+    for row in &rows {
+        let id: i64 = row.get("id");
+        let payload: serde_json::Value = row.get("payload");
+        let batch = decode_payload(&payload, db, outbox_name, id).await?;
+        messages.extend(batch_to_messages(&batch));
+    }
+    Ok(messages)
+}
+```
+
+#### Consumer Group Mode
+
+Used when `--group` is specified. Delegates coordination to pg-trickle's
+built-in consumer group SQL functions.
+
+```rust
+async fn poll_group(
+    db: &Client,
+    group: &str,
+    consumer_id: &str,
+    batch_size: i32,
+    visibility_seconds: i32,
+) -> Result<Vec<RelayMessage>, RelayError> {
+    let rows = db.query(
+        "SELECT * FROM pgtrickle.poll_outbox($1, $2, $3, $4)",
+        &[&group, &consumer_id, &batch_size, &visibility_seconds],
+    ).await?;
+
+    if rows.is_empty() {
+        // Heartbeat even when idle
+        db.execute(
+            "SELECT pgtrickle.consumer_heartbeat($1, $2)",
+            &[&group, &consumer_id],
+        ).await?;
+        return Ok(vec![]);
+    }
+
+    let mut messages = Vec::new();
+    for row in &rows {
+        let id: i64 = row.get("id");
+        let payload: serde_json::Value = row.get("payload");
+        let batch = decode_payload(&payload, db, &outbox_name, id).await?;
+        messages.extend(batch_to_messages(&batch));
+    }
+    Ok(messages)
+}
+```
+
+#### Lease Renewal for Slow Sinks
+
+If a batch takes longer to publish than `visibility_seconds`, the poller
+spawns a background task that periodically calls `extend_lease()`:
+
+```rust
+let lease_guard = spawn_lease_renewer(db, group, consumer_id, visibility_seconds);
+// ... process batch ...
+lease_guard.cancel(); // stop renewing after commit
+```
+
+The renewer calls `extend_lease()` at `visibility_seconds / 2` intervals.
+
+### A.9 Payload Handling (Inline + Claim-Check)
+
+The payload decoder handles all four outbox modes:
+
+| `claim_check` | `full_refresh` | Path |
+|----------------|----------------|------|
+| `false`        | `false`        | Inline differential — rows in `payload.inserted` / `payload.deleted` |
+| `false`        | `true`         | Inline full refresh — all current rows in `payload.inserted`, apply upsert semantics |
+| `true`         | `false`        | Claim-check differential — cursor-fetch from `outbox_delta_rows_<st>` |
+| `true`         | `true`         | Claim-check full refresh — cursor-fetch + upsert semantics |
+
+```rust
+#[derive(Debug)]
+struct OutboxBatch {
+    outbox_id: i64,
+    refresh_id: Uuid,
+    is_full_refresh: bool,
+    inserted: Vec<serde_json::Value>,
+    deleted: Vec<serde_json::Value>,
+}
+
+async fn decode_payload(
+    payload: &serde_json::Value,
+    db: &Client,
+    outbox_name: &str,
+    outbox_id: i64,
+) -> Result<OutboxBatch, RelayError> {
+    let v = payload["v"].as_i64().unwrap_or(0);
+    if v != 1 {
+        return Err(RelayError::UnsupportedPayloadVersion(v));
+    }
+
+    let is_full_refresh = payload.get("full_refresh")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let is_claim_check = payload.get("claim_check")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    if is_claim_check {
+        // Cursor-fetch from companion table in bounded batches
+        let (inserted, deleted) = fetch_claim_check_rows(
+            db, outbox_name, outbox_id
+        ).await?;
+
+        // Signal consumption complete
+        db.execute(
+            "SELECT pgtrickle.outbox_rows_consumed($1, $2)",
+            &[&outbox_name, &outbox_id],
+        ).await?;
+
+        Ok(OutboxBatch {
+            outbox_id,
+            refresh_id: parse_uuid(payload),
+            is_full_refresh,
+            inserted,
+            deleted,
+        })
+    } else {
+        // Inline — rows are in the payload itself
+        Ok(OutboxBatch {
+            outbox_id,
+            refresh_id: parse_uuid(payload),
+            is_full_refresh,
+            inserted: extract_array(payload, "inserted"),
+            deleted: extract_array(payload, "deleted"),
+        })
+    }
+}
+
+async fn fetch_claim_check_rows(
+    db: &Client,
+    outbox_name: &str,
+    outbox_id: i64,
+) -> Result<(Vec<Value>, Vec<Value>), RelayError> {
+    // Use a server-side cursor for bounded memory
+    let delta_table = format!("pgtrickle.outbox_delta_rows_{}", outbox_name);
+    let rows = db.query(
+        &format!(
+            "SELECT op, payload FROM {} WHERE outbox_id = $1 ORDER BY row_num",
+            delta_table  // validated at startup
+        ),
+        &[&outbox_id],
+    ).await?;
+
+    let mut inserted = Vec::new();
+    let mut deleted = Vec::new();
+    for row in rows {
+        let op: &str = row.get("op");
+        let payload: serde_json::Value = row.get("payload");
+        match op {
+            "I" => inserted.push(payload),
+            "D" => deleted.push(payload),
+            _ => tracing::warn!(op, "unknown delta op"),
+        }
+    }
+    Ok((inserted, deleted))
+}
+```
+
+### A.10 Consumer Group Integration
+
+When `--group` is specified in forward mode, the relay:
+
+1. **Startup:** Calls `create_consumer_group()` (idempotent) to ensure the
+   group exists.
+2. **Poll loop:** Uses `poll_outbox()` + `commit_offset()` as described in A.8.
+3. **Heartbeat:** Sends `consumer_heartbeat()` every 10 seconds via a
+   background task, independent of the poll loop.
+4. **Lease renewal:** Calls `extend_lease()` if batch processing takes
+   longer than `visibility_seconds / 2`.
+5. **Shutdown:** On SIGTERM/SIGINT, finishes the current batch, commits the
+   offset, then exits.
+
+### A.11 Graceful Shutdown & Signal Handling
+
+```rust
+let shutdown = tokio::signal::ctrl_c();
+let sigterm = async {
+    tokio::signal::unix::signal(SignalKind::terminate())
+        .expect("register SIGTERM")
+        .recv()
+        .await;
+};
+
+tokio::select! {
+    _ = relay_loop => {},
+    _ = shutdown => {
+        tracing::info!("SIGINT received, finishing current batch...");
+    }
+    _ = sigterm => {
+        tracing::info!("SIGTERM received, finishing current batch...");
+    }
+}
+// Drain in-flight batch, acknowledge, close connections
+```
+
+The shutdown sequence:
+
+1. Stop polling/consuming.
+2. Wait for the in-flight batch to finish publishing (up to a configurable
+   `shutdown_timeout_seconds`, default 30).
+3. Acknowledge the completed batch (commit outbox offset or ack broker messages).
+4. Close sink, source, and database connections.
+5. Exit with code 0.
+
+If the in-flight batch doesn't complete within the timeout, the relay exits
+with code 1. Unacknowledged messages will be redelivered by the source.
+
+### A.12 Observability
+
+#### Structured Logging
+
+- `tracing` + `tracing-subscriber` with `env-filter`.
+- `--log-format json` for structured JSON logs (default in container mode).
+- Key span fields: `mode`, `source`, `sink`, `outbox`, `inbox`, `group`.
+
+#### Prometheus Metrics
+
+Exposed via an HTTP endpoint (default `:9090/metrics`):
+
+| Metric | Type | Labels | Description |
+|--------|------|--------|-------------|
+| `relay_polls_total` | counter | `mode`, `source` | Total poll attempts |
+| `relay_messages_published_total` | counter | `mode`, `sink` | Messages published to sink |
+| `relay_messages_received_total` | counter | `mode`, `source` | Messages received from source |
+| `relay_batches_committed_total` | counter | `mode` | Batches acknowledged |
+| `relay_batch_publish_duration_seconds` | histogram | `mode`, `sink` | Time to publish a batch |
+| `relay_poll_duration_seconds` | histogram | `mode`, `source` | Time for a poll round-trip |
+| `relay_claim_check_fetches_total` | counter | — | Claim-check cursor fetches (forward) |
+| `relay_full_refresh_batches_total` | counter | — | Full-refresh batches received (forward) |
+| `relay_inbox_writes_total` | counter | `inbox` | Rows written to inbox (reverse) |
+| `relay_inbox_dedup_skips_total` | counter | `inbox` | Rows skipped via ON CONFLICT (reverse) |
+| `relay_errors_total` | counter | `mode`, `kind` | Errors by category |
+| `relay_last_committed_offset` | gauge | `mode` | Last committed offset |
+| `relay_consumer_lag_rows` | gauge | `mode` | Rows behind latest |
+| `relay_source_connected` | gauge | — | 1 if source connection is healthy |
+| `relay_sink_connected` | gauge | — | 1 if sink connection is healthy |
+
+#### Health Endpoint
+
+`GET :9090/health` returns:
+
+```json
+{
+  "status": "healthy",
+  "mode": "forward",
+  "source": "outbox",
+  "sink": "nats",
+  "postgres": "connected",
+  "source_healthy": true,
+  "sink_healthy": true,
+  "last_poll_at": "2026-04-18T12:00:00Z",
+  "last_commit_at": "2026-04-18T12:00:00Z",
+  "lag_rows": 42
+}
+```
+
+Returns HTTP 200 if healthy, 503 if degraded (no poll in last 60 s or
+source/sink disconnected). Suitable for Kubernetes liveness/readiness probes.
+
+### A.13 Error Handling & Retries
+
+| Error class | Behaviour |
+|-------------|-----------|
+| PostgreSQL connection lost | Reconnect with exponential backoff (1 s → 2 s → 4 s → … → 60 s cap). |
+| Source connection lost | Reconnect with exponential backoff. Pause relay until reconnected. |
+| Sink connection lost | Reconnect with exponential backoff. Pause relay until reconnected. |
+| Sink publish failure (transient) | Retry the batch up to 3 times with backoff. Do not acknowledge. |
+| Sink publish failure (permanent, e.g. 400) | Log error, skip the message, emit `relay_errors_total{kind="sink_permanent"}`. Advance offset to avoid poison-pill blocking. |
+| Payload decode error | Log error, skip the message. Emit `relay_errors_total{kind="decode"}`. |
+| Claim-check fetch failure | Retry up to 3 times. If permanent, log + skip + emit error metric. |
+| Inbox write failure (transient) | Retry with backoff. Do not ack source message. |
+| Inbox write failure (permanent) | Log error, skip message, emit `relay_errors_total{kind="inbox_permanent"}`. |
+
+All retries use jittered exponential backoff to avoid thundering herds.
+
+---
+
+## Part B — Sink Backends (Forward Mode)
+
+These backends implement the `Sink` trait and are used primarily in forward
+mode (outbox → external). They can also be used in reverse mode when
+composing arbitrary source → sink pipelines.
+
+### B.1 NATS JetStream
+
+**Crate:** `async-nats`
+
+```toml
+[sink.nats]
+url = "nats://localhost:4222"
+# credentials_file = "/etc/nats/creds"
+# tls_ca = "/etc/nats/ca.pem"
+subject_template = "pgtrickle.{stream_table}.{op}"
+# Publish options:
+# ack_timeout_ms = 5000
+# max_in_flight = 256          # concurrent unacked publishes
+```
+
+**Dedup:** Uses `Nats-Msg-Id` header set to `{dedup_key}`.
+JetStream deduplicates within the configured dedup window.
+
+**Full-refresh handling:** Publishes with header `Pgtrickle-Full-Refresh: true`
+so consumers can detect snapshot events.
+
+### B.2 HTTP Webhook
+
+**Crate:** `reqwest`
+
+```toml
+[sink.webhook]
+url = "https://api.example.com/events"
+method = "POST"                             # POST (default) or PUT
+# headers:
+#   Authorization = "Bearer token123"
+#   X-Custom = "value"
+# timeout_ms = 10000
+# batch_mode = true                         # send entire batch as one POST
+# retry_on_status = [429, 500, 502, 503, 504]
+# tls_ca = "/etc/ssl/custom-ca.pem"
+```
+
+**Batch mode (default: true):** Sends the entire batch as a single POST body.
+
+**Per-event mode (`batch_mode = false`):** One HTTP request per event row.
+Slower but compatible with endpoints that expect single-event payloads.
+
+**Dedup:** Sends `Idempotency-Key` header with the dedup key.
+
+**Full-refresh handling:** Sends `X-Pgtrickle-Full-Refresh: true` header.
+
+### B.3 Apache Kafka
+
+**Crate:** `rdkafka` (librdkafka wrapper)
+
+```toml
+[sink.kafka]
+brokers = "localhost:9092"
+topic = "pgtrickle-events"
+# topic_template = "pgtrickle.{stream_table}"
+# key_template = "{op}:{outbox_id}"          # Kafka record key
+# acks = "all"                               # all | 1 | 0
+# compression = "lz4"                        # none | gzip | snappy | lz4 | zstd
+# linger_ms = 5
+# batch_num_messages = 1000
+# security_protocol = "SASL_SSL"
+# sasl_mechanism = "PLAIN"
+# sasl_username = "user"
+# sasl_password = "password"
+# Additional librdkafka config:
+# [sink.kafka.rdkafka]
+# "message.max.bytes" = "10485760"
+```
+
+**Dedup:** Uses the dedup key as the Kafka record key + enables idempotent
+producer (`enable.idempotence = true`).
+
+**Full-refresh:** Sets Kafka header `pgtrickle-full-refresh: true`.
+
+### B.4 stdout / File
+
+No external dependencies.
+
+```toml
+[sink.stdout]
+format = "jsonl"            # jsonl (default) | json_pretty | csv
+# output = "/var/log/relay/events.jsonl"   # file path; omit for stdout
+# rotate_bytes = 104857600  # 100 MiB log rotation (file mode only)
+```
+
+Useful for:
+- Debugging and development
+- Piping to `jq`, `tee`, log collectors
+- Integration testing
+
+### B.5 Redis Streams
+
+**Crate:** `redis` with `streams` feature
+
+```toml
+[sink.redis]
+url = "redis://localhost:6379"
+stream_key = "pgtrickle:{stream_table}"
+# maxlen = 100000             # MAXLEN ~ approximate trimming
+# password = "secret"
+# tls = false
+```
+
+**Dedup:** Uses the dedup key as the Redis Stream entry ID field
+(`pgt_dedup_key`). Consumers use consumer groups on the Redis side for
+exactly-once processing.
+
+### B.6 Amazon SQS
+
+**Crate:** `aws-sdk-sqs`
+
+```toml
+[sink.sqs]
+queue_url = "https://sqs.us-east-1.amazonaws.com/123456789012/my-queue"
+# region = "us-east-1"       # default: from env/config
+# message_group_id = "pgtrickle"   # for FIFO queues
+# batch_send = true          # use SendMessageBatch (up to 10 per call)
+```
+
+**Dedup:** For FIFO queues, uses `MessageDeduplicationId` set to the dedup
+key. For standard queues, dedup is the consumer's responsibility.
+
+### B.7 PostgreSQL (Inbox)
+
+Uses `tokio-postgres` (already a dependency).
+
+```toml
+[sink.pg-inbox]
+url = "postgres://user:password@other-host/other_db"
+inbox_table = "my_inbox"
+# schema = "public"
+# on_conflict = "DO NOTHING"   # default: idempotent via event_id PK
+```
+
+Inserts events into a pg-trickle inbox (or any table with compatible
+schema) on a different PostgreSQL instance. Enables cross-database /
+cross-service event propagation using pg-trickle on both sides.
+
+```sql
+INSERT INTO my_inbox (event_id, event_type, payload, received_at)
+VALUES ($1, $2, $3, now())
+ON CONFLICT (event_id) DO NOTHING;
+```
+
+### B.8 RabbitMQ (AMQP 0-9-1)
+
+**Crate:** `lapin`
+
+```toml
+[sink.rabbitmq]
+url = "amqp://guest:guest@localhost:5672"
+exchange = "pgtrickle"
+routing_key_template = "{stream_table}.{op}"
+# exchange_type = "topic"     # topic | direct | fanout
+# declare_exchange = true     # auto-declare on connect
+# mandatory = true            # require at least one queue binding
+# tls = false
+```
+
+**Dedup:** Sets `message-id` AMQP property to the dedup key. Consumer-side
+dedup required (RabbitMQ does not deduplicate natively).
+
+---
+
+## Part C — Source Backends (Reverse Mode)
+
+These backends implement the `Source` trait and are used in reverse mode
+(external system → inbox). They consume messages from external brokers /
+transports and feed them into the relay loop for writing to a pg-trickle
+inbox table.
+
+### C.1 NATS JetStream Source
+
+**Crate:** `async-nats`
+
+```toml
+[source.nats]
+url = "nats://localhost:4222"
+subject = "external.events.>"       # NATS subject to subscribe to
+# durable_name = "pgtrickle-inbox"  # durable consumer for persistence
+# deliver_policy = "all"            # all | last | new | by_start_time
+# ack_wait_seconds = 30
+# max_deliver = 5                   # max redelivery attempts
+# credentials_file = "/etc/nats/creds"
+# tls_ca = "/etc/nats/ca.pem"
+```
+
+**Consumption model:** Creates a JetStream pull consumer (durable if
+`durable_name` set). Messages are acked only after successful inbox write.
+
+**Dedup key:** Uses `Nats-Msg-Id` header if present; otherwise generates
+`nats:{stream}:{seq}` from the stream sequence number.
+
+**Event type mapping:** Subject is used as the inbox `event_type`.
+Configurable via `[routing]` overrides.
+
+### C.2 HTTP Webhook Receiver
+
+**Crate:** `axum` (already a dependency for metrics)
+
+```toml
+[source.webhook]
+listen_addr = "0.0.0.0:8080"       # separate from metrics endpoint
+path = "/inbox"                     # POST path to receive events
+# auth_header = "X-Webhook-Secret"
+# auth_value = "my-secret-token"
+# max_body_bytes = 10485760         # 10 MiB
+```
+
+**Consumption model:** Runs an HTTP server that accepts POST requests.
+Each request body is parsed as JSON and written to the inbox. Returns 200
+only after successful inbox write (synchronous acknowledgement).
+
+**Dedup key:** Uses `Idempotency-Key` header if present; otherwise
+generates a UUID v4.
+
+**Event type mapping:** Uses the URL path suffix or a configurable header
+(e.g. `X-Event-Type`).
+
+### C.3 Apache Kafka Consumer
+
+**Crate:** `rdkafka`
+
+```toml
+[source.kafka]
+brokers = "localhost:9092"
+topic = "external-events"
+group_id = "pgtrickle-inbox-writer"
+# auto_offset_reset = "earliest"    # earliest | latest
+# security_protocol = "SASL_SSL"
+# sasl_mechanism = "PLAIN"
+# sasl_username = "user"
+# sasl_password = "password"
+# Additional librdkafka config:
+# [source.kafka.rdkafka]
+# "session.timeout.ms" = "30000"
+```
+
+**Consumption model:** Uses rdkafka's `StreamConsumer` with manual offset
+commits. Offsets are committed only after successful inbox write.
+
+**Dedup key:** Uses Kafka record key if present; otherwise generates
+`kafka:{topic}:{partition}:{offset}`.
+
+**Event type mapping:** Uses Kafka header `event-type` if present, or the
+topic name.
+
+### C.4 stdin / File Source
+
+No external dependencies.
+
+```toml
+[source.stdin]
+format = "jsonl"            # jsonl (default) | json_pretty
+# input = "/var/spool/events.jsonl"   # file path; omit for stdin
+# follow = false             # tail -f mode for files
+```
+
+Useful for:
+- Replaying captured events into an inbox
+- Piping from other tools: `cat events.jsonl | pgtrickle-relay reverse --source stdin`
+- Integration testing
+
+**Dedup key:** Uses `dedup_key` field from JSON payload if present;
+otherwise generates a UUID v4.
+
+### C.5 Redis Streams Consumer
+
+**Crate:** `redis` with `streams` feature
+
+```toml
+[source.redis]
+url = "redis://localhost:6379"
+stream_key = "external:events"
+group_name = "pgtrickle-inbox"
+consumer_name = "relay-1"           # default: hostname
+# start_id = "0"                    # "0" for all history, "$" for new only
+# block_ms = 5000
+# count = 100                       # messages per XREADGROUP call
+# password = "secret"
+# tls = false
+```
+
+**Consumption model:** Uses Redis consumer groups (`XREADGROUP`).
+Messages are `XACK`ed only after successful inbox write.
+
+**Dedup key:** Uses `pgt_dedup_key` field if present; otherwise uses the
+Redis stream entry ID.
+
+### C.6 Amazon SQS Consumer
+
+**Crate:** `aws-sdk-sqs`
+
+```toml
+[source.sqs]
+queue_url = "https://sqs.us-east-1.amazonaws.com/123456789012/my-queue"
+# region = "us-east-1"
+# max_messages = 10                  # messages per ReceiveMessage call
+# wait_time_seconds = 20            # long polling
+# visibility_timeout = 30
+```
+
+**Consumption model:** Uses `ReceiveMessage` with long polling. Messages
+are deleted (`DeleteMessage`) only after successful inbox write. Visibility
+timeout provides implicit retry on failure.
+
+**Dedup key:** Uses `MessageDeduplicationId` (FIFO) or `MessageId`
+(standard).
+
+### C.7 RabbitMQ Consumer
+
+**Crate:** `lapin`
+
+```toml
+[source.rabbitmq]
+url = "amqp://guest:guest@localhost:5672"
+queue = "inbox-events"
+# consumer_tag = "pgtrickle-relay"
+# prefetch_count = 100
+# declare_queue = true               # auto-declare on connect
+# auto_ack = false                   # manual ack (default)
+# tls = false
+```
+
+**Consumption model:** Uses `basic_consume` with manual acknowledgement.
+Messages are acked only after successful inbox write. `basic_nack` with
+requeue on transient failure.
+
+**Dedup key:** Uses `message-id` AMQP property if present; otherwise
+generates a UUID v4.
+
+---
+
+## Part D — PostgreSQL Inbox Sink (Reverse Mode)
+
+The inbox sink is the primary Sink for reverse mode. It writes messages
+into a pg-trickle inbox table via `tokio-postgres`.
+
+```toml
+[reverse]
+source = "kafka"
+inbox = "external_events"
+inbox_schema = "public"
+
+# Optional: map source fields to inbox columns
+[reverse.mapping]
+event_id = "dedup_key"         # default: dedup_key
+event_type = "subject"         # default: subject
+payload = "payload"            # default: payload
+```
+
+#### Inbox Table Schema
+
+The relay expects the inbox table to have at minimum:
+
+```sql
+CREATE TABLE external_events (
+    event_id    TEXT PRIMARY KEY,       -- populated from dedup_key
+    event_type  TEXT NOT NULL,          -- populated from subject
+    payload     JSONB NOT NULL,         -- populated from message payload
+    received_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+```
+
+Additional columns are ignored. The relay uses `ON CONFLICT (event_id)
+DO NOTHING` for idempotent writes.
+
+#### Batch Insert
+
+For throughput, the inbox sink batches inserts:
+
+```rust
+async fn publish(&self, batch: &[RelayMessage]) -> Result<usize, RelayError> {
+    let mut written = 0;
+    // Use a transaction for atomicity
+    let tx = self.db.transaction().await?;
+
+    for msg in batch {
+        let result = tx.execute(
+            "INSERT INTO $inbox (event_id, event_type, payload, received_at) \
+             VALUES ($1, $2, $3, now()) \
+             ON CONFLICT (event_id) DO NOTHING",
+            &[&msg.dedup_key, &msg.subject, &msg.payload],
+        ).await?;
+        if result > 0 { written += 1; }
+    }
+
+    tx.commit().await?;
+    Ok(written)
+}
+```
+
+#### Dedup Semantics
+
+- `ON CONFLICT (event_id) DO NOTHING` ensures that duplicate messages
+  (e.g. from at-least-once source delivery) are silently dropped.
+- The `relay_inbox_dedup_skips_total` metric tracks how often this happens.
+
+---
+
+## Part E — Testing Strategy
+
+### E.1 Unit Tests
+
+- Payload decoder: all 4 outbox modes (inline, claim-check, full-refresh, combined).
+- Config merging: CLI > env > file (TOML / YAML / JSON) > defaults; all three file formats produce identical results.
+- Subject/topic templating with variables.
+- Dedup key generation (both forward and reverse).
+- Retry backoff calculation.
+- RelayMessage envelope serialization round-trip.
+- Source → Sink composition (mock source + mock sink).
+
+### E.2 Forward Mode Integration Tests (Testcontainers)
+
+Each test spins up PostgreSQL + the target sink via Testcontainers:
+
+| Test | Containers | Validates |
+|------|-----------|-----------|
+| NATS relay E2E | postgres + nats | Poll → publish → JetStream consume; verify dedup |
+| Kafka relay E2E | postgres + kafka (redpanda) | Poll → produce → consume; verify partition key |
+| Webhook relay E2E | postgres + wiremock | Poll → POST → verify request body + headers |
+| Redis relay E2E | postgres + redis | Poll → XADD → XRANGE; verify stream entries |
+| PG inbox relay E2E | postgres (source) + postgres (target) | Poll → INSERT → verify inbox rows |
+| Consumer group E2E | postgres + nats + 2 relay instances | Verify no duplicates, crash recovery |
+| Claim-check E2E | postgres + nats | Large delta → cursor fetch → publish all rows |
+| Full-refresh E2E | postgres + nats | AUTO fallback → full-refresh header set |
+
+### E.3 Reverse Mode Integration Tests (Testcontainers)
+
+| Test | Containers | Validates |
+|------|-----------|-----------|
+| NATS → inbox E2E | nats + postgres | Publish to subject → relay consumes → verify inbox row |
+| Kafka → inbox E2E | kafka (redpanda) + postgres | Produce record → relay consumes → verify inbox row |
+| Webhook → inbox E2E | postgres | POST to relay webhook → verify inbox row; verify 200 response |
+| Redis → inbox E2E | redis + postgres | XADD → relay reads → verify inbox row |
+| stdin → inbox E2E | postgres | Pipe JSONL → relay reads → verify inbox row |
+| SQS → inbox E2E | localstack + postgres | Send message → relay receives → verify inbox row |
+| RabbitMQ → inbox E2E | rabbitmq + postgres | Publish to queue → relay consumes → verify inbox row |
+| Reverse dedup E2E | nats + postgres | Publish same message twice → verify only 1 inbox row |
+| Reverse crash recovery | kafka + postgres | Kill relay mid-batch → restart → verify no lost messages |
+
+### E.4 Benchmark
+
+- Forward throughput: relay 100K inline outbox rows to NATS; measure events/sec.
+- Forward throughput: relay 100K claim-check outbox rows; measure events/sec.
+- Reverse throughput: consume 100K Kafka messages → inbox; measure events/sec.
+- Latency: p50/p95/p99 poll-to-publish for a single event (both modes).
+- Memory: verify bounded memory during claim-check fetch (no full delta
+  buffering).
+
+---
+
+## Part F — Documentation & Distribution
+
+### F.1 Documentation
+
+| Document | Content |
+|----------|---------|
+| `pgtrickle-relay/README.md` | Quick start, installation, forward & reverse basic usage |
+| `docs/RELAY.md` | Comprehensive guide: all backends, config reference, deployment patterns |
+| `docs/SQL_REFERENCE.md` | Updated with relay-related SQL functions |
+| `docs/PATTERNS.md` | "Relay" section with worked examples per backend (forward + reverse) |
+
+### F.2 Distribution
+
+| Channel | Artifact |
+|---------|----------|
+| GitHub Releases | Pre-built binaries (Linux amd64/arm64, macOS amd64/arm64) |
+| Docker Hub | `grove/pgtrickle-relay:0.24.0` — minimal distroless image |
+| Cargo | `cargo install pgtrickle-relay` |
+| Homebrew | `brew install grove/tap/pgtrickle-relay` |
+
+#### Docker Image
+
+```dockerfile
+FROM rust:1.85-bookworm AS builder
+WORKDIR /src
+COPY . .
+RUN cargo build --release --bin pgtrickle-relay \
+    --features default
+
+FROM gcr.io/distroless/cc-debian12:nonroot
+COPY --from=builder /src/target/release/pgtrickle-relay /usr/local/bin/
+ENTRYPOINT ["pgtrickle-relay"]
+```
+
+#### Kubernetes Sidecar Pattern (Forward)
+
+```yaml
+containers:
+  - name: app
+    image: myapp:latest
+  - name: relay
+    image: grove/pgtrickle-relay:0.24.0
+    args: ["forward"]
+    env:
+      - name: PG_URL
+        valueFrom:
+          secretKeyRef:
+            name: pg-credentials
+            key: url
+      - name: RELAY_OUTBOX
+        value: order_events
+      - name: RELAY_SINK
+        value: nats
+      - name: RELAY_GROUP
+        value: order-publisher
+    ports:
+      - name: metrics
+        containerPort: 9090
+    livenessProbe:
+      httpGet:
+        path: /health
+        port: 9090
+    readinessProbe:
+      httpGet:
+        path: /health
+        port: 9090
+```
+
+#### Kubernetes Sidecar Pattern (Reverse)
+
+```yaml
+containers:
+  - name: app
+    image: myapp:latest
+  - name: relay
+    image: grove/pgtrickle-relay:0.24.0
+    args: ["reverse"]
+    env:
+      - name: PG_URL
+        valueFrom:
+          secretKeyRef:
+            name: pg-credentials
+            key: url
+      - name: RELAY_SOURCE
+        value: kafka
+      - name: RELAY_INBOX
+        value: external_events
+    ports:
+      - name: metrics
+        containerPort: 9090
+    livenessProbe:
+      httpGet:
+        path: /health
+        port: 9090
+```
+
+---
+
+## Part G — Implementation Roadmap
+
+### Phase 1 — Core Framework + Forward Tier 1 Sinks (10 days)
+
+| Item | Description | Effort |
+|------|-------------|--------|
+| RELAY-1 | Crate scaffold, CLI parsing (forward/reverse subcommands), config loading (TOML/YAML/JSON), error types, RelayMessage envelope | 1d |
+| RELAY-2 | Source + Sink traits, relay loop, cancellation token plumbing | 1d |
+| RELAY-3 | Outbox poller source (simple mode + consumer group mode) | 2d |
+| RELAY-4 | Payload decoder (inline + claim-check + full-refresh) | 1d |
+| RELAY-5 | Sink: stdout/file backend | 0.5d |
+| RELAY-6 | Sink: NATS JetStream | 1d |
+| RELAY-7 | Sink: HTTP webhook | 1d |
+| RELAY-8 | Sink: Apache Kafka | 1.5d |
+| RELAY-9 | Metrics endpoint + health check + signal handling + graceful shutdown | 1d |
+
+### Phase 2 — Forward Tier 2 Sinks (5 days)
+
+| Item | Description | Effort |
+|------|-------------|--------|
+| RELAY-10 | Sink: Redis Streams | 1d |
+| RELAY-11 | Sink: Amazon SQS | 1d |
+| RELAY-12 | Sink: PostgreSQL inbox (remote) | 1d |
+| RELAY-13 | Sink: RabbitMQ AMQP | 1d |
+| RELAY-14 | Subject/topic routing templates + key extraction | 1d |
+
+### Phase 3 — Reverse Mode Sources + Inbox Sink (10 days)
+
+| Item | Description | Effort |
+|------|-------------|--------|
+| RELAY-22 | Inbox sink (pg-trickle inbox writer with batch insert + ON CONFLICT dedup) | 1.5d |
+| RELAY-23 | Source: NATS JetStream consumer (durable pull consumer, ack after inbox write) | 1d |
+| RELAY-24 | Source: Apache Kafka consumer (manual offset commit after inbox write) | 1.5d |
+| RELAY-25 | Source: HTTP webhook receiver (axum server, synchronous ack) | 1d |
+| RELAY-26 | Source: Redis Streams consumer (XREADGROUP + XACK) | 1d |
+| RELAY-27 | Source: Amazon SQS consumer (ReceiveMessage + DeleteMessage) | 1d |
+| RELAY-28 | Source: RabbitMQ consumer (basic_consume + manual ack) | 1d |
+| RELAY-29 | Source: stdin/file reader | 0.5d |
+| RELAY-30 | Reverse-mode dedup key mapping + event type extraction config | 0.5d |
+
+### Phase 4 — Testing & Polish (7 days)
+
+| Item | Description | Effort |
+|------|-------------|--------|
+| RELAY-15 | Unit tests (payload, config, routing, retries, envelope, mock source/sink) | 1d |
+| RELAY-16 | Forward integration tests (NATS, Kafka, webhook, Redis, PG inbox) | 2d |
+| RELAY-17 | Forward consumer group E2E (multi-instance, crash recovery) | 1d |
+| RELAY-31 | Reverse integration tests (NATS→inbox, Kafka→inbox, webhook→inbox, Redis→inbox, SQS→inbox, RabbitMQ→inbox, stdin→inbox) | 2d |
+| RELAY-32 | Reverse dedup + crash recovery E2E | 0.5d |
+| RELAY-18 | Benchmarks (forward + reverse throughput, latency, memory) | 0.5d |
+
+### Phase 5 — Documentation & Distribution (2.5 days)
+
+| Item | Description | Effort |
+|------|-------------|--------|
+| RELAY-19 | Documentation (README, docs/RELAY.md, PATTERNS.md — covering both modes) | 1d |
+| RELAY-20 | Dockerfile + GitHub Actions CI for binary builds | 1d |
+| RELAY-21 | Release automation (GitHub Releases, Docker Hub, Homebrew) | 0.5d |
+
+> **Total: ~34.5 days solo / ~22 days with two developers**
+> (Phases 1–2 forward sinks and Phase 3 reverse sources can be parallelised.
+> Requires v0.23.0 outbox + consumer groups for full forward E2E testing;
+> reverse mode only needs inbox table schema.)
+
+### Dependencies
+
+- **Forward mode requires v0.23.0 outbox (Part A)** — the relay polls
+  `pgtrickle.outbox_<st>` and reads claim-check rows from
+  `pgtrickle.outbox_delta_rows_<st>`.
+- **Forward consumer group mode requires v0.23.0 Part B** — `poll_outbox()`,
+  `commit_offset()`, `consumer_heartbeat()`, `extend_lease()`.
+- **Reverse mode requires only an inbox table** — no dependency on outbox
+  implementation. Can be developed and tested independently.
+- **Both modes can be developed in parallel** with the outbox implementation:
+  mock the outbox table schema in integration tests until the real extension
+  is ready.
+
+---
+
+## Open Questions
+
+| # | Question | Options | Recommendation |
+|---|----------|---------|----------------|
+| 1 | Should the relay support multiple outboxes/sources in one process? | (a) One source per process (simpler, Kubernetes-native scaling), (b) Multi-source config (fewer processes) | **(a)** — one source per process. Scale via replicas. Simpler operationally. |
+| 2 | Should we support custom transforms (e.g. JMESPath, JSONata)? | (a) No transforms in v0.24.0, (b) JMESPath filter | **(a)** — out of scope. The stream table query itself is the transform layer. |
+| 3 | Dead-letter queue for the relay? | (a) Skip poison events + log, (b) DLQ table in PostgreSQL | **(a)** for v0.24.0. Log + metric is sufficient. DLQ can be added later. |
+| 4 | Should `pgtrickle-relay` be a workspace member or a separate repo? | (a) Workspace member (shared CI, version lock), (b) Separate repo | **(a)** — workspace member alongside `pgtrickle-tui`. Shared version, single release. |
+| 5 | Should NATS Micro integration be included for service discovery? | (a) Yes, (b) No | **(b)** for initial release. Can be added if demand exists. |
+| 6 | Google Cloud Pub/Sub as a backend? | (a) v0.24.0, (b) Post-v0.24.0 | **(b)** — add post-launch based on demand. |
+| 7 | Azure Service Bus as a backend? | (a) v0.24.0, (b) Post-v0.24.0 | **(b)** — add post-launch based on demand. |
+| 8 | Should reverse mode support arbitrary Sink (not just inbox)? | (a) Only inbox sink in v0.24.0, (b) Any sink | **(a)** — primary use-case is source→inbox. Arbitrary source→sink is architecturally possible but not a priority. |
+| 9 | Message format conversion (e.g. Avro, Protobuf)? | (a) JSON only in v0.24.0, (b) Schema registry integration | **(a)** — JSON only. Schema-aware deserialization is a post-v0.24.0 feature. |
