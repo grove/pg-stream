@@ -507,7 +507,7 @@ async fn test_crash_recovery_no_stale_running_records() {
     db.execute(
         "UPDATE pgtrickle.pgt_refresh_history
          SET status = 'FAILED',
-             finished_at = now(),
+             end_time = now(),
              error_message = 'Recovered from unclean shutdown (pg_ctl stop -m immediate)'
          WHERE status = 'RUNNING'",
     )
@@ -577,7 +577,7 @@ async fn test_crash_recovery_covers_all_stream_tables() {
     db.execute(
         "UPDATE pgtrickle.pgt_refresh_history
          SET status = 'FAILED',
-             finished_at = now(),
+             end_time = now(),
              error_message = 'Recovered from unclean shutdown'
          WHERE status = 'RUNNING'",
     )
@@ -627,7 +627,7 @@ async fn test_crash_recovery_does_not_suspend_stream_table() {
     db.execute(
         "UPDATE pgtrickle.pgt_refresh_history
          SET status = 'FAILED',
-             finished_at = now(),
+             end_time = now(),
              error_message = 'Recovered from unclean shutdown'
          WHERE status = 'RUNNING'",
     )
