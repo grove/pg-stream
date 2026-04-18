@@ -27,6 +27,7 @@
   - [A.11 Graceful Shutdown & Signal Handling](#a11-graceful-shutdown--signal-handling)
   - [A.12 Observability](#a12-observability)
   - [A.13 Error Handling & Retries](#a13-error-handling--retries)
+  - [A.14 Catalog Schema (Config Tables)](#a14-catalog-schema-config-tables)
 - [Part B — Sink Backends (Forward Mode)](#part-b--sink-backends-forward-mode)
   - [B.1 NATS JetStream](#b1-nats-jetstream)
   - [B.2 HTTP Webhook](#b2-http-webhook)
@@ -270,194 +271,78 @@ lapin = { version = "2", optional = true }
 ### A.2 CLI Interface
 
 ```
-pgtrickle-relay <COMMAND> [OPTIONS]
+pgtrickle-relay [OPTIONS]
+pgtrickle-relay config <SUBCOMMAND>
 
-COMMANDS:
-  forward     Relay outbox → external sinks (default)
-  reverse     Relay external sources → inbox
-  validate    Validate config, test connections, exit
-  schema      Print JSON schema of the relay message envelope
-  completion  Generate shell completions
-
-COMMON OPTIONS:
-  -c, --config <FILE>           Path to config file (TOML, YAML, or JSON;
-                                format auto-detected by extension:
-                                .toml, .yaml/.yml, .json)
-      --pg-url <URL>            PostgreSQL connection string [env: PG_URL]
+STARTUP OPTIONS:
+      --postgres-url <URL>      PostgreSQL connection string (required)
+                                [env: PGTRICKLE_RELAY_POSTGRES_URL]
       --metrics-addr <ADDR>     Prometheus metrics + health endpoint
-                                (default: 0.0.0.0:9090) [env: RELAY_METRICS_ADDR]
+                                (default: 0.0.0.0:9090)
       --log-format <FMT>        Log format: text, json (default: text)
-                                [env: RELAY_LOG_FORMAT]
-      --log-level <LEVEL>       Log level (default: info) [env: RELAY_LOG_LEVEL]
+      --log-level <LEVEL>       Log level (default: info)
   -V, --version                 Print version
   -h, --help                    Print help
 
-FORWARD-SPECIFIC OPTIONS:
-      --outbox <NAME>           Stream table name to relay [env: RELAY_OUTBOX]
-      --sink <SINK>             Sink backend: nats, webhook, kafka, stdout,
-                                redis, sqs, pg-inbox, rabbitmq [env: RELAY_SINK]
-      --group <NAME>            Consumer group name (enables group mode)
-                                [env: RELAY_GROUP]
-      --consumer-id <ID>        Consumer ID within group (default: hostname)
-                                [env: RELAY_CONSUMER_ID]
-      --batch-size <N>          Rows per poll (default: 100) [env: RELAY_BATCH_SIZE]
-      --poll-interval <MS>      Milliseconds between empty polls (default: 1000)
-                                [env: RELAY_POLL_INTERVAL_MS]
-      --visibility-seconds <N>  Lease visibility timeout (default: 30)
-                                [env: RELAY_VISIBILITY_SECONDS]
-
-REVERSE-SPECIFIC OPTIONS:
-      --source <SOURCE>         Source backend: nats, webhook, kafka, stdin,
-                                redis, sqs, rabbitmq [env: RELAY_SOURCE]
-      --inbox <NAME>            Inbox table name to write to [env: RELAY_INBOX]
-      --inbox-schema <SCHEMA>   Schema for inbox table (default: public)
-                                [env: RELAY_INBOX_SCHEMA]
-
-BACKEND-SPECIFIC OPTIONS (passed via config file or --source-opt/--sink-opt KEY=VALUE):
-  See documentation for each backend.
+CONFIG SUBCOMMANDS (manage pipelines stored in pgtrickle.relay_*_config):
+  config list                   Show all outbox + inbox pipelines and enabled status
+  config show <name>            Show config JSONB for a named pipeline
+  config set outbox <name> --config <json>  Upsert a forward pipeline
+  config set inbox  <name> --config <json>  Upsert a reverse pipeline
+  config enable  <name>         Enable a pipeline (starts immediately via NOTIFY)
+  config disable <name>         Disable a pipeline (stops immediately via NOTIFY)
+  config delete  <name>         Delete a pipeline row
 ```
 
 ### A.3 Configuration
 
-Configuration is resolved in priority order (highest wins):
+The relay has no config file and no environment variables for pipeline
+definitions. All pipeline config lives in the database (see [A.14](#a14-catalog-schema-config-tables)).
+The only required input at startup is the PostgreSQL connection URL:
 
-1. CLI flags
-2. Environment variables
-3. Config file (TOML, YAML, or JSON — format auto-detected from extension:
-   `.toml`, `.yaml` / `.yml`, `.json`; default filename searched in order:
-   `relay.toml`, `relay.yaml`, `relay.yml`, `relay.json`)
-4. Built-in defaults
+```bash
+# Minimal startup
+pgtrickle-relay --postgres-url postgres://relay:password@localhost/mydb
 
-All three formats are equivalent at runtime; TOML is the recommended default
-because it is already used throughout the pg-trickle workspace.
-
-#### Config File Examples
-
-**TOML** (`relay.toml` — recommended):
-
-##### Forward Mode Example
-
-```toml
-[postgres]
-url = "postgres://user:password@localhost/mydb"
-
-[forward]
-outbox = "order_events"
-sink = "nats"
-group = "order-publisher"
-consumer_id = "relay-1"       # default: hostname
-batch_size = 100
-poll_interval_ms = 1000
-visibility_seconds = 30
-
-[metrics]
-addr = "0.0.0.0:9090"
-enabled = true
-
-[logging]
-format = "json"     # text | json
-level = "info"
-
-# Subject/topic template — available variables:
-#   {stream_table}, {event_type}, {outbox_id}, {refresh_id}
-[routing]
-subject_template = "pgtrickle.{stream_table}"
-# Optional per-event-type override:
-# [routing.overrides]
-# "order.created" = "orders.created"
-# "order.shipped" = "orders.shipped"
-
-# Sink-specific configuration
-[sink.nats]
-url = "nats://localhost:4222"
-# See B.1 for full options
+# Or via the single supported env var (bootstrap only)
+export PGTRICKLE_RELAY_POSTGRES_URL=postgres://relay:password@localhost/mydb
+pgtrickle-relay
 ```
 
-##### Reverse Mode Example
+On startup the relay:
+1. Connects to PostgreSQL
+2. Queries `pgtrickle.relay_outbox_config` and `pgtrickle.relay_inbox_config`
+   for all `enabled = true` rows
+3. Spawns one tokio task per pipeline
+4. Subscribes to `LISTEN pgtrickle_relay_config` for hot-reload
 
-```toml
-[postgres]
-url = "postgres://user:password@localhost/mydb"
+If either table does not exist the relay exits with a clear error.
 
-[reverse]
-source = "kafka"
-inbox = "external_events"
-inbox_schema = "public"
+#### Example Pipeline Inserts
 
-[metrics]
-addr = "0.0.0.0:9090"
-enabled = true
+Pipelines are managed via SQL or the `config` subcommands:
 
-[logging]
-format = "json"
-level = "info"
+```sql
+-- Forward: outbox → NATS
+INSERT INTO pgtrickle.relay_outbox_config (name, config) VALUES (
+    'orders-to-nats',
+    '{"source_type": "outbox", "source": {"outbox": "order_events", "group": "order-publisher"},
+      "sink_type":   "nats",   "sink":   {"url": "nats://localhost:4222"}}'
+);
 
-# Source-specific configuration
-[source.kafka]
-brokers = "localhost:9092"
-topic = "external-events"
-group_id = "pgtrickle-inbox-writer"
-# See C.3 for full options
+-- Reverse: Kafka → inbox
+INSERT INTO pgtrickle.relay_inbox_config (name, config) VALUES (
+    'kafka-to-orders',
+    '{"source_type": "kafka",    "source": {"brokers": "localhost:9092", "topic": "orders"},
+      "sink_type":   "pg-inbox", "sink":   {"inbox_table": "order_inbox"}}'
+);
 ```
 
-**YAML** (`relay.yaml`):
+Or via CLI:
 
-##### Forward Mode Example
-
-```yaml
-postgres:
-  url: postgres://user:password@localhost/mydb
-
-forward:
-  outbox: order_events
-  sink: nats
-  group: order-publisher
-  consumer_id: relay-1
-  batch_size: 100
-  poll_interval_ms: 1000
-  visibility_seconds: 30
-
-routing:
-  subject_template: "pgtrickle.{stream_table}"
-
-sink:
-  nats:
-    url: nats://localhost:4222
-```
-
-##### Reverse Mode Example
-
-```yaml
-postgres:
-  url: postgres://user:password@localhost/mydb
-
-reverse:
-  source: kafka
-  inbox: external_events
-  inbox_schema: public
-
-source:
-  kafka:
-    brokers: localhost:9092
-    topic: external-events
-    group_id: pgtrickle-inbox-writer
-```
-
-**JSON** (`relay.json`) — Forward Mode Example:
-
-```json
-{
-  "postgres": { "url": "postgres://user:password@localhost/mydb" },
-  "forward": {
-    "outbox": "order_events",
-    "sink": "nats",
-    "group": "order-publisher",
-    "batch_size": 100
-  },
-  "sink": {
-    "nats": { "url": "nats://localhost:4222" }
-  }
-}
+```bash
+pgtrickle-relay config set outbox orders-to-nats \
+  --config '{"source_type":"outbox","source":{"outbox":"order_events"},"sink_type":"nats","sink":{"url":"nats://localhost:4222"}}'
 ```
 
 ### A.4 Relay Modes (Forward & Reverse)
@@ -897,6 +782,63 @@ source/sink disconnected). Suitable for Kubernetes liveness/readiness probes.
 | Inbox write failure (permanent) | Log error, skip message, emit `relay_errors_total{kind="inbox_permanent"}`. |
 
 All retries use jittered exponential backoff to avoid thundering herds.
+
+---
+
+### A.14 Catalog Schema (Config Tables)
+
+Pipeline definitions live in two tables created by the pg-trickle extension
+migration (same schema as other catalog tables). All backend-specific settings
+go in the `config` JSONB column; validation happens in Rust at load time.
+
+```sql
+-- Forward pipelines: outbox → sink
+CREATE TABLE pgtrickle.relay_outbox_config (
+    name     TEXT PRIMARY KEY,
+    enabled  BOOLEAN NOT NULL DEFAULT true,
+    config   JSONB NOT NULL  -- {source_type, source, sink_type, sink}
+);
+
+-- Reverse pipelines: source → inbox
+CREATE TABLE pgtrickle.relay_inbox_config (
+    name     TEXT PRIMARY KEY,
+    enabled  BOOLEAN NOT NULL DEFAULT true,
+    config   JSONB NOT NULL  -- {source_type, source, sink_type, sink}
+);
+
+-- One shared trigger function; TG_TABLE_NAME identifies the direction
+CREATE OR REPLACE FUNCTION pgtrickle.relay_config_notify()
+RETURNS TRIGGER LANGUAGE plpgsql AS $$
+BEGIN
+    PERFORM pg_notify(
+        'pgtrickle_relay_config',
+        json_build_object(
+            'direction', TG_TABLE_NAME,
+            'event',     TG_OP,
+            'name',      COALESCE(NEW.name, OLD.name),
+            'enabled',   COALESCE(NEW.enabled, OLD.enabled)
+        )::text
+    );
+    RETURN NULL;
+END;
+$$;
+
+CREATE TRIGGER relay_outbox_config_notify
+    AFTER INSERT OR UPDATE OR DELETE ON pgtrickle.relay_outbox_config
+    FOR EACH ROW EXECUTE FUNCTION pgtrickle.relay_config_notify();
+
+CREATE TRIGGER relay_inbox_config_notify
+    AFTER INSERT OR UPDATE OR DELETE ON pgtrickle.relay_inbox_config
+    FOR EACH ROW EXECUTE FUNCTION pgtrickle.relay_config_notify();
+```
+
+The relay subscribes to `LISTEN pgtrickle_relay_config` after startup:
+- `INSERT` with `enabled = true` → start a new pipeline task
+- `UPDATE` → gracefully restart the named pipeline with the new config
+- `DELETE` or `UPDATE` with `enabled = false` → gracefully stop the pipeline
+
+Credentials must not be stored as plaintext in `config` JSONB. Use env var
+references (e.g. `{"password_env": "KAFKA_PASSWORD"}`) resolved at runtime.
 
 ---
 
@@ -1470,7 +1412,7 @@ containers:
 
 | Item | Description | Effort |
 |------|-------------|--------|
-| RELAY-1 | Crate scaffold, CLI parsing (forward/reverse subcommands), config loading (TOML/YAML/JSON), error types, RelayMessage envelope | 1d |
+| RELAY-1 | Crate scaffold, CLI parsing (`--postgres-url`, `config` subcommands), DB bootstrap (load tables, LISTEN/NOTIFY), error types, RelayMessage envelope | 1.5d |
 | RELAY-2 | Source + Sink traits, relay loop, cancellation token plumbing | 1d |
 | RELAY-3 | Outbox poller source (simple mode + consumer group mode) | 2d |
 | RELAY-4 | Payload decoder (inline + claim-check + full-refresh) | 1d |
@@ -1523,7 +1465,7 @@ containers:
 | RELAY-20 | Dockerfile + GitHub Actions CI for binary builds | 1d |
 | RELAY-21 | Release automation (GitHub Releases, Docker Hub, Homebrew) | 0.5d |
 
-> **Total: ~34.5 days solo / ~22 days with two developers**
+> **Total: ~36 days solo / ~23 days with two developers**
 > (Phases 1–2 forward sinks and Phase 3 reverse sources can be parallelised.
 > Requires v0.23.0 outbox + consumer groups for full forward E2E testing;
 > reverse mode only needs inbox table schema.)

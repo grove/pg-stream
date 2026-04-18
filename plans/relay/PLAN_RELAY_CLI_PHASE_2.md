@@ -37,7 +37,6 @@
   - [B.12 Plugin System (Dynamic Backends)](#b12-plugin-system-dynamic-backends)
   - [B.13 Encryption Envelope](#b13-encryption-envelope)
   - [B.14 Webhook Signature Verification](#b14-webhook-signature-verification)
-  - [B.15 Database-Stored Configuration](#b15-database-stored-configuration)
 - [Part C — Testing Strategy](#part-c--testing-strategy)
 - [Part D — Implementation Roadmap](#part-d--implementation-roadmap)
 - [Open Questions](#open-questions)
@@ -1109,136 +1108,6 @@ header = "X-Webhook-Signature"            # header containing the signature
 
 ---
 
-### B.15 Database-Stored Configuration
-
-**Problem:** Phase 1 config lives in files or env vars. This makes
-multi-pipeline management cumbersome, requires SIGHUP or restarts to apply
-changes, and doesn't integrate with the pg-trickle catalog.
-
-**Design:** DB is the only config source. Two tables — one for forward
-pipelines (outbox → sink) and one for reverse (source → inbox) — keep
-the direction implicit in the table name. All backend-specific settings live
-in a single `config` JSONB column. The only config required outside the DB
-is the PostgreSQL connection URL (passed via `--postgres-url` CLI flag).
-
-#### Catalog Schema
-
-```sql
--- Forward pipelines: outbox → sink
-CREATE TABLE pgtrickle.relay_outbox_config (
-    name     TEXT PRIMARY KEY,
-    enabled  BOOLEAN NOT NULL DEFAULT true,
-    config   JSONB NOT NULL  -- {source_type, source, sink_type, sink}
-);
-
--- Reverse pipelines: source → inbox
-CREATE TABLE pgtrickle.relay_inbox_config (
-    name     TEXT PRIMARY KEY,
-    enabled  BOOLEAN NOT NULL DEFAULT true,
-    config   JSONB NOT NULL  -- {source_type, source, sink_type, sink}
-);
-```
-
-All pipeline settings — source type, sink type, connection details, and any
-backend-specific options — live in the `config` JSONB column. Validation is
-done in Rust when the row is loaded.
-
-**Example rows:**
-
-```sql
--- Forward: outbox → Kafka
-INSERT INTO pgtrickle.relay_outbox_config (name, config) VALUES (
-    'orders-to-kafka',
-    '{"source_type": "outbox", "source": {"outbox": "order_events"},
-      "sink_type":   "kafka",  "sink":   {"brokers": "localhost:9092", "topic": "orders"}}'
-);
-
--- Reverse: Kafka → inbox
-INSERT INTO pgtrickle.relay_inbox_config (name, config) VALUES (
-    'kafka-to-orders',
-    '{"source_type": "kafka",    "source": {"brokers": "localhost:9092", "topic": "orders"},
-      "sink_type":   "pg-inbox", "sink":   {"inbox_table": "orders_inbox"}}'
-);
-```
-
-#### Bootstrap
-
-Pass the database URL and the relay starts:
-
-```bash
-pgtrickle-relay --postgres-url postgres://relay:password@localhost/mydb
-```
-
-The relay queries both tables:
-
-```sql
-SELECT 'forward', name, config FROM pgtrickle.relay_outbox_config WHERE enabled = true
-UNION ALL
-SELECT 'reverse', name, config FROM pgtrickle.relay_inbox_config  WHERE enabled = true;
-```
-
-Spawns one tokio task per row and subscribes to LISTEN/NOTIFY for hot-reload.
-If either table does not exist the relay exits with a clear error.
-
-#### LISTEN/NOTIFY Hot-Reload
-
-```sql
-CREATE OR REPLACE FUNCTION pgtrickle.relay_config_notify()
-RETURNS TRIGGER LANGUAGE plpgsql AS $$
-BEGIN
-    PERFORM pg_notify(
-        'pgtrickle_relay_config',
-        json_build_object(
-            'direction', TG_TABLE_NAME,  -- 'relay_outbox_config' | 'relay_inbox_config'
-            'event',     TG_OP,
-            'name',      COALESCE(NEW.name, OLD.name),
-            'enabled',   COALESCE(NEW.enabled, OLD.enabled)
-        )::text
-    );
-    RETURN NULL;
-END;
-$$;
-
-CREATE TRIGGER relay_outbox_config_notify
-    AFTER INSERT OR UPDATE OR DELETE ON pgtrickle.relay_outbox_config
-    FOR EACH ROW EXECUTE FUNCTION pgtrickle.relay_config_notify();
-
-CREATE TRIGGER relay_inbox_config_notify
-    AFTER INSERT OR UPDATE OR DELETE ON pgtrickle.relay_inbox_config
-    FOR EACH ROW EXECUTE FUNCTION pgtrickle.relay_config_notify();
-```
-
-The relay's config watcher listens on `pgtrickle_relay_config`:
-- `INSERT` with `enabled = true` → start new pipeline task
-- `UPDATE` → gracefully restart named pipeline with new config
-- `DELETE` or `UPDATE` with `enabled = false` → gracefully stop pipeline
-
-Changes take effect within milliseconds, no restart or SIGHUP needed.
-
-#### CLI Commands
-
-```
-pgtrickle-relay --postgres-url <url>              # Start relay (all enabled pipelines)
-pgtrickle-relay config list                       # Show all pipelines (both tables) + status
-pgtrickle-relay config show <name>                # Show config JSONB for a pipeline
-pgtrickle-relay config set outbox <name> --config <json>   # Upsert forward pipeline
-pgtrickle-relay config set inbox  <name> --config <json>   # Upsert reverse pipeline
-pgtrickle-relay config enable  <name>
-pgtrickle-relay config disable <name>
-pgtrickle-relay config delete  <name>
-```
-
-#### Security
-
-- Standard PostgreSQL RBAC: grant `SELECT` to relay's DB user;
-  `INSERT/UPDATE/DELETE` to administrator roles only.
-- Do not store plaintext credentials in the `config` JSONB — use a secrets
-  manager reference (e.g. `{"password_env": "KAFKA_PASSWORD"}`).
-
-**Effort:** 1.5d
-
----
-
 ## Part C — Testing Strategy
 
 ### C.1 New Backend Tests (Testcontainers)
@@ -1273,9 +1142,8 @@ pgtrickle-relay config delete  <name>
 | OTel tracing E2E | Verify spans exported to OTLP collector |
 | Encryption E2E | Encrypt → publish → decrypt → verify payload |
 | Webhook signature E2E | Signed POST accepted; unsigned POST rejected with 401 |
-| DB config — both tables exist, rows found | Relay loads all enabled pipelines from both tables; spawns one task per row |
-| DB config — table missing | Relay exits with clear error message |
-| DB config — no enabled rows | Relay starts but idles; resumes when a row is enabled via LISTEN/NOTIFY |
+| DB config — outbox pipeline loaded | Relay reads `relay_outbox_config`; forward pipeline starts correctly |
+| DB config — inbox pipeline loaded | Relay reads `relay_inbox_config`; reverse pipeline starts correctly |
 | DB config — LISTEN/NOTIFY reload | Update row → relay restarts affected pipeline within 1 second |
 | DB config — enable/disable | UPDATE `enabled = false/true` → task stops/starts immediately |
 | DB config — DB down during run | Existing pipelines keep running; reconnect when DB recovers |
@@ -1316,7 +1184,7 @@ pgtrickle-relay config delete  <name>
 | RELAY-P2-9 | Sink + Source: Apache Pulsar | *deferred — P3* |
 | RELAY-P2-10 | Sink + Source: Arrow Flight / gRPC | *deferred — P3* |
 
-### Phase 2c — Operational Excellence (18 days)
+### Phase 2c — Operational Excellence (16.5 days)
 
 | Item | Description | Effort |
 |------|-------------|--------|
@@ -1331,23 +1199,21 @@ pgtrickle-relay config delete  <name>
 | RELAY-P2-19 | Dry-run & replay mode (--dry-run, --replay, --from-offset) | 1d |
 | RELAY-P2-20 | OpenTelemetry tracing (OTLP export + context propagation) | 1.5d |
 | RELAY-P2-21 | Webhook signature verification (HMAC, GitHub, Stripe, Svix) | 1d |
-| RELAY-P2-22 | DB-stored config: `pgtrickle.relay_outbox_config` + `relay_inbox_config` tables + shared LISTEN/NOTIFY trigger + CLI commands | 1.5d |
 
-### Phase 2d — Testing & Polish (7 days)
+### Phase 2d — Testing & Polish (6 days)
 
 | Item | Description | Effort |
 |------|-------------|--------|
 | RELAY-P2-23 | Backend integration tests (Pub/Sub, Kinesis, Service Bus, ES, MQTT, ClickHouse, S3) | 3d |
 | RELAY-P2-24 | Extension integration tests (DLQ, schema registry, transforms, routing, rate limit, circuit breaker, multi-pipeline, hot-reload, dry-run, replay, OTel, encryption, webhook sig) | 2d |
-| RELAY-P2-25 | DB config integration tests: both tables exist → use DB config; tables missing → fallback; LISTEN/NOTIFY reload on both | 1d |
-| RELAY-P2-26 | Benchmarks (new backends + extensions overhead) | 1d |
+| RELAY-P2-25 | Benchmarks (new backends + extensions overhead) | 1d |
 
 ### Phase 2e — Documentation & Distribution (2 days)
 
 | Item | Description | Effort |
 |------|-------------|--------|
-| RELAY-P2-27 | Documentation updates (new backends, extensions, config reference, DB config guide) | 1d |
-| RELAY-P2-28 | Docker image with all features + updated CI matrix | 1d |
+| RELAY-P2-26 | Documentation updates (new backends, extensions, config reference) | 1d |
+| RELAY-P2-27 | Docker image with all features + updated CI matrix | 1d |
 
 ### Deferred to Phase 3
 
@@ -1370,10 +1236,10 @@ pgtrickle-relay config delete  <name>
 |-------|--------|
 | Phase 2a — Cloud Provider Parity | 9d |
 | Phase 2b — IoT, Analytics & Data Lake | 7.5d |
-| Phase 2c — Operational Excellence | 18d |
-| Phase 2d — Testing & Polish | 7d |
+| Phase 2c — Operational Excellence | 16.5d |
+| Phase 2d — Testing & Polish | 6d |
 | Phase 2e — Documentation & Distribution | 2d |
-| **Total** | **~43 days solo / ~27 days with two developers** |
+| **Total** | **~41 days solo / ~26 days with two developers** |
 
 Phases 2a and 2b (backends) can be parallelised with Phase 2c (extensions).
 With two developers, one focuses on backends while the other builds
@@ -1407,5 +1273,4 @@ operational features.
 | 6 | Priority: Schema Registry or DLQ first? | (a) DLQ, (b) Schema Registry | **(a)** — DLQ is universally needed. Schema Registry is use-case dependent. |
 | 7 | Should Elasticsearch full-refresh use alias rotation or delete+reindex? | (a) Alias rotation (zero-downtime), (b) Delete + reindex | **(a)** — alias rotation is the standard Elasticsearch practice. |
 | 8 | Should we support ClickHouse via HTTP or native protocol? | (a) HTTP (simpler), (b) Native (faster) | **(a)** for Phase 2 — HTTP is simpler and well-supported by the `clickhouse` crate. |
-| 9 | Should relay credentials in the `config` JSONB be stored encrypted? | (a) Reference-only (env var names in JSON), (b) pgcrypto encryption, (c) External KMS | **(a)** for Phase 2 — store references like `{"password_env": "KAFKA_PASSWORD"}`, resolve at runtime. Encrypted storage is Phase 3. |
-| 10 | Should `pgtrickle-relay config set` accept a JSON string or a file? | (a) File only (explicit, reviewable), (b) Both inline JSON and file | **(b)** — inline JSON for quick changes, file for declarative deployment. |
+| 9 | Should `pgtrickle-relay config set` accept a JSON string or a file? | (a) Inline JSON string, (b) File path | **(a)** for CLI convenience; both supported. |
