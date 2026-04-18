@@ -840,6 +840,75 @@ The relay subscribes to `LISTEN pgtrickle_relay_config` after startup:
 Credentials must not be stored as plaintext in `config` JSONB. Use env var
 references (e.g. `{"password_env": "KAFKA_PASSWORD"}`) resolved at runtime.
 
+#### SQL API Functions
+
+Seven PL/pgSQL wrapper functions provide a public API for managing relay
+pipelines without requiring direct table access. Validation of required JSONB
+keys and direction constraints happens inside the functions, not in application
+code.
+
+```sql
+-- Upsert a forward pipeline (outbox → sink).
+-- source_type must be 'outbox'.
+SELECT pgtrickle.set_relay_outbox(
+    'orders-to-nats',
+    '{"source_type":"outbox","source":{"outbox":"orders","group":"order-relay"},
+      "sink_type":"nats","sink":{"url":"nats://localhost:4222"}}'
+);
+
+-- Upsert a reverse pipeline (source → inbox).
+-- sink_type must be 'pg-inbox'.
+SELECT pgtrickle.set_relay_inbox(
+    'kafka-to-orders',
+    '{"source_type":"kafka","source":{"brokers":"localhost:9092","topic":"orders"},
+      "sink_type":"pg-inbox","sink":{"inbox_table":"order_inbox"}}'
+);
+
+-- Enable / disable a pipeline by name (searches both tables).
+SELECT pgtrickle.enable_relay('orders-to-nats');
+SELECT pgtrickle.disable_relay('kafka-to-orders');
+
+-- Delete a pipeline by name (searches both tables).
+SELECT pgtrickle.delete_relay('orders-to-nats');
+
+-- Fetch config for a single named pipeline.
+SELECT * FROM pgtrickle.get_relay_config('orders-to-nats');
+-- Returns: name TEXT, direction TEXT, enabled BOOLEAN, config JSONB
+
+-- List all pipelines (both directions).
+SELECT * FROM pgtrickle.list_relay_configs();
+-- Returns rows for every entry in relay_outbox_config and relay_inbox_config.
+```
+
+All functions are schema-qualified and raise exceptions with clear messages on
+missing pipelines or invalid configs. The underlying table names are not part
+of the public API.
+
+#### Access Control
+
+Direct table access is revoked; all mutations go through the API functions.
+The migration includes:
+
+```sql
+-- Revoke direct table access from the relay role
+REVOKE ALL ON pgtrickle.relay_outbox_config FROM pgtrickle_relay;
+REVOKE ALL ON pgtrickle.relay_inbox_config  FROM pgtrickle_relay;
+
+-- Grant execute on the API functions only
+GRANT EXECUTE ON FUNCTION pgtrickle.set_relay_outbox(TEXT, JSONB, BOOLEAN)  TO pgtrickle_relay;
+GRANT EXECUTE ON FUNCTION pgtrickle.set_relay_inbox(TEXT, JSONB, BOOLEAN)   TO pgtrickle_relay;
+GRANT EXECUTE ON FUNCTION pgtrickle.enable_relay(TEXT)                      TO pgtrickle_relay;
+GRANT EXECUTE ON FUNCTION pgtrickle.disable_relay(TEXT)                     TO pgtrickle_relay;
+GRANT EXECUTE ON FUNCTION pgtrickle.delete_relay(TEXT)                      TO pgtrickle_relay;
+GRANT EXECUTE ON FUNCTION pgtrickle.get_relay_config(TEXT)                  TO pgtrickle_relay;
+GRANT EXECUTE ON FUNCTION pgtrickle.list_relay_configs()                    TO pgtrickle_relay;
+```
+
+The functions run with `SECURITY DEFINER` so they can access the underlying
+tables on behalf of any caller granted `EXECUTE`, without exposing the tables
+directly. Superusers and the `pgtrickle` role (extension owner) retain full
+table access for administrative purposes.
+
 ---
 
 ## Part B — Sink Backends (Forward Mode)
@@ -1408,10 +1477,11 @@ containers:
 
 ## Part G — Implementation Roadmap
 
-### Phase 1 — Core Framework + Forward Tier 1 Sinks (10 days)
+### Phase 1 — Core Framework + Forward Tier 1 Sinks (10.5 days)
 
 | Item | Description | Effort |
 |------|-------------|--------|
+| RELAY-CAT | **Catalog schema + SQL API.** `sql/pg_trickle--0.23.0--0.24.0.sql`: create `relay_outbox_config` + `relay_inbox_config` tables, shared `relay_config_notify()` trigger, and 7 SQL wrapper functions (`set_relay_outbox`, `set_relay_inbox`, `enable_relay`, `disable_relay`, `delete_relay`, `get_relay_config`, `list_relay_configs`). | 0.5d |
 | RELAY-1 | Crate scaffold, CLI parsing (`--postgres-url`, `config` subcommands), DB bootstrap (load tables, LISTEN/NOTIFY), error types, RelayMessage envelope | 1.5d |
 | RELAY-2 | Source + Sink traits, relay loop, cancellation token plumbing | 1d |
 | RELAY-3 | Outbox poller source (simple mode + consumer group mode) | 2d |
@@ -1465,7 +1535,7 @@ containers:
 | RELAY-20 | Dockerfile + GitHub Actions CI for binary builds | 1d |
 | RELAY-21 | Release automation (GitHub Releases, Docker Hub, Homebrew) | 0.5d |
 
-> **Total: ~36 days solo / ~23 days with two developers**
+> **Total: ~36.5 days solo / ~23 days with two developers**
 > (Phases 1–2 forward sinks and Phase 3 reverse sources can be parallelised.
 > Requires v0.23.0 outbox + consumer groups for full forward E2E testing;
 > reverse mode only needs inbox table schema.)

@@ -6489,7 +6489,8 @@ Dependencies: DB-3 (uses schema version to determine needed migrations). Schema 
 
 | Item | Description | Effort | Ref |
 |------|-------------|--------|-----|
-| RELAY-1 | **Crate scaffold.** Workspace member `pgtrickle-relay/` with `Cargo.toml`, feature flags per backend, CLI parsing via `clap` (`forward`/`reverse` subcommands), config merging (CLI > env > file > defaults) supporting TOML (primary), YAML, and JSON, `RelayError` enum, `RelayMessage` envelope type. | 1d | [PLAN_RELAY_CLI.md](plans/relay/PLAN_RELAY_CLI.md) §A.1–A.3, §A.7 |
+| RELAY-CAT | **Catalog schema + SQL API.** `sql/pg_trickle--0.23.0--0.24.0.sql`: create `pgtrickle.relay_outbox_config` + `pgtrickle.relay_inbox_config` tables, shared `relay_config_notify()` trigger (uses `TG_TABLE_NAME` to identify direction), and 7 `SECURITY DEFINER` SQL wrapper functions: `set_relay_outbox`, `set_relay_inbox`, `enable_relay`, `disable_relay`, `delete_relay`, `get_relay_config`, `list_relay_configs`. Functions validate required JSONB keys and raise clear exceptions. Direct table access is revoked from `pgtrickle_relay`; only `EXECUTE` on the API functions is granted — tables are an internal implementation detail. | 0.5d | [PLAN_RELAY_CLI.md](plans/relay/PLAN_RELAY_CLI.md) §A.14 |
+| RELAY-1 | **Crate scaffold.** Workspace member `pgtrickle-relay/` with `Cargo.toml`, feature flags per backend, CLI parsing via `clap` (`--postgres-url`, `config` subcommands), DB bootstrap (connect to PG, load `relay_outbox_config` + `relay_inbox_config`, `LISTEN pgtrickle_relay_config`), `RelayError` enum, `RelayMessage` envelope type. | 1.5d | [PLAN_RELAY_CLI.md](plans/relay/PLAN_RELAY_CLI.md) §A.1–A.3, §A.7 |
 | RELAY-2 | **Source + Sink traits + relay loop.** `async trait Source` with `poll`/`acknowledge`, `async trait Sink` with `publish`/`is_healthy`. Generic relay loop composing any source with any sink via `CancellationToken`. | 1d | [PLAN_RELAY_CLI.md](plans/relay/PLAN_RELAY_CLI.md) §A.4–A.6 |
 | RELAY-3 | **Outbox poller source.** Simple mode (offset tracked in memory) and consumer group mode (`poll_outbox()` + `commit_offset()`). Heartbeat background task. Lease renewal via `extend_lease()`. | 2d | [PLAN_RELAY_CLI.md](plans/relay/PLAN_RELAY_CLI.md) §A.8 |
 | RELAY-4 | **Payload decoder.** All four modes: inline differential, inline full-refresh, claim-check differential, claim-check full-refresh. Server-side cursor for claim-check rows. `outbox_rows_consumed()` called after cursor consumption. | 1d | [PLAN_RELAY_CLI.md](plans/relay/PLAN_RELAY_CLI.md) §A.9 |
@@ -6499,7 +6500,7 @@ Dependencies: DB-3 (uses schema version to determine needed migrations). Schema 
 | RELAY-8 | **Sink: Apache Kafka.** `rdkafka`. Idempotent producer. Dedup key as record key. Topic template. Compression, acks, SASL/SSL. | 1.5d | [PLAN_RELAY_CLI.md](plans/relay/PLAN_RELAY_CLI.md) §B.3 |
 | RELAY-9 | **Observability + shutdown.** `axum` at `:9090/metrics` + `GET /health`. Prometheus counters for both modes. SIGTERM/SIGINT graceful shutdown. | 1d | [PLAN_RELAY_CLI.md](plans/relay/PLAN_RELAY_CLI.md) §A.11–A.12 |
 
-> **Phase 1 subtotal: ~10 days**
+> **Phase 1 subtotal: ~10.5 days**
 
 ### Phase 2 — Forward Tier 2 Sinks
 
@@ -6562,12 +6563,17 @@ Dependencies: DB-3 (uses schema version to determine needed migrations). Schema 
 | Phase 4 | Tests: unit, Testcontainers integration (forward + reverse), consumer group E2E, benchmarks | Days 25–32 |
 | Phase 5 | Distribution: Docker, CI binaries, Homebrew, docs, cargo publish | Days 32–34.5 |
 
-> **v0.24.0 total: ~34.5 days solo / ~22 days with two developers**
+> **v0.24.0 total: ~36.5 days solo / ~23 days with two developers**
 > (Phases 1–2 forward sinks and Phase 3 reverse sources can be parallelised.
 > Requires v0.23.0 outbox + consumer groups for full forward E2E; reverse
 > mode only needs inbox table schema.)
 
 **Exit criteria:**
+- [ ] RELAY-CAT: Migration `sql/pg_trickle--0.23.0--0.24.0.sql` creates `relay_outbox_config` + `relay_inbox_config` tables and `relay_config_notify()` trigger
+- [ ] RELAY-CAT: `set_relay_outbox()` validates `source_type = 'outbox'`; `set_relay_inbox()` validates `sink_type = 'pg-inbox'`; missing keys raise clear exception
+- [ ] RELAY-CAT: `enable_relay()`/`disable_relay()`/`delete_relay()` search both tables; raise exception on missing name
+- [ ] RELAY-CAT: `list_relay_configs()` returns all pipelines with `direction` column; `get_relay_config()` raises on missing name
+- [ ] RELAY-CAT: functions are `SECURITY DEFINER`; `pgtrickle_relay` role has no direct table access; `SELECT * FROM pgtrickle.relay_outbox_config` fails with permission denied for relay role
 - [ ] RELAY-1: `pgtrickle-relay` crate builds with `--features default` and `--features nats,webhook,kafka`
 - [ ] RELAY-2: Source + Sink traits compose correctly; relay loop runs with mock source/sink
 - [ ] RELAY-3: Simple mode polls and forwards events; consumer group mode uses `poll_outbox()` + `commit_offset()` correctly
