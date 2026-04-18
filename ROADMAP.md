@@ -6094,27 +6094,27 @@ Dependencies: DB-3 (uses schema version to determine needed migrations). Schema 
 > **v0.21.0 total: ~6–8 weeks** (EC-01 fix + safety hardening + API ergonomics + Prometheus endpoint + test coverage + module refactor + shadow mode + docs)
 
 **Exit criteria:**
-- [ ] EC01-0: Q15 added to `IMMEDIATE_SKIP_ALLOWLIST` as stop-gap
-- [ ] EC01-1/EC01-2: `test_tpch_q07_ec01b_combined_delete` passes deterministically
-- [ ] EC01-3: Q07 and Q15 removed from IMMEDIATE/DIFFERENTIAL skip allowlists
-- [ ] EC01-4: Multi-cycle phantom proptest passes 5,000 iterations
-- [ ] SAF-1: All 28 production `.unwrap()` sites in `sublinks.rs` converted to `?`
-- [ ] SAF-2: `unsafe` block count reduced by ≥40%
-- [ ] SAF-3: `clippy::unwrap_used` lint gate passes with zero violations in non-test code
-- [ ] OP-6: `create_stream_table` warns or rejects queries using `now()`, `random()`, volatile UDFs without `non_deterministic => true`
-- [ ] TEST-1/2/3: ≥70 new unit tests across 3 previously-untested files
-- [ ] TEST-4: Fuzz target runs 1h with zero panics
-- [ ] TEST-5: Crash-recovery test passes deterministically
-- [ ] ARCH-1: `refresh.rs` split into 4 sub-modules; all existing tests pass unchanged
-- [ ] ARCH-2: `refresh_reason = 'recursive_cte_fallback'` visible in Prometheus/NOTIFY
-- [ ] OPS-1: `canary_diff()` / `canary_promote()` API functional with E2E tests
-- [ ] OP-2: Prometheus HTTP endpoint accessible at `pg_trickle.metrics_port`; all monitoring metrics present
-- [ ] OP-3: `pgtrickle.pause_all()` / `resume_all()` work idempotently; E2E test passes
-- [ ] OP-4: `pgtrickle.refresh_if_stale(name, max_age)` correctly gates refresh by age
-- [ ] OP-5: `pgtrickle.stream_table_definition(name)` returns accurate single-row result
-- [ ] DOC-1: `docs/PERFORMANCE_COOKBOOK.md` published
-- [ ] Extension upgrade path tested (`0.20.0 → 0.21.0`)
-- [ ] `just check-version-sync` passes
+- [x] EC01-0: Q15 added to `IMMEDIATE_SKIP_ALLOWLIST` as stop-gap
+- [x] EC01-1/EC01-2: `test_tpch_q07_ec01b_combined_delete` passes deterministically
+- [x] EC01-3: Q07 and Q15 removed from IMMEDIATE/DIFFERENTIAL skip allowlists
+- [x] EC01-4: Multi-cycle phantom proptest passes 5,000 iterations
+- [x] SAF-1: All 28 production `.unwrap()` sites in `sublinks.rs` converted to `?`
+- [x] SAF-2: `unsafe` block count reduced by ≥40%
+- [x] SAF-3: `clippy::unwrap_used` lint gate passes with zero violations in non-test code
+- [x] OP-6: `create_stream_table` warns or rejects queries using `now()`, `random()`, volatile UDFs without `non_deterministic => true`
+- [x] TEST-1/2/3: ≥70 new unit tests across 3 previously-untested files
+- [x] TEST-4: Fuzz target runs 1h with zero panics
+- [x] TEST-5: Crash-recovery test passes deterministically
+- [x] ARCH-1: `refresh.rs` split into 4 sub-modules; all existing tests pass unchanged
+- [x] ARCH-2: `refresh_reason = 'recursive_cte_fallback'` visible in Prometheus/NOTIFY
+- [x] OPS-1: `canary_diff()` / `canary_promote()` API functional with E2E tests
+- [x] OP-2: Prometheus HTTP endpoint accessible at `pg_trickle.metrics_port`; all monitoring metrics present
+- [x] OP-3: `pgtrickle.pause_all()` / `resume_all()` work idempotently; E2E test passes
+- [x] OP-4: `pgtrickle.refresh_if_stale(name, max_age)` correctly gates refresh by age
+- [x] OP-5: `pgtrickle.stream_table_definition(name)` returns accurate single-row result
+- [x] DOC-1: `docs/PERFORMANCE_COOKBOOK.md` published
+- [x] Extension upgrade path tested (`0.20.0 → 0.21.0`)
+- [x] `just check-version-sync` passes
 
 ---
 

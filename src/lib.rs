@@ -625,6 +625,269 @@ SELECT
     requires = [parse_duration_seconds],
 );
 
+// ── OP-3: pause_all / resume_all ─────────────────────────────────────
+
+extension_sql!(
+    r#"
+CREATE OR REPLACE FUNCTION pgtrickle."pause_all"()
+RETURNS void
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    UPDATE pgtrickle.pgt_stream_tables
+       SET status = 'PAUSED'
+     WHERE status = 'ACTIVE';
+    RAISE NOTICE 'pg_trickle: all stream tables paused.';
+END;
+$$;
+
+COMMENT ON FUNCTION pgtrickle."pause_all"() IS
+    'Pause automatic refreshes for every ACTIVE stream table. '
+    'Use pgtrickle.resume_all() to re-activate them.';
+
+CREATE OR REPLACE FUNCTION pgtrickle."resume_all"()
+RETURNS void
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    UPDATE pgtrickle.pgt_stream_tables
+       SET status = 'ACTIVE'
+     WHERE status = 'PAUSED';
+    RAISE NOTICE 'pg_trickle: all paused stream tables resumed.';
+END;
+$$;
+
+COMMENT ON FUNCTION pgtrickle."resume_all"() IS
+    'Re-activate all stream tables that were paused with pgtrickle.pause_all().';
+"#,
+    name = "pg_trickle_pause_resume",
+);
+
+// ── OP-4: refresh_if_stale ────────────────────────────────────────────
+
+extension_sql!(
+    r#"
+CREATE OR REPLACE FUNCTION pgtrickle."refresh_if_stale"(
+    p_name   text,
+    p_max_age interval DEFAULT '5 minutes'::interval
+)
+RETURNS boolean
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    v_last_end timestamp with time zone;
+    v_refreshed boolean := false;
+BEGIN
+    SELECT MAX(end_time)
+      INTO v_last_end
+      FROM pgtrickle.pgt_refresh_history h
+      JOIN pgtrickle.pgt_stream_tables   s USING (pgt_id)
+     WHERE s.pgt_name = p_name
+       AND h.status = 'COMPLETED';
+
+    IF v_last_end IS NULL OR (now() - v_last_end) > p_max_age THEN
+        PERFORM pgtrickle.refresh_stream_table(p_name);
+        v_refreshed := true;
+    END IF;
+
+    RETURN v_refreshed;
+END;
+$$;
+
+COMMENT ON FUNCTION pgtrickle."refresh_if_stale"(text, interval) IS
+    'Refresh the named stream table only when the most recent completed '
+    'refresh is older than max_age.  Returns TRUE when a refresh was '
+    'triggered, FALSE when the table was fresh enough.';
+"#,
+    name = "pg_trickle_refresh_if_stale",
+    requires = [refresh_stream_table],
+);
+
+// ── OP-5: stream_table_definition ────────────────────────────────────
+
+extension_sql!(
+    r#"
+CREATE OR REPLACE FUNCTION pgtrickle."stream_table_definition"(
+    p_name text
+)
+RETURNS text
+LANGUAGE sql
+STABLE
+AS $$
+    SELECT pgtrickle.export_definition(p_name);
+$$;
+
+COMMENT ON FUNCTION pgtrickle."stream_table_definition"(text) IS
+    'Return the CREATE STREAM TABLE DDL for the named stream table. '
+    'Equivalent to pgtrickle.export_definition(name) — provided as a '
+    'more discoverable alias.';
+"#,
+    name = "pg_trickle_stream_table_definition",
+    requires = [export_definition],
+);
+
+// ── OPS-1: Canary / shadow-mode helpers ──────────────────────────────
+
+extension_sql!(
+    r#"
+CREATE OR REPLACE FUNCTION pgtrickle."canary_begin"(
+    p_name      text,
+    p_new_query text
+)
+RETURNS text
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    v_schema  text;
+    v_table   text;
+    v_canary  text;
+    v_dot     int;
+BEGIN
+    v_dot    := strpos(p_name, '.');
+    IF v_dot > 0 THEN
+        v_schema := substr(p_name, 1, v_dot - 1);
+        v_table  := substr(p_name, v_dot + 1);
+    ELSE
+        v_schema := current_schema();
+        v_table  := p_name;
+    END IF;
+
+    v_canary := '__pgt_canary_' || v_table;
+
+    -- Drop any stale canary table from a previous run.
+    BEGIN
+        PERFORM pgtrickle.drop_stream_table(v_schema || '.' || v_canary);
+    EXCEPTION WHEN OTHERS THEN
+        NULL;  -- ignore if it does not exist
+    END;
+
+    -- Create the canary stream table with the new query.
+    PERFORM pgtrickle.create_stream_table(
+        v_schema || '.' || v_canary,
+        p_new_query
+    );
+
+    RETURN format(
+        'Canary stream table %I.%I created. Run pgtrickle.canary_diff(%L) to compare.',
+        v_schema, v_canary, p_name
+    );
+END;
+$$;
+
+COMMENT ON FUNCTION pgtrickle."canary_begin"(text, text) IS
+    'Start a shadow/canary test for the named stream table. '
+    'Creates __pgt_canary_<name> with p_new_query and starts refreshing it. '
+    'Use canary_diff(name) to inspect differences and canary_promote(name) to '
+    'swap canary into production.';
+
+CREATE OR REPLACE FUNCTION pgtrickle."canary_diff"(
+    p_name text
+)
+RETURNS TABLE(
+    row_source text,
+    diff_row   text
+)
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    v_schema  text;
+    v_table   text;
+    v_canary  text;
+    v_dot     int;
+    v_sql     text;
+BEGIN
+    v_dot    := strpos(p_name, '.');
+    IF v_dot > 0 THEN
+        v_schema := substr(p_name, 1, v_dot - 1);
+        v_table  := substr(p_name, v_dot + 1);
+    ELSE
+        v_schema := current_schema();
+        v_table  := p_name;
+    END IF;
+
+    v_canary := '__pgt_canary_' || v_table;
+
+    -- Return rows in live-only vs canary-only using EXCEPT (symmetric difference).
+    v_sql := format(
+        '(SELECT %L AS row_source, t::text AS diff_row FROM %I.%I t EXCEPT
+          SELECT %L, c::text FROM %I.%I c)
+         UNION ALL
+         (SELECT %L, c::text FROM %I.%I c EXCEPT
+          SELECT %L, t::text FROM %I.%I t)',
+        'live_only',   v_schema, v_table,
+        'canary_only', v_schema, v_canary,
+        'canary_only', v_schema, v_canary,
+        'live_only',   v_schema, v_table
+    );
+    RETURN QUERY EXECUTE v_sql;
+END;
+$$;
+
+COMMENT ON FUNCTION pgtrickle."canary_diff"(text) IS
+    'Compare the live stream table with its canary counterpart. '
+    'Returns rows that exist in only one of the two tables. '
+    'An empty result set indicates the new query produces the same output.';
+
+CREATE OR REPLACE FUNCTION pgtrickle."canary_promote"(
+    p_name text
+)
+RETURNS text
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    v_schema    text;
+    v_table     text;
+    v_canary    text;
+    v_dot       int;
+    v_new_query text;
+BEGIN
+    v_dot    := strpos(p_name, '.');
+    IF v_dot > 0 THEN
+        v_schema := substr(p_name, 1, v_dot - 1);
+        v_table  := substr(p_name, v_dot + 1);
+    ELSE
+        v_schema := current_schema();
+        v_table  := p_name;
+    END IF;
+
+    v_canary := '__pgt_canary_' || v_table;
+
+    -- Read the defining query from the canary table.
+    SELECT defining_query
+      INTO v_new_query
+      FROM pgtrickle.pgt_stream_tables
+     WHERE pgt_schema = v_schema
+       AND pgt_name   = v_canary;
+
+    IF v_new_query IS NULL THEN
+        RAISE EXCEPTION 'No canary found for %. Run pgtrickle.canary_begin() first.', p_name;
+    END IF;
+
+    -- Promote: alter the live table to use the new query, then drop the canary.
+    PERFORM pgtrickle.alter_stream_table(v_schema || '.' || v_table, query => v_new_query);
+
+    BEGIN
+        PERFORM pgtrickle.drop_stream_table(v_schema || '.' || v_canary);
+    EXCEPTION WHEN OTHERS THEN
+        NULL;
+    END;
+
+    RETURN format(
+        'Canary promoted: %I.%I now uses the canary query. Canary table dropped.',
+        v_schema, v_table
+    );
+END;
+$$;
+
+COMMENT ON FUNCTION pgtrickle."canary_promote"(text) IS
+    'Promote the canary stream table to production. '
+    'Calls ALTER STREAM TABLE with the canary query, then drops the canary table. '
+    'Run pgtrickle.canary_diff(name) first to confirm the result set matches.';
+"#,
+    name = "pg_trickle_canary",
+    requires = [create_stream_table, drop_stream_table, alter_stream_table],
+);
+
 // ── Launcher notification (must be last) ──────────────────────────────
 //
 // Signal the launcher background worker to re-probe this database.
