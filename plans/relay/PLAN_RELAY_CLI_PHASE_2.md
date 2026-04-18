@@ -1115,18 +1115,27 @@ header = "X-Webhook-Signature"            # header containing the signature
 multi-pipeline management cumbersome, requires SIGHUP or restarts to apply
 changes, and doesn't integrate with the pg-trickle catalog.
 
-**Design:** DB is the only config source. A single `pgtrickle.relay_config`
-table stores all pipelines. The only config required outside the DB is the
-PostgreSQL connection URL (passed via `--postgres-url` CLI flag).
+**Design:** DB is the only config source. Two tables — one for forward
+pipelines (outbox → sink) and one for reverse (source → inbox) — keep
+the direction implicit in the table name. All backend-specific settings live
+in a single `config` JSONB column. The only config required outside the DB
+is the PostgreSQL connection URL (passed via `--postgres-url` CLI flag).
 
 #### Catalog Schema
 
 ```sql
-CREATE TABLE pgtrickle.relay_config (
-    name       TEXT PRIMARY KEY,
-    enabled    BOOLEAN NOT NULL DEFAULT true,
-    direction  TEXT NOT NULL,  -- 'forward' | 'reverse'
-    config     JSONB NOT NULL  -- {source_type, source_config, sink_type, sink_config}
+-- Forward pipelines: outbox → sink
+CREATE TABLE pgtrickle.relay_outbox_config (
+    name     TEXT PRIMARY KEY,
+    enabled  BOOLEAN NOT NULL DEFAULT true,
+    config   JSONB NOT NULL  -- {source_type, source, sink_type, sink}
+);
+
+-- Reverse pipelines: source → inbox
+CREATE TABLE pgtrickle.relay_inbox_config (
+    name     TEXT PRIMARY KEY,
+    enabled  BOOLEAN NOT NULL DEFAULT true,
+    config   JSONB NOT NULL  -- {source_type, source, sink_type, sink}
 );
 ```
 
@@ -1138,15 +1147,15 @@ done in Rust when the row is loaded.
 
 ```sql
 -- Forward: outbox → Kafka
-INSERT INTO pgtrickle.relay_config (name, direction, config) VALUES (
-    'orders-to-kafka', 'forward',
+INSERT INTO pgtrickle.relay_outbox_config (name, config) VALUES (
+    'orders-to-kafka',
     '{"source_type": "outbox", "source": {"outbox": "order_events"},
-      "sink_type": "kafka",   "sink":   {"brokers": "localhost:9092", "topic": "orders"}}'
+      "sink_type":   "kafka",  "sink":   {"brokers": "localhost:9092", "topic": "orders"}}'
 );
 
 -- Reverse: Kafka → inbox
-INSERT INTO pgtrickle.relay_config (name, direction, config) VALUES (
-    'kafka-to-orders', 'reverse',
+INSERT INTO pgtrickle.relay_inbox_config (name, config) VALUES (
+    'kafka-to-orders',
     '{"source_type": "kafka",    "source": {"brokers": "localhost:9092", "topic": "orders"},
       "sink_type":   "pg-inbox", "sink":   {"inbox_table": "orders_inbox"}}'
 );
@@ -1160,9 +1169,16 @@ Pass the database URL and the relay starts:
 pgtrickle-relay --postgres-url postgres://relay:password@localhost/mydb
 ```
 
-The relay runs `SELECT * FROM pgtrickle.relay_config WHERE enabled = true`,
-spawns one tokio task per row, and subscribes to LISTEN/NOTIFY for hot-reload.
-If the table does not exist the relay exits with a clear error.
+The relay queries both tables:
+
+```sql
+SELECT 'forward', name, config FROM pgtrickle.relay_outbox_config WHERE enabled = true
+UNION ALL
+SELECT 'reverse', name, config FROM pgtrickle.relay_inbox_config  WHERE enabled = true;
+```
+
+Spawns one tokio task per row and subscribes to LISTEN/NOTIFY for hot-reload.
+If either table does not exist the relay exits with a clear error.
 
 #### LISTEN/NOTIFY Hot-Reload
 
@@ -1173,17 +1189,22 @@ BEGIN
     PERFORM pg_notify(
         'pgtrickle_relay_config',
         json_build_object(
-            'event',   TG_OP,
-            'name',    COALESCE(NEW.name, OLD.name),
-            'enabled', COALESCE(NEW.enabled, OLD.enabled)
+            'direction', TG_TABLE_NAME,  -- 'relay_outbox_config' | 'relay_inbox_config'
+            'event',     TG_OP,
+            'name',      COALESCE(NEW.name, OLD.name),
+            'enabled',   COALESCE(NEW.enabled, OLD.enabled)
         )::text
     );
     RETURN NULL;
 END;
 $$;
 
-CREATE TRIGGER relay_config_notify
-    AFTER INSERT OR UPDATE OR DELETE ON pgtrickle.relay_config
+CREATE TRIGGER relay_outbox_config_notify
+    AFTER INSERT OR UPDATE OR DELETE ON pgtrickle.relay_outbox_config
+    FOR EACH ROW EXECUTE FUNCTION pgtrickle.relay_config_notify();
+
+CREATE TRIGGER relay_inbox_config_notify
+    AFTER INSERT OR UPDATE OR DELETE ON pgtrickle.relay_inbox_config
     FOR EACH ROW EXECUTE FUNCTION pgtrickle.relay_config_notify();
 ```
 
@@ -1197,13 +1218,14 @@ Changes take effect within milliseconds, no restart or SIGHUP needed.
 #### CLI Commands
 
 ```
-pgtrickle-relay --postgres-url <url>             # Start relay (all enabled pipelines)
-pgtrickle-relay config list                      # Show all pipelines + enabled status
-pgtrickle-relay config show <name>               # Show config JSONB for a pipeline
-pgtrickle-relay config set <name> --direction <forward|reverse> --config <json>
-pgtrickle-relay config enable <name>
+pgtrickle-relay --postgres-url <url>              # Start relay (all enabled pipelines)
+pgtrickle-relay config list                       # Show all pipelines (both tables) + status
+pgtrickle-relay config show <name>                # Show config JSONB for a pipeline
+pgtrickle-relay config set outbox <name> --config <json>   # Upsert forward pipeline
+pgtrickle-relay config set inbox  <name> --config <json>   # Upsert reverse pipeline
+pgtrickle-relay config enable  <name>
 pgtrickle-relay config disable <name>
-pgtrickle-relay config delete <name>
+pgtrickle-relay config delete  <name>
 ```
 
 #### Security
@@ -1251,7 +1273,7 @@ pgtrickle-relay config delete <name>
 | OTel tracing E2E | Verify spans exported to OTLP collector |
 | Encryption E2E | Encrypt → publish → decrypt → verify payload |
 | Webhook signature E2E | Signed POST accepted; unsigned POST rejected with 401 |
-| DB config — table exists, rows found | Relay loads all enabled pipelines; spawns one task per row |
+| DB config — both tables exist, rows found | Relay loads all enabled pipelines from both tables; spawns one task per row |
 | DB config — table missing | Relay exits with clear error message |
 | DB config — no enabled rows | Relay starts but idles; resumes when a row is enabled via LISTEN/NOTIFY |
 | DB config — LISTEN/NOTIFY reload | Update row → relay restarts affected pipeline within 1 second |
@@ -1309,7 +1331,7 @@ pgtrickle-relay config delete <name>
 | RELAY-P2-19 | Dry-run & replay mode (--dry-run, --replay, --from-offset) | 1d |
 | RELAY-P2-20 | OpenTelemetry tracing (OTLP export + context propagation) | 1.5d |
 | RELAY-P2-21 | Webhook signature verification (HMAC, GitHub, Stripe, Svix) | 1d |
-| RELAY-P2-22 | DB-stored config: single `pgtrickle.relay_config` table + LISTEN/NOTIFY trigger + CLI commands | 1.5d |
+| RELAY-P2-22 | DB-stored config: `pgtrickle.relay_outbox_config` + `relay_inbox_config` tables + shared LISTEN/NOTIFY trigger + CLI commands | 1.5d |
 
 ### Phase 2d — Testing & Polish (7 days)
 
