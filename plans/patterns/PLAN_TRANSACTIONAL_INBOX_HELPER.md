@@ -639,6 +639,7 @@ All GUCs are `SUSET` (require superuser to change).
 | Replay `where_clause` invalid | Rejected with `InboxReplayInvalidArgs`; no rows modified. |
 | Application INSERT fails | Not pg_trickle's responsibility; application handles. |
 | Processing failure | Application increments `retry_count`; pg_trickle detects via stream table refresh. |
+| **Processor crash after marking `processed_at` but before committing business logic** | pg_trickle sees the message as processed (`processed_at IS NOT NULL`). **Mitigation:** always execute business logic first, then set `processed_at` — this is the two-phase commit pattern for at-least-once processing. Recovery: `replay_inbox_messages(name, event_ids => ARRAY[$1])` re-queues specific messages. Operators should pause the processor (or set `pg_trickle.inbox_enabled = false`) before bulk replay to avoid re-processing by concurrent workers. See `PoisonMessageGuard` in `examples/inbox/inbox_processor.py` for the circuit-breaker pattern. |
 
 ### A.12 Performance Considerations
 
@@ -716,6 +717,18 @@ Not supported in initial release. Users must:
 - Support **partition-affinity** for competing workers (each worker handles
   a subset of aggregates for cache locality).
 
+> **Mutual Exclusion:** `enable_inbox_ordering()` and
+> `enable_inbox_priority()` are **mutually exclusive** for the same inbox.
+> Attempting to enable both returns `InboxOrderingPriorityConflict { name }`
+> with a clear message:
+> _"Per-aggregate ordering and priority tiers cannot be enabled together on
+> the same inbox. Ordered processing requires processing the next message
+> per aggregate regardless of priority; priority tiers would violate sequence
+> ordering across tiers. Use a single tier with ordering, or model priority
+> as separate inboxes."_
+> If ordered processing with priority is required, the recommended pattern
+> is separate inboxes per priority class, each with ordering enabled.
+
 ### B.2 SQL API
 
 ```sql
@@ -725,6 +738,8 @@ SELECT pgtrickle.enable_inbox_ordering(
     aggregate_id_col  TEXT DEFAULT 'aggregate_id',
     sequence_num_col  TEXT DEFAULT 'sequence_num'
 ) RETURNS void;
+-- Errors: InboxNotFound, InboxColumnMissing, InboxOrderingPriorityConflict
+--         (if enable_inbox_priority was already called on this inbox)
 
 -- Enable priority processing for an inbox
 SELECT pgtrickle.enable_inbox_priority(
@@ -736,6 +751,8 @@ SELECT pgtrickle.enable_inbox_priority(
         {"name": "background","min": 7, "max": 9, "schedule": "30s"}
     ]'
 ) RETURNS void;
+-- Errors: InboxNotFound, InboxColumnMissing, InboxOrderingPriorityConflict
+--         (if enable_inbox_ordering was already called on this inbox)
 
 -- Inspect ordering gaps
 SELECT * FROM pgtrickle.inbox_ordering_gaps(
@@ -808,6 +825,26 @@ SELECT pgtrickle.create_stream_table(
     refresh_mode => 'DIFFERENTIAL'
 );
 ```
+
+> **Performance considerations for gap detection:**
+> The `generate_series(MIN, MAX)` approach scans the full sequence range per
+> aggregate. This is efficient for inboxes with tens of thousands of
+> aggregates but can become expensive for large gaps (e.g., missing sequences
+> in a sparse range).
+>
+> Scale guidelines:
+> - Up to 10 000 aggregates × 10 000 max sequence: ✅ acceptable at 30 s refresh
+> - 10 000–100 000 aggregates: ⚠️ extend schedule to 60 s; monitor refresh time
+> - > 100 000 aggregates or max sequence > 1 000 000: add `pg_trickle_alert`
+>   `inbox_ordering_gap_perf` warning and disable auto-refresh; use
+>   `inbox_ordering_gaps()` function for on-demand checks only
+>
+> Future optimization (post-v0.23.0): delta-based gap detection that only
+> scans aggregates with recent activity (last N minutes), avoiding full
+> table scans. Tracked as a follow-up issue.
+>
+> The benchmark gate (INBOX-B5) must verify acceptable performance at:
+> 1M messages, 10 000 aggregates, 30 s refresh schedule.
 
 When gaps are detected, a `pg_trickle_alert` event is emitted:
 
@@ -1150,9 +1187,28 @@ Extend `benches/refresh_bench.rs`:
 - `inbox_pending_st_refresh_100_pending` (100 pending out of 10K total)
 - `inbox_pending_st_refresh_10k_pending` (10K pending out of 100K total)
 - `inbox_stats_st_refresh` (aggregate query over 100K rows)
+- `inbox_gaps_st_refresh_10k_aggregates` (gap detection at 10K aggregates,\
+  max sequence 1 000; must complete in < 1 s at 30 s refresh schedule)
 
 Acceptance criteria: pending ST refresh < 5 ms at 100 pending, < 50 ms at
-10K pending.
+10K pending. Gap detection < 1 s at 10K aggregates.
+
+### D.6 Chaos Tests
+
+- Processor crash after setting `processed_at` but before finishing business
+  logic: verify `replay_inbox_messages()` re-queues the message correctly and
+  the pending ST reflects it on the next refresh.
+- 10 concurrent processor connections with `FOR UPDATE SKIP LOCKED`: inject
+  100 000 messages and verify each processed exactly once (no duplicate
+  business-logic execution).
+- DLQ flood: inject 50 messages that all fail immediately; verify DLQ alert
+  fires with batch summary (not 50 individual alerts) and `inbox_health()`
+  reports `critical` status.
+- `enable_inbox_ordering()` then inject 50 messages out-of-order per aggregate:
+  verify `next_<inbox>` surfaces them strictly in sequence order; verify gap
+  detection fires for each missing sequence.
+- Upgrade path (v0.22.0 → v0.23.0): existing non-inbox stream tables survive;
+  new inbox catalog tables present; `inbox_health()` available.
 
 ---
 
@@ -1160,13 +1216,14 @@ Acceptance criteria: pending ST refresh < 5 ms at 100 pending, < 50 ms at
 
 | File | Sections to Add |
 |------|-----------------|
-| [docs/SQL_REFERENCE.md](../../docs/SQL_REFERENCE.md) | `pgtrickle.create_inbox()`, `enable_inbox_tracking()`, `drop_inbox()`, `inbox_status()`, `inbox_health()`, `replay_inbox_messages()` |
+| [docs/SQL_REFERENCE.md](../../docs/SQL_REFERENCE.md) | `pgtrickle.create_inbox()`, `enable_inbox_tracking()`, `drop_inbox()`, `inbox_status()`, `inbox_health()`, `replay_inbox_messages()`, `enable_inbox_ordering()`, `enable_inbox_priority()`, `inbox_worker_partition()`; ordered+priority mutual exclusion note |
 | [docs/CONFIGURATION.md](../../docs/CONFIGURATION.md) | All six inbox GUCs with defaults and effect descriptions |
-| [docs/PATTERNS.md](../../docs/PATTERNS.md) | New section "Transactional Inbox" linking to PLAN_TRANSACTIONAL_INBOX.md |
+| [docs/PATTERNS.md](../../docs/PATTERNS.md) | New section "Transactional Inbox" with: basic inbox setup, DLQ flow, processor crash recovery guide, per-aggregate ordering pattern, priority queue pattern, partition affinity for competing workers, "Ordered + Priority" mutual exclusion explanation and recommended alternative (separate inboxes per priority class) |
 | [docs/ARCHITECTURE.md](../../docs/ARCHITECTURE.md) | Diagram of inbox pipeline with stream tables |
-| [docs/TROUBLESHOOTING.md](../../docs/TROUBLESHOOTING.md) | Common inbox issues: DLQ growth, stale pending messages, processor backpressure |
-| [CHANGELOG.md](../../CHANGELOG.md) | Entry for INBOX-1/2/3/4/5 items |
-| [examples/](../../examples/) | `inbox/inbox_writer_nats.py`, `inbox/inbox_processor.py`, `inbox/webhook_receiver.py` |
+| [docs/TROUBLESHOOTING.md](../../docs/TROUBLESHOOTING.md) | Common inbox issues: DLQ growth, stale pending messages, processor backpressure, gap detection slowdown at scale |
+| [CHANGELOG.md](../../CHANGELOG.md) | v0.23.0 entry for INBOX-1 through INBOX-10 and INBOX-B1 through INBOX-B6 |
+| [dbt-pgtrickle/](../../dbt-pgtrickle/) | `inbox_config` property in dbt model config; `pgtrickle_create_inbox` macro; dbt docs update |
+| [examples/](../../examples/) | `inbox/inbox_writer_nats.py`, `inbox/inbox_processor.py`, `inbox/webhook_receiver.py`, `inbox/inbox_processor_ordered.py` |
 
 ---
 
@@ -1208,17 +1265,20 @@ column-mapping complexity and the `enable_inbox_tracking()` path.
    it.
 
 2. **IMMEDIATE-mode inbox stream tables.** Should the pending ST support
-   `IMMEDIATE` mode for zero-lag processing? **Proposal:** allow it if
-   IMMEDIATE mode is stable; document the trade-off (adds latency to every
-   INSERT into the inbox table).
+   `IMMEDIATE` mode for zero-lag processing? **Proposal:** Allow it \u2014
+   the pending ST is a source-table-driven view, and IMMEDIATE mode on that
+   ST adds latency to every inbox INSERT (same concern as outbox). Default
+   to DIFFERENTIAL; document IMMEDIATE as an advanced opt-in for sub-second
+   pending visibility. Unlike outbox, inbox IMMEDIATE does not have the
+   atomicity concern (inbox writes are application-controlled).
 
 3. **CloudEvents schema.** Should `create_inbox()` offer a CloudEvents-
    compatible schema variant with `spec_version`, `subject`,
-   `data_content_type` columns? **Proposal:** not in v0.22.0; add as an
+   `data_content_type` columns? **Proposal:** not in v0.23.0; add as an
    optional `schema_variant => 'cloudevents'` parameter later.
 
 4. **Payload validation on INSERT.** Should pg_trickle offer a trigger-based
-   JSON Schema validator for inbox payloads? **Proposal:** out of scope —
+   JSON Schema validator for inbox payloads? **Proposal:** out of scope \u2014
    validation belongs in the application's inbox-writer layer.
 
 5. **Per-inbox DLQ alerts vs. global alert.** Currently, DLQ alerts include
@@ -1228,15 +1288,17 @@ column-mapping complexity and the `enable_inbox_tracking()` path.
    routing by `inbox_name` in the payload. Per-inbox channels add
    complexity for marginal benefit.
 
-6. **Replay safety for multi-worker processors.** When
-   `replay_inbox_messages()` resets `processed_at` to NULL, a concurrent
-   processor might pick up the message before the operator intends. Should
-   replay require the processor to be paused? **Proposal:** document this
-   as a known caveat. Operators should drain the processor or set
-   `pg_trickle.inbox_enabled = false` before bulk replays.
+6. **Replay safety for multi-worker processors.** \u2705 **Resolved:** When
+   `replay_inbox_messages()` resets `processed_at` to NULL, concurrent
+   processors can pick up the message immediately. This is intentional (it
+   is a re-queue). Operators must either: (a) drain the processor before
+   bulk replay; or (b) set `pg_trickle.inbox_enabled = false` temporarily
+   to suppress alerts while replaying; or (c) stop the processor
+   explicitly. This is documented in A.11 Failure Handling, A.8 Replay
+   Helper, and `docs/PATTERNS.md`.
 
-7. **Integration with Outbox Helper.** The common inbox → business logic →
-   outbox pipeline (see PLAN_TRANSACTIONAL_INBOX.md §Combining Outbox and
+7. **Integration with Outbox Helper.** The common inbox \u2192 business logic \u2192
+   outbox pipeline (see PLAN_TRANSACTIONAL_INBOX.md \u00a7Combining Outbox and
    Inbox) should be documented as a pattern but not special-cased in code.
    **Proposal:** add a "Bidirectional Event Pipeline" section to
    `docs/PATTERNS.md` with a worked example.
@@ -1252,9 +1314,29 @@ column-mapping complexity and the `enable_inbox_tracking()` path.
 
 10. **`enable_inbox_tracking()` with missing optional columns.** If the
     adopted table lacks `source` or `trace_id`, should the helper skip those
-    in stream table SQL? **Proposal:** yes — optional columns
+    in stream table SQL? **Proposal:** yes \u2014 optional columns
     (`source`, `aggregate_id`, `trace_id`) should be gracefully omitted
     from stream table definitions if not present in the adopted table.
+
+11. **`enable_inbox_ordering()` + `enable_inbox_priority()` together.** \u2705
+    **Resolved:** mutually exclusive (see Part B, B.1 Goals and B.2 SQL
+    API). Returns `InboxOrderingPriorityConflict`. Recommended alternative:
+    separate inboxes per priority class, each with ordering enabled
+    independently. Documented in `docs/PATTERNS.md`.
+
+---
+
+## Part H \u2014 Design Review Checklist
+
+Five critical questions resolved before implementation begins:
+
+| # | Question | Decision | Rationale |
+|---|----------|----------|-----------|
+| 1 | Can ordering and priority be enabled together on the same inbox? | **No \u2014 hard error** (`InboxOrderingPriorityConflict`) | Per-aggregate ordering must surface the next sequence regardless of priority. Mixing tiers violates sequence guarantees. Use separate inboxes per priority class, each with ordering. |
+| 2 | Processor crash recovery \u2014 who is responsible? | **Application** (two-phase pattern) | pg_trickle documents: execute business logic first, set `processed_at` second. Replay via `replay_inbox_messages()`. Document in PATTERNS.md with code example. |
+| 3 | Gap detection performance at scale | **Benchmark-gated** + scale guidelines documented | < 1 s at 10K aggregates is the v0.23.0 gate. Above 100K aggregates, auto-refresh disabled; on-demand via `inbox_ordering_gaps()` only. Delta-based optimization tracked as post-v0.23.0 follow-up. |
+| 4 | Naming collision resolution for stream tables | **Truncate to 56 bytes + 7-char hex suffix** | Same algorithm as outbox. Final names stored in `pgt_inbox_config` (pending/dlq/stats ST name columns). |
+| 5 | dbt integration scope | **dbt model config properties + macro** | `outbox_enabled`, `inbox_config` properties supported in dbt model config. Documented in `dbt-pgtrickle/README.md` and `docs/SQL_REFERENCE.md`. |
 
 ---
 

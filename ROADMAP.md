@@ -6260,6 +6260,17 @@ Dependencies: DB-3 (uses schema version to determine needed migrations). Schema 
 
 ---
 
+### Known Limitations in v0.23.0
+
+| Limitation | Rationale | Future Path |
+|------------|-----------|-------------|
+| **Outbox requires DIFFERENTIAL mode.** `enable_outbox()` on `IMMEDIATE`-mode stream tables returns `OutboxRequiresNotImmediateMode`. | Outbox writes one row per refresh cycle inside the refresh transaction. IMMEDIATE refreshes fire inside every source transaction; adding an outbox INSERT there imposes that cost on every application write. | Post-1.0 opt-in GUC if demand justifies. |
+| **Ordering and priority are mutually exclusive per inbox.** Calling both `enable_inbox_ordering()` and `enable_inbox_priority()` on the same inbox returns `InboxOrderingPriorityConflict`. | Per-aggregate sequence ordering must surface the next message in sequence regardless of priority level; priority tiers violate that guarantee. | Use separate inboxes per priority class, each with `enable_inbox_ordering()` applied independently. |
+| **Gap detection degrades above ~100K aggregates.** The `gaps_<inbox>` stream table uses `generate_series` over the full sequence range per aggregate. | Manageable up to ~10K aggregates at 30 s schedule. Above 100K, auto-refresh is disabled and `inbox_ordering_gaps()` is available for on-demand checks only. | Post-v0.23.0: delta-based gap detection scanning only recently-active aggregates. |
+| **Consumer groups provide at-least-once delivery per consumer instance, not exactly-once globally.** | Exactly-once is achieved by composition: relay uses broker idempotency keys; inbox uses `ON CONFLICT (event_id) DO NOTHING`. Three-layer deduplication is more resilient than a monolithic exactly-once guarantee. | Design decision. Documented in PATTERNS.md and SQL_REFERENCE.md. |
+
+---
+
 ### Part A — Essential Patterns
 
 #### Transactional Outbox Helper (P2 — §9.12)
@@ -6274,7 +6285,7 @@ Dependencies: DB-3 (uses schema version to determine needed migrations). Schema 
 | Item | Description | Effort | Ref |
 |------|-------------|--------|-----|
 | OUTBOX-1 | **Catalog + SQL functions.** `pgt_outbox_config` catalog table. `enable_outbox(name, retention_hours)` / `disable_outbox(name, if_exists)` SQL functions. `OutboxAlreadyEnabled`, `OutboxNotEnabled`, `OutboxRequiresDifferential` error variants. | 0.5d | [PLAN_TRANSACTIONAL_OUTBOX_HELPER.md](plans/patterns/PLAN_TRANSACTIONAL_OUTBOX_HELPER.md) §A.1–A.2 |
-| OUTBOX-2 | **Outbox table creation.** `pgtrickle.outbox_<st>` with `id BIGSERIAL`, `pgt_id UUID`, `refresh_id UUID`, `created_at`, `inserted_count INT`, `deleted_count INT`, `payload JSONB`. Index on `created_at`. Naming rules with 63-byte truncation and collision resolution. | 0.5d | [PLAN_TRANSACTIONAL_OUTBOX_HELPER.md](plans/patterns/PLAN_TRANSACTIONAL_OUTBOX_HELPER.md) §A.3 |
+| OUTBOX-2 | **Outbox table creation.** `pgtrickle.outbox_<st>` with `id BIGSERIAL`, `pgt_id UUID`, `refresh_id UUID`, `created_at`, `inserted_count INT`, `deleted_count INT`, `payload JSONB`. Index on `created_at`. Naming: 7-byte `outbox_` prefix + up to 56-byte stream table name; collision resolution appends 7-char hex suffix derived from `left(md5(name), 7)`. Final name stored in `pgt_outbox_config.outbox_table_name`. Also creates zero-cost **deduplicated view** `pgtrickle.pgt_outbox_dedup_<st>` (`DISTINCT ON (pgt_id) ORDER BY pgt_id, id DESC`) for latest-state-only consumers; dropped alongside the outbox table. | 0.5d | [PLAN_TRANSACTIONAL_OUTBOX_HELPER.md](plans/patterns/PLAN_TRANSACTIONAL_OUTBOX_HELPER.md) §A.3 |
 | OUTBOX-3 | **Refresh-path integration.** After successful MERGE, if outbox is enabled, INSERT outbox row within the same transaction. In-memory `outbox_enabled_set` cache with DDL-triggered invalidation. Hot-path cost < 50 ns when disabled. Payload serialisation reuses existing `Vec<DeltaRow>`. | 1d | [PLAN_TRANSACTIONAL_OUTBOX_HELPER.md](plans/patterns/PLAN_TRANSACTIONAL_OUTBOX_HELPER.md) §A.4 |
 | OUTBOX-4 | **Versioned payload format.** `{"v":1, "inserted":[…], "deleted":[…]}` with `to_jsonb()` type mapping. Configurable `outbox_max_payload_bytes` GUC (default 8 MiB); oversized payloads emit truncation marker `{"v":1, "truncated":true, …}`. | 0.5d | [PLAN_TRANSACTIONAL_OUTBOX_HELPER.md](plans/patterns/PLAN_TRANSACTIONAL_OUTBOX_HELPER.md) §A.5 |
 | OUTBOX-5 | **Retention drain.** Scheduler cleanup step: batched DELETE with `outbox_drain_batch_size` GUC (default 10 000). Per-ST or global `outbox_retention_hours` (default 24). `last_drained_at` / `last_drained_count` tracked in catalog. | 0.5d | [PLAN_TRANSACTIONAL_OUTBOX_HELPER.md](plans/patterns/PLAN_TRANSACTIONAL_OUTBOX_HELPER.md) §A.6 |
@@ -6345,7 +6356,7 @@ Dependencies: DB-3 (uses schema version to determine needed migrations). Schema 
 | OUTBOX-B6 | **Dead consumer auto-cleanup.** Scheduler step (GUC `consumer_cleanup_enabled`, default `true`): reap consumers with `last_heartbeat_at < now() - 24 h`, release their leases. Remove from offsets if also `last_commit_at < now() - 7 d`. Emit `pg_trickle_alert` event `consumer_reaped`. | 0.5d | [PLAN_TRANSACTIONAL_OUTBOX_HELPER.md](plans/patterns/PLAN_TRANSACTIONAL_OUTBOX_HELPER.md) §B.9 |
 | OUTBOX-B7 | **Retention safety guard.** When consumer groups are enabled, retention drain refuses to delete rows with `id > MIN(last_offset across all consumers)` to prevent silent data loss for slow relays. GUC `outbox_force_retention` (default `false`) allows operator override for permanently abandoned consumers. | 0.5d | [PLAN_TRANSACTIONAL_OUTBOX_HELPER.md](plans/patterns/PLAN_TRANSACTIONAL_OUTBOX_HELPER.md) §B.6 |
 | OUTBOX-B8 | **Tests.** Integration: multi-relay group creation, visibility timeout expiry + re-poll, `commit_offset` idempotency, `seek_offset` replay, heartbeat → unhealthy transition, dead consumer reaping, retention guard prevents early drain. Benchmark: `poll_outbox` latency < 5 ms at 10K outbox rows. | 1.5d | [PLAN_TRANSACTIONAL_OUTBOX_HELPER.md](plans/patterns/PLAN_TRANSACTIONAL_OUTBOX_HELPER.md) §D |
-| OUTBOX-B9 | **Documentation & reference relay.** SQL_REFERENCE.md: consumer group API. CONFIGURATION.md: `consumer_cleanup_enabled`, `outbox_force_retention` GUCs. Reference Python relay with group coordination (`examples/relay/outbox_relay.py`). Rust equivalent (`examples/relay/outbox_relay.rs`). PATTERNS.md: multi-relay competing consumers section. | 1d | [PLAN_TRANSACTIONAL_OUTBOX_HELPER.md](plans/patterns/PLAN_TRANSACTIONAL_OUTBOX_HELPER.md) §B, §C |
+| OUTBOX-B9 | **Documentation & reference relay.** SQL_REFERENCE.md: consumer group API + delivery guarantee section (at-least-once per consumer; exactly-once by composition). CONFIGURATION.md: `consumer_cleanup_enabled`, `outbox_force_retention`, `consumer_dead_threshold_hours` (default 24), `consumer_stale_offset_threshold_days` (default 7) GUCs. Reference Python relay with group coordination (`examples/relay/outbox_relay.py`). Rust equivalent (`examples/relay/outbox_relay.rs`). PATTERNS.md: multi-relay competing consumers section + truncated payload fallback guide + latest-state consumer section (dedup view). | 1d | [PLAN_TRANSACTIONAL_OUTBOX_HELPER.md](plans/patterns/PLAN_TRANSACTIONAL_OUTBOX_HELPER.md) §B, §C |
 
 > **Consumer groups subtotal: ~8 days**
 
@@ -6363,11 +6374,11 @@ Dependencies: DB-3 (uses schema version to determine needed migrations). Schema 
 
 | Item | Description | Effort | Ref |
 |------|-------------|--------|-----|
-| INBOX-B1 | **`enable_inbox_ordering()` + aggregate-ordered stream table.** `pgt_inbox_ordering_config` catalog table. `enable_inbox_ordering(inbox, aggregate_id_col, sequence_num_col)` creates `next_<inbox>` ST: `DISTINCT ON (aggregate_id)` selecting only the row where `sequence_num = last_processed_seq + 1`. Ensures only the next expected message per aggregate is surfaced. `disable_inbox_ordering(inbox)` drops the ST + config row. | 1.5d | [PLAN_TRANSACTIONAL_INBOX_HELPER.md](plans/patterns/PLAN_TRANSACTIONAL_INBOX_HELPER.md) §B.2–B.3 |
+| INBOX-B1 | **`enable_inbox_ordering()` + aggregate-ordered stream table.** `pgt_inbox_ordering_config` catalog table. `enable_inbox_ordering(inbox, aggregate_id_col, sequence_num_col)` creates `next_<inbox>` ST: `DISTINCT ON (aggregate_id)` selecting only the row where `sequence_num = last_processed_seq + 1`. Ensures only the next expected message per aggregate is surfaced. `disable_inbox_ordering(inbox)` drops the ST + config row. **Mutually exclusive with `enable_inbox_priority()`** — returns `InboxOrderingPriorityConflict` if priority is already enabled on this inbox (and vice versa). | 1.5d | [PLAN_TRANSACTIONAL_INBOX_HELPER.md](plans/patterns/PLAN_TRANSACTIONAL_INBOX_HELPER.md) §B.2–B.3 |
 | INBOX-B2 | **Gap detection stream table + alert.** `gaps_<inbox>` ST: CTE generates expected sequence range per aggregate; LEFT JOIN finds missing rows; surfaces `{aggregate_id, missing_sequence, gap_age_sec}`. Emits `pg_trickle_alert` event `inbox_ordering_gap` when new gaps appear. `inbox_ordering_gaps(inbox_name)` SQL function for ad-hoc inspection. 30 s refresh schedule. | 1d | [PLAN_TRANSACTIONAL_INBOX_HELPER.md](plans/patterns/PLAN_TRANSACTIONAL_INBOX_HELPER.md) §B.4 |
 | INBOX-B3 | **`enable_inbox_priority()` + tier-based stream tables.** `pgt_inbox_priority_config` catalog table. `enable_inbox_priority(inbox, priority_col, tiers JSONB)` creates one `pending_<inbox>_<tier>` ST per priority tier with per-tier `schedule` and `WHERE priority BETWEEN min AND max`. Default 3 tiers: critical (1–2, 1 s), normal (3–6, 5 s), background (7–9, 30 s). Original `pending_<inbox>` preserved as unified view. | 1d | [PLAN_TRANSACTIONAL_INBOX_HELPER.md](plans/patterns/PLAN_TRANSACTIONAL_INBOX_HELPER.md) §B.5 |
 | INBOX-B4 | **`inbox_worker_partition()` helper.** SQL function returning a WHERE-clause fragment `abs(hashtext(<aggregate_id_col>)) % <total_workers> = <worker_id>` for partition-affinity polling. Advisory only — workers can still process any message; the filter makes each worker prefer its subset for cache locality. Documented in PATTERNS.md with Python + SQL usage example. | 0.5d | [PLAN_TRANSACTIONAL_INBOX_HELPER.md](plans/patterns/PLAN_TRANSACTIONAL_INBOX_HELPER.md) §B.6 |
-| INBOX-B5 | **Tests.** Integration: ordered ST surfaces only next-sequence messages; out-of-order arrivals withheld until preceding sequence processed; gap detection fires alert after configurable delay; priority tier routing; partition affinity correctness (no messages lost). | 1.5d | [PLAN_TRANSACTIONAL_INBOX_HELPER.md](plans/patterns/PLAN_TRANSACTIONAL_INBOX_HELPER.md) §D |
+| INBOX-B5 | **Tests.** Integration: ordered ST surfaces only next-sequence messages; out-of-order arrivals withheld until preceding sequence processed; gap detection fires alert after configurable delay; priority tier routing; partition affinity correctness (no messages lost). Benchmark gate: `gaps_<inbox>` ST refresh at 1M messages across 10K aggregates must complete in < 1 s at 30 s schedule (uses `generate_series`; exceeding 100K aggregates triggers performance warning and disables auto-refresh). Chaos: processor crash mid-processing + replay recovery; concurrent processors with `FOR UPDATE SKIP LOCKED` (no duplicate processing at 10 concurrent workers). | 1.5d | [PLAN_TRANSACTIONAL_INBOX_HELPER.md](plans/patterns/PLAN_TRANSACTIONAL_INBOX_HELPER.md) §D |
 | INBOX-B6 | **Documentation & examples.** SQL_REFERENCE.md: ordering + priority API. CONFIGURATION.md: ordering GUCs. PATTERNS.md: per-aggregate ordering, gap recovery, priority queue, and competing workers with partition affinity sections. Reference `examples/inbox/inbox_processor_ordered.py`. | 0.5d | [PLAN_TRANSACTIONAL_INBOX_HELPER.md](plans/patterns/PLAN_TRANSACTIONAL_INBOX_HELPER.md) §B, §C |
 
 > **Ordered processing subtotal: ~6 days**
@@ -6377,10 +6388,11 @@ Dependencies: DB-3 (uses schema version to determine needed migrations). Schema 
 | Item | Description | Effort | Ref |
 |------|-------------|--------|-----|
 | SHARED-B1 | **Upgrade SQL additions.** Extend `sql/upgrade--0.22.0--0.23.0.sql`: create `pgt_consumer_groups`, `pgt_consumer_offsets`, `pgt_consumer_leases`, `pgt_inbox_ordering_config`, `pgt_inbox_priority_config` tables; register all Part B SQL functions. | 0.5d | — |
-| SHARED-B2 | **Advanced PATTERNS.md sections.** Add to "Event-Driven Integration Patterns" chapter: competing relays with consumer groups, ordered inbox processing end-to-end, priority queues (when to use), and partition-affinity for high-throughput inboxes. | 0.5d | — |
-| SHARED-B3 | **Advanced E2E tests.** (1) Multi-relay group test: 3 relays share one outbox group, verify each row published exactly once, simulate relay crash + visibility timeout redelivery. (2) Ordered inbox test: publish 10 messages out-of-order per aggregate, verify processor receives them in sequence order. | 1d | — |
+| SHARED-B2 | **Advanced PATTERNS.md sections.** Add to "Event-Driven Integration Patterns" chapter: competing relays with consumer groups, ordered inbox processing end-to-end, priority queues (when to use), partition-affinity for high-throughput inboxes, truncated payload fallback strategy, and latest-state consumer pattern (dedup view). | 0.5d | — |
+| SHARED-B3 | **Advanced E2E tests.** (1) Multi-relay group test: 3 relays share one outbox group, verify each row published exactly once, simulate relay crash + visibility timeout redelivery. (2) Ordered inbox test: publish 10 messages out-of-order per aggregate, verify processor receives them in sequence order. (3) Concurrent stress: 10 relay workers + 100K outbox rows; verify < 0.1% duplicate rate at broker. | 1d | — |
+| SHARED-B4 | **dbt adapter updates.** Add `outbox_enabled`, `consumer_group` and `inbox_config` properties to dbt model config; add `pgtrickle_outbox_config` and `pgtrickle_create_inbox` macros; update dbt-pgtrickle docs and integration tests. | 0.5d | [dbt-pgtrickle/AGENTS.md](dbt-pgtrickle/AGENTS.md) |
 
-> **Part B subtotal: ~17 days**
+> **Part B subtotal: ~17.5 days**
 
 ---
 
@@ -6401,33 +6413,39 @@ Dependencies: DB-3 (uses schema version to determine needed migrations). Schema 
 > **v0.23.0 total: ~4–5 weeks** (Part A: essential patterns + Part B: production patterns)
 
 **Exit criteria:**
-- [ ] OUTBOX-1/2: `enable_outbox()` creates outbox table with correct schema; catalog row present
+- [ ] OUTBOX-1/2: `enable_outbox()` creates outbox table + `pgt_outbox_dedup_<st>` view with correct schema; catalog row present
+- [ ] OUTBOX-1: `enable_outbox()` on IMMEDIATE-mode stream table returns `OutboxRequiresNotImmediateMode` with clear message
+- [ ] OUTBOX-2: Naming collision resolution: truncation + hex suffix tested end-to-end; final name stored in catalog
 - [ ] OUTBOX-3: Refresh populates outbox payload within same transaction; rollback on outbox INSERT failure
-- [ ] OUTBOX-4: Payload follows `{"v":1, "inserted":[…], "deleted":[…]}` format; truncation marker emitted for oversized payloads
+- [ ] OUTBOX-4: Payload follows `{"v":1, "inserted":[…], "deleted":[…]}` format; truncation marker emitted for oversized payloads; relay fallback to direct ST query documented + tested
 - [ ] OUTBOX-5: Retention drain removes rows older than `outbox_retention_hours`; respects batch size
-- [ ] OUTBOX-6: `drop_stream_table()` cascades to outbox; `outbox_status()` returns correct data
+- [ ] OUTBOX-6: `drop_stream_table()` cascades to outbox + dedup view; `outbox_status()` returns correct data
 - [ ] OUTBOX-7: Benchmark shows < 10 % overhead vs baseline at small payloads
 - [ ] INBOX-1/2: `create_inbox()` creates inbox table + 3 stream tables + metadata
 - [ ] INBOX-3: Pending ST reflects unprocessed messages; DLQ ST reflects poisoned messages
 - [ ] INBOX-4: `enable_inbox_tracking()` works with non-standard column names on existing tables
 - [ ] INBOX-5: `pg_trickle_alert` fires when new DLQ entries appear
 - [ ] INBOX-6: `inbox_health()` returns correct health status; `inbox_status()` lists all inboxes
-- [ ] INBOX-7: `replay_inbox_messages()` resets messages; retention drain respects DLQ
+- [ ] INBOX-7: `replay_inbox_messages()` resets messages; retention drain respects DLQ; processor crash + replay recovery path documented
 - [ ] INBOX-8: `drop_inbox(cascade := true)` drops managed table; preserves adopted tables
 - [ ] SHARED-3: End-to-end inbox → business logic → outbox pipeline test passes
+- [ ] SHARED-4: dbt adapter updated with `outbox_enabled` and `inbox_config` properties; integration tests pass
 - [ ] OUTBOX-B1: `create_consumer_group()` creates group + offset + lease tables; idempotent re-create
 - [ ] OUTBOX-B2: `poll_outbox()` returns correct batch; no overlap between concurrent relays; visibility timeout expires and row re-delivered
 - [ ] OUTBOX-B3: `commit_offset()` advances monotonically; `seek_offset()` enables replay from any position
 - [ ] OUTBOX-B4: Heartbeat tracks liveness; `consumer_unhealthy` alert fires on timeout
 - [ ] OUTBOX-B5: Three monitoring STs (status, group lag, active leases) refresh correctly
-- [ ] OUTBOX-B6: Dead relay reaped after 24 h; leases released; `consumer_reaped` alert emitted
+- [ ] OUTBOX-B6: Dead relay reaped after `consumer_dead_threshold_hours` (default 24 h, configurable); leases released; `consumer_reaped` alert emitted
 - [ ] OUTBOX-B7: Retention drain respects `MIN(last_offset)`; `outbox_force_retention` override works
 - [ ] OUTBOX-B8: Multi-relay group E2E: each outbox row published exactly once across 3 concurrent relays
+- [ ] OUTBOX-B8: Concurrent relay stress test: 10 relays, 100K outbox rows, < 0.1% duplicate rate before broker dedup; 0% after
 - [ ] INBOX-B1: `next_<inbox>` ST surfaces only next expected sequence per aggregate; withholds future sequences
-- [ ] INBOX-B2: `gaps_<inbox>` ST detects missing sequences; `inbox_ordering_gap` alert fires
+- [ ] INBOX-B1: `enable_inbox_ordering()` + `enable_inbox_priority()` together returns `InboxOrderingPriorityConflict` with clear message
+- [ ] INBOX-B2: `gaps_<inbox>` ST detects missing sequences; `inbox_ordering_gap` alert fires; gap detection benchmark passes (< 1 s at 10K aggregates, 1M messages)
 - [ ] INBOX-B3: Priority tier STs refresh at configured schedules; messages route to correct tier
 - [ ] INBOX-B4: `inbox_worker_partition()` returns valid WHERE fragment; no messages lost across N workers
 - [ ] SHARED-B3: Ordered inbox E2E: 10 out-of-order arrivals per aggregate delivered to processor in order
+- [ ] SHARED-B4: dbt adapter updated with consumer group and inbox ordering properties
 - [ ] Extension upgrade path tested (`0.22.0 → 0.23.0`)
 - [ ] `just check-version-sync` passes
 
