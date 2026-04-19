@@ -10,7 +10,10 @@ running `test_tpch_performance_comparison` at SF=0.01 / SF=0.1 / SF=1.0
 (April 19 2026). Queries fall into three categories: threshold collapse,
 early collapse, and structural bugs. Most map onto known DI items in
 `PLAN_DVM_IMPROVEMENTS.md`; this plan tracks the investigation-first
-workflow needed to confirm hypotheses before coding.
+workflow needed to confirm hypotheses before coding. Phase 6 adds three
+additional test-suite issues uncovered during the same investigation:
+WAL exhaustion in `test_tpch_cross_query_consistency`, IMMEDIATE-mode
+scaling gaps, and a coverage hole in `test_tpch_sustained_churn`.
 
 > **Note on DI items:** `PLAN_DVM_IMPROVEMENTS.md` already contains
 > detailed algebraic analysis of the DVM bottlenecks. This document
@@ -29,9 +32,10 @@ workflow needed to confirm hypotheses before coding.
 5. [Phase 3: Fix Early-Collapse Query (q04)](#5-phase-3-fix-early-collapse-query-q04)
 6. [Phase 4: Fix Structural Bug (q20)](#6-phase-4-fix-structural-bug-q20)
 7. [Phase 5: Planner Hints and work_mem GUC](#7-phase-5-planner-hints-and-work_mem-guc)
-8. [Effort Estimates](#8-effort-estimates)
-9. [Verification](#9-verification)
-10. [Appendix: Raw Benchmark Data](#10-appendix-raw-benchmark-data)
+8. [Phase 6: Additional TPC-H Test Suite Issues](#8-phase-6-additional-tpch-test-suite-issues)
+9. [Effort Estimates](#9-effort-estimates)
+10. [Verification](#10-verification)
+11. [Appendix: Raw Benchmark Data](#11-appendix-raw-benchmark-data)
 
 ---
 
@@ -336,7 +340,87 @@ queries. Useful diagnostic until planner stats are reliable.
 
 ---
 
-## 8. Effort Estimates
+## 8. Phase 6: Additional TPC-H Test Suite Issues
+
+Three issues in the test suite itself (distinct from DVM code defects) were
+identified during the same investigation. They do not require Phase 1
+diagnosis as a prerequisite and can be worked in parallel.
+
+### P6-1: test_tpch_cross_query_consistency WAL Exhaustion (½ day)
+
+`test_tpch_cross_query_consistency` creates all 22 stream tables
+simultaneously and refreshes them in sequence within each mutation cycle.
+At SF=10 on April 18, 2026, this caused a 4h50m hang ending in disk/WAL
+exhaustion. The test already calls `CHECKPOINT` after each per-query refresh
+(added after that incident), but the fix has not been validated at SF≥1.
+
+**Investigation:** Run `test_tpch_cross_query_consistency` at SF=1.0 with
+`docker stats` monitoring open. Track WAL LSN delta before/after each
+`CHECKPOINT` call using `SELECT pg_current_wal_lsn()` to confirm WAL is
+being drained per-query rather than accumulating across the full cycle.
+If WAL still grows unbounded between CHECKPOINTs, add a
+`TPCH_MAX_CONCURRENT_STREAMS` env var to cap the number of simultaneously
+created STs and refresh them in batches of N.
+
+**Success criterion:** `test_tpch_cross_query_consistency` completes at
+SF=1.0 in under 30 minutes with peak WAL size below 10GB.
+
+### P6-2: test_tpch_immediate_correctness at SF=1.0 (1.5 days)
+
+`test_tpch_immediate_correctness` is only run at SF=0.01 in the standard
+E2E suite. In IMMEDIATE mode, IVM triggers fire *inside* the base-table DML
+transaction. For multi-join queries like q05/q07/q08/q09, if the delta SQL
+generated for IMMEDIATE mode has similar scaling failures as DIFFERENTIAL
+mode, the application transaction itself will stall at SF=1.0 (potentially
+for 30+ seconds per RF cycle).
+
+**Investigation:** Run `test_tpch_immediate_correctness` at SF=1.0
+(`TPCH_SCALE=1.0`) and record per-query RF cycle time. Identify any query
+where `try_apply_rf1` / `try_apply_rf2` / `try_apply_rf3` takes >5s
+(the IVM trigger fires synchronously inside those calls). Queries exceeding
+30s per cycle are unsafe for production IMMEDIATE use and should be
+documented in the Known Limitations section of `SQL_REFERENCE.md`.
+
+**Note:** The IMMEDIATE mode delta SQL rewrite path is separate from the
+DIFFERENTIAL path; it uses `TransitionTable` as the delta source rather
+than the change buffer. Scaling failures here may be independent of the
+DI-2/DI-6 fixes tracked in Phases 2–4.
+
+**Success criterion:** Per-query RF cycle times documented for SF=1.0;
+any query with >5s cycle time flagged in SQL_REFERENCE.md as not
+recommended for IMMEDIATE mode at production scale.
+
+### P6-3: test_tpch_sustained_churn Coverage Gap (1 day)
+
+`test_tpch_sustained_churn` uses only 7 of 22 queries
+(q01/q03/q04/q06/q10/q14/q22). The threshold-collapse group
+(q05/q07/q08/q09) and super-linear group (q13/q15/q17) are excluded:
+q05 explicitly (comment: "reliably exceeds temp_file_limit") and the
+others implicitly as "not known to work well with DIFFERENTIAL". This means
+the durability test never exercises the worst-performing queries over
+multiple cycles, making it a test of only the fast subset.
+
+**After Phase 2–3 fixes land**, add these queries to the churn set and
+verify they do not drift over 100 cycles:
+
+- q05, q07, q08, q09 — threshold-collapse group (should be fast after
+  DI-2 or work_mem fix)
+- q13, q15, q17 — super-linear group (post-EXPLAIN ANALYZE diagnosis)
+- q22 — already in churn set; verify it stays correct after P3-2
+  (delta-key R_old restriction touches the `NOT IN` path q22 uses)
+
+**Implementation:** Add a `TPCH_CHURN_ALL_QUERIES=1` env var to
+`test_tpch_sustained_churn` that includes the full 22-query set (or the
+subset that passed P2A-2 regression validation). Gate the expanded set
+behind the env var so the default churn run stays fast.
+
+**Success criterion:** `test_tpch_sustained_churn` with
+`TPCH_CHURN_ALL_QUERIES=1` completes 100 cycles at SF=0.1 with zero drift
+for all queries added post-fix.
+
+---
+
+## 9. Effort Estimates
 
 | Phase | Item | Days | Confidence | Prerequisite |
 |-------|------|------|------------|--------------|
@@ -351,8 +435,9 @@ queries. Useful diagnostic until planner stats are reliable.
 | 4 | P4-1: q20 nested EXISTS analysis | 0.5 | High | P1-2 |
 | 4 | P4-2: hoist inner R_old to named CTE | 2.0 | Medium | P4-1 |
 | 5 | P5-1: delta_work_mem GUC | 0.5 | High | — |
-| 5 | P5-2: delta_enable_nestloop GUC | 0.5 | Low | P5-1 |
-
+| 5 | P5-2: delta_enable_nestloop GUC | 0.5 | Low | P5-1 || 6 | P6-1: cross-query consistency WAL check | 0.5 | High | — |
+| 6 | P6-2: IMMEDIATE mode SF=1.0 spike | 1.5 | Medium | — |
+| 6 | P6-3: sustained-churn coverage gap | 1.0 | High | Phases 2–3 complete |
 **Best case (hypothesis A: spill):** P1-1 + P1-2 + P2B + P5-1 = **2.5 days**
 The queries are already generating correct delta SQL; PostgreSQL just needs
 more sort memory. This path requires no DVM code changes.
@@ -362,6 +447,9 @@ more sort memory. This path requires no DVM code changes.
 DI-2 completion plus targeted fixes for q04 and q20. This is the path if
 the work_mem benchmark shows no improvement.
 
+**Phase 6 (parallel, no prerequisites for P6-1/P6-2):** P6-1 + P6-2 + P6-3 = **~3 days**
+Can start independently of Phases 1–5; P6-3 waits for Phases 2–3 to land.
+
 **Key uncertainty:** The 0.01→0.1 plateau for q05/q07/q09 followed by the
 0.1→1.0 explosion strongly suggests memory spill, but the existing DI-1
 named-CTE work should have reduced intermediate volume. If DI-1 is correctly
@@ -370,7 +458,7 @@ aggregate rescan path described in `PLAN_DVM_IMPROVEMENTS.md §2.4`.
 
 ---
 
-## 9. Verification
+## 10. Verification
 
 After each phase:
 
@@ -395,10 +483,13 @@ TPCH_SCALE=1.0 TPCH_CYCLES=2 \
 - q05/q07/q08/q09 DIFF < 2s at SF=1.0 (currently 28–40s)
 - q22 DIFF < 200ms at SF=1.0 (currently 3.1s)
 - No regression on queries that are currently fast (q02, q11, q16: stay < 20ms)
+- `test_tpch_cross_query_consistency` completes at SF=1.0 in < 30 min (P6-1)
+- IMMEDIATE mode RF cycle times documented for all 22 queries at SF=1.0 (P6-2)
+- `test_tpch_sustained_churn` with `TPCH_CHURN_ALL_QUERIES=1` completes 100 cycles at SF=0.1 with zero drift (P6-3, after Phases 2–3)
 
 ---
 
-## 10. Appendix: Raw Benchmark Data
+## 11. Appendix: Raw Benchmark Data
 
 Collected 2026-04-19 on macOS, Docker Desktop, pg_trickle_e2e:latest,
 PostgreSQL 18.3. `TPCH_BENCH=1 TPCH_CYCLES=2`. Median of 2 measured cycles.

@@ -6306,12 +6306,23 @@ coding, then apply fixes to the smallest affected code paths.
 | P5-1 | **`pgtrickle.delta_work_mem` GUC.** Add a GUC that sets `work_mem` inside `execute_delta_sql` before running generated SQL. Default `0` (inherit session `work_mem`). Allows tuning without server restart: `ALTER SYSTEM SET pgtrickle.delta_work_mem = '256MB'`. Short-term mitigation while DI-2 completion (Phase 2) is in progress. **Location:** `config.rs` + `refresh.rs`. | 0.5d | — |
 | P5-2 | **`pgtrickle.delta_enable_nestloop` GUC (optional).** Add a GUC to disable nested-loop joins inside delta execution (`SET enable_nestloop = off`). Useful diagnostic for planner regressions on large right-side joins before planner statistics are reliable. **Location:** `config.rs` + `refresh.rs`. | 0.5d | — |
 
+### Phase 6 — Additional TPC-H Test Suite Issues
+
+*Independent of Phases 1–5; P6-1 and P6-2 can start immediately. P6-3 requires Phases 2–3 to land first.*
+
+| Item | Description | Effort | Priority |
+|------|-------------|--------|----------|
+| P6-1 | **test_tpch_cross_query_consistency WAL exhaustion.** The April 18 4h50m hang was caused by WAL accumulation from 22 simultaneous stream tables at SF-10. The test already has per-query `CHECKPOINT` calls, but this has not been validated at SF≥1. Run the test at SF=1.0 with WAL LSN monitoring to confirm CHECKPOINTs drain WAL before it grows unbounded. If not, add `TPCH_MAX_CONCURRENT_STREAMS` env var to cap concurrent STs and refresh in batches. **Success:** completes at SF=1.0 in <30 min, peak WAL <10GB. | 0.5d | High |
+| P6-2 | **IMMEDIATE mode scaling at SF=1.0.** `test_tpch_immediate_correctness` is only run at SF=0.01. In IMMEDIATE mode, IVM triggers fire *inside* the DML transaction. If multi-join queries (q05/q07/q08/q09) have similar scaling failures as DIFFERENTIAL, the application transaction stalls at SF=1.0. Run the test at SF=1.0, record per-query RF cycle time. Queries >5s per cycle must be documented in SQL_REFERENCE.md as not recommended for IMMEDIATE mode at production scale. Note: IMMEDIATE mode uses `TransitionTable` delta source, so fixes may be independent of DI-2/DI-6. | 1.5d | Medium |
+| P6-3 | **test_tpch_sustained_churn coverage gap.** The churn test uses only 7 of 22 queries (q01/q03/q04/q06/q10/q14/q22). The threshold-collapse group (q05/q07/q08/q09) and super-linear group (q13/q15/q17) are excluded. After Phases 2–3 fix their scaling, add them to the churn set behind `TPCH_CHURN_ALL_QUERIES=1` env var. Verify zero drift over 100 cycles at SF=0.1. Also verify q22 stays correct after P3-2 touches the `NOT IN` path q22 uses. | 1.0d | High (post Phase 2–3) |
+
 ### Effort Summary for v0.23.0
 
 | Path | Items | Total |
 |------|-------|-------|
-| Best case (hypothesis A: spill) | P1-1 + P1-2 + P2B-1 + P2-1 + P3-1 + P4-1 + P5-1 | **~4 days** |
-| Likely case (hypothesis B: DVM cardinality) | All items | **~11 days** |
+| Best case (hypothesis A: spill) | P1-1 + P1-2 + P2B-1 + P2-1 + P3-1 + P4-1 + P5-1 + P6-1 + P6-2 | **~6 days** |
+| Likely case (hypothesis B: DVM cardinality) | All items | **~14 days** |
+| Phase 6 only (parallel track) | P6-1 + P6-2 + P6-3 | **~3 days** |
 
 **Exit criteria:**
 - [ ] P1-1: work_mem benchmark run at SF=1.0 with results recorded in PLAN_TPCH_DVM_PERF.md
@@ -6323,6 +6334,9 @@ coding, then apply fixes to the smallest affected code paths.
 - [ ] q22 DIFF < 200ms at SF=1.0 (currently 3.1s)
 - [ ] All 22 TPC-H queries pass `test_tpch_differential_correctness` at SF=1.0
 - [ ] No regression on q02/q11/q16 (must stay < 20ms DIFF at SF=1.0)
+- [ ] P6-1: `test_tpch_cross_query_consistency` completes at SF=1.0 in < 30 min
+- [ ] P6-2: IMMEDIATE mode RF cycle times documented for all 22 queries at SF=1.0
+- [ ] P6-3: `test_tpch_sustained_churn` with `TPCH_CHURN_ALL_QUERIES=1` passes 100 cycles at SF=0.1 with zero drift
 - [ ] `just check-version-sync` passes
 
 ---
@@ -8891,7 +8905,7 @@ to keep the pre-1.0 milestones focused on performance and correctness.
 | v0.20.0 — Dog-Feeding (pg_trickle monitors itself) | ~3–4wk | — | |
 | v0.21.0 — Correctness, Safety & Test Hardening | ~6–8wk | 2026-07-16 | ✅ Released |
 | v0.22.0 — Production Scalability & Downstream Integration | ~5–6wk (parallel refresh + downstream CDC + predictive cost + SLA tier) | — | |
-| v0.23.0 — TPC-H DVM Scaling Performance | ~4d best case (spill) / ~11d likely (DVM cardinality) | — | |
+| v0.23.0 — TPC-H DVM Scaling Performance | ~6d best case (spill) / ~14d likely (DVM cardinality) | — | |
 | v0.24.0 — Transactional Inbox & Outbox Patterns | ~4–5wk (outbox + inbox + consumer groups + ordered processing) | — | |
 | v0.25.0 — Relay CLI (`pgtrickle-relay`) | ~34.5d (forward + reverse + 8 backends × Source+Sink + tests + distribution) | — | |
 | v0.26.0 — TUI Dog-Feeding Integration | ~3–4wk (TUI + architecture + backend + CLI) | — | |
