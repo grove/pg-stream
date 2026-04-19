@@ -760,8 +760,8 @@ fn compute_coordinator_tick_watermark(
             (lsn, 0, 0)
         }
 
-        config::FrontierHoldbackMode::Xmin => {
-            // Skip the probe when CDC mode is WAL — commit-LSN ordering
+        config::FrontierHoldbackMode::Xmin | config::FrontierHoldbackMode::InvalidLsn => {
+            // Skip the probe when CDC mode is WAL -- commit-LSN ordering
             // is already safe in logical-replication mode.
             if config::pg_trickle_cdc_mode() == "wal" {
                 let lsn =
@@ -795,18 +795,35 @@ fn compute_coordinator_tick_watermark(
                     (Some(safe_lsn), current_oldest_xmin, age_secs)
                 }
                 Err(e) => {
-                    // On probe failure, fall back to current write LSN.
-                    log!(
-                        "pg_trickle: holdback probe failed ({}); using raw write LSN",
+                    // On probe failure, hold at the previous watermark (if known)
+                    // rather than advancing to the raw write LSN.  Advancing on
+                    // failure is the exact unsafe behaviour the holdback is meant
+                    // to prevent — the probe may have failed precisely because a
+                    // long-running transaction exists.
+                    warning!(
+                        "pg_trickle: holdback probe failed ({}); holding at previous watermark",
                         e
                     );
-                    let lsn =
-                        Spi::get_one::<String>("SELECT pg_current_wal_lsn()::text").unwrap_or(None);
-                    if let Some(ref l) = lsn {
-                        shmem::set_last_tick_safe_lsn(version::lsn_to_u64(l));
-                    }
+                    let safe_lsn = match prev_watermark_lsn {
+                        Some(prev) => {
+                            // Re-use last known-safe watermark.
+                            let u = version::lsn_to_u64(prev);
+                            shmem::set_last_tick_safe_lsn(u);
+                            Some(prev.to_string())
+                        }
+                        None => {
+                            // First tick — no previous watermark; fall back to
+                            // write LSN to avoid stalling forever on startup.
+                            let lsn = Spi::get_one::<String>("SELECT pg_current_wal_lsn()::text")
+                                .unwrap_or(None);
+                            if let Some(ref l) = lsn {
+                                shmem::set_last_tick_safe_lsn(version::lsn_to_u64(l));
+                            }
+                            lsn
+                        }
+                    };
                     shmem::update_holdback_metrics(0, 0);
-                    (lsn, 0, 0)
+                    (safe_lsn, 0, 0)
                 }
             }
         }
@@ -846,7 +863,9 @@ fn compute_worker_tick_watermark() -> Option<String> {
             Spi::get_one::<String>("SELECT pg_current_wal_lsn()::text").unwrap_or(None)
         }
 
-        config::FrontierHoldbackMode::Xmin | config::FrontierHoldbackMode::LsnBytes(_) => {
+        config::FrontierHoldbackMode::Xmin
+        | config::FrontierHoldbackMode::LsnBytes(_)
+        | config::FrontierHoldbackMode::InvalidLsn => {
             // Read the safe watermark the coordinator stored in shmem.
             let safe_lsn_u64 = shmem::last_tick_safe_lsn_u64();
 

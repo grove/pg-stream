@@ -486,4 +486,30 @@ mod tests {
             ts
         );
     }
+
+    #[test]
+    fn test_lsn_to_u64_round_trip() {
+        // Round-trip: parse then format
+        assert_eq!(u64_to_lsn(lsn_to_u64("1/00000500")), "1/00000500");
+        assert_eq!(u64_to_lsn(lsn_to_u64("0/00000001")), "0/00000001");
+        assert_eq!(u64_to_lsn(lsn_to_u64("FF/FFFFFFFF")), "FF/FFFFFFFF");
+        assert_eq!(u64_to_lsn(lsn_to_u64("0/0")), "0/00000000");
+    }
+
+    #[test]
+    fn test_lsn_to_u64_known_values() {
+        // High segment 1, low 0x500 = u64 value 0x1_0000_0500
+        assert_eq!(lsn_to_u64("1/00000500"), 0x1_0000_0500);
+        assert_eq!(lsn_to_u64("0/00000001"), 1);
+        assert_eq!(lsn_to_u64("0/0"), 0);
+    }
+
+    #[test]
+    fn test_u64_to_lsn_format() {
+        // u64_to_lsn uses uppercase hex with zero-padded 8-char low half,
+        // matching PostgreSQL's pg_lsn output format.
+        assert_eq!(u64_to_lsn(0x1_0000_0500), "1/00000500");
+        assert_eq!(u64_to_lsn(1), "0/00000001");
+        assert_eq!(u64_to_lsn(0), "0/00000000");
+    }
 }
