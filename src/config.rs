@@ -963,14 +963,21 @@ pub enum FrontierHoldbackMode {
     None,
     /// Hold back the frontier by exactly N bytes (debugging only).
     LsnBytes(u64),
+    /// Sentinel: `lsn:<value>` was present but the number failed to parse.
+    /// The accessor converts this to `Xmin` after emitting a WARNING.
+    InvalidLsn,
 }
 
 impl FrontierHoldbackMode {
-    pub fn as_str(&self) -> &'static str {
+    /// Return a human-readable representation of the mode.
+    /// Unlike `as_str()` on simpler enums, this allocates for `LsnBytes`
+    /// to include the actual byte count (e.g. `"lsn:1048576"`).
+    pub fn display_string(&self) -> String {
         match self {
-            FrontierHoldbackMode::Xmin => "xmin",
-            FrontierHoldbackMode::None => "none",
-            FrontierHoldbackMode::LsnBytes(_) => "lsn:<bytes>",
+            FrontierHoldbackMode::Xmin => "xmin".to_string(),
+            FrontierHoldbackMode::None => "none".to_string(),
+            FrontierHoldbackMode::LsnBytes(n) => format!("lsn:{n}"),
+            FrontierHoldbackMode::InvalidLsn => "invalid".to_string(),
         }
     }
 }
@@ -979,8 +986,11 @@ pub fn normalize_frontier_holdback_mode(value: Option<String>) -> FrontierHoldba
     match value.as_deref().map(str::to_ascii_lowercase).as_deref() {
         Some("none") => FrontierHoldbackMode::None,
         Some(s) if s.starts_with("lsn:") => {
-            let bytes: u64 = s["lsn:".len()..].parse().unwrap_or(0);
-            FrontierHoldbackMode::LsnBytes(bytes)
+            let tail = &s["lsn:".len()..];
+            match tail.parse::<u64>() {
+                Ok(bytes) => FrontierHoldbackMode::LsnBytes(bytes),
+                Err(_) => FrontierHoldbackMode::InvalidLsn,
+            }
         }
         _ => FrontierHoldbackMode::Xmin,
     }
@@ -2441,11 +2451,19 @@ pub fn pg_trickle_diff_output_format() -> DiffOutputFormat {
 
 /// #536: Returns the current frontier holdback mode.
 pub fn pg_trickle_frontier_holdback_mode() -> FrontierHoldbackMode {
-    normalize_frontier_holdback_mode(
-        PGS_FRONTIER_HOLDBACK_MODE
-            .get()
-            .and_then(|cs| cs.to_str().ok().map(str::to_owned)),
-    )
+    let raw = PGS_FRONTIER_HOLDBACK_MODE
+        .get()
+        .and_then(|cs| cs.to_str().ok().map(str::to_owned));
+    let mode = normalize_frontier_holdback_mode(raw.clone());
+    if matches!(mode, FrontierHoldbackMode::InvalidLsn) {
+        pgrx::warning!(
+            "pg_trickle: invalid frontier_holdback_mode '{}' — \
+             expected 'lsn:<bytes>' with a valid integer; defaulting to 'xmin'",
+            raw.as_deref().unwrap_or("")
+        );
+        return FrontierHoldbackMode::Xmin;
+    }
+    mode
 }
 
 /// #536: Returns the frontier holdback warning threshold in seconds (0 = disabled).
@@ -3020,10 +3038,10 @@ mod tests {
             normalize_frontier_holdback_mode(Some("lsn:0".to_string())),
             FrontierHoldbackMode::LsnBytes(0)
         );
-        // Invalid number → 0 bytes
+        // Invalid number → returns InvalidLsn sentinel (accessor converts to Xmin + warns)
         assert_eq!(
             normalize_frontier_holdback_mode(Some("lsn:notanumber".to_string())),
-            FrontierHoldbackMode::LsnBytes(0)
+            FrontierHoldbackMode::InvalidLsn
         );
     }
 }
