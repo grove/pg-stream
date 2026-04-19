@@ -127,10 +127,17 @@ async fn apply_changes(db: &E2eDb, table_size: usize, change_pct: f64) {
 // ── Query complexity definitions ───────────────────────────────────────
 
 /// Benchmark scenario: a named query template + whether it needs a join table.
+///
+/// `max_table_size`: when `Some(n)`, the scenario is skipped for table sizes
+/// larger than `n` in the full/large matrix benchmarks.  Use this for queries
+/// that fall back to FULL refresh and have super-linear (e.g. O(n²)) cost at
+/// large scales — notably correlated LATERAL sub-selects and window functions.
 struct QueryScenario {
     name: &'static str,
     query: &'static str,
     needs_dim: bool,
+    /// Skip in matrix benchmarks when `table_size > max_table_size`.
+    max_table_size: Option<usize>,
 }
 
 fn query_scenarios() -> Vec<QueryScenario> {
@@ -139,22 +146,26 @@ fn query_scenarios() -> Vec<QueryScenario> {
             name: "scan",
             query: "SELECT id, region, category, amount, score FROM src",
             needs_dim: false,
+            max_table_size: None,
         },
         QueryScenario {
             name: "filter",
             query: "SELECT id, region, amount FROM src WHERE amount > 5000",
             needs_dim: false,
+            max_table_size: None,
         },
         QueryScenario {
             name: "aggregate",
             query: "SELECT region, SUM(amount) AS total, COUNT(*) AS cnt FROM src GROUP BY region",
             needs_dim: false,
+            max_table_size: None,
         },
         QueryScenario {
             name: "join",
             query: "SELECT s.id, s.region, s.amount, d.region_name \
                     FROM src s INNER JOIN dim d ON s.region = d.region",
             needs_dim: true,
+            max_table_size: None,
         },
         QueryScenario {
             name: "join_agg",
@@ -162,14 +173,21 @@ fn query_scenarios() -> Vec<QueryScenario> {
                     FROM src s INNER JOIN dim d ON s.region = d.region \
                     GROUP BY d.region_name",
             needs_dim: true,
+            max_table_size: None,
         },
         // I-7: Window / lateral / CTE / UNION ALL operator scenarios
+        //
+        // window: falls back to FULL refresh (window functions not differentiable).
+        //         O(n log n) FULL refresh becomes expensive at 100K rows.
+        // lateral: correlated sub-select is O(n²/regions) per FULL refresh;
+        //          at 100K rows this took ~60 min in CI — cap at 10K.
         QueryScenario {
             name: "window",
             query: "SELECT id, region, amount, \
                     ROW_NUMBER() OVER (PARTITION BY region ORDER BY amount DESC, id) AS rn \
                     FROM src",
             needs_dim: false,
+            max_table_size: Some(10_000),
         },
         QueryScenario {
             name: "lateral",
@@ -178,6 +196,7 @@ fn query_scenarios() -> Vec<QueryScenario> {
                     LATERAL (SELECT MAX(score) AS top_score FROM src s2 \
                              WHERE s2.region = s.region) l",
             needs_dim: false,
+            max_table_size: Some(10_000),
         },
         QueryScenario {
             name: "cte",
@@ -187,6 +206,7 @@ fn query_scenarios() -> Vec<QueryScenario> {
                     SELECT s.id, s.region, s.amount, r.total \
                     FROM src s JOIN regional r ON s.region = r.region",
             needs_dim: false,
+            max_table_size: None,
         },
         QueryScenario {
             name: "union_all",
@@ -194,6 +214,7 @@ fn query_scenarios() -> Vec<QueryScenario> {
                     UNION ALL \
                     SELECT id, amount, 'low' AS tier FROM src WHERE amount <= 5000",
             needs_dim: false,
+            max_table_size: None,
         },
     ]
 }
@@ -990,6 +1011,15 @@ async fn bench_large_matrix() {
         };
         for &change_pct in rates {
             for scenario in &scenarios {
+                if let Some(max) = scenario.max_table_size
+                    && table_size > max
+                {
+                    eprintln!(
+                        "↷ Skipping: {} | {}rows (capped at {}rows — FULL-refresh O(n²))",
+                        scenario.name, table_size, max,
+                    );
+                    continue;
+                }
                 eprintln!(
                     "▶ Benchmarking: {} | {} rows | {:.0}% changes ...",
                     scenario.name,
@@ -1007,9 +1037,13 @@ async fn bench_large_matrix() {
 
 // ── Full matrix benchmark ──────────────────────────────────────────────
 //
-// Runs ALL combinations of dimensions: 5 queries × 2 sizes × 3 rates = 30 runs.
+// Runs ALL combinations of dimensions: 9 queries × 2 sizes × 3 rates,
+// skipping scenarios whose `max_table_size` cap would be exceeded.
 // Each run does CYCLES full + CYCLES differential refreshes.
-// Expect ~15-30 minutes depending on hardware.
+// Expect ~30-60 minutes depending on hardware.
+//
+// Scenarios capped at 10K rows (lateral, window) are excluded at 100K
+// because their FULL-refresh cost is O(n²) / prohibitively slow in CI.
 
 #[tokio::test]
 #[ignore]
@@ -1020,6 +1054,15 @@ async fn bench_full_matrix() {
     for table_size in TABLE_SIZES {
         for change_pct in CHANGE_RATES {
             for scenario in &scenarios {
+                if let Some(max) = scenario.max_table_size
+                    && *table_size > max
+                {
+                    eprintln!(
+                        "↷ Skipping: {} | {}rows (capped at {}rows — FULL-refresh O(n²))",
+                        scenario.name, table_size, max,
+                    );
+                    continue;
+                }
                 eprintln!(
                     "▶ Benchmarking: {} | {}rows | {:.0}% changes ...",
                     scenario.name,
