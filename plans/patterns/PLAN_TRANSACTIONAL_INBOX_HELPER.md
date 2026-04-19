@@ -1,6 +1,6 @@
 # Transactional Inbox Helper & Dead-Letter Queue Extension
 
-> **Status:** Implementation Plan (DRAFT)
+> **Status:** Implementation Plan (DESIGN REVIEW COMPLETE — 2026-04-19)
 > **Created:** 2026-04-18
 > **Category:** Integration Pattern — Implementation
 > **Related:** [PLAN_TRANSACTIONAL_INBOX.md](PLAN_TRANSACTIONAL_INBOX.md) ·
@@ -15,7 +15,7 @@
 - [Goals & Non-Goals](#goals--non-goals)
 - [Background](#background)
 - [Key Differences from the Outbox Helper](#key-differences-from-the-outbox-helper)
-- [Part A — Inbox Helper (v0.22.0 or v0.23.0)](#part-a--inbox-helper-v0220-or-v0230)
+- [Part A — Inbox Helper (v0.23.0)](#part-a--inbox-helper-v0230)
   - [A.1 SQL API](#a1-sql-api)
   - [A.2 Catalog Schema](#a2-catalog-schema)
   - [A.3 Inbox Table Schema](#a3-inbox-table-schema)
@@ -52,7 +52,7 @@
 
 This plan specifies two complementary features for pg_trickle:
 
-1. **Inbox Helper (v0.22.0 or v0.23.0):** A convenience layer that creates
+1. **Inbox Helper (v0.23.0):** A convenience layer that creates
    a best-practice inbox table with auto-managed stream tables for the
    pending-message queue, dead-letter queue, and processing statistics.
    It also supports *adopting* an existing hand-rolled inbox table into
@@ -112,8 +112,8 @@ This is an important conceptual asymmetry:
   responsibility of the application or an inbox-writer process.
 - pg_trickle does **not** own broker connections. Consuming from Kafka, NATS,
   RabbitMQ, etc. remains external.
-- pg_trickle does **not** enforce message ordering in v0.22.0 — that is
-  Part B (v0.23.0).
+- pg_trickle does **not** enforce message ordering in Part A — that is
+  Part B of this release.
 - The inbox helper does **not** replace pgmq, pgflow, or other purpose-built
   queue extensions. It is a thin orchestration layer for the common
   "table + stream table" pattern.
@@ -153,7 +153,7 @@ Understanding the asymmetry is critical for correct implementation:
 
 ---
 
-## Part A — Inbox Helper (v0.22.0 or v0.23.0)
+## Part A — Inbox Helper (v0.23.0)
 
 ### A.1 SQL API
 
@@ -161,6 +161,7 @@ Understanding the asymmetry is critical for correct implementation:
 -- Create a new inbox table with best-practice schema + stream tables
 SELECT pgtrickle.create_inbox(
     inbox_name       TEXT,                      -- e.g. 'payment_inbox'
+    schema           TEXT DEFAULT 'pgtrickle',  -- schema for the inbox table (default: pgtrickle)
     max_retries      INT DEFAULT 5,             -- messages with retry_count >= this go to DLQ
     schedule         INTERVAL DEFAULT '1s',     -- refresh interval for pending stream table
     with_dead_letter BOOLEAN DEFAULT true,      -- create DLQ stream table?
@@ -199,12 +200,14 @@ SELECT * FROM pgtrickle.inbox_status(
 --          pending_count, dlq_count, processed_count,
 --          oldest_pending_age_sec, total_bytes
 
--- Replay: reset messages for re-processing
+-- Replay: reset messages for re-processing (by explicit event ID list only)
+-- Note: a free-form where_clause parameter was considered and rejected due to
+-- SQL injection risk. Replay by filter criteria should be done externally
+-- using a parameterised SELECT to identify event IDs, then passing the list here.
 SELECT pgtrickle.replay_inbox_messages(
-    inbox_name   TEXT,
-    where_clause TEXT DEFAULT NULL,            -- e.g. 'event_type = ''PaymentFailed'''
-    event_ids    TEXT[] DEFAULT NULL           -- or specific event IDs
-) RETURNS INT;                                -- number of messages reset
+    inbox_name TEXT,
+    event_ids  TEXT[]             -- required: explicit list of event IDs to reset
+) RETURNS INT;                   -- number of messages reset
 
 -- Quick health check (returns JSONB summary)
 SELECT pgtrickle.inbox_health(
@@ -230,7 +233,7 @@ SELECT pgtrickle.inbox_health(
 | `enable_inbox_tracking` | Table must exist; required columns must be present with compatible types; must not already be tracked. |
 | `drop_inbox` | Must be tracked (or `if_exists := true`). `cascade := true` required to drop the inbox table itself. |
 | `inbox_status` | Returns empty set if argument provided but no match. |
-| `replay_inbox_messages` | Exactly one of `where_clause` or `event_ids` must be non-NULL. `where_clause` is validated via `EXPLAIN` before execution to prevent SQL injection. |
+| `replay_inbox_messages` | `event_ids` must be non-NULL and non-empty. Uses a parameterised `WHERE event_id = ANY($1)` — no free-form SQL accepted; eliminates injection surface entirely. |
 | `inbox_health` | Returns NULL if inbox not found. |
 
 #### Errors
@@ -240,7 +243,6 @@ All errors use `PgTrickleError` variants:
 - `InboxNotFound { name }` (new variant)
 - `InboxTableNotFound { table }` (new variant, for `enable_inbox_tracking`)
 - `InboxColumnMissing { table, column }` (new variant)
-- `InboxReplayInvalidArgs { detail }` (new variant)
 
 ### A.2 Catalog Schema
 
@@ -432,7 +434,9 @@ SELECT pgtrickle.create_stream_table(
         event_type_col
     ),
     schedule => '10s',
-    refresh_mode => 'DIFFERENTIAL'
+    refresh_mode => 'FULL'  -- FULL required: max_pending_age_sec uses now(),
+                            -- which changes every refresh and would cause
+                            -- DIFFERENTIAL to treat every row as changed.
 );
 ```
 
@@ -523,10 +527,16 @@ Inbox tables grow unboundedly unless processed messages are cleaned up.
 The inbox helper adds a retention drain step to the scheduler:
 
 ```sql
+-- PostgreSQL does not support LIMIT on DELETE directly; use a CTE.
+WITH rows_to_delete AS (
+    SELECT <id_column> FROM <schema>.<inbox_table>
+    WHERE <processed_at_column> IS NOT NULL
+      AND <processed_at_column> < now() - INTERVAL '<retention_hours> hours'
+    ORDER BY <processed_at_column>
+    LIMIT <drain_batch_size>
+)
 DELETE FROM <schema>.<inbox_table>
-WHERE <processed_at_column> IS NOT NULL
-  AND <processed_at_column> < now() - INTERVAL '<retention_hours> hours'
-LIMIT <drain_batch_size>;
+WHERE <id_column> IN (SELECT <id_column> FROM rows_to_delete);
 ```
 
 - Runs once per cleanup cycle (controlled by
@@ -554,20 +564,23 @@ DLQ messages (those with `retry_count >= max_retries` and
 
 ### A.8 Replay Helper
 
-`replay_inbox_messages()` resets selected messages for re-processing:
+`replay_inbox_messages()` resets selected messages for re-processing by
+explicit event ID list. A free-form `where_clause` parameter was considered
+but rejected: `EXPLAIN`-based validation is insufficient to prevent all
+injection vectors (scalar subqueries, set-returning functions), and requiring
+operators to compose the filter externally via a parameterised `SELECT` is
+safer and no less ergonomic.
 
 ```sql
--- Replay by event IDs
+-- Replay a specific list of event IDs
 SELECT pgtrickle.replay_inbox_messages(
     'payment_inbox',
     event_ids => ARRAY['evt-001', 'evt-002']
 );
-
--- Replay by filter (validated via EXPLAIN before execution)
-SELECT pgtrickle.replay_inbox_messages(
-    'payment_inbox',
-    where_clause => $$event_type = 'PaymentFailed' AND received_at > '2026-04-01'$$
-);
+-- To replay by filter, first collect the IDs externally:
+-- SELECT ARRAY_AGG(event_id) FROM pgtrickle.payment_inbox
+--   WHERE event_type = 'PaymentFailed' AND received_at > '2026-04-01';
+-- Then pass the result to replay_inbox_messages().
 ```
 
 #### Implementation
@@ -575,9 +588,9 @@ SELECT pgtrickle.replay_inbox_messages(
 ```sql
 UPDATE <schema>.<inbox_table>
 SET <processed_at_column> = NULL,
-    <retry_count_column> = 0,
-    <error_column> = NULL
-WHERE <where_clause or id_column = ANY(event_ids)>
+    <retry_count_column>   = 0,
+    <error_column>         = NULL
+WHERE <id_column> = ANY($1::text[])          -- parameterised; no dynamic SQL
   AND (<processed_at_column> IS NOT NULL
        OR <retry_count_column> >= <max_retries>)
 RETURNING 1;
@@ -587,12 +600,8 @@ Returns the count of rows reset.
 
 #### Safety
 
-- The `where_clause` is validated by running `EXPLAIN` on a constructed
-  `SELECT` before executing the `UPDATE`. If `EXPLAIN` fails (syntax error,
-  nonexistent column), the replay is rejected with `InboxReplayInvalidArgs`.
-- This prevents SQL injection: the `where_clause` is used inside a
-  parameterised query context, and only column references to the inbox table
-  are valid.
+- Uses a parameterised `WHERE <id_column> = ANY($1)` — no free-form SQL
+  accepted, eliminating the injection surface entirely.
 - A `pg_trickle_alert` event of type `inbox_replay` is emitted with the
   count of replayed messages.
 
@@ -636,7 +645,6 @@ All GUCs are `SUSET` (require superuser to change).
 | `create_inbox()` partially fails | Transaction rolls back; no orphaned objects. |
 | Stream table refresh fails | Standard pg_trickle error handling; retried next cycle. |
 | Drain loop fails | Logged via `pgrx::warning!`; retried next cleanup cycle. Does not block stream table refresh. |
-| Replay `where_clause` invalid | Rejected with `InboxReplayInvalidArgs`; no rows modified. |
 | Application INSERT fails | Not pg_trickle's responsibility; application handles. |
 | Processing failure | Application increments `retry_count`; pg_trickle detects via stream table refresh. |
 | **Processor crash after marking `processed_at` but before committing business logic** | pg_trickle sees the message as processed (`processed_at IS NOT NULL`). **Mitigation:** always execute business logic first, then set `processed_at` — this is the two-phase commit pattern for at-least-once processing. Recovery: `replay_inbox_messages(name, event_ids => ARRAY[$1])` re-queues specific messages. Operators should pause the processor (or set `pg_trickle.inbox_enabled = false`) before bulk replay to avoid re-processing by concurrent workers. See `PoisonMessageGuard` in `examples/inbox/inbox_processor.py` for the circuit-breaker pattern. |
@@ -675,6 +683,44 @@ DIFFERENTIAL is effective because:
 | < 1K msg/sec | Default `create_inbox()` settings work well. |
 | 1K–10K msg/sec | Consider partitioning inbox table by `received_at` (via pg_partman). Increase `schedule` to `2s`. |
 | > 10K msg/sec | Partition + increase `schedule` to `5s`. Use `FOR UPDATE SKIP LOCKED` directly on base table for processing (bypass pending ST). |
+
+#### Backpressure When Ingestion Outpaces Processing
+
+pg_trickle does not own the inbox write path, so it cannot apply
+authomatic backpressure. When the message ingestion rate exceeds processor
+throughput, the `pending_<inbox>` stream table grows, CDC buffer scans
+widen, and refresh latency degrades. Operators should act before this
+becomes critical:
+
+| `inbox_health()` status | Signal | Recommended action |
+|------------------------|--------|---------|
+| `healthy` | `oldest_pending_age_sec` < 30 | None — running normally |
+| `degraded` | `oldest_pending_age_sec` ≥ 30 or `pending_count` > 10K | Add processor workers; inspect slow-path aggregates |
+| `critical` | `oldest_pending_age_sec` ≥ 120 or `pending_count` > 100K | Throttle ingestion at the consumer/webhook layer; scale out processors aggressively |
+
+The `oldest_pending_age_sec` field from `inbox_health()` is the primary
+pressure indicator. Wire it to a Grafana alert or a pg_trickle alert rule
+to automate the response. The `stats_<inbox>` stream table exposes
+`throughput_per_sec` which can be used to compare against broker ingestion
+rate for a combined lag metric.
+
+#### Stats Stream Table at High Throughput
+
+The `stats_<inbox>` ST uses **FULL** refresh mode (because it projects
+`now()` in the `max_pending_age_sec` column) at a 10 s schedule. At high
+message volumes the underlying `COUNT(*)`/`AVG()` scan is O(N) in inbox
+table size:
+
+| Inbox size | Estimated stats refresh time |
+|------------|-------------------------------|
+| < 100K rows | < 5 ms |
+| 100K–1M rows | ~10–50 ms |
+| > 1M rows | > 100 ms — consider `with_stats => false` |
+
+For high-throughput inboxes (> 10K msg/sec or > 1M rows), set
+`with_stats => false` and use `inbox_health()` on demand instead of
+the materialised stats stream table. The `pending_<inbox>` and
+`dlq_<inbox>` STs are DIFFERENTIAL and are not affected.
 
 #### Bloat Mitigation
 
@@ -806,55 +852,81 @@ SELECT pgtrickle.create_stream_table(
 This guarantees that only the **next expected message** per aggregate is
 surfaced — preventing out-of-order processing.
 
+> **Known performance limitation — `last_processed` CTE is a full scan.**
+> The `last_processed` CTE scans all processed rows in the inbox table on
+> every refresh. For a long-lived inbox with millions of processed messages
+> this grows without bound and will eventually degrade refresh performance.
+>
+> **v0.23.0 mitigation:** Add a partial index:
+> ```sql
+> CREATE INDEX idx_<inbox>_processed_seq
+>     ON <inbox_table> (aggregate_id, sequence_num)
+>     WHERE processed_at IS NOT NULL;
+> ```
+> The planner will use this index for the `MAX(sequence_num) GROUP BY` query.
+> This makes the CTE an **index-only scan**, but it still scales with the
+> number of processed rows. Concrete scaling thresholds:
+>
+> | Processed rows | Est. refresh time (partial index) | Recommended schedule |
+> |----------------|----------------------------------|----------------------|
+> | < 100K         | < 5 ms                           | `1s` (default)       |
+> | 100K – 1M      | ~10–50 ms                        | `5s`                 |
+> | > 1M           | > 100 ms                         | `10s` – `30s`        |
+> | > 10M          | > 1 s                            | Use `inbox_ordering_gaps()` on-demand only |
+>
+> Operators should increase the `next_<inbox>` schedule as processed history
+> grows. Document this recommendation in the inbox runbook.
+>
+> **Post-v0.23.0 optimization:** Introduce a `pgt_inbox_sequence_state`
+> catalog table with columns `(inbox_id, aggregate_id, last_processed_seq)`
+> updated atomically when processors call `advance_inbox_sequence()`.
+> This makes the `last_processed` CTE O(changed aggregates) instead of
+> O(all processed rows), eliminating the scaling cliff entirely.
+
 ### B.4 Gap Detection Stream Table
 
 ```sql
 SELECT pgtrickle.create_stream_table(
     'gaps_<inbox_name>',
-    $$WITH expected AS (
-        SELECT aggregate_id,
-               generate_series(
-                   MIN(sequence_num),
-                   MAX(sequence_num)
-               ) AS expected_seq
-        FROM <inbox_table>
-        GROUP BY aggregate_id
-    )
-    SELECT e.aggregate_id, e.expected_seq AS missing_sequence,
-           EXTRACT(EPOCH FROM (now() - (
-               SELECT MIN(received_at) FROM <inbox_table>
-               WHERE aggregate_id = e.aggregate_id
-                 AND sequence_num > e.expected_seq
-           ))) AS gap_age_sec
-    FROM expected e
-    LEFT JOIN <inbox_table> i
-        ON i.aggregate_id = e.aggregate_id
-        AND i.sequence_num = e.expected_seq
-    WHERE i.event_id IS NULL$$,
+    $$SELECT aggregate_id,
+             sequence_num + 1 AS missing_sequence,
+             EXTRACT(EPOCH FROM (now() - MIN(received_at) OVER (PARTITION BY aggregate_id
+                 ORDER BY sequence_num
+                 ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING)
+             )) AS gap_age_sec
+      FROM (
+          SELECT aggregate_id, sequence_num,
+                 received_at,
+                 LEAD(sequence_num) OVER (PARTITION BY aggregate_id ORDER BY sequence_num)
+                     AS next_seq
+          FROM <inbox_table>
+          WHERE processed_at IS NULL
+      ) t
+      WHERE next_seq IS NOT NULL
+        AND next_seq > sequence_num + 1$$,
     schedule => '30s',
-    refresh_mode => 'DIFFERENTIAL'
+    refresh_mode => 'FULL'  -- FULL required: now() in gap_age_sec changes every refresh
 );
 ```
 
-> **Performance considerations for gap detection:**
-> The `generate_series(MIN, MAX)` approach scans the full sequence range per
-> aggregate. This is efficient for inboxes with tens of thousands of
-> aggregates but can become expensive for large gaps (e.g., missing sequences
-> in a sparse range).
+> **Why LEAD() instead of generate_series?**
+> The `LEAD()` window function scans the pending messages table once in O(N log N)
+> and detects gaps by comparing adjacent sequence numbers. It does **not** generate
+> a virtual row per expected sequence number, so it scales to any sequence density.
+> By contrast, `generate_series(MIN, MAX)` over all aggregates produces a row for
+> every sequence number in every aggregate’s range — 1 000 aggregates with
+> max_sequence = 1 000 000 generate 1 billion virtual rows regardless of how many
+> messages actually exist. The `LEAD()` approach avoids this entirely.
+>
+> **Scope:** Only pending messages (`processed_at IS NULL`) are scanned.
+> Processed rows are excluded — a gap in processed history is not actionable.
 >
 > Scale guidelines:
-> - Up to 10 000 aggregates × 10 000 max sequence: ✅ acceptable at 30 s refresh
-> - 10 000–100 000 aggregates: ⚠️ extend schedule to 60 s; monitor refresh time
-> - > 100 000 aggregates or max sequence > 1 000 000: add `pg_trickle_alert`
->   `inbox_ordering_gap_perf` warning and disable auto-refresh; use
->   `inbox_ordering_gaps()` function for on-demand checks only
->
-> Future optimization (post-v0.23.0): delta-based gap detection that only
-> scans aggregates with recent activity (last N minutes), avoiding full
-> table scans. Tracked as a follow-up issue.
->
-> The benchmark gate (INBOX-B5) must verify acceptable performance at:
-> 1M messages, 10 000 aggregates, 30 s refresh schedule.
+> - Up to 1 000 000 pending messages: ✅ acceptable at 30 s schedule
+> - > 1 000 000 pending messages: ⚠️ extend schedule to 60 s; monitor refresh time
+> - > 10 000 000 pending messages: add `pg_trickle_alert`
+>   `inbox_ordering_gap_perf` warning and consider on-demand checks only via
+>   `inbox_ordering_gaps()` instead of continuous auto-refresh
 
 When gaps are detected, a `pg_trickle_alert` event is emitted:
 
@@ -902,36 +974,37 @@ For high-throughput inboxes processed by multiple workers, partition affinity
 improves cache locality and reduces contention:
 
 ```sql
--- Proposed helper (generates a WHERE clause for worker assignment)
-SELECT pgtrickle.inbox_worker_partition(
-    inbox_name   TEXT,
+-- Boolean-returning helper: returns true if this row belongs to the given worker.
+-- Returns a BOOLEAN so it composes safely with prepared statements and ORMs
+-- without requiring SQL string interpolation.
+SELECT pgtrickle.inbox_is_my_partition(
+    aggregate_id TEXT,
     worker_id    INT,                      -- 0-based
     total_workers INT                      -- total worker count
-) RETURNS TEXT;
--- Returns: 'abs(hashtext(aggregate_id)) % 4 = 0' (for worker 0 of 4)
+) RETURNS BOOLEAN;
+-- Returns: abs(hashtext(aggregate_id)) % total_workers = worker_id
 ```
 
-Workers use this to add a filter when polling:
+Workers use this in their polling query:
 
 ```python
-partition_filter = await conn.fetchval(
-    "SELECT pgtrickle.inbox_worker_partition('payment_inbox', $1, $2)",
-    worker_id, total_workers,
-)
-rows = await conn.fetch(f"""
+rows = await conn.fetch("""
     SELECT event_id, event_type, payload
     FROM pgtrickle.payment_inbox
     WHERE processed_at IS NULL
       AND retry_count < 5
-      AND {partition_filter}
+      AND pgtrickle.inbox_is_my_partition(aggregate_id, $1, $2)
     ORDER BY received_at
     LIMIT 50
     FOR UPDATE SKIP LOCKED
-""")
+""", worker_id, total_workers)
 ```
 
 This is advisory — workers can still process any message. The partition
-clause just makes it likely that each worker focuses on its own subset.
+condition just makes it likely that each worker focuses on its own subset.
+Because the function is called inline in a WHERE clause it composes safely
+with prepared statements and ORM query builders, unlike a TEXT-returning
+helper that requires unsafe SQL interpolation.
 
 ---
 
@@ -1232,7 +1305,7 @@ Acceptance criteria: pending ST refresh < 5 ms at 100 pending, < 50 ms at
 
 | File | Sections to Add |
 |------|-----------------|
-| [docs/SQL_REFERENCE.md](../../docs/SQL_REFERENCE.md) | `pgtrickle.create_inbox()`, `enable_inbox_tracking()`, `drop_inbox()`, `inbox_status()`, `inbox_health()`, `replay_inbox_messages()`, `enable_inbox_ordering()`, `enable_inbox_priority()`, `inbox_worker_partition()`; ordered+priority mutual exclusion note |
+| [docs/SQL_REFERENCE.md](../../docs/SQL_REFERENCE.md) | `pgtrickle.create_inbox()`, `enable_inbox_tracking()`, `drop_inbox()`, `inbox_status()`, `inbox_health()`, `replay_inbox_messages()`, `enable_inbox_ordering()`, `enable_inbox_priority()`, `inbox_is_my_partition()`; ordered+priority mutual exclusion note |
 | [docs/CONFIGURATION.md](../../docs/CONFIGURATION.md) | All six inbox GUCs with defaults and effect descriptions |
 | [docs/PATTERNS.md](../../docs/PATTERNS.md) | New section "Transactional Inbox" with: basic inbox setup, DLQ flow, processor crash recovery guide, per-aggregate ordering pattern, priority queue pattern, partition affinity for competing workers, "Ordered + Priority" mutual exclusion explanation and recommended alternative (separate inboxes per priority class) |
 | [docs/ARCHITECTURE.md](../../docs/ARCHITECTURE.md) | Diagram of inbox pipeline with stream tables |
@@ -1245,7 +1318,7 @@ Acceptance criteria: pending ST refresh < 5 ms at 100 pending, < 50 ms at
 
 ## Part F — Implementation Roadmap
 
-### Part A — v0.22.0 or v0.23.0
+### Part A — v0.23.0 (Essential Patterns)
 
 | Item | Description | Effort |
 |------|-------------|--------|
@@ -1253,32 +1326,34 @@ Acceptance criteria: pending ST refresh < 5 ms at 100 pending, < 50 ms at
 | INBOX-2 | Auto-created stream tables (pending, DLQ, stats) with column-mapped SQL generation | 1d |
 | INBOX-3 | `enable_inbox_tracking()` for existing tables: validation, column mapping, stream table creation | 0.5d |
 | INBOX-4 | DLQ alert mechanism (post-refresh hook), `inbox_health()`, `inbox_status()` | 0.5d |
-| INBOX-5 | Retention drain for processed messages, `replay_inbox_messages()`, `drop_inbox()` lifecycle | 0.5d |
+| INBOX-5 | Retention drain for processed messages, `replay_inbox_messages()` (event_ids only), `drop_inbox()` lifecycle | 0.5d |
 | INBOX-6 | Unit + integration + E2E tests, benchmark, docs updates, reference examples | 1d |
 
-**Total: ~4.5 days.** Slightly larger than the outbox helper due to
-column-mapping complexity and the `enable_inbox_tracking()` path.
+**Total: ~4.5 days** (matches roadmap estimate).
 
-### Part B — v0.23.0 (same milestone)
+### Part B — v0.23.0 (Production Patterns)
 
 | Item | Description | Effort |
 |------|-------------|--------|
-| ORD-1 | `enable_inbox_ordering()`: aggregate-ordered stream table, sequence tracking | 1d |
+| ORD-1 | `enable_inbox_ordering()`: aggregate-ordered stream table, sequence tracking, partial index for `last_processed` CTE | 1d |
 | ORD-2 | Gap detection stream table + alert mechanism | 0.5d |
 | ORD-3 | `enable_inbox_priority()`: per-tier stream tables, configurable schedules | 1d |
-| ORD-4 | `inbox_worker_partition()`: hash-based worker affinity helper | 0.5d |
+| ORD-4 | `inbox_is_my_partition()`: boolean-returning hash-based worker affinity helper. Signature: `inbox_is_my_partition(aggregate_id TEXT, worker_id INT, total_workers INT) RETURNS BOOLEAN`. Composable with prepared statements and ORMs; no SQL string interpolation required. | 0.5d |
 | ORD-5 | E2E tests for ordering, gaps, priority, partition affinity | 1d |
 
-**Total: ~4 days.** Suggested for v0.24.0 or v1.1.0.
+**Total: ~4 days.**
 
 ---
 
 ## Part G — Open Questions
 
-1. **Schema for `create_inbox()` tables.** Should managed inbox tables always
-   live in `pgtrickle` schema, or should the user choose? **Proposal:**
-   default to `pgtrickle`; add optional `schema` parameter if users request
-   it.
+1. ✅ **Schema for `create_inbox()` tables.** ✅ **Resolved:** Managed inbox
+   tables default to the `pgtrickle` schema. An optional `schema TEXT
+   DEFAULT 'pgtrickle'` parameter is added to `create_inbox()` so users can
+   place the inbox table in `public` or any other schema — useful for RLS
+   policies and `pg_dump --schema=public` workflows. Adopted tables
+   (`enable_inbox_tracking`) remain in their original schema. The chosen
+   schema is stored in `pgt_inbox_config.inbox_table_schema`.
 
 2. **IMMEDIATE-mode inbox stream tables.** Should the pending ST support
    `IMMEDIATE` mode for zero-lag processing? **Proposal:** Allow it \u2014

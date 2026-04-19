@@ -1,6 +1,6 @@
 # Relay CLI — Implementation Plan
 
-> **Status:** Implementation Plan (DRAFT)
+> **Status:** Implementation Plan (DESIGN REVIEW COMPLETE — 2026-04-19)
 > **Created:** 2026-04-18
 > **Category:** Tooling — Bidirectional Relay
 > **Related:** [PLAN_TRANSACTIONAL_OUTBOX_HELPER.md](../patterns/PLAN_TRANSACTIONAL_OUTBOX_HELPER.md) ·
@@ -378,7 +378,7 @@ Each relay process contains a **coordinator** and a **worker pool**:
 Process (pod)
 ├── Coordinator task  (1 long-lived, pinned PG connection)
 │   ├── On startup: load enabled pipelines from relay_*_config
-│   ├── Every tick: pg_try_advisory_lock(hashtext(group_id), pipeline_id)
+│   ├── Every tick: pg_try_advisory_lock(hashtext(group_id), hashtext(pipeline_id))
 │   │   for each unowned pipeline
 │   ├── On lock acquired: read consumer_offsets, dispatch to worker pool
 │   ├── On lock lost (coordinator conn drop or another pod stole it):
@@ -402,9 +402,19 @@ namespaces and never collide with each other:
 ```sql
 SELECT pg_try_advisory_lock(
     hashtext(relay_group_id),   -- namespace per group/deployment
-    pipeline_id::int            -- individual pipeline within the group
+    hashtext(pipeline_id)       -- individual pipeline within the group
+                                -- (pipeline_id is TEXT — cannot cast to int)
 )
 ```
+
+> **Hash collision risk:** `hashtext()` maps unbounded TEXT to int4 (2.1 billion
+> values). For deployments with up to a few thousand pipelines the birthday-paradox
+> collision probability is negligible (< 0.0001%). For larger deployments use the
+> single-argument `pg_try_advisory_lock(bigint)` form with a collision-resistant
+> key: `('x' || left(md5(relay_group_id || ':' || pipeline_id), 16))::bit(64)::bigint`.
+> Pipeline names are validated to be unique in `relay_outbox_config` and
+> `relay_inbox_config`, so combining group_id and pipeline_id into a single
+> MD5-derived int8 eliminates the namespace collision risk entirely.
 
 #### Core worker loop (per pipeline)
 
@@ -527,7 +537,7 @@ pub struct RelayMessage {
 pub enum AckToken {
     OutboxOffset(i64),
     KafkaOffset { partition: i32, offset: i64 },
-    NatsAckHandle(/* async-nats ack handle */),
+    NatsAckHandle(async_nats::Message),
     SqsReceiptHandle(String),
     RabbitMqDeliveryTag(u64),
     RedisStreamId(String),
@@ -729,27 +739,40 @@ async fn fetch_claim_check_rows(
     outbox_name: &str,
     outbox_id: i64,
 ) -> Result<(Vec<Value>, Vec<Value>), RelayError> {
-    // Use a server-side cursor for bounded memory
+    // Use a server-side cursor in bounded batches to keep relay heap bounded
+    // regardless of claim-check delta size. This is the key memory-safety
+    // guarantee of the claim-check path — never buffer the full delta in RAM.
+    const FETCH_BATCH: i64 = 1000;
     let delta_table = format!("pgtrickle.outbox_delta_rows_{}", outbox_name);
-    let rows = db.query(
-        &format!(
-            "SELECT op, payload FROM {} WHERE outbox_id = $1 ORDER BY row_num",
-            delta_table  // validated at startup
-        ),
-        &[&outbox_id],
-    ).await?;
+
+    let cursor_name = format!("relay_cc_{}_{}", outbox_id, uuid::Uuid::new_v4().simple());
+    db.batch_execute(&format!(
+        "DECLARE {cursor} NO SCROLL CURSOR FOR \
+         SELECT op, payload FROM {table} WHERE outbox_id = $1 ORDER BY row_num",
+        cursor = cursor_name,
+        table = delta_table  // validated at startup against catalog
+    )).await?;
 
     let mut inserted = Vec::new();
     let mut deleted = Vec::new();
-    for row in rows {
-        let op: &str = row.get("op");
-        let payload: serde_json::Value = row.get("payload");
-        match op {
-            "I" => inserted.push(payload),
-            "D" => deleted.push(payload),
-            _ => tracing::warn!(op, "unknown delta op"),
+    loop {
+        let rows = db.query(
+            &format!("FETCH {n} FROM {cursor}", n = FETCH_BATCH, cursor = cursor_name),
+            &[],
+        ).await?;
+        let done = rows.len() < FETCH_BATCH as usize;
+        for row in rows {
+            let op: &str = row.get("op");
+            let payload: serde_json::Value = row.get("payload");
+            match op {
+                "I" => inserted.push(payload),
+                "D" => deleted.push(payload),
+                _ => tracing::warn!(op, "unknown delta op"),
+            }
         }
+        if done { break; }
     }
+    db.batch_execute(&format!("CLOSE {cursor}", cursor = cursor_name)).await?;
     Ok((inserted, deleted))
 }
 ```
@@ -950,11 +973,15 @@ references (e.g. `{"password_env": "KAFKA_PASSWORD"}`) resolved at runtime.
 Seven PL/pgSQL wrapper functions provide a public API for managing relay
 pipelines without requiring direct table access. Validation of required JSONB
 keys and direction constraints happens inside the functions, not in application
-code.
+code. Each function validates that the required top-level keys (`source_type`,
+`sink_type`, `source`, `sink`) are present in the JSONB config and raises
+`relay.invalid_config` if not — preventing silent misconfigurations that would
+only surface at relay startup.
 
 ```sql
 -- Upsert a forward pipeline (outbox → sink).
--- source_type must be 'outbox'.
+-- source_type must be 'outbox'. Raises relay.invalid_config on bad JSON shape.
+-- enabled defaults to true; pass false to insert in disabled state.
 SELECT pgtrickle.set_relay_outbox(
     'orders-to-nats',
     '{"source_type":"outbox","source":{"outbox":"orders","group":"order-relay"},
@@ -962,7 +989,8 @@ SELECT pgtrickle.set_relay_outbox(
 );
 
 -- Upsert a reverse pipeline (source → inbox).
--- sink_type must be 'pg-inbox'.
+-- sink_type must be 'pg-inbox'. Raises relay.invalid_config on bad JSON shape.
+-- enabled defaults to true; pass false to insert in disabled state.
 SELECT pgtrickle.set_relay_inbox(
     'kafka-to-orders',
     '{"source_type":"kafka","source":{"brokers":"localhost:9092","topic":"orders"},
@@ -1001,8 +1029,8 @@ REVOKE ALL ON pgtrickle.relay_inbox_config     FROM pgtrickle_relay;
 REVOKE ALL ON pgtrickle.relay_consumer_offsets FROM pgtrickle_relay;
 
 -- Grant execute on the API functions only
-GRANT EXECUTE ON FUNCTION pgtrickle.set_relay_outbox(TEXT, JSONB, BOOLEAN)  TO pgtrickle_relay;
-GRANT EXECUTE ON FUNCTION pgtrickle.set_relay_inbox(TEXT, JSONB, BOOLEAN)   TO pgtrickle_relay;
+GRANT EXECUTE ON FUNCTION pgtrickle.set_relay_outbox(TEXT, JSONB)  TO pgtrickle_relay;
+GRANT EXECUTE ON FUNCTION pgtrickle.set_relay_inbox(TEXT, JSONB)   TO pgtrickle_relay;
 GRANT EXECUTE ON FUNCTION pgtrickle.enable_relay(TEXT)                      TO pgtrickle_relay;
 GRANT EXECUTE ON FUNCTION pgtrickle.disable_relay(TEXT)                     TO pgtrickle_relay;
 GRANT EXECUTE ON FUNCTION pgtrickle.delete_relay(TEXT)                      TO pgtrickle_relay;
@@ -1030,9 +1058,13 @@ advisory locks for all enabled pipelines:
 ```sql
 SELECT pg_try_advisory_lock(
     hashtext(relay_group_id),   -- namespace per relay group/deployment
-    pipeline_id::int            -- individual pipeline within group
+    hashtext(pipeline_id)       -- individual pipeline within group
+                                -- (pipeline_id is TEXT — cannot cast to int)
 );
 ```
+
+> **Hash collision note:** See [A.4](#a4-relay-modes-forward--reverse) for
+> the recommended int8 key alternative for large deployments.
 
 - If the lock is acquired → this pod owns that pipeline; spawn a worker task.
 - If the lock is already held → another pod owns it; skip.
@@ -1096,6 +1128,40 @@ To enable/disable a pipeline without restarting the pod:
 - **Offset writes:** `INSERT ... ON CONFLICT DO UPDATE` (1-2ms per batch).
 - **Concurrency:** Multiple pods polling the same source is **safe** because
   the outbox source tracks offsets per relay group, not globally.
+
+#### Connection Pool Sizing
+
+Each relay pod consumes exactly:
+- **1 coordinator connection** (pinned, holds all advisory locks for this pod).
+- **1 connection per active worker** (up to `max_workers_per_pod` pipelines).
+
+With N pods and M pipelines distributed across them:
+
+```
+total_PG_connections = N_pods × (1 + min(M_pipelines / N_pods, max_workers_per_pod))
+```
+
+Example: 3 pods × (1 coordinator + 4 worker pipelines each) = **15 connections**.
+
+The startup config option `max_workers_per_pod` (default: `10`) caps the
+worker count per pod. Tune it so `N_pods × (1 + max_workers_per_pod) +
+other_app_connections` stays well below `max_connections` on the PostgreSQL
+server. Leave headroom for admin connections (at least 5 via
+`superuser_reserved_connections`).
+
+If `max_connections` is approached, reduce `max_workers_per_pod`, increase
+replicas, or front the relay with PgBouncer in transaction mode (the relay's
+worker connections are compatible with transaction pooling; the coordinator
+connection must **not** be pooled — it holds session-level advisory locks).
+
+```yaml
+# Environment-variable tuning knobs for the relay process:
+env:
+  - name: PGTRICKLE_RELAY_MAX_WORKERS_PER_POD
+    value: "10"         # caps per-pod worker connections (default: 10)
+  - name: PGTRICKLE_RELAY_COORDINATOR_TICK_MS
+    value: "500"        # advisory-lock retry interval (default: 500 ms)
+```
 
 #### Example Kubernetes Deployment
 
@@ -1616,6 +1682,30 @@ Each test spins up PostgreSQL + the target sink via Testcontainers:
 - Latency: p50/p95/p99 poll-to-publish for a single event (both modes).
 - Memory: verify bounded memory during claim-check fetch (no full delta
   buffering).
+- **Consumer group contention:** `commit_offset()` latency with 10 concurrent relay
+  workers all committing to the same group simultaneously — must be < 10 ms p99.
+- **Relay crash + re-poll:** measure time from visibility timeout expiry to
+  second relay picking up and re-publishing the batch; must be < `visibility_seconds + 2 s`.
+- **Advisory lock storm:** 10 pods all starting simultaneously; measure lock
+  acquisition time until all pipelines are owned; must complete within 5 s.
+
+### E.5 End-to-End Latency Benchmark
+
+Measures the **full path latency** that users cite in production comparisons:
+
+```
+source DML commit → CDC trigger → refresh MERGE → outbox INSERT + NOTIFY
+  → relay poll (or LISTEN wake) → broker publish → consumer receipt
+```
+
+| Relay wake mode | p50 target | p95 target |
+|-----------------|-----------|----------|
+| Polling only (v0.23.0, `visibility_seconds = 30s`) | < 1.5 s  | < 2.5 s  |
+| LISTEN/NOTIFY wake (v0.24.0 relay) | < 100 ms | < 250 ms |
+
+Add as `benches/e2e_relay_latency.rs` (Testcontainers, `tokio`, requires
+`--features e2e-bench`). Run manually; not in Criterion regression gate
+because results are environment-sensitive.
 
 ---
 
@@ -1655,25 +1745,23 @@ ENTRYPOINT ["pgtrickle-relay"]
 
 #### Kubernetes Sidecar Pattern (Forward)
 
+All pipeline definitions live in the database (see [A.14](#a14-catalog-schema-config-tables)).
+The only env var required at startup is `PGTRICKLE_RELAY_POSTGRES_URL`.
+Configure pipelines once via `pgtrickle-relay config set` or SQL;
+the running relay picks up changes automatically via `LISTEN/NOTIFY`.
+
 ```yaml
 containers:
   - name: app
     image: myapp:latest
   - name: relay
     image: grove/pgtrickle-relay:0.24.0
-    args: ["forward"]
     env:
-      - name: PG_URL
+      - name: PGTRICKLE_RELAY_POSTGRES_URL
         valueFrom:
           secretKeyRef:
             name: pg-credentials
-            key: url
-      - name: RELAY_OUTBOX
-        value: order_events
-      - name: RELAY_SINK
-        value: nats
-      - name: RELAY_GROUP
-        value: order-publisher
+            key: relay-url
     ports:
       - name: metrics
         containerPort: 9090
@@ -1687,7 +1775,18 @@ containers:
         port: 9090
 ```
 
+Pipeline setup (run once, not per-pod):
+
+```bash
+# Forward: outbox → NATS
+pgtrickle-relay config set outbox orders-to-nats \
+  --config '{"source_type":"outbox","source":{"outbox":"order_events","group":"order-publisher"},"sink_type":"nats","sink":{"url":"nats://nats:4222"}}'
+```
+
 #### Kubernetes Sidecar Pattern (Reverse)
+
+Same pattern — the single `PGTRICKLE_RELAY_POSTGRES_URL` env var is sufficient.
+All source/inbox config lives in `pgtrickle.relay_inbox_config`.
 
 ```yaml
 containers:
@@ -1695,17 +1794,12 @@ containers:
     image: myapp:latest
   - name: relay
     image: grove/pgtrickle-relay:0.24.0
-    args: ["reverse"]
     env:
-      - name: PG_URL
+      - name: PGTRICKLE_RELAY_POSTGRES_URL
         valueFrom:
           secretKeyRef:
             name: pg-credentials
-            key: url
-      - name: RELAY_SOURCE
-        value: kafka
-      - name: RELAY_INBOX
-        value: external_events
+            key: relay-url
     ports:
       - name: metrics
         containerPort: 9090
@@ -1713,6 +1807,14 @@ containers:
       httpGet:
         path: /health
         port: 9090
+```
+
+Pipeline setup (run once, not per-pod):
+
+```bash
+# Reverse: Kafka → inbox
+pgtrickle-relay config set inbox kafka-to-orders \
+  --config '{"source_type":"kafka","source":{"brokers":"kafka:9092","topic":"orders"},"sink_type":"pg-inbox","sink":{"inbox_table":"order_inbox"}}'
 ```
 
 ---
