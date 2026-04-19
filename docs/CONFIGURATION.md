@@ -2228,6 +2228,14 @@ pg_trickle.prediction_window = 60               # minutes of history for regress
 pg_trickle.prediction_ratio = 1.5               # diff/full cost ratio threshold
 pg_trickle.prediction_min_samples = 5           # minimum samples before model activates
 
+# DVM scaling & diagnostics (v0.23.0+)
+pg_trickle.log_delta_sql = false                # log delta SQL at DEBUG1 (diagnostic only)
+pg_trickle.delta_work_mem = 0                   # work_mem MB for delta execution (0 = inherit)
+pg_trickle.delta_enable_nestloop = true         # allow nested-loop joins in delta SQL
+pg_trickle.analyze_before_delta = true          # ANALYZE change buffers before delta SQL
+pg_trickle.max_change_buffer_alert_rows = 0     # change buffer overflow alert threshold (0 = off)
+pg_trickle.diff_output_format = 'split'         # 'split' (DI-2 pairs) | 'merged' (compat)
+
 # Advanced / internal
 pg_trickle.change_buffer_schema = 'pgtrickle_changes'
 pg_trickle.foreign_table_polling = false

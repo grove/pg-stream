@@ -46,6 +46,67 @@ For future plans and upcoming features, see [ROADMAP.md](ROADMAP.md).
 
 ---
 
+## [0.23.0] — TPC-H DVM Scaling Performance
+
+### DVM Scaling Diagnostics
+
+- **P1-2:** New `pg_trickle.log_delta_sql` GUC logs generated delta SQL at
+  DEBUG1 level. Enables `EXPLAIN (ANALYZE, BUFFERS)` diagnosis of delta
+  queries without modifying test code.
+
+- **P5-1:** New `pg_trickle.delta_work_mem` GUC (default 0 = inherit)
+  overrides `work_mem` for delta SQL execution. Allows tuning without server
+  restart: `ALTER SYSTEM SET pg_trickle.delta_work_mem = 256`.
+
+- **P5-2:** New `pg_trickle.delta_enable_nestloop` GUC (default on).
+  When set to `off`, disables nested-loop joins during delta SQL execution.
+
+### Performance
+
+- **PERF-5:** New `pg_trickle.analyze_before_delta` GUC (default on). Runs
+  `ANALYZE` on change buffer tables before delta SQL execution, giving the
+  PostgreSQL planner accurate row count estimates for tables that are
+  truncated and refilled every refresh cycle.
+
+- **UX-1:** When `log_delta_sql = on` and a DIFF refresh takes longer than the
+  last FULL refresh, a warning is emitted with the timing comparison.
+
+### Monitoring & Observability
+
+- **SCAL-2:** New `pg_trickle.max_change_buffer_alert_rows` GUC (default 0 =
+  disabled). Emits a warning when any source's change buffer exceeds the
+  threshold during refresh.
+
+- **STAB-4:** New `pgtrickle.pgtrickle_refresh_stats()` function. Returns
+  per-stream-table timing with avg/p95/p99 percentiles from refresh history.
+
+### Developer Tools
+
+- **UX-3:** New `pgtrickle.explain_diff_sql(name)` function. Returns the
+  generated delta SQL template for a stream table for inspection — no
+  execution required.
+
+- **UX-7:** New `pg_trickle.diff_output_format` GUC (`split` or `merged`).
+  Controls how DI-2 aggregate UPDATE-splits are surfaced. `split` (default)
+  emits DELETE+INSERT pairs; `merged` re-combines for backward compatibility.
+
+### Documentation
+
+- **UX-2:** Added "DVM Query Complexity Limits" section to
+  `docs/PERFORMANCE_COOKBOOK.md` documenting the three failure mode categories,
+  which SQL patterns trigger each, and recommended mitigation GUCs.
+
+- **UX-5:** Added "Upgrading to v0.23.0" section to `docs/UPGRADING.md`
+  covering new GUCs, behavioral changes, and rollback strategy.
+
+- **UX-6:** Added `docs/DVM_REWRITE_RULES.md` documenting the full DVM
+  query transformation pipeline with algebraic correctness arguments.
+
+- **STAB-5:** Updated `docs/ERRORS.md` with new error variants for change
+  buffer overflow and DIFF-slower-than-FULL warnings.
+
+---
+
 ## [0.22.0] — Downstream CDC, Parallel Refresh & Predictive Cost Model
 
 **v0.22.0 adds downstream CDC publication support, a parallel refresh worker

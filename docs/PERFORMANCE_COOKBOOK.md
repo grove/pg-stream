@@ -467,6 +467,83 @@ SELECT pgtrickle.reinitialize_stream_table('public.orders_mv');
 
 ---
 
+## 13. DVM Query Complexity Limits
+
+**Problem:** Differential refresh is slower than full refresh for complex
+queries, especially at scale. Understanding when DIFFERENTIAL mode breaks
+down helps you choose the right strategy.
+
+### Three Failure Mode Categories
+
+| Category | SQL Pattern | Symptom | Root Cause |
+|----------|-------------|---------|------------|
+| **Threshold Collapse** | 4+ table JOINs with cascading EXCEPT ALL | Fast at small scale, 100–260× slower per data decade | Intermediate CTE cardinality blowup: O(n²) row generation from L₀ snapshot expansion |
+| **Early Collapse** | EXISTS anti-join with non-equi predicates | 140× jump at first 10× scale step, then stable | Equi-join key filter not applied correctly; R_old EXCEPT ALL scans full table |
+| **Structural Bug** | Doubly-nested correlated EXISTS / NOT EXISTS | Slow at all scales (constant ~2s overhead) | Inner R_old re-materialized per outer delta row: O(Δ_outer × n_inner) |
+
+### Which SQL Patterns Trigger Each Category
+
+**Threshold Collapse** (queries like TPC-H Q05, Q07, Q08, Q09):
+- Multi-table joins (4+ tables) using the cascading `EXCEPT ALL` delta strategy
+- Queries with many intermediate join nodes generate exponential intermediate rows
+- Diagnosis: `pgtrickle.log_delta_sql = on` + `EXPLAIN (ANALYZE, BUFFERS)`
+
+**Early Collapse** (queries like TPC-H Q04):
+- `WHERE EXISTS (SELECT 1 FROM t WHERE t.key = outer.key AND t.col < t.col2)`
+- The non-equi predicates in the EXISTS clause can prevent key-filter extraction
+- Diagnosis: Check if `R_old` CTE scans the full right table
+
+**Structural Bug** (queries like TPC-H Q20):
+- `WHERE EXISTS (SELECT 1 FROM t1 WHERE EXISTS (SELECT 1 FROM t2 WHERE ...))`
+- Inner snapshot CTEs are re-evaluated per outer row instead of shared
+- Diagnosis: Look for repeated CTE evaluations in `EXPLAIN ANALYZE`
+
+### Recommended Scale Factors
+
+| Pattern | Safe for DIFF | Use FULL above |
+|---------|---------------|----------------|
+| Simple scan/filter | Any scale | — |
+| 2-table JOIN | Up to ~10M rows | — |
+| 3-table JOIN | Up to ~1M rows | ~10M rows |
+| 4+ table JOIN | Up to ~100K rows | ~1M rows |
+| EXISTS anti-join | Up to ~100K rows | ~1M rows |
+| Nested EXISTS | Use FULL mode | — |
+
+### Diagnosing Your Query
+
+```sql
+-- 1. Enable delta SQL logging
+SET pg_trickle.log_delta_sql = on;
+
+-- 2. Trigger a manual refresh
+SELECT pgtrickle.refresh_stream_table('my_stream_table');
+
+-- 3. Check the PostgreSQL log for the generated delta SQL
+-- 4. Run EXPLAIN (ANALYZE, BUFFERS) on the captured SQL
+-- 5. Look for:
+--    - Nested Loop joins on large tables (threshold collapse)
+--    - Sequential scans on R_old CTEs (early collapse)
+--    - Repeated CTE evaluations (structural bug)
+
+-- Use explain_diff_sql() to inspect without executing:
+SELECT pgtrickle.explain_diff_sql('my_stream_table');
+```
+
+### Mitigation GUCs
+
+```sql
+-- Increase work_mem for delta execution
+SET pg_trickle.delta_work_mem = 256;  -- MB
+
+-- Disable nested loops for delta execution
+SET pg_trickle.delta_enable_nestloop = off;
+
+-- Run ANALYZE on change buffers (enabled by default)
+SET pg_trickle.analyze_before_delta = on;
+```
+
+---
+
 ## See Also
 
 - [docs/CONFIGURATION.md](CONFIGURATION.md) — full GUC reference

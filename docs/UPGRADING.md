@@ -602,3 +602,53 @@ done
 
 For CNPG deployments, see [cnpg/README.md](../cnpg/) for upgrade
 instructions specific to the Kubernetes operator.
+
+---
+
+## Upgrading to v0.23.0
+
+### New GUCs
+
+| GUC | Default | Description |
+|-----|---------|-------------|
+| `pg_trickle.log_delta_sql` | `off` | Log generated delta SQL at DEBUG1 level for diagnosis |
+| `pg_trickle.delta_work_mem` | `0` (inherit) | work_mem override (MB) for delta SQL execution |
+| `pg_trickle.delta_enable_nestloop` | `on` | Allow nested-loop joins during delta execution |
+| `pg_trickle.analyze_before_delta` | `on` | Run ANALYZE on change buffers before delta SQL |
+| `pg_trickle.max_change_buffer_alert_rows` | `0` (disabled) | Alert threshold for change buffer overflow |
+| `pg_trickle.diff_output_format` | `split` | DIFF output format: `split` or `merged` |
+
+### Behavioral Changes
+
+**DI-2 aggregate UPDATE-split:** The DIFF output row format for aggregate
+stream tables changes from UPDATE rows to DELETE+INSERT pairs. This is the
+algebraically correct form that enables O(Δ) performance for multi-join
+queries.
+
+**Impact:** Application code that reads the change buffer or outbox and
+checks `op = 'UPDATE'` will silently produce incorrect results.
+
+**Migration path:**
+1. Set `pg_trickle.diff_output_format = 'merged'` before upgrading
+2. Migrate application code to handle DELETE+INSERT pairs
+3. Switch to `pg_trickle.diff_output_format = 'split'` (default)
+
+### Rollback Strategy
+
+The DI-2/DI-6 code paths are gated by detecting UPDATE rows in the change
+buffer. Downgrading to v0.22.0 is safe if no writes have occurred to
+upgraded stream tables.
+
+### Pre-Upgrade Validation
+
+```bash
+# Verify version files are in sync
+just check-version-sync
+```
+
+### New SQL Functions
+
+- `pgtrickle.explain_diff_sql(name TEXT)` — Returns the delta SQL template
+  for a stream table (for inspection/EXPLAIN)
+- `pgtrickle.pgtrickle_refresh_stats()` — Per-stream-table timing stats
+  with avg/p95/p99 percentiles

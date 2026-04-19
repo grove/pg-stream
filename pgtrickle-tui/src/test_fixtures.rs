@@ -266,6 +266,7 @@ pub fn sample_state() -> AppState {
         error_message: None,
         diag_signals: std::collections::HashMap::new(),
         dedup_stats: None,
+        scheduler_overhead: None,
         cdc_health: vec![],
         quick_health: None,
         source_gates: vec![],

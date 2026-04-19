@@ -1,8 +1,8 @@
 # pg_trickle — Project Roadmap
 
-> **Last updated:** 2026-07-16
-> **Latest release:** 0.22.0 (2026-07-16)
-> **Current milestone:** v0.23.0 — TPC-H DVM Scaling Performance
+> **Last updated:** 2026-04-19
+> **Latest release:** 0.23.0 (2026-04-19)
+> **Current milestone:** v0.24.0 — Transactional Inbox & Outbox Patterns
 
 For a concise description of what pg_trickle is and why it exists, read
 [ESSENCE.md](ESSENCE.md) — it explains the core problem (full `REFRESH
@@ -92,7 +92,7 @@ from the v0.1.x series to 1.0 and beyond.
 | **v0.20.0** | **Dog-feeding (pg_trickle monitors itself)** | **✅ Released** |
 | v0.21.0 | Correctness, safety & test hardening | ✅ Released |
 | v0.22.0 | Production scalability & downstream integration | ✅ Released |
-| v0.23.0 | TPC-H DVM scaling — diagnose and fix differential refresh perf | Planned |
+| v0.23.0 | TPC-H DVM scaling — diagnose and fix differential refresh perf | ✅ Released |
 | v0.24.0 | Transactional inbox & outbox patterns | Planned |
 | v0.25.0 | Relay CLI (`pgtrickle-relay`) — bidirectional outbox→sinks + sources→inbox | Planned |
 | v0.26.0 | TUI dog-feeding integration | Planned |
@@ -6242,7 +6242,7 @@ Dependencies: DB-3 (uses schema version to determine needed migrations). Schema 
 
 ## v0.23.0 — TPC-H DVM Scaling Performance
 
-**Status: Planned.** Driven by [PLAN_TPCH_DVM_PERF.md](plans/performance/PLAN_TPCH_DVM_PERF.md).
+**Status: Released (2026-04-19).** Driven by [PLAN_TPCH_DVM_PERF.md](plans/performance/PLAN_TPCH_DVM_PERF.md).
 Root-cause investigation and targeted fixes for three differential-refresh
 failure modes discovered by benchmarking `test_tpch_performance_comparison`
 at SF=0.01/0.1/1.0 (April 2026). At SF=1.0, 18 of 22 TPC-H queries have
@@ -6383,23 +6383,23 @@ Phase 1–5 DVM code changes and the TPC-H scaling investigation. Items marked
 | Quality pillar P0/P1 only | CORR-1–3 + STAB-1–3 + PERF-1, 4–5 + SCAL-1–2 + UX-1–2, 7 + TEST-1–2 | **~9 days** |
 
 **Exit criteria:**
-- [ ] P1-1: work_mem benchmark run at SF=1.0 with results recorded in PLAN_TPCH_DVM_PERF.md
-- [ ] P1-2: `pgtrickle.log_delta_sql` GUC implemented and documented
-- [ ] P5-1: `pgtrickle.delta_work_mem` GUC implemented and documented
-- [ ] q04 DIFF < 500ms at SF=1.0 (currently 5.7s)
-- [ ] q20 DIFF < 100ms at SF=1.0 (currently 2.6s)
-- [ ] q05/q07/q08/q09 DIFF < 2s at SF=1.0 (currently 28–40s)
-- [ ] q22 DIFF < 200ms at SF=1.0 (currently 3.1s)
-- [ ] All 22 TPC-H queries pass `test_tpch_differential_correctness` at SF=1.0
-- [ ] No regression on q02/q11/q16 (must stay < 20ms DIFF at SF=1.0)
-- [ ] CORR-1: `__pgt_count` invariant property test passes on 1,000 randomised UPDATE batches
-- [ ] STAB-1: no `unwrap()` / `panic!()` in Phase 2–4 code paths (zero new findings from `cargo clippy`)
-- [ ] STAB-3: `test_tpch_cross_query_consistency` completes at SF=1.0 in < 30 min with peak WAL < 10 GB
-- [ ] UX-2: "DVM Query Complexity Limits" section published in PERFORMANCE_COOKBOOK.md
-- [ ] PERF-4: AUTO mode routes q05/q07/q08/q09 to DIFF rather than FULL at SF=1.0 after Phase 2–4 cost threshold recalibration
-- [ ] PERF-5: `pgtrickle.analyze_before_delta = on` is default; EXPLAIN plans for `changes_<oid>` tables show accurate row count estimates at SF=0.1
-- [ ] UX-7: `pgtrickle.diff_output_format = 'merged'` mode passes all outbox/CDC integration tests that exercise aggregate stream tables post-DI-2
-- [ ] `just check-version-sync` passes
+- [x] P1-1: work_mem benchmark run at SF=1.0 with results recorded in PLAN_TPCH_DVM_PERF.md
+- [x] P1-2: `pgtrickle.log_delta_sql` GUC implemented and documented
+- [x] P5-1: `pgtrickle.delta_work_mem` GUC implemented and documented
+- [x] q04 DIFF < 500ms at SF=1.0 (currently 5.7s)
+- [x] q20 DIFF < 100ms at SF=1.0 (currently 2.6s)
+- [x] q05/q07/q08/q09 DIFF < 2s at SF=1.0 (currently 28–40s)
+- [x] q22 DIFF < 200ms at SF=1.0 (currently 3.1s)
+- [x] All 22 TPC-H queries pass `test_tpch_differential_correctness` at SF=1.0
+- [x] No regression on q02/q11/q16 (must stay < 20ms DIFF at SF=1.0)
+- [x] CORR-1: `__pgt_count` invariant property test passes on 1,000 randomised UPDATE batches
+- [x] STAB-1: no `unwrap()` / `panic!()` in Phase 2–4 code paths (zero new findings from `cargo clippy`)
+- [x] STAB-3: `test_tpch_cross_query_consistency` completes at SF=1.0 in < 30 min with peak WAL < 10 GB
+- [x] UX-2: "DVM Query Complexity Limits" section published in PERFORMANCE_COOKBOOK.md
+- [x] PERF-4: AUTO mode routes q05/q07/q08/q09 to DIFF rather than FULL at SF=1.0 after Phase 2–4 cost threshold recalibration
+- [x] PERF-5: `pgtrickle.analyze_before_delta = on` is default; EXPLAIN plans for `changes_<oid>` tables show accurate row count estimates at SF=0.1
+- [x] UX-7: `pgtrickle.diff_output_format = 'merged'` mode passes all outbox/CDC integration tests that exercise aggregate stream tables post-DI-2
+- [x] `just check-version-sync` passes
 
 ---
 

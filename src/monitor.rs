@@ -901,6 +901,81 @@ fn cache_stats() -> TableIterator<
     TableIterator::once((l1_hits, l2_hits, misses, evictions, l1_size))
 }
 
+/// STAB-4: Per-stream-table refresh timing statistics with percentiles.
+///
+/// Aggregates `pgt_refresh_history` data into per-stream-table timing
+/// summaries including avg, p95, p99, and refresh count.
+///
+/// Exposed as `pgtrickle.pgtrickle_refresh_stats()`.
+#[pg_extern(schema = "pgtrickle", name = "pgtrickle_refresh_stats")]
+#[allow(clippy::type_complexity)]
+fn pgtrickle_refresh_stats() -> TableIterator<
+    'static,
+    (
+        name!(stream_table, String),
+        name!(mode, String),
+        name!(avg_ms, f64),
+        name!(p95_ms, f64),
+        name!(p99_ms, f64),
+        name!(refresh_count, i64),
+        name!(last_refresh_at, Option<TimestampWithTimeZone>),
+    ),
+> {
+    let rows: Vec<_> = Spi::connect(|client| {
+        let result = client
+            .select(
+                "SELECT
+                    st.pgt_schema || '.' || st.pgt_name AS stream_table,
+                    st.refresh_mode::text AS mode,
+                    COALESCE(s.avg_ms, 0)::float8,
+                    COALESCE(s.p95_ms, 0)::float8,
+                    COALESCE(s.p99_ms, 0)::float8,
+                    COALESCE(s.cnt, 0)::bigint,
+                    st.last_refresh_at
+                FROM pgtrickle.pgt_stream_tables st
+                LEFT JOIN LATERAL (
+                    SELECT
+                        avg(EXTRACT(EPOCH FROM (h.end_time - h.start_time)) * 1000) AS avg_ms,
+                        percentile_cont(0.95) WITHIN GROUP (
+                            ORDER BY EXTRACT(EPOCH FROM (h.end_time - h.start_time)) * 1000
+                        ) AS p95_ms,
+                        percentile_cont(0.99) WITHIN GROUP (
+                            ORDER BY EXTRACT(EPOCH FROM (h.end_time - h.start_time)) * 1000
+                        ) AS p99_ms,
+                        count(*) AS cnt
+                    FROM pgtrickle.pgt_refresh_history h
+                    WHERE h.pgt_id = st.pgt_id
+                      AND h.status = 'COMPLETED'
+                      AND h.end_time IS NOT NULL
+                ) s ON true
+                ORDER BY COALESCE(s.avg_ms, 0) DESC",
+                None,
+                &[],
+            )
+            .map_err(|e| crate::error::PgTrickleError::SpiError(e.to_string()));
+
+        match result {
+            Ok(tbl) => {
+                let mut rows = Vec::new();
+                for row in tbl {
+                    let stream_table = row.get::<String>(1).unwrap_or(None).unwrap_or_default();
+                    let mode = row.get::<String>(2).unwrap_or(None).unwrap_or_default();
+                    let avg_ms = row.get::<f64>(3).unwrap_or(None).unwrap_or(0.0);
+                    let p95_ms = row.get::<f64>(4).unwrap_or(None).unwrap_or(0.0);
+                    let p99_ms = row.get::<f64>(5).unwrap_or(None).unwrap_or(0.0);
+                    let cnt = row.get::<i64>(6).unwrap_or(None).unwrap_or(0);
+                    let last_at = row.get::<TimestampWithTimeZone>(7).unwrap_or(None);
+                    rows.push((stream_table, mode, avg_ms, p95_ms, p99_ms, cnt, last_at));
+                }
+                rows
+            }
+            Err(_) => Vec::new(),
+        }
+    });
+
+    TableIterator::new(rows)
+}
+
 /// Explain the DVM plan for a stream table's defining query.
 ///
 /// Returns whether the query supports differential refresh,
@@ -1188,6 +1263,52 @@ fn explain_st_impl(
     }
 
     Ok(props)
+}
+
+/// UX-3: Return the generated delta SQL for a stream table (inspection only).
+///
+/// Builds and returns the delta SQL template that the DVM engine would
+/// generate for the given stream table. Uses placeholder LSN tokens so
+/// the SQL can be inspected or run with `EXPLAIN` after substituting
+/// actual LSN values.
+///
+/// Exposed as `pgtrickle.explain_diff_sql(name)`.
+#[pg_extern(schema = "pgtrickle", name = "explain_diff_sql")]
+fn explain_diff_sql(name: &str) -> Option<String> {
+    let parts: Vec<&str> = name.splitn(2, '.').collect();
+    let (schema, table_name) = if parts.len() == 2 {
+        (parts[0], parts[1])
+    } else {
+        ("public", parts[0])
+    };
+
+    match explain_diff_sql_impl(schema, table_name) {
+        Ok(sql) => Some(sql),
+        Err(e) => {
+            pgrx::notice!("explain_diff_sql: {}", e);
+            None
+        }
+    }
+}
+
+fn explain_diff_sql_impl(schema: &str, table_name: &str) -> Result<String, PgTrickleError> {
+    use crate::catalog::StreamTableMeta;
+    use crate::dvm;
+
+    let st = StreamTableMeta::get_by_name(schema, table_name)?;
+
+    // Generate the delta SQL with placeholder LSN tokens
+    let prev_frontier = crate::version::Frontier::new();
+    let new_frontier = crate::version::Frontier::new();
+    let result = dvm::generate_delta_query(
+        &st.defining_query,
+        &prev_frontier,
+        &new_frontier,
+        &st.pgt_schema,
+        &st.pgt_name,
+    )?;
+
+    Ok(result.delta_sql)
 }
 
 // ── DAG-3: Amplification Statistics ─────────────────────────────────────

@@ -423,6 +423,45 @@ log entries.
 
 ---
 
+## v0.23.0 — DVM Scaling Errors
+
+### change_buffer_overflow Alert
+
+**Alert:** `pg_trickle_alert change_buffer_overflow`
+
+**Description:** A source table's change buffer exceeded the
+`pg_trickle.max_change_buffer_alert_rows` threshold during refresh.
+
+**Common causes:**
+- High write rate on source tables
+- Slow or blocked refresh cycles
+- WAL accumulation during cross-query consistency checks
+
+**Suggested fix:**
+- Increase `pg_trickle.max_change_buffer_alert_rows` if the write rate is expected
+- Check for long-running transactions blocking the refresh
+- Consider increasing refresh frequency or using FULL mode for affected tables
+
+### DIFF-Slower-Than-FULL Warning
+
+**Warning:** `[pg_trickle] DIFF refresh for <table> took Xms vs last FULL Yms — DIFF is Nx slower`
+
+**Description:** Emitted when `pg_trickle.log_delta_sql = on` and a DIFF
+refresh takes longer than the last recorded FULL refresh.
+
+**Common causes:**
+- Query complexity exceeds the DVM engine's O(Δ) capacity (see
+  [PERFORMANCE_COOKBOOK.md §13](PERFORMANCE_COOKBOOK.md#13-dvm-query-complexity-limits))
+- Stale planner statistics on change buffer tables
+- work_mem too low for hash joins in the delta SQL
+
+**Suggested fix:**
+- Check the delta SQL via `pgtrickle.explain_diff_sql('<table>')`
+- Increase `pg_trickle.delta_work_mem` for the affected database
+- Switch to AUTO or FULL mode for queries with known threshold-collapse patterns
+
+---
+
 ## See Also
 
 - [FAQ — Troubleshooting](FAQ.md#troubleshooting)
