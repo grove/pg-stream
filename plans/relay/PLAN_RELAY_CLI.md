@@ -238,7 +238,7 @@ they need. A default feature set covers the most common backends.
 ```toml
 [package]
 name = "pgtrickle-relay"
-version = "0.24.0"
+version = "0.25.0"
 edition = "2024"
 
 [[bin]]
@@ -609,6 +609,20 @@ async fn update_consumer_offset(
 `"relay-6b7f9-0:3"`), useful for debugging stalls in multi-pod deployments.
 
 #### Consumer Group Mode
+
+> **Simple mode vs. consumer group mode:** The relay supports two offset-tracking
+> strategies for forward mode. **Simple mode** (default) uses the relay's own
+> `pgtrickle.relay_consumer_offsets` table — a lightweight `(relay_group_id,
+> pipeline_id, last_change_id)` row updated atomically after each batch. This
+> is sufficient for single-relay deployments and requires no v0.24.0 consumer
+> group infrastructure. **Consumer group mode** delegates offset tracking to
+> the v0.24.0 `poll_outbox()` / `commit_offset()` API, which adds visibility
+> timeouts, lease management, multi-relay coordination, and lag monitoring via
+> `consumer_lag()`. Use consumer group mode when multiple relay instances share
+> a single outbox, or when you need the operational tooling (heartbeats, dead
+> consumer reaping, `seek_offset()` replay). The pipeline's `config` JSONB
+> controls which mode is used: include a `"group"` key in the source config
+> to activate consumer group mode.
 
 Used when `--group` is specified. Delegates coordination to pg-trickle's
 built-in consumer group SQL functions.

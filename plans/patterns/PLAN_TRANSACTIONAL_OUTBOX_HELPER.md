@@ -858,8 +858,10 @@ or repeated `create_consumer_group()` calls are safe.
 
 ```sql
 -- Per-consumer status.
--- Uses FULL mode: last_offset and last_heartbeat_at do not change every cycle,
--- but this is a small table (one row per consumer) and FULL is safe here.
+-- Uses FULL mode: pgt_consumer_offsets is updated on every heartbeat and
+-- offset commit, so most rows change between refreshes at typical relay
+-- poll rates. FULL is simpler for this small table (one row per consumer)
+-- and avoids the overhead of delta computation for frequently-changing data.
 -- Consumers compute heartbeat_age_sec client-side from last_heartbeat_at;
 -- for live health status use consumer_lag() instead.
 SELECT pgtrickle.create_stream_table(
@@ -870,7 +872,7 @@ SELECT pgtrickle.create_stream_table(
       FROM pgtrickle.pgt_consumer_groups g
       JOIN pgtrickle.pgt_consumer_offsets o USING (group_id)$$,
     schedule => '5 seconds',
-    refresh_mode => 'FULL'   -- stable data; FULL avoids false-change churn from now()-derived columns
+    refresh_mode => 'FULL'   -- small, frequently-updated table; FULL is simpler than DIFFERENTIAL
 );
 
 -- Per-group aggregate lag.
@@ -904,19 +906,33 @@ SELECT pgtrickle.create_stream_table(
 ```
 
 > **Why FULL for pgt_consumer_status and pgt_consumer_active_leases?**
-> Both queries use `now()` either in derived columns or in a WHERE clause.
-> DIFFERENTIAL mode computes a delta by comparing the current result to the
-> previous one; when `now()` changes, *every* row appears modified on every
-> refresh, producing a useless delta that is 100% false changes. FULL mode
-> always replaces the materialised view in one pass, which is correct and
-> efficient for these small tables. Use `consumer_lag()` (a live SQL function)
-> for programmatic health checks that need the current `heartbeat_age_sec`.
+> `pgt_consumer_active_leases` filters on `visibility_until > now()`, which
+> changes every refresh cycle — expired leases disappear, making DIFFERENTIAL
+> emit spurious deletes. FULL is the only correct mode here.
+> `pgt_consumer_status` does *not* use `now()` in its query, but it reads from
+> `pgt_consumer_offsets` which is updated on every heartbeat and offset commit
+> — at typical relay poll rates (every 1–5 s), most rows change between
+> refreshes. FULL mode is simpler and avoids the overhead of delta computation
+> for a table that is both small (one row per consumer) and frequently changing.
+> Use `consumer_lag()` (a live SQL function) for programmatic health checks
+> that need the current `heartbeat_age_sec`.
 
 ### B.8 Concurrency & Isolation
 
 - All catalog updates use `READ COMMITTED`.
 - `poll_outbox()` uses `FOR UPDATE SKIP LOCKED` on the outbox table to
   prevent two concurrent polls from leasing overlapping ranges.
+  > **Design note:** `FOR UPDATE OF o` locks the outbox rows themselves, which
+  > are append-only and never updated by the application. The lock serves purely
+  > to prevent two concurrent `poll_outbox()` calls from selecting the same
+  > `id` range before either inserts a lease. An alternative is to rely solely
+  > on the lease INSERT for mutual exclusion (using `ON CONFLICT DO NOTHING` on
+  > the lease PK). The `FOR UPDATE SKIP LOCKED` approach was chosen because it
+  > provides atomicity within the CTE without a retry loop and is idiomatic for
+  > PostgreSQL queue patterns. The lock is held only for the duration of the
+  > `poll_outbox()` function call (milliseconds), so contention with the
+  > retention drain is negligible — the drain targets old rows well behind the
+  > consumers' offsets.
 - `commit_offset()` is idempotent: monotonically advances `last_offset`,
   rejects regression with a warning.
 - Per-consumer rows in `pgt_consumer_offsets` are isolated; no cross-consumer
@@ -973,15 +989,18 @@ import nats
 GROUP_NAME    = os.environ['RELAY_GROUP']        # e.g. "order-publisher"
 CONSUMER_ID   = os.environ['RELAY_CONSUMER_ID']  # e.g. "relay-1"
 OUTBOX_NAME   = os.environ['RELAY_OUTBOX']       # e.g. "outbox_pending_order_events"
+STREAM_TABLE  = os.environ['RELAY_STREAM_TABLE'] # e.g. "pending_order_events" (the pg_trickle ST name)
 NATS_URL      = os.environ['NATS_URL']
 PG_DSN        = os.environ['PG_DSN']
 
-# SAFETY: OUTBOX_NAME is a catalog-verified table name read from an environment
-# variable set by the operator, not from user input. Validate its format here
-# to prevent injection if this script is ever adapted to accept CLI arguments.
+# SAFETY: OUTBOX_NAME and STREAM_TABLE are catalog-verified table names read
+# from environment variables set by the operator, not from user input. Validate
+# their format here to prevent injection if this script is ever adapted to
+# accept CLI arguments.
 import re
-if not re.match(r'^[a-z_][a-z0-9_]*$', OUTBOX_NAME):
-    raise ValueError(f"RELAY_OUTBOX must be a valid SQL identifier, got: {OUTBOX_NAME!r}")
+for name, val in [("RELAY_OUTBOX", OUTBOX_NAME), ("RELAY_STREAM_TABLE", STREAM_TABLE)]:
+    if not re.match(r'^[a-z_][a-z0-9_]*$', val):
+        raise ValueError(f"{name} must be a valid SQL identifier, got: {val!r}")
 
 async def main():
     db = await asyncpg.connect(PG_DSN)
@@ -1027,9 +1046,11 @@ async def main():
                 inserted = [r['payload'] for r in delta_rows if r['op'] == 'I']
                 deleted  = [r['payload'] for r in delta_rows if r['op'] == 'D']
                 # Signal completion so retention drain can safely clean up delta rows
+                # NOTE: outbox_rows_consumed() takes the stream table name, not
+                # the outbox table name — it resolves the outbox via pgt_outbox_config.
                 await db.execute(
                     "SELECT pgtrickle.outbox_rows_consumed($1, $2)",
-                    OUTBOX_NAME, row['id'],
+                    STREAM_TABLE, row['id'],
                 )
             else:
                 inserted = payload.get('inserted', [])

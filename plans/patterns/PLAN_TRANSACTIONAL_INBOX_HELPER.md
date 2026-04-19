@@ -713,9 +713,10 @@ rate for a combined lag metric.
 
 #### Stats Stream Table at High Throughput
 
-The `stats_<inbox>` ST uses **FULL** refresh mode (because it projects
-`now()` in the `max_pending_age_sec` column) at a 10 s schedule. At high
-message volumes the underlying `COUNT(*)`/`AVG()` scan is O(N) in inbox
+The `stats_<inbox>` ST uses **DIFFERENTIAL** refresh mode (the `now()`-dependent
+`max_pending_age_sec` column was removed from the materialised query — see §A.4
+design note — enabling DIFFERENTIAL without spurious deltas) at a 10 s schedule.
+At high message volumes the underlying `COUNT(*)`/`AVG()` scan is O(N) in inbox
 table size:
 
 | Inbox size | Estimated stats refresh time |
@@ -897,15 +898,14 @@ SELECT pgtrickle.create_stream_table(
     'gaps_<inbox_name>',
     $$SELECT aggregate_id,
              sequence_num + 1 AS missing_sequence,
-             EXTRACT(EPOCH FROM (now() - MIN(received_at) OVER (PARTITION BY aggregate_id
-                 ORDER BY sequence_num
-                 ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING)
-             )) AS gap_age_sec
+             EXTRACT(EPOCH FROM (now() - next_received_at)) AS gap_age_sec
       FROM (
           SELECT aggregate_id, sequence_num,
                  received_at,
                  LEAD(sequence_num) OVER (PARTITION BY aggregate_id ORDER BY sequence_num)
-                     AS next_seq
+                     AS next_seq,
+                 LEAD(received_at) OVER (PARTITION BY aggregate_id ORDER BY sequence_num)
+                     AS next_received_at
           FROM <inbox_table>
           WHERE processed_at IS NULL
       ) t
@@ -914,6 +914,13 @@ SELECT pgtrickle.create_stream_table(
     schedule => '30s',
     refresh_mode => 'FULL'  -- FULL required: now() in gap_age_sec changes every refresh
 );
+```
+
+> **`gap_age_sec` semantics:** The gap age is measured from the `received_at`
+> of the row *after* the gap — the row whose arrival revealed the gap. This
+> is the most useful metric for operators: it answers "how long have we known
+> about this gap?" If the row after the gap arrived 45 seconds ago, the gap
+> has been visible for at least 45 seconds.
 ```
 
 > **Why LEAD() instead of generate_series?**
@@ -1017,6 +1024,16 @@ helper that requires unsafe SQL interpolation.
 ---
 
 ## Part C — Reference Implementations
+
+> **Security note on table name interpolation:** The reference examples below
+> use Python f-strings to interpolate table names into SQL (e.g.
+> `f"INSERT INTO {INBOX_TABLE} ..."`). This is acceptable in reference code
+> because (a) the table name is read from an operator-controlled environment
+> variable, not from user input, and (b) each script validates the name format
+> via regex before use. In production relay code (e.g. `pgtrickle-relay`
+> v0.25.0), table names should be resolved from the pg_trickle catalog at
+> startup and validated against `pgt_inbox_config` / `pgt_outbox_config` —
+> never accepted from request parameters or message payloads.
 
 ### C.1 Inbox Writer (NATS JetStream → PostgreSQL)
 
