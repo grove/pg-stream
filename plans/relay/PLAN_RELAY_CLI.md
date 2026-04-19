@@ -238,7 +238,7 @@ they need. A default feature set covers the most common backends.
 ```toml
 [package]
 name = "pgtrickle-relay"
-version = "0.24.0"
+version = "0.25.0"
 edition = "2024"
 
 [[bin]]
@@ -421,13 +421,23 @@ async fn worker_loop(
     db: &Client,
     shutdown: CancellationToken,
 ) -> Result<(), RelayError> {
+    // Exponential backoff on empty polls to avoid busy-spinning against a
+    // quiet outbox. Resets to min_sleep on any non-empty batch.
+    let mut empty_poll_sleep = Duration::from_millis(pipeline.poll_interval_ms);
+    const MAX_SLEEP: Duration = Duration::from_secs(5);
+
     loop {
         tokio::select! {
             batch = source.poll() => {
                 let batch = batch?;
                 if batch.is_empty() {
+                    // Back off rather than tight-loop against an empty outbox.
+                    tokio::time::sleep(empty_poll_sleep).await;
+                    empty_poll_sleep = (empty_poll_sleep * 2).min(MAX_SLEEP);
                     continue;
                 }
+                // Non-empty batch — reset backoff.
+                empty_poll_sleep = Duration::from_millis(pipeline.poll_interval_ms);
                 sink.publish(&batch).await?;
                 source.acknowledge(&batch).await?;
                 // Write durable offset atomically after each batch
@@ -605,10 +615,24 @@ async fn update_consumer_offset(
 }
 ```
 
-`worker_id` is set to `"<pod_name>:<thread_index>"` at startup (e.g.
-`"relay-6b7f9-0:3"`), useful for debugging stalls in multi-pod deployments.
+`worker_id` is set to `"<pod_name>:<thread_index>"` at startup, where `<pod_name>` is read from the `HOSTNAME` environment variable (or `os::hostname()` if unset); `<thread_index>` is the worker thread index (e.g. `"relay-6b7f9-0:3"`). Useful for debugging stalls in multi-pod deployments.
 
 #### Consumer Group Mode
+
+> **Simple mode vs. consumer group mode:** The relay supports two offset-tracking
+> strategies for forward mode. **Simple mode** (default) uses the relay's own
+> `pgtrickle.relay_consumer_offsets` table — a lightweight `(relay_group_id,
+> pipeline_id, last_change_id)` row updated atomically after each batch. This
+> is sufficient for single-relay deployments and requires no v0.24.0 consumer
+> group infrastructure; the extension's retention drain checks `relay_consumer_offsets`
+> to avoid data loss. **Consumer group mode** delegates offset tracking to
+> the v0.24.0 `poll_outbox()` / `commit_offset()` API, which uses the extension's
+> `pgt_consumer_offsets` table and adds visibility timeouts, lease management,
+> multi-relay coordination, and lag monitoring via `consumer_lag()`. Use consumer
+> group mode when multiple relay instances share a single outbox, or when you need
+> the operational tooling (heartbeats, dead consumer reaping, `seek_offset()` replay).
+> The pipeline's `config` JSONB controls which mode is used: include a `"group"`
+> key in the source config to activate consumer group mode.
 
 Used when `--group` is specified. Delegates coordination to pg-trickle's
 built-in consumer group SQL functions.
@@ -618,6 +642,7 @@ async fn poll_group(
     db: &Client,
     group: &str,
     consumer_id: &str,
+    stream_table_name: &str,  // stream table name for decode_payload / outbox_rows_consumed
     batch_size: i32,
     visibility_seconds: i32,
 ) -> Result<Vec<RelayMessage>, RelayError> {
@@ -639,7 +664,7 @@ async fn poll_group(
     for row in &rows {
         let id: i64 = row.get("id");
         let payload: serde_json::Value = row.get("payload");
-        let batch = decode_payload(&payload, db, &outbox_name, id).await?;
+        let batch = decode_payload(&payload, db, stream_table_name, id).await?;
         messages.extend(batch_to_messages(&batch));
     }
     Ok(messages)
@@ -683,7 +708,7 @@ struct OutboxBatch {
 async fn decode_payload(
     payload: &serde_json::Value,
     db: &Client,
-    outbox_name: &str,
+    stream_table_name: &str,   // pg_trickle stream table name (NOT the outbox table name)
     outbox_id: i64,
 ) -> Result<OutboxBatch, RelayError> {
     let v = payload["v"].as_i64().unwrap_or(0);
@@ -699,15 +724,18 @@ async fn decode_payload(
         .unwrap_or(false);
 
     if is_claim_check {
-        // Cursor-fetch from companion table in bounded batches
+        // Cursor-fetch from companion table in bounded batches.
+        // outbox_name is derived from stream_table_name ("outbox_" + stream_table_name).
+        let outbox_name = format!("outbox_{}", stream_table_name);
         let (inserted, deleted) = fetch_claim_check_rows(
-            db, outbox_name, outbox_id
+            db, &outbox_name, outbox_id
         ).await?;
 
-        // Signal consumption complete
+        // Signal consumption complete.
+        // outbox_rows_consumed() takes the STREAM TABLE name, not the outbox table name.
         db.execute(
             "SELECT pgtrickle.outbox_rows_consumed($1, $2)",
-            &[&outbox_name, &outbox_id],
+            &[&stream_table_name, &outbox_id],
         ).await?;
 
         Ok(OutboxBatch {
@@ -741,11 +769,15 @@ async fn fetch_claim_check_rows(
     let delta_table = format!("pgtrickle.outbox_delta_rows_{}", outbox_name);
 
     let cursor_name = format!("relay_cc_{}_{}", outbox_id, uuid::Uuid::new_v4().simple());
+    // Embed outbox_id as a literal — batch_execute does not support parameter
+    // binding, so $1 would not be substituted. outbox_id is an i64 from the
+    // database, not user input, so embedding it directly is safe.
     db.batch_execute(&format!(
         "DECLARE {cursor} NO SCROLL CURSOR FOR \
-         SELECT op, payload FROM {table} WHERE outbox_id = $1 ORDER BY row_num",
+         SELECT op, payload FROM {table} WHERE outbox_id = {oid} ORDER BY row_num",
         cursor = cursor_name,
-        table = delta_table  // validated at startup against catalog
+        table = delta_table,  // validated at startup against catalog
+        oid = outbox_id,
     )).await?;
 
     let mut inserted = Vec::new();

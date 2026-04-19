@@ -713,9 +713,10 @@ rate for a combined lag metric.
 
 #### Stats Stream Table at High Throughput
 
-The `stats_<inbox>` ST uses **FULL** refresh mode (because it projects
-`now()` in the `max_pending_age_sec` column) at a 10 s schedule. At high
-message volumes the underlying `COUNT(*)`/`AVG()` scan is O(N) in inbox
+The `stats_<inbox>` ST uses **DIFFERENTIAL** refresh mode (the `now()`-dependent
+`max_pending_age_sec` column was removed from the materialised query — see §A.4
+design note — enabling DIFFERENTIAL without spurious deltas) at a 10 s schedule.
+At high message volumes the underlying `COUNT(*)`/`AVG()` scan is O(N) in inbox
 table size:
 
 | Inbox size | Estimated stats refresh time |
@@ -794,6 +795,15 @@ SELECT pgtrickle.enable_inbox_ordering(
 -- Errors: InboxNotFound, InboxColumnMissing, InboxOrderingPriorityConflict
 --         (if enable_inbox_priority was already called on this inbox)
 
+-- Disable ordered processing (teardown)
+SELECT pgtrickle.disable_inbox_ordering(
+    inbox_name TEXT,
+    if_exists  BOOLEAN DEFAULT false
+) RETURNS void;
+-- Drops the next_<inbox> stream table and the pgt_inbox_ordering_config row.
+-- The original unified pending_<inbox> stream table continues to be available.
+-- Returns InboxNotFound if if_exists = false and ordering is not enabled.
+
 -- Enable priority processing for an inbox
 SELECT pgtrickle.enable_inbox_priority(
     inbox_name       TEXT,
@@ -813,15 +823,16 @@ SELECT pgtrickle.disable_inbox_priority(
     if_exists  BOOLEAN DEFAULT false
 ) RETURNS void;
 -- Drops all pending_<inbox>_<tier> stream tables and the pgt_inbox_priority_config row.
--- The original unified pending_<inbox> stream table is restored (re-created if it was
--- dropped by enable_inbox_priority). Returns InboxNotFound if if_exists = false and
--- priority is not enabled.
+-- The original unified pending_<inbox> stream table was never dropped and continues to be
+-- available. Returns InboxNotFound if if_exists = false and priority is not enabled.
 
--- Inspect ordering gaps
+-- Inspect ordering gaps (on-demand query; for high-throughput inboxes
+-- instead of continuous auto-refresh of the gaps_<inbox> stream table)
 SELECT * FROM pgtrickle.inbox_ordering_gaps(
     inbox_name TEXT
 );
 -- Columns: aggregate_id, expected_seq, gap_age_sec
+-- Returns empty set if no gaps detected.
 ```
 
 ### B.3 Aggregate-Ordered Stream Table
@@ -897,15 +908,14 @@ SELECT pgtrickle.create_stream_table(
     'gaps_<inbox_name>',
     $$SELECT aggregate_id,
              sequence_num + 1 AS missing_sequence,
-             EXTRACT(EPOCH FROM (now() - MIN(received_at) OVER (PARTITION BY aggregate_id
-                 ORDER BY sequence_num
-                 ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING)
-             )) AS gap_age_sec
+             EXTRACT(EPOCH FROM (now() - next_received_at)) AS gap_age_sec
       FROM (
           SELECT aggregate_id, sequence_num,
                  received_at,
                  LEAD(sequence_num) OVER (PARTITION BY aggregate_id ORDER BY sequence_num)
-                     AS next_seq
+                     AS next_seq,
+                 LEAD(received_at) OVER (PARTITION BY aggregate_id ORDER BY sequence_num)
+                     AS next_received_at
           FROM <inbox_table>
           WHERE processed_at IS NULL
       ) t
@@ -914,6 +924,13 @@ SELECT pgtrickle.create_stream_table(
     schedule => '30s',
     refresh_mode => 'FULL'  -- FULL required: now() in gap_age_sec changes every refresh
 );
+```
+
+> **`gap_age_sec` semantics:** The gap age is measured from the `received_at`
+> of the row *after* the gap — the row whose arrival revealed the gap. This
+> is the most useful metric for operators: it answers "how long have we known
+> about this gap?" If the row after the gap arrived 45 seconds ago, the gap
+> has been visible for at least 45 seconds.
 ```
 
 > **Why LEAD() instead of generate_series?**
@@ -1018,12 +1035,22 @@ helper that requires unsafe SQL interpolation.
 
 ## Part C — Reference Implementations
 
+> **Security note on table name interpolation:** The reference examples below
+> use Python f-strings to interpolate table names into SQL (e.g.
+> `f"INSERT INTO {INBOX_TABLE} ..."`). This is acceptable in reference code
+> because (a) the table name is read from an operator-controlled environment
+> variable, not from user input, and (b) each script validates the name format
+> via regex before use. In production relay code (e.g. `pgtrickle-relay`
+> v0.25.0), table names should be resolved from the pg_trickle catalog at
+> startup and validated against `pgt_inbox_config` / `pgt_outbox_config` —
+> never accepted from request parameters or message payloads.
+
 ### C.1 Inbox Writer (NATS JetStream → PostgreSQL)
 
 Ships as `examples/inbox/inbox_writer_nats.py`:
 
 ```python
-import asyncio, asyncpg, json, os, signal
+import asyncio, asyncpg, json, os, re, signal
 import nats
 
 NATS_URL     = os.environ['NATS_URL']
@@ -1032,6 +1059,10 @@ SUBJECT      = os.environ.get('NATS_SUBJECT', 'payments.>')
 CONSUMER     = os.environ.get('NATS_CONSUMER', 'inbox-writer')
 STREAM       = os.environ.get('NATS_STREAM', 'PAYMENTS')
 INBOX_TABLE  = os.environ.get('INBOX_TABLE', 'pgtrickle.payment_inbox')
+
+# SAFETY: INBOX_TABLE is operator-provided. Validate before use in f-strings.
+if not re.match(r'^[a-z_][a-z0-9_.]*$', INBOX_TABLE):
+    raise ValueError(f"INBOX_TABLE must be a valid schema-qualified identifier, got: {INBOX_TABLE!r}")
 
 async def main():
     nc = await nats.connect(NATS_URL)
@@ -1145,6 +1176,9 @@ async def main():
             LIMIT $1
             FOR UPDATE SKIP LOCKED
         """, BATCH_SIZE)
+        # NOTE: This query processes messages in receipt order (unordered with respect
+        # to aggregates). For per-aggregate ordered processing (Part B), query the
+        # next_<inbox> stream table instead, which guarantees sequence ordering per aggregate.
 
         if not rows:
             await asyncio.wait([stop.wait()], timeout=POLL_SECONDS)
