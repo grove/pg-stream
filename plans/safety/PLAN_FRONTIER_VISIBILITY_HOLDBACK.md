@@ -1,6 +1,6 @@
 # PLAN — Frontier Visibility Holdback (Issue #536)
 
-**Status:** Draft
+**Status:** Implemented
 **Owner:** TBD
 **Tracking issue:** [#536](https://github.com/grove/pg-trickle/issues/536)
 **Related:** [PLAN_OVERALL_ASSESSMENT_2.md](../PLAN_OVERALL_ASSESSMENT_2.md) (frontier/buffer non-atomic commit), ADR-001 / ADR-002 in [plans/adrs/PLAN_ADRS.md](../adrs/PLAN_ADRS.md)

@@ -362,8 +362,12 @@ async fn test_holdback_prepared_transaction() {
 /// truly reverts to the old unsafe behaviour (the unsafe escape hatch must
 /// remain unsafe so that benchmark operators know what they're opting into).
 ///
-/// The test is marked `#[ignore]` so it does not run in normal CI.  It can
-/// be explicitly run to confirm the unsafe mode still works as documented.
+/// The test is marked `#[ignore]` so it does not run in normal CI.  Run it
+/// explicitly to confirm the unsafe mode still behaves as documented:
+///
+/// ```bash
+/// cargo test --test e2e_long_txn_visibility_tests test_holdback_none_mode_regression_guard -- --ignored --nocapture
+/// ```
 #[tokio::test]
 #[ignore]
 async fn test_holdback_none_mode_regression_guard() {

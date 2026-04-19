@@ -538,6 +538,11 @@ ORDER BY duration_ms DESC;
 
 ### 13. Fuse Tripped (Circuit Breaker)
 
+**Symptoms:**
+- Stream table shows `fuse_state = 'BLOWN'` or refresh is paused
+- `fuse_status()` reports a tripped fuse
+- No refreshes happening despite active scheduler
+
 **Diagnosis:**
 
 ```sql

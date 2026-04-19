@@ -777,10 +777,10 @@ fn compute_coordinator_tick_watermark(
 
             match cdc::compute_safe_upper_bound(prev_watermark_lsn, prev_oldest_xmin) {
                 Ok((safe_lsn, write_lsn, current_oldest_xmin, age_secs)) => {
-                    // Persist for next tick and for dynamic workers.
-                    shmem::set_last_tick_oldest_xmin(current_oldest_xmin);
+                    // Persist for next tick and for dynamic workers under a
+                    // single lock so workers never see xmin/LSN out of sync.
                     let safe_u64 = version::lsn_to_u64(&safe_lsn);
-                    shmem::set_last_tick_safe_lsn(safe_u64);
+                    shmem::set_last_tick_holdback_state(current_oldest_xmin, safe_u64);
 
                     // Update holdback gauge metrics.
                     let write_u64 = version::lsn_to_u64(&write_lsn);

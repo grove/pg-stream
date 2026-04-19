@@ -3049,6 +3049,11 @@ pub fn classify_holdback(prev_oldest_xmin: u64, current_oldest_xmin: u64) -> boo
         return true;
     }
     // Hold back if the oldest still-running xmin is at or before the baseline.
+    //
+    // Note: xids are 32-bit and wrap around at ~4 billion. We treat them as
+    // linear u64 here. True wraparound between two consecutive scheduler ticks
+    // (100ms–10s apart) would require ~4 billion transactions to commit in that
+    // window, which is impossible in practice. This assumption holds for PG18.
     current_oldest_xmin <= prev_oldest_xmin
 }
 
@@ -3067,7 +3072,7 @@ pub fn classify_holdback(prev_oldest_xmin: u64, current_oldest_xmin: u64) -> boo
 /// - `safe_lsn`: the LSN the frontier may safely advance to.
 /// - `write_lsn`: the actual current write LSN (for holdback metric).
 /// - `current_oldest_xmin`: value to persist via
-///   `shmem::set_last_tick_oldest_xmin()` for the next tick.
+///   `shmem::set_last_tick_holdback_state()` for the next tick.
 /// - `oldest_txn_age_secs`: age of the oldest in-progress txn in seconds
 ///   (0 when no holdback is active, for the warning threshold check).
 pub fn compute_safe_upper_bound(
@@ -3079,6 +3084,11 @@ pub fn compute_safe_upper_bound(
     let result = Spi::connect(|client| {
         let rows = client
             .select(
+                // xid (type oid 28) is 32-bit in PostgreSQL up to and including
+                // PG18.  Casting via ::text::bigint is safe because 2^32 fits
+                // comfortably in a signed bigint.  If a future PG version exposes
+                // xid8 (64-bit) here, this cast will still work but the 32-bit
+                // wraparound assumption in classify_holdback() should be revisited.
                 "WITH active_xmins AS (
                     SELECT
                         backend_xmin::text::bigint AS xmin,

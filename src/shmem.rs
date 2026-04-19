@@ -498,6 +498,19 @@ pub fn set_last_tick_oldest_xmin(xmin: u64) {
     PGS_STATE.exclusive().last_tick_oldest_xmin = xmin;
 }
 
+/// Persist both the oldest-xmin and the safe frontier LSN **atomically** under
+/// a single exclusive lock acquisition so that dynamic workers never see a
+/// state where the xmin has advanced but the safe LSN has not yet been updated
+/// (or vice-versa).
+pub fn set_last_tick_holdback_state(xmin: u64, lsn_u64: u64) {
+    if !is_shmem_available() {
+        return;
+    }
+    let mut state = PGS_STATE.exclusive();
+    state.last_tick_oldest_xmin = xmin;
+    state.last_tick_safe_lsn_u64 = lsn_u64;
+}
+
 /// Read the safe frontier LSN (u64) written by the coordinator at the last tick.
 ///
 /// Dynamic refresh workers use this as a conservative upper bound.
