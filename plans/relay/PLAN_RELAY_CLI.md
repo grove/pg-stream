@@ -407,6 +407,15 @@ SELECT pg_try_advisory_lock(
 )
 ```
 
+> **Hash collision risk:** `hashtext()` maps unbounded TEXT to int4 (2.1 billion
+> values). For deployments with up to a few thousand pipelines the birthday-paradox
+> collision probability is negligible (< 0.0001%). For larger deployments use the
+> single-argument `pg_try_advisory_lock(bigint)` form with a collision-resistant
+> key: `('x' || left(md5(relay_group_id || ':' || pipeline_id), 16))::bit(64)::bigint`.
+> Pipeline names are validated to be unique in `relay_outbox_config` and
+> `relay_inbox_config`, so combining group_id and pipeline_id into a single
+> MD5-derived int8 eliminates the namespace collision risk entirely.
+
 #### Core worker loop (per pipeline)
 
 ```rust
@@ -528,7 +537,7 @@ pub struct RelayMessage {
 pub enum AckToken {
     OutboxOffset(i64),
     KafkaOffset { partition: i32, offset: i64 },
-    NatsAckHandle(/* async-nats ack handle */),
+    NatsAckHandle(async_nats::Message),
     SqsReceiptHandle(String),
     RabbitMqDeliveryTag(u64),
     RedisStreamId(String),
@@ -730,27 +739,40 @@ async fn fetch_claim_check_rows(
     outbox_name: &str,
     outbox_id: i64,
 ) -> Result<(Vec<Value>, Vec<Value>), RelayError> {
-    // Use a server-side cursor for bounded memory
+    // Use a server-side cursor in bounded batches to keep relay heap bounded
+    // regardless of claim-check delta size. This is the key memory-safety
+    // guarantee of the claim-check path — never buffer the full delta in RAM.
+    const FETCH_BATCH: i64 = 1000;
     let delta_table = format!("pgtrickle.outbox_delta_rows_{}", outbox_name);
-    let rows = db.query(
-        &format!(
-            "SELECT op, payload FROM {} WHERE outbox_id = $1 ORDER BY row_num",
-            delta_table  // validated at startup
-        ),
-        &[&outbox_id],
-    ).await?;
+
+    let cursor_name = format!("relay_cc_{}_{}", outbox_id, uuid::Uuid::new_v4().simple());
+    db.batch_execute(&format!(
+        "DECLARE {cursor} NO SCROLL CURSOR FOR \
+         SELECT op, payload FROM {table} WHERE outbox_id = $1 ORDER BY row_num",
+        cursor = cursor_name,
+        table = delta_table  // validated at startup against catalog
+    )).await?;
 
     let mut inserted = Vec::new();
     let mut deleted = Vec::new();
-    for row in rows {
-        let op: &str = row.get("op");
-        let payload: serde_json::Value = row.get("payload");
-        match op {
-            "I" => inserted.push(payload),
-            "D" => deleted.push(payload),
-            _ => tracing::warn!(op, "unknown delta op"),
+    loop {
+        let rows = db.query(
+            &format!("FETCH {n} FROM {cursor}", n = FETCH_BATCH, cursor = cursor_name),
+            &[],
+        ).await?;
+        let done = rows.len() < FETCH_BATCH as usize;
+        for row in rows {
+            let op: &str = row.get("op");
+            let payload: serde_json::Value = row.get("payload");
+            match op {
+                "I" => inserted.push(payload),
+                "D" => deleted.push(payload),
+                _ => tracing::warn!(op, "unknown delta op"),
+            }
         }
+        if done { break; }
     }
+    db.batch_execute(&format!("CLOSE {cursor}", cursor = cursor_name)).await?;
     Ok((inserted, deleted))
 }
 ```
@@ -951,11 +973,15 @@ references (e.g. `{"password_env": "KAFKA_PASSWORD"}`) resolved at runtime.
 Seven PL/pgSQL wrapper functions provide a public API for managing relay
 pipelines without requiring direct table access. Validation of required JSONB
 keys and direction constraints happens inside the functions, not in application
-code.
+code. Each function validates that the required top-level keys (`source_type`,
+`sink_type`, `source`, `sink`) are present in the JSONB config and raises
+`relay.invalid_config` if not — preventing silent misconfigurations that would
+only surface at relay startup.
 
 ```sql
 -- Upsert a forward pipeline (outbox → sink).
--- source_type must be 'outbox'.
+-- source_type must be 'outbox'. Raises relay.invalid_config on bad JSON shape.
+-- enabled defaults to true; pass false to insert in disabled state.
 SELECT pgtrickle.set_relay_outbox(
     'orders-to-nats',
     '{"source_type":"outbox","source":{"outbox":"orders","group":"order-relay"},
@@ -963,7 +989,8 @@ SELECT pgtrickle.set_relay_outbox(
 );
 
 -- Upsert a reverse pipeline (source → inbox).
--- sink_type must be 'pg-inbox'.
+-- sink_type must be 'pg-inbox'. Raises relay.invalid_config on bad JSON shape.
+-- enabled defaults to true; pass false to insert in disabled state.
 SELECT pgtrickle.set_relay_inbox(
     'kafka-to-orders',
     '{"source_type":"kafka","source":{"brokers":"localhost:9092","topic":"orders"},
@@ -1002,8 +1029,8 @@ REVOKE ALL ON pgtrickle.relay_inbox_config     FROM pgtrickle_relay;
 REVOKE ALL ON pgtrickle.relay_consumer_offsets FROM pgtrickle_relay;
 
 -- Grant execute on the API functions only
-GRANT EXECUTE ON FUNCTION pgtrickle.set_relay_outbox(TEXT, JSONB, BOOLEAN)  TO pgtrickle_relay;
-GRANT EXECUTE ON FUNCTION pgtrickle.set_relay_inbox(TEXT, JSONB, BOOLEAN)   TO pgtrickle_relay;
+GRANT EXECUTE ON FUNCTION pgtrickle.set_relay_outbox(TEXT, JSONB)  TO pgtrickle_relay;
+GRANT EXECUTE ON FUNCTION pgtrickle.set_relay_inbox(TEXT, JSONB)   TO pgtrickle_relay;
 GRANT EXECUTE ON FUNCTION pgtrickle.enable_relay(TEXT)                      TO pgtrickle_relay;
 GRANT EXECUTE ON FUNCTION pgtrickle.disable_relay(TEXT)                     TO pgtrickle_relay;
 GRANT EXECUTE ON FUNCTION pgtrickle.delete_relay(TEXT)                      TO pgtrickle_relay;
@@ -1035,6 +1062,9 @@ SELECT pg_try_advisory_lock(
                                 -- (pipeline_id is TEXT — cannot cast to int)
 );
 ```
+
+> **Hash collision note:** See [A.4](#a4-relay-modes-forward--reverse) for
+> the recommended int8 key alternative for large deployments.
 
 - If the lock is acquired → this pod owns that pipeline; spawn a worker task.
 - If the lock is already held → another pod owns it; skip.

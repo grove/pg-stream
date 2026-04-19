@@ -838,72 +838,45 @@ surfaced — preventing out-of-order processing.
 ```sql
 SELECT pgtrickle.create_stream_table(
     'gaps_<inbox_name>',
-    $$WITH expected AS (
-        SELECT aggregate_id,
-               generate_series(
-                   MIN(sequence_num),
-                   MAX(sequence_num)
-               ) AS expected_seq
-        FROM <inbox_table>
-        GROUP BY aggregate_id
-    )
-    SELECT e.aggregate_id, e.expected_seq AS missing_sequence,
-           EXTRACT(EPOCH FROM (now() - (
-               SELECT MIN(received_at) FROM <inbox_table>
-               WHERE aggregate_id = e.aggregate_id
-                 AND sequence_num > e.expected_seq
-           ))) AS gap_age_sec
-    FROM expected e
-    LEFT JOIN <inbox_table> i
-        ON i.aggregate_id = e.aggregate_id
-        AND i.sequence_num = e.expected_seq
-    WHERE i.event_id IS NULL$$,
+    $$SELECT aggregate_id,
+             sequence_num + 1 AS missing_sequence,
+             EXTRACT(EPOCH FROM (now() - MIN(received_at) OVER (PARTITION BY aggregate_id
+                 ORDER BY sequence_num
+                 ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING)
+             )) AS gap_age_sec
+      FROM (
+          SELECT aggregate_id, sequence_num,
+                 received_at,
+                 LEAD(sequence_num) OVER (PARTITION BY aggregate_id ORDER BY sequence_num)
+                     AS next_seq
+          FROM <inbox_table>
+          WHERE processed_at IS NULL
+      ) t
+      WHERE next_seq IS NOT NULL
+        AND next_seq > sequence_num + 1$$,
     schedule => '30s',
-    refresh_mode => 'DIFFERENTIAL'
+    refresh_mode => 'FULL'  -- FULL required: now() in gap_age_sec changes every refresh
 );
 ```
 
-> **Performance considerations for gap detection:**
-> The `generate_series(MIN, MAX)` approach scans the full sequence range per
-> aggregate. This is efficient for inboxes with tens of thousands of
-> aggregates but can become expensive for large gaps (e.g., missing sequences
-> in a sparse range).
+> **Why LEAD() instead of generate_series?**
+> The `LEAD()` window function scans the pending messages table once in O(N log N)
+> and detects gaps by comparing adjacent sequence numbers. It does **not** generate
+> a virtual row per expected sequence number, so it scales to any sequence density.
+> By contrast, `generate_series(MIN, MAX)` over all aggregates produces a row for
+> every sequence number in every aggregate’s range — 1 000 aggregates with
+> max_sequence = 1 000 000 generate 1 billion virtual rows regardless of how many
+> messages actually exist. The `LEAD()` approach avoids this entirely.
 >
-> **Important:** the actual scaling bound is the *sum of sequence ranges*
-> across all aggregates, not aggregate count alone. 1 000 aggregates with
-> `max_sequence = 1 000 000` generate 1 billion virtual rows from
-> `generate_series` — far beyond the safe threshold. Add a guard:
-> `HAVING MAX(sequence_num) - MIN(sequence_num) < 100 000` to skip
-> aggregates with extremely sparse ranges.
->
-> **Recommended alternative for post-v0.23.0:** use a `LAG()` window
-> function to detect actual gaps without generating a full sequence range:
-> ```sql
-> SELECT aggregate_id, sequence_num + 1 AS missing_sequence
-> FROM (
->     SELECT aggregate_id, sequence_num,
->            LEAD(sequence_num) OVER (PARTITION BY aggregate_id ORDER BY sequence_num)
->                AS next_seq
->     FROM <inbox_table>
->     WHERE processed_at IS NULL
-> ) t
-> WHERE next_seq IS NOT NULL AND next_seq > sequence_num + 1;
-> ```
-> This is O(N log N) not O(range) and scales to any sequence density.
+> **Scope:** Only pending messages (`processed_at IS NULL`) are scanned.
+> Processed rows are excluded — a gap in processed history is not actionable.
 >
 > Scale guidelines:
-> - Up to 10 000 aggregates × 10 000 max sequence: ✅ acceptable at 30 s refresh
-> - 10 000–100 000 aggregates: ⚠️ extend schedule to 60 s; monitor refresh time
-> - > 100 000 aggregates or max sequence > 1 000 000: add `pg_trickle_alert`
->   `inbox_ordering_gap_perf` warning and disable auto-refresh; use
->   `inbox_ordering_gaps()` function for on-demand checks only
->
-> Future optimization (post-v0.23.0): delta-based gap detection that only
-> scans aggregates with recent activity (last N minutes), avoiding full
-> table scans. Tracked as a follow-up issue.
->
-> The benchmark gate (INBOX-B5) must verify acceptable performance at:
-> 1M messages, 10 000 aggregates, 30 s refresh schedule.
+> - Up to 1 000 000 pending messages: ✅ acceptable at 30 s schedule
+> - > 1 000 000 pending messages: ⚠️ extend schedule to 60 s; monitor refresh time
+> - > 10 000 000 pending messages: add `pg_trickle_alert`
+>   `inbox_ordering_gap_perf` warning and consider on-demand checks only via
+>   `inbox_ordering_gaps()` instead of continuous auto-refresh
 
 When gaps are detected, a `pg_trickle_alert` event is emitted:
 
@@ -951,36 +924,37 @@ For high-throughput inboxes processed by multiple workers, partition affinity
 improves cache locality and reduces contention:
 
 ```sql
--- Proposed helper (generates a WHERE clause for worker assignment)
-SELECT pgtrickle.inbox_worker_partition(
-    inbox_name   TEXT,
+-- Boolean-returning helper: returns true if this row belongs to the given worker.
+-- Returns a BOOLEAN so it composes safely with prepared statements and ORMs
+-- without requiring SQL string interpolation.
+SELECT pgtrickle.inbox_is_my_partition(
+    aggregate_id TEXT,
     worker_id    INT,                      -- 0-based
     total_workers INT                      -- total worker count
-) RETURNS TEXT;
--- Returns: 'abs(hashtext(aggregate_id)) % 4 = 0' (for worker 0 of 4)
+) RETURNS BOOLEAN;
+-- Returns: abs(hashtext(aggregate_id)) % total_workers = worker_id
 ```
 
-Workers use this to add a filter when polling:
+Workers use this in their polling query:
 
 ```python
-partition_filter = await conn.fetchval(
-    "SELECT pgtrickle.inbox_worker_partition('payment_inbox', $1, $2)",
-    worker_id, total_workers,
-)
-rows = await conn.fetch(f"""
+rows = await conn.fetch("""
     SELECT event_id, event_type, payload
     FROM pgtrickle.payment_inbox
     WHERE processed_at IS NULL
       AND retry_count < 5
-      AND {partition_filter}
+      AND pgtrickle.inbox_is_my_partition(aggregate_id, $1, $2)
     ORDER BY received_at
     LIMIT 50
     FOR UPDATE SKIP LOCKED
-""")
+""", worker_id, total_workers)
 ```
 
 This is advisory — workers can still process any message. The partition
-clause just makes it likely that each worker focuses on its own subset.
+condition just makes it likely that each worker focuses on its own subset.
+Because the function is called inline in a WHERE clause it composes safely
+with prepared statements and ORM query builders, unlike a TEXT-returning
+helper that requires unsafe SQL interpolation.
 
 ---
 
@@ -1281,7 +1255,7 @@ Acceptance criteria: pending ST refresh < 5 ms at 100 pending, < 50 ms at
 
 | File | Sections to Add |
 |------|-----------------|
-| [docs/SQL_REFERENCE.md](../../docs/SQL_REFERENCE.md) | `pgtrickle.create_inbox()`, `enable_inbox_tracking()`, `drop_inbox()`, `inbox_status()`, `inbox_health()`, `replay_inbox_messages()`, `enable_inbox_ordering()`, `enable_inbox_priority()`, `inbox_worker_partition()`; ordered+priority mutual exclusion note |
+| [docs/SQL_REFERENCE.md](../../docs/SQL_REFERENCE.md) | `pgtrickle.create_inbox()`, `enable_inbox_tracking()`, `drop_inbox()`, `inbox_status()`, `inbox_health()`, `replay_inbox_messages()`, `enable_inbox_ordering()`, `enable_inbox_priority()`, `inbox_is_my_partition()`; ordered+priority mutual exclusion note |
 | [docs/CONFIGURATION.md](../../docs/CONFIGURATION.md) | All six inbox GUCs with defaults and effect descriptions |
 | [docs/PATTERNS.md](../../docs/PATTERNS.md) | New section "Transactional Inbox" with: basic inbox setup, DLQ flow, processor crash recovery guide, per-aggregate ordering pattern, priority queue pattern, partition affinity for competing workers, "Ordered + Priority" mutual exclusion explanation and recommended alternative (separate inboxes per priority class) |
 | [docs/ARCHITECTURE.md](../../docs/ARCHITECTURE.md) | Diagram of inbox pipeline with stream tables |
@@ -1314,7 +1288,7 @@ Acceptance criteria: pending ST refresh < 5 ms at 100 pending, < 50 ms at
 | ORD-1 | `enable_inbox_ordering()`: aggregate-ordered stream table, sequence tracking, partial index for `last_processed` CTE | 1d |
 | ORD-2 | Gap detection stream table + alert mechanism | 0.5d |
 | ORD-3 | `enable_inbox_priority()`: per-tier stream tables, configurable schedules | 1d |
-| ORD-4 | `inbox_worker_partition()`: hash-based worker affinity helper | 0.5d |
+| ORD-4 | `inbox_is_my_partition()`: boolean-returning hash-based worker affinity helper. Signature: `inbox_is_my_partition(aggregate_id TEXT, worker_id INT, total_workers INT) RETURNS BOOLEAN`. Composable with prepared statements and ORMs; no SQL string interpolation required. | 0.5d |
 | ORD-5 | E2E tests for ordering, gaps, priority, partition affinity | 1d |
 
 **Total: ~4 days.**

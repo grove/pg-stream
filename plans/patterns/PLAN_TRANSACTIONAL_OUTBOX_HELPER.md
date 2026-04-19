@@ -49,7 +49,7 @@
 
 This plan specifies two complementary features for pg_trickle:
 
-1. **Outbox Helper (v0.22.0):** A built-in, minimal-API mechanism that
+1. **Outbox Helper (v0.23.0):** A built-in, minimal-API mechanism that
    captures the per-refresh delta `{inserted, deleted}` of any DIFFERENTIAL
    stream table into a dedicated audit-style table
    `pgtrickle.outbox_<st>`. This eliminates the dual-write problem for
@@ -457,6 +457,8 @@ WHERE id IN (SELECT id FROM rows_to_delete);
 
 ### A.8 GUCs
 
+#### Part A — Outbox Helper GUCs
+
 | GUC | Type | Default | Description |
 |-----|------|---------|-------------|
 | `pg_trickle.outbox_enabled` | bool | `true` | Master switch. When `false`, refresh skips outbox writes even if enabled per ST. |
@@ -464,8 +466,15 @@ WHERE id IN (SELECT id FROM rows_to_delete);
 | `pg_trickle.outbox_drain_batch_size` | int | `10000` | Max rows deleted per drain pass. |
 | `pg_trickle.outbox_inline_threshold_rows` | int | `10000` | Delta row count at or below which rows are inlined into the outbox `payload` column. Above this threshold the claim-check path is used: rows land in `outbox_delta_rows_<st>` and the relay fetches via server-side cursor. **Replaces** the old `outbox_max_payload_bytes` GUC (removed). |
 | `pg_trickle.outbox_drain_interval_seconds` | int | `60` | Minimum interval between drain passes. |
+
+#### Part B — Consumer Group GUCs
+
+| GUC | Type | Default | Description |
+|-----|------|---------|-------------|
 | `pg_trickle.consumer_dead_threshold_hours` | int | `24` | Hours since last heartbeat before a consumer is considered dead and its leases released. Reduce to `1` for high-criticality systems. |
 | `pg_trickle.consumer_stale_offset_threshold_days` | int | `7` | Days since last commit before a dead consumer's offset row is permanently removed. |
+| `pg_trickle.consumer_cleanup_enabled` | bool | `true` | Enable scheduler step that reaps dead consumers and releases their leases. |
+| `pg_trickle.outbox_force_retention` | bool | `false` | Override the per-consumer retention guard. When `true`, the drain deletes rows regardless of consumer offsets. Use only when a consumer is permanently abandoned. |
 
 All GUCs are `SUSET` (require superuser to change).
 
@@ -632,6 +641,24 @@ ALTER TABLE pgtrickle.pgt_consumer_leases SET (
     autovacuum_vacuum_scale_factor = 0.01,
     autovacuum_vacuum_cost_limit   = 2000
 );
+
+-- Per-consumer-group claim-check completion tracking.
+-- Required for retention drain safety: the drain must not delete an outbox
+-- row (and cascade-delete its delta rows) until every consumer group that
+-- has polled past that outbox_id has signalled cursor consumption complete
+-- via outbox_rows_consumed().
+CREATE TABLE pgtrickle.pgt_consumer_claim_check_acks (
+    group_id            UUID NOT NULL REFERENCES pgtrickle.pgt_consumer_groups(group_id) ON DELETE CASCADE,
+    outbox_id           BIGINT NOT NULL,           -- FK to outbox_<st>(id) NOT enforced (cross-table)
+    consumer_id         TEXT NOT NULL,
+    acked_at            TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (group_id, outbox_id, consumer_id)
+);
+-- Retention drain: a claim-check outbox row may only be deleted when
+-- no row exists in pgt_consumer_claim_check_acks where acked_at IS NULL,
+-- i.e., when every group that polled past this id has called
+-- outbox_rows_consumed() for it. Rows are removed from this table as
+-- part of the drain step itself after the parent is safely deleted.
 ```
 
 ### B.4 Polling Semantics
@@ -747,36 +774,60 @@ Three pg_trickle-managed stream tables (auto-created on first
 `create_consumer_group()` call) provide always-fresh dashboards:
 
 ```sql
--- Per-consumer status
+-- Per-consumer status.
+-- Uses FULL mode: last_offset and last_heartbeat_at do not change every cycle,
+-- but this is a small table (one row per consumer) and FULL is safe here.
+-- Consumers compute heartbeat_age_sec client-side from last_heartbeat_at;
+-- for live health status use consumer_lag() instead.
 SELECT pgtrickle.create_stream_table(
     'pgt_consumer_status',
     $$SELECT g.group_name, o.consumer_id, o.last_offset,
-             o.last_heartbeat_at,
-             EXTRACT(EPOCH FROM (now() - o.last_heartbeat_at)) AS heartbeat_age_sec,
-             (now() - o.last_heartbeat_at) < interval '60 seconds' AS healthy
+             o.last_commit_at,
+             o.last_heartbeat_at
       FROM pgtrickle.pgt_consumer_groups g
       JOIN pgtrickle.pgt_consumer_offsets o USING (group_id)$$,
     schedule => '5 seconds',
-    refresh_mode => 'DIFFERENTIAL'
+    refresh_mode => 'FULL'   -- stable data; FULL avoids false-change churn from now()-derived columns
 );
 
--- Per-group aggregate lag
+-- Per-group aggregate lag.
+-- Does NOT use now() in computed columns; DIFFERENTIAL is safe here.
 SELECT pgtrickle.create_stream_table(
     'pgt_consumer_group_lag',
-    $$...$$,
+    $$SELECT g.group_name,
+             MAX(o.last_offset)                   AS max_offset,
+             MIN(o.last_offset)                   AS min_offset,
+             COUNT(o.consumer_id)                 AS consumer_count,
+             (SELECT MAX(id) FROM pgtrickle.outbox_<st>) - MIN(o.last_offset)
+                                                  AS max_lag_rows
+      FROM pgtrickle.pgt_consumer_groups g
+      JOIN pgtrickle.pgt_consumer_offsets o USING (group_id)
+      GROUP BY g.group_name$$,
     schedule => '10 seconds',
     refresh_mode => 'DIFFERENTIAL'
 );
 
--- Active leases
+-- Active leases.
+-- Uses FULL mode: the WHERE clause filters on visibility_until > now(),
+-- which changes on every refresh cycle (expired leases disappear).
+-- DIFFERENTIAL would emit spurious deletes for every expired lease row.
 SELECT pgtrickle.create_stream_table(
     'pgt_consumer_active_leases',
     $$SELECT * FROM pgtrickle.pgt_consumer_leases
       WHERE visibility_until > now()$$,
     schedule => '5 seconds',
-    refresh_mode => 'DIFFERENTIAL'
+    refresh_mode => 'FULL'   -- WHERE now() changes every cycle; FULL avoids false-change churn
 );
 ```
+
+> **Why FULL for pgt_consumer_status and pgt_consumer_active_leases?**
+> Both queries use `now()` either in derived columns or in a WHERE clause.
+> DIFFERENTIAL mode computes a delta by comparing the current result to the
+> previous one; when `now()` changes, *every* row appears modified on every
+> refresh, producing a useless delta that is 100% false changes. FULL mode
+> always replaces the materialised view in one pass, which is correct and
+> efficient for these small tables. Use `consumer_lag()` (a live SQL function)
+> for programmatic health checks that need the current `heartbeat_age_sec`.
 
 ### B.8 Concurrency & Isolation
 
@@ -847,10 +898,9 @@ async def main():
     nc = await nats.connect(NATS_URL)
     js = nc.jetstream()
 
-    # Auto-register (idempotent)
+    # Auto-register (idempotent — create_consumer_group() is a no-op if the group exists)
     await db.execute(
-        "SELECT pgtrickle.create_consumer_group($1, $2, 'latest') "
-        "ON CONFLICT (group_name) DO NOTHING",
+        "SELECT pgtrickle.create_consumer_group($1, $2, 'latest')",
         GROUP_NAME, OUTBOX_NAME,
     )
 
@@ -1004,7 +1054,7 @@ broker dedup. Total throughput > 10 000 rows/sec across 10 relays.
 
 | File | Sections to Add |
 |------|-----------------|
-| [docs/SQL_REFERENCE.md](../../docs/SQL_REFERENCE.md) | `pgtrickle.enable_outbox()`, `disable_outbox()`, `outbox_status()`, payload schema (with version), `pgt_outbox_dedup_<st>` view usage, consumer group API |
+| [docs/SQL_REFERENCE.md](../../docs/SQL_REFERENCE.md) | `pgtrickle.enable_outbox()`, `disable_outbox()`, `outbox_status()`, payload schema (with version), `pgt_outbox_latest_<st>` view usage, consumer group API |
 | [docs/CONFIGURATION.md](../../docs/CONFIGURATION.md) | All seven outbox+consumer GUCs with defaults and effect descriptions |
 | [docs/PATTERNS.md](../../docs/PATTERNS.md) | New section "Transactional Outbox" linking to PLAN_TRANSACTIONAL_OUTBOX.md; "Claim-Check Large Delta Relay" pattern (server-side cursor, `outbox_rows_consumed()`, memory-bounded loop); "Latest-State Consumers" (dedup view); "Monitoring Outbox Health" (custom ST example); "Multi-Relay Consumer Groups" (competing consumers) |
 | [docs/ARCHITECTURE.md](../../docs/ARCHITECTURE.md) | Diagram of refresh path with optional outbox write step |
@@ -1213,7 +1263,7 @@ Five critical questions resolved before implementation begins:
 | # | Question | Decision | Rationale |
 |---|----------|----------|-----------|
 | 1 | Should `enable_outbox()` work for IMMEDIATE-mode STs? | **No — hard error** (`OutboxRequiresNotImmediateMode`) | IMMEDIATE refreshes inside the source transaction; an extra INSERT on every write is unacceptable overhead. Exactly-once downstream semantics require a separate commit point. |
-| 2 | Outbox deduplication — whose responsibility? | **Relay + inbox** (not outbox) | Outbox is an append-only audit log. Relay uses broker idempotency keys; inbox uses `ON CONFLICT DO NOTHING`. pg_trickle provides `pgt_outbox_dedup_<st>` view as a zero-cost helper for latest-state clients only. |
+| 2 | Outbox deduplication — whose responsibility? | **Relay + inbox** (not outbox) | Outbox is an append-only audit log. Relay uses broker idempotency keys; inbox uses `ON CONFLICT DO NOTHING`. pg_trickle provides the `pgt_outbox_latest_<st>` view (ORDER BY id DESC LIMIT 1) as a zero-cost helper for latest-delta inspection. |
 | 3 | Consumer lease hold time after crash — configurable? | **Yes — `pg_trickle.consumer_dead_threshold_hours`** (default 24) | High-criticality systems can set this to 1 hour. Relay heartbeat interval (recommended 10 s) gives 360× buffer even at 1-hour threshold. |
 | 4 | Large-delta relay memory safety | **Claim-check path** (`outbox_delta_rows_<st>`) | When `delta_row_count > outbox_inline_threshold_rows`, rows land in `pgtrickle.outbox_delta_rows_<st>` (not in `payload`). The relay fetches via server-side cursor in bounded batches and calls `outbox_rows_consumed()`. There is **no truncation path** — all rows are always available. The old `payload.truncated` concept was removed when the claim-check design was finalised. |
 | 5 | Naming collision resolution algorithm | **Exact 56-byte truncation + 7-char hex suffix** | Deterministic, reproducible, and stored in `pgt_outbox_config.outbox_table_name` so no re-derivation is needed at runtime. |
