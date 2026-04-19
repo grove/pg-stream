@@ -6306,12 +6306,70 @@ coding, then apply fixes to the smallest affected code paths.
 | P5-1 | **`pgtrickle.delta_work_mem` GUC.** Add a GUC that sets `work_mem` inside `execute_delta_sql` before running generated SQL. Default `0` (inherit session `work_mem`). Allows tuning without server restart: `ALTER SYSTEM SET pgtrickle.delta_work_mem = '256MB'`. Short-term mitigation while DI-2 completion (Phase 2) is in progress. **Location:** `config.rs` + `refresh.rs`. | 0.5d | — |
 | P5-2 | **`pgtrickle.delta_enable_nestloop` GUC (optional).** Add a GUC to disable nested-loop joins inside delta execution (`SET enable_nestloop = off`). Useful diagnostic for planner regressions on large right-side joins before planner statistics are reliable. **Location:** `config.rs` + `refresh.rs`. | 0.5d | — |
 
+---
+
+### Quality Pillar Enrichment
+
+Items across the six quality pillars that are directly triggered by the
+Phase 1–5 DVM code changes and the TPC-H scaling investigation. Items marked
+**P0** block the release; **P1** are target; **P2** are nice-to-have.
+
+#### Correctness
+
+| ID | Title | Effort | Priority | Description |
+|----|-------|--------|----------|-------------|
+| CORR-1 | **`__pgt_count` invariant under UPDATE-split** | S | P0 | After P2A-1 (DI-2 aggregate UPDATE-split), add a property-based test (proptest/quickcheck) that generates random UPDATE batches and asserts `SUM(__pgt_count) = 0` over the change buffer before and after the UPDATE-split merge path. An imbalanced count silently corrupts the stream table aggregate. **Location:** `src/dvm/operators/aggregate.rs`, `tests/`. |
+| CORR-2 | **HAVING correctness after aggregate UPDATE-split** | S | P1 | HAVING filters must be applied to the final merged aggregate, not to the intermediate split rows. Add a regression test with `GROUP BY … HAVING count(*) > N` that applies an UPDATE that changes grouped keys — the expected behaviour is that only rows whose post-update aggregate crosses the HAVING threshold appear in the delta. Catches off-by-one errors in the split path. |
+| CORR-3 | **NULL-safe equi-join key extraction in DI-6** | S | P1 | `extract_equijoin_keys_aliased` in `anti_join.rs` and `semi_join.rs` uses standard equality. If a join key column is nullable, the EXCEPT ALL in R_old can miss or double-count rows on NULL keys. Add unit tests for anti-join delta with a NULL `l_orderkey`; fix the key filter to emit `IS NOT DISTINCT FROM` for nullable key columns. **Location:** `src/dvm/operators/anti_join.rs`, `semi_join.rs`. |
+
+#### Stability
+
+| ID | Title | Effort | Priority | Description |
+|----|-------|--------|----------|-------------|
+| STAB-1 | **Panic elimination in DI-2 / DI-6 new code paths** | S | P0 | Any `unreachable!()` or `panic!()` in `diff.rs`, `aggregate.rs`, `anti_join.rs`, `semi_join.rs` that can be reached by the new UPDATE-split and key-restriction code paths must be replaced with `PgTrickleError::DvmUnsupportedOperator` and surface as a PostgreSQL `ERROR` (not a backend crash). Audit all `unwrap()` calls added in Phase 2–4. **Constraint:** Per AGENTS.md — never `unwrap()` / `panic!()` in code reachable from SQL. |
+| STAB-2 | **Graceful fallback for invalid `delta_work_mem` value** | XS | P1 | If `pgtrickle.delta_work_mem` is set to an invalid memory string (e.g. `'invalid'`), the `SET LOCAL work_mem = '...'` inside `execute_delta_sql` returns a PostgreSQL error. Catch that SPI error and fall back to the session `work_mem` with a `WARNING` log rather than propagating as an unhandled error. **Location:** `src/refresh.rs`. |
+| STAB-3 | **WAL exhaustion guard in cross-query consistency** | S | P0 | `test_tpch_cross_query_consistency` creates all 22 stream tables simultaneously and caused a 4h50m hang at SF-10 (April 2026) via WAL/disk exhaustion. Validate the per-query `CHECKPOINT` fix at SF=1.0 by tracking WAL LSN delta before/after each checkpoint call. If WAL still grows unbounded between checkpoints, add a `TPCH_MAX_CONCURRENT_STREAMS` cap that refreshes tables in batches of N. **Success:** test completes at SF=1.0 in <30 min with peak WAL <10 GB. |
+
+#### Performance
+
+| ID | Title | Effort | Priority | Description |
+|----|-------|--------|----------|-------------|
+| PERF-1 | **Criterion regression gate for fixed query patterns** | S | P1 | After each phase lands (P2, P3, P4), add the fixed pattern to `benches/diff_operators.rs` as a Criterion micro-benchmark: multi-table join delta (q09-shape), EXISTS anti-join delta (q04-shape), nested EXISTS delta (q20-shape). Gate CI to fail if DIFF time at SF=0.1 regresses >20% vs the post-fix baseline. Catches regressions introduced by future DVM changes without requiring a full TPC-H run. |
+| PERF-2 | **Delta SQL template caching for repeated refresh** | S | P2 | When `pgtrickle.log_delta_sql = on` is active (P1-2), the delta SQL string is built on every refresh. Add a thread-local `HashMap<(stream_table_oid, change_kind), String>` cache so the SQL is only regenerated when the stream table definition changes (DDL invalidation via `pg_notify`). Eliminates the SQL generation overhead from the hot path once the debugging GUC is removed. **Location:** `src/refresh.rs`, `src/dvm/diff.rs`. |
+
+#### Scalability
+
+| ID | Title | Effort | Priority | Description |
+|----|-------|--------|----------|-------------|
+| SCAL-1 | **Intermediate CTE row count bound at SF=10** | M | P1 | After DI-2 completion (P2A-1), run `EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON)` on fixed queries (q05/q07/q08/q09) with the `pgtrickle.log_delta_sql` GUC at SF=10 and assert that the highest-cardinality intermediate CTE node does not exceed O(Δ × k) rows (where Δ = RF batch size and k = number of join levels). Capture the JSON EXPLAIN plan as a CI artifact. This verifies the fix is truly O(Δ) and not just better constant factors. |
+| SCAL-2 | **Change buffer growth monitoring during multi-ST refresh** | S | P1 | Add a `pgtrickle.max_change_buffer_rows` GUC (default `0` = unlimited) that emits a `pg_trickle_alert change_buffer_overflow` event when the change buffer for a single stream table exceeds the threshold. Prevents the WAL accumulation pattern seen in `test_tpch_cross_query_consistency` from going undetected in production. **Location:** `config.rs`, `src/cdc.rs` (post-trigger count check). |
+
+#### Ease of Use
+
+| ID | Title | Effort | Priority | Description |
+|----|-------|--------|----------|-------------|
+| UX-1 | **DIFF-slower-than-FULL per-query log warning** | XS | P1 | When `pgtrickle.log_delta_sql = on` and a delta refresh takes longer than the last recorded FULL refresh time for the same stream table (from `st_refresh_stats`), emit a `pgrx::warning!()` message: `[pgtrickle] DIFF refresh for <table> took Xms vs last FULL Yms — DIFF is Nx slower`. Allows operators to identify affected tables during normal operation without running the full benchmark suite. **Location:** `src/refresh.rs`. |
+| UX-2 | **Scaling limits section in PERFORMANCE_COOKBOOK.md** | XS | P1 | Add a "DVM Query Complexity Limits" section documenting: the three failure mode categories (threshold collapse, early collapse, structural bug), which SQL patterns trigger each category (multi-table joins, EXISTS anti-joins, doubly-nested EXISTS), the recommended SF at which each is safe, and how to identify which mode applies to a given user query using `pgtrickle.log_delta_sql`. Cross-reference with `ERRORS.md` for the `DvmUnsupportedOperator` error. |
+| UX-3 | **`pgtrickle.explain_diff_sql(stream_table)` helper** | M | P2 | New SQL function `pgtrickle.explain_diff_sql(stream_table TEXT) RETURNS TEXT` that builds and returns the delta SQL for the given stream table using a zero-row mock change buffer (for inspection only — no execution). Allows operators to review what SQL the DVM engine will generate without running a full refresh. Wraps the existing delta SQL builder. **Location:** `src/api.rs`. **Schema change:** Yes — new SQL function in `sql/pg_trickle--0.22.0--0.23.0.sql`. |
+
+#### Test Coverage
+
+| ID | Title | Effort | Priority | Description |
+|----|-------|--------|----------|-------------|
+| TEST-1 | **`test_tpch_immediate_correctness` at SF=1.0** | M | P1 | Run `test_tpch_immediate_correctness` at SF=1.0 (`TPCH_SCALE=1.0`) and record per-query RF cycle time. IMMEDIATE mode fires IVM triggers inside the DML transaction; if multi-join queries (q05/q07/q08/q09) exhibit the same scaling failure, application transactions stall. Queries exceeding 5 s per RF cycle must be documented in SQL_REFERENCE.md Known Limitations as not recommended for IMMEDIATE mode at production scale. Note: the IMMEDIATE mode delta path uses `TransitionTable`; scaling failures here may be independent of the DI-2/DI-6 fixes. |
+| TEST-2 | **Sustained churn for full 22-query set (post Phase 2–3)** | S | P1 | After Phase 2–3 fixes land, add the threshold-collapse group (q05/q07/q08/q09) and super-linear group (q13/q15/q17) to `test_tpch_sustained_churn` behind `TPCH_CHURN_ALL_QUERIES=1` env var. Verify zero correctness drift over 100 cycles at SF=0.1. Also verify q22 stays correct after P3-2 (delta-key R_old restriction touches the `NOT IN` path q22 uses). Default churn run unchanged. |
+| TEST-3 | **Light E2E eligibility audit for TPC-H tests** | S | P2 | 10 of the 52 TPC-H test cases require the full E2E Docker image. Audit each to determine if the dependency is necessary or can be removed. Tests that only need the extension binary (not custom postgres config or third-party extensions) should be migrated to light E2E using `cargo pgrx package` + stock `postgres:18.3`. Reduces PR feedback latency since full E2E is skipped on PRs. |
+
+---
+
 ### Effort Summary for v0.23.0
 
 | Path | Items | Total |
 |------|-------|-------|
 | Best case (hypothesis A: spill) | P1-1 + P1-2 + P2B-1 + P2-1 + P3-1 + P4-1 + P5-1 | **~4 days** |
-| Likely case (hypothesis B: DVM cardinality) | All items | **~11 days** |
+| Likely case (hypothesis B: DVM cardinality) | Phases 1–5 (all items) | **~11 days** |
+| Quality pillar additions (all priorities) | CORR-1–3 + STAB-1–3 + PERF-1–2 + SCAL-1–2 + UX-1–3 + TEST-1–3 | **~8 days** |
+| Quality pillar P0/P1 only | CORR-1–3 + STAB-1–3 + PERF-1 + SCAL-1–2 + UX-1–2 + TEST-1–2 | **~6 days** |
 
 **Exit criteria:**
 - [ ] P1-1: work_mem benchmark run at SF=1.0 with results recorded in PLAN_TPCH_DVM_PERF.md
@@ -6323,6 +6381,10 @@ coding, then apply fixes to the smallest affected code paths.
 - [ ] q22 DIFF < 200ms at SF=1.0 (currently 3.1s)
 - [ ] All 22 TPC-H queries pass `test_tpch_differential_correctness` at SF=1.0
 - [ ] No regression on q02/q11/q16 (must stay < 20ms DIFF at SF=1.0)
+- [ ] CORR-1: `__pgt_count` invariant property test passes on 1,000 randomised UPDATE batches
+- [ ] STAB-1: no `unwrap()` / `panic!()` in Phase 2–4 code paths (zero new findings from `cargo clippy`)
+- [ ] STAB-3: `test_tpch_cross_query_consistency` completes at SF=1.0 in < 30 min with peak WAL < 10 GB
+- [ ] UX-2: "DVM Query Complexity Limits" section published in PERFORMANCE_COOKBOOK.md
 - [ ] `just check-version-sync` passes
 
 ---
