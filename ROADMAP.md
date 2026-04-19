@@ -6330,6 +6330,7 @@ Phase 1–5 DVM code changes and the TPC-H scaling investigation. Items marked
 | STAB-2 | **Graceful fallback for invalid `delta_work_mem` value** | XS | P1 | If `pgtrickle.delta_work_mem` is set to an invalid memory string (e.g. `'invalid'`), the `SET LOCAL work_mem = '...'` inside `execute_delta_sql` returns a PostgreSQL error. Catch that SPI error and fall back to the session `work_mem` with a `WARNING` log rather than propagating as an unhandled error. **Location:** `src/refresh.rs`. |
 | STAB-3 | **WAL exhaustion guard in cross-query consistency** | S | P0 | `test_tpch_cross_query_consistency` creates all 22 stream tables simultaneously and caused a 4h50m hang at SF-10 (April 2026) via WAL/disk exhaustion. Validate the per-query `CHECKPOINT` fix at SF=1.0 by tracking WAL LSN delta before/after each checkpoint call. If WAL still grows unbounded between checkpoints, add a `TPCH_MAX_CONCURRENT_STREAMS` cap that refreshes tables in batches of N. **Success:** test completes at SF=1.0 in <30 min with peak WAL <10 GB. |
 | STAB-4 | **`pgtrickle_refresh_stats` view for production observability** | S | P2 | Add a `pgtrickle.pgtrickle_refresh_stats` view that aggregates per-stream-table timing from `st_refresh_stats` into `(stream_table, mode, avg_ms, p95_ms, p99_ms, refresh_count, last_refresh_at)`. Gives operators a single `SELECT * FROM pgtrickle.pgtrickle_refresh_stats ORDER BY avg_ms DESC` to identify slow stream tables in production without running a TPC-H benchmark. The view is updated by the scheduler after each successful refresh cycle. **Location:** `src/monitor.rs`, `sql/`. **Schema change:** Yes — new view. |
+| STAB-5 | **Update `docs/ERRORS.md` with new DVM error variants** | XS | P2 | STAB-1 (panic elimination) replaces `unwrap()`/`panic!()` with `PgTrickleError::DvmUnsupportedOperator` errors. UX-4 introduces a `dvm_unsupported_pattern` alert. Phase 2–4 code paths may produce new error conditions not currently documented. Add entries to `docs/ERRORS.md` for each new error variant: error ID, SQLSTATE code, description, remediation hint, and reference to relevant roadmap items (UX-2, UX-4, PERF-4). Cross-reference from `ERRORS.md` to PERFORMANCE_COOKBOOK.md section added in UX-2. **Location:** `docs/ERRORS.md`. **No schema change.** |
 
 #### Performance
 
@@ -6378,7 +6379,7 @@ Phase 1–5 DVM code changes and the TPC-H scaling investigation. Items marked
 |------|-------|-------|
 | Best case (hypothesis A: spill) | P1-1 + P1-2 + P2B-1 + P2-1 + P3-1 + P4-1 + P5-1 | **~4 days** |
 | Likely case (hypothesis B: DVM cardinality) | Phases 1–5 (all items) | **~11 days** |
-| Quality pillar additions (all priorities) | CORR-1–3 + STAB-1–4 + PERF-1–5 + SCAL-1–3 + UX-1–7 + TEST-1–4 | **~16 days** |
+| Quality pillar additions (all priorities) | CORR-1–3 + STAB-1–5 + PERF-1–5 + SCAL-1–3 + UX-1–7 + TEST-1–4 | **~17 days** |
 | Quality pillar P0/P1 only | CORR-1–3 + STAB-1–3 + PERF-1, 4–5 + SCAL-1–2 + UX-1–2, 7 + TEST-1–2 | **~9 days** |
 
 **Exit criteria:**
