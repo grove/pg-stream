@@ -88,7 +88,8 @@ new entries when creating documents.
 | [REPORT_CUSTOM_SQL_SYNTAX.md](sql/REPORT_CUSTOM_SQL_SYNTAX.md) | REPORT | Reference | PostgreSQL extension syntax mechanisms research |
 | [REPORT_DB_SCHEMA_STABILITY.md](sql/REPORT_DB_SCHEMA_STABILITY.md) | REPORT | Assessment | Database schema stability assessment (pre-1.0) |
 | [PLAN_HYBRID_CDC.md](sql/PLAN_HYBRID_CDC.md) | PLAN | Complete | Hybrid CDC — trigger bootstrap → logical replication |
-| [PLAN_LEAPFROG_TRIEJOIN.md](sql/PLAN_LEAPFROG_TRIEJOIN.md) | PLAN | Proposed | Worst-case optimal join algorithms (LFTJ, WCOJ) for multi-way join optimization |
+| [PLAN_ALGORITHMS_LEAPFROG_TRIEJOIN.md](sql/PLAN_ALGORITHMS_LEAPFROG_TRIEJOIN.md) | PLAN | Proposed | Worst-case optimal join algorithms (LFTJ, WCOJ) for multi-way join optimization |
+| [PLAN_ALGORITHMS_OTHER.md](sql/PLAN_ALGORITHMS_OTHER.md) | PLAN | Research | Additional algorithms: higher-order IVM, aggregate-aware processing, multi-query optimization, scheduling |
 | [PLAN_BOOTSTRAP_GATING.md](sql/PLAN_BOOTSTRAP_GATING.md) | PLAN | Exploration | Bootstrap gating — block downstream refresh until external sources are initially populated |
 | [PLAN_WATERMARK_GATING.md](sql/PLAN_WATERMARK_GATING.md) | PLAN | Exploration | User-provided watermarks for cross-source gating of externally-loaded data |
 | [PLAN_NATIVE_SYNTAX.md](sql/PLAN_NATIVE_SYNTAX.md) | PLAN | Proposed | Native PostgreSQL syntax for stream tables |
