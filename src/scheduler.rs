@@ -726,7 +726,7 @@ static LAST_HOLDBACK_WARN_SECS: std::sync::atomic::AtomicU64 = std::sync::atomic
 /// Applies the `frontier_holdback_mode` GUC logic:
 /// - `"none"` / watermark disabled: use raw `pg_current_wal_lsn()`.
 /// - `"xmin"`: probe `pg_stat_activity` + `pg_prepared_xacts` and hold back
-///    if a long-running transaction would cause data loss.
+///   if a long-running transaction would cause data loss.
 /// - `"lsn:<N>"`: hold back by exactly N bytes.
 ///
 /// Side effects (when holdback fires):
