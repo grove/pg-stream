@@ -114,6 +114,12 @@ This plan formalises that observation into a concrete implementation.
 
 ### A.1 SQL API
 
+> **Relay integration:** `pgtrickle.set_relay_outbox()` (relay plan A.14)
+> calls `enable_outbox()` automatically when creating a new forward pipeline,
+> so most users never need to call `enable_outbox()` directly. Use it when
+> you want outbox capture without an associated relay pipeline — e.g. for
+> direct polling by application code.
+
 ```sql
 -- Enable outbox capture for a stream table
 SELECT pgtrickle.enable_outbox(

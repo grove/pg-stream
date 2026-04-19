@@ -1006,35 +1006,55 @@ typed parameter — not buried in JSONB. Only the external backend options live
 in the JSONB argument, keeping validation simple and making misconfigurations
 visible at call time rather than at relay startup.
 
+These two functions follow the same "create + connect" ergonomic as
+RisingWave / Feldera `CREATE TABLE … WITH (connector = …)`: a single call
+creates the pg-trickle infrastructure and binds the relay pipeline. The
+underlying objects (outbox table, inbox table) remain independently accessible
+for direct polling, replay, or monitoring — unlike the RisingWave model where
+the table and connector are inseparable.
+
 ```sql
--- Upsert a forward pipeline (outbox → external sink).
---   outbox  — name of the pg-trickle outbox (validated against the catalog).
---   group   — consumer-group name for offset tracking.
---   sink    — JSONB describing the external sink backend.
---             Required key: "type"  (e.g. "nats", "kafka", "http", "redis",
---             "sqs", "rabbitmq", "stdout").
---             All other keys are backend-specific.
---             Raises relay.invalid_config if "type" is missing.
+-- Upsert a forward pipeline (stream table → outbox → external sink).
+--   outbox          — stream table name. The outbox is enabled automatically
+--                     via enable_outbox() if not already active (idempotent).
+--   group           — consumer-group name for offset tracking.
+--   sink            — JSONB describing the external sink backend.
+--                     Required key: "type"  (e.g. "nats", "kafka", "http",
+--                     "redis", "sqs", "rabbitmq", "stdout").
+--                     All other keys are backend-specific.
+--                     Raises relay.invalid_config if "type" is missing.
+--   retention_hours — passed to enable_outbox() on first creation only;
+--                     ignored if the outbox already exists.
 -- enabled defaults to true; pass false to insert in disabled state.
 SELECT pgtrickle.set_relay_outbox(
     'orders-to-nats',
-    outbox => 'orders',
-    group  => 'order-relay',
-    sink   => '{"type":"nats","url":"nats://localhost:4222"}'
+    outbox          => 'orders',
+    group           => 'order-relay',
+    sink            => '{"type":"nats","url":"nats://localhost:4222"}',
+    retention_hours => 24   -- optional, only applied on first outbox creation
 );
 
 -- Upsert a reverse pipeline (external source → pg-trickle inbox).
---   inbox   — name of the pg-trickle inbox table (validated against the catalog).
---   source  — JSONB describing the external source backend.
---             Required key: "type"  (e.g. "kafka", "nats", "http", "redis",
---             "sqs", "rabbitmq", "stdin").
---             All other keys are backend-specific.
---             Raises relay.invalid_config if "type" is missing.
+--   inbox           — inbox name. The inbox table is created automatically
+--                     via create_inbox() if it does not already exist.
+--                     If the table exists but is not tracked, it is adopted
+--                     via enable_inbox_tracking() (idempotent).
+--   source          — JSONB describing the external source backend.
+--                     Required key: "type"  (e.g. "kafka", "nats", "http",
+--                     "redis", "sqs", "rabbitmq", "stdin").
+--                     All other keys are backend-specific.
+--                     Raises relay.invalid_config if "type" is missing.
+--   The remaining parameters are forwarded to create_inbox() on first
+--   creation only; they are ignored if the inbox already exists.
 -- enabled defaults to true; pass false to insert in disabled state.
 SELECT pgtrickle.set_relay_inbox(
     'kafka-to-orders',
-    inbox  => 'order_inbox',
-    source => '{"type":"kafka","brokers":"localhost:9092","topic":"orders"}'
+    inbox           => 'order_inbox',
+    source          => '{"type":"kafka","brokers":"localhost:9092","topic":"orders"}',
+    max_retries     => 5,           -- optional, only applied on first inbox creation
+    schedule        => '1s',        -- optional, only applied on first inbox creation
+    with_dead_letter => true,       -- optional, only applied on first inbox creation
+    retention_hours => 24           -- optional, only applied on first inbox creation
 );
 
 -- Enable / disable a pipeline by name (searches both tables).
@@ -1069,8 +1089,8 @@ REVOKE ALL ON pgtrickle.relay_inbox_config     FROM pgtrickle_relay;
 REVOKE ALL ON pgtrickle.relay_consumer_offsets FROM pgtrickle_relay;
 
 -- Grant execute on the API functions only
-GRANT EXECUTE ON FUNCTION pgtrickle.set_relay_outbox(TEXT, TEXT, TEXT, JSONB)  TO pgtrickle_relay;
-GRANT EXECUTE ON FUNCTION pgtrickle.set_relay_inbox(TEXT, TEXT, JSONB)         TO pgtrickle_relay;
+GRANT EXECUTE ON FUNCTION pgtrickle.set_relay_outbox(TEXT, TEXT, TEXT, JSONB, INT)  TO pgtrickle_relay;
+GRANT EXECUTE ON FUNCTION pgtrickle.set_relay_inbox(TEXT, TEXT, JSONB, INT, INTERVAL, BOOLEAN, INT)  TO pgtrickle_relay;
 GRANT EXECUTE ON FUNCTION pgtrickle.enable_relay(TEXT)                      TO pgtrickle_relay;
 GRANT EXECUTE ON FUNCTION pgtrickle.disable_relay(TEXT)                     TO pgtrickle_relay;
 GRANT EXECUTE ON FUNCTION pgtrickle.delete_relay(TEXT)                      TO pgtrickle_relay;

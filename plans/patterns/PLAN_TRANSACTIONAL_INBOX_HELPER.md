@@ -157,6 +157,13 @@ Understanding the asymmetry is critical for correct implementation:
 
 ### A.1 SQL API
 
+> **Relay integration:** `pgtrickle.set_relay_inbox()` (relay plan A.14)
+> calls `create_inbox()` automatically when creating a new reverse pipeline
+> and the named inbox does not yet exist (or adopts it via
+> `enable_inbox_tracking()` if the table already exists). Use `create_inbox()`
+> directly when you want fine-grained control over inbox schema before
+> attaching a relay, or when no relay is involved.
+
 ```sql
 -- Create a new inbox table with best-practice schema + stream tables
 SELECT pgtrickle.create_inbox(
