@@ -346,7 +346,8 @@ async fn shared_container() -> &'static SharedContainer {
                 .with_env_var("POSTGRES_DB", "postgres")
                 .with_label("com.pgtrickle.test", "true")
                 .with_label("com.pgtrickle.suite", "full-e2e")
-                .with_label("com.pgtrickle.repo", "pg-stream");
+                .with_label("com.pgtrickle.repo", "pg-stream")
+                .with_shm_size(536_870_912); // 512 MB — prevents POSIX shm exhaustion when many databases accumulate
 
             if let Some(run_id) = run_id {
                 image = image.with_label("com.pgtrickle.run-id", run_id);
