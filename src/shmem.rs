@@ -527,7 +527,8 @@ pub fn set_last_tick_safe_lsn(lsn_u64: u64) {
     if !is_shmem_available() {
         return;
     }
-    // Update both fields atomically under the same lock.
+    // Update only the cached safe LSN under the shared-memory lock.
+    // When both xmin and LSN must be updated together, use set_last_tick_holdback_state().
     PGS_STATE.exclusive().last_tick_safe_lsn_u64 = lsn_u64;
 }
 

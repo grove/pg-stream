@@ -699,20 +699,20 @@ pub(crate) fn collect_metrics_text() -> String {
     // #536: Frontier holdback gauges
     let (holdback_lsn, holdback_age) = crate::shmem::read_holdback_metrics();
     out.push_str(
-        "# HELP pgtrickle_frontier_holdback_lsn_bytes \
+        "# HELP pg_trickle_frontier_holdback_lsn_bytes \
          How many WAL bytes behind the write LSN the safe frontier currently is (0 = no holdback)\n",
     );
-    out.push_str("# TYPE pgtrickle_frontier_holdback_lsn_bytes gauge\n");
+    out.push_str("# TYPE pg_trickle_frontier_holdback_lsn_bytes gauge\n");
     out.push_str(&format!(
-        "pgtrickle_frontier_holdback_lsn_bytes {holdback_lsn}\n"
+        "pg_trickle_frontier_holdback_lsn_bytes {holdback_lsn}\n"
     ));
     out.push_str(
-        "# HELP pgtrickle_frontier_holdback_seconds \
+        "# HELP pg_trickle_frontier_holdback_seconds \
          Age in seconds of the oldest in-progress transaction causing a holdback (0 = no holdback)\n",
     );
-    out.push_str("# TYPE pgtrickle_frontier_holdback_seconds gauge\n");
+    out.push_str("# TYPE pg_trickle_frontier_holdback_seconds gauge\n");
     out.push_str(&format!(
-        "pgtrickle_frontier_holdback_seconds {holdback_age}\n"
+        "pg_trickle_frontier_holdback_seconds {holdback_age}\n"
     ));
 
     // OpenMetrics requires the exposition to end with # EOF

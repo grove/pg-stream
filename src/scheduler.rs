@@ -2337,8 +2337,18 @@ pub extern "C-unwind" fn pg_trickle_scheduler_main(_arg: pg_sys::Datum) {
 
     // #536: Previous tick's safe frontier watermark, used by the holdback
     // algorithm to determine whether any long-running transaction spans a
-    // tick boundary.  Reset to None on scheduler restart.
-    let mut prev_tick_watermark: Option<String> = None;
+    // tick boundary.  Seeded from shared memory on scheduler startup so
+    // that the first post-restart tick preserves the last known-safe LSN
+    // (avoids a one-tick window where the frontier could advance past an
+    // in-flight transaction that was already open before the restart).
+    let mut prev_tick_watermark: Option<String> = {
+        let last_safe = crate::shmem::last_tick_safe_lsn_u64();
+        if last_safe != 0 {
+            Some(crate::version::u64_to_lsn(last_safe))
+        } else {
+            None
+        }
+    };
 
     // Per-ST retry state (in-memory only, reset on scheduler restart)
     let mut retry_states: HashMap<i64, RetryState> = HashMap::new();

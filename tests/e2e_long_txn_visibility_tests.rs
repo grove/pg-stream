@@ -42,11 +42,17 @@ async fn configure_fast_scheduler(db: &E2eDb) {
         .await;
     db.execute("ALTER SYSTEM SET pg_trickle.auto_backoff = off")
         .await;
+    // Force trigger-based CDC so the holdback logic is exercised.
+    // WAL CDC (the default when wal_level=logical) is already immune
+    // to this race and would make these tests pass trivially.
+    db.execute("ALTER SYSTEM SET pg_trickle.cdc_mode = 'trigger'")
+        .await;
     db.reload_config_and_wait().await;
     db.wait_for_setting("pg_trickle.scheduler_interval_ms", "100")
         .await;
     db.wait_for_setting("pg_trickle.min_schedule_seconds", "1")
         .await;
+    db.wait_for_setting("pg_trickle.cdc_mode", "trigger").await;
 
     let ok = db.wait_for_scheduler(Duration::from_secs(90)).await;
     assert!(ok, "pg_trickle scheduler did not start within 90 s");

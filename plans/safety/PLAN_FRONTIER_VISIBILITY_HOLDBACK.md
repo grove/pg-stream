@@ -162,8 +162,8 @@ known-clean OLTP workloads.
    [src/config.rs](../../src/config.rs) (string GUC parsed once per tick).
 
 5. **Metrics** — emit two counters via the existing monitoring path:
-   - `pgtrickle_frontier_holdback_lsn_bytes` (gauge: how far behind write_lsn)
-   - `pgtrickle_frontier_holdback_seconds` (gauge: oldest in-progress txn age)
+   - `pg_trickle_frontier_holdback_lsn_bytes` (gauge: how far behind write_lsn)
+   - `pg_trickle_frontier_holdback_seconds` (gauge: oldest in-progress txn age)
 
 6. **Docs** —
    - Add ADR-XX explaining the choice of probe-based holdback over

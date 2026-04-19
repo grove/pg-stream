@@ -219,8 +219,8 @@ The holdback algorithm (`cdc::classify_holdback`) is purely functional and unit-
 **Note:** WAL/logical-replication CDC mode is immune to this issue (commit-LSN ordering is inherently safe). The holdback is skipped when `cdc_mode = 'wal'`.
 
 **Observability:** Two Prometheus gauges are exposed:
-- `pgtrickle_frontier_holdback_lsn_bytes` — how many WAL bytes behind write_lsn the safe frontier currently is.
-- `pgtrickle_frontier_holdback_seconds` — age (in seconds) of the oldest in-progress transaction.
+- `pg_trickle_frontier_holdback_lsn_bytes` — how many WAL bytes behind write_lsn the safe frontier currently is.
+- `pg_trickle_frontier_holdback_seconds` — age (in seconds) of the oldest in-progress transaction.
 
 See `plans/safety/PLAN_FRONTIER_VISIBILITY_HOLDBACK.md` for the full design rationale.
 

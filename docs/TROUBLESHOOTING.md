@@ -569,7 +569,7 @@ details on fuse thresholds and configuration.
 **Symptoms:**
 - A stream table's `data_timestamp` is not advancing even though the source
   table is receiving new inserts.
-- The `pgtrickle_frontier_holdback_lsn_bytes` Prometheus gauge is non-zero.
+- The `pg_trickle_frontier_holdback_lsn_bytes` Prometheus gauge is non-zero.
 - Server log contains: `pg_trickle: frontier holdback active — the oldest in-progress transaction is Ns old`.
 
 **Cause:**
