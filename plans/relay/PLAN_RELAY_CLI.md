@@ -288,9 +288,8 @@ lapin = { version = "2", optional = true }
 
 ```
 pgtrickle-relay [OPTIONS]
-pgtrickle-relay config <SUBCOMMAND>
 
-STARTUP OPTIONS:
+OPTIONS:
       --postgres-url <URL>      PostgreSQL connection string (required)
                                 [env: PGTRICKLE_RELAY_POSTGRES_URL]
       --metrics-addr <ADDR>     Prometheus metrics + health endpoint
@@ -299,16 +298,11 @@ STARTUP OPTIONS:
       --log-level <LEVEL>       Log level (default: info)
   -V, --version                 Print version
   -h, --help                    Print help
-
-CONFIG SUBCOMMANDS (manage pipelines stored in pgtrickle.relay_*_config):
-  config list                   Show all outbox + inbox pipelines and enabled status
-  config show <name>            Show config JSONB for a named pipeline
-  config set outbox <name> --config <json>  Upsert a forward pipeline
-  config set inbox  <name> --config <json>  Upsert a reverse pipeline
-  config enable  <name>         Enable a pipeline (starts immediately via NOTIFY)
-  config disable <name>         Disable a pipeline (stops immediately via NOTIFY)
-  config delete  <name>         Delete a pipeline row
 ```
+
+Pipeline management is done entirely via SQL — there are no CLI subcommands
+for managing pipelines. See [A.3 Configuration](#a3-configuration) for SQL
+examples.
 
 ### A.3 Configuration
 
@@ -336,7 +330,7 @@ If either table does not exist the relay exits with a clear error.
 
 #### Example Pipeline Inserts
 
-Pipelines are managed via SQL or the `config` subcommands:
+Pipelines are managed entirely via SQL:
 
 ```sql
 -- Forward: outbox → NATS
@@ -352,13 +346,6 @@ INSERT INTO pgtrickle.relay_inbox_config (name, config) VALUES (
     '{"source_type": "kafka",    "source": {"brokers": "localhost:9092", "topic": "orders"},
       "sink_type":   "pg-inbox", "sink":   {"inbox_table": "order_inbox"}}'
 );
-```
-
-Or via CLI:
-
-```bash
-pgtrickle-relay config set outbox orders-to-nats \
-  --config '{"source_type":"outbox","source":{"outbox":"order_events"},"sink_type":"nats","sink":{"url":"nats://localhost:4222"}}'
 ```
 
 ### A.4 Relay Modes (Forward & Reverse)
@@ -1724,7 +1711,7 @@ containers:
 | Item | Description | Effort |
 |------|-------------|--------|
 | RELAY-CAT | **Catalog schema + SQL API + offset tracking.** `sql/pg_trickle--0.23.0--0.24.0.sql`: create `relay_outbox_config`, `relay_inbox_config`, and `relay_consumer_offsets` tables; shared `relay_config_notify()` trigger; 7 SQL wrapper functions. | 0.5d |
-| RELAY-1 | Crate scaffold, CLI parsing (`--postgres-url`), DB bootstrap (load tables, LISTEN/NOTIFY), coordinator task setup, error types, RelayMessage envelope | 2d |
+| RELAY-1 | Crate scaffold, CLI parsing (`--postgres-url`, `--metrics-addr`, `--log-format`, `--log-level`), DB bootstrap (load tables, LISTEN/NOTIFY), coordinator task setup, error types, RelayMessage envelope | 2d |
 | RELAY-2 | Source + Sink traits, coordinator loop (advisory locks), worker pool dispatch, cancellation token plumbing | 1.5d |
 | RELAY-3 | Outbox poller source (simple mode with durable offsets + consumer group mode) | 2.5d |
 | RELAY-4 | Payload decoder (inline + claim-check + full-refresh) | 1d |
