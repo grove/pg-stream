@@ -5,8 +5,18 @@
 # must not block PRs or push-to-main gating.  They run daily and on manual
 # dispatch, matching the pattern established by stability-tests.yml.
 #
-#   SF-1  (600K lineitem rows, 3 cycles): timeout 180 min
-#   SF-10 (6M lineitem rows,  2 cycles): timeout 300 min
+#   SF-1  (150K orders, 3 cycles): timeout 180 min — all 15 tests
+#   SF-10 (1.5M orders, 2 cycles): timeout 120 min — differential_correctness only
+#
+# SF-10 runs only test_tpch_differential_correctness because:
+#   - 22 TPC-H queries × 2 cycles at 1.5M orders totals ~36 min per test function
+#   - Running all 15 tests would require ~8.7 hours — far beyond any sane timeout
+#   - SF-1 already covers all 15 tests for broad correctness coverage
+#   - SF-10 adds scale-factor coverage: hash collisions, sort spill, plan changes
+#
+# Per-test hard limit: nextest slow-timeout 90 min (terminate-after=1) prevents
+# any single test from hanging indefinitely (e.g., WAL/disk exhaustion during
+# initial materialisation of 6M-lineitem queries).
 # =============================================================================
 name: TPC-H Nightly
 
@@ -41,10 +51,15 @@ jobs:
             tpch_scale: "1.0"
             tpch_cycles: "3"
             timeout_minutes: 180
+            # SF-1: run all 15 tests — full breadth coverage
+            filter_expr: ""
           - scale: "SF-10"
             tpch_scale: "10.0"
             tpch_cycles: "2"
-            timeout_minutes: 300
+            timeout_minutes: 120
+            # SF-10: run only differential correctness — scale coverage without
+            # the 8.7-hour workload of all 15 tests.  SF-1 covers the rest.
+            filter_expr: "test(test_tpch_differential_correctness)"
     steps:
       - uses: actions/checkout@v5
 
@@ -58,9 +73,16 @@ jobs:
         env:
           TPCH_SCALE: ${{ matrix.tpch_scale }}
           TPCH_CYCLES: ${{ matrix.tpch_cycles }}
+          TPCH_FILTER: ${{ matrix.filter_expr }}
         run: |
-          cargo nextest run --profile ci --test e2e_tpch_tests \
-            --run-ignored all --no-capture
+          if [ -n "${TPCH_FILTER}" ]; then
+            cargo nextest run --profile ci --test e2e_tpch_tests \
+              --run-ignored all --no-capture \
+              -E "${TPCH_FILTER}"
+          else
+            cargo nextest run --profile ci --test e2e_tpch_tests \
+              --run-ignored all --no-capture
+          fi
 
   # ── Final gate ────────────────────────────────────────────────────────
   check:
