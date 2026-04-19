@@ -369,10 +369,14 @@ async fn run_crash_oracle() {
     let mut structured_errors = 0usize;
     let mut successes = 0usize;
 
-    for (i, gq) in queries.iter().enumerate() {
-        // Use a fresh DB per query to avoid cross-test pollution.
-        let db = E2eDb::new().await.with_extension().await;
+    // One shared database for the entire oracle run.  Each iteration uses
+    // index-scoped table names (e.g. t_ss_0, t_ss_1, …) so there are no
+    // cross-iteration conflicts.  This avoids creating thousands of databases
+    // in the shared container, which exhausts its /dev/shm (POSIX shared
+    // memory used by PostgreSQL background workers).
+    let db = E2eDb::new().await.with_extension().await;
 
+    for (i, gq) in queries.iter().enumerate() {
         // Create tables and insert data.
         for tbl in &gq.tables {
             db.execute(&tbl.ddl()).await;
@@ -466,9 +470,10 @@ async fn run_equivalence_oracle() {
     let mut skipped = 0usize;
     let mut checked = 0usize;
 
-    for (i, gq) in queries.iter().enumerate() {
-        let db = E2eDb::new().await.with_extension().await;
+    // One shared database for the entire oracle run (see run_crash_oracle for rationale).
+    let db = E2eDb::new().await.with_extension().await;
 
+    for (i, gq) in queries.iter().enumerate() {
         // Create source tables.
         for tbl in &gq.tables {
             db.execute(&tbl.ddl()).await;
@@ -640,9 +645,10 @@ async fn run_diff_vs_full_oracle() {
     let mut skipped = 0usize;
     let mut checked = 0usize;
 
-    for (i, gq) in queries.iter().enumerate() {
-        let db = E2eDb::new().await.with_extension().await;
+    // One shared database for the entire oracle run (see run_crash_oracle for rationale).
+    let db = E2eDb::new().await.with_extension().await;
 
+    for (i, gq) in queries.iter().enumerate() {
         for tbl in &gq.tables {
             db.execute(&tbl.ddl()).await;
             let mut rng = Lcg::new(gq.seed ^ (i as u64).wrapping_mul(0x1234567890abcdef));
