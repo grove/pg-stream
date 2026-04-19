@@ -1129,6 +1129,40 @@ To enable/disable a pipeline without restarting the pod:
 - **Concurrency:** Multiple pods polling the same source is **safe** because
   the outbox source tracks offsets per relay group, not globally.
 
+#### Connection Pool Sizing
+
+Each relay pod consumes exactly:
+- **1 coordinator connection** (pinned, holds all advisory locks for this pod).
+- **1 connection per active worker** (up to `max_workers_per_pod` pipelines).
+
+With N pods and M pipelines distributed across them:
+
+```
+total_PG_connections = N_pods × (1 + min(M_pipelines / N_pods, max_workers_per_pod))
+```
+
+Example: 3 pods × (1 coordinator + 4 worker pipelines each) = **15 connections**.
+
+The startup config option `max_workers_per_pod` (default: `10`) caps the
+worker count per pod. Tune it so `N_pods × (1 + max_workers_per_pod) +
+other_app_connections` stays well below `max_connections` on the PostgreSQL
+server. Leave headroom for admin connections (at least 5 via
+`superuser_reserved_connections`).
+
+If `max_connections` is approached, reduce `max_workers_per_pod`, increase
+replicas, or front the relay with PgBouncer in transaction mode (the relay's
+worker connections are compatible with transaction pooling; the coordinator
+connection must **not** be pooled — it holds session-level advisory locks).
+
+```yaml
+# Environment-variable tuning knobs for the relay process:
+env:
+  - name: PGTRICKLE_RELAY_MAX_WORKERS_PER_POD
+    value: "10"         # caps per-pod worker connections (default: 10)
+  - name: PGTRICKLE_RELAY_COORDINATOR_TICK_MS
+    value: "500"        # advisory-lock retry interval (default: 500 ms)
+```
+
 #### Example Kubernetes Deployment
 
 ```yaml
@@ -1648,6 +1682,30 @@ Each test spins up PostgreSQL + the target sink via Testcontainers:
 - Latency: p50/p95/p99 poll-to-publish for a single event (both modes).
 - Memory: verify bounded memory during claim-check fetch (no full delta
   buffering).
+- **Consumer group contention:** `commit_offset()` latency with 10 concurrent relay
+  workers all committing to the same group simultaneously — must be < 10 ms p99.
+- **Relay crash + re-poll:** measure time from visibility timeout expiry to
+  second relay picking up and re-publishing the batch; must be < `visibility_seconds + 2 s`.
+- **Advisory lock storm:** 10 pods all starting simultaneously; measure lock
+  acquisition time until all pipelines are owned; must complete within 5 s.
+
+### E.5 End-to-End Latency Benchmark
+
+Measures the **full path latency** that users cite in production comparisons:
+
+```
+source DML commit → CDC trigger → refresh MERGE → outbox INSERT + NOTIFY
+  → relay poll (or LISTEN wake) → broker publish → consumer receipt
+```
+
+| Relay wake mode | p50 target | p95 target |
+|-----------------|-----------|----------|
+| Polling only (v0.23.0, `visibility_seconds = 30s`) | < 1.5 s  | < 2.5 s  |
+| LISTEN/NOTIFY wake (v0.24.0 relay) | < 100 ms | < 250 ms |
+
+Add as `benches/e2e_relay_latency.rs` (Testcontainers, `tokio`, requires
+`--features e2e-bench`). Run manually; not in Criterion regression gate
+because results are environment-sensitive.
 
 ---
 

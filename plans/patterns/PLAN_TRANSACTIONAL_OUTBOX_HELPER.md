@@ -302,6 +302,11 @@ fn run_differential_refresh(...) -> Result<RefreshResult> {
 - One additional INSERT into `pgtrickle.outbox_<st>` per refresh cycle.
 - Payload serialisation reuses the in-memory `Vec<DeltaRow>` already
   computed for the MERGE — no extra round trips.
+- A single `pg_notify('pgtrickle_outbox_new', outbox_table_name)` is issued
+  inside the same transaction so the relay can `LISTEN` for sub-second
+  wake-up in addition to polling (see [§A.10 Gap #3 note](#a10-performance-considerations);
+  the relay implementation lands in v0.24.0 but the NOTIFY is cheap enough
+  to emit from v0.23.0 onwards).
 
 #### FULL-Refresh Fallback
 
@@ -465,7 +470,9 @@ WHERE id IN (SELECT id FROM rows_to_delete);
 | `pg_trickle.outbox_retention_hours` | int | `24` | Default retention for outbox rows. |
 | `pg_trickle.outbox_drain_batch_size` | int | `10000` | Max rows deleted per drain pass. |
 | `pg_trickle.outbox_inline_threshold_rows` | int | `10000` | Delta row count at or below which rows are inlined into the outbox `payload` column. Above this threshold the claim-check path is used: rows land in `outbox_delta_rows_<st>` and the relay fetches via server-side cursor. **Replaces** the old `outbox_max_payload_bytes` GUC (removed). |
+| `pg_trickle.outbox_claim_check_batch_size` | int | `1000` | Number of delta rows fetched per SPI call on the write side, and per FETCH on the relay cursor side. Decrease for very wide rows (e.g. 100 KB JSONB payloads) to cap per-batch memory; increase for narrow rows to reduce round-trip count. |
 | `pg_trickle.outbox_drain_interval_seconds` | int | `60` | Minimum interval between drain passes. |
+| `pg_trickle.outbox_storage_critical_mb` | int | `1024` | When the total size of any `outbox_<st>` table exceeds this threshold (in MiB), a `pg_trickle_alert outbox_storage_critical` event is emitted on every cleanup cycle and `outbox_status()` marks the outbox as `degraded`. Intended as an early warning when a dead or slow consumer blocks the retention drain. Set to `0` to disable. |
 
 #### Part B — Consumer Group GUCs
 
@@ -497,6 +504,7 @@ All GUCs are `SUSET` (require superuser to change).
 For every refresh that enables outbox:
 - 1 additional INSERT (~1 KB row + payload size).
 - 1 index entry on `created_at`.
+- 1 `pg_notify('pgtrickle_outbox_new', ...)` inside the same transaction (negligible — ~2 µs).
 
 Expected overhead at 1 refresh/sec: ~5–10 µs/refresh. Benchmark with
 `benches/refresh_bench.rs` extended to cover outbox-enabled and
@@ -508,6 +516,57 @@ outbox-disabled cases.
 - Average row size: 200 bytes (header) + payload (typically 1–10 KB).
 - ~1 GB/day per ST at modest payload sizes.
 - Bounded by retention drain.
+
+> **Multi-ST storage estimate:** With 50 stream tables all at 1 Hz refresh,
+> expect ~4.3 M outbox rows/day across all tables. Budget storage accordingly
+> and monitor via `outbox_status()`. The `outbox_storage_critical_mb` GUC
+> triggers an alert when any single outbox exceeds the threshold.
+
+#### WAL Overhead
+
+Outbox tables are regular (logged) heap tables — every INSERT generates WAL.
+**UNLOGGED outbox tables are intentionally not supported**: a crash could
+leave the outbox permanently behind the stream table's materialised state,
+silently dropping events that were committed to the source table but never
+published. Durability of committed changes is non-negotiable.
+
+Expected WAL impact per stream table at 1 Hz:
+- ~1–10 KB WAL/refresh (depending on payload size).
+- ~86 MB–860 MB WAL/day.
+- With 50 outbox-enabled STs: ~4–43 GB WAL/day (dominated by payload size).
+
+To reduce WAL pressure, prefer DIFFERENTIAL mode over AUTO to avoid
+FULL-refresh outbox rows (which contain all current ST rows). If WAL
+generation is a concern, increase `schedule` on high-frequency STs or
+consider disabling outbox and using logical replication/Debezium instead.
+
+#### Claim-Check Batch Size Tuning
+
+The `outbox_claim_check_batch_size` GUC (default 1 000 rows) controls both
+the write-side SPI batch size and should match the relay's FETCH batch:
+
+| Payload width | Recommended batch size | Approximate per-batch memory |
+|---------------|------------------------|------------------------------|
+| < 1 KB/row    | 5 000                  | ~5 MB                        |
+| 1–10 KB/row   | 1 000 (default)        | ~1–10 MB                     |
+| 10–100 KB/row | 200                    | ~2–20 MB                     |
+| > 100 KB/row  | 50                     | ~5–50 MB                     |
+
+#### Storage Alert and Retention Guard Interaction
+
+When a consumer is dead and `outbox_force_retention = false` (default),
+the retention drain cannot delete rows past the dead consumer's offset.
+Storage grows unboundedly until either the consumer resumes or an operator
+sets `outbox_force_retention = true`. The `outbox_storage_critical_mb` GUC
+provides an automated alert at a configurable threshold — reducing the
+window between a consumer dying and an operator noticing.
+
+Typical operator response to a `outbox_storage_critical` alert:
+1. Investigate consumer health via `consumer_lag()` and `pgt_consumer_status`.
+2. Either recover the consumer or run `drop_consumer_group()` to release the
+   retention guard.
+3. If emergency storage reclaim is needed: `SET pg_trickle.outbox_force_retention = true;`
+   (requires superuser; reverts automatically to `false` after reload).
 
 #### Bloat Mitigation
 
@@ -1021,10 +1080,41 @@ Extend `benches/refresh_bench.rs`:
 - `refresh_no_outbox` (baseline)
 - `refresh_outbox_enabled_small_payload` (10 rows)
 - `refresh_outbox_enabled_large_payload` (10,000 rows)
+- `refresh_outbox_claim_check` (11,000 rows — one above inline threshold)
+- `poll_outbox_latency_10k_rows` — `poll_outbox()` latency with 10K pending outbox rows
+- `commit_offset_concurrent_10` — `commit_offset()` latency with 10 concurrent relays
+- `consumer_lag_100k_rows` — `consumer_lag()` cost at 100K+ outbox rows
 
-Acceptance criteria: < 10 % overhead vs. baseline at small payloads,
-< 25 % at large payloads. Tracked in CI via
-`scripts/criterion_regression_check.py`.
+Acceptance criteria:
+- < 10 % overhead vs. baseline at small payloads.
+- < 25 % at large payloads.
+- `poll_outbox()` < 5 ms at 10K outbox rows.
+- `commit_offset()` < 10 ms at 10 concurrent relays.
+- `consumer_lag()` < 50 ms at 100K outbox rows.
+
+Tracked in CI via `scripts/criterion_regression_check.py`.
+
+### D.8 End-to-End Latency Benchmark
+
+Measures the full path: **source DML → CDC trigger → refresh MERGE → outbox
+INSERT + NOTIFY → relay poll/LISTEN wake → broker publish**. This is the
+latency number users cite in blog posts and competitive comparisons.
+
+```
+Metric: time from `INSERT INTO source_table` (committed) to broker message
+        visible in consumer
+Scenario: 1 row INSERT → DIFFERENTIAL refresh at 1 s schedule
+Targets:
+  p50  < 1.5 s  (dominated by refresh schedule)
+  p95  < 2.5 s
+  p99  < 5.0 s
+  With LISTEN/NOTIFY wake (v0.24.0 relay): p50 < 100 ms
+Infrastructure: postgres + NATS (Testcontainers), relay running in-process
+```
+
+Add as `benches/e2e_outbox_latency.rs` (uses `tokio` + Testcontainers;
+gated behind `#[cfg(feature = "e2e-bench")]`). Tracked manually (not in
+Criterion regression check — environment-sensitive).
 
 ### D.6 Chaos Tests
 

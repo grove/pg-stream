@@ -684,6 +684,44 @@ DIFFERENTIAL is effective because:
 | 1K–10K msg/sec | Consider partitioning inbox table by `received_at` (via pg_partman). Increase `schedule` to `2s`. |
 | > 10K msg/sec | Partition + increase `schedule` to `5s`. Use `FOR UPDATE SKIP LOCKED` directly on base table for processing (bypass pending ST). |
 
+#### Backpressure When Ingestion Outpaces Processing
+
+pg_trickle does not own the inbox write path, so it cannot apply
+authomatic backpressure. When the message ingestion rate exceeds processor
+throughput, the `pending_<inbox>` stream table grows, CDC buffer scans
+widen, and refresh latency degrades. Operators should act before this
+becomes critical:
+
+| `inbox_health()` status | Signal | Recommended action |
+|------------------------|--------|---------|
+| `healthy` | `oldest_pending_age_sec` < 30 | None — running normally |
+| `degraded` | `oldest_pending_age_sec` ≥ 30 or `pending_count` > 10K | Add processor workers; inspect slow-path aggregates |
+| `critical` | `oldest_pending_age_sec` ≥ 120 or `pending_count` > 100K | Throttle ingestion at the consumer/webhook layer; scale out processors aggressively |
+
+The `oldest_pending_age_sec` field from `inbox_health()` is the primary
+pressure indicator. Wire it to a Grafana alert or a pg_trickle alert rule
+to automate the response. The `stats_<inbox>` stream table exposes
+`throughput_per_sec` which can be used to compare against broker ingestion
+rate for a combined lag metric.
+
+#### Stats Stream Table at High Throughput
+
+The `stats_<inbox>` ST uses **FULL** refresh mode (because it projects
+`now()` in the `max_pending_age_sec` column) at a 10 s schedule. At high
+message volumes the underlying `COUNT(*)`/`AVG()` scan is O(N) in inbox
+table size:
+
+| Inbox size | Estimated stats refresh time |
+|------------|-------------------------------|
+| < 100K rows | < 5 ms |
+| 100K–1M rows | ~10–50 ms |
+| > 1M rows | > 100 ms — consider `with_stats => false` |
+
+For high-throughput inboxes (> 10K msg/sec or > 1M rows), set
+`with_stats => false` and use `inbox_health()` on demand instead of
+the materialised stats stream table. The `pending_<inbox>` and
+`dlq_<inbox>` STs are DIFFERENTIAL and are not affected.
+
 #### Bloat Mitigation
 
 Inbox tables have a mixed UPDATE + DELETE pattern (mark processed, then
@@ -826,12 +864,24 @@ surfaced — preventing out-of-order processing.
 >     WHERE processed_at IS NOT NULL;
 > ```
 > The planner will use this index for the `MAX(sequence_num) GROUP BY` query.
+> This makes the CTE an **index-only scan**, but it still scales with the
+> number of processed rows. Concrete scaling thresholds:
+>
+> | Processed rows | Est. refresh time (partial index) | Recommended schedule |
+> |----------------|----------------------------------|----------------------|
+> | < 100K         | < 5 ms                           | `1s` (default)       |
+> | 100K – 1M      | ~10–50 ms                        | `5s`                 |
+> | > 1M           | > 100 ms                         | `10s` – `30s`        |
+> | > 10M          | > 1 s                            | Use `inbox_ordering_gaps()` on-demand only |
+>
+> Operators should increase the `next_<inbox>` schedule as processed history
+> grows. Document this recommendation in the inbox runbook.
 >
 > **Post-v0.23.0 optimization:** Introduce a `pgt_inbox_sequence_state`
 > catalog table with columns `(inbox_id, aggregate_id, last_processed_seq)`
-> updated by a trigger or helper call when the processor marks
-> `processed_at`. This makes the `last_processed` CTE O(changed aggregates)
-> instead of O(all processed rows). Tracked as a follow-up item.
+> updated atomically when processors call `advance_inbox_sequence()`.
+> This makes the `last_processed` CTE O(changed aggregates) instead of
+> O(all processed rows), eliminating the scaling cliff entirely.
 
 ### B.4 Gap Detection Stream Table
 
