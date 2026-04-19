@@ -29,6 +29,7 @@
   - [A.13 Error Handling & Retries](#a13-error-handling--retries)
   - [A.14 Catalog Schema (Config Tables)](#a14-catalog-schema-config-tables)
   - [A.15 Horizontal Scaling & Work Distribution](#a15-horizontal-scaling--work-distribution)
+  - [A.16 Secret Reference Interpolation](#a16-secret-reference-interpolation)
 - [Part B — Sink Backends (Forward Mode)](#part-b--sink-backends-forward-mode)
   - [B.1 NATS JetStream](#b1-nats-jetstream)
   - [B.2 HTTP Webhook](#b2-http-webhook)
@@ -905,6 +906,34 @@ Exposed via an HTTP endpoint (default `:9090/metrics`):
 Returns HTTP 200 if healthy, 503 if degraded (no poll in last 60 s or
 source/sink disconnected). Suitable for Kubernetes liveness/readiness probes.
 
+#### Drain Health Endpoint
+
+`GET :9090/health/drained` returns:
+
+```json
+{"drained": true, "max_lag_rows": 0}
+```
+
+or, when pipelines are still behind:
+
+```json
+{"drained": false, "max_lag_rows": 1247, "lagging_pipelines": ["orders-to-kafka"]}
+```
+
+Returns HTTP 200 only when `consumer_lag = 0` across all enabled pipelines
+(every worker's `last_acked_outbox_id >= max(id)` in its outbox). Returns HTTP
+202 while lag > 0. Reads in-memory state only — no database query.
+
+Use in Kubernetes `preStop` hooks to drain in-flight batches before pod
+termination:
+
+```yaml
+lifecycle:
+  preStop:
+    exec:
+      command: ["sh", "-c", "until curl -sf http://localhost:9090/health/drained; do sleep 1; done"]
+```
+
 ### A.13 Error Handling & Retries
 
 | Error class | Behaviour |
@@ -1276,6 +1305,142 @@ spec:
 Scaling up → new pods join and acquire available locks.
 Scaling down → evicted pods release locks; remaining pods acquire them.
 Rolling updates → replace pods one at a time; work rebalances automatically.
+
+---
+
+### A.16 Secret Reference Interpolation
+
+Connector credentials (passwords, API tokens, TLS keys) **must not be stored
+as plaintext in `relay_outbox_config.config` or `relay_inbox_config.config`**.
+Anyone with `SELECT` on those tables would read every credential. Instead, the
+relay resolves lightweight *reference tokens* from the pipeline config JSONB
+at startup and on every hot-reload, replacing them with the live secret value
+in memory only — the resolved config is never written back to the database and
+never logged.
+
+#### Supported reference syntax
+
+| Token | Resolved from | Best for |
+|-------|--------------|----------|
+| `${env:VAR_NAME}` | Process environment variable | 12-factor deployments, K8s `envFrom: secretRef`, Compose `env_file:`, CI pipelines |
+| `${file:/path/to/secret}` | UTF-8 file contents (trailing newline stripped) | Docker secrets (`/run/secrets/`), K8s mounted secrets (`/etc/secrets/`), systemd `LoadCredential` |
+
+Phase 2 will add `${secret:vault:path/key}` (HashiCorp Vault) and
+`${secret:aws-ssm:param-name}` (AWS Parameter Store) once the core mechanism
+is validated. Kubernetes-native injection (env + file mounts) already covers
+the majority of real deployments without additional SDK dependencies.
+
+#### Example — no credentials in the database
+
+```sql
+INSERT INTO pgtrickle.relay_outbox_config (name, config) VALUES (
+    'orders-to-kafka',
+    '{
+        "source_type": "outbox",
+        "source": {"outbox": "order_events", "group": "order-publisher"},
+        "sink_type": "kafka",
+        "sink": {
+            "brokers":        "${env:KAFKA_BROKERS}",
+            "sasl_username":  "${env:KAFKA_SASL_USERNAME}",
+            "sasl_password":  "${file:/run/secrets/kafka_sasl_password}",
+            "topic":          "order-events"
+        }
+    }'
+);
+```
+
+The database row contains only reference tokens. The relay process resolves
+them once at startup (and again on each hot-reload) from its runtime
+environment.
+
+#### Implementation — `src/secrets.rs`
+
+```rust
+/// Walk a serde_json::Value tree and substitute ${env:X} and ${file:/path}
+/// tokens. Returns an error if any reference cannot be resolved.
+///
+/// IMPORTANT: never log or persist the returned value — it contains
+/// resolved secrets.
+pub fn resolve_secret_refs(value: &serde_json::Value) -> Result<serde_json::Value, RelayError> {
+    match value {
+        Value::String(s) => resolve_string(s),
+        Value::Object(map) => {
+            let mut out = serde_json::Map::new();
+            for (k, v) in map {
+                out.insert(k.clone(), resolve_secret_refs(v)?);
+            }
+            Ok(Value::Object(out))
+        }
+        Value::Array(arr) => Ok(Value::Array(
+            arr.iter().map(resolve_secret_refs).collect::<Result<Vec<_>, _>>()?,
+        )),
+        other => Ok(other.clone()),
+    }
+}
+
+fn resolve_string(s: &str) -> Result<serde_json::Value, RelayError> {
+    if let Some(var) = s.strip_prefix("${env:").and_then(|s| s.strip_suffix('}')) {
+        validate_env_var_name(var)?; // allows [A-Za-z_][A-Za-z0-9_]* only
+        let val = std::env::var(var)
+            .map_err(|_| RelayError::SecretNotFound(format!("env var {var} not set")))?;
+        return Ok(Value::String(val));
+    }
+    if let Some(path) = s.strip_prefix("${file:").and_then(|s| s.strip_suffix('}')) {
+        let val = std::fs::read_to_string(path)
+            .map_err(|e| RelayError::SecretNotFound(format!("file {path}: {e}")))?;
+        return Ok(Value::String(val.trim_end_matches('\n').to_owned()));
+    }
+    Ok(Value::String(s.to_owned()))
+}
+```
+
+`resolve_secret_refs` is called in `coordinator.rs` immediately after reading
+each pipeline row from the database, before constructing the Source/Sink. The
+resolved config object is ephemeral — held only in the worker's task memory.
+
+#### Hot-reload and credential rotation
+
+The coordinator already reloads on every `NOTIFY pgtrickle_relay_config` event.
+Secret resolution runs on every reload, so zero-downtime credential rotation is:
+
+1. Mount the new secret (update file, rotate env var in K8s Secret, etc.)
+2. Trigger a reload without changing credentials: `UPDATE pgtrickle.relay_outbox_config SET updated_at = now() WHERE name = 'orders-to-kafka';`
+3. The relay re-resolves `${file:/run/secrets/kafka_sasl_password}` and reconnects the sink with the new credential.
+
+No relay restart required.
+
+#### Failure behaviour
+
+If a reference cannot be resolved at config-load time, the **pipeline is
+disabled in the coordinator's in-memory state and a structured error is
+logged**. Other pipelines in the same relay process are unaffected. The
+coordinator retries the failing pipeline on the next reload tick. This is
+consistent with the relay's per-pipeline fault isolation model (each pipeline
+is an independent advisory-lock + worker pair).
+
+```
+ERROR pipeline=orders-to-kafka error="secret not found: env var KAFKA_SASL_PASSWORD not set"
+      action="pipeline disabled until next reload"
+```
+
+#### Security checklist
+
+- [ ] `resolve_secret_refs` result is never passed to `tracing::debug!` or
+      any other log macro — log only the *raw* (unreferenced) config
+- [ ] `validate_env_var_name` enforces `[A-Za-z_][A-Za-z0-9_]*` — no shell
+      metacharacters, no path traversal via env names
+- [ ] File path is not sanitised for traversal (relay runs with
+      operator-controlled config; path restrictions are an operator concern,
+      consistent with Feldera's approach)
+- [ ] Resolved secrets never appear in Prometheus metric labels or the
+      `/health` response body
+- [ ] `relay_outbox_config.config` and `relay_inbox_config.config` columns
+      should be accessed by the relay's service account via the
+      `SECURITY DEFINER` SQL API functions only — **do not grant `SELECT`
+      directly on these tables to the relay role**. The relay reads config
+      via the `get_relay_config()` / `list_relay_configs()` functions which
+      return the raw (unreferenced) JSONB; the relay resolves references
+      locally. Document the role setup in SQL_REFERENCE.md.
 
 ---
 
@@ -1886,6 +2051,7 @@ pgtrickle-relay config set inbox kafka-to-orders \
 | Item | Description | Effort |
 |------|-------------|--------|
 | RELAY-CAT | **Catalog schema + SQL API + offset tracking.** `sql/pg_trickle--0.24.0--0.25.0.sql`: create `relay_outbox_config`, `relay_inbox_config`, and `relay_consumer_offsets` tables; shared `relay_config_notify()` trigger; 7 SQL wrapper functions. | 0.5d |
+| RELAY-SEC | **Secret reference interpolation.** `src/secrets.rs`: `resolve_secret_refs()` JSONB walker; `${env:VAR}` and `${file:/path}` token types; `validate_env_var_name()` guard; per-pipeline failure isolation (bad secret disables only that pipeline); hot-reload re-resolution; security checklist items (no logging of resolved values, no metric label exposure). See [A.16](#a16-secret-reference-interpolation). | 0.5d |
 | RELAY-1 | Crate scaffold, CLI parsing (`--postgres-url`, `--metrics-addr`, `--log-format`, `--log-level`), DB bootstrap (load tables, LISTEN/NOTIFY), coordinator task setup, error types, RelayMessage envelope | 2d |
 | RELAY-2 | Source + Sink traits, coordinator loop (advisory locks), worker pool dispatch, cancellation token plumbing | 1.5d |
 | RELAY-3 | Outbox poller source (simple mode with durable offsets + consumer group mode) | 2.5d |
@@ -1894,7 +2060,7 @@ pgtrickle-relay config set inbox kafka-to-orders \
 | RELAY-6 | Sink: NATS JetStream | 1d |
 | RELAY-7 | Sink: HTTP webhook | 1d |
 | RELAY-8 | Sink: Apache Kafka | 1.5d |
-| RELAY-9 | Metrics endpoint + health check + signal handling + graceful shutdown | 1d |
+| RELAY-9 | Metrics endpoint + health check (`/health` + `/health/drained`) + signal handling + graceful shutdown. See [A.12](#a12-observability). | 1d |
 
 ### Phase 2 — Forward Tier 2 Sinks (5 days)
 
@@ -1939,7 +2105,7 @@ pgtrickle-relay config set inbox kafka-to-orders \
 | RELAY-20 | Dockerfile + GitHub Actions CI for binary builds | 1d |
 | RELAY-21 | Release automation (GitHub Releases, Docker Hub, Homebrew) | 0.5d |
 
-> **Total: ~36.5 days solo / ~23 days with two developers**
+> **Total: ~37.5 days solo / ~23 days with two developers**
 > (Phases 1–2 forward sinks and Phase 3 reverse sources can be parallelised.
 > Requires v0.24.0 outbox + consumer groups for full forward E2E testing;
 > reverse mode only needs inbox table schema.)
@@ -1972,3 +2138,5 @@ pgtrickle-relay config set inbox kafka-to-orders \
 | 7 | Azure Service Bus as a backend? | (a) v0.25.0, (b) Post-v0.25.0 | **(b)** — add post-launch based on demand. |
 | 8 | Should reverse mode support arbitrary Sink (not just inbox)? | (a) Only inbox sink in v0.25.0, (b) Any sink | **(a)** — primary use-case is source→inbox. Arbitrary source→sink is architecturally possible but not a priority. |
 | 9 | Message format conversion (e.g. Avro, Protobuf)? | (a) JSON only in v0.25.0, (b) Schema registry integration | **(a)** — JSON only. Schema-aware deserialization is a post-v0.25.0 feature. |
+| 10 | How should connector credentials be handled in the config JSONB? | (a) Plaintext (insecure), (b) Reference tokens resolved at runtime | **(b)** — `${env:VAR}` and `${file:/path}` tokens resolved in-process at startup and on hot-reload. Plaintext credentials in the DB are a security anti-pattern. Implemented in RELAY-SEC as part of Phase 1 core. See [A.16](#a16-secret-reference-interpolation). |
+| 11 | What should happen if a secret reference can't be resolved? | (a) Abort the whole process, (b) Disable only the affected pipeline | **(b)** — per-pipeline fault isolation: the bad pipeline logs an error and is skipped; all other pipelines continue. Consistent with the relay's per-pipeline advisory-lock model. |
