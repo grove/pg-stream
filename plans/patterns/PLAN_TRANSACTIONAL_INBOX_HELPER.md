@@ -1,6 +1,6 @@
 # Transactional Inbox Helper & Dead-Letter Queue Extension
 
-> **Status:** Implementation Plan (DRAFT)
+> **Status:** Implementation Plan (DESIGN REVIEW COMPLETE — 2026-04-19)
 > **Created:** 2026-04-18
 > **Category:** Integration Pattern — Implementation
 > **Related:** [PLAN_TRANSACTIONAL_INBOX.md](PLAN_TRANSACTIONAL_INBOX.md) ·
@@ -15,7 +15,7 @@
 - [Goals & Non-Goals](#goals--non-goals)
 - [Background](#background)
 - [Key Differences from the Outbox Helper](#key-differences-from-the-outbox-helper)
-- [Part A — Inbox Helper (v0.22.0 or v0.23.0)](#part-a--inbox-helper-v0220-or-v0230)
+- [Part A — Inbox Helper (v0.23.0)](#part-a--inbox-helper-v0230)
   - [A.1 SQL API](#a1-sql-api)
   - [A.2 Catalog Schema](#a2-catalog-schema)
   - [A.3 Inbox Table Schema](#a3-inbox-table-schema)
@@ -52,7 +52,7 @@
 
 This plan specifies two complementary features for pg_trickle:
 
-1. **Inbox Helper (v0.22.0 or v0.23.0):** A convenience layer that creates
+1. **Inbox Helper (v0.23.0):** A convenience layer that creates
    a best-practice inbox table with auto-managed stream tables for the
    pending-message queue, dead-letter queue, and processing statistics.
    It also supports *adopting* an existing hand-rolled inbox table into
@@ -112,8 +112,8 @@ This is an important conceptual asymmetry:
   responsibility of the application or an inbox-writer process.
 - pg_trickle does **not** own broker connections. Consuming from Kafka, NATS,
   RabbitMQ, etc. remains external.
-- pg_trickle does **not** enforce message ordering in v0.22.0 — that is
-  Part B (v0.23.0).
+- pg_trickle does **not** enforce message ordering in Part A — that is
+  Part B of this release.
 - The inbox helper does **not** replace pgmq, pgflow, or other purpose-built
   queue extensions. It is a thin orchestration layer for the common
   "table + stream table" pattern.
@@ -434,7 +434,9 @@ SELECT pgtrickle.create_stream_table(
         event_type_col
     ),
     schedule => '10s',
-    refresh_mode => 'DIFFERENTIAL'
+    refresh_mode => 'FULL'  -- FULL required: max_pending_age_sec uses now(),
+                            -- which changes every refresh and would cause
+                            -- DIFFERENTIAL to treat every row as changed.
 );
 ```
 
@@ -525,10 +527,16 @@ Inbox tables grow unboundedly unless processed messages are cleaned up.
 The inbox helper adds a retention drain step to the scheduler:
 
 ```sql
+-- PostgreSQL does not support LIMIT on DELETE directly; use a CTE.
+WITH rows_to_delete AS (
+    SELECT <id_column> FROM <schema>.<inbox_table>
+    WHERE <processed_at_column> IS NOT NULL
+      AND <processed_at_column> < now() - INTERVAL '<retention_hours> hours'
+    ORDER BY <processed_at_column>
+    LIMIT <drain_batch_size>
+)
 DELETE FROM <schema>.<inbox_table>
-WHERE <processed_at_column> IS NOT NULL
-  AND <processed_at_column> < now() - INTERVAL '<retention_hours> hours'
-LIMIT <drain_batch_size>;
+WHERE <id_column> IN (SELECT <id_column> FROM rows_to_delete);
 ```
 
 - Runs once per cleanup cycle (controlled by
@@ -637,7 +645,6 @@ All GUCs are `SUSET` (require superuser to change).
 | `create_inbox()` partially fails | Transaction rolls back; no orphaned objects. |
 | Stream table refresh fails | Standard pg_trickle error handling; retried next cycle. |
 | Drain loop fails | Logged via `pgrx::warning!`; retried next cleanup cycle. Does not block stream table refresh. |
-| Replay `where_clause` invalid | Rejected with `InboxReplayInvalidArgs`; no rows modified. |
 | Application INSERT fails | Not pg_trickle's responsibility; application handles. |
 | Processing failure | Application increments `retry_count`; pg_trickle detects via stream table refresh. |
 | **Processor crash after marking `processed_at` but before committing business logic** | pg_trickle sees the message as processed (`processed_at IS NOT NULL`). **Mitigation:** always execute business logic first, then set `processed_at` — this is the two-phase commit pattern for at-least-once processing. Recovery: `replay_inbox_messages(name, event_ids => ARRAY[$1])` re-queues specific messages. Operators should pause the processor (or set `pg_trickle.inbox_enabled = false`) before bulk replay to avoid re-processing by concurrent workers. See `PoisonMessageGuard` in `examples/inbox/inbox_processor.py` for the circuit-breaker pattern. |
@@ -861,6 +868,28 @@ SELECT pgtrickle.create_stream_table(
 > aggregate. This is efficient for inboxes with tens of thousands of
 > aggregates but can become expensive for large gaps (e.g., missing sequences
 > in a sparse range).
+>
+> **Important:** the actual scaling bound is the *sum of sequence ranges*
+> across all aggregates, not aggregate count alone. 1 000 aggregates with
+> `max_sequence = 1 000 000` generate 1 billion virtual rows from
+> `generate_series` — far beyond the safe threshold. Add a guard:
+> `HAVING MAX(sequence_num) - MIN(sequence_num) < 100 000` to skip
+> aggregates with extremely sparse ranges.
+>
+> **Recommended alternative for post-v0.23.0:** use a `LAG()` window
+> function to detect actual gaps without generating a full sequence range:
+> ```sql
+> SELECT aggregate_id, sequence_num + 1 AS missing_sequence
+> FROM (
+>     SELECT aggregate_id, sequence_num,
+>            LEAD(sequence_num) OVER (PARTITION BY aggregate_id ORDER BY sequence_num)
+>                AS next_seq
+>     FROM <inbox_table>
+>     WHERE processed_at IS NULL
+> ) t
+> WHERE next_seq IS NOT NULL AND next_seq > sequence_num + 1;
+> ```
+> This is O(N log N) not O(range) and scales to any sequence density.
 >
 > Scale guidelines:
 > - Up to 10 000 aggregates × 10 000 max sequence: ✅ acceptable at 30 s refresh

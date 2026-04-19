@@ -1,6 +1,6 @@
 # Relay CLI — Implementation Plan
 
-> **Status:** Implementation Plan (DRAFT)
+> **Status:** Implementation Plan (DESIGN REVIEW COMPLETE — 2026-04-19)
 > **Created:** 2026-04-18
 > **Category:** Tooling — Bidirectional Relay
 > **Related:** [PLAN_TRANSACTIONAL_OUTBOX_HELPER.md](../patterns/PLAN_TRANSACTIONAL_OUTBOX_HELPER.md) ·
@@ -378,7 +378,7 @@ Each relay process contains a **coordinator** and a **worker pool**:
 Process (pod)
 ├── Coordinator task  (1 long-lived, pinned PG connection)
 │   ├── On startup: load enabled pipelines from relay_*_config
-│   ├── Every tick: pg_try_advisory_lock(hashtext(group_id), pipeline_id)
+│   ├── Every tick: pg_try_advisory_lock(hashtext(group_id), hashtext(pipeline_id))
 │   │   for each unowned pipeline
 │   ├── On lock acquired: read consumer_offsets, dispatch to worker pool
 │   ├── On lock lost (coordinator conn drop or another pod stole it):
@@ -402,7 +402,8 @@ namespaces and never collide with each other:
 ```sql
 SELECT pg_try_advisory_lock(
     hashtext(relay_group_id),   -- namespace per group/deployment
-    pipeline_id::int            -- individual pipeline within the group
+    hashtext(pipeline_id)       -- individual pipeline within the group
+                                -- (pipeline_id is TEXT — cannot cast to int)
 )
 ```
 
@@ -1030,7 +1031,8 @@ advisory locks for all enabled pipelines:
 ```sql
 SELECT pg_try_advisory_lock(
     hashtext(relay_group_id),   -- namespace per relay group/deployment
-    pipeline_id::int            -- individual pipeline within group
+    hashtext(pipeline_id)       -- individual pipeline within group
+                                -- (pipeline_id is TEXT — cannot cast to int)
 );
 ```
 
@@ -1655,25 +1657,23 @@ ENTRYPOINT ["pgtrickle-relay"]
 
 #### Kubernetes Sidecar Pattern (Forward)
 
+All pipeline definitions live in the database (see [A.14](#a14-catalog-schema-config-tables)).
+The only env var required at startup is `PGTRICKLE_RELAY_POSTGRES_URL`.
+Configure pipelines once via `pgtrickle-relay config set` or SQL;
+the running relay picks up changes automatically via `LISTEN/NOTIFY`.
+
 ```yaml
 containers:
   - name: app
     image: myapp:latest
   - name: relay
     image: grove/pgtrickle-relay:0.24.0
-    args: ["forward"]
     env:
-      - name: PG_URL
+      - name: PGTRICKLE_RELAY_POSTGRES_URL
         valueFrom:
           secretKeyRef:
             name: pg-credentials
-            key: url
-      - name: RELAY_OUTBOX
-        value: order_events
-      - name: RELAY_SINK
-        value: nats
-      - name: RELAY_GROUP
-        value: order-publisher
+            key: relay-url
     ports:
       - name: metrics
         containerPort: 9090
@@ -1687,7 +1687,18 @@ containers:
         port: 9090
 ```
 
+Pipeline setup (run once, not per-pod):
+
+```bash
+# Forward: outbox → NATS
+pgtrickle-relay config set outbox orders-to-nats \
+  --config '{"source_type":"outbox","source":{"outbox":"order_events","group":"order-publisher"},"sink_type":"nats","sink":{"url":"nats://nats:4222"}}'
+```
+
 #### Kubernetes Sidecar Pattern (Reverse)
+
+Same pattern — the single `PGTRICKLE_RELAY_POSTGRES_URL` env var is sufficient.
+All source/inbox config lives in `pgtrickle.relay_inbox_config`.
 
 ```yaml
 containers:
@@ -1695,17 +1706,12 @@ containers:
     image: myapp:latest
   - name: relay
     image: grove/pgtrickle-relay:0.24.0
-    args: ["reverse"]
     env:
-      - name: PG_URL
+      - name: PGTRICKLE_RELAY_POSTGRES_URL
         valueFrom:
           secretKeyRef:
             name: pg-credentials
-            key: url
-      - name: RELAY_SOURCE
-        value: kafka
-      - name: RELAY_INBOX
-        value: external_events
+            key: relay-url
     ports:
       - name: metrics
         containerPort: 9090
@@ -1713,6 +1719,14 @@ containers:
       httpGet:
         path: /health
         port: 9090
+```
+
+Pipeline setup (run once, not per-pod):
+
+```bash
+# Reverse: Kafka → inbox
+pgtrickle-relay config set inbox kafka-to-orders \
+  --config '{"source_type":"kafka","source":{"brokers":"kafka:9092","topic":"orders"},"sink_type":"pg-inbox","sink":{"inbox_table":"order_inbox"}}'
 ```
 
 ---

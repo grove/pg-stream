@@ -1,11 +1,11 @@
 # Transactional Outbox Helper & Consumer Offset Extension
 
-> **Status:** Implementation Plan (DRAFT)
+> **Status:** Implementation Plan (DESIGN REVIEW COMPLETE — 2026-04-19)
 > **Created:** 2026-04-18
 > **Category:** Integration Pattern — Implementation
 > **Related:** [PLAN_TRANSACTIONAL_OUTBOX.md](PLAN_TRANSACTIONAL_OUTBOX.md) ·
 > [PLAN_OVERALL_ASSESSMENT.md §9.12](../PLAN_OVERALL_ASSESSMENT.md#912-transactional-outbox-helper-s-effort--1-week) ·
-> [ROADMAP v0.22.0 OUTBOX](../../ROADMAP.md#transactional-outbox-helper-p2--912)
+> [ROADMAP v0.23.0 OUTBOX](../../ROADMAP.md#v0230--transactional-inbox--outbox-patterns)
 
 ---
 
@@ -14,7 +14,7 @@
 - [Executive Summary](#executive-summary)
 - [Goals & Non-Goals](#goals--non-goals)
 - [Background](#background)
-- [Part A — Outbox Helper (v0.22.0)](#part-a--outbox-helper-v0220)
+- [Part A — Outbox Helper (v0.23.0)](#part-a--outbox-helper-v0230)
   - [A.1 SQL API](#a1-sql-api)
   - [A.2 Catalog Schema](#a2-catalog-schema)
   - [A.3 Outbox Table Schema](#a3-outbox-table-schema)
@@ -237,24 +237,33 @@ CREATE TABLE pgtrickle.outbox_delta_rows_<st> (
   never need to re-derive it.
 - Always lives in schema `pgtrickle`.
 
-#### Deduplicated View (Automatically Created)
+#### Latest-Row View (Automatically Created)
 
-Alongside `outbox_<st>`, `enable_outbox()` also creates a **zero-cost
-deduplicated view** for clients that want only the latest state per source
-primary key rather than the full delta log:
+Alongside `outbox_<st>`, `enable_outbox()` also creates a **latest-row
+view** for quick operational checks and lag monitoring:
 
 ```sql
 -- Auto-created alongside the outbox table:
-CREATE VIEW pgtrickle.pgt_outbox_dedup_<st> AS
-SELECT DISTINCT ON (pgt_id) *
+CREATE VIEW pgtrickle.pgt_outbox_latest_<st> AS
+SELECT *
 FROM pgtrickle.outbox_<st>
-ORDER BY pgt_id, id DESC;  -- pgt_id is the stream table row identity
+ORDER BY id DESC
+LIMIT 1;
 ```
+
+> **Note on state-sync consumers:** The outbox is a per-refresh audit log,
+> not a per-source-row log. `pgt_id` is the stream table's UUID — every row
+> in `outbox_<st>` shares the same `pgt_id`, so `DISTINCT ON (pgt_id)` would
+> return only one row. To query the *current state* of all rows in the stream
+> table, consumers should query the stream table directly
+> (`SELECT * FROM pgtrickle.<st>`), which always contains the current
+> materialised state.
 
 | Consumer | Which view to query |
 |----------|-----------------------|
 | Full audit trail, event sourcing, replay testing | `outbox_<st>` — all rows, in insertion order |
-| Cache invalidation, read-model sync, state propagation | `pgt_outbox_dedup_<st>` — latest state per row, no intermediate states |
+| Quick lag check / last-delta inspection | `pgt_outbox_latest_<st>` — most recent refresh row only |
+| Current materialised state for cache sync | Query the stream table: `SELECT * FROM pgtrickle.<st>` |
 
 No extra storage. Dropped automatically when `disable_outbox()` is called.
 
@@ -411,14 +420,19 @@ The existing scheduler cleanup phase (see
 once per cleanup cycle:
 
 ```sql
+-- PostgreSQL does not support LIMIT on DELETE directly; use a CTE.
+WITH rows_to_delete AS (
+    SELECT id FROM pgtrickle.outbox_<st>
+    WHERE created_at < now() - INTERVAL '<retention_hours> hours'
+    ORDER BY id
+    LIMIT pg_trickle.outbox_drain_batch_size  -- default 10000
+)
 DELETE FROM pgtrickle.outbox_<st>
-WHERE created_at < now() - INTERVAL '<retention_hours> hours'
-RETURNING 1
-LIMIT pg_trickle.outbox_drain_batch_size;  -- default 10000
+WHERE id IN (SELECT id FROM rows_to_delete);
 ```
 
 - Batched to avoid long locks.
-- Loops until the batch returns < `outbox_drain_batch_size` rows.
+- Loops until the CTE returns < `outbox_drain_batch_size` rows.
 - Updates `pgt_outbox_config.last_drained_at` and
   `last_drained_count`.
 
@@ -495,10 +509,10 @@ outbox-disabled cases.
 
 ### A.11 Migration & Upgrade
 
-#### v0.21.0 → v0.22.0
+#### v0.22.0 → v0.23.0
 
 - New catalog table `pgtrickle.pgt_outbox_config` created via
-  `sql/upgrade--0.21.0--0.22.0.sql`.
+  `sql/upgrade--0.22.0--0.23.0.sql`.
 - New SQL functions registered.
 - Existing stream tables unaffected; outbox is opt-in.
 
@@ -603,13 +617,20 @@ CREATE TABLE pgtrickle.pgt_consumer_offsets (
 );
 
 CREATE TABLE pgtrickle.pgt_consumer_leases (
-    group_id            UUID NOT NULL,
+    group_id            UUID NOT NULL REFERENCES pgtrickle.pgt_consumer_groups(group_id) ON DELETE CASCADE,
     consumer_id         TEXT NOT NULL,
     leased_id_min       BIGINT NOT NULL,           -- inclusive
     leased_id_max       BIGINT NOT NULL,           -- inclusive
     leased_at           TIMESTAMPTZ NOT NULL DEFAULT now(),
     visibility_until    TIMESTAMPTZ NOT NULL,
     PRIMARY KEY (group_id, leased_id_min)
+);
+
+-- High-churn table: one INSERT per poll_outbox() call, one DELETE per
+-- commit_offset(). Tune autovacuum aggressively at sustained poll rates.
+ALTER TABLE pgtrickle.pgt_consumer_leases SET (
+    autovacuum_vacuum_scale_factor = 0.01,
+    autovacuum_vacuum_cost_limit   = 2000
 );
 ```
 
@@ -855,10 +876,13 @@ async def main():
             payload = row['payload']
             if payload.get('claim_check'):
                 # Large delta: fetch rows via server-side cursor from companion table
+                # OUTBOX_NAME is read from RELAY_OUTBOX env var and validated
+                # against the catalog at startup. Table names cannot be
+                # parameterised in PostgreSQL, so string interpolation is used.
                 delta_rows = await db.fetch(
-                    "SELECT op, payload FROM pgtrickle.outbox_delta_rows_$1 "
-                    "WHERE outbox_id = $2 ORDER BY row_num",
-                    OUTBOX_NAME, row['id'],
+                    f"SELECT op, payload FROM pgtrickle.outbox_delta_rows_{OUTBOX_NAME} "
+                    "WHERE outbox_id = $1 ORDER BY row_num",
+                    row['id'],
                 )
                 inserted = [r['payload'] for r in delta_rows if r['op'] == 'I']
                 deleted  = [r['payload'] for r in delta_rows if r['op'] == 'D']
@@ -1191,5 +1215,5 @@ Five critical questions resolved before implementation begins:
 | 1 | Should `enable_outbox()` work for IMMEDIATE-mode STs? | **No — hard error** (`OutboxRequiresNotImmediateMode`) | IMMEDIATE refreshes inside the source transaction; an extra INSERT on every write is unacceptable overhead. Exactly-once downstream semantics require a separate commit point. |
 | 2 | Outbox deduplication — whose responsibility? | **Relay + inbox** (not outbox) | Outbox is an append-only audit log. Relay uses broker idempotency keys; inbox uses `ON CONFLICT DO NOTHING`. pg_trickle provides `pgt_outbox_dedup_<st>` view as a zero-cost helper for latest-state clients only. |
 | 3 | Consumer lease hold time after crash — configurable? | **Yes — `pg_trickle.consumer_dead_threshold_hours`** (default 24) | High-criticality systems can set this to 1 hour. Relay heartbeat interval (recommended 10 s) gives 360× buffer even at 1-hour threshold. |
-| 4 | Truncated payload recovery path | **Relay falls back to direct ST query** | When `payload.truncated = true`, relay reads `SELECT * FROM pgtrickle.<st> WHERE pgt_id = $1`. Documented in reference relay + PATTERNS.md. |
+| 4 | Large-delta relay memory safety | **Claim-check path** (`outbox_delta_rows_<st>`) | When `delta_row_count > outbox_inline_threshold_rows`, rows land in `pgtrickle.outbox_delta_rows_<st>` (not in `payload`). The relay fetches via server-side cursor in bounded batches and calls `outbox_rows_consumed()`. There is **no truncation path** — all rows are always available. The old `payload.truncated` concept was removed when the claim-check design was finalised. |
 | 5 | Naming collision resolution algorithm | **Exact 56-byte truncation + 7-char hex suffix** | Deterministic, reproducible, and stored in `pgt_outbox_config.outbox_table_name` so no re-derivation is needed at runtime. |
