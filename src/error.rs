@@ -126,6 +126,17 @@ pub enum PgTrickleError {
     #[error("SLA interval too small for available tiers: {0}")]
     SlaTooSmall(String),
 
+    // ── CDC errors ───────────────────────────────────────────────────────
+    /// CDC-1 (v0.24.0): Failed to build the changed-columns bitmask expression.
+    /// This indicates a table structure that prevents column-change tracking
+    /// (e.g., all columns are part of the primary key).
+    #[error("failed to build changed-columns bitmask: {0}")]
+    ChangedColsBitmaskFailed(String),
+
+    /// CDC-2 (v0.24.0): Publication rebuild failed for a partitioned source.
+    #[error("publication rebuild failed: {0}")]
+    PublicationRebuildFailed(String),
+
     // ── Internal errors — should not happen ──────────────────────────────
     /// An unexpected internal error. Indicates a bug.
     #[error("internal error: {0}")]
@@ -305,6 +316,9 @@ impl PgTrickleError {
             PgTrickleError::SpiPermissionError(_) => PgTrickleErrorKind::User,
 
             PgTrickleError::InternalError(_) => PgTrickleErrorKind::Internal,
+
+            PgTrickleError::ChangedColsBitmaskFailed(_)
+            | PgTrickleError::PublicationRebuildFailed(_) => PgTrickleErrorKind::System,
         }
     }
 }

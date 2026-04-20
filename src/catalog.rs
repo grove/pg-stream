@@ -644,6 +644,108 @@ impl StreamTableMeta {
         }
     }
 
+    // ── DUR-1: Two-phase frontier commit ─────────────────────────────────
+    //
+    // Phase 1 (prepare): Write the tentative frontier to `tentative_frontier`
+    //   column BEFORE truncating the change buffer and executing the MERGE.
+    //   If the process crashes between prepare and finalize, the tentative
+    //   frontier survives and can be reconciled on restart.
+    //
+    // Phase 2 (finalize): After the MERGE commits, copy
+    //   `tentative_frontier` → `frontier` and clear the tentative column.
+    //
+    // Recovery: On scheduler startup, any ST with a non-null
+    //   `tentative_frontier` but stale `frontier` is detected and
+    //   reconciled — the tentative frontier is promoted if the change
+    //   buffer is empty (MERGE succeeded), or discarded if the buffer is
+    //   non-empty (MERGE was not reached).
+
+    /// DUR-1 Phase 1: Write a tentative frontier before MERGE execution.
+    ///
+    /// Stores the proposed new frontier in `tentative_frontier` without
+    /// touching the committed `frontier` column. This survives a crash
+    /// between the TRUNCATE of the change buffer and the MERGE commit.
+    pub fn prepare_frontier(pgt_id: i64, frontier: &Frontier) -> Result<(), PgTrickleError> {
+        let frontier_json = serde_json::to_value(frontier).map_err(|e| {
+            PgTrickleError::InternalError(format!("Failed to serialize frontier: {}", e))
+        })?;
+
+        Spi::run_with_args(
+            "UPDATE pgtrickle.pgt_stream_tables \
+             SET tentative_frontier = $1, updated_at = now() \
+             WHERE pgt_id = $2",
+            &[pgrx::JsonB(frontier_json).into(), pgt_id.into()],
+        )
+        .map_err(|e: pgrx::spi::SpiError| PgTrickleError::SpiError(e.to_string()))
+    }
+
+    /// DUR-1 Phase 2: Finalize the frontier after MERGE commits.
+    ///
+    /// Promotes `tentative_frontier` → `frontier` and clears the tentative
+    /// column. Combined with refresh completion for efficiency (S3).
+    pub fn finalize_frontier_and_complete_refresh(
+        pgt_id: i64,
+        rows_affected: i64,
+    ) -> Result<TimestampWithTimeZone, PgTrickleError> {
+        Spi::get_one_with_args::<TimestampWithTimeZone>(
+            "UPDATE pgtrickle.pgt_stream_tables \
+             SET data_timestamp = now(), is_populated = true, \
+             last_refresh_at = now(), consecutive_errors = 0, \
+             status = 'ACTIVE', needs_reinit = false, \
+             last_error_message = NULL, last_error_at = NULL, \
+             frontier = tentative_frontier, tentative_frontier = NULL, \
+             updated_at = now() \
+             WHERE pgt_id = $1 \
+             RETURNING data_timestamp",
+            &[pgt_id.into(), rows_affected.into()],
+        )
+        .map_err(|e: pgrx::spi::SpiError| PgTrickleError::SpiError(e.to_string()))?
+        .ok_or_else(|| PgTrickleError::NotFound(format!("pgt_id={}", pgt_id)))
+    }
+
+    /// DUR-1 Recovery: Reconcile tentative frontiers on scheduler startup.
+    ///
+    /// Finds all STs with a non-null `tentative_frontier` and decides:
+    /// - If the change buffer is empty → promote (MERGE succeeded)
+    /// - If the change buffer is non-empty → discard (MERGE never ran)
+    ///
+    /// Returns the number of reconciled STs.
+    pub fn reconcile_tentative_frontiers(change_schema: &str) -> Result<i64, PgTrickleError> {
+        let count = Spi::get_one_with_args::<i64>(
+            &format!(
+                "WITH stale AS ( \
+                    SELECT pgt_id, pgt_relid \
+                    FROM pgtrickle.pgt_stream_tables \
+                    WHERE tentative_frontier IS NOT NULL \
+                 ) \
+                 UPDATE pgtrickle.pgt_stream_tables st \
+                 SET frontier = CASE \
+                         WHEN NOT EXISTS ( \
+                             SELECT 1 FROM {change_schema}.changes_ || s.pgt_relid::text LIMIT 1 \
+                         ) THEN st.tentative_frontier \
+                         ELSE st.frontier \
+                     END, \
+                     tentative_frontier = NULL, \
+                     updated_at = now() \
+                 FROM stale s \
+                 WHERE st.pgt_id = s.pgt_id \
+                 RETURNING st.pgt_id"
+            ),
+            &[],
+        )
+        .map_err(|e: pgrx::spi::SpiError| PgTrickleError::SpiError(e.to_string()))?
+        .unwrap_or(0);
+
+        if count > 0 {
+            pgrx::log!(
+                "[pg_trickle] DUR-1: reconciled {} tentative frontier(s) on startup",
+                count,
+            );
+        }
+
+        Ok(count)
+    }
+
     /// Increment the consecutive error count. Returns the new count.
     pub fn increment_errors(pgt_id: i64) -> Result<i32, PgTrickleError> {
         Spi::get_one_with_args::<i32>(

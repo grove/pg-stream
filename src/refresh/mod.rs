@@ -7552,6 +7552,198 @@ mod tests {
             );
         }
     }
+
+    // ── EC01-4: Join cross-cycle phantom convergence property tests ──────
+    //
+    // These tests verify that INSERT/DELETE sequences on multi-table JOINs
+    // converge to the same result as a full refresh, regardless of the order
+    // and timing of changes across multiple refresh cycles.
+    //
+    // The model: two tables L (left) and R (right) with a join L.key = R.key.
+    // Each cycle, random I/D actions are applied to both sides. The
+    // incremental result (applying deltas cycle-by-cycle) must match the
+    // full recomputation at the end.
+    //
+    // The property: ∀ action sequences, Σ(deltas) = full_join(L_final, R_final)
+
+    /// Simulate a join between two tables and verify convergence.
+    ///
+    /// `left_cycles` and `right_cycles` each contain a sequence of (key, action)
+    /// pairs per cycle. After all cycles, the incremental result must match the
+    /// full join of the final table states.
+    fn simulate_join_convergence(
+        left_cycles: &[Vec<(u32, char)>],
+        right_cycles: &[Vec<(u32, char)>],
+    ) -> bool {
+        use std::collections::{HashMap, HashSet};
+
+        // Track table state: key → count (non-negative multiset)
+        let mut left_state: HashMap<u32, i64> = HashMap::new();
+        let mut right_state: HashMap<u32, i64> = HashMap::new();
+
+        // Track incremental join result: (left_key, right_key) → count
+        let mut incr_result: HashMap<(u32, u32), i64> = HashMap::new();
+
+        let n_cycles = left_cycles.len().max(right_cycles.len());
+
+        for cycle in 0..n_cycles {
+            let left_delta = left_cycles.get(cycle).cloned().unwrap_or_default();
+            let right_delta = right_cycles.get(cycle).cloned().unwrap_or_default();
+
+            // Compute effective left delta weights (skip impossible deletes)
+            let mut left_dw: HashMap<u32, i64> = HashMap::new();
+            for (key, action) in &left_delta {
+                if *action == 'D' && *left_state.get(key).unwrap_or(&0) <= 0 {
+                    continue; // Can't delete what doesn't exist
+                }
+                let w = if *action == 'I' { 1i64 } else { -1 };
+                *left_dw.entry(*key).or_insert(0) += w;
+                *left_state.entry(*key).or_insert(0) += w;
+            }
+
+            let mut right_dw: HashMap<u32, i64> = HashMap::new();
+            for (key, action) in &right_delta {
+                if *action == 'D' && *right_state.get(key).unwrap_or(&0) <= 0 {
+                    continue;
+                }
+                let w = if *action == 'I' { 1i64 } else { -1 };
+                *right_dw.entry(*key).or_insert(0) += w;
+                *right_state.entry(*key).or_insert(0) += w;
+            }
+
+            // DBSP delta join: ΔJ = (ΔL ⋈ R_after) + (L_before ⋈ ΔR)
+            //
+            // Part 1: ΔL ⋈ R_after (right state AFTER applying right delta)
+            for (lk, lw) in &left_dw {
+                let rcount = *right_state.get(lk).unwrap_or(&0);
+                *incr_result.entry((*lk, *lk)).or_insert(0) += lw * rcount;
+            }
+
+            // Part 2: L_before ⋈ ΔR (left state BEFORE applying left delta)
+            // L_before = L_after - ΔL
+            for (rk, rw) in &right_dw {
+                let l_after = *left_state.get(rk).unwrap_or(&0);
+                let l_delta = *left_dw.get(rk).unwrap_or(&0);
+                let l_before = l_after - l_delta;
+                *incr_result.entry((*rk, *rk)).or_insert(0) += l_before * rw;
+            }
+        }
+
+        // Compute full join of final states
+        let mut full_result: HashMap<(u32, u32), i64> = HashMap::new();
+        for (lk, lcount) in &left_state {
+            if *lcount > 0
+                && let Some(&rcount) = right_state.get(lk)
+                && rcount > 0
+            {
+                *full_result.entry((*lk, *lk)).or_insert(0) += lcount * rcount;
+            }
+        }
+
+        // Check convergence: incremental result must match full result
+        // (ignoring keys with zero count)
+        let all_keys: HashSet<(u32, u32)> = incr_result
+            .keys()
+            .chain(full_result.keys())
+            .cloned()
+            .collect();
+
+        for key in &all_keys {
+            let incr = *incr_result.get(key).unwrap_or(&0);
+            let full = *full_result.get(key).unwrap_or(&0);
+            if incr != full {
+                return false;
+            }
+        }
+
+        true
+    }
+
+    proptest! {
+        #![proptest_config(proptest::test_runner::Config::with_cases(5000))]
+
+        /// EC01-4a: Single-cycle join convergence — random I/D on both sides.
+        #[test]
+        fn prop_join_single_cycle_convergence(
+            left_actions in proptest::collection::vec(
+                (0u32..5, proptest::sample::select(vec!['I', 'D'])),
+                1..=20
+            ),
+            right_actions in proptest::collection::vec(
+                (0u32..5, proptest::sample::select(vec!['I', 'D'])),
+                1..=20
+            ),
+        ) {
+            prop_assert!(
+                simulate_join_convergence(&[left_actions], &[right_actions]),
+                "Single-cycle join convergence failed"
+            );
+        }
+
+        /// EC01-4b: Multi-cycle join convergence — 3-10 cycles of random I/D.
+        #[test]
+        fn prop_join_multi_cycle_convergence(
+            n_cycles in 3usize..=10,
+            left_actions in proptest::collection::vec(
+                proptest::collection::vec(
+                    (0u32..5, proptest::sample::select(vec!['I', 'D'])),
+                    0..=10
+                ),
+                3..=10
+            ),
+            right_actions in proptest::collection::vec(
+                proptest::collection::vec(
+                    (0u32..5, proptest::sample::select(vec!['I', 'D'])),
+                    0..=10
+                ),
+                3..=10
+            ),
+        ) {
+            let left = &left_actions[..n_cycles.min(left_actions.len())];
+            let right = &right_actions[..n_cycles.min(right_actions.len())];
+            prop_assert!(
+                simulate_join_convergence(left, right),
+                "Multi-cycle join convergence failed after {} cycles", n_cycles
+            );
+        }
+
+        /// EC01-4c: Asymmetric changes — only one side changes per cycle.
+        #[test]
+        fn prop_join_asymmetric_convergence(
+            left_actions in proptest::collection::vec(
+                proptest::collection::vec(
+                    (0u32..3, proptest::sample::select(vec!['I', 'D'])),
+                    0..=8
+                ),
+                2..=6
+            ),
+            right_actions in proptest::collection::vec(
+                proptest::collection::vec(
+                    (0u32..3, proptest::sample::select(vec!['I', 'D'])),
+                    0..=8
+                ),
+                2..=6
+            ),
+        ) {
+            // Alternate: even cycles change left, odd cycles change right
+            let n = left_actions.len().min(right_actions.len());
+            let mut left_cyc = Vec::new();
+            let mut right_cyc = Vec::new();
+            for i in 0..n {
+                if i % 2 == 0 {
+                    left_cyc.push(left_actions[i].clone());
+                    right_cyc.push(vec![]);
+                } else {
+                    left_cyc.push(vec![]);
+                    right_cyc.push(right_actions[i].clone());
+                }
+            }
+            prop_assert!(
+                simulate_join_convergence(&left_cyc, &right_cyc),
+                "Asymmetric join convergence failed"
+            );
+        }
+    }
 }
 
 #[cfg(feature = "pg_test")]

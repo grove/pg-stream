@@ -101,18 +101,7 @@ fn handle_connection(stream: &mut TcpStream, metrics_text: &str) {
     };
     let request = std::str::from_utf8(&buf[..n]).unwrap_or("");
 
-    // Only serve GET /metrics — everything else gets a 404.
-    let (status, content_type, body) = if request.starts_with("GET /metrics") {
-        (
-            "200 OK",
-            "application/openmetrics-text; version=1.0.0; charset=utf-8",
-            metrics_text,
-        )
-    } else if request.starts_with("GET /health") || request.starts_with("GET /-/healthy") {
-        ("200 OK", "text/plain", "ok\n")
-    } else {
-        ("404 Not Found", "text/plain", "Not Found\n")
-    };
+    let (status, content_type, body) = route_request(request, metrics_text);
 
     let response = format!(
         "HTTP/1.1 {status}\r\n\
@@ -124,4 +113,119 @@ fn handle_connection(stream: &mut TcpStream, metrics_text: &str) {
         body.len()
     );
     let _ = stream.write_all(response.as_bytes());
+}
+
+/// Route an HTTP request to the appropriate handler.
+///
+/// Returns `(status, content_type, body)` for the response.
+/// Extracted from `handle_connection` for unit testability (TEST-8).
+fn route_request<'a>(
+    request: &str,
+    metrics_text: &'a str,
+) -> (&'static str, &'static str, &'a str) {
+    if request.starts_with("GET /metrics") {
+        (
+            "200 OK",
+            "application/openmetrics-text; version=1.0.0; charset=utf-8",
+            metrics_text,
+        )
+    } else if request.starts_with("GET /health") || request.starts_with("GET /-/healthy") {
+        ("200 OK", "text/plain", "ok\n")
+    } else {
+        ("404 Not Found", "text/plain", "Not Found\n")
+    }
+}
+
+// ── TEST-8 (v0.24.0): Unit tests for metrics_server.rs ─────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── Route request tests ─────────────────────────────────────────────
+
+    #[test]
+    fn test_route_metrics_endpoint() {
+        let metrics = "# TYPE pg_trickle_up gauge\npg_trickle_up 1\n";
+        let (status, ct, body) = route_request("GET /metrics HTTP/1.1\r\n", metrics);
+        assert_eq!(status, "200 OK");
+        assert!(ct.contains("openmetrics"));
+        assert_eq!(body, metrics);
+    }
+
+    #[test]
+    fn test_route_health_endpoint() {
+        let (status, ct, body) = route_request("GET /health HTTP/1.1\r\n", "");
+        assert_eq!(status, "200 OK");
+        assert_eq!(ct, "text/plain");
+        assert_eq!(body, "ok\n");
+    }
+
+    #[test]
+    fn test_route_healthy_endpoint() {
+        let (status, ct, body) = route_request("GET /-/healthy HTTP/1.1\r\n", "");
+        assert_eq!(status, "200 OK");
+        assert_eq!(ct, "text/plain");
+        assert_eq!(body, "ok\n");
+    }
+
+    #[test]
+    fn test_route_404_unknown_path() {
+        let (status, _, body) = route_request("GET /unknown HTTP/1.1\r\n", "");
+        assert_eq!(status, "404 Not Found");
+        assert_eq!(body, "Not Found\n");
+    }
+
+    #[test]
+    fn test_route_404_post_method() {
+        let (status, _, _) = route_request("POST /metrics HTTP/1.1\r\n", "");
+        assert_eq!(status, "404 Not Found");
+    }
+
+    #[test]
+    fn test_route_404_empty_request() {
+        let (status, _, _) = route_request("", "");
+        assert_eq!(status, "404 Not Found");
+    }
+
+    #[test]
+    fn test_route_metrics_with_query_string() {
+        let metrics = "pg_trickle_up 1\n";
+        let (status, _, body) = route_request("GET /metrics?format=text HTTP/1.1\r\n", metrics);
+        assert_eq!(status, "200 OK");
+        assert_eq!(body, metrics);
+    }
+
+    // ── Port handling tests ─────────────────────────────────────────────
+
+    #[test]
+    fn test_start_disabled_port_zero() {
+        // Port 0 means disabled — should return None.
+        assert!(MetricsServer::start(0).is_none());
+    }
+
+    #[test]
+    fn test_route_content_type_openmetrics() {
+        let (_, ct, _) = route_request("GET /metrics HTTP/1.1\r\n", "");
+        assert_eq!(
+            ct,
+            "application/openmetrics-text; version=1.0.0; charset=utf-8"
+        );
+    }
+
+    #[test]
+    fn test_route_health_content_type_plain() {
+        let (_, ct, _) = route_request("GET /health HTTP/1.1\r\n", "");
+        assert_eq!(ct, "text/plain");
+    }
+
+    #[test]
+    fn test_route_large_metrics_body() {
+        let metrics: String = (0..1000)
+            .map(|i| format!("pg_trickle_metric_{i} {i}\n"))
+            .collect();
+        let (status, _, body) = route_request("GET /metrics HTTP/1.1\r\n", &metrics);
+        assert_eq!(status, "200 OK");
+        assert_eq!(body.len(), metrics.len());
+    }
 }

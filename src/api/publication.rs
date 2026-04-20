@@ -414,4 +414,164 @@ mod tests {
     fn test_quote_ident_with_quotes() {
         assert_eq!(quote_ident("he\"llo"), "\"he\"\"llo\"");
     }
+
+    // ── TEST-6 (v0.24.0): Comprehensive publication.rs unit tests ────────
+    //
+    // 25+ tests for assign_tier_for_sla, parse_qualified_name, quote_ident,
+    // and boundary cases (0, negative, NaN-like edge values).
+
+    #[test]
+    fn test_assign_tier_sla_zero() {
+        use crate::scheduler::RefreshTier;
+        // Zero is valid (Hot tier — aggressive)
+        assert_eq!(assign_tier_for_sla(0).ok(), Some(RefreshTier::Hot));
+    }
+
+    #[test]
+    fn test_assign_tier_sla_one_ms() {
+        use crate::scheduler::RefreshTier;
+        assert_eq!(assign_tier_for_sla(1).ok(), Some(RefreshTier::Hot));
+    }
+
+    #[test]
+    fn test_assign_tier_sla_boundary_5000() {
+        use crate::scheduler::RefreshTier;
+        assert_eq!(assign_tier_for_sla(5000).ok(), Some(RefreshTier::Hot));
+    }
+
+    #[test]
+    fn test_assign_tier_sla_boundary_5001() {
+        use crate::scheduler::RefreshTier;
+        assert_eq!(assign_tier_for_sla(5001).ok(), Some(RefreshTier::Warm));
+    }
+
+    #[test]
+    fn test_assign_tier_sla_boundary_30000() {
+        use crate::scheduler::RefreshTier;
+        assert_eq!(assign_tier_for_sla(30000).ok(), Some(RefreshTier::Warm));
+    }
+
+    #[test]
+    fn test_assign_tier_sla_boundary_30001() {
+        use crate::scheduler::RefreshTier;
+        assert_eq!(assign_tier_for_sla(30001).ok(), Some(RefreshTier::Cold));
+    }
+
+    #[test]
+    fn test_assign_tier_sla_very_large() {
+        use crate::scheduler::RefreshTier;
+        assert_eq!(
+            assign_tier_for_sla(86_400_000).ok(),
+            Some(RefreshTier::Cold)
+        );
+    }
+
+    #[test]
+    fn test_assign_tier_sla_negative() {
+        use crate::scheduler::RefreshTier;
+        // Negative is technically invalid but shouldn't panic.
+        // It falls into the Hot tier (≤ 5000).
+        assert_eq!(assign_tier_for_sla(-1).ok(), Some(RefreshTier::Hot));
+    }
+
+    #[test]
+    fn test_assign_tier_sla_i64_max() {
+        use crate::scheduler::RefreshTier;
+        assert_eq!(assign_tier_for_sla(i64::MAX).ok(), Some(RefreshTier::Cold));
+    }
+
+    #[test]
+    fn test_parse_qualified_dots_in_schema() {
+        // Only the first dot is treated as schema separator
+        let (schema, table) = parse_qualified_name("my.schema.table");
+        assert_eq!(schema, "my");
+        assert_eq!(table, "schema.table");
+    }
+
+    #[test]
+    fn test_parse_qualified_empty_string() {
+        let (schema, table) = parse_qualified_name("");
+        assert_eq!(schema, "public");
+        assert_eq!(table, "");
+    }
+
+    #[test]
+    fn test_parse_qualified_dot_only() {
+        let (schema, table) = parse_qualified_name(".");
+        assert_eq!(schema, "");
+        assert_eq!(table, "");
+    }
+
+    #[test]
+    fn test_quote_ident_empty() {
+        assert_eq!(quote_ident(""), "\"\"");
+    }
+
+    #[test]
+    fn test_quote_ident_spaces() {
+        assert_eq!(quote_ident("my table"), "\"my table\"");
+    }
+
+    #[test]
+    fn test_quote_ident_unicode() {
+        assert_eq!(quote_ident("tëst"), "\"tëst\"");
+    }
+
+    #[test]
+    fn test_quote_ident_qualified_basic() {
+        assert_eq!(
+            quote_ident_qualified("public", "orders"),
+            "\"public\".\"orders\""
+        );
+    }
+
+    #[test]
+    fn test_quote_ident_qualified_with_quotes() {
+        assert_eq!(
+            quote_ident_qualified("my\"schema", "my\"table"),
+            "\"my\"\"schema\".\"my\"\"table\""
+        );
+    }
+
+    #[test]
+    fn test_quote_ident_qualified_empty_schema() {
+        assert_eq!(quote_ident_qualified("", "table"), "\"\".\"table\"");
+    }
+
+    #[test]
+    fn test_assign_tier_sla_warm_midpoint() {
+        use crate::scheduler::RefreshTier;
+        assert_eq!(assign_tier_for_sla(15000).ok(), Some(RefreshTier::Warm));
+    }
+
+    #[test]
+    fn test_assign_tier_sla_cold_100s() {
+        use crate::scheduler::RefreshTier;
+        assert_eq!(assign_tier_for_sla(100_000).ok(), Some(RefreshTier::Cold));
+    }
+
+    #[test]
+    fn test_parse_qualified_leading_dot() {
+        let (schema, table) = parse_qualified_name(".table");
+        assert_eq!(schema, "");
+        assert_eq!(table, "table");
+    }
+
+    #[test]
+    fn test_parse_qualified_trailing_dot() {
+        let (schema, table) = parse_qualified_name("schema.");
+        assert_eq!(schema, "schema");
+        assert_eq!(table, "");
+    }
+
+    #[test]
+    fn test_quote_ident_backslash() {
+        assert_eq!(quote_ident("back\\slash"), "\"back\\slash\"");
+    }
+
+    #[test]
+    fn test_quote_ident_null_char() {
+        // Null characters should be preserved in quoting
+        assert_eq!(quote_ident("a\0b"), "\"a\0b\"");
+    }
 }

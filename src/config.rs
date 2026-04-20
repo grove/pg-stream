@@ -662,6 +662,66 @@ fn normalize_merge_join_strategy(value: Option<String>) -> MergeJoinStrategy {
 /// Default `false` — change buffers remain WAL-logged and crash-safe.
 pub static PGS_UNLOGGED_BUFFERS: GucSetting<bool> = GucSetting::<bool>::new(false);
 
+/// DUR-2: Change buffer durability mode.
+///
+/// Controls the WAL-logging behavior of change buffer tables:
+/// - `"unlogged"` (default): Change buffers are UNLOGGED for maximum write
+///   throughput. After a crash, buffers are lost and the ST receives a FULL
+///   refresh. Equivalent to `pg_trickle.unlogged_buffers = true`.
+/// - `"logged"`: Change buffers are WAL-logged. Survives crashes and is
+///   replicated to standbys. Higher write overhead (~30% more WAL).
+/// - `"sync"`: WAL-logged + `synchronous_commit = on` for the change buffer
+///   transaction. Maximum durability — no data loss even under OS crashes.
+///
+/// This GUC supersedes `pg_trickle.unlogged_buffers` (which is now a
+/// compatibility alias: `true` maps to `"unlogged"`, `false` to `"logged"`).
+pub static PGS_CHANGE_BUFFER_DURABILITY: GucSetting<Option<std::ffi::CString>> =
+    GucSetting::<Option<std::ffi::CString>>::new(Some(c"unlogged"));
+
+/// DUR-2: Change buffer durability mode enum.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChangeBufferDurability {
+    /// UNLOGGED tables — maximum performance, lost on crash.
+    Unlogged,
+    /// WAL-logged tables — survives crash, replicated.
+    Logged,
+    /// WAL-logged + synchronous_commit — maximum durability.
+    Sync,
+}
+
+impl ChangeBufferDurability {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ChangeBufferDurability::Unlogged => "unlogged",
+            ChangeBufferDurability::Logged => "logged",
+            ChangeBufferDurability::Sync => "sync",
+        }
+    }
+
+    pub fn is_wal_logged(self) -> bool {
+        matches!(
+            self,
+            ChangeBufferDurability::Logged | ChangeBufferDurability::Sync
+        )
+    }
+}
+
+fn normalize_change_buffer_durability(value: Option<String>) -> ChangeBufferDurability {
+    match value.as_deref().map(str::to_ascii_lowercase).as_deref() {
+        Some("logged") => ChangeBufferDurability::Logged,
+        Some("sync") => ChangeBufferDurability::Sync,
+        _ => ChangeBufferDurability::Unlogged,
+    }
+}
+
+/// Return the current change buffer durability mode.
+pub fn pg_trickle_change_buffer_durability() -> ChangeBufferDurability {
+    let raw = PGS_CHANGE_BUFFER_DURABILITY
+        .get()
+        .map(|c| c.to_string_lossy().into_owned());
+    normalize_change_buffer_durability(raw)
+}
+
 /// PH-D1: MERGE strategy override.
 ///
 /// Controls how differential refresh applies deltas to stream tables:
@@ -1732,6 +1792,20 @@ pub fn register_gucs() {
            Existing buffers are not changed; use pgtrickle.convert_buffers_to_unlogged() \
            to convert them. Default: false (crash-safe, WAL-logged).",
         &PGS_UNLOGGED_BUFFERS,
+        GucContext::Suset,
+        GucFlags::default(),
+    );
+
+    // DUR-2: Change buffer durability mode.
+    GucRegistry::define_string_guc(
+        c"pg_trickle.change_buffer_durability",
+        c"Change buffer durability: unlogged (default), logged, or sync.",
+        c"'unlogged' (default) creates UNLOGGED change buffers for max throughput; \
+           lost on crash (auto FULL refresh on recovery). \
+           'logged' creates WAL-logged change buffers; survives crash, replicated. \
+           'sync' adds synchronous_commit for maximum durability. \
+           Supersedes pg_trickle.unlogged_buffers (compatibility alias).",
+        &PGS_CHANGE_BUFFER_DURABILITY,
         GucContext::Suset,
         GucFlags::default(),
     );

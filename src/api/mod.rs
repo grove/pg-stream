@@ -412,6 +412,24 @@ fn raise_error_with_context(e: PgTrickleError) -> ! {
             .report(PgLogLevel::ERROR);
             unreachable!()
         }
+        PgTrickleError::ChangedColsBitmaskFailed(msg) => {
+            ErrorReport::new(
+                PgSqlErrorCode::ERRCODE_INTERNAL_ERROR,
+                format!("changed-columns bitmask failed: {}", msg),
+                "",
+            )
+            .report(PgLogLevel::ERROR);
+            unreachable!()
+        }
+        PgTrickleError::PublicationRebuildFailed(msg) => {
+            ErrorReport::new(
+                PgSqlErrorCode::ERRCODE_INTERNAL_ERROR,
+                format!("publication rebuild failed: {}", msg),
+                "",
+            )
+            .report(PgLogLevel::ERROR);
+            unreachable!()
+        }
     }
 }
 

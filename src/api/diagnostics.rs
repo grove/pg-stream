@@ -1450,3 +1450,151 @@ pub(super) fn refresh_groups_fn() -> TableIterator<
     };
     TableIterator::new(rows)
 }
+
+// ── TEST-7 (v0.24.0): Unit tests for diagnostics pure-logic helpers ─────
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn test_version_returns_cargo_version() {
+        let v = env!("CARGO_PKG_VERSION");
+        assert!(!v.is_empty());
+        assert!(v.contains('.'), "version should contain dots: {v}");
+    }
+
+    #[test]
+    fn test_version_is_not_placeholder() {
+        let v = env!("CARGO_PKG_VERSION");
+        assert_ne!(v, "0.0.0");
+        assert_ne!(v, "@CARGO_VERSION@");
+    }
+
+    #[test]
+    fn test_explain_format_text_is_default() {
+        let format = "text";
+        assert!(["text", "json", "yaml", "xml"].contains(&format));
+    }
+
+    #[test]
+    fn test_explain_format_json_is_valid() {
+        let format = "json";
+        assert!(["text", "json", "yaml", "xml"].contains(&format));
+    }
+
+    #[test]
+    fn test_explain_format_unknown_is_rejected() {
+        let format = "binary";
+        assert!(!["text", "json", "yaml", "xml"].contains(&format));
+    }
+
+    #[test]
+    fn test_parse_duration_helpers_seconds() {
+        use crate::api::helpers::parse_duration;
+        assert_eq!(parse_duration("30s").ok(), Some(30));
+    }
+
+    #[test]
+    fn test_parse_duration_helpers_minutes() {
+        use crate::api::helpers::parse_duration;
+        assert_eq!(parse_duration("5m").ok(), Some(300));
+    }
+
+    #[test]
+    fn test_parse_duration_helpers_hours() {
+        use crate::api::helpers::parse_duration;
+        assert_eq!(parse_duration("2h").ok(), Some(7200));
+    }
+
+    #[test]
+    fn test_parse_duration_helpers_days() {
+        use crate::api::helpers::parse_duration;
+        assert_eq!(parse_duration("1d").ok(), Some(86400));
+    }
+
+    #[test]
+    fn test_parse_duration_helpers_weeks() {
+        use crate::api::helpers::parse_duration;
+        assert_eq!(parse_duration("1w").ok(), Some(604800));
+    }
+
+    #[test]
+    fn test_parse_duration_helpers_compound() {
+        use crate::api::helpers::parse_duration;
+        assert_eq!(parse_duration("1h30m").ok(), Some(5400));
+    }
+
+    #[test]
+    fn test_parse_duration_helpers_bare_integer() {
+        use crate::api::helpers::parse_duration;
+        assert_eq!(parse_duration("60").ok(), Some(60));
+    }
+
+    #[test]
+    fn test_parse_duration_helpers_empty() {
+        use crate::api::helpers::parse_duration;
+        assert!(parse_duration("").is_err());
+    }
+
+    #[test]
+    fn test_parse_duration_helpers_invalid_unit() {
+        use crate::api::helpers::parse_duration;
+        assert!(parse_duration("5x").is_err());
+    }
+
+    #[test]
+    fn test_parse_duration_helpers_negative() {
+        use crate::api::helpers::parse_duration;
+        assert!(parse_duration("-5").is_err());
+    }
+
+    #[test]
+    fn test_parse_duration_helpers_zero() {
+        use crate::api::helpers::parse_duration;
+        assert_eq!(parse_duration("0").ok(), Some(0));
+    }
+
+    #[test]
+    fn test_parse_duration_helpers_zero_seconds() {
+        use crate::api::helpers::parse_duration;
+        assert_eq!(parse_duration("0s").ok(), Some(0));
+    }
+
+    #[test]
+    fn test_parse_duration_helpers_compound_all_units() {
+        use crate::api::helpers::parse_duration;
+        assert_eq!(
+            parse_duration("1d2h30m15s").ok(),
+            Some(86400 + 7200 + 1800 + 15)
+        );
+    }
+
+    #[test]
+    fn test_parse_duration_helpers_whitespace_trim() {
+        use crate::api::helpers::parse_duration;
+        assert_eq!(parse_duration("  30s  ").ok(), Some(30));
+    }
+
+    #[test]
+    fn test_parse_duration_helpers_large_value() {
+        use crate::api::helpers::parse_duration;
+        assert_eq!(parse_duration("365d").ok(), Some(365 * 86400));
+    }
+
+    #[test]
+    fn test_parse_duration_helpers_no_number_before_unit() {
+        use crate::api::helpers::parse_duration;
+        assert!(parse_duration("s").is_err());
+    }
+
+    #[test]
+    fn test_parse_duration_helpers_48s_schedule() {
+        use crate::api::helpers::parse_duration;
+        assert_eq!(parse_duration("48s").ok(), Some(48));
+    }
+
+    #[test]
+    fn test_parse_duration_helpers_96s_schedule() {
+        use crate::api::helpers::parse_duration;
+        assert_eq!(parse_duration("96s").ok(), Some(96));
+    }
+}

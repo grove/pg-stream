@@ -363,6 +363,160 @@ pub fn build_changed_cols_bitmask_expr(
     Some(parts.join(" ||\n        "))
 }
 
+/// CDC-2 (v0.24.0): Check if a partitioned source table's publication needs
+/// rebuilding to include `publish_via_partition_root = true`.
+///
+/// Returns `true` if the source is a partitioned table (`relkind = 'p'`) and
+/// the publication either doesn't exist or doesn't have
+/// `publish_via_partition_root` enabled.
+pub fn needs_publication_rebuild(source_relid: pg_sys::Oid) -> Result<bool, PgTrickleError> {
+    let is_partitioned = Spi::get_one_with_args::<bool>(
+        "SELECT relkind = 'p' FROM pg_catalog.pg_class WHERE oid = $1",
+        &[(source_relid.to_u32() as i64).into()],
+    )
+    .map_err(|e| PgTrickleError::SpiError(e.to_string()))?
+    .unwrap_or(false);
+
+    if !is_partitioned {
+        return Ok(false);
+    }
+
+    // Check if our publication has publish_via_partition_root
+    let has_correct_pub = Spi::get_one_with_args::<bool>(
+        "SELECT EXISTS( \
+            SELECT 1 FROM pg_catalog.pg_publication_tables pt \
+            JOIN pg_catalog.pg_publication p ON pt.pubid = p.oid \
+            WHERE pt.schemaname || '.' || pt.tablename = \
+                  (SELECT n.nspname::text || '.' || c.relname::text \
+                   FROM pg_catalog.pg_class c \
+                   JOIN pg_catalog.pg_namespace n ON c.relnamespace = n.oid \
+                   WHERE c.oid = $1) \
+            AND p.pubviaroot = true \
+         )",
+        &[(source_relid.to_u32() as i64).into()],
+    )
+    .map_err(|e| PgTrickleError::SpiError(e.to_string()))?
+    .unwrap_or(false);
+
+    Ok(!has_correct_pub)
+}
+
+/// CDC-2 (v0.24.0): Rebuild the publication for a partitioned source table
+/// with `publish_via_partition_root = true`.
+///
+/// Creates or alters the pg_trickle publication for the given source table
+/// to ensure partition root routing. Emits a log message with
+/// `refresh_reason = 'publication_rebuild'`.
+pub fn rebuild_publication_for_partitioned_source(
+    source_relid: pg_sys::Oid,
+) -> Result<(), PgTrickleError> {
+    let table_name = Spi::get_one_with_args::<String>(
+        "SELECT n.nspname::text || '.' || c.relname::text \
+         FROM pg_catalog.pg_class c \
+         JOIN pg_catalog.pg_namespace n ON c.relnamespace = n.oid \
+         WHERE c.oid = $1",
+        &[(source_relid.to_u32() as i64).into()],
+    )
+    .map_err(|e| PgTrickleError::SpiError(e.to_string()))?
+    .ok_or_else(|| {
+        PgTrickleError::PublicationRebuildFailed(format!(
+            "source table OID {} not found",
+            source_relid.to_u32()
+        ))
+    })?;
+
+    let pub_name = format!("pgt_pub_{}", source_relid.to_u32());
+
+    // Drop and recreate to ensure publish_via_partition_root is set
+    Spi::run(&format!(
+        "DROP PUBLICATION IF EXISTS \"{pub_name}\"; \
+         CREATE PUBLICATION \"{pub_name}\" FOR TABLE {table_name} \
+         WITH (publish_via_partition_root = true)"
+    ))
+    .map_err(|e| PgTrickleError::PublicationRebuildFailed(e.to_string()))?;
+
+    pgrx::log!(
+        "[pg_trickle] CDC-2: rebuilt publication '{}' for partitioned source {} \
+         with publish_via_partition_root = true (refresh_reason = 'publication_rebuild')",
+        pub_name,
+        table_name,
+    );
+
+    Ok(())
+}
+
+/// CDC-3 (v0.24.0): Build a TOAST-aware column hash expression.
+///
+/// For columns with `attstorage IN ('e', 'x')` (external or extended TOAST
+/// storage), includes `pg_column_size()` in the hash to detect in-place TOAST
+/// rewrites that don't change the detoasted value but do change the on-disk
+/// representation.
+///
+/// Returns an enhanced pk_hash expression that includes TOAST column sizes
+/// for affected columns.
+pub fn build_toast_aware_hash_expr(
+    pk_columns: &[String],
+    _columns: &[(String, String)],
+    toast_columns: &[String],
+) -> String {
+    let mut parts = Vec::new();
+
+    // Primary key columns in the hash
+    for col in pk_columns {
+        let qcol = col.replace('"', "\"\"");
+        parts.push(format!("NEW.\"{qcol}\"::text"));
+    }
+
+    // Add pg_column_size for TOAST-eligible columns
+    for col in toast_columns {
+        let qcol = col.replace('"', "\"\"");
+        parts.push(format!("pg_column_size(NEW.\"{qcol}\")::text"));
+    }
+
+    if parts.len() == 1 {
+        format!("pgtrickle.pg_trickle_hash({})", parts[0])
+    } else {
+        format!(
+            "pgtrickle.pg_trickle_hash_multi(ARRAY[{}])",
+            parts.join(", ")
+        )
+    }
+}
+
+/// CDC-3 (v0.24.0): Identify TOAST-eligible columns for a given table.
+///
+/// Returns column names where `attstorage` is 'e' (external) or 'x' (extended),
+/// indicating the column uses TOAST storage and may have in-place rewrites.
+pub fn get_toast_columns(source_relid: pg_sys::Oid) -> Result<Vec<String>, PgTrickleError> {
+    let mut toast_cols = Vec::new();
+
+    Spi::connect(|client| {
+        let result = client
+            .select(
+                "SELECT a.attname::text \
+                 FROM pg_catalog.pg_attribute a \
+                 WHERE a.attrelid = $1 \
+                   AND a.attnum > 0 \
+                   AND NOT a.attisdropped \
+                   AND a.attstorage IN ('e', 'x') \
+                 ORDER BY a.attnum",
+                None,
+                &[(source_relid.to_u32() as i64).into()],
+            )
+            .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
+
+        for row in result {
+            if let Some(name) = row.get::<String>(1).ok().flatten() {
+                toast_cols.push(name);
+            }
+        }
+
+        Ok::<(), PgTrickleError>(())
+    })?;
+
+    Ok(toast_cols)
+}
+
 /// Build typed column definitions for a change buffer table.
 ///
 /// Produces SQL fragments like `,\"new_col\" TYPE,\"old_col\" TYPE` for each

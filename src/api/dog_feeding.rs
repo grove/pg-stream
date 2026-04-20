@@ -9,13 +9,14 @@ use crate::error::PgTrickleError;
 
 // ── Dog-feeding stream table definitions ────────────────────────────────────
 
-/// Names of all five dog-feeding stream tables.
+/// Names of all six dog-feeding stream tables.
 const DF_STREAM_TABLES: &[&str] = &[
     "df_efficiency_rolling",
     "df_anomaly_signals",
     "df_threshold_advice",
     "df_cdc_buffer_trends",
     "df_scheduling_interference",
+    "df_frozen_stream_tables",
 ];
 
 /// DF-1: Rolling efficiency statistics over pgt_refresh_history.
@@ -173,6 +174,33 @@ WHERE a.status = 'COMPLETED'
 GROUP BY a.pgt_id, b.pgt_id, sta.pgt_name, stb.pgt_name
 HAVING count(*) >= 3";
 
+/// OPS-2 (v0.24.0): Frozen stream table detector.
+///
+/// Flags any stream table whose last_refresh_at is older than 5× its
+/// refresh_interval while its source tables have recent CDC activity.
+/// This indicates the scheduler is stuck or the ST is misconfigured.
+const DF_FROZEN_STREAM_TABLES_QUERY: &str = "\
+SELECT
+    st.pgt_id,
+    st.pgt_schema,
+    st.pgt_name,
+    st.status,
+    st.refresh_tier,
+    st.last_refresh_at,
+    st.effective_schedule_seconds,
+    now() - st.last_refresh_at AS stale_duration,
+    (SELECT max(h.start_time) \
+     FROM pgtrickle.pgt_refresh_history h \
+     WHERE h.pgt_id = st.pgt_id AND h.status = 'COMPLETED' \
+    ) AS last_successful_refresh,
+    st.consecutive_errors,
+    st.last_error_message
+FROM pgtrickle.pgt_stream_tables st
+WHERE st.status IN ('ACTIVE', 'ERROR')
+  AND st.last_refresh_at IS NOT NULL
+  AND st.effective_schedule_seconds IS NOT NULL
+  AND st.last_refresh_at < now() - make_interval(secs => st.effective_schedule_seconds * 5)";
+
 // ── Schedule and mode assignments ───────────────────────────────────────────
 
 /// Return (schedule, refresh_mode) for each dog-feeding stream table.
@@ -183,6 +211,7 @@ fn df_st_config(name: &str) -> (&'static str, &'static str) {
         "df_threshold_advice" => ("96s", "AUTO"),
         "df_cdc_buffer_trends" => ("48s", "FULL"),
         "df_scheduling_interference" => ("96s", "FULL"),
+        "df_frozen_stream_tables" => ("120s", "FULL"),
         _ => ("60s", "AUTO"),
     }
 }
@@ -195,6 +224,7 @@ fn df_st_query(name: &str) -> &'static str {
         "df_threshold_advice" => DF_THRESHOLD_ADVICE_QUERY,
         "df_cdc_buffer_trends" => DF_CDC_BUFFER_TRENDS_QUERY,
         "df_scheduling_interference" => DF_SCHEDULING_INTERFERENCE_QUERY,
+        "df_frozen_stream_tables" => DF_FROZEN_STREAM_TABLES_QUERY,
         _ => "",
     }
 }
@@ -684,7 +714,7 @@ mod tests {
 
     #[test]
     fn test_df_stream_tables_count() {
-        assert_eq!(DF_STREAM_TABLES.len(), 5);
+        assert_eq!(DF_STREAM_TABLES.len(), 6);
     }
 
     #[test]

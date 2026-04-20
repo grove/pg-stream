@@ -104,13 +104,9 @@ const IMMEDIATE_SKIP_ALLOWLIST: &[&str] = &[
     // q09: 6-table join (nation, supplier, part, partsupp, orders, lineitem)
     // exceeds temp_file_limit (4 GB) — same root cause as q05/q07/q08.
     "q09",
-    // q15: derived-table join with scalar subquery comparison
-    // `total_revenue = (SELECT MAX(...))`.  When an UPDATE to lineitem
-    // changes which supplier has the maximum revenue, the IVM trigger
-    // correctly inserts the new top-supplier row but cannot remove the
-    // old one because the scalar subquery result changed — a known
-    // limitation of trigger-based IVM for non-monotonic WHERE filters.
-    "q15",
+    // EC01-3 (v0.24.0): Q15 removed from allowlist after EC01-1/2 landed.
+    // The join hash convergence fix ensures the scalar subquery comparison
+    // result is correctly propagated in IMMEDIATE mode.
 ];
 
 // ── P3.15: TPCH_STRICT mode ───────────────────────────────────────────

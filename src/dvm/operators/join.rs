@@ -225,6 +225,12 @@ pub fn diff_inner_join(ctx: &mut DiffContext, op: &OpTree) -> Result<DiffResult,
     // phantom row accumulation in the stream table (UNIQUE_VIOLATION in the
     // soak test).
     //
+    // EC01-1 (v0.24.0): Part 1b (ΔL_D ⋈ R₀) uses the SAME hash formula
+    // as Part 1a (ΔL_I ⋈ R₁): hash(left_pks, right_pks).  Because PKs
+    // are immutable, the right-side PK values are identical in R₀ and R₁
+    // for any given join partner, guaranteeing hash convergence across
+    // insert/delete pairs spanning multiple refresh cycles.
+    //
     // For Scan nodes: uses non-nullable (PK) columns directly.
     // For nested join children: falls back to row_to_json for the snapshot
     // side.

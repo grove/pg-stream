@@ -1,8 +1,8 @@
 # pg_trickle — Project Roadmap
 
 > **Last updated:** 2026-04-19
-> **Latest release:** 0.23.0 (2026-04-19)
-> **Current milestone:** v0.24.0 — Join Correctness & Durability Hardening
+> **Latest release:** 0.24.0 (2026-04-20)
+> **Current milestone:** v0.25.0 — Scheduler Scalability & Pooler Performance
 
 For a concise description of what pg_trickle is and why it exists, read
 [ESSENCE.md](ESSENCE.md) — it explains the core problem (full `REFRESH
@@ -94,7 +94,7 @@ from the v0.1.x series to 1.0 and beyond.
 | v0.21.0 | Correctness, safety & test hardening | ✅ Released |
 | v0.22.0 | Production scalability & downstream integration | ✅ Released |
 | v0.23.0 | TPC-H DVM scaling — diagnose and fix differential refresh perf | ✅ Released |
-| v0.24.0 | Join correctness & durability hardening | Planned |
+| v0.24.0 | Join correctness & durability hardening | ✅ Released |
 | v0.25.0 | Scheduler scalability & pooler performance | Planned |
 | v0.26.0 | Test & concurrency hardening | Planned |
 | v0.27.0 | Transactional inbox & outbox patterns | Planned |
@@ -6429,7 +6429,7 @@ Phase 1–5 DVM code changes and the TPC-H scaling investigation. Items marked
 
 ## v0.24.0 — Join Correctness & Durability Hardening
 
-**Status: Planned.** Sourced from [PLAN_OVERALL_ASSESSMENT_2.md](plans/PLAN_OVERALL_ASSESSMENT_2.md) §3, §4, §6.
+**Status: Released (2026-04-20).** Sourced from [PLAN_OVERALL_ASSESSMENT_2.md](plans/PLAN_OVERALL_ASSESSMENT_2.md) §3, §4, §6.
 
 > **Release Theme**
 > This release closes the remaining **critical correctness bugs** and
@@ -6498,25 +6498,25 @@ Phase 1–5 DVM code changes and the TPC-H scaling investigation. Items marked
 > **v0.24.0 total: ~8–9 weeks** (~42 person-days solo)
 
 **Exit criteria:**
-- [ ] EC01-1: Part 1b arm hashes left-side PK only; TPC-H Q07 passes multi-cycle correctness
-- [ ] EC01-2: PH-D1 cleans up prior-cycle phantoms; no residual rows after 10 cycles
-- [ ] EC01-3: Q15 removed from IMMEDIATE_SKIP_ALLOWLIST; TPC-H Q15 passes IMMEDIATE mode
-- [ ] EC01-4: 5,000-iteration proptest passes for JOIN convergence
-- [ ] DUR-1: Two-phase frontier commit implemented; manual and scheduler paths unified
-- [ ] DUR-2: `change_buffer_durability = 'logged'` creates WAL-logged change buffers; `'unlogged'` preserves current behaviour
-- [ ] DUR-3: Crash-recovery E2E: kill bgworker mid-refresh → restart → zero lost/duplicated rows
-- [ ] CDC-1: Zero `unwrap()` calls in `src/cdc.rs` production paths
-- [ ] CDC-2: Converting a source table to partitioned triggers automatic publication rebuild
-- [ ] CDC-3: TOAST-only column update detected and propagated in DIFFERENTIAL mode
-- [ ] CDC-4: jsonb + bytea TOAST E2E tests pass
-- [ ] OPS-1: History older than retention_days is pruned automatically; GUC documented
-- [ ] OPS-2: Frozen-ST detector fires alert when ST stalls with active CDC source
-- [ ] OPS-3: Internal catalog indexes exist; scheduler tick time reduced at 100+ STs
-- [ ] TEST-6: 25+ publication.rs unit tests pass (predictive model boundary cases)
-- [ ] TEST-7: 20+ diagnostics.rs unit tests pass
-- [ ] TEST-8: 10+ metrics_server.rs unit tests pass (port conflict, timeout, format)
-- [ ] Extension upgrade path tested (`0.23.0 → 0.24.0`)
-- [ ] `just check-version-sync` passes
+- [x] EC01-1: Part 1b arm hashes left-side PK only; TPC-H Q07 passes multi-cycle correctness
+- [x] EC01-2: PH-D1 cleans up prior-cycle phantoms; no residual rows after 10 cycles
+- [x] EC01-3: Q15 removed from IMMEDIATE_SKIP_ALLOWLIST; TPC-H Q15 passes IMMEDIATE mode
+- [x] EC01-4: 5,000-iteration proptest passes for JOIN convergence
+- [x] DUR-1: Two-phase frontier commit implemented; manual and scheduler paths unified
+- [x] DUR-2: `change_buffer_durability = 'logged'` creates WAL-logged change buffers; `'unlogged'` preserves current behaviour
+- [x] DUR-3: Crash-recovery E2E: kill bgworker mid-refresh → restart → zero lost/duplicated rows
+- [x] CDC-1: Zero `unwrap()` calls in `src/cdc.rs` production paths
+- [x] CDC-2: Converting a source table to partitioned triggers automatic publication rebuild
+- [x] CDC-3: TOAST-only column update detected and propagated in DIFFERENTIAL mode
+- [x] CDC-4: jsonb + bytea TOAST E2E tests pass
+- [x] OPS-1: History older than retention_days is pruned automatically; GUC documented
+- [x] OPS-2: Frozen-ST detector fires alert when ST stalls with active CDC source
+- [x] OPS-3: Internal catalog indexes exist; scheduler tick time reduced at 100+ STs
+- [x] TEST-6: 25+ publication.rs unit tests pass (predictive model boundary cases)
+- [x] TEST-7: 20+ diagnostics.rs unit tests pass
+- [x] TEST-8: 10+ metrics_server.rs unit tests pass (port conflict, timeout, format)
+- [x] Extension upgrade path tested (`0.23.0 → 0.24.0`)
+- [x] `just check-version-sync` passes
 
 ---
 
