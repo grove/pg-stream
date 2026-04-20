@@ -941,8 +941,8 @@ fn apply_planner_hints(estimated_delta: i64, st_relid: pg_sys::Oid, scan_count: 
                 e
             );
         }
+        // nosemgrep: rust.spi.run.dynamic-format — mb is a numeric value; SET LOCAL cannot use params
         if let Err(e) = Spi::run(&format!("SET LOCAL work_mem = '{mb}MB'")) {
-            // nosemgrep: rust.spi.run.dynamic-format — mb is a numeric value; SET LOCAL cannot use params
             pgrx::debug1!("[pg_trickle] D-1: failed to SET LOCAL work_mem: {}", e);
         }
     } else if estimated_delta >= PLANNER_HINT_NESTLOOP_THRESHOLD {
@@ -1783,8 +1783,8 @@ fn deallocate_prepared_merge_statement(_pgt_id: i64) {
     {
         let pgt_id = _pgt_id;
         let stmt = format!("__pgt_merge_{pgt_id}");
+        // nosemgrep: rust.spi.query.dynamic-format — stmt is derived from numeric pgt_id
         let exists = Spi::get_one::<bool>(&format!(
-            // nosemgrep: rust.spi.query.dynamic-format — stmt is derived from numeric pgt_id
             "SELECT EXISTS(SELECT 1 FROM pg_prepared_statements WHERE name = '{stmt}')"
         ))
         .unwrap_or(Some(false))
@@ -5643,8 +5643,8 @@ pub fn execute_differential_refresh(
             // session within this same backend.
             // Note: DEALLOCATE does not support IF EXISTS in PostgreSQL.
             // Check pg_prepared_statements first to avoid an error.
+            // nosemgrep: rust.spi.query.dynamic-format — stmt_name is derived from numeric pgt_id
             let stale_exists = Spi::get_one::<bool>(&format!(
-                // nosemgrep: rust.spi.query.dynamic-format — stmt_name is derived from numeric pgt_id
                 "SELECT EXISTS(SELECT 1 FROM pg_prepared_statements WHERE name = '{stmt_name}')"
             ))
             .unwrap_or(Some(false))
@@ -5652,8 +5652,8 @@ pub fn execute_differential_refresh(
             if stale_exists {
                 let _ = Spi::run(&format!("DEALLOCATE {stmt_name}")); // nosemgrep: rust.spi.run.dynamic-format — stmt_name is derived from numeric pgt_id, not user input
             }
+            // nosemgrep: rust.spi.run.dynamic-format — stmt_name and type_list are derived from numeric IDs; parameterized_merge_sql is an internal template
             Spi::run(&format!(
-                // nosemgrep: rust.spi.run.dynamic-format — stmt_name and type_list are derived from numeric IDs; parameterized_merge_sql is an internal template
                 "PREPARE {stmt_name} ({type_list}) AS {}",
                 resolved.parameterized_merge_sql
             ))
