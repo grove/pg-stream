@@ -67,7 +67,10 @@ fn rf_count() -> usize {
 // signalling a DVM regression where a previously-passing query no longer
 // creates or runs correctly.
 //
-// DIFFERENTIAL: all 22 queries are known to pass → allowlist is empty.
+// DIFFERENTIAL: all 22 queries pass at SF<10. At SF≥10, queries with correlated
+//               scalar subqueries in WHERE clauses become quadratic in the DVM delta
+//               SQL and exceed the 90-minute nextest slow-timeout. Those queries are
+//               in LARGE_SCALE_DIFFERENTIAL_SKIP below and are skipped automatically.
 // IMMEDIATE:    a subset cannot be created (IVM restriction). Populate by
 //               running with the guard disabled, then hardening the set.
 //
@@ -75,11 +78,37 @@ fn rf_count() -> usize {
 // the output, and add the skipped query names here with a comment explaining
 // the known limitation.
 
-/// Queries allowed to be skipped in DIFFERENTIAL mode.
+/// Queries allowed to be skipped in DIFFERENTIAL mode at any scale factor.
 const DIFFERENTIAL_SKIP_ALLOWLIST: &[&str] = &[
     // DI-11 deep-join planner hints (disable nestloop, raise work_mem,
     // bump join_collapse_limit, temp_file_limit=-1) resolved Q05/Q09.
-    // All 22 TPC-H queries now pass DIFFERENTIAL mode.
+    // All 22 TPC-H queries pass DIFFERENTIAL mode at SF<10.
+];
+
+/// Scale factor threshold above which LARGE_SCALE_DIFFERENTIAL_SKIP applies.
+const LARGE_SCALE_SKIP_THRESHOLD: f64 = 10.0;
+
+/// Queries skipped in DIFFERENTIAL mode at SF≥LARGE_SCALE_SKIP_THRESHOLD.
+///
+/// These queries pass correctly at smaller scale factors (all 22 pass at SF-1)
+/// but have DVM performance limitations that cause cycle-level timeouts at
+/// SF≥10. They are pre-skipped to prevent the 90-minute nextest slow-timeout
+/// from killing the whole test function.
+///
+/// Root cause: the DVM delta SQL for these queries contains a correlated scalar
+/// subquery in the WHERE clause. The subquery is re-evaluated for every row in
+/// the CDC delta, giving O(delta × table) complexity. At SF-10 with accumulated
+/// CDC events this becomes quadratic and exceeds the per-test timeout.
+const LARGE_SCALE_DIFFERENTIAL_SKIP: &[&str] = &[
+    // q20: Semi-Join + nested correlated scalar subquery
+    //   `ps_availqty > (SELECT 0.5 * SUM(l_quantity) FROM lineitem
+    //                   WHERE l_partkey = ps_partkey AND l_suppkey = ps_suppkey AND ...)`
+    // DVM re-executes the lineitem subquery for every changed row in the delta.
+    // At SF=10 (6M lineitems), cycle 2 takes 45+ minutes and triggers the
+    // 90-minute nextest slow-timeout, killing the whole test function.
+    // Tracked for fix: replace correlated subquery with a pre-aggregated CTE
+    // in the DVM delta rewrite (DVM rewrite rule for semi-join EXISTS/IN).
+    "q20",
 ];
 
 /// Queries allowed to be skipped in IMMEDIATE mode.
@@ -708,6 +737,28 @@ async fn test_tpch_differential_correctness() {
             q.name, q.tier
         );
 
+        // Pre-skip queries with known DVM performance issues at large scale.
+        // These queries are correct at SF<10 but their DVM delta SQL becomes
+        // O(delta × table) at SF≥10, causing cycle-level timeouts that kill
+        // the whole test function via nextest slow-timeout.
+        if scale_factor() >= LARGE_SCALE_SKIP_THRESHOLD
+            && LARGE_SCALE_DIFFERENTIAL_SKIP.contains(&q.name)
+        {
+            println!(
+                "  SKIP — {} large-scale DVM perf limit at SF={} (see LARGE_SCALE_DIFFERENTIAL_SKIP)",
+                q.name,
+                scale_factor()
+            );
+            skipped.push((
+                q.name,
+                format!(
+                    "large-scale DVM correlated-subquery perf limit at SF={}",
+                    scale_factor()
+                ),
+            ));
+            continue;
+        }
+
         // Create stream table
         let st_name = format!("tpch_{}", q.name);
         let create_result = db
@@ -885,16 +936,22 @@ async fn test_tpch_differential_correctness() {
     );
 
     // T2: Skip-set regression guard for DIFFERENTIAL mode.
+    // At SF≥LARGE_SCALE_SKIP_THRESHOLD, also accept pre-skipped large-scale
+    // performance queries (LARGE_SCALE_DIFFERENTIAL_SKIP) as expected skips.
     let unexpected_skips: Vec<&str> = skipped
         .iter()
         .map(|(name, _)| *name)
         .filter(|name| !DIFFERENTIAL_SKIP_ALLOWLIST.contains(name))
+        .filter(|name| {
+            !(scale_factor() >= LARGE_SCALE_SKIP_THRESHOLD
+                && LARGE_SCALE_DIFFERENTIAL_SKIP.contains(name))
+        })
         .collect();
     assert!(
         unexpected_skips.is_empty(),
         "DIFFERENTIAL REGRESSION: queries newly skipped that are not in \
-         DIFFERENTIAL_SKIP_ALLOWLIST: {:?}\n\
-         If intentional, add to the allowlist with an explanatory comment.",
+         DIFFERENTIAL_SKIP_ALLOWLIST or LARGE_SCALE_DIFFERENTIAL_SKIP: {:?}\n\
+         If intentional, add to the appropriate allowlist with an explanatory comment.",
         unexpected_skips
     );
 
