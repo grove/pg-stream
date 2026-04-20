@@ -357,8 +357,14 @@ fn base_seed() -> u64 {
 /// server PANIC is a failure.
 ///
 /// Run with: `just sqlancer-fast` or `SQLANCER_CASES=10000 just sqlancer-fast`.
-/// Run the crash oracle logic (extracted so it can be called from combined test).
-async fn run_crash_oracle() {
+/// Run the crash oracle logic.
+///
+/// Accepts a shared `E2eDb` so that the combined CI test (`test_sqlancer_ci_combined`)
+/// can reuse a single database across all three oracle phases, keeping the number of
+/// active PostgreSQL databases — and thus pg_trickle background workers consuming
+/// DSM — bounded to one.  Each iteration cleans up its tables so the database stays
+/// lean throughout a long run.
+async fn run_crash_oracle(db: &E2eDb) {
     let cases = sqlancer_cases();
     let seed = base_seed();
 
@@ -368,13 +374,6 @@ async fn run_crash_oracle() {
     let mut crashes = 0usize;
     let mut structured_errors = 0usize;
     let mut successes = 0usize;
-
-    // One shared database for the entire oracle run.  Each iteration uses
-    // index-scoped table names (e.g. t_ss_0, t_ss_1, …) so there are no
-    // cross-iteration conflicts.  This avoids creating thousands of databases
-    // in the shared container, which exhausts its /dev/shm (POSIX shared
-    // memory used by PostgreSQL background workers).
-    let db = E2eDb::new().await.with_extension().await;
 
     for (i, gq) in queries.iter().enumerate() {
         // Create tables and insert data.
@@ -438,6 +437,19 @@ async fn run_crash_oracle() {
                 i + 1
             );
         }
+
+        // Cleanup: drop the stream table (if it was created) and all source tables
+        // so they do not accumulate across iterations.  Without this, thousands of
+        // tables build up in the shared database, eventually exhausting the
+        // container's /dev/shm via pg_trickle background-worker DSM usage.
+        let _ = db
+            .try_execute(&format!("SELECT pgtrickle.drop_stream_table('{st_name}')"))
+            .await;
+        for tbl in &gq.tables {
+            let _ = db
+                .try_execute(&format!("DROP TABLE IF EXISTS {}", tbl.name))
+                .await;
+        }
     }
 
     println!(
@@ -455,11 +467,15 @@ async fn run_crash_oracle() {
 #[tokio::test]
 #[ignore]
 async fn test_sqlancer_crash_oracle() {
-    run_crash_oracle().await;
+    let db = E2eDb::new().await.with_extension().await;
+    run_crash_oracle(&db).await;
 }
 
-/// Run the equivalence oracle logic (extracted so it can be called from combined test).
-async fn run_equivalence_oracle() {
+/// Run the equivalence oracle logic.
+///
+/// See [`run_crash_oracle`] for the rationale behind the shared-database approach
+/// and per-iteration cleanup.
+async fn run_equivalence_oracle(db: &E2eDb) {
     let cases = sqlancer_cases();
     let seed = base_seed();
 
@@ -470,9 +486,6 @@ async fn run_equivalence_oracle() {
     let mut skipped = 0usize;
     let mut checked = 0usize;
 
-    // One shared database for the entire oracle run (see run_crash_oracle for rationale).
-    let db = E2eDb::new().await.with_extension().await;
-
     for (i, gq) in queries.iter().enumerate() {
         // Create source tables.
         for tbl in &gq.tables {
@@ -481,7 +494,8 @@ async fn run_equivalence_oracle() {
             db.execute(&tbl.insert_dml(&mut rng)).await;
         }
 
-        // Attempt to create + populate a FULL-mode stream table.
+        // Attempt to create + populate a FULL-mode stream table, then compare.
+        // Use an inner async block so cleanup always runs regardless of the exit path.
         let st_name = format!("sqlancer_eq_{i}");
         let create_sql = format!(
             "SELECT pgtrickle.create_stream_table(\
@@ -492,36 +506,50 @@ async fn run_equivalence_oracle() {
              )",
             gq.query
         );
-
-        if db.try_execute(&create_sql).await.is_err() {
-            skipped += 1;
-            continue;
-        }
-
-        // Force a FULL refresh.
         let refresh_sql = format!("SELECT pgtrickle.refresh_stream_table('{st_name}')");
-        if db.try_execute(&refresh_sql).await.is_err() {
-            skipped += 1;
-            continue;
+
+        let result: Option<(i64, i64)> = async {
+            if db.try_execute(&create_sql).await.is_err() {
+                return None;
+            }
+            if db.try_execute(&refresh_sql).await.is_err() {
+                return None;
+            }
+            let st_count: i64 = db
+                .query_scalar(&format!("SELECT COUNT(*) FROM public.{st_name}"))
+                .await;
+            let direct_count: i64 = db
+                .query_scalar(&format!("SELECT COUNT(*) FROM ({}) AS _q", gq.query))
+                .await;
+            Some((st_count, direct_count))
+        }
+        .await;
+
+        // Cleanup: always drop the stream table and source tables so they do not
+        // accumulate across iterations (see run_crash_oracle for rationale).
+        let _ = db
+            .try_execute(&format!("SELECT pgtrickle.drop_stream_table('{st_name}')"))
+            .await;
+        for tbl in &gq.tables {
+            let _ = db
+                .try_execute(&format!("DROP TABLE IF EXISTS {}", tbl.name))
+                .await;
         }
 
-        // Compare row counts.
-        let st_count: i64 = db
-            .query_scalar(&format!("SELECT COUNT(*) FROM public.{st_name}"))
-            .await;
-
-        let direct_count: i64 = db
-            .query_scalar(&format!("SELECT COUNT(*) FROM ({}) AS _q", gq.query))
-            .await;
-
-        checked += 1;
-
-        if st_count != direct_count {
-            let msg = format!(
-                "count mismatch: st={st_count} vs direct={direct_count} | query: {}",
-                gq.query
-            );
-            mismatches.push((gq.seed, gq.description.clone(), msg));
+        match result {
+            None => {
+                skipped += 1;
+            }
+            Some((st_count, direct_count)) => {
+                checked += 1;
+                if st_count != direct_count {
+                    let msg = format!(
+                        "count mismatch: st={st_count} vs direct={direct_count} | query: {}",
+                        gq.query
+                    );
+                    mismatches.push((gq.seed, gq.description.clone(), msg));
+                }
+            }
         }
 
         if (i + 1) % 50 == 0 {
@@ -557,7 +585,8 @@ async fn run_equivalence_oracle() {
 #[tokio::test]
 #[ignore]
 async fn test_sqlancer_equivalence_oracle() {
-    run_equivalence_oracle().await;
+    let db = E2eDb::new().await.with_extension().await;
+    run_equivalence_oracle(&db).await;
 }
 
 // ── DML mutation helpers ───────────────────────────────────────────────────
@@ -635,7 +664,10 @@ fn apply_random_mutation(rng: &mut Lcg, tbl: &TestTable, next_id: &mut u64) -> S
 /// surface after an UPDATE or DELETE (e.g. incorrect delta computation).
 ///
 /// Run via `just sqlancer-fast` (combines SQLANCER-1 through SQLANCER-3).
-async fn run_diff_vs_full_oracle() {
+///
+/// See [`run_crash_oracle`] for the rationale behind the shared-database approach
+/// and per-iteration cleanup.
+async fn run_diff_vs_full_oracle(db: &E2eDb) {
     let cases = sqlancer_cases();
     let seed = base_seed();
     println!("[sqlancer-3] diff-vs-full oracle: {cases} cases, seed=0x{seed:016x}");
@@ -644,9 +676,6 @@ async fn run_diff_vs_full_oracle() {
     let mut mismatches: Vec<(u64, String, String)> = Vec::new();
     let mut skipped = 0usize;
     let mut checked = 0usize;
-
-    // One shared database for the entire oracle run (see run_crash_oracle for rationale).
-    let db = E2eDb::new().await.with_extension().await;
 
     for (i, gq) in queries.iter().enumerate() {
         for tbl in &gq.tables {
@@ -675,61 +704,84 @@ async fn run_diff_vs_full_oracle() {
             gq.query
         );
 
-        // Skip if DIFFERENTIAL mode is not supported for this query.
-        if db.try_execute(&create_diff).await.is_err() {
-            skipped += 1;
-            continue;
-        }
-        if db.try_execute(&create_full).await.is_err() {
-            skipped += 1;
-            continue;
-        }
-
         let refresh_diff_sql = format!("SELECT pgtrickle.refresh_stream_table('{st_diff}')");
         let refresh_full_sql = format!("SELECT pgtrickle.refresh_stream_table('{st_full}')");
 
-        if db.try_execute(&refresh_diff_sql).await.is_err()
-            || db.try_execute(&refresh_full_sql).await.is_err()
-        {
-            skipped += 1;
-            continue;
-        }
-
-        // Apply a short DML sequence (4 mutations) to the first source table.
-        let mut rng = Lcg::new(gq.seed ^ 0xabcdef1234567890);
-        let mut next_id = 10_000u64 + (i as u64 * 500);
-        if let Some(tbl) = gq.tables.first() {
-            for _ in 0..4 {
-                let sql = apply_random_mutation(&mut rng, tbl, &mut next_id);
-                let _ = db.try_execute(&sql).await;
+        // Run the oracle logic in an inner async block so cleanup always runs
+        // regardless of which early-exit path is taken.
+        let result: Option<(i64, i64)> = async {
+            // Skip if DIFFERENTIAL mode is not supported for this query.
+            if db.try_execute(&create_diff).await.is_err() {
+                return None;
             }
+            if db.try_execute(&create_full).await.is_err() {
+                return None;
+            }
+
+            if db.try_execute(&refresh_diff_sql).await.is_err()
+                || db.try_execute(&refresh_full_sql).await.is_err()
+            {
+                return None;
+            }
+
+            // Apply a short DML sequence (4 mutations) to the first source table.
+            let mut rng = Lcg::new(gq.seed ^ 0xabcdef1234567890);
+            let mut next_id = 10_000u64 + (i as u64 * 500);
+            if let Some(tbl) = gq.tables.first() {
+                for _ in 0..4 {
+                    let sql = apply_random_mutation(&mut rng, tbl, &mut next_id);
+                    let _ = db.try_execute(&sql).await;
+                }
+            }
+
+            if db.try_execute(&refresh_diff_sql).await.is_err()
+                || db.try_execute(&refresh_full_sql).await.is_err()
+            {
+                return None;
+            }
+
+            let diff_count: i64 = db
+                .query_scalar(&format!("SELECT COUNT(*) FROM public.{st_diff}"))
+                .await;
+            let full_count: i64 = db
+                .query_scalar(&format!("SELECT COUNT(*) FROM public.{st_full}"))
+                .await;
+
+            Some((diff_count, full_count))
+        }
+        .await;
+
+        // Cleanup: always drop both stream tables and all source tables so they do
+        // not accumulate across iterations (see run_crash_oracle for rationale).
+        let _ = db
+            .try_execute(&format!("SELECT pgtrickle.drop_stream_table('{st_diff}')"))
+            .await;
+        let _ = db
+            .try_execute(&format!("SELECT pgtrickle.drop_stream_table('{st_full}')"))
+            .await;
+        for tbl in &gq.tables {
+            let _ = db
+                .try_execute(&format!("DROP TABLE IF EXISTS {}", tbl.name))
+                .await;
         }
 
-        if db.try_execute(&refresh_diff_sql).await.is_err()
-            || db.try_execute(&refresh_full_sql).await.is_err()
-        {
-            skipped += 1;
-            continue;
-        }
-
-        let diff_count: i64 = db
-            .query_scalar(&format!("SELECT COUNT(*) FROM public.{st_diff}"))
-            .await;
-        let full_count: i64 = db
-            .query_scalar(&format!("SELECT COUNT(*) FROM public.{st_full}"))
-            .await;
-
-        checked += 1;
-
-        if diff_count != full_count {
-            mismatches.push((
-                gq.seed,
-                gq.description.clone(),
-                format!(
-                    "count mismatch after DML: diff={diff_count} vs full={full_count} | query: {}",
-                    gq.query
-                ),
-            ));
+        match result {
+            None => {
+                skipped += 1;
+            }
+            Some((diff_count, full_count)) => {
+                checked += 1;
+                if diff_count != full_count {
+                    mismatches.push((
+                        gq.seed,
+                        gq.description.clone(),
+                        format!(
+                            "count mismatch after DML: diff={diff_count} vs full={full_count} | query: {}",
+                            gq.query
+                        ),
+                    ));
+                }
+            }
         }
 
         if (i + 1) % 25 == 0 {
@@ -766,7 +818,8 @@ async fn run_diff_vs_full_oracle() {
 #[tokio::test]
 #[ignore]
 async fn test_sqlancer_diff_vs_full_oracle() {
-    run_diff_vs_full_oracle().await;
+    let db = E2eDb::new().await.with_extension().await;
+    run_diff_vs_full_oracle(&db).await;
 }
 
 // ── SQLANCER-4: Stateful DML fuzzing ──────────────────────────────────────
@@ -962,10 +1015,19 @@ async fn test_sqlancer_stateful_dml() {
 /// case count (default 200 for quick CI runs; 2 000 for nightly).
 /// The stateful DML soak test (SQLANCER-4) runs separately via
 /// `test_sqlancer_stateful_dml` with `SQLANCER_MUTATIONS=10000`.
+///
+/// All three oracle phases share a **single** `E2eDb` (and therefore a single
+/// PostgreSQL database).  The previous approach created one database per oracle
+/// phase; since pg_trickle background workers allocate POSIX shared memory
+/// (DSM) for each active database, three live databases could exhaust the
+/// container's `/dev/shm` (512 MB) before the equivalence oracle even started.
+/// Sharing one database keeps DSM usage bounded.  Each oracle function cleans
+/// up its tables after every iteration so the database stays lean.
 #[tokio::test]
 #[ignore]
 async fn test_sqlancer_ci_combined() {
-    run_crash_oracle().await;
-    run_equivalence_oracle().await;
-    run_diff_vs_full_oracle().await;
+    let db = E2eDb::new().await.with_extension().await;
+    run_crash_oracle(&db).await;
+    run_equivalence_oracle(&db).await;
+    run_diff_vs_full_oracle(&db).await;
 }
