@@ -1793,9 +1793,13 @@ impl ExecutionUnitDag {
         );
 
         // Collect external downstream edges of the LAST unit in the chain.
-        let last_id = *chain
-            .last() // nosemgrep: rust.panic-in-sql-path — chain is always non-empty by construction in build_execution_units
-            .expect("chain is always non-empty by construction in build_execution_units");
+        let last_id = match chain.last() {
+            Some(&id) => id,
+            // SAFETY: chain is always non-empty by construction in build_execution_units
+            None => pgrx::error!(
+                "unreachable: chain is always non-empty by construction in build_execution_units"
+            ),
+        };
         let external_downstream: Vec<ExecutionUnitId> =
             self.edges.get(&last_id).cloned().unwrap_or_default();
 

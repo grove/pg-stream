@@ -942,6 +942,7 @@ fn apply_planner_hints(estimated_delta: i64, st_relid: pg_sys::Oid, scan_count: 
             );
         }
         if let Err(e) = Spi::run(&format!("SET LOCAL work_mem = '{mb}MB'")) {
+            // nosemgrep: rust.spi.run.dynamic-format — mb is a numeric GUC value, not user input; SET LOCAL GUC cannot be parameterized
             pgrx::debug1!("[pg_trickle] D-1: failed to SET LOCAL work_mem: {}", e);
         }
     } else if estimated_delta >= PLANNER_HINT_NESTLOOP_THRESHOLD {
@@ -1783,12 +1784,13 @@ fn deallocate_prepared_merge_statement(_pgt_id: i64) {
         let pgt_id = _pgt_id;
         let stmt = format!("__pgt_merge_{pgt_id}");
         let exists = Spi::get_one::<bool>(&format!(
+            // nosemgrep: rust.spi.query.dynamic-format — stmt is derived from numeric pgt_id, not user input
             "SELECT EXISTS(SELECT 1 FROM pg_prepared_statements WHERE name = '{stmt}')"
         ))
         .unwrap_or(Some(false))
         .unwrap_or(false);
         if exists {
-            let _ = Spi::run(&format!("DEALLOCATE {stmt}"));
+            let _ = Spi::run(&format!("DEALLOCATE {stmt}")); // nosemgrep: rust.spi.run.dynamic-format — stmt is derived from numeric pgt_id, not user input
         }
     }
 }
@@ -2746,7 +2748,7 @@ pub fn execute_full_refresh(st: &StreamTableMeta) -> Result<(i64, i64), PgTrickl
     // Suppress user triggers during TRUNCATE + INSERT to prevent
     // spurious trigger invocations with wrong semantics.
     if has_triggers {
-        Spi::run(&format!("ALTER TABLE {quoted_table} DISABLE TRIGGER USER"))
+        Spi::run(&format!("ALTER TABLE {quoted_table} DISABLE TRIGGER USER")) // nosemgrep: rust.spi.run.dynamic-format — ALTER TABLE DDL cannot be parameterized; quoted_table is a PostgreSQL-quoted identifier
             .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
     }
 
@@ -2816,7 +2818,7 @@ pub fn execute_full_refresh(st: &StreamTableMeta) -> Result<(i64, i64), PgTrickl
     };
 
     // Truncate
-    Spi::run(&format!("TRUNCATE {quoted_table}"))
+    Spi::run(&format!("TRUNCATE {quoted_table}")) // nosemgrep: rust.spi.run.dynamic-format — TRUNCATE DDL cannot be parameterized; quoted_table is a PostgreSQL-quoted identifier
         .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
 
     // Compute row_id using the same hash formula as the delta query so
@@ -2892,7 +2894,7 @@ pub fn execute_full_refresh(st: &StreamTableMeta) -> Result<(i64, i64), PgTrickl
     // Re-enable user triggers and emit NOTIFY so listeners know a FULL
     // refresh occurred.
     if has_triggers {
-        Spi::run(&format!("ALTER TABLE {quoted_table} ENABLE TRIGGER USER"))
+        Spi::run(&format!("ALTER TABLE {quoted_table} ENABLE TRIGGER USER")) // nosemgrep: rust.spi.run.dynamic-format — ALTER TABLE DDL cannot be parameterized; quoted_table is a PostgreSQL-quoted identifier
             .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
 
         // PB2/STAB-1: Skip NOTIFY when pooler compatibility mode is enabled.
@@ -5114,7 +5116,7 @@ pub fn execute_differential_refresh(
             schema.replace('"', "\"\""),
             name.replace('"', "\"\""),
         );
-        Spi::run(&format!("ALTER TABLE {quoted_table} DISABLE TRIGGER USER"))
+        Spi::run(&format!("ALTER TABLE {quoted_table} DISABLE TRIGGER USER")) // nosemgrep: rust.spi.run.dynamic-format — ALTER TABLE DDL cannot be parameterized; quoted_table is a PostgreSQL-quoted identifier
             .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
     }
 
@@ -5642,14 +5644,16 @@ pub fn execute_differential_refresh(
             // Note: DEALLOCATE does not support IF EXISTS in PostgreSQL.
             // Check pg_prepared_statements first to avoid an error.
             let stale_exists = Spi::get_one::<bool>(&format!(
+                // nosemgrep: rust.spi.query.dynamic-format — stmt_name is derived from numeric pgt_id, not user input
                 "SELECT EXISTS(SELECT 1 FROM pg_prepared_statements WHERE name = '{stmt_name}')"
             ))
             .unwrap_or(Some(false))
             .unwrap_or(false);
             if stale_exists {
-                let _ = Spi::run(&format!("DEALLOCATE {stmt_name}"));
+                let _ = Spi::run(&format!("DEALLOCATE {stmt_name}")); // nosemgrep: rust.spi.run.dynamic-format — stmt_name is derived from numeric pgt_id, not user input
             }
             Spi::run(&format!(
+                // nosemgrep: rust.spi.run.dynamic-format — stmt_name and type_list are derived from numeric IDs; parameterized_merge_sql is an internal template
                 "PREPARE {stmt_name} ({type_list}) AS {}",
                 resolved.parameterized_merge_sql
             ))
@@ -5688,7 +5692,7 @@ pub fn execute_differential_refresh(
             schema.replace('"', "\"\""),
             name.replace('"', "\"\""),
         );
-        Spi::run(&format!("ALTER TABLE {quoted_table} ENABLE TRIGGER USER"))
+        Spi::run(&format!("ALTER TABLE {quoted_table} ENABLE TRIGGER USER")) // nosemgrep: rust.spi.run.dynamic-format — ALTER TABLE DDL cannot be parameterized; quoted_table is a PostgreSQL-quoted identifier
             .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
     }
 
