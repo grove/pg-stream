@@ -563,7 +563,7 @@ CREATE  FUNCTION pgtrickle."dog_feeding_status"() RETURNS TABLE (
 )
 STRICT 
 LANGUAGE c /* Rust */
-AS 'MODULE_PATHNAME', 'dog_feeding_status_wrapper';
+AS 'MODULE_PATHNAME', 'self_monitoring_status_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
@@ -1113,7 +1113,7 @@ AS 'MODULE_PATHNAME', 'refresh_timeline_wrapper';
 CREATE  FUNCTION pgtrickle."setup_dog_feeding"() RETURNS void
 STRICT 
 LANGUAGE c /* Rust */
-AS 'MODULE_PATHNAME', 'setup_dog_feeding_wrapper';
+AS 'MODULE_PATHNAME', 'setup_self_monitoring_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
@@ -1769,7 +1769,7 @@ AS 'MODULE_PATHNAME', 'get_refresh_history_wrapper';
 CREATE  FUNCTION pgtrickle."teardown_dog_feeding"() RETURNS void
 STRICT 
 LANGUAGE c /* Rust */
-AS 'MODULE_PATHNAME', 'teardown_dog_feeding_wrapper';
+AS 'MODULE_PATHNAME', 'teardown_self_monitoring_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */

@@ -39,10 +39,9 @@ CREATE INDEX IF NOT EXISTS idx_pgt_rh_pgt_action_ts
 CREATE INDEX IF NOT EXISTS idx_pgt_ct_source_relid
     ON pgtrickle.pgt_change_tracking (source_relid);
 
--- RENAME-1: Rename self_monitoring → self_monitoring SQL API.
--- The "self monitoring" terminology was a misnomer; the industry term is
--- "dogfooding" but the feature name has been standardised to the clearer
--- and more professional "self_monitoring".
+-- RENAME-1: Rename dog_feeding → self_monitoring SQL API.
+-- The "dog_feeding" terminology was internal jargon; the feature has been
+-- renamed to the clearer and more professional "self_monitoring".
 --
 -- Create new functions backed by the renamed Rust wrapper symbols.
 CREATE OR REPLACE FUNCTION pgtrickle."setup_self_monitoring"() RETURNS void
@@ -64,10 +63,10 @@ CREATE OR REPLACE FUNCTION pgtrickle."self_monitoring_status"() RETURNS TABLE (
     LANGUAGE c STRICT
 AS 'MODULE_PATHNAME', 'self_monitoring_status_wrapper';
 
--- Drop the old function names.
-DROP FUNCTION IF EXISTS pgtrickle."setup_self_monitoring"();
-DROP FUNCTION IF EXISTS pgtrickle."teardown_self_monitoring"();
-DROP FUNCTION IF EXISTS pgtrickle."self_monitoring_status"();
+-- Drop the old function names (dog_feeding → self_monitoring rename).
+DROP FUNCTION IF EXISTS pgtrickle."setup_dog_feeding"();
+DROP FUNCTION IF EXISTS pgtrickle."teardown_dog_feeding"();
+DROP FUNCTION IF EXISTS pgtrickle."dog_feeding_status"();
 
 -- Update initiated_by CHECK constraint: add SELF_MONITOR, remove SELF_MONITOR.
 -- Use a two-step approach: drop the old constraint, add the new one.
