@@ -433,8 +433,8 @@ pub fn rebuild_publication_for_partitioned_source(
 
     // Drop and recreate to ensure publish_via_partition_root is set.
     // Both identifiers are properly quoted above before interpolation.
+    // nosemgrep: rust.spi.run.dynamic-format — DDL cannot be parameterized; identifiers are quoted via quote_ident
     Spi::run(&format!(
-        // nosemgrep: rust.spi.run.dynamic-format — DDL cannot be parameterized; identifiers are quoted via quote_ident
         "DROP PUBLICATION IF EXISTS {pub_name_quoted}; \
          CREATE PUBLICATION {pub_name_quoted} FOR TABLE {table_name} \
          WITH (publish_via_partition_root = true)"
