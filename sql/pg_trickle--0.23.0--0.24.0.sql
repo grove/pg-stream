@@ -53,12 +53,12 @@ CREATE OR REPLACE FUNCTION pgtrickle."teardown_self_monitoring"() RETURNS void
 AS 'MODULE_PATHNAME', 'teardown_self_monitoring_wrapper';
 
 CREATE OR REPLACE FUNCTION pgtrickle."self_monitoring_status"() RETURNS TABLE (
-    st_name text,
-    exists bool,
-    status text,
-    refresh_mode text,
-    last_refresh_at text,
-    total_refreshes bigint
+    "st_name" text,
+    "exists" bool,
+    "status" text,
+    "refresh_mode" text,
+    "last_refresh_at" text,
+    "total_refreshes" bigint
 )
     LANGUAGE c STRICT
 AS 'MODULE_PATHNAME', 'self_monitoring_status_wrapper';
