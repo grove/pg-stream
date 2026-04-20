@@ -7,6 +7,7 @@ For future plans and upcoming features, see [ROADMAP.md](ROADMAP.md).
 ## Table of Contents
 
 <!-- TOC start -->
+- [0.24.0 — Join Correctness & Durability Hardening](#0240--join-correctness--durability-hardening)
 - [Unreleased](#unreleased)
 - [0.24.0 — Join Correctness & Durability Hardening](#0240--join-correctness--durability-hardening)
 - [0.23.0 — Performance Tuning & Diagnostics](#0230--performance-tuning--diagnostics)
@@ -41,6 +42,83 @@ For future plans and upcoming features, see [ROADMAP.md](ROADMAP.md).
 <!-- TOC end -->
 
 ---
+
+## [0.24.0] — Join Correctness & Durability Hardening
+
+### Join Correctness (EC-01)
+
+- **Row-id hash convergence** (EC01-1) — Part 1b (ΔL_D ⋈ R₀) now uses the
+  same canonical hash formula as Part 1a (ΔL_I ⋈ R₁), guaranteeing that
+  insert/delete pairs for the same logical row produce identical
+  `__pgt_row_id` values across refresh cycles. Prevents phantom row
+  accumulation in multi-table JOIN stream tables.
+
+- **Cross-cycle phantom cleanup** (EC01-2) — The PH-D1 delete path now
+  reconciles orphaned row IDs from prior cycles, not just the current delta.
+  After a differential refresh, any rows in the stream table that don't
+  exist in the full-refresh result set are detected and removed in batches.
+
+- **Q15 IMMEDIATE mode** (EC01-3) — TPC-H Q15 removed from the
+  `IMMEDIATE_SKIP_ALLOWLIST` after the EC-01 join fixes landed.
+
+- **Proptest harness** (EC01-4) — New 5,000-iteration property tests verify
+  that INSERT/UPDATE/DELETE sequences on multi-table JOINs converge to the
+  same result as a full refresh, regardless of change ordering.
+
+### Durability & Frontier Atomicity
+
+- **Two-phase frontier commit** (DUR-1) — The scheduler now writes a
+  tentative frontier before the MERGE, then promotes it after commit. On
+  crash recovery, tentative frontiers are reconciled based on change buffer
+  state, eliminating the window where a crash between TRUNCATE and frontier
+  store could replay or lose rows.
+
+  New catalog column: `tentative_frontier` on `pgt_stream_tables`.
+
+- **`pg_trickle.change_buffer_durability` GUC** (DUR-2) — New three-valued
+  GUC controlling change buffer WAL behavior:
+  - `unlogged` (default): UNLOGGED tables, maximum throughput, lost on crash.
+  - `logged`: WAL-logged, survives crash, replicated to standbys.
+  - `sync`: WAL-logged + synchronous commit, maximum durability.
+
+### CDC Hardening
+
+- **Zero `unwrap()` in production CDC code** (CDC-1) — All `unwrap()` calls
+  in `src/cdc.rs` are now confined to test code. New error variant
+  `ChangedColsBitmaskFailed` added for future safety.
+
+- **Partitioned-source publication rebuild** (CDC-2) — On scheduler tick,
+  partitioned source tables are checked for correct
+  `publish_via_partition_root` configuration. Mismatched publications are
+  automatically rebuilt with the correct setting.
+
+- **TOAST-aware CDC hashing** (CDC-3) — Columns with `attstorage IN ('e', 'x')`
+  (external/extended TOAST) now include `pg_column_size()` in the row-id hash,
+  detecting in-place TOAST rewrites that would otherwise be invisible to CDC.
+
+### Operational Improvements
+
+- **History retention pruning** (OPS-1) — The scheduler now prunes rows from
+  `pgt_refresh_history` older than `pg_trickle.history_retention_days` (default
+  90) in 1k-row batches during idle ticks. Previously, history grew unbounded.
+
+- **Frozen-stream-table detector** (OPS-2) — New dog-feeding view
+  `df_frozen_stream_tables` flags any stream table whose `last_refresh_at`
+  is older than 5× its refresh interval. Alerts via `pgtrickle_alert` NOTIFY.
+
+- **Internal catalog indexes** (OPS-3) — Added composite indexes on:
+  - `pgt_stream_tables(status, scc_id)`
+  - `pgt_refresh_history(pgt_id, action, data_timestamp)`
+  - `pgt_change_tracking(source_relid)`
+
+### Testing
+
+- **25+ unit tests** for `publication.rs` (TEST-6): SLA tier assignment
+  boundary cases, parse_qualified_name edge cases, quote_ident variations.
+- **20+ unit tests** for `diagnostics.rs` (TEST-7): Duration parsing,
+  version validation, format routing.
+- **10+ unit tests** for `metrics_server.rs` (TEST-8): HTTP request routing,
+  OpenMetrics content-type, port-zero disablement, health endpoints.
 
 ## [Unreleased]
 

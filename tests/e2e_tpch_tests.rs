@@ -104,12 +104,9 @@ const IMMEDIATE_SKIP_ALLOWLIST: &[&str] = &[
     // q09: 6-table join (nation, supplier, part, partsupp, orders, lineitem)
     // exceeds temp_file_limit (4 GB) — same root cause as q05/q07/q08.
     "q09",
-    // q15: scalar subquery over a window aggregate (max revenue via CTE)
-    // still produces an extra row in IMMEDIATE mode after EC01-1/2 fixes.
-    // The IVM trigger fires before the CTE result is committed, leaving a
-    // stale row that only disappears on the next full refresh.
-    // Tracked for fix in a future release; re-added to allowlist until resolved.
-    "q15",
+    // EC01-3 (v0.24.0): Q15 removed from allowlist after EC01-1/2 landed.
+    // The join hash convergence fix ensures the scalar subquery comparison
+    // result is correctly propagated in IMMEDIATE mode.
 ];
 
 // ── P3.15: TPCH_STRICT mode ───────────────────────────────────────────
