@@ -4720,8 +4720,8 @@ fn get_data_timestamp_str() -> String {
 /// This matches the version reported by `pg_extension.extversion`.
 // ── Sub-modules ─────────────────────────────────────────────────────────────
 mod diagnostics;
-mod dog_feeding;
 mod helpers;
+mod self_monitoring;
 
 // Re-export public items from sub-modules so external callers are unaffected.
 pub use helpers::*;

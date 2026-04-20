@@ -1,4 +1,4 @@
-# PLAN: Dog-Feeding — pg_trickle Monitoring Itself via Stream Tables
+# PLAN: Self-Monitoring — pg_trickle Monitoring Itself via Stream Tables
 
 **Date:** 2026-04-13
 **Status:** Proposed
@@ -13,7 +13,7 @@ to power reactive adaptive logic, anomaly detection, and operational analytics.
 2. [Architecture](#2-architecture)
 3. [Bootstrap Problem & Safety Boundary](#3-bootstrap-problem--safety-boundary)
 4. [Current Adaptive Logic Inventory](#4-current-adaptive-logic-inventory)
-5. [Dog-Feeding Stream Tables](#5-dog-feeding-stream-tables)
+5. [Self-Monitoring Stream Tables](#5-self-monitoring-stream-tables)
 6. [Reactive Policy Layer](#6-reactive-policy-layer)
 7. [Implementation Phases](#7-implementation-phases)
 8. [Testing Strategy](#8-testing-strategy)
@@ -67,7 +67,7 @@ that learns from multi-cycle, cross-ST patterns.
   scheduler dispatch loop remain in Rust (§3)
 - Automatic unsupervised reconfiguration — the policy layer is advisory by
   default; auto-apply is opt-in per GUC
-- Supporting dog-feeding on day one of a fresh install — stream tables require
+- Supporting self-monitoring on day one of a fresh install — stream tables require
   history to exist first
 
 ---
@@ -130,7 +130,7 @@ to today. This eliminates the bootstrapping cycle described in §3.
 
 ### The Problem
 
-If the scheduler needed a dog-feeding stream table to decide whether to refresh
+If the scheduler needed a self-monitoring stream table to decide whether to refresh
 a stream table, it would need pg_trickle to be running to run pg_trickle. This
 creates a circular dependency:
 
@@ -144,7 +144,7 @@ scheduler tick
 
 ### The Solution: Strict Layering
 
-| Component | Layer | Depends on dog-feeding? |
+| Component | Layer | Depends on self-monitoring? |
 |-----------|-------|------------------------|
 | `compute_adaptive_threshold()` | Control plane | **No** — uses only `auto_threshold` and `last_full_ms` from catalog |
 | `compute_adaptive_poll_ms()` | Control plane | **No** — uses only in-memory state |
@@ -153,19 +153,19 @@ scheduler tick
 | `df_threshold_advice` | Analytics plane | **No** — reads `pgt_refresh_history` + `pgt_stream_tables` |
 | Policy auto-apply worker | Policy layer | **Yes** — reads analytics plane stream tables |
 
-The policy layer is the **only** component that reads dog-feeding stream tables,
+The policy layer is the **only** component that reads self-monitoring stream tables,
 and it runs in a separate session, off the critical path, behind an opt-in GUC.
 
 ### Self-Referential Refresh
 
-The dog-feeding stream tables themselves are refreshed by the same scheduler
+The self-monitoring stream tables themselves are refreshed by the same scheduler
 that refreshes user stream tables. They appear in the DAG as normal ST nodes.
 Their refresh generates `pgt_refresh_history` rows, which are then consumed by
 the next refresh of the analytics stream tables — a healthy feedback loop,
 not a deadlock, because:
 
 1. Each refresh reads history **up to the current tick watermark** (CSS1)
-2. The dog-feeding STs have a relaxed schedule (`'48s'` or longer)
+2. The self-monitoring STs have a relaxed schedule (`'48s'` or longer)
 3. They are CDC'd via INSERT triggers on `pgt_refresh_history` (append-only)
 
 ### Startup Sequence
@@ -174,10 +174,10 @@ On extension install or upgrade:
 
 1. Control plane starts normally with the existing Rust-only adaptive logic
 2. After the first few refreshes populate `pgt_refresh_history`, the analytics
-   stream tables can be created (manually or via `pgtrickle.setup_dog_feeding()`)
+   stream tables can be created (manually or via `pgtrickle.setup_self_monitoring()`)
 3. The policy layer activates only after the analytics STs are populated
 
-If a dog-feeding ST enters SUSPENDED state, it is treated like any other
+If a self-monitoring ST enters SUSPENDED state, it is treated like any other
 suspended ST — the control plane continues operating on its own.
 
 ---
@@ -241,10 +241,10 @@ Emits EC-11 alert when refresh duration exceeds 80% of schedule interval.
 
 ---
 
-## 5. Dog-Feeding Stream Tables
+## 5. Self-Monitoring Stream Tables
 
-All dog-feeding STs use the `pgtrickle` schema and the `df_` prefix
-(dog-feeding). Each targets a specific gap identified in §4.
+All self-monitoring STs use the `pgtrickle` schema and the `df_` prefix
+(self-monitoring). Each targets a specific gap identified in §4.
 
 ### DF-1: Rolling Efficiency Statistics
 
@@ -490,7 +490,7 @@ over the bounded window is efficient.
 ## 6. Reactive Policy Layer
 
 The policy layer is **optional** and **off by default**. It reads the
-dog-feeding stream tables and translates analytics into configuration changes.
+self-monitoring stream tables and translates analytics into configuration changes.
 
 ### 6.1 Advisory Mode (Default)
 
@@ -513,7 +513,7 @@ WHERE duration_anomaly IS NOT NULL
 Controlled by a new GUC:
 
 ```
-pg_trickle.dog_feeding_auto_apply = off  (default)
+pg_trickle.self_monitoring_auto_apply = off  (default)
                                     threshold_only
                                     full
 ```
@@ -522,7 +522,7 @@ When `threshold_only`:
 - A background task reads `df_threshold_advice` after each refresh cycle
 - If confidence is HIGH and the recommended threshold differs from current by
   > 5%, applies `ALTER STREAM TABLE ... SET auto_threshold = <recommended>`
-- Changes are logged to `pgt_refresh_history` with `initiated_by = 'DOG_FEED'`
+- Changes are logged to `pgt_refresh_history` with `initiated_by = 'SELF_MONITOR'`
 - Rate-limited: at most one threshold change per ST per 10 minutes
 
 When `full`:
@@ -537,7 +537,7 @@ channel:
 
 ```json
 {
-  "event": "dog_feed_anomaly",
+  "event": "self_monitor_anomaly",
   "schema": "public",
   "name": "orders_summary",
   "anomaly": "DURATION_SPIKE",
@@ -576,7 +576,7 @@ stream tables over it refresh correctly.
 1. Create DF-2 (`df_anomaly_signals`) dependent on DF-1
 2. Create DF-3 (`df_threshold_advice`) dependent on DF-1
 3. Verify DAG ordering: DF-1 refreshes first, then DF-2 and DF-3
-4. Verify that the dog-feeding STs' own refresh history rows don't cause
+4. Verify that the self-monitoring STs' own refresh history rows don't cause
    circular confusion (they should appear in DF-1 naturally and harmlessly)
 
 **Deliverables:**
@@ -600,15 +600,15 @@ stream tables over it refresh correctly.
 
 ### Phase 4: Setup Helper & GUC (Low Risk)
 
-**Goal:** Make dog-feeding easy to enable.
+**Goal:** Make self-monitoring easy to enable.
 
-1. Implement `pgtrickle.setup_dog_feeding()` — creates all DF STs in one call
-2. Implement `pgtrickle.teardown_dog_feeding()` — drops all DF STs cleanly
-3. Add `pg_trickle.dog_feeding_auto_apply` GUC (off / threshold_only / full)
+1. Implement `pgtrickle.setup_self_monitoring()` — creates all DF STs in one call
+2. Implement `pgtrickle.teardown_self_monitoring()` — drops all DF STs cleanly
+3. Add `pg_trickle.self_monitoring_auto_apply` GUC (off / threshold_only / full)
 4. Document in CONFIGURATION.md and SQL_REFERENCE.md
 
 **Deliverables:**
-- `setup_dog_feeding()` / `teardown_dog_feeding()` SQL functions
+- `setup_self_monitoring()` / `teardown_self_monitoring()` SQL functions
 - GUC registered in `src/config.rs`
 
 ### Phase 5: Auto-Apply Worker (Higher Risk)
@@ -618,7 +618,7 @@ stream tables over it refresh correctly.
 1. Implement the auto-apply logic in a scheduler post-tick hook
 2. Read `df_threshold_advice` after each coordinator tick
 3. Apply threshold changes with rate limiting and logging
-4. Add `initiated_by = 'DOG_FEED'` to `pgt_refresh_history` for audit trail
+4. Add `initiated_by = 'SELF_MONITOR'` to `pgt_refresh_history` for audit trail
 
 **Deliverables:**
 - Auto-apply worker with rate limiting
@@ -630,7 +630,7 @@ stream tables over it refresh correctly.
 
 **Goal:** Surface anomalies to external systems.
 
-1. Emit `dog_feed_anomaly` NOTIFY events when DF-2 detects anomalies
+1. Emit `self_monitor_anomaly` NOTIFY events when DF-2 detects anomalies
 2. Add Grafana dashboard JSON for DF-1 and DF-2 visualization
 3. Document LISTEN workflow for anomaly alerting
 
@@ -668,7 +668,7 @@ stream tables over it refresh correctly.
 
 ### Stability
 
-- Soak test: run dog-feeding under 100 user STs for 1 hour, verify no memory
+- Soak test: run self-monitoring under 100 user STs for 1 hour, verify no memory
   growth, no cascading failures, no scheduler stalls
 
 ---
@@ -678,20 +678,20 @@ stream tables over it refresh correctly.
 ### R1: Recursive CDC Amplification
 
 **Risk:** Dog-feeding STs refresh → generate history rows → trigger CDC →
-schedule another dog-feeding refresh → generate more history rows → ...
+schedule another self-monitoring refresh → generate more history rows → ...
 
-**Mitigation:** Each refresh generates exactly 1 history row. A dog-feeding
+**Mitigation:** Each refresh generates exactly 1 history row. A self-monitoring
 cycle of 5 STs generates 5 rows per tick. At 48s schedule, that's 375
 rows/hour — negligible compared to user workload. The system is convergent:
-each dog-feeding refresh reads all accumulated rows and produces a fixed-size
+each self-monitoring refresh reads all accumulated rows and produces a fixed-size
 aggregate output, not an amplifying chain.
 
 ### R2: Bootstrapping on Empty History
 
-**Risk:** `setup_dog_feeding()` called on a fresh install with 0 history rows.
+**Risk:** `setup_self_monitoring()` called on a fresh install with 0 history rows.
 Stream tables would be empty and useless.
 
-**Mitigation:** `setup_dog_feeding()` checks `pgt_refresh_history` row count.
+**Mitigation:** `setup_self_monitoring()` checks `pgt_refresh_history` row count.
 If < 50 rows, emits a WARNING and proceeds — the STs will populate naturally
 as history accumulates. Documentation notes the warm-up period.
 
@@ -722,12 +722,12 @@ Phase 1 validates which approach works.
 ### R5: Schema Coupling
 
 **Risk:** Upgrade migrations that change `pgt_refresh_history` columns
-would break dog-feeding ST definitions.
+would break self-monitoring ST definitions.
 
 **Mitigation:** Dog-feeding STs reference only stable columns (`pgt_id`,
 `action`, `status`, `start_time`, `end_time`, `rows_inserted`, `rows_deleted`,
 `delta_row_count`). These columns have been stable since v0.5.0. If a column
-is renamed, `teardown_dog_feeding()` + `setup_dog_feeding()` re-creates the
+is renamed, `teardown_self_monitoring()` + `setup_self_monitoring()` re-creates the
 STs with updated definitions. The upgrade migration script can automate this.
 
 ### R6: Performance Overhead
@@ -744,9 +744,9 @@ further or the STs moved to `refresh_tier = 'warm'`.
 
 ## 10. Future Extensions
 
-### 10.1 Cross-Database Dog-Feeding
+### 10.1 Cross-Database Self-Monitoring
 
-When multi-database support (G17-MDB) ships, dog-feeding STs could aggregate
+When multi-database support (G17-MDB) ships, self-monitoring STs could aggregate
 refresh history across all databases on the cluster, detecting patterns that
 span database boundaries (e.g., shared I/O contention).
 
@@ -770,7 +770,7 @@ to recommend thresholds that satisfy freshness SLAs rather than purely
 optimizing cost. A ST that must be fresh within 5s tolerance should have a
 lower threshold (prefer FULL for predictability) than one with 60s tolerance.
 
-### 10.5 Grafana Dog-Feeding Dashboard
+### 10.5 Grafana Self-Monitoring Dashboard
 
 Pre-built Grafana dashboard that reads DF-1 through DF-5, providing out-of-box
 operational visibility:

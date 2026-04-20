@@ -842,7 +842,7 @@ fn normalize_refresh_strategy(value: Option<String>) -> RefreshStrategy {
 
 /// Dog-feeding auto-apply policy mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DogFeedingAutoApply {
+pub enum SelfMonitoringAutoApply {
     /// No automatic configuration changes (default).
     Off,
     /// Apply only threshold recommendations from `df_threshold_advice`.
@@ -851,7 +851,7 @@ pub enum DogFeedingAutoApply {
     Full,
 }
 
-impl DogFeedingAutoApply {
+impl SelfMonitoringAutoApply {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Off => "off",
@@ -861,14 +861,14 @@ impl DogFeedingAutoApply {
     }
 }
 
-pub static PGS_DOG_FEEDING_AUTO_APPLY: GucSetting<Option<std::ffi::CString>> =
+pub static PGS_SELF_MONITORING_AUTO_APPLY: GucSetting<Option<std::ffi::CString>> =
     GucSetting::<Option<std::ffi::CString>>::new(Some(c"off"));
 
-fn normalize_dog_feeding_auto_apply(value: Option<String>) -> DogFeedingAutoApply {
+fn normalize_self_monitoring_auto_apply(value: Option<String>) -> SelfMonitoringAutoApply {
     match value.as_deref().map(str::to_ascii_lowercase).as_deref() {
-        Some("threshold_only") => DogFeedingAutoApply::ThresholdOnly,
-        Some("full") => DogFeedingAutoApply::Full,
-        _ => DogFeedingAutoApply::Off,
+        Some("threshold_only") => SelfMonitoringAutoApply::ThresholdOnly,
+        Some("full") => SelfMonitoringAutoApply::Full,
+        _ => SelfMonitoringAutoApply::Off,
     }
 }
 
@@ -1867,15 +1867,15 @@ pub fn register_gucs() {
 
     // DF-G1: Dog-feeding auto-apply policy.
     GucRegistry::define_string_guc(
-        c"pg_trickle.dog_feeding_auto_apply",
+        c"pg_trickle.self_monitoring_auto_apply",
         c"Dog-feeding auto-apply policy: off (default), threshold_only, full.",
-        c"Controls whether the dog-feeding analytics stream tables can \
+        c"Controls whether the self-monitoring analytics stream tables can \
            automatically adjust stream table configuration. \
            'off' — advisory only (no automatic changes). \
            'threshold_only' — auto-apply threshold recommendations from \
            df_threshold_advice when confidence is HIGH and delta > 5%%. \
            'full' — also apply scheduling hints from df_scheduling_interference.",
-        &PGS_DOG_FEEDING_AUTO_APPLY,
+        &PGS_SELF_MONITORING_AUTO_APPLY,
         GucContext::Suset,
         GucFlags::default(),
     );
@@ -2458,10 +2458,10 @@ pub fn pg_trickle_history_retention_days() -> i32 {
     PGS_HISTORY_RETENTION_DAYS.get()
 }
 
-/// DF-G1: Returns the current dog-feeding auto-apply policy.
-pub fn pg_trickle_dog_feeding_auto_apply() -> DogFeedingAutoApply {
-    normalize_dog_feeding_auto_apply(
-        PGS_DOG_FEEDING_AUTO_APPLY
+/// DF-G1: Returns the current self-monitoring auto-apply policy.
+pub fn pg_trickle_self_monitoring_auto_apply() -> SelfMonitoringAutoApply {
+    normalize_self_monitoring_auto_apply(
+        PGS_SELF_MONITORING_AUTO_APPLY
             .get()
             .and_then(|cs| cs.to_str().ok().map(str::to_owned)),
     )
@@ -2548,12 +2548,12 @@ pub fn pg_trickle_frontier_holdback_warn_seconds() -> i32 {
 #[cfg(test)]
 mod tests {
     use super::{
-        CdcTriggerMode, DiffOutputFormat, DogFeedingAutoApply, FrontierHoldbackMode,
-        MergeJoinStrategy, MergeStrategy, ParallelRefreshMode, RefreshStrategy, UserTriggersMode,
+        CdcTriggerMode, DiffOutputFormat, FrontierHoldbackMode, MergeJoinStrategy, MergeStrategy,
+        ParallelRefreshMode, RefreshStrategy, SelfMonitoringAutoApply, UserTriggersMode,
         VolatileFunctionPolicy, normalize_cdc_trigger_mode, normalize_diff_output_format,
-        normalize_dog_feeding_auto_apply, normalize_frontier_holdback_mode,
-        normalize_merge_join_strategy, normalize_merge_strategy, normalize_parallel_refresh_mode,
-        normalize_recursive_max_depth, normalize_refresh_strategy, normalize_user_triggers_mode,
+        normalize_frontier_holdback_mode, normalize_merge_join_strategy, normalize_merge_strategy,
+        normalize_parallel_refresh_mode, normalize_recursive_max_depth, normalize_refresh_strategy,
+        normalize_self_monitoring_auto_apply, normalize_user_triggers_mode,
         normalize_volatile_function_policy, threshold_mb_to_bytes,
     };
 
@@ -2963,63 +2963,63 @@ mod tests {
     // `GucSetting::get()` in multi-threaded unit tests triggers pgrx's
     // "postgres FFI may not be called from multiple threads" guard.
 
-    // ── DF-G1: DogFeedingAutoApply normalizer tests ────────────────
+    // ── DF-G1: SelfMonitoringAutoApply normalizer tests ────────────────
 
     #[test]
-    fn test_normalize_dog_feeding_auto_apply_defaults_to_off() {
+    fn test_normalize_self_monitoring_auto_apply_defaults_to_off() {
         assert_eq!(
-            normalize_dog_feeding_auto_apply(None),
-            DogFeedingAutoApply::Off
+            normalize_self_monitoring_auto_apply(None),
+            SelfMonitoringAutoApply::Off
         );
         assert_eq!(
-            normalize_dog_feeding_auto_apply(Some("off".to_string())),
-            DogFeedingAutoApply::Off
+            normalize_self_monitoring_auto_apply(Some("off".to_string())),
+            SelfMonitoringAutoApply::Off
         );
         assert_eq!(
-            normalize_dog_feeding_auto_apply(Some("unexpected".to_string())),
-            DogFeedingAutoApply::Off
+            normalize_self_monitoring_auto_apply(Some("unexpected".to_string())),
+            SelfMonitoringAutoApply::Off
         );
     }
 
     #[test]
-    fn test_normalize_dog_feeding_auto_apply_all_variants() {
+    fn test_normalize_self_monitoring_auto_apply_all_variants() {
         assert_eq!(
-            normalize_dog_feeding_auto_apply(Some("threshold_only".to_string())),
-            DogFeedingAutoApply::ThresholdOnly
+            normalize_self_monitoring_auto_apply(Some("threshold_only".to_string())),
+            SelfMonitoringAutoApply::ThresholdOnly
         );
         assert_eq!(
-            normalize_dog_feeding_auto_apply(Some("THRESHOLD_ONLY".to_string())),
-            DogFeedingAutoApply::ThresholdOnly
+            normalize_self_monitoring_auto_apply(Some("THRESHOLD_ONLY".to_string())),
+            SelfMonitoringAutoApply::ThresholdOnly
         );
         assert_eq!(
-            normalize_dog_feeding_auto_apply(Some("full".to_string())),
-            DogFeedingAutoApply::Full
+            normalize_self_monitoring_auto_apply(Some("full".to_string())),
+            SelfMonitoringAutoApply::Full
         );
         assert_eq!(
-            normalize_dog_feeding_auto_apply(Some("FULL".to_string())),
-            DogFeedingAutoApply::Full
+            normalize_self_monitoring_auto_apply(Some("FULL".to_string())),
+            SelfMonitoringAutoApply::Full
         );
     }
 
     #[test]
-    fn test_dog_feeding_auto_apply_as_str() {
-        assert_eq!(DogFeedingAutoApply::Off.as_str(), "off");
+    fn test_self_monitoring_auto_apply_as_str() {
+        assert_eq!(SelfMonitoringAutoApply::Off.as_str(), "off");
         assert_eq!(
-            DogFeedingAutoApply::ThresholdOnly.as_str(),
+            SelfMonitoringAutoApply::ThresholdOnly.as_str(),
             "threshold_only"
         );
-        assert_eq!(DogFeedingAutoApply::Full.as_str(), "full");
+        assert_eq!(SelfMonitoringAutoApply::Full.as_str(), "full");
     }
 
     #[test]
-    fn test_normalize_dog_feeding_auto_apply_roundtrip() {
+    fn test_normalize_self_monitoring_auto_apply_roundtrip() {
         for mode in [
-            DogFeedingAutoApply::Off,
-            DogFeedingAutoApply::ThresholdOnly,
-            DogFeedingAutoApply::Full,
+            SelfMonitoringAutoApply::Off,
+            SelfMonitoringAutoApply::ThresholdOnly,
+            SelfMonitoringAutoApply::Full,
         ] {
             assert_eq!(
-                normalize_dog_feeding_auto_apply(Some(mode.as_str().to_string())),
+                normalize_self_monitoring_auto_apply(Some(mode.as_str().to_string())),
                 mode
             );
         }

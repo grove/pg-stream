@@ -131,14 +131,14 @@ CREATE TABLE IF NOT EXISTS pgtrickle.pgt_refresh_history (
     status          TEXT NOT NULL
                      CHECK (status IN ('RUNNING', 'COMPLETED', 'FAILED', 'SKIPPED')),
     initiated_by    TEXT
-                     CHECK (initiated_by IN ('SCHEDULER', 'MANUAL', 'INITIAL', 'DOG_FEED')),
+                     CHECK (initiated_by IN ('SCHEDULER', 'MANUAL', 'INITIAL', 'SELF_MONITOR')),
     freshness_deadline TIMESTAMPTZ,
     tick_watermark_lsn PG_LSN,
     fixpoint_iteration INT
 );
 
 CREATE INDEX IF NOT EXISTS idx_hist_pgt_ts ON pgtrickle.pgt_refresh_history (pgt_id, data_timestamp);
--- PERF-1: Fast lookup by (pgt_id, start_time) for dog-feeding and scheduler_overhead queries.
+-- PERF-1: Fast lookup by (pgt_id, start_time) for self-monitoring and scheduler_overhead queries.
 CREATE INDEX IF NOT EXISTS idx_hist_pgt_start ON pgtrickle.pgt_refresh_history (pgt_id, start_time);
 
 -- Per-source CDC slot tracking
@@ -516,8 +516,8 @@ AS 'MODULE_PATHNAME', 'shared_buffer_stats_fn_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/api/dog_feeding.rs:566
--- pg_trickle::api::dog_feeding::explain_dag
+-- src/api/self_monitoring.rs:566
+-- pg_trickle::api::self_monitoring::explain_dag
 CREATE  FUNCTION pgtrickle."explain_dag"(
 	"format" TEXT DEFAULT 'mermaid' /* core::option::Option<&str> */
 ) RETURNS TEXT /* core::option::Option<alloc::string::String> */
@@ -527,12 +527,12 @@ AS 'MODULE_PATHNAME', 'explain_dag_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/api/dog_feeding.rs:305
--- pg_trickle::api::dog_feeding::teardown_dog_feeding
-CREATE  FUNCTION pgtrickle."teardown_dog_feeding"() RETURNS void
+-- src/api/self_monitoring.rs:305
+-- pg_trickle::api::self_monitoring::teardown_self_monitoring
+CREATE  FUNCTION pgtrickle."teardown_self_monitoring"() RETURNS void
 STRICT 
 LANGUAGE c /* Rust */
-AS 'MODULE_PATHNAME', 'teardown_dog_feeding_wrapper';
+AS 'MODULE_PATHNAME', 'teardown_self_monitoring_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
@@ -962,12 +962,12 @@ AS 'MODULE_PATHNAME', 'explain_st_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/api/dog_feeding.rs:240
--- pg_trickle::api::dog_feeding::setup_dog_feeding
-CREATE  FUNCTION pgtrickle."setup_dog_feeding"() RETURNS void
+-- src/api/self_monitoring.rs:240
+-- pg_trickle::api::self_monitoring::setup_self_monitoring
+CREATE  FUNCTION pgtrickle."setup_self_monitoring"() RETURNS void
 STRICT 
 LANGUAGE c /* Rust */
-AS 'MODULE_PATHNAME', 'setup_dog_feeding_wrapper';
+AS 'MODULE_PATHNAME', 'setup_self_monitoring_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
@@ -1223,8 +1223,8 @@ AS 'MODULE_PATHNAME', 'recommend_refresh_mode_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/api/dog_feeding.rs:453
--- pg_trickle::api::dog_feeding::scheduler_overhead
+-- src/api/self_monitoring.rs:453
+-- pg_trickle::api::self_monitoring::scheduler_overhead
 CREATE  FUNCTION pgtrickle."scheduler_overhead"() RETURNS TABLE (
 	"total_refreshes_1h" bigint,  /* i64 */
 	"df_refreshes_1h" bigint,  /* i64 */
@@ -1772,9 +1772,9 @@ AS 'MODULE_PATHNAME', '_signal_launcher_rescan_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/api/dog_feeding.rs:358
--- pg_trickle::api::dog_feeding::dog_feeding_status
-CREATE  FUNCTION pgtrickle."dog_feeding_status"() RETURNS TABLE (
+-- src/api/self_monitoring.rs:358
+-- pg_trickle::api::self_monitoring::self_monitoring_status
+CREATE  FUNCTION pgtrickle."self_monitoring_status"() RETURNS TABLE (
 	"st_name" TEXT,  /* alloc::string::String */
 	"exists" bool,  /* bool */
 	"status" TEXT,  /* core::option::Option<alloc::string::String> */
@@ -1784,7 +1784,7 @@ CREATE  FUNCTION pgtrickle."dog_feeding_status"() RETURNS TABLE (
 )
 STRICT 
 LANGUAGE c /* Rust */
-AS 'MODULE_PATHNAME', 'dog_feeding_status_wrapper';
+AS 'MODULE_PATHNAME', 'self_monitoring_status_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */

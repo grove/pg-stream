@@ -4,7 +4,7 @@ use e2e::E2eDb;
 // ── DF-F3: E2E test — setup/teardown cycle ──────────────────────────────────
 
 #[tokio::test]
-async fn test_dog_feeding_setup_creates_five_stream_tables() {
+async fn test_self_monitoring_setup_creates_five_stream_tables() {
     let db = E2eDb::new().await.with_extension().await;
 
     // Create a source table and a user ST so pgt_refresh_history has data.
@@ -16,8 +16,8 @@ async fn test_dog_feeding_setup_creates_five_stream_tables() {
         .await;
     db.refresh_st("user_st").await;
 
-    // Setup dog-feeding.
-    db.execute("SELECT pgtrickle.setup_dog_feeding()").await;
+    // Setup self-monitoring.
+    db.execute("SELECT pgtrickle.setup_self_monitoring()").await;
 
     // Verify all six DF stream tables exist.
     let count: i64 = db
@@ -28,14 +28,14 @@ async fn test_dog_feeding_setup_creates_five_stream_tables() {
         .await;
     assert_eq!(
         count, 6,
-        "setup_dog_feeding should create 6 DF stream tables"
+        "setup_self_monitoring should create 6 DF stream tables"
     );
 }
 
-// ── STAB-1: setup_dog_feeding() idempotency ─────────────────────────────────
+// ── STAB-1: setup_self_monitoring() idempotency ─────────────────────────────────
 
 #[tokio::test]
-async fn test_dog_feeding_setup_idempotent_three_calls() {
+async fn test_self_monitoring_setup_idempotent_three_calls() {
     let db = E2eDb::new().await.with_extension().await;
 
     db.execute("CREATE TABLE src (id INT PRIMARY KEY)").await;
@@ -45,9 +45,9 @@ async fn test_dog_feeding_setup_idempotent_three_calls() {
     db.refresh_st("user_st").await;
 
     // Call setup 3 times — should not error or create duplicates.
-    db.execute("SELECT pgtrickle.setup_dog_feeding()").await;
-    db.execute("SELECT pgtrickle.setup_dog_feeding()").await;
-    db.execute("SELECT pgtrickle.setup_dog_feeding()").await;
+    db.execute("SELECT pgtrickle.setup_self_monitoring()").await;
+    db.execute("SELECT pgtrickle.setup_self_monitoring()").await;
+    db.execute("SELECT pgtrickle.setup_self_monitoring()").await;
 
     let count: i64 = db
         .query_scalar(
@@ -61,7 +61,7 @@ async fn test_dog_feeding_setup_idempotent_three_calls() {
 // ── DF-F5 + STAB-5: teardown + partial teardown ────────────────────────────
 
 #[tokio::test]
-async fn test_dog_feeding_teardown_drops_all_stream_tables() {
+async fn test_self_monitoring_teardown_drops_all_stream_tables() {
     let db = E2eDb::new().await.with_extension().await;
 
     db.execute("CREATE TABLE src (id INT PRIMARY KEY)").await;
@@ -70,7 +70,7 @@ async fn test_dog_feeding_teardown_drops_all_stream_tables() {
         .await;
     db.refresh_st("user_st").await;
 
-    db.execute("SELECT pgtrickle.setup_dog_feeding()").await;
+    db.execute("SELECT pgtrickle.setup_self_monitoring()").await;
 
     // Verify STs exist before teardown.
     let before: i64 = db
@@ -82,7 +82,8 @@ async fn test_dog_feeding_teardown_drops_all_stream_tables() {
     assert_eq!(before, 6);
 
     // Teardown.
-    db.execute("SELECT pgtrickle.teardown_dog_feeding()").await;
+    db.execute("SELECT pgtrickle.teardown_self_monitoring()")
+        .await;
 
     let after: i64 = db
         .query_scalar(
@@ -103,7 +104,7 @@ async fn test_dog_feeding_teardown_drops_all_stream_tables() {
 }
 
 #[tokio::test]
-async fn test_dog_feeding_teardown_safe_with_partial_setup() {
+async fn test_self_monitoring_teardown_safe_with_partial_setup() {
     let db = E2eDb::new().await.with_extension().await;
 
     db.execute("CREATE TABLE src (id INT PRIMARY KEY)").await;
@@ -113,12 +114,13 @@ async fn test_dog_feeding_teardown_safe_with_partial_setup() {
     db.refresh_st("user_st").await;
 
     // Setup, then manually drop one DF ST to simulate partial state.
-    db.execute("SELECT pgtrickle.setup_dog_feeding()").await;
+    db.execute("SELECT pgtrickle.setup_self_monitoring()").await;
     db.execute("SELECT pgtrickle.drop_stream_table('pgtrickle.df_anomaly_signals', true)")
         .await;
 
     // Teardown should succeed without errors even with missing DF ST.
-    db.execute("SELECT pgtrickle.teardown_dog_feeding()").await;
+    db.execute("SELECT pgtrickle.teardown_self_monitoring()")
+        .await;
 
     let count: i64 = db
         .query_scalar(
@@ -129,10 +131,10 @@ async fn test_dog_feeding_teardown_safe_with_partial_setup() {
     assert_eq!(count, 0, "teardown should clean up remaining STs");
 }
 
-// ── UX-1: dog_feeding_status() ──────────────────────────────────────────────
+// ── UX-1: self_monitoring_status() ──────────────────────────────────────────────
 
 #[tokio::test]
-async fn test_dog_feeding_status_reports_all_five() {
+async fn test_self_monitoring_status_reports_all_five() {
     let db = E2eDb::new().await.with_extension().await;
 
     db.execute("CREATE TABLE src (id INT PRIMARY KEY)").await;
@@ -141,34 +143,34 @@ async fn test_dog_feeding_status_reports_all_five() {
         .await;
     db.refresh_st("user_st").await;
 
-    db.execute("SELECT pgtrickle.setup_dog_feeding()").await;
+    db.execute("SELECT pgtrickle.setup_self_monitoring()").await;
 
     let count: i64 = db
-        .query_scalar("SELECT count(*) FROM pgtrickle.dog_feeding_status()")
+        .query_scalar("SELECT count(*) FROM pgtrickle.self_monitoring_status()")
         .await;
-    assert_eq!(count, 6, "dog_feeding_status should report 6 rows");
+    assert_eq!(count, 6, "self_monitoring_status should report 6 rows");
 
     // All should exist.
     let all_exist: bool = db
-        .query_scalar("SELECT bool_and(exists) FROM pgtrickle.dog_feeding_status()")
+        .query_scalar("SELECT bool_and(exists) FROM pgtrickle.self_monitoring_status()")
         .await;
     assert!(all_exist, "all six DF STs should report exists = true");
 }
 
 #[tokio::test]
-async fn test_dog_feeding_status_before_setup() {
+async fn test_self_monitoring_status_before_setup() {
     let db = E2eDb::new().await.with_extension().await;
 
     let count: i64 = db
-        .query_scalar("SELECT count(*) FROM pgtrickle.dog_feeding_status()")
+        .query_scalar("SELECT count(*) FROM pgtrickle.self_monitoring_status()")
         .await;
     assert_eq!(
         count, 6,
-        "dog_feeding_status should report 6 rows even before setup"
+        "self_monitoring_status should report 6 rows even before setup"
     );
 
     let any_exist: bool = db
-        .query_scalar("SELECT bool_or(exists) FROM pgtrickle.dog_feeding_status()")
+        .query_scalar("SELECT bool_or(exists) FROM pgtrickle.self_monitoring_status()")
         .await;
     assert!(!any_exist, "no DF STs should exist before setup");
 }
@@ -176,7 +178,7 @@ async fn test_dog_feeding_status_before_setup() {
 // ── TEST-2: Full create/refresh/teardown cycle ──────────────────────────────
 
 #[tokio::test]
-async fn test_dog_feeding_full_lifecycle() {
+async fn test_self_monitoring_full_lifecycle() {
     let db = E2eDb::new().await.with_extension().await;
 
     // Create source data.
@@ -200,20 +202,21 @@ async fn test_dog_feeding_full_lifecycle() {
         db.refresh_st("user_st").await;
     }
 
-    // Setup dog-feeding.
-    db.execute("SELECT pgtrickle.setup_dog_feeding()").await;
+    // Setup self-monitoring.
+    db.execute("SELECT pgtrickle.setup_self_monitoring()").await;
 
     // Verify status.
     let count: i64 = db
-        .query_scalar("SELECT count(*) FROM pgtrickle.dog_feeding_status() WHERE exists")
+        .query_scalar("SELECT count(*) FROM pgtrickle.self_monitoring_status() WHERE exists")
         .await;
     assert_eq!(count, 6);
 
     // Teardown.
-    db.execute("SELECT pgtrickle.teardown_dog_feeding()").await;
+    db.execute("SELECT pgtrickle.teardown_self_monitoring()")
+        .await;
 
     let count_after: i64 = db
-        .query_scalar("SELECT count(*) FROM pgtrickle.dog_feeding_status() WHERE exists")
+        .query_scalar("SELECT count(*) FROM pgtrickle.self_monitoring_status() WHERE exists")
         .await;
     assert_eq!(count_after, 0);
 }
@@ -230,7 +233,7 @@ async fn test_explain_dag_includes_df_nodes_after_setup() {
         .await;
     db.refresh_st("user_st").await;
 
-    db.execute("SELECT pgtrickle.setup_dog_feeding()").await;
+    db.execute("SELECT pgtrickle.setup_self_monitoring()").await;
 
     let dag: String = db.query_scalar("SELECT pgtrickle.explain_dag()").await;
 
@@ -286,15 +289,15 @@ async fn test_scheduler_overhead_returns_valid_row() {
     assert!(total >= 1, "should have at least 1 refresh in history");
 }
 
-// ── DF-G1: dog_feeding_auto_apply GUC ───────────────────────────────────────
+// ── DF-G1: self_monitoring_auto_apply GUC ───────────────────────────────────────
 
 #[tokio::test]
-async fn test_dog_feeding_auto_apply_guc_exists() {
+async fn test_self_monitoring_auto_apply_guc_exists() {
     let db = E2eDb::new().await.with_extension().await;
 
     // Default should be 'off'.
     let value: String = db
-        .query_scalar("SHOW pg_trickle.dog_feeding_auto_apply")
+        .query_scalar("SHOW pg_trickle.self_monitoring_auto_apply")
         .await;
     assert_eq!(value, "off", "default should be 'off'");
 
@@ -303,14 +306,14 @@ async fn test_dog_feeding_auto_apply_guc_exists() {
     // to different backends otherwise).
     let value: String = {
         let mut conn = db.pool.acquire().await.expect("acquire connection");
-        sqlx::query("SET pg_trickle.dog_feeding_auto_apply = 'threshold_only'")
+        sqlx::query("SET pg_trickle.self_monitoring_auto_apply = 'threshold_only'")
             .execute(&mut *conn)
             .await
-            .expect("SET pg_trickle.dog_feeding_auto_apply");
-        sqlx::query_scalar("SHOW pg_trickle.dog_feeding_auto_apply")
+            .expect("SET pg_trickle.self_monitoring_auto_apply");
+        sqlx::query_scalar("SHOW pg_trickle.self_monitoring_auto_apply")
             .fetch_one(&mut *conn)
             .await
-            .expect("SHOW pg_trickle.dog_feeding_auto_apply")
+            .expect("SHOW pg_trickle.self_monitoring_auto_apply")
     };
     assert_eq!(value, "threshold_only");
 }
@@ -346,8 +349,8 @@ async fn test_cdc_insert_only_trigger_on_refresh_history() {
         .await;
     db.refresh_st("user_st").await;
 
-    // Setup dog-feeding — this creates STs that reference pgt_refresh_history.
-    db.execute("SELECT pgtrickle.setup_dog_feeding()").await;
+    // Setup self-monitoring — this creates STs that reference pgt_refresh_history.
+    db.execute("SELECT pgtrickle.setup_self_monitoring()").await;
 
     // Verify that CDC triggers on pgt_refresh_history are INSERT-only.
     // PostgreSQL tgtype bitmask (pg_trigger.h):
@@ -383,10 +386,11 @@ async fn test_control_plane_survives_df_st_suspension() {
         .await;
     db.refresh_st("user_st").await;
 
-    db.execute("SELECT pgtrickle.setup_dog_feeding()").await;
+    db.execute("SELECT pgtrickle.setup_self_monitoring()").await;
 
     // Drop all DF STs — simulate suspension.
-    db.execute("SELECT pgtrickle.teardown_dog_feeding()").await;
+    db.execute("SELECT pgtrickle.teardown_self_monitoring()")
+        .await;
 
     // User ST should still refresh successfully.
     db.execute("INSERT INTO src VALUES (3, 30)").await;
@@ -434,13 +438,13 @@ async fn test_upgrade_preserves_refresh_history() {
         .await;
     assert!(hist >= 1, "TEST-3: history rows must survive upgrade");
 
-    // Verify initiated_by CHECK allows DOG_FEED.
+    // Verify initiated_by CHECK allows SELF_MONITOR.
     // data_timestamp is NOT NULL in pgt_refresh_history; use now() for a SKIP row.
     db.execute(
         "INSERT INTO pgtrickle.pgt_refresh_history \
          (pgt_id, data_timestamp, start_time, action, status, delta_row_count, \
           rows_inserted, initiated_by) \
-         SELECT pgt_id, now(), now(), 'SKIP', 'COMPLETED', 0, 0, 'DOG_FEED' \
+         SELECT pgt_id, now(), now(), 'SKIP', 'COMPLETED', 0, 0, 'SELF_MONITOR' \
          FROM pgtrickle.pgt_stream_tables LIMIT 1",
     )
     .await;
@@ -474,7 +478,7 @@ async fn test_threshold_advice_produces_recommendations() {
         db.refresh_st("user_st").await;
     }
 
-    db.execute("SELECT pgtrickle.setup_dog_feeding()").await;
+    db.execute("SELECT pgtrickle.setup_self_monitoring()").await;
 
     // Refresh DF-1 (efficiency rolling) which feeds DF-3 (threshold advice).
     db.refresh_st("pgtrickle.df_efficiency_rolling").await;
@@ -527,7 +531,7 @@ async fn test_anomaly_signals_detects_spikes() {
         db.refresh_st("user_st").await;
     }
 
-    db.execute("SELECT pgtrickle.setup_dog_feeding()").await;
+    db.execute("SELECT pgtrickle.setup_self_monitoring()").await;
     db.refresh_st("pgtrickle.df_efficiency_rolling").await;
     db.refresh_st("pgtrickle.df_anomaly_signals").await;
 
@@ -587,7 +591,7 @@ async fn test_scheduling_interference_detects_overlap() {
         db.refresh_st("st_b").await;
     }
 
-    db.execute("SELECT pgtrickle.setup_dog_feeding()").await;
+    db.execute("SELECT pgtrickle.setup_self_monitoring()").await;
     db.refresh_st("pgtrickle.df_scheduling_interference").await;
 
     // The interference table should exist and be queryable (even when empty —
@@ -609,21 +613,21 @@ async fn test_scheduling_interference_detects_overlap() {
 async fn test_auto_apply_initiated_by_dog_feed() {
     let db = E2eDb::new().await.with_extension().await;
 
-    // Verify the DOG_FEED initiated_by value is allowed by the CHECK constraint.
+    // Verify the SELF_MONITOR initiated_by value is allowed by the CHECK constraint.
     db.execute("CREATE TABLE src (id INT PRIMARY KEY)").await;
     db.execute("INSERT INTO src VALUES (1)").await;
     db.create_st("user_st", "SELECT id FROM src", "1m", "FULL")
         .await;
     db.refresh_st("user_st").await;
 
-    // Insert a DOG_FEED audit row directly to test CHECK constraint.
+    // Insert a SELF_MONITOR audit row directly to test CHECK constraint.
     // data_timestamp is NOT NULL in pgt_refresh_history (used for
     // ST-on-ST cascade logic); use now() as a stand-in for a SKIP row.
     db.execute(
         "INSERT INTO pgtrickle.pgt_refresh_history \
          (pgt_id, data_timestamp, start_time, action, status, delta_row_count, \
           rows_inserted, initiated_by, error_message) \
-         SELECT pgt_id, now(), now(), 'SKIP', 'COMPLETED', 0, 0, 'DOG_FEED', \
+         SELECT pgt_id, now(), now(), 'SKIP', 'COMPLETED', 0, 0, 'SELF_MONITOR', \
                 'auto_threshold 0.10 → 0.15' \
          FROM pgtrickle.pgt_stream_tables WHERE pgt_name = 'user_st'",
     )
@@ -633,12 +637,12 @@ async fn test_auto_apply_initiated_by_dog_feed() {
     let dog_feed: i64 = db
         .query_scalar(
             "SELECT count(*) FROM pgtrickle.pgt_refresh_history \
-             WHERE initiated_by = 'DOG_FEED'",
+             WHERE initiated_by = 'SELF_MONITOR'",
         )
         .await;
     assert!(
         dog_feed >= 1,
-        "DF-G4: DOG_FEED initiated_by should be insertable"
+        "DF-G4: SELF_MONITOR initiated_by should be insertable"
     );
 }
 
@@ -653,19 +657,19 @@ async fn test_auto_apply_guc_values() {
     // single round-trip, avoiding connection-pool ambiguity (SET on one
     // backend is not visible to a SHOW on a different backend).
     let v1: String = db
-        .query_scalar("SELECT set_config('pg_trickle.dog_feeding_auto_apply', 'off', false)")
+        .query_scalar("SELECT set_config('pg_trickle.self_monitoring_auto_apply', 'off', false)")
         .await;
     assert_eq!(v1, "off");
 
     let v2: String = db
         .query_scalar(
-            "SELECT set_config('pg_trickle.dog_feeding_auto_apply', 'threshold_only', false)",
+            "SELECT set_config('pg_trickle.self_monitoring_auto_apply', 'threshold_only', false)",
         )
         .await;
     assert_eq!(v2, "threshold_only");
 
     let v3: String = db
-        .query_scalar("SELECT set_config('pg_trickle.dog_feeding_auto_apply', 'full', false)")
+        .query_scalar("SELECT set_config('pg_trickle.self_monitoring_auto_apply', 'full', false)")
         .await;
     assert_eq!(v3, "full");
 }
@@ -683,7 +687,7 @@ async fn test_cdc_health_no_false_alerts_for_df_sts() {
         .await;
     db.refresh_st("user_st").await;
 
-    db.execute("SELECT pgtrickle.setup_dog_feeding()").await;
+    db.execute("SELECT pgtrickle.setup_self_monitoring()").await;
 
     // Check that check_cdc_health() does not flag DF STs as problematic.
     // DF STs read from pgt_refresh_history which has triggers, not from user tables.
@@ -717,7 +721,7 @@ async fn test_explain_st_shows_df_coverage() {
     let before: String = db
         .query_scalar(
             "SELECT value FROM pgtrickle.explain_st('public.user_st') \
-             WHERE property = 'dog_feeding_coverage'",
+             WHERE property = 'self_monitoring_coverage'",
         )
         .await;
     assert!(
@@ -726,12 +730,12 @@ async fn test_explain_st_shows_df_coverage() {
     );
 
     // After setup: should report "full".
-    db.execute("SELECT pgtrickle.setup_dog_feeding()").await;
+    db.execute("SELECT pgtrickle.setup_self_monitoring()").await;
 
     let after: String = db
         .query_scalar(
             "SELECT value FROM pgtrickle.explain_st('public.user_st') \
-             WHERE property = 'dog_feeding_coverage'",
+             WHERE property = 'self_monitoring_coverage'",
         )
         .await;
     assert!(
@@ -796,7 +800,7 @@ async fn test_benchmark_df_efficiency_vs_refresh_efficiency() {
         db.refresh_st("user_st").await;
     }
 
-    db.execute("SELECT pgtrickle.setup_dog_feeding()").await;
+    db.execute("SELECT pgtrickle.setup_self_monitoring()").await;
     db.refresh_st("pgtrickle.df_efficiency_rolling").await;
 
     // Both should return data for user_st.
@@ -824,7 +828,7 @@ async fn test_benchmark_df_efficiency_vs_refresh_efficiency() {
 
 #[tokio::test]
 #[ignore] // Requires extended run — use --ignored to include
-async fn test_dog_feeding_overhead_below_threshold() {
+async fn test_self_monitoring_overhead_below_threshold() {
     let db = E2eDb::new().await.with_extension().await;
 
     db.execute("CREATE TABLE src (id INT PRIMARY KEY, val INT)")
@@ -849,7 +853,7 @@ async fn test_dog_feeding_overhead_below_threshold() {
         db.refresh_st("user_st").await;
     }
 
-    db.execute("SELECT pgtrickle.setup_dog_feeding()").await;
+    db.execute("SELECT pgtrickle.setup_self_monitoring()").await;
 
     // Refresh all DF STs.
     for st in &[
@@ -878,10 +882,10 @@ async fn test_dog_feeding_overhead_below_threshold() {
     }
 }
 
-// ── SCAL-2: Retention interacts correctly with dog-feeding CDC ──────────
+// ── SCAL-2: Retention interacts correctly with self-monitoring CDC ──────────
 
 #[tokio::test]
-async fn test_retention_cleanup_does_not_break_dog_feeding() {
+async fn test_retention_cleanup_does_not_break_self_monitoring() {
     let db = E2eDb::new().await.with_extension().await;
 
     db.execute("CREATE TABLE src (id INT PRIMARY KEY)").await;
@@ -890,7 +894,7 @@ async fn test_retention_cleanup_does_not_break_dog_feeding() {
         .await;
     db.refresh_st("user_st").await;
 
-    db.execute("SELECT pgtrickle.setup_dog_feeding()").await;
+    db.execute("SELECT pgtrickle.setup_self_monitoring()").await;
 
     // Simulate history cleanup (delete old rows).
     db.execute(
@@ -903,7 +907,7 @@ async fn test_retention_cleanup_does_not_break_dog_feeding() {
     db.refresh_st("pgtrickle.df_efficiency_rolling").await;
 
     let status_ok: bool = db
-        .query_scalar("SELECT bool_and(exists) FROM pgtrickle.dog_feeding_status()")
+        .query_scalar("SELECT bool_and(exists) FROM pgtrickle.self_monitoring_status()")
         .await;
     assert!(
         status_ok,
@@ -947,7 +951,7 @@ async fn test_df_sts_refresh_within_window_at_scale() {
         }
     }
 
-    db.execute("SELECT pgtrickle.setup_dog_feeding()").await;
+    db.execute("SELECT pgtrickle.setup_self_monitoring()").await;
 
     // Refresh all DF STs — should complete within a reasonable time.
     let start = std::time::Instant::now();
@@ -971,7 +975,7 @@ async fn test_df_sts_refresh_within_window_at_scale() {
 
     // Verify all DF STs still exist and are healthy.
     let all_exist: bool = db
-        .query_scalar("SELECT bool_and(exists) FROM pgtrickle.dog_feeding_status()")
+        .query_scalar("SELECT bool_and(exists) FROM pgtrickle.self_monitoring_status()")
         .await;
     assert!(all_exist, "SCAL-1: all DF STs should exist after refresh");
 }
@@ -980,7 +984,7 @@ async fn test_df_sts_refresh_within_window_at_scale() {
 
 #[tokio::test]
 #[ignore] // Long-running soak test — use --ignored to include
-async fn test_soak_dog_feeding_multiple_cycles() {
+async fn test_soak_self_monitoring_multiple_cycles() {
     let db = E2eDb::new().await.with_extension().await;
 
     db.execute("CREATE TABLE src (id INT PRIMARY KEY, val INT)")
@@ -995,7 +999,7 @@ async fn test_soak_dog_feeding_multiple_cycles() {
     )
     .await;
 
-    db.execute("SELECT pgtrickle.setup_dog_feeding()").await;
+    db.execute("SELECT pgtrickle.setup_self_monitoring()").await;
 
     // Run 20 cycles of: insert data → refresh user ST → refresh all DF STs.
     for cycle in 0..20 {
@@ -1019,7 +1023,7 @@ async fn test_soak_dog_feeding_multiple_cycles() {
 
     // After 20 cycles, all DF STs should still be healthy.
     let all_exist: bool = db
-        .query_scalar("SELECT bool_and(exists) FROM pgtrickle.dog_feeding_status()")
+        .query_scalar("SELECT bool_and(exists) FROM pgtrickle.self_monitoring_status()")
         .await;
     assert!(all_exist, "DF-D4: all DF STs should survive 20 soak cycles");
 
@@ -1033,11 +1037,11 @@ async fn test_soak_dog_feeding_multiple_cycles() {
     );
 }
 
-// ── TEST-5: Soak — dog-feeding with many user STs ───────────────────────
+// ── TEST-5: Soak — self-monitoring with many user STs ───────────────────────
 
 #[tokio::test]
 #[ignore] // Long-running soak test — use --ignored to include
-async fn test_soak_dog_feeding_with_many_user_sts() {
+async fn test_soak_self_monitoring_with_many_user_sts() {
     let db = E2eDb::new().await.with_extension().await;
 
     db.execute("CREATE TABLE src (id INT PRIMARY KEY, val INT)")
@@ -1069,7 +1073,7 @@ async fn test_soak_dog_feeding_with_many_user_sts() {
         }
     }
 
-    db.execute("SELECT pgtrickle.setup_dog_feeding()").await;
+    db.execute("SELECT pgtrickle.setup_self_monitoring()").await;
 
     // Refresh all DF STs.
     for st in &[
@@ -1096,7 +1100,8 @@ async fn test_soak_dog_feeding_with_many_user_sts() {
     }
 
     // Teardown should work cleanly.
-    db.execute("SELECT pgtrickle.teardown_dog_feeding()").await;
+    db.execute("SELECT pgtrickle.teardown_self_monitoring()")
+        .await;
 
     let after: i64 = db
         .query_scalar(

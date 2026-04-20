@@ -36,7 +36,7 @@ coverage, all in plain language.
 - [v0.17.0 — Query Intelligence & Stability](#v0170--query-intelligence--stability)
 - [v0.18.0 — Hardening & Delta Performance](#v0180--hardening--delta-performance)
 - [v0.19.0 — Production Gap Closure & Distribution](#v0190--production-gap-closure--distribution)
-- [v0.20.0 — Dog-Feeding](#v0200--dog-feeding-pg_trickle-monitors-itself)
+- [v0.20.0 — Self-Monitoring](#v0200--self-monitoring-pg_trickle-monitors-itself)
 - [v0.21.0 — Correctness, Safety & Test Hardening](#v0210--correctness-safety--test-hardening)
 - [v0.22.0 — Production Scalability & Downstream Integration](#v0220--production-scalability--downstream-integration)
 - [v0.23.0 — TPC-H DVM Scaling Performance](#v0230--tpch-dvm-scaling-performance)
@@ -45,7 +45,7 @@ coverage, all in plain language.
 - [v0.26.0 — Test & Concurrency Hardening](#v0260--test--concurrency-hardening)
 - [v0.27.0 — Transactional Inbox & Outbox Patterns](#v0270--transactional-inbox--outbox-patterns)
 - [v0.28.0 — Relay CLI (`pgtrickle-relay`)](#v0280--relay-cli-pgtrickle-relay)
-- [v1.6.0 — TUI Dog-Feeding Integration](#v160--tui-dog-feeding-integration)
+- [v1.6.0 — TUI Self-Monitoring Integration](#v160--tui-self-monitoring-integration)
 - [v1.1.0 — PostgreSQL 17 Support](#v110--postgresql-17-support)
 - [v1.2.0 — PGlite Proof of Concept](#v120--pglite-proof-of-concept)
 - [v1.3.0 — Core Extraction (`pg_trickle_core`)](#v130--core-extraction-pg_trickle_core)
@@ -99,7 +99,7 @@ from the v0.1.x series to 1.0 and beyond.
 | v0.26.0 | Test & concurrency hardening | Planned |
 | v0.27.0 | Transactional inbox & outbox patterns | Planned |
 | v0.28.0 | Relay CLI (`pgtrickle-relay`) — bidirectional outbox→sinks + sources→inbox | Planned |
-| v1.6.0 | TUI dog-feeding integration | Planned |
+| v1.6.0 | TUI self-monitoring integration | Planned |
 | v1.1.0 | PostgreSQL 17 support | Planned |
 | v1.2.0 | PGlite proof of concept | Planned |
 | v1.3.0 | Core extraction (`pg_trickle_core`) | Planned |
@@ -5260,15 +5260,15 @@ Dependencies: DB-3 (uses schema version to determine needed migrations). Schema 
 
 ---
 
-## v0.20.0 — Dog-Feeding (pg_trickle Monitors Itself)
+## v0.20.0 — Self-Monitoring (pg_trickle Monitors Itself)
 
 **Status: Released (2026-04-15).** All 62 items implemented, 1 skipped
 (PERF-6 already shipped in v0.19.0). See `plans/PLAN_0_20_0.md`.
 
 > **Release Theme**
-> This release implements *dog-feeding*: pg_trickle uses its own stream
+> This release implements *self-monitoring*: pg_trickle uses its own stream
 > tables to maintain reactive analytics over its internal catalog and
-> refresh-history tables. Five dog-feeding stream tables (`df_efficiency_rolling`,
+> refresh-history tables. Five self-monitoring stream tables (`df_efficiency_rolling`,
 > `df_anomaly_signals`, `df_threshold_advice`, `df_cdc_buffer_trends`,
 > `df_scheduling_interference`) replace repeated full-scan diagnostic
 > functions with continuously-maintained incremental views, enable
@@ -5278,7 +5278,7 @@ Dependencies: DB-3 (uses schema version to determine needed migrations). Schema 
 > its own non-trivial workload and demonstrates the incremental analytics
 > value proposition to users.
 >
-> See [plans/PLAN_DOG_FEEDING.md](plans/PLAN_DOG_FEEDING.md) for the full
+> See [plans/PLAN_SELF_MONITORING.md](plans/PLAN_SELF_MONITORING.md) for the full
 > design, architecture, and risk analysis.
 
 <details>
@@ -5288,57 +5288,57 @@ Dependencies: DB-3 (uses schema version to determine needed migrations). Schema 
 
 | Item | Description | Effort | Ref |
 |------|-------------|--------|-----|
-| DF-F1 | **Verify CDC on `pgt_refresh_history`.** Confirm that `create_stream_table()` installs INSERT triggers on `pgt_refresh_history`. Fix schema-exclusion logic if the `pgtrickle` schema is skipped. | 2–4h | [PLAN_DOG_FEEDING.md](plans/PLAN_DOG_FEEDING.md) §7 Phase 1 |
-| DF-F2 | **Create `df_efficiency_rolling` (DF-1).** Maintained rolling-window aggregates over `pgt_refresh_history`. Replaces `refresh_efficiency()` full scans. | 2–4h | [PLAN_DOG_FEEDING.md](plans/PLAN_DOG_FEEDING.md) §5 DF-1 |
-| DF-F3 | **E2E test: DF-1 output matches `refresh_efficiency()`.** Insert synthetic history rows, refresh DF-1, assert aggregates agree. | 2–4h | [PLAN_DOG_FEEDING.md](plans/PLAN_DOG_FEEDING.md) §8 |
-| DF-F4 | **`pgtrickle.setup_dog_feeding()` helper.** Single SQL call that creates all five `df_*` stream tables. | 2–4h | [PLAN_DOG_FEEDING.md](plans/PLAN_DOG_FEEDING.md) §7 Phase 4 |
-| DF-F5 | **`pgtrickle.teardown_dog_feeding()` helper.** Drops all `df_*` stream tables cleanly. | 1h | [PLAN_DOG_FEEDING.md](plans/PLAN_DOG_FEEDING.md) §7 Phase 4 |
+| DF-F1 | **Verify CDC on `pgt_refresh_history`.** Confirm that `create_stream_table()` installs INSERT triggers on `pgt_refresh_history`. Fix schema-exclusion logic if the `pgtrickle` schema is skipped. | 2–4h | [PLAN_SELF_MONITORING.md](plans/PLAN_SELF_MONITORING.md) §7 Phase 1 |
+| DF-F2 | **Create `df_efficiency_rolling` (DF-1).** Maintained rolling-window aggregates over `pgt_refresh_history`. Replaces `refresh_efficiency()` full scans. | 2–4h | [PLAN_SELF_MONITORING.md](plans/PLAN_SELF_MONITORING.md) §5 DF-1 |
+| DF-F3 | **E2E test: DF-1 output matches `refresh_efficiency()`.** Insert synthetic history rows, refresh DF-1, assert aggregates agree. | 2–4h | [PLAN_SELF_MONITORING.md](plans/PLAN_SELF_MONITORING.md) §8 |
+| DF-F4 | **`pgtrickle.setup_self_monitoring()` helper.** Single SQL call that creates all five `df_*` stream tables. | 2–4h | [PLAN_SELF_MONITORING.md](plans/PLAN_SELF_MONITORING.md) §7 Phase 4 |
+| DF-F5 | **`pgtrickle.teardown_self_monitoring()` helper.** Drops all `df_*` stream tables cleanly. | 1h | [PLAN_SELF_MONITORING.md](plans/PLAN_SELF_MONITORING.md) §7 Phase 4 |
 
 ### Phase 2 — Anomaly Detection
 
 | Item | Description | Effort | Ref |
 |------|-------------|--------|-----|
-| DF-A1 | **Create `df_anomaly_signals` (DF-2).** Detects duration spikes, error bursts, and mode oscillation by comparing recent behavior against DF-1 baselines. | 3–5h | [PLAN_DOG_FEEDING.md](plans/PLAN_DOG_FEEDING.md) §5 DF-2 |
-| DF-A2 | **Create `df_threshold_advice` (DF-3).** Multi-cycle threshold recommendation replacing the single-step `compute_adaptive_threshold()` convergence. | 3–5h | [PLAN_DOG_FEEDING.md](plans/PLAN_DOG_FEEDING.md) §5 DF-3 |
-| DF-A3 | **Verify DAG ordering.** DF-1 refreshes before DF-2 and DF-3. | 1–2h | [PLAN_DOG_FEEDING.md](plans/PLAN_DOG_FEEDING.md) §7 Phase 2 |
-| DF-A4 | **E2E test: threshold spike detection.** Inject synthetic history making DIFF consistently fast; assert DF-3 recommends raising the threshold. | 2–4h | [PLAN_DOG_FEEDING.md](plans/PLAN_DOG_FEEDING.md) §8 |
-| DF-A5 | **E2E test: anomaly duration spike.** Inject a 3× duration spike; assert DF-2 detects it. | 2–4h | [PLAN_DOG_FEEDING.md](plans/PLAN_DOG_FEEDING.md) §8 |
+| DF-A1 | **Create `df_anomaly_signals` (DF-2).** Detects duration spikes, error bursts, and mode oscillation by comparing recent behavior against DF-1 baselines. | 3–5h | [PLAN_SELF_MONITORING.md](plans/PLAN_SELF_MONITORING.md) §5 DF-2 |
+| DF-A2 | **Create `df_threshold_advice` (DF-3).** Multi-cycle threshold recommendation replacing the single-step `compute_adaptive_threshold()` convergence. | 3–5h | [PLAN_SELF_MONITORING.md](plans/PLAN_SELF_MONITORING.md) §5 DF-3 |
+| DF-A3 | **Verify DAG ordering.** DF-1 refreshes before DF-2 and DF-3. | 1–2h | [PLAN_SELF_MONITORING.md](plans/PLAN_SELF_MONITORING.md) §7 Phase 2 |
+| DF-A4 | **E2E test: threshold spike detection.** Inject synthetic history making DIFF consistently fast; assert DF-3 recommends raising the threshold. | 2–4h | [PLAN_SELF_MONITORING.md](plans/PLAN_SELF_MONITORING.md) §8 |
+| DF-A5 | **E2E test: anomaly duration spike.** Inject a 3× duration spike; assert DF-2 detects it. | 2–4h | [PLAN_SELF_MONITORING.md](plans/PLAN_SELF_MONITORING.md) §8 |
 
 ### Phase 3 — CDC Buffer & Interference
 
 | Item | Description | Effort | Ref |
 |------|-------------|--------|-----|
-| DF-C1 | **Create `df_cdc_buffer_trends` (DF-4).** Tracks change-buffer growth rates per source table. May require `pgtrickle.cdc_buffer_row_counts()` helper for dynamic table names. | 4–8h | [PLAN_DOG_FEEDING.md](plans/PLAN_DOG_FEEDING.md) §5 DF-4 |
-| DF-C2 | **Create `df_scheduling_interference` (DF-5).** Detects concurrent refresh overlap. FULL-refresh mode initially (bounded 1-hour window). | 3–5h | [PLAN_DOG_FEEDING.md](plans/PLAN_DOG_FEEDING.md) §5 DF-5 |
-| DF-C3 | **E2E test: scheduling overlap detection.** Create 3 STs with overlapping schedules; verify DF-5 detects overlap. | 2–4h | [PLAN_DOG_FEEDING.md](plans/PLAN_DOG_FEEDING.md) §8 |
+| DF-C1 | **Create `df_cdc_buffer_trends` (DF-4).** Tracks change-buffer growth rates per source table. May require `pgtrickle.cdc_buffer_row_counts()` helper for dynamic table names. | 4–8h | [PLAN_SELF_MONITORING.md](plans/PLAN_SELF_MONITORING.md) §5 DF-4 |
+| DF-C2 | **Create `df_scheduling_interference` (DF-5).** Detects concurrent refresh overlap. FULL-refresh mode initially (bounded 1-hour window). | 3–5h | [PLAN_SELF_MONITORING.md](plans/PLAN_SELF_MONITORING.md) §5 DF-5 |
+| DF-C3 | **E2E test: scheduling overlap detection.** Create 3 STs with overlapping schedules; verify DF-5 detects overlap. | 2–4h | [PLAN_SELF_MONITORING.md](plans/PLAN_SELF_MONITORING.md) §8 |
 
 ### Phase 4 — GUC & Auto-Apply
 
 | Item | Description | Effort | Ref |
 |------|-------------|--------|-----|
-| DF-G1 | **`pg_trickle.dog_feeding_auto_apply` GUC.** Values: `off` (default) / `threshold_only` / `full`. Registered in `src/config.rs`. | 1–2h | [PLAN_DOG_FEEDING.md](plans/PLAN_DOG_FEEDING.md) §6.2 |
-| DF-G2 | **Auto-apply worker (threshold_only).** Post-tick hook reads `df_threshold_advice`; applies `ALTER STREAM TABLE ... SET auto_threshold = <recommended>` when confidence is HIGH and delta > 5%. Rate-limited to 1 change per ST per 10 minutes. | 4–8h | [PLAN_DOG_FEEDING.md](plans/PLAN_DOG_FEEDING.md) §7 Phase 5 |
-| DF-G3 | **`initiated_by = 'DOG_FEED'` audit trail.** Log auto-apply changes to `pgt_refresh_history`. | 1–2h | [PLAN_DOG_FEEDING.md](plans/PLAN_DOG_FEEDING.md) §7 Phase 5 |
-| DF-G4 | **E2E test: auto-apply threshold.** Enable `threshold_only`, inject history making DIFF consistently faster, verify threshold increases automatically. | 2–4h | [PLAN_DOG_FEEDING.md](plans/PLAN_DOG_FEEDING.md) §8 |
-| DF-G5 | **E2E test: rate limiting.** Verify no more than 1 threshold change per ST per 10 minutes. | 1–2h | [PLAN_DOG_FEEDING.md](plans/PLAN_DOG_FEEDING.md) §8 |
+| DF-G1 | **`pg_trickle.self_monitoring_auto_apply` GUC.** Values: `off` (default) / `threshold_only` / `full`. Registered in `src/config.rs`. | 1–2h | [PLAN_SELF_MONITORING.md](plans/PLAN_SELF_MONITORING.md) §6.2 |
+| DF-G2 | **Auto-apply worker (threshold_only).** Post-tick hook reads `df_threshold_advice`; applies `ALTER STREAM TABLE ... SET auto_threshold = <recommended>` when confidence is HIGH and delta > 5%. Rate-limited to 1 change per ST per 10 minutes. | 4–8h | [PLAN_SELF_MONITORING.md](plans/PLAN_SELF_MONITORING.md) §7 Phase 5 |
+| DF-G3 | **`initiated_by = 'SELF_MONITOR'` audit trail.** Log auto-apply changes to `pgt_refresh_history`. | 1–2h | [PLAN_SELF_MONITORING.md](plans/PLAN_SELF_MONITORING.md) §7 Phase 5 |
+| DF-G4 | **E2E test: auto-apply threshold.** Enable `threshold_only`, inject history making DIFF consistently faster, verify threshold increases automatically. | 2–4h | [PLAN_SELF_MONITORING.md](plans/PLAN_SELF_MONITORING.md) §8 |
+| DF-G5 | **E2E test: rate limiting.** Verify no more than 1 threshold change per ST per 10 minutes. | 1–2h | [PLAN_SELF_MONITORING.md](plans/PLAN_SELF_MONITORING.md) §8 |
 
 ### Phase 5 — Operational Diagnostics
 
 | Item | Description | Effort | Ref |
 |------|-------------|--------|-----|
-| OPS-1 | **`pgtrickle.recommend_refresh_mode(st_name)`** Reads `df_threshold_advice` to return a structured recommendation `{ mode, confidence, reason }` rather than computing on demand. | 2–4h | [PLAN_DOG_FEEDING.md](plans/PLAN_DOG_FEEDING.md) §10.6 |
-| OPS-2 | **`check_cdc_health()` spill-risk enrichment.** Query `df_cdc_buffer_trends` growth rate; emit a `spill_risk` alert when buffer growth will breach `spill_threshold_blocks` within 2 cycles. | 2–4h | [PLAN_DOG_FEEDING.md](plans/PLAN_DOG_FEEDING.md) §10.3 |
+| OPS-1 | **`pgtrickle.recommend_refresh_mode(st_name)`** Reads `df_threshold_advice` to return a structured recommendation `{ mode, confidence, reason }` rather than computing on demand. | 2–4h | [PLAN_SELF_MONITORING.md](plans/PLAN_SELF_MONITORING.md) §10.6 |
+| OPS-2 | **`check_cdc_health()` spill-risk enrichment.** Query `df_cdc_buffer_trends` growth rate; emit a `spill_risk` alert when buffer growth will breach `spill_threshold_blocks` within 2 cycles. | 2–4h | [PLAN_SELF_MONITORING.md](plans/PLAN_SELF_MONITORING.md) §10.3 |
 | OPS-3 | **`pgtrickle.scheduler_overhead()` diagnostic function.** Returns busy-time ratio, queue depth, avg dispatch latency, and fraction of CPU spent on DF STs vs user STs. | 2–4h | — |
-| OPS-4 | **`pgtrickle.explain_dag()` — Mermaid/DOT output.** Returns DAG as Mermaid markdown with node colours: user=blue, dog-feeding=green, suspended=red. | 3–4h | — |
-| OPS-5 | **`sql/dog_feeding_setup.sql` quick-start template.** Runnable script: call `setup_dog_feeding()`, set `dog_feeding_auto_apply = 'threshold_only'`, configure LISTEN, query initial recommendations. | 1h | — |
-| OPS-6 | **Workload-aware poll intervals via DF-5 signal.** Replace `compute_adaptive_poll_ms()` exponential backoff with pre-emptive dispatch interval widening when `df_scheduling_interference` detects contention. | 2–4h | [PLAN_DOG_FEEDING.md](plans/PLAN_DOG_FEEDING.md) §10.2 |
-| DASH-1 | **Grafana Dog-Feeding Dashboard.** New `monitoring/grafana/dashboards/pg_trickle_dog_feeding.json` — 5 panels reading from DF-1 through DF-5. | 4–6h | [PLAN_DOG_FEEDING.md](plans/PLAN_DOG_FEEDING.md) §10.5 |
-| DBT-1 | **dbt `pgtrickle_enable_monitoring` post-hook macro.** Calls `setup_dog_feeding()` automatically after a successful `dbt run`; documented in `dbt-pgtrickle/`. | 2h | — |
+| OPS-4 | **`pgtrickle.explain_dag()` — Mermaid/DOT output.** Returns DAG as Mermaid markdown with node colours: user=blue, self-monitoring=green, suspended=red. | 3–4h | — |
+| OPS-5 | **`sql/self_monitoring_setup.sql` quick-start template.** Runnable script: call `setup_self_monitoring()`, set `self_monitoring_auto_apply = 'threshold_only'`, configure LISTEN, query initial recommendations. | 1h | — |
+| OPS-6 | **Workload-aware poll intervals via DF-5 signal.** Replace `compute_adaptive_poll_ms()` exponential backoff with pre-emptive dispatch interval widening when `df_scheduling_interference` detects contention. | 2–4h | [PLAN_SELF_MONITORING.md](plans/PLAN_SELF_MONITORING.md) §10.2 |
+| DASH-1 | **Grafana Self-Monitoring Dashboard.** New `monitoring/grafana/dashboards/pg_trickle_self_monitoring.json` — 5 panels reading from DF-1 through DF-5. | 4–6h | [PLAN_SELF_MONITORING.md](plans/PLAN_SELF_MONITORING.md) §10.5 |
+| DBT-1 | **dbt `pgtrickle_enable_monitoring` post-hook macro.** Calls `setup_self_monitoring()` automatically after a successful `dbt run`; documented in `dbt-pgtrickle/`. | 2h | — |
 
 **OPS-1 — `pgtrickle.recommend_refresh_mode(st_name text)`**
 
 > Reads directly from `df_threshold_advice` instead of computing a
-> single-cycle cost comparison on demand (PLAN_DOG_FEEDING.md §10.6). Returns
+> single-cycle cost comparison on demand (PLAN_SELF_MONITORING.md §10.6). Returns
 > `TABLE(mode text, confidence text, reason text)`. When confidence is LOW
 > (< 10 history rows), emits a fallback with mode=`'AUTO'` and a reason
 > explaining insufficient data. Integrates with `explain_st()` output.
@@ -5353,7 +5353,7 @@ Dependencies: DB-3 (uses schema version to determine needed migrations). Schema 
 > When DF-C1 is active, query `df_cdc_buffer_trends` growth rate instead.
 > Emit a `spill_risk = 'IMMINENT'` row when the 1-cycle growth rate extrapolated
 > 2 cycles ahead exceeds `spill_threshold_blocks`. Falls back to full scan
-> when dog-feeding is not set up.
+> when self-monitoring is not set up.
 >
 > Verify: inject 80% of `spill_threshold_blocks` worth of buffer rows with a
 > steep growth rate; assert `check_cdc_health()` returns a spill-risk alert.
@@ -5376,20 +5376,20 @@ Dependencies: DB-3 (uses schema version to determine needed migrations). Schema 
 > Returns the full refresh DAG as a Mermaid markdown string (default) or
 > Graphviz DOT (via `format => 'dot'` argument). Node labels show ST name,
 > current mode, and refresh interval. Node colours: user STs = blue,
-> dog-feeding STs = green, suspended = red, fused = orange. Edges show
+> self-monitoring STs = green, suspended = red, fused = orange. Edges show
 > dependency direction. Validates that DF-1 → DF-2 → DF-3 ordering is
 > correct post-setup.
 >
-> Verify: `SELECT pgtrickle.explain_dag()` after `setup_dog_feeding()` returns
+> Verify: `SELECT pgtrickle.explain_dag()` after `setup_self_monitoring()` returns
 > a string containing all five `df_` nodes in green with correct edges.
 > Dependencies: None. Schema change: No (new function only).
 
-**OPS-5 — `sql/dog_feeding_setup.sql` quick-start template**
+**OPS-5 — `sql/self_monitoring_setup.sql` quick-start template**
 
 > A standalone SQL script in `sql/` that an operator can run with
-> `psql -f sql/dog_feeding_setup.sql`. Contents: calls `setup_dog_feeding()`,
-> sets `pg_trickle.dog_feeding_auto_apply = 'threshold_only'`, runs
-> `LISTEN pg_trickle_alert`, queries `dog_feeding_status()` for a status
+> `psql -f sql/self_monitoring_setup.sql`. Contents: calls `setup_self_monitoring()`,
+> sets `pg_trickle.self_monitoring_auto_apply = 'threshold_only'`, runs
+> `LISTEN pg_trickle_alert`, queries `self_monitoring_status()` for a status
 > summary, and queries `df_threshold_advice` for initial recommendations
 > with a warm-up note. Referenced from GETTING_STARTED.md Day 2 operations
 > section (UX-4).
@@ -5405,7 +5405,7 @@ Dependencies: DB-3 (uses schema version to determine needed migrations). Schema 
 > signal: after each scheduler tick, read the latest `overlap_count` from
 > `df_scheduling_interference`; if `overlap_count >= 2`, increase the dispatch
 > interval for the next tick by 20% before dispatching (capped at
-> `pg_trickle.max_poll_interval_ms`). This closes the dog-feeding feedback loop
+> `pg_trickle.max_poll_interval_ms`). This closes the self-monitoring feedback loop
 > by letting the analytics directly influence scheduling policy, reducing
 > contention on write-heavy deployments without waiting for timeouts.
 >
@@ -5413,9 +5413,9 @@ Dependencies: DB-3 (uses schema version to determine needed migrations). Schema 
 > DF-5 with signal enabled vs disabled. `scheduler_overhead()` shows reduced
 > busy-time ratio. Dependencies: DF-C2, OPS-3. Schema change: No.
 
-**DASH-1 — Grafana Dog-Feeding Dashboard**
+**DASH-1 — Grafana Self-Monitoring Dashboard**
 
-> Add `monitoring/grafana/dashboards/pg_trickle_dog_feeding.json` alongside
+> Add `monitoring/grafana/dashboards/pg_trickle_self_monitoring.json` alongside
 > the existing `pg_trickle_overview.json`. Five panels: (1) Refresh throughput
 > timeline (DF-1 `avg_diff_ms` over time), (2) Anomaly heatmap (DF-2 per-ST
 > anomaly type grid), (3) Threshold calibration scatter (DF-3 current vs
@@ -5430,24 +5430,24 @@ Dependencies: DB-3 (uses schema version to determine needed migrations). Schema 
 **DBT-1 — `pgtrickle_enable_monitoring` dbt post-hook macro**
 
 > Add a `pgtrickle_enable_monitoring` macro to `dbt-pgtrickle/macros/` that
-> calls `{{ pgtrickle.setup_dog_feeding() }}` and emits a `log()` message
+> calls `{{ pgtrickle.setup_self_monitoring() }}` and emits a `log()` message
 > confirming activation. Documented in `dbt-pgtrickle/README.md`. Users add
 > `+post-hook: "{{ pgtrickle_enable_monitoring() }}"` to `dbt_project.yml`
 > to auto-enable monitoring after any `dbt run`. Idempotent — safe to call on
-> every run because `setup_dog_feeding()` is already idempotent (STAB-1).
+> every run because `setup_self_monitoring()` is already idempotent (STAB-1).
 >
 > Verify: `just test-dbt` includes a test case that runs the macro twice;
-> asserts `dog_feeding_status()` shows 5 active STs after both calls.
+> asserts `self_monitoring_status()` shows 5 active STs after both calls.
 > Dependencies: DF-F4, STAB-1. Schema change: No.
 
 ### Documentation & Safety
 
 | Item | Description | Effort | Ref |
 |------|-------------|--------|-----|
-| DF-D1 | **SQL_REFERENCE.md: dog-feeding quick start.** Document `setup_dog_feeding()`, `teardown_dog_feeding()`, all five `df_*` stream tables, and the auto-apply GUC. | 2–4h | — |
-| DF-D2 | **CONFIGURATION.md: `pg_trickle.dog_feeding_auto_apply` GUC.** | 1h | — |
-| DF-D3 | **E2E test: control plane survives DF ST suspension.** Drop or suspend all `df_*` STs; verify the scheduler and refresh logic operate identically. | 2–4h | [PLAN_DOG_FEEDING.md](plans/PLAN_DOG_FEEDING.md) §8 |
-| DF-D4 | **Soak test addition.** Add dog-feeding STs to the existing soak test; verify no memory growth or scheduler stalls under 1-hour sustained load. | 2–4h | [PLAN_DOG_FEEDING.md](plans/PLAN_DOG_FEEDING.md) §8 |
+| DF-D1 | **SQL_REFERENCE.md: self-monitoring quick start.** Document `setup_self_monitoring()`, `teardown_self_monitoring()`, all five `df_*` stream tables, and the auto-apply GUC. | 2–4h | — |
+| DF-D2 | **CONFIGURATION.md: `pg_trickle.self_monitoring_auto_apply` GUC.** | 1h | — |
+| DF-D3 | **E2E test: control plane survives DF ST suspension.** Drop or suspend all `df_*` STs; verify the scheduler and refresh logic operate identically. | 2–4h | [PLAN_SELF_MONITORING.md](plans/PLAN_SELF_MONITORING.md) §8 |
+| DF-D4 | **Soak test addition.** Add self-monitoring STs to the existing soak test; verify no memory growth or scheduler stalls under 1-hour sustained load. | 2–4h | [PLAN_SELF_MONITORING.md](plans/PLAN_SELF_MONITORING.md) §8 |
 
 ### Correctness
 
@@ -5526,21 +5526,21 @@ Dependencies: DB-3 (uses schema version to determine needed migrations). Schema 
 
 | ID | Title | Effort | Priority |
 |----|-------|--------|----------|
-| STAB-1 | `setup_dog_feeding()` is fully idempotent | S | P0 |
+| STAB-1 | `setup_self_monitoring()` is fully idempotent | S | P0 |
 | STAB-2 | Auto-apply handles `ALTER STREAM TABLE` failure gracefully | S | P0 |
 | STAB-3 | DF STs survive `DROP EXTENSION` + `CREATE EXTENSION` cycle | S | P1 |
 | STAB-4 | Auto-apply worker checks ST still exists before applying | XS | P1 |
-| STAB-5 | `teardown_dog_feeding()` is safe when some DF STs already removed | XS | P1 |
+| STAB-5 | `teardown_self_monitoring()` is safe when some DF STs already removed | XS | P1 |
 
-**STAB-1 — `setup_dog_feeding()` is fully idempotent**
+**STAB-1 — `setup_self_monitoring()` is fully idempotent**
 
-> Calling `setup_dog_feeding()` a second time while DF STs already exist must
+> Calling `setup_self_monitoring()` a second time while DF STs already exist must
 > not raise an error. Use `IF NOT EXISTS` semantics internally (or check catalog
 > before creating). The function must also be safe to call concurrently from
 > two sessions. Idempotency is critical for upgrade scripts and Terraform-style
 > declarative deployment workflows.
 >
-> Verify: call `setup_dog_feeding()` three times in a row; no errors, no
+> Verify: call `setup_self_monitoring()` three times in a row; no errors, no
 > duplicate stream tables. Dependencies: DF-F4. Schema change: No.
 
 **STAB-2 — Auto-apply handles `ALTER STREAM TABLE` failure gracefully**
@@ -5559,13 +5559,13 @@ Dependencies: DB-3 (uses schema version to determine needed migrations). Schema 
 **STAB-3 — DF STs survive `DROP EXTENSION` + `CREATE EXTENSION` cycle**
 
 > `DROP EXTENSION pg_trickle CASCADE` drops all extension-owned objects.
-> After `CREATE EXTENSION pg_trickle`, `setup_dog_feeding()` should recreate
+> After `CREATE EXTENSION pg_trickle`, `setup_self_monitoring()` should recreate
 > the DF STs cleanly. There must be no leftover triggers, orphaned change
 > buffer tables, or stale catalog rows from the previous installation. This
 > is the most likely failure mode after an emergency rollback + reinstall.
 >
-> Verify: E2E test: `setup_dog_feeding()` → `DROP EXTENSION CASCADE` →
-> `CREATE EXTENSION` → `setup_dog_feeding()` → insert history → refresh DF-1;
+> Verify: E2E test: `setup_self_monitoring()` → `DROP EXTENSION CASCADE` →
+> `CREATE EXTENSION` → `setup_self_monitoring()` → insert history → refresh DF-1;
 > assert correct aggregates. Dependencies: DF-F4, DF-F5. Schema change: No.
 
 **STAB-4 — Auto-apply worker checks ST still exists before applying**
@@ -5580,15 +5580,15 @@ Dependencies: DB-3 (uses schema version to determine needed migrations). Schema 
 > assert no threshold change is applied-to a suspended stream table.
 > Dependencies: DF-G2. Schema change: No.
 
-**STAB-5 — `teardown_dog_feeding()` is safe when some DF STs already removed**
+**STAB-5 — `teardown_self_monitoring()` is safe when some DF STs already removed**
 
 > If a user manually drops `df_anomaly_signals` before calling
-> `teardown_dog_feeding()`, the teardown function must not error on `DROP
+> `teardown_self_monitoring()`, the teardown function must not error on `DROP
 > STREAM TABLE df_anomaly_signals`. Use `drop_stream_table(name, if_exists
 > => true)` semantics for each DF table in the teardown. Otherwise a partial
 > teardown leaves the system in an inconsistent state.
 >
-> Verify: drop two DF STs manually, then call `teardown_dog_feeding()`; assert
+> Verify: drop two DF STs manually, then call `teardown_self_monitoring()`; assert
 > no errors and remaining DF STs are gone. Dependencies: DF-F5. Schema change: No.
 
 ---
@@ -5618,7 +5618,7 @@ Dependencies: DB-3 (uses schema version to determine needed migrations). Schema 
 
 **PERF-2 — Benchmark DF-1 vs `refresh_efficiency()` on 10 K history rows**
 
-> The primary performance claim of dog-feeding is that a maintained DIFFERENTIAL
+> The primary performance claim of self-monitoring is that a maintained DIFFERENTIAL
 > stream table is cheaper than scanning the full history table on every
 > diagnostic call. Establish a Criterion micro-benchmark that seeds 10 K history
 > rows, then compares: (a) a full `SELECT * FROM pgtrickle.refresh_efficiency()`
@@ -5656,7 +5656,7 @@ Dependencies: DB-3 (uses schema version to determine needed migrations). Schema 
 **PERF-5 — History pruning batch-DELETE with short transactions**
 
 > `pg_trickle.history_retention_days` cleanup (shipped in v0.19.0) currently
-> deletes rows in a single long transaction. Under dog-feeding, that transaction
+> deletes rows in a single long transaction. Under self-monitoring, that transaction
 > holds a lock on `pgt_refresh_history` that can delay CDC trigger INSERTs.
 > Rewrite the purge as batched DELETEs: delete at most 500 rows per
 > transaction, commit between batches, sleep 50 ms between batches. The index
@@ -5688,7 +5688,7 @@ Dependencies: DB-3 (uses schema version to determine needed migrations). Schema 
 | ID | Title | Effort | Priority |
 |----|-------|--------|----------|
 | SCAL-1 | DF STs refresh within window at 100 user stream tables | S | P1 |
-| SCAL-2 | `pgt_refresh_history` retention interacts correctly with dog-feeding | S | P1 |
+| SCAL-2 | `pgt_refresh_history` retention interacts correctly with self-monitoring | S | P1 |
 | SCAL-3 | 1-hour rolling window doesn't over-aggregate when history is sparse | XS | P2 |
 
 **SCAL-1 — DF STs refresh within window at 100 user stream tables**
@@ -5702,7 +5702,7 @@ Dependencies: DB-3 (uses schema version to determine needed migrations). Schema 
 > Verify: soak test with 100 STs; DF-1 refresh duration < 10 s throughout.
 > Dependencies: PERF-1. Schema change: No.
 
-**SCAL-2 — `pgt_refresh_history` retention interacts correctly with dog-feeding**
+**SCAL-2 — `pgt_refresh_history` retention interacts correctly with self-monitoring**
 
 > `pg_trickle.history_retention_days` (shipped in v0.19.0, default 90 days)
 > purges old history rows. DF-1 only looks back 1 hour, so retention does
@@ -5732,8 +5732,8 @@ Dependencies: DB-3 (uses schema version to determine needed migrations). Schema 
 
 | ID | Title | Effort | Priority |
 |----|-------|--------|----------|
-| UX-1 | `pgtrickle.dog_feeding_status()` diagnostic function | S | P0 |
-| UX-2 | `setup_dog_feeding()` warm-up hint when history is sparse | XS | P1 |
+| UX-1 | `pgtrickle.self_monitoring_status()` diagnostic function | S | P0 |
+| UX-2 | `setup_self_monitoring()` warm-up hint when history is sparse | XS | P1 |
 | UX-3 | NOTIFY on anomaly via `pg_trickle_alert` channel | S | P1 |
 | UX-4 | GETTING_STARTED.md: "Day 2 operations" section | S | P1 |
 | UX-5 | `explain_st()` shows if a DF ST covers the queried stream table | XS | P2 |
@@ -5741,34 +5741,34 @@ Dependencies: DB-3 (uses schema version to determine needed migrations). Schema 
 | UX-7 | `scheduler_overhead()` output included in TUI diagnostics panel | XS | P2 |
 | UX-8 | `df_threshold_advice` extended with SLA headroom column | S | P2 |
 
-**UX-1 — `pgtrickle.dog_feeding_status()` diagnostic function**
+**UX-1 — `pgtrickle.self_monitoring_status()` diagnostic function**
 
-> A single-query overview of the dog-feeding analytics plane: name, last
+> A single-query overview of the self-monitoring analytics plane: name, last
 > refresh timestamp, row count, and whether the DF ST is ACTIVE / SUSPENDED /
 > NOT_CREATED. Calling this function is the first thing an operator should run
-> to check that dog-feeding is working. Return type: `TABLE(df_name text,
+> to check that self-monitoring is working. Return type: `TABLE(df_name text,
 > status text, last_refresh timestamptz, row_count bigint, note text)`.
 >
 > Verify: function returns 5 rows when all DF STs are active; returns rows with
-> `status = 'NOT_CREATED'` when `setup_dog_feeding()` has not been called.
+> `status = 'NOT_CREATED'` when `setup_self_monitoring()` has not been called.
 > Schema change: No (new function only).
 
-**UX-2 — `setup_dog_feeding()` warm-up hint when history is sparse**
+**UX-2 — `setup_self_monitoring()` warm-up hint when history is sparse**
 
-> If `pgt_refresh_history` has fewer than 50 rows when `setup_dog_feeding()`
+> If `pgt_refresh_history` has fewer than 50 rows when `setup_self_monitoring()`
 > is called, emit a NOTICE: `"Dog-feeding stream tables created. DF analytics
 > will populate as refresh history accumulates (currently N rows; recommend
 > ≥ 50 before consulting df_threshold_advice)."` This prevents operators from
 > acting on meaningless LOW-confidence advice immediately after setup.
 >
-> Verify: call `setup_dog_feeding()` on a fresh install; assert NOTICE contains
+> Verify: call `setup_self_monitoring()` on a fresh install; assert NOTICE contains
 > the row count and the ≥ 50 recommendation. Dependencies: DF-F4. Schema change: No.
 
 **UX-3 — NOTIFY on anomaly via `pg_trickle_alert` channel**
 
 > When `df_anomaly_signals` detects a `duration_anomaly IS NOT NULL` or
 > `recent_failures >= 2` after a refresh, emit a `pg_notify('pg_trickle_alert',
-> payload::text)` with `event = 'dog_feed_anomaly'`, the stream table name,
+> payload::text)` with `event = 'self_monitor_anomaly'`, the stream table name,
 > anomaly type, last duration, baseline, and a plain-English recommendation.
 > This integrates with existing alert pipelines without requiring a new channel.
 > Fires from a post-refresh trigger on `df_anomaly_signals` or from the
@@ -5781,10 +5781,10 @@ Dependencies: DB-3 (uses schema version to determine needed migrations). Schema 
 **UX-4 — GETTING_STARTED.md: "Day 2 operations" section**
 
 > Add a new section to `docs/GETTING_STARTED.md` covering the first steps
-> after initial deployment: (1) enable dog-feeding with `setup_dog_feeding()`,
-> (2) check status with `dog_feeding_status()`, (3) query `df_threshold_advice`
+> after initial deployment: (1) enable self-monitoring with `setup_self_monitoring()`,
+> (2) check status with `self_monitoring_status()`, (3) query `df_threshold_advice`
 > to tune thresholds, (4) set up anomaly alerting via LISTEN. This gives new
-> users a clear post-install checklist and demonstrates the dog-feeding value
+> users a clear post-install checklist and demonstrates the self-monitoring value
 > proposition immediately.
 >
 > Verify: documentation PR reviewed; code examples in GETTING_STARTED.md
@@ -5794,11 +5794,11 @@ Dependencies: DB-3 (uses schema version to determine needed migrations). Schema 
 
 > When a user calls `pgtrickle.explain_st('my_table')`, append a line
 > `"Dog-feeding coverage: df_efficiency_rolling ✓, df_threshold_advice ✓"` (or
-> `"Not set up — run setup_dog_feeding()"`) to the output. This surfaces the
-> analytics plane to users who might not know dog-feeding exists, without
+> `"Not set up — run setup_self_monitoring()"`) to the output. This surfaces the
+> analytics plane to users who might not know self-monitoring exists, without
 > requiring a separate function call.
 >
-> Verify: `SELECT explain_st('any_table')` output includes a `dog_feeding`
+> Verify: `SELECT explain_st('any_table')` output includes a `self_monitoring`
 > field in the JSON output. Dependencies: UX-1. Schema change: No.
 
 **UX-8 — `df_threshold_advice` extended with SLA headroom column**
@@ -5816,10 +5816,10 @@ Dependencies: DB-3 (uses schema version to determine needed migrations). Schema 
 
 **UX-6 — `recommend_refresh_mode()` exposed in `explain_st()` JSON output**
 
-> `explain_st()` already shows dog-feeding coverage (UX-5). Extend its JSON
+> `explain_st()` already shows self-monitoring coverage (UX-5). Extend its JSON
 > output with a `recommended_mode` field reading from `df_threshold_advice`
 > (OPS-1). If OPS-1 is not available (no DF setup), fall back to `null` with
-> a `setup_dog_feeding()` hint. Keeps the single-function diagnostic surface
+> a `setup_self_monitoring()` hint. Keeps the single-function diagnostic surface
 > comprehensive without requiring separate calls.
 >
 > Verify: `SELECT explain_st('any_table')` JSON includes `recommended_mode`
@@ -5843,11 +5843,11 @@ Dependencies: DB-3 (uses schema version to determine needed migrations). Schema 
 | ID | Title | Effort | Priority |
 |----|-------|--------|----------|
 | TEST-1 | Property test: DF-3 recommended threshold always ∈ \[0.01, 0.80\] | S | P0 |
-| TEST-2 | Light E2E: dog-feeding create/refresh/teardown full cycle | S | P0 |
+| TEST-2 | Light E2E: self-monitoring create/refresh/teardown full cycle | S | P0 |
 | TEST-3 | Upgrade test: `pgt_refresh_history` rows survive `0.19.0 → 0.20.0` | S | P0 |
 | TEST-4 | Regression test: DF STs absent from `check_cdc_health()` anomaly list | XS | P1 |
-| TEST-5 | Stability test: dog-feeding under 1-h soak with 50 user STs | M | P1 |
-| TEST-6 | Light E2E: `setup_dog_feeding()` idempotency (3× call) | XS | P1 |
+| TEST-5 | Stability test: self-monitoring under 1-h soak with 50 user STs | M | P1 |
+| TEST-6 | Light E2E: `setup_self_monitoring()` idempotency (3× call) | XS | P1 |
 
 **TEST-1 — Property test: DF-3 recommended threshold always ∈ \[0.01, 0.80\]**
 
@@ -5860,13 +5860,13 @@ Dependencies: DB-3 (uses schema version to determine needed migrations). Schema 
 > Verify: `just test-unit` passes; 10,000 proptest iterations with zero failures.
 > Dependencies: CORR-1. Schema change: No.
 
-**TEST-2 — Light E2E: dog-feeding create/refresh/teardown full cycle**
+**TEST-2 — Light E2E: self-monitoring create/refresh/teardown full cycle**
 
 > A light E2E test (stock `postgres:18.3` container) that: (1) installs the
 > extension, (2) creates 3 user STs, (3) runs 5 refresh cycles to populate
-> history, (4) calls `setup_dog_feeding()`, (5) refreshes all DF STs once,
-> (6) asserts `dog_feeding_status()` shows 5 active STs, (7) calls
-> `teardown_dog_feeding()`, (8) asserts all DF STs are gone.
+> history, (4) calls `setup_self_monitoring()`, (5) refreshes all DF STs once,
+> (6) asserts `self_monitoring_status()` shows 5 active STs, (7) calls
+> `teardown_self_monitoring()`, (8) asserts all DF STs are gone.
 >
 > Verify: test passes in `just test-light-e2e` with zero assertions failed.
 > Schema change: No.
@@ -5885,28 +5885,28 @@ Dependencies: DB-3 (uses schema version to determine needed migrations). Schema 
 **TEST-4 — Regression test: DF STs absent from `check_cdc_health()` anomaly list**
 
 > `pgtrickle.check_cdc_health()` scans all stream tables for CDC anomalies.
-> After `setup_dog_feeding()`, DF STs must not appear in the anomaly list
+> After `setup_self_monitoring()`, DF STs must not appear in the anomaly list
 > just because they are refreshed at longer intervals (48–96 s). Their
 > schedules must be recognised as intentionally relaxed, not "falling behind".
 >
-> Verify: E2E test: `setup_dog_feeding()` → wait one full DF cycle → assert
+> Verify: E2E test: `setup_self_monitoring()` → wait one full DF cycle → assert
 > `check_cdc_health()` returns no anomalies for any `df_` table. Dependencies:
 > DF-F4. Schema change: No.
 
-**TEST-5 — Stability test: dog-feeding under 1-h soak with 50 user STs**
+**TEST-5 — Stability test: self-monitoring under 1-h soak with 50 user STs**
 
 > Extends DF-D4. Runs 50 user STs + 5 DF STs for 1 hour under steady insert
 > load (1 000 rows/min across all sources). Assertions: (a) all DF STs remain
 > ACTIVE, (b) no OOM or background worker crash, (c) DF-1 avg refresh duration
-> < 5 s throughout, (d) `pgtrickle.dog_feeding_status()` shows 5 active STs
+> < 5 s throughout, (d) `pgtrickle.self_monitoring_status()` shows 5 active STs
 > at end of run.
 >
 > Verify: soak test passes with all four assertions. Dependencies: DF-D4,
 > SCAL-1. Schema change: No.
 
-**TEST-6 — Light E2E: `setup_dog_feeding()` idempotency (3× call)**
+**TEST-6 — Light E2E: `setup_self_monitoring()` idempotency (3× call)**
 
-> Implements STAB-1 as a light E2E test. Call `setup_dog_feeding()` three
+> Implements STAB-1 as a light E2E test. Call `setup_self_monitoring()` three
 > consecutive times in the same session. Assert: no errors, exactly five
 > `df_` stream tables in `pgt_stream_tables`, no duplicate triggers in
 > `pg_trigger` for history table.
@@ -5933,7 +5933,7 @@ Dependencies: DB-3 (uses schema version to determine needed migrations). Schema 
 3. **STAB-3 (DROP EXTENSION cycle) requires DF STs to be extension-owned or
    cleanly unregistered.** If DF STs are not extension-owned objects, `DROP
    EXTENSION CASCADE` will not drop them. Either register them as extension
-   members or document that `teardown_dog_feeding()` must be called before
+   members or document that `teardown_self_monitoring()` must be called before
    `DROP EXTENSION`.
 
 4. **TEST-5 (soak test) overlaps with the existing soak test in CI.** Add it
@@ -5953,7 +5953,7 @@ Dependencies: DB-3 (uses schema version to determine needed migrations). Schema 
    affecting any other item — it shares no code paths with the DF pipeline.
 
 7. **OPS-2 (`check_cdc_health()` enrichment) has a fallback requirement.**
-   When `setup_dog_feeding()` has not been called, the function must fall back
+   When `setup_self_monitoring()` has not been called, the function must fall back
    to the old full-scan path without error. Guard with a catalog check for
    `df_cdc_buffer_trends` existence before querying it.
 
@@ -5966,7 +5966,7 @@ Dependencies: DB-3 (uses schema version to determine needed migrations). Schema 
    `compute_adaptive_poll_ms()` function is called on every scheduler tick.
    The DF-5 read must be a single O(1) catalog lookup (latest row only), not
    a full table scan. Guard with `LIMIT 1 ORDER BY collected_at DESC`. If
-   the DF-5 table does not exist (dog-feeding not set up), fall back to the
+   the DF-5 table does not exist (self-monitoring not set up), fall back to the
    old backoff logic without error.
 
 10. **DASH-1 (Grafana) depends on postgres-exporter SQL queries.** The
@@ -5976,7 +5976,7 @@ Dependencies: DB-3 (uses schema version to determine needed migrations). Schema 
     the existing exporter config.
 
 11. **DBT-1 macro idempotency.** The `pgtrickle_enable_monitoring` macro
-    calls `setup_dog_feeding()` on every `dbt run`. Document that this is
+    calls `setup_self_monitoring()` on every `dbt run`. Document that this is
     intentionally safe (STAB-1) and adds < 5 ms overhead per run.
 
 > **v0.20.0 total: ~3–4 weeks**
@@ -5985,14 +5985,14 @@ Dependencies: DB-3 (uses schema version to determine needed migrations). Schema 
 - [x] DF-F1: `pgt_refresh_history` receives CDC INSERT triggers when `create_stream_table()` is called
 - [x] DF-F2: `df_efficiency_rolling` created and refreshes correctly in DIFFERENTIAL mode
 - [x] DF-F3: DF-1 output matches `refresh_efficiency()` results on synthetic history
-- [x] DF-F4: `setup_dog_feeding()` creates all five `df_*` stream tables in one call
-- [x] DF-F5: `teardown_dog_feeding()` drops all `df_*` tables cleanly with no orphaned triggers
+- [x] DF-F4: `setup_self_monitoring()` creates all five `df_*` stream tables in one call
+- [x] DF-F5: `teardown_self_monitoring()` drops all `df_*` tables cleanly with no orphaned triggers
 - [x] DF-A1: `df_anomaly_signals` created and detects 3× duration spikes
 - [x] DF-A2: `df_threshold_advice` provides HIGH-confidence recommendations after ≥ 20 refresh cycles
 - [x] DF-A3: DAG ensures DF-1 refreshes before DF-2 and DF-3 in every scheduler tick
 - [x] DF-C1: `df_cdc_buffer_trends` created (FULL or DIFFERENTIAL mode)
 - [x] DF-C2: `df_scheduling_interference` detects overlapping concurrent refreshes
-- [x] DF-G1: `pg_trickle.dog_feeding_auto_apply` GUC registered with default `off`
+- [x] DF-G1: `pg_trickle.self_monitoring_auto_apply` GUC registered with default `off`
 - [x] DF-G2: Auto-apply adjusts threshold with ≥ 1 confirmed change in E2E test
 - [x] DF-G5: Rate limiting verified — no more than 1 change per ST per 10 minutes
 - [x] DF-D3: Suspending all `df_*` STs does not affect control-plane operation
@@ -6000,13 +6000,13 @@ Dependencies: DB-3 (uses schema version to determine needed migrations). Schema 
 - [x] CORR-2: No false-positive DURATION_SPIKE on first-ever refresh of a new ST
 - [x] CORR-3: `avg_change_ratio` is NULL or in [0, 1] for zero-delta sources
 - [x] CORR-4: Only INSERT triggers (no UPDATE/DELETE) on `pgt_refresh_history`
-- [x] STAB-1: `setup_dog_feeding()` called 3× produces no errors and no duplicates
+- [x] STAB-1: `setup_self_monitoring()` called 3× produces no errors and no duplicates
 - [x] STAB-2: Auto-apply worker logs WARNING (not panic) when ALTER target disappears
-- [x] STAB-3: DROP EXTENSION + CREATE EXTENSION + `setup_dog_feeding()` cycle works cleanly
+- [x] STAB-3: DROP EXTENSION + CREATE EXTENSION + `setup_self_monitoring()` cycle works cleanly
 - [x] PERF-1: `pgt_refresh_history(pgt_id, start_time)` index exists and is used by DF queries
 - [x] PERF-2: DF-1 read ≥ 5× faster than `refresh_efficiency()` at 10 K history rows
-- [x] UX-1: `pgtrickle.dog_feeding_status()` returns correct status for all five DF STs
-- [x] UX-2: `setup_dog_feeding()` emits warm-up NOTICE when history has < 50 rows
+- [x] UX-1: `pgtrickle.self_monitoring_status()` returns correct status for all five DF STs
+- [x] UX-2: `setup_self_monitoring()` emits warm-up NOTICE when history has < 50 rows
 - [x] UX-3: `pg_trickle_alert` NOTIFY received within one DF cycle after a 3× duration spike
 - [x] TEST-1: Proptest for DF-3 threshold bounds passes 10,000 iterations
 - [x] TEST-2: Light E2E full cycle test passes
@@ -6015,13 +6015,13 @@ Dependencies: DB-3 (uses schema version to determine needed migrations). Schema 
 - [x] OPS-1: `recommend_refresh_mode()` returns `mode` ∈ `{'DIFFERENTIAL','FULL','AUTO'}` and `confidence` ∈ `{'HIGH','MEDIUM','LOW'}`
 - [x] OPS-2: `check_cdc_health()` returns spill-risk alert when buffer growth rate extrapolates to breach threshold within 2 cycles
 - [x] OPS-3: `scheduler_overhead()` returns non-NULL fields after ≥ 5 refresh cycles; `df_refresh_fraction < 0.01` in soak test
-- [x] OPS-4: `explain_dag()` output contains all five `df_*` nodes after `setup_dog_feeding()`
-- [x] OPS-5: `sql/dog_feeding_setup.sql` executes without errors on a fresh install
+- [x] OPS-4: `explain_dag()` output contains all five `df_*` nodes after `setup_self_monitoring()`
+- [x] OPS-5: `sql/self_monitoring_setup.sql` executes without errors on a fresh install
 - [x] PERF-5: Concurrent history purge + DF CDC INSERT produces no lock wait timeouts in soak test
 - [x] PERF-6: `changed_columns` bitmask stored in change buffer for UPDATE rows when `columnar_tracking = on` (if included)
 - [x] OPS-6: Soak test shows lower `overlap_count` in DF-5 with workload-aware poll enabled vs disabled
-- [x] DASH-1: `docker compose up` in `monitoring/` loads pg_trickle_dog_feeding dashboard; all 5 panels show data
-- [x] DBT-1: `pgtrickle_enable_monitoring` macro runs twice without error; `dog_feeding_status()` shows 5 active STs after both calls
+- [x] DASH-1: `docker compose up` in `monitoring/` loads pg_trickle_self_monitoring dashboard; all 5 panels show data
+- [x] DBT-1: `pgtrickle_enable_monitoring` macro runs twice without error; `self_monitoring_status()` shows 5 active STs after both calls
 - [x] UX-8: `df_threshold_advice.sla_breach_risk = true` when `avg_diff_ms > freshness_deadline_ms` on synthetic data
 - [x] Extension upgrade path tested (`0.19.0 → 0.20.0`)
 - [x] `just check-version-sync` passes
@@ -6197,7 +6197,7 @@ Dependencies: DB-3 (uses schema version to determine needed migrations). Schema 
 ### Predictive Refresh Cost Model (P2 — §9.3)
 
 > **In plain terms:** The current adaptive threshold reacts *after* a slow
-> differential refresh. This extends dog-feeding to *predict* `duration_ms`
+> differential refresh. This extends self-monitoring to *predict* `duration_ms`
 > from `rows_inserted + rows_deleted` via linear regression over the last
 > hour. When the forecast exceeds `last_full_ms × 1.5`, pg_trickle switches
 > to FULL pre-emptively — eliminating the one-bad-cycle latency spike entirely.
@@ -6473,7 +6473,7 @@ Phase 1–5 DVM code changes and the TPC-H scaling investigation. Items marked
 | Item | Description | Effort | Ref |
 |------|-------------|--------|-----|
 | OPS-1 | **`pg_trickle.refresh_history_retention_days` GUC.** Default 7 days. Bgworker prunes stale rows in 1k-row batches during idle ticks. | 2d | [PLAN_OVERALL_ASSESSMENT_2.md](plans/PLAN_OVERALL_ASSESSMENT_2.md) §4 |
-| OPS-2 | **Frozen-stream-table detector.** New dog-feeding view `df_frozen_stream_tables` that flags any ST whose `last_refresh_at < now() - 5 × refresh_interval` with recent CDC activity. Alert via `pgtrickle_alert` NOTIFY. | 2d | [PLAN_OVERALL_ASSESSMENT_2.md](plans/PLAN_OVERALL_ASSESSMENT_2.md) §4 |
+| OPS-2 | **Frozen-stream-table detector.** New self-monitoring view `df_frozen_stream_tables` that flags any ST whose `last_refresh_at < now() - 5 × refresh_interval` with recent CDC activity. Alert via `pgtrickle_alert` NOTIFY. | 2d | [PLAN_OVERALL_ASSESSMENT_2.md](plans/PLAN_OVERALL_ASSESSMENT_2.md) §4 |
 | OPS-3 | **Missing internal catalog indexes.** Add composite indexes on `pgt_stream_tables(status, scc_id)`, `pgt_refresh_history(pgt_id, action, data_timestamp)`, `pgt_change_tracking(source_relid)`, and a partial index on `changes_<oid>(__pgt_action)`. | 1d | [PLAN_OVERALL_ASSESSMENT_2.md](plans/PLAN_OVERALL_ASSESSMENT_2.md) §5 |
 
 ### Test Coverage (TEST-6/7/8)
@@ -7079,12 +7079,12 @@ Phase 1–5 DVM code changes and the TPC-H scaling investigation. Items marked
 
 ---
 
-## v1.6.0 — TUI Dog-Feeding Integration
+## v1.6.0 — TUI Self-Monitoring Integration
 
 **Status: Planned.** See [plans/ui/PLAN_TUI_PART_3.md](plans/ui/PLAN_TUI_PART_3.md) for the full design.
 
 > **Release Theme**
-> This release wires the v0.20.0 dog-feeding stream tables (`df_*`) into
+> This release wires the v0.20.0 self-monitoring stream tables (`df_*`) into
 > the TUI, giving operators live visibility into anomaly signals, CDC buffer
 > trends, scheduling interference, and efficiency metrics — all driven by
 > the same incremental refresh engine. Alongside the new views, the TUI
@@ -7107,7 +7107,7 @@ Phase 1–5 DVM code changes and the TPC-H scaling investigation. Items marked
 | T15 | **CLI/TUI command unification.** Introduce `commands/domain.rs` with shared logic for refresh, pause, resume, fuse reset, repair, and gate/ungate. | 0.5d | [PLAN_TUI_PART_3.md](plans/ui/PLAN_TUI_PART_3.md) §T15 |
 | T16 | **Dog-feeding data layer.** Add `DogFeedingDomain` state types, polling queries for all 5 `df_*` stream tables, fixture builders, and contract stubs. | 1d | [PLAN_TUI_PART_3.md](plans/ui/PLAN_TUI_PART_3.md) §T16 |
 
-### Phase 2 — Dog-Feeding TUI Views (T17)
+### Phase 2 — Self-Monitoring TUI Views (T17)
 
 | Item | Description | Effort | Ref |
 |------|-------------|--------|-----|
@@ -7118,13 +7118,13 @@ Phase 1–5 DVM code changes and the TPC-H scaling investigation. Items marked
 | TUI-5 | **Workers Interference sub-tab.** Second tab in Workers view showing `df_scheduling_interference` overlap pairs. | 3h | [PLAN_TUI_PART_3.md](plans/ui/PLAN_TUI_PART_3.md) §TUI-5 |
 | TUI-6 | **Workers scheduler overhead bar.** Busy-time ratio bar from `scheduler_overhead()` in the Workers view. | 1h | [PLAN_TUI_PART_3.md](plans/ui/PLAN_TUI_PART_3.md) §TUI-6 |
 | TUI-7 | **Dependencies Mermaid/DOT export (`x` key).** Scrollable overlay showing `explain_dag()` Mermaid output; `Ctrl+E` writes to file. | 2h | [PLAN_TUI_PART_3.md](plans/ui/PLAN_TUI_PART_3.md) §TUI-7 |
-| TUI-8 | **Header dog-feeding status badge.** `df:N/M` pill in the TUI header bar; turns amber on retention warning. | 1h | [PLAN_TUI_PART_3.md](plans/ui/PLAN_TUI_PART_3.md) §TUI-8 |
-| TUI-9 | **Command palette dog-feeding commands.** `dog-feeding enable / disable / status` in palette with confirmation dialogs. | 2h | [PLAN_TUI_PART_3.md](plans/ui/PLAN_TUI_PART_3.md) §TUI-9 |
+| TUI-8 | **Header self-monitoring status badge.** `df:N/M` pill in the TUI header bar; turns amber on retention warning. | 1h | [PLAN_TUI_PART_3.md](plans/ui/PLAN_TUI_PART_3.md) §TUI-8 |
+| TUI-9 | **Command palette self-monitoring commands.** `self-monitoring enable / disable / status` in palette with confirmation dialogs. | 2h | [PLAN_TUI_PART_3.md](plans/ui/PLAN_TUI_PART_3.md) §TUI-9 |
 | TUI-10 | **Detail view anomaly summary.** Active anomaly count row in the Properties section of the detail overlay. | 1h | [PLAN_TUI_PART_3.md](plans/ui/PLAN_TUI_PART_3.md) §TUI-10 |
-| TUI-11 | **Refresh Log `[auto]` tag.** Annotate rows with `initiated_by = 'DOG_FEED'` in the Refresh Log view. | 1h | [PLAN_TUI_PART_3.md](plans/ui/PLAN_TUI_PART_3.md) §TUI-11 |
-| TUI-12 | **First-launch dog-feeding toast.** 10-second hint toast on first launch when dog-feeding is not set up. | 1h | [PLAN_TUI_PART_3.md](plans/ui/PLAN_TUI_PART_3.md) §TUI-12 |
+| TUI-11 | **Refresh Log `[auto]` tag.** Annotate rows with `initiated_by = 'SELF_MONITOR'` in the Refresh Log view. | 1h | [PLAN_TUI_PART_3.md](plans/ui/PLAN_TUI_PART_3.md) §TUI-11 |
+| TUI-12 | **First-launch self-monitoring toast.** 10-second hint toast on first launch when self-monitoring is not set up. | 1h | [PLAN_TUI_PART_3.md](plans/ui/PLAN_TUI_PART_3.md) §TUI-12 |
 | TUI-13 | **Anomaly signals as Issues.** `detect_issues()` maps active anomaly signals to the Issues view with category "Anomaly". | 1h | [PLAN_TUI_PART_3.md](plans/ui/PLAN_TUI_PART_3.md) §TUI-13 |
-| TUI-14 | **`dog_feed_anomaly` alert styling.** Cyan `🔍` icon for anomaly alert type in the Alerts view. | 0.5h | [PLAN_TUI_PART_3.md](plans/ui/PLAN_TUI_PART_3.md) §TUI-14 |
+| TUI-14 | **`self_monitor_anomaly` alert styling.** Cyan `🔍` icon for anomaly alert type in the Alerts view. | 0.5h | [PLAN_TUI_PART_3.md](plans/ui/PLAN_TUI_PART_3.md) §TUI-14 |
 | TUI-15 | **Dashboard snapshot tests.** 5 snapshot branches: standard, wide, empty, anomalies-present, narrow. | 2h | [PLAN_TUI_PART_3.md](plans/ui/PLAN_TUI_PART_3.md) §TUI-15 |
 | TUI-16 | **Diagnostics `df_efficiency_rolling` panel.** Aggregate speedup ratio and DIFF/FULL counts from `df_efficiency_rolling`. | 2h | [PLAN_TUI_PART_3.md](plans/ui/PLAN_TUI_PART_3.md) §TUI-16 |
 | TUI-D1 | **`docs/TUI.md` documentation update.** Document Anomaly view, CDC sparklines, Workers interference tab, Mermaid export, header badge, and command palette additions. | 2h | [PLAN_TUI_PART_3.md](plans/ui/PLAN_TUI_PART_3.md) §T20 |
@@ -7134,28 +7134,28 @@ Phase 1–5 DVM code changes and the TPC-H scaling investigation. Items marked
 | Item | Description | Effort | Ref |
 |------|-------------|--------|-----|
 | DF-21 | **`sla_breach_risk` column in `df_threshold_advice`.** Boolean: `true` when `avg_diff_ms > freshness_deadline_ms`. | 2h | [PLAN_TUI_PART_3.md](plans/ui/PLAN_TUI_PART_3.md) §DF-21 |
-| DF-22 | **`dog_feeding_auto_apply = 'full'` mode.** Widen dispatch interval when `df_scheduling_interference` detects high overlap. | 4h | [PLAN_TUI_PART_3.md](plans/ui/PLAN_TUI_PART_3.md) §DF-22 |
-| DF-23 | **`dog_feeding_status()` retention warning.** `retention_warning` column when `history_retention_days` is below the minimum window. | 2h | [PLAN_TUI_PART_3.md](plans/ui/PLAN_TUI_PART_3.md) §DF-23 |
-| DF-24 | **`recommend_refresh_mode()` reads from `df_threshold_advice`.** Returns consistent results with the incremental view when dog-feeding is active. | 3h | [PLAN_TUI_PART_3.md](plans/ui/PLAN_TUI_PART_3.md) §DF-24 |
+| DF-22 | **`self_monitoring_auto_apply = 'full'` mode.** Widen dispatch interval when `df_scheduling_interference` detects high overlap. | 4h | [PLAN_TUI_PART_3.md](plans/ui/PLAN_TUI_PART_3.md) §DF-22 |
+| DF-23 | **`self_monitoring_status()` retention warning.** `retention_warning` column when `history_retention_days` is below the minimum window. | 2h | [PLAN_TUI_PART_3.md](plans/ui/PLAN_TUI_PART_3.md) §DF-23 |
+| DF-24 | **`recommend_refresh_mode()` reads from `df_threshold_advice`.** Returns consistent results with the incremental view when self-monitoring is active. | 3h | [PLAN_TUI_PART_3.md](plans/ui/PLAN_TUI_PART_3.md) §DF-24 |
 | TEST-21 | **Proptest for `df_threshold_advice` bounds.** 10,000 cases verifying `[0.01, 0.80]` clamping invariant. | 2h | [PLAN_TUI_PART_3.md](plans/ui/PLAN_TUI_PART_3.md) §TEST-21 |
 
 ### Phase 4 — CLI Integration (T19)
 
 | Item | Description | Effort | Ref |
 |------|-------------|--------|-----|
-| CLI-1 | **`pgtrickle dog-feeding` subcommand group.** `enable / disable / status` subcommands with `--format json\|table\|csv` for status. | 4h | [PLAN_TUI_PART_3.md](plans/ui/PLAN_TUI_PART_3.md) §CLI-1 |
+| CLI-1 | **`pgtrickle self-monitoring` subcommand group.** `enable / disable / status` subcommands with `--format json\|table\|csv` for status. | 4h | [PLAN_TUI_PART_3.md](plans/ui/PLAN_TUI_PART_3.md) §CLI-1 |
 | CLI-2 | **`pgtrickle graph --format` flag.** `ascii` (existing) / `mermaid` / `dot` format options for the graph subcommand. | 2h | [PLAN_TUI_PART_3.md](plans/ui/PLAN_TUI_PART_3.md) §CLI-2 |
 
 ### Phase 5 — Documentation & Polish (T20)
 
 | Item | Description | Effort | Ref |
 |------|-------------|--------|-----|
-| DOC-21 | **`docs/GETTING_STARTED.md` Day 2 update.** Document dog-feeding CLI and TUI integration for new users. | 1h | [PLAN_TUI_PART_3.md](plans/ui/PLAN_TUI_PART_3.md) §T20 |
+| DOC-21 | **`docs/GETTING_STARTED.md` Day 2 update.** Document self-monitoring CLI and TUI integration for new users. | 1h | [PLAN_TUI_PART_3.md](plans/ui/PLAN_TUI_PART_3.md) §T20 |
 | DOC-22 | **`docs/SQL_REFERENCE.md` update.** Document `df_threshold_advice.sla_breach_risk` column. | 0.5h | [PLAN_TUI_PART_3.md](plans/ui/PLAN_TUI_PART_3.md) §T20 |
 
 ### Phase 6 — TUI/CLI Visualization Polish
 
-TUI/CLI visualization enhancement for the dog-feeding views. Recommended from [PLAN_OVERALL_ASSESSMENT.md](plans/PLAN_OVERALL_ASSESSMENT.md) §9.11.
+TUI/CLI visualization enhancement for the self-monitoring views. Recommended from [PLAN_OVERALL_ASSESSMENT.md](plans/PLAN_OVERALL_ASSESSMENT.md) §9.11.
 
 | Item | Description | Effort | Ref |
 |------|-------------|--------|-----|
@@ -7166,14 +7166,14 @@ TUI/CLI visualization enhancement for the dog-feeding views. Recommended from [P
 | Phase | Description | Duration |
 |-------|-------------|----------|
 | T15 | Architecture Foundation — AppState decomp, selective polling, poller extraction, CLI unification | Days 1–3 |
-| T16 | Dog-Feeding Data Layer — types, polling queries, fixtures, contract stubs | Days 3–5 |
-| T17 | Dog-Feeding TUI Views — all 16 TUI items, snapshot + unit tests | Days 5–9 |
+| T16 | Self-Monitoring Data Layer — types, polling queries, fixtures, contract stubs | Days 3–5 |
+| T17 | Self-Monitoring TUI Views — all 16 TUI items, snapshot + unit tests | Days 5–9 |
 | T18 | Backend Enhancements — DF-21 through DF-24, proptest, upgrade SQL | Days 9–12 |
-| T19 | CLI Integration — `pgtrickle dog-feeding`, `pgtrickle graph --format` | Days 12–13 |
+| T19 | CLI Integration — `pgtrickle self-monitoring`, `pgtrickle graph --format` | Days 12–13 |
 | T20 | Documentation, Polish & Final Testing — docs, cross-cutting tests, coverage audit | Days 13–15 |
 | T21 (OP) | TUI/CLI Polish — DAG runtime overlay in `explain_dag()` | Days 15–16 (parallel or interleaved) |
 
-> **v0.26.0 total: ~3–4 weeks** (TUI dog-feeding integration + DAG visualization polish: architecture + 16 views + 4 backend items + 2 CLI commands + tests + docs)
+> **v0.26.0 total: ~3–4 weeks** (TUI self-monitoring integration + DAG visualization polish: architecture + 16 views + 4 backend items + 2 CLI commands + tests + docs)
 
 **Exit criteria:**
 - [ ] T15: `AppState` uses 8 domain structs; all existing tests pass; `just lint` clean
@@ -7185,15 +7185,15 @@ TUI/CLI visualization enhancement for the dog-feeding views. Recommended from [P
 - [ ] TUI-5: Workers view has Interference sub-tab; overlap pairs render
 - [ ] TUI-6: Scheduler overhead bar visible in Workers view after ≥ 5 refresh cycles
 - [ ] TUI-7: `x` key on Dependencies view opens Mermaid overlay; `Ctrl+E` exports to file
-- [ ] TUI-8: Header `df:N/M` badge reflects active dog-feeding stream tables
-- [ ] TUI-9: Command palette `dog-feeding enable/disable` completes with confirmation
+- [ ] TUI-8: Header `df:N/M` badge reflects active self-monitoring stream tables
+- [ ] TUI-9: Command palette `self-monitoring enable/disable` completes with confirmation
 - [ ] TUI-15/TUI-T1: All new snapshot tests pass; dashboard snapshots cover 5 branches
 - [ ] DF-21: `sla_breach_risk = true` when `avg_diff_ms > freshness_deadline_ms`
 - [ ] DF-22: Dispatch interval widens after synthetic interference insertion
 - [ ] DF-23: `retention_warning` column non-null when retention below minimum
-- [ ] DF-24: `recommend_refresh_mode()` consistent with `df_threshold_advice` when dog-feeding active
+- [ ] DF-24: `recommend_refresh_mode()` consistent with `df_threshold_advice` when self-monitoring active
 - [ ] TEST-21: Proptest passes 10,000 iterations
-- [ ] CLI-1: `pgtrickle dog-feeding enable/disable/status` functional
+- [ ] CLI-1: `pgtrickle self-monitoring enable/disable/status` functional
 - [ ] CLI-2: `pgtrickle graph --format mermaid` outputs valid Mermaid
 - [ ] TUI-D1/DOC-21/DOC-22: Documentation updated
 - [ ] Extension upgrade path tested (`0.24.0 → 0.25.0`)

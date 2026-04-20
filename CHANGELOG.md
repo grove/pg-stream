@@ -12,7 +12,7 @@ For future plans and upcoming features, see [ROADMAP.md](ROADMAP.md).
 - [0.23.0 — Performance Tuning & Diagnostics](#0230--performance-tuning--diagnostics)
 - [0.22.0 — Downstream CDC, Parallel Refresh & Predictive Cost Model](#0220--downstream-cdc-parallel-refresh--predictive-cost-model)
 - [0.21.0 — Reliability, Safety & Operational Tools](#0210--reliability-safety--operational-tools)
-- [0.20.0 — Dog Feeding](#0200--dog-feeding)
+- [0.20.0 — Self Monitoring](#0200--self-monitoring)
 - [0.19.0 — Security, Scheduler Performance & Operator Convenience](#0190--security-scheduler-performance--operator-convenience)
 - [0.18.0 — Hardening & Delta Performance](#0180--hardening--delta-performance)
 - [0.17.0 — Query Intelligence & Stability](#0170--query-intelligence--stability)
@@ -312,7 +312,7 @@ ALTER EXTENSION pg_trickle UPDATE TO '0.21.0';
 
 ---
 
-## [0.20.0] — Dog Feeding
+## [0.20.0] — Self Monitoring
 
 **pg_trickle now monitors itself.** Instead of you having to check on
 pg_trickle's health manually, this release lets pg_trickle watch its own
@@ -321,18 +321,18 @@ new stream tables sit in the `pgtrickle` schema and continuously analyse
 refresh history — the same technology you use for your own data, pointed
 inward. One SQL call sets everything up; one call tears it down.
 
-We call this *dog feeding* — pg_trickle uses its own stream-table technology
+We call this *self monitoring* — pg_trickle uses its own stream-table technology
 to keep an eye on itself, just like it keeps your data views up to date.
 
 ### What's new
 
-- **One-click self-monitoring** — run `SELECT pgtrickle.setup_dog_feeding()`
+- **One-click self-monitoring** — run `SELECT pgtrickle.setup_self_monitoring()`
   and pg_trickle creates five monitoring stream tables that continuously track
-  how well it is performing. Run `teardown_dog_feeding()` to remove them.
+  how well it is performing. Run `teardown_self_monitoring()` to remove them.
   Both are idempotent — safe to call as many times as you like, even during
   rolling upgrades.
 
-- **Health at a glance** — the new `dog_feeding_status()` function shows the
+- **Health at a glance** — the new `self_monitoring_status()` function shows the
   status of all five monitoring views in one query: whether each one exists,
   its refresh mode, and the last time it refreshed. Quick to run from a
   monitoring script or dashboard.
@@ -345,11 +345,11 @@ to keep an eye on itself, just like it keeps your data views up to date.
   `sla_headroom_pct` column shows exactly how much faster incremental refresh
   is versus full refresh for that table.
 
-- **Automatic tuning** — set `pg_trickle.dog_feeding_auto_apply = 'threshold_only'`
+- **Automatic tuning** — set `pg_trickle.self_monitoring_auto_apply = 'threshold_only'`
   and pg_trickle will apply HIGH-confidence threshold recommendations
   automatically. Changes are rate-limited to once per 10 minutes per stream
   table, and every adjustment is logged to `pgt_refresh_history` with
-  `initiated_by = 'DOG_FEED'` so you have a full audit trail.
+  `initiated_by = 'SELF_MONITOR'` so you have a full audit trail.
 
 - **Real-time alerts** — when pg_trickle detects an anomaly (duration spike
   exceeding 3× the baseline, or two or more recent failures), it sends a
@@ -364,12 +364,12 @@ to keep an eye on itself, just like it keeps your data views up to date.
 
 - **Visual dependency graph** — the new `explain_dag()` function renders
   your full refresh pipeline as a Mermaid or Graphviz DOT diagram. User
-  stream tables appear in blue, dog-feeding tables in green, suspended tables
+  stream tables appear in blue, self-monitoring tables in green, suspended tables
   in red. Paste the output into any Mermaid renderer or `dot` to see exactly
   how your tables depend on each other.
 
 - **Scheduler overhead report** — `scheduler_overhead()` returns metrics
-  for the last hour: total refreshes, how many were dog-feeding, the
+  for the last hour: total refreshes, how many were self-monitoring, the
   fraction they represent, and average durations. Useful for confirming that
   self-monitoring adds negligible cost.
 
@@ -386,7 +386,7 @@ to keep an eye on itself, just like it keeps your data views up to date.
 ### Faster and more reliable
 
 - A new index on `pgt_refresh_history(pgt_id, start_time)` speeds up all
-  dog-feeding queries and general history lookups. Applied automatically
+  self-monitoring queries and general history lookups. Applied automatically
   during the 0.19.0 → 0.20.0 upgrade.
 - Old history records are now pruned in batches of 1,000 rows per transaction
   (previously one large DELETE), which avoids long lock holds on
@@ -394,26 +394,26 @@ to keep an eye on itself, just like it keeps your data views up to date.
 - `check_cdc_health()` is enriched with spill-risk alerts: if a source
   table's max burst delta exceeds 10× its average, you get an early warning
   before the buffer fills.
-- `explain_st()` now shows two new properties: `dog_feeding_coverage`
+- `explain_st()` now shows two new properties: `self_monitoring_coverage`
   (none / partial / full) and `recommended_refresh_mode`, so diagnostics
   automatically surface self-monitoring data when it is available.
 
 ### New documentation and tooling
 
-- **SQL Reference** — a new "Dog Feeding — Self-Monitoring" section covers
-  all five stream tables, `setup_dog_feeding()`, `teardown_dog_feeding()`,
+- **SQL Reference** — a new "Self Monitoring — Self-Monitoring" section covers
+  all five stream tables, `setup_self_monitoring()`, `teardown_self_monitoring()`,
   confidence levels, and the `sla_headroom_pct` column.
 - **Getting Started** — a new "Day 2 Operations" section walks through
-  enabling dog-feeding, reading recommendations, enabling auto-apply, and
+  enabling self-monitoring, reading recommendations, enabling auto-apply, and
   visualising the DAG.
-- **Configuration** — `pg_trickle.dog_feeding_auto_apply` is fully
+- **Configuration** — `pg_trickle.self_monitoring_auto_apply` is fully
   documented with values, rate-limiting behaviour, and the audit trail.
-- A ready-made **Grafana dashboard** (`pg_trickle_dog_feeding.json`) with
+- A ready-made **Grafana dashboard** (`pg_trickle_self_monitoring.json`) with
   five panels covers refresh throughput, anomaly heatmap, threshold
   calibration, CDC buffer growth, and the scheduling interference matrix.
 - A **dbt macro** (`pgtrickle_enable_monitoring`) enables monitoring as a
   post-hook with one line in `dbt_project.yml`.
-- A **quick-start SQL script** at `sql/dog_feeding_setup.sql` walks through
+- A **quick-start SQL script** at `sql/self_monitoring_setup.sql` walks through
   setup, auto-apply, alert listening, and status verification in six steps.
 
 ---

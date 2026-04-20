@@ -1,6 +1,6 @@
 //! Dog-feeding API: pg_trickle monitors itself via stream tables.
 //!
-//! Provides `setup_dog_feeding()`, `teardown_dog_feeding()`, `dog_feeding_status()`,
+//! Provides `setup_self_monitoring()`, `teardown_self_monitoring()`, `self_monitoring_status()`,
 //! `recommend_refresh_mode()`, `scheduler_overhead()`, and `explain_dag()`.
 #![allow(clippy::type_complexity)]
 use pgrx::prelude::*;
@@ -9,7 +9,7 @@ use crate::error::PgTrickleError;
 
 // ── Dog-feeding stream table definitions ────────────────────────────────────
 
-/// Names of all six dog-feeding stream tables.
+/// Names of all six self-monitoring stream tables.
 const DF_STREAM_TABLES: &[&str] = &[
     "df_efficiency_rolling",
     "df_anomaly_signals",
@@ -203,7 +203,7 @@ WHERE st.status IN ('ACTIVE', 'ERROR')
 
 // ── Schedule and mode assignments ───────────────────────────────────────────
 
-/// Return (schedule, refresh_mode) for each dog-feeding stream table.
+/// Return (schedule, refresh_mode) for each self-monitoring stream table.
 fn df_st_config(name: &str) -> (&'static str, &'static str) {
     match name {
         "df_efficiency_rolling" => ("48s", "AUTO"),
@@ -216,7 +216,7 @@ fn df_st_config(name: &str) -> (&'static str, &'static str) {
     }
 }
 
-/// Return the defining query for a dog-feeding stream table.
+/// Return the defining query for a self-monitoring stream table.
 fn df_st_query(name: &str) -> &'static str {
     match name {
         "df_efficiency_rolling" => DF_EFFICIENCY_ROLLING_QUERY,
@@ -229,23 +229,23 @@ fn df_st_query(name: &str) -> &'static str {
     }
 }
 
-// ── setup_dog_feeding() — DF-F4, STAB-1 ────────────────────────────────────
+// ── setup_self_monitoring() — DF-F4, STAB-1 ────────────────────────────────────
 
-/// Create all five dog-feeding stream tables.
+/// Create all five self-monitoring stream tables.
 ///
 /// Idempotent: if a DF stream table already exists it is skipped with an INFO
 /// message. Safe to call multiple times (STAB-1).
 ///
 /// UX-2: Emits a warm-up hint if `pgt_refresh_history` has fewer than 50 rows.
 #[pg_extern(schema = "pgtrickle")]
-fn setup_dog_feeding() {
-    let result = setup_dog_feeding_impl();
+fn setup_self_monitoring() {
+    let result = setup_self_monitoring_impl();
     if let Err(e) = result {
-        pgrx::error!("setup_dog_feeding failed: {e}");
+        pgrx::error!("setup_self_monitoring failed: {e}");
     }
 }
 
-fn setup_dog_feeding_impl() -> Result<(), PgTrickleError> {
+fn setup_self_monitoring_impl() -> Result<(), PgTrickleError> {
     // UX-2: Warm-up hint if history is sparse.
     let history_count: Option<i64> =
         Spi::get_one("SELECT count(*) FROM pgtrickle.pgt_refresh_history")
@@ -290,27 +290,27 @@ fn setup_dog_feeding_impl() -> Result<(), PgTrickleError> {
         )
         .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
 
-        pgrx::info!("Created dog-feeding stream table pgtrickle.{name}");
+        pgrx::info!("Created self-monitoring stream table pgtrickle.{name}");
     }
 
     Ok(())
 }
 
-// ── teardown_dog_feeding() — DF-F5, STAB-5 ─────────────────────────────────
+// ── teardown_self_monitoring() — DF-F5, STAB-5 ─────────────────────────────────
 
-/// Drop all dog-feeding stream tables.
+/// Drop all self-monitoring stream tables.
 ///
 /// Safe with partial setups: each table is dropped individually, and missing
 /// tables are silently skipped (STAB-5).
 #[pg_extern(schema = "pgtrickle")]
-fn teardown_dog_feeding() {
-    let result = teardown_dog_feeding_impl();
+fn teardown_self_monitoring() {
+    let result = teardown_self_monitoring_impl();
     if let Err(e) = result {
-        pgrx::error!("teardown_dog_feeding failed: {e}");
+        pgrx::error!("teardown_self_monitoring failed: {e}");
     }
 }
 
-fn teardown_dog_feeding_impl() -> Result<(), PgTrickleError> {
+fn teardown_self_monitoring_impl() -> Result<(), PgTrickleError> {
     // Drop in reverse dependency order: downstream first.
     let reverse_order = [
         "df_frozen_stream_tables",
@@ -343,20 +343,20 @@ fn teardown_dog_feeding_impl() -> Result<(), PgTrickleError> {
         )
         .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
 
-        pgrx::info!("Dropped dog-feeding stream table pgtrickle.{name}");
+        pgrx::info!("Dropped self-monitoring stream table pgtrickle.{name}");
     }
 
     Ok(())
 }
 
-// ── dog_feeding_status() — UX-1 ────────────────────────────────────────────
+// ── self_monitoring_status() — UX-1 ────────────────────────────────────────────
 
-/// Returns the status of all dog-feeding stream tables.
+/// Returns the status of all self-monitoring stream tables.
 ///
 /// For each of the five expected DF stream tables, reports whether it exists,
 /// its current status, refresh mode, and last refresh time.
 #[pg_extern(schema = "pgtrickle")]
-fn dog_feeding_status() -> TableIterator<
+fn self_monitoring_status() -> TableIterator<
     'static,
     (
         name!(st_name, String),
@@ -367,11 +367,11 @@ fn dog_feeding_status() -> TableIterator<
         name!(total_refreshes, Option<i64>),
     ),
 > {
-    let rows = dog_feeding_status_impl().unwrap_or_default();
+    let rows = self_monitoring_status_impl().unwrap_or_default();
     TableIterator::new(rows)
 }
 
-fn dog_feeding_status_impl() -> Result<
+fn self_monitoring_status_impl() -> Result<
     Vec<(
         String,
         bool,
@@ -439,7 +439,7 @@ fn dog_feeding_status_impl() -> Result<
 
 // ── recommend_refresh_mode() — OPS-1 ────────────────────────────────────────
 // NOTE: The existing `recommend_refresh_mode` in helpers.rs already provides
-// comprehensive mode recommendations. OPS-1 enhancement: when dog-feeding is
+// comprehensive mode recommendations. OPS-1 enhancement: when self-monitoring is
 // active, the existing function's signals can be enriched with data from
 // `df_threshold_advice`. This is handled via `diagnostics::gather_all_signals()`
 // which reads from the DF STs when they exist.
@@ -449,7 +449,7 @@ fn dog_feeding_status_impl() -> Result<
 /// Returns scheduler efficiency metrics.
 ///
 /// Computes busy-time ratio, queue depth, avg dispatch latency, and the
-/// fraction of CPU spent on dog-feeding STs vs user STs from refresh history.
+/// fraction of CPU spent on self-monitoring STs vs user STs from refresh history.
 #[pg_extern(schema = "pgtrickle")]
 fn scheduler_overhead() -> TableIterator<
     'static,
@@ -561,7 +561,7 @@ fn scheduler_overhead_impl() -> Result<
 
 /// Returns the full refresh DAG as a Mermaid markdown string.
 ///
-/// Node colours: user STs = blue, dog-feeding STs = green,
+/// Node colours: user STs = blue, self-monitoring STs = green,
 /// suspended = red, fused = orange.
 #[pg_extern(schema = "pgtrickle")]
 fn explain_dag(format: default!(Option<&str>, "'mermaid'")) -> Option<String> {

@@ -2731,10 +2731,10 @@ pub extern "C-unwind" fn pg_trickle_scheduler_main(_arg: pg_sys::Datum) {
         {
             let now_for_auto_apply = current_epoch_ms();
             if now_for_auto_apply.saturating_sub(last_auto_apply_ms) >= AUTO_APPLY_INTERVAL_MS {
-                let auto_apply_mode = config::pg_trickle_dog_feeding_auto_apply();
-                if auto_apply_mode != config::DogFeedingAutoApply::Off {
+                let auto_apply_mode = config::pg_trickle_self_monitoring_auto_apply();
+                if auto_apply_mode != config::SelfMonitoringAutoApply::Off {
                     BackgroundWorker::transaction(AssertUnwindSafe(|| {
-                        dog_feeding_auto_apply_tick();
+                        self_monitoring_auto_apply_tick();
                     }));
                 }
                 last_auto_apply_ms = now_for_auto_apply;
@@ -2746,7 +2746,7 @@ pub extern "C-unwind" fn pg_trickle_scheduler_main(_arg: pg_sys::Datum) {
                 }));
 
                 // OPS-6: Refresh interference overlap count for workload-aware poll.
-                // Only reads if the DF ST exists (safe even without dog-feeding).
+                // Only reads if the DF ST exists (safe even without self-monitoring).
                 BackgroundWorker::transaction(AssertUnwindSafe(|| {
                     let si_exists: bool = Spi::get_one(
                         "SELECT EXISTS ( \
@@ -3474,14 +3474,14 @@ fn sla_tier_adjustment_tick() {
 
 /// Auto-apply threshold recommendations from `df_threshold_advice`.
 ///
-/// Called once per `AUTO_APPLY_INTERVAL_MS` when `dog_feeding_auto_apply` GUC
+/// Called once per `AUTO_APPLY_INTERVAL_MS` when `self_monitoring_auto_apply` GUC
 /// is not `off`. Reads HIGH-confidence recommendations where the recommended
 /// threshold differs from the current threshold by > 5%, then applies via
 /// `StreamTableMeta::update_adaptive_threshold`. Rate-limited to 1 change per
 /// ST per invocation (STAB-2, STAB-4).
 ///
-/// DF-G3: Logs changes to `pgt_refresh_history` with `initiated_by = 'DOG_FEED'`.
-fn dog_feeding_auto_apply_tick() {
+/// DF-G3: Logs changes to `pgt_refresh_history` with `initiated_by = 'SELF_MONITOR'`.
+fn self_monitoring_auto_apply_tick() {
     // STAB-4: Check that df_threshold_advice exists before reading.
     let advice_exists: bool = Spi::get_one(
         "SELECT EXISTS (
@@ -3539,7 +3539,7 @@ fn dog_feeding_auto_apply_tick() {
         ) {
             Ok(()) => {
                 log!(
-                    "pg_trickle: auto-apply threshold {} → {} for {} (DOG_FEED)",
+                    "pg_trickle: auto-apply threshold {} → {} for {} (SELF_MONITOR)",
                     current,
                     recommended,
                     fq_name,
@@ -3556,10 +3556,10 @@ fn dog_feeding_auto_apply_tick() {
                         0,
                         0,
                         Some(&format!(
-                            "DOG_FEED: auto_threshold {} → {}",
+                            "SELF_MONITOR: auto_threshold {} → {}",
                             current, recommended
                         )),
-                        Some("DOG_FEED"),
+                        Some("SELF_MONITOR"),
                         None,
                         0,
                         None,
@@ -3586,14 +3586,14 @@ fn dog_feeding_auto_apply_tick() {
     }
 
     // UX-3: Check for anomalies and emit NOTIFY on pg_trickle_alert channel.
-    dog_feeding_anomaly_notify();
+    self_monitoring_anomaly_notify();
 }
 
 /// UX-3: Emit NOTIFY on `pgtrickle_alert` channel when anomalies are detected.
 ///
 /// Reads `df_anomaly_signals` and sends a JSON notification for each stream
 /// table that has a duration anomaly or recent failures ≥ 2.
-fn dog_feeding_anomaly_notify() {
+fn self_monitoring_anomaly_notify() {
     let signals_exist: bool = Spi::get_one(
         "SELECT EXISTS (
             SELECT 1 FROM pgtrickle.pgt_stream_tables
@@ -3637,7 +3637,7 @@ fn dog_feeding_anomaly_notify() {
     for (fq_name, anomaly, failures) in &anomalies {
         let anomaly_str = anomaly.as_deref().unwrap_or("none");
         let payload = format!(
-            r#"{{"event":"dog_feed_anomaly","stream_table":"{}","anomaly":"{}","recent_failures":{}}}"#,
+            r#"{{"event":"self_monitor_anomaly","stream_table":"{}","anomaly":"{}","recent_failures":{}}}"#,
             fq_name.replace('"', r#"\""#),
             anomaly_str.replace('"', r#"\""#),
             failures,

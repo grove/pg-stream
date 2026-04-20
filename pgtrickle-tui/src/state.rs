@@ -362,7 +362,7 @@ pub struct DedupStats {
     pub dedup_ratio_pct: f64,
 }
 
-/// UX-7: Dog-feeding scheduler overhead metrics.
+/// UX-7: Self-monitoring scheduler overhead metrics.
 #[derive(Clone, Serialize, Default)]
 pub struct SchedulerOverhead {
     pub total_refreshes_1h: i64,

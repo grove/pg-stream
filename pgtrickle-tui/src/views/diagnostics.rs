@@ -21,7 +21,7 @@ pub fn render(
         .and_then(|d| d.signals.as_ref())
         .is_some();
 
-    // UX-7: Show scheduler overhead panel when dog-feeding is active.
+    // UX-7: Show scheduler overhead panel when self-monitoring is active.
     let has_overhead = state.scheduler_overhead.is_some();
 
     if has_signals && has_overhead {
@@ -197,7 +197,7 @@ fn render_signal_breakdown(
     frame.render_widget(Paragraph::new(lines).block(block), area);
 }
 
-/// UX-7: Render scheduler overhead panel showing dog-feeding cost.
+/// UX-7: Render scheduler overhead panel showing self-monitoring cost.
 fn render_scheduler_overhead(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     let overhead = match &state.scheduler_overhead {
         Some(o) => o,

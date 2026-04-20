@@ -1403,16 +1403,16 @@ so deployments are always idempotent.
 > **Added in v0.20.0 (UX-4).**
 
 Once your stream tables are running in production, pg_trickle can monitor
-itself using its own stream tables — a technique called *dog-feeding*.
+itself using its own stream tables — a technique called *self-monitoring*.
 
-### Enabling Dog-Feeding
+### Enabling Self-Monitoring
 
 ```sql
 -- Create all five monitoring stream tables (idempotent, safe to repeat).
-SELECT pgtrickle.setup_dog_feeding();
+SELECT pgtrickle.setup_self_monitoring();
 
 -- Check what was created.
-SELECT * FROM pgtrickle.dog_feeding_status();
+SELECT * FROM pgtrickle.self_monitoring_status();
 ```
 
 This creates five stream tables in the `pgtrickle` schema:
@@ -1447,12 +1447,12 @@ WHERE duration_anomaly IS NOT NULL OR recent_failures >= 2;
 To let pg_trickle automatically apply threshold recommendations:
 
 ```sql
-SET pg_trickle.dog_feeding_auto_apply = 'threshold_only';
+SET pg_trickle.self_monitoring_auto_apply = 'threshold_only';
 ```
 
 This applies changes only when confidence is HIGH and the recommended threshold
 differs by more than 5%. Changes are rate-limited to once per 10 minutes per
-stream table and logged with `initiated_by = 'DOG_FEED'`.
+stream table and logged with `initiated_by = 'SELF_MONITOR'`.
 
 ### Visualizing the DAG
 
@@ -1463,14 +1463,14 @@ SELECT pgtrickle.explain_dag();
 
 Dog-feeding STs appear in green, user STs in blue, suspended in red.
 
-### Disabling Dog-Feeding
+### Disabling Self-Monitoring
 
 ```sql
-SELECT pgtrickle.teardown_dog_feeding();
+SELECT pgtrickle.teardown_self_monitoring();
 ```
 
 This drops all monitoring stream tables. User stream tables are never affected.
-The control plane continues operating identically without dog-feeding.
+The control plane continues operating identically without self-monitoring.
 
 ---
 

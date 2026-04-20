@@ -390,11 +390,11 @@ ALTER SYSTEM SET pg_trickle.cost_model_safety_margin = 0.30;
 SELECT pg_reload_conf();
 ```
 
-**Recipe — Use dog-feeding analytics to auto-tune:**
+**Recipe — Use self-monitoring analytics to auto-tune:**
 
 ```sql
 -- Let pg_trickle automatically apply threshold recommendations
-ALTER SYSTEM SET pg_trickle.dog_feeding_auto_apply = 'threshold_only';
+ALTER SYSTEM SET pg_trickle.self_monitoring_auto_apply = 'threshold_only';
 SELECT pg_reload_conf();
 ```
 

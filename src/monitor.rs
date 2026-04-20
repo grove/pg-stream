@@ -1164,13 +1164,13 @@ fn explain_st_impl(
         .unwrap_or(Some(0))
         .unwrap_or(0);
         let coverage = if df_count >= 5 {
-            "full (5/5 dog-feeding STs active)"
+            "full (5/5 self-monitoring STs active)"
         } else if df_count > 0 {
             "partial"
         } else {
-            "none (run setup_dog_feeding() to enable)"
+            "none (run setup_self_monitoring() to enable)"
         };
-        props.push(("dog_feeding_coverage".to_string(), coverage.to_string()));
+        props.push(("self_monitoring_coverage".to_string(), coverage.to_string()));
     }
 
     // UX-6: Refresh mode recommendation from recommend_refresh_mode().

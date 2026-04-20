@@ -487,7 +487,7 @@ distributed across FAQ / TROUBLESHOOTING.
 
 ### 7.3 Gap — Dog-feeding recipes are new; examples light
 
-v0.20 introduced `setup_dog_feeding()` but the examples mostly show
+v0.20 introduced `setup_self_monitoring()` but the examples mostly show
 the setup line itself. A "day in the life" walkthrough — ingest some
 data, wait, read `df_threshold_advice`, apply, observe — would lift
 adoption.
@@ -574,7 +574,7 @@ are currently blocked on users setting up a second slot.
 
 ### 9.3 Predictive refresh cost model (M effort — 1–2 weeks)
 
-Extend dog-feeding to forecast `duration_ms` from
+Extend self-monitoring to forecast `duration_ms` from
 `rows_inserted + rows_deleted` using linear regression over the last
 hour. When the forecast exceeds `last_full_ms × 1.5`, pre-emptively
 switch to FULL. Keeps adaptive fallback from *reacting* to a slow

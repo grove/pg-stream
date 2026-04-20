@@ -4046,11 +4046,11 @@ WHERE fuse_mode != 'off';
 
 ---
 
-## Dog Feeding — Self-Monitoring (v0.20.0)
+## Self Monitoring — Self-Monitoring (v0.20.0)
 
 > **Added in v0.20.0.**
 
-pg_trickle can monitor itself using its own stream tables. Five *dog-feeding*
+pg_trickle can monitor itself using its own stream tables. Five *self-monitoring*
 stream tables maintain reactive analytics over the internal catalog, replacing
 repeated full-scan diagnostic queries with continuously-maintained incremental
 views.
@@ -4058,11 +4058,11 @@ views.
 ### Quick Start
 
 ```sql
--- Create all five dog-feeding stream tables (idempotent).
-SELECT pgtrickle.setup_dog_feeding();
+-- Create all five self-monitoring stream tables (idempotent).
+SELECT pgtrickle.setup_self_monitoring();
 
 -- Check status.
-SELECT * FROM pgtrickle.dog_feeding_status();
+SELECT * FROM pgtrickle.self_monitoring_status();
 
 -- View threshold recommendations (after 10+ refresh cycles).
 SELECT * FROM pgtrickle.df_threshold_advice
@@ -4073,15 +4073,15 @@ SELECT * FROM pgtrickle.df_anomaly_signals
 WHERE duration_anomaly IS NOT NULL;
 
 -- Enable auto-apply (optional).
-SET pg_trickle.dog_feeding_auto_apply = 'threshold_only';
+SET pg_trickle.self_monitoring_auto_apply = 'threshold_only';
 
 -- Clean up.
-SELECT pgtrickle.teardown_dog_feeding();
+SELECT pgtrickle.teardown_self_monitoring();
 ```
 
-### `pgtrickle.setup_dog_feeding()`
+### `pgtrickle.setup_self_monitoring()`
 
-Creates all five dog-feeding stream tables. Idempotent — safe to call multiple
+Creates all five self-monitoring stream tables. Idempotent — safe to call multiple
 times. Emits a warm-up warning if `pgt_refresh_history` has fewer than 50 rows.
 
 **Stream tables created:**
@@ -4094,14 +4094,14 @@ times. Emits a warm-up warning if `pgt_refresh_history` has fewer than 50 rows.
 | `pgtrickle.df_cdc_buffer_trends` | 48s | AUTO | CDC buffer growth rates per source |
 | `pgtrickle.df_scheduling_interference` | 96s | FULL | Concurrent refresh overlap detection |
 
-### `pgtrickle.teardown_dog_feeding()`
+### `pgtrickle.teardown_self_monitoring()`
 
-Drops all dog-feeding stream tables. Safe with partial setups — missing tables
+Drops all self-monitoring stream tables. Safe with partial setups — missing tables
 are silently skipped. User stream tables are never affected.
 
-### `pgtrickle.dog_feeding_status()`
+### `pgtrickle.self_monitoring_status()`
 
-Returns the status of all five expected dog-feeding stream tables:
+Returns the status of all five expected self-monitoring stream tables:
 
 | Column | Type | Description |
 |--------|------|-------------|
@@ -4120,7 +4120,7 @@ Returns scheduler efficiency metrics for the last hour:
 |--------|------|-------------|
 | `total_refreshes_1h` | bigint | Total refreshes in the last hour |
 | `df_refreshes_1h` | bigint | Dog-feeding refreshes in the last hour |
-| `df_refresh_fraction` | float | Fraction of refreshes that are dog-feeding |
+| `df_refresh_fraction` | float | Fraction of refreshes that are self-monitoring |
 | `avg_refresh_ms` | float | Average refresh duration (ms) |
 | `avg_df_refresh_ms` | float | Average DF refresh duration (ms) |
 | `total_refresh_time_s` | float | Total time spent refreshing (seconds) |
@@ -4129,7 +4129,7 @@ Returns scheduler efficiency metrics for the last hour:
 ### `pgtrickle.explain_dag(format)`
 
 Returns the full refresh DAG as a Mermaid markdown (default) or Graphviz DOT
-string. Node colours: user STs = blue, dog-feeding STs = green,
+string. Node colours: user STs = blue, self-monitoring STs = green,
 suspended = red, fused = orange.
 
 ```sql
@@ -4142,7 +4142,7 @@ SELECT pgtrickle.explain_dag('dot');
 
 ### Auto-Apply Policy
 
-The `pg_trickle.dog_feeding_auto_apply` GUC controls whether analytics can
+The `pg_trickle.self_monitoring_auto_apply` GUC controls whether analytics can
 automatically adjust stream table configuration:
 
 | Value | Behaviour |
@@ -4153,7 +4153,7 @@ automatically adjust stream table configuration:
 
 Auto-apply is rate-limited to at most one threshold change per stream table
 per 10 minutes. Changes are logged to `pgt_refresh_history` with
-`initiated_by = 'DOG_FEED'`.
+`initiated_by = 'SELF_MONITOR'`.
 
 ### Confidence Levels and Sparse History
 
@@ -4166,7 +4166,7 @@ per 10 minutes. Changes are logged to `pgt_refresh_history` with
 | **LOW** | < 10 total refreshes | Insufficient data — recommendation equals the current threshold |
 
 **When you see LOW confidence:** This is normal during the first minutes after
-`setup_dog_feeding()`. The stream tables need time to accumulate refresh
+`setup_self_monitoring()`. The stream tables need time to accumulate refresh
 history. In typical deployments with a 1-minute schedule, expect:
 - **LOW** for the first ~10 minutes
 - **MEDIUM** after ~10 minutes

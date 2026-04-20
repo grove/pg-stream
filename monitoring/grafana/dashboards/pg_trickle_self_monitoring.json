@@ -77,12 +77,12 @@
     }
   ],
   "schemaVersion": 39,
-  "tags": ["pg_trickle", "dog-feeding"],
+  "tags": ["pg_trickle", "self-monitoring"],
   "templating": { "list": [] },
   "time": { "from": "now-1h", "to": "now" },
   "timepicker": {},
   "timezone": "",
-  "title": "pg_trickle Dog-Feeding Analytics",
-  "uid": "pg_trickle_dog_feeding",
+  "title": "pg_trickle Self-Monitoring Analytics",
+  "uid": "pg_trickle_self_monitoring",
   "version": 1
 }

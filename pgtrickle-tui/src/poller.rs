@@ -1065,7 +1065,7 @@ async fn poll_scc_status_query(client: &Client) -> Result<Vec<SccGroup>, PgErr> 
         .collect())
 }
 
-/// UX-7: Poll scheduler_overhead() for dog-feeding diagnostics.
+/// UX-7: Poll scheduler_overhead() for self-monitoring diagnostics.
 async fn poll_scheduler_overhead_query(
     client: &Client,
 ) -> Result<Option<SchedulerOverhead>, PgErr> {

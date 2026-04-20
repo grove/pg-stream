@@ -1,4 +1,4 @@
-# PLAN_TUI_PART_3.md — TUI Dog-Feeding Integration & Architecture (v0.21)
+# PLAN_TUI_PART_3.md — TUI Self-Monitoring Integration & Architecture (v0.21)
 
 **Milestone:** v0.21.0
 **Status:** Planned
@@ -15,9 +15,9 @@
 PLAN_TUI.md (v0.14) delivered 14 views, 18 CLI subcommands, and real-time
 alerts. PLAN_TUI_PART_2 (v0.15) added write actions, command palette,
 scrollable views, parallel polling, and 15 new SQL API surface expansions.
-This third plan wires the v0.20.0 **dog-feeding stream tables** (`df_*`)
+This third plan wires the v0.20.0 **self-monitoring stream tables** (`df_*`)
 into the TUI, introduces a **structural refactoring** of the TUI internals,
-and adds CLI subcommands for dog-feeding lifecycle management.
+and adds CLI subcommands for self-monitoring lifecycle management.
 
 ### Release Theme
 
@@ -47,26 +47,26 @@ and adds CLI subcommands for dog-feeding lifecycle management.
 9. **TUI-5** — Workers Interference sub-tab from `df_scheduling_interference`
 10. **TUI-6** — Workers scheduler overhead bar
 11. **TUI-7** — Dependencies Mermaid/DOT export overlay
-12. **TUI-8** — Header bar dog-feeding status badge
-13. **TUI-9** — Command palette `dog-feeding enable/disable`
+12. **TUI-8** — Header bar self-monitoring status badge
+13. **TUI-9** — Command palette `self-monitoring enable/disable`
 14. **TUI-10** — Detail view active anomaly summary row
-15. **TUI-11** — Refresh Log `[auto]` annotation for `DOG_FEED` rows
-16. **TUI-12** — First-launch dog-feeding setup hint toast
+15. **TUI-11** — Refresh Log `[auto]` annotation for `SELF_MONITOR` rows
+16. **TUI-12** — First-launch self-monitoring setup hint toast
 17. **TUI-13** — Anomaly signals as Issues
-18. **TUI-14** — `dog_feed_anomaly` alert styling
+18. **TUI-14** — `self_monitor_anomaly` alert styling
 19. **TUI-15** — Dashboard snapshot tests
 20. **TUI-16** — Diagnostics `df_efficiency_rolling` summary panel
 
 **Backend enhancements:**
 
 21. **DF-21** — `sla_breach_risk` column in `df_threshold_advice`
-22. **DF-22** — `dog_feeding_auto_apply = 'full'` scheduling mode
-23. **DF-23** — `dog_feeding_status()` retention warning
+22. **DF-22** — `self_monitoring_auto_apply = 'full'` scheduling mode
+23. **DF-23** — `self_monitoring_status()` retention warning
 24. **DF-24** — `recommend_refresh_mode()` reads from `df_threshold_advice`
 
 **CLI integration:**
 
-25. **CLI-1** — `pgtrickle dog-feeding` subcommand group
+25. **CLI-1** — `pgtrickle self-monitoring` subcommand group
 26. **CLI-2** — `pgtrickle graph --format ascii|mermaid|dot`
 
 **Test coverage, documentation:**
@@ -93,7 +93,7 @@ and adds CLI subcommands for dog-feeding lifecycle management.
 - [Architecture: Selective Polling](#architecture-selective-polling)
 - [Architecture: Poller Extraction](#architecture-poller-extraction)
 - [Architecture: CLI/TUI Command Unification](#architecture-clitui-command-unification)
-- [Dog-Feeding Data Model](#dog-feeding-data-model)
+- [Self-Monitoring Data Model](#self-monitoring-data-model)
 - [Feature Specifications](#feature-specifications)
   - [TUI-1 — Anomaly Detection View](#tui-1--anomaly-detection-view)
   - [TUI-2 — Dashboard Anomaly Badge](#tui-2--dashboard-anomaly-badge)
@@ -102,11 +102,11 @@ and adds CLI subcommands for dog-feeding lifecycle management.
   - [TUI-5 — Workers Interference Sub-Tab](#tui-5--workers-interference-sub-tab)
   - [TUI-6 — Workers Scheduler Overhead Bar](#tui-6--workers-scheduler-overhead-bar)
   - [TUI-7 — Dependencies Mermaid/DOT Export](#tui-7--dependencies-mermaiddot-export)
-  - [TUI-8 — Header Dog-Feeding Status Badge](#tui-8--header-dog-feeding-status-badge)
-  - [TUI-9 — Dog-Feeding Commands in Palette](#tui-9--dog-feeding-commands-in-palette)
+  - [TUI-8 — Header Self-Monitoring Status Badge](#tui-8--header-self-monitoring-status-badge)
+  - [TUI-9 — Self-Monitoring Commands in Palette](#tui-9--self-monitoring-commands-in-palette)
   - [TUI-10 — Detail View Anomaly Summary](#tui-10--detail-view-anomaly-summary)
   - [TUI-11 — Refresh Log Auto Tag](#tui-11--refresh-log-auto-tag)
-  - [TUI-12 — First-Launch Dog-Feeding Toast](#tui-12--first-launch-dog-feeding-toast)
+  - [TUI-12 — First-Launch Self-Monitoring Toast](#tui-12--first-launch-self-monitoring-toast)
   - [TUI-13 — Anomaly Signals as Issues](#tui-13--anomaly-signals-as-issues)
   - [TUI-14 — Dog-Feed Alert Styling](#tui-14--dog-feed-alert-styling)
   - [TUI-15 — Dashboard Snapshot Tests](#tui-15--dashboard-snapshot-tests)
@@ -117,7 +117,7 @@ and adds CLI subcommands for dog-feeding lifecycle management.
   - [DF-23 — Retention Warning](#df-23--retention-warning)
   - [DF-24 — recommend_refresh_mode Reads DF](#df-24--recommend_refresh_mode-reads-df)
 - [CLI Integration](#cli-integration)
-  - [CLI-1 — Dog-Feeding Subcommand Group](#cli-1--dog-feeding-subcommand-group)
+  - [CLI-1 — Self-Monitoring Subcommand Group](#cli-1--self-monitoring-subcommand-group)
   - [CLI-2 — Graph Format Flag](#cli-2--graph-format-flag)
 - [Test Strategy](#test-strategy)
 - [Implementation Phases](#implementation-phases)
@@ -130,7 +130,7 @@ and adds CLI subcommands for dog-feeding lifecycle management.
 ### AppState Complexity
 
 `state.rs` defines a single `AppState` struct with 50+ fields. All views
-receive the entire state. Adding dog-feeding data (5 stream table views,
+receive the entire state. Adding self-monitoring data (5 stream table views,
 status, anomaly signals, trends, interference, efficiency, threshold advice)
 would push AppState past 60 fields with no clear ownership.
 
@@ -165,7 +165,7 @@ further. No grouping, no parent-child relationships.
 ### CLI/TUI Command Divergence
 
 CLI commands in `commands/*.rs` and TUI palette commands in `app.rs` execute
-the same SQL but through different code paths. Adding `dog-feeding enable`
+the same SQL but through different code paths. Adding `self-monitoring enable`
 requires changes in both places.
 
 ---
@@ -175,7 +175,7 @@ requires changes in both places.
 ### Goal
 
 Split `AppState` into domain-scoped sub-structs. Views access only the
-domains they need. New domains (dog-feeding) are added without touching
+domains they need. New domains (self-monitoring) are added without touching
 existing view code.
 
 ### Design
@@ -194,7 +194,7 @@ pub struct AppState {
     pub scheduling: SchedulingDomain,
     pub watermarks: WatermarkDomain,
     pub config: ConfigDomain,
-    pub dog_feeding: DogFeedingDomain,  // NEW
+    pub self_monitoring: DogFeedingDomain,  // NEW
 
     // Caches (shared across views)
     pub caches: CacheStore,
@@ -259,7 +259,7 @@ pub struct ConfigDomain {
 /// Dog-feeding domain — data from the five df_* stream tables.
 #[derive(Default)]
 pub struct DogFeedingDomain {
-    /// Whether dog-feeding is set up and active
+    /// Whether self-monitoring is set up and active
     pub enabled: bool,
     /// Dog-feeding status (active STs, setup date, health)
     pub status: Option<DogFeedingStatus>,
@@ -273,7 +273,7 @@ pub struct DogFeedingDomain {
     pub efficiency_rolling: Vec<EfficiencyRollingRecord>,
     /// Threshold advice from df_threshold_advice
     pub threshold_advice: Vec<ThresholdAdviceRecord>,
-    /// Retention warning from dog_feeding_status()
+    /// Retention warning from self_monitoring_status()
     pub retention_warning: Option<String>,
 }
 
@@ -355,7 +355,7 @@ pub struct DataSubscriptions {
     pub needs_scheduler_overhead: bool,
 
     // Dog-feeding (only when enabled, Phase 2)
-    pub needs_dog_feeding_status: bool,
+    pub needs_self_monitoring_status: bool,
     pub needs_anomaly_signals: bool,
     pub needs_cdc_trends: bool,
     pub needs_interference: bool,
@@ -365,35 +365,35 @@ pub struct DataSubscriptions {
 
 impl DataSubscriptions {
     /// Compute subscriptions from the active view.
-    pub fn for_view(view: View, dog_feeding_enabled: bool) -> Self {
+    pub fn for_view(view: View, self_monitoring_enabled: bool) -> Self {
         let mut subs = Self::default();
 
         // Dog-feeding status is always checked (lightweight)
-        subs.needs_dog_feeding_status = true;
+        subs.needs_self_monitoring_status = true;
         // Quick health is always needed for the header bar
         subs.needs_quick_health = true;
 
         match view {
             View::Dashboard => {
-                subs.needs_anomaly_signals = dog_feeding_enabled;
+                subs.needs_anomaly_signals = self_monitoring_enabled;
             }
             View::Detail => {
-                subs.needs_anomaly_signals = dog_feeding_enabled;
+                subs.needs_anomaly_signals = self_monitoring_enabled;
             }
             View::Cdc => {
                 subs.needs_cdc_health = true;
                 subs.needs_dedup_stats = true;
                 subs.needs_shared_buffer_stats = true;
-                subs.needs_cdc_trends = dog_feeding_enabled;
+                subs.needs_cdc_trends = self_monitoring_enabled;
             }
             View::Workers => {
                 subs.needs_scheduler_overhead = true;
-                subs.needs_interference = dog_feeding_enabled;
+                subs.needs_interference = self_monitoring_enabled;
             }
             View::Diagnostics => {
                 subs.needs_scheduler_overhead = true;
-                subs.needs_efficiency_rolling = dog_feeding_enabled;
-                subs.needs_threshold_advice = dog_feeding_enabled;
+                subs.needs_efficiency_rolling = self_monitoring_enabled;
+                subs.needs_threshold_advice = self_monitoring_enabled;
             }
             View::Graph => {
                 subs.needs_diamond_scc = true;
@@ -403,7 +403,7 @@ impl DataSubscriptions {
                 subs.needs_watermark_alignment = true;
             }
             View::Issues => {
-                subs.needs_anomaly_signals = dog_feeding_enabled;
+                subs.needs_anomaly_signals = self_monitoring_enabled;
             }
             // RefreshLog, Config, Health, Alerts, Fuse, DeltaInspector:
             // no Phase 2 subscriptions needed
@@ -454,39 +454,39 @@ pub async fn poll_all(
     // ... etc for each subscription ...
 
     // Dog-feeding subscriptions (only when status check says enabled)
-    if subs.needs_dog_feeding_status {
-        if let Ok(status) = poll_dog_feeding_status_query(client).await {
-            state.dog_feeding.enabled = status.is_some();
-            state.dog_feeding.status = status;
-            state.dog_feeding.retention_warning =
-                state.dog_feeding.status.as_ref()
+    if subs.needs_self_monitoring_status {
+        if let Ok(status) = poll_self_monitoring_status_query(client).await {
+            state.self_monitoring.enabled = status.is_some();
+            state.self_monitoring.status = status;
+            state.self_monitoring.retention_warning =
+                state.self_monitoring.status.as_ref()
                     .and_then(|s| s.retention_warning.clone());
         }
     }
-    if state.dog_feeding.enabled {
+    if state.self_monitoring.enabled {
         if subs.needs_anomaly_signals {
             if let Ok(signals) = poll_anomaly_signals_query(client).await {
-                state.dog_feeding.anomaly_signals = signals;
+                state.self_monitoring.anomaly_signals = signals;
             }
         }
         if subs.needs_cdc_trends {
             if let Ok(trends) = poll_cdc_trends_query(client).await {
-                state.dog_feeding.cdc_trends = trends;
+                state.self_monitoring.cdc_trends = trends;
             }
         }
         if subs.needs_interference {
             if let Ok(records) = poll_interference_query(client).await {
-                state.dog_feeding.interference = records;
+                state.self_monitoring.interference = records;
             }
         }
         if subs.needs_efficiency_rolling {
             if let Ok(records) = poll_efficiency_rolling_query(client).await {
-                state.dog_feeding.efficiency_rolling = records;
+                state.self_monitoring.efficiency_rolling = records;
             }
         }
         if subs.needs_threshold_advice {
             if let Ok(records) = poll_threshold_advice_query(client).await {
-                state.dog_feeding.threshold_advice = records;
+                state.self_monitoring.threshold_advice = records;
             }
         }
     }
@@ -524,7 +524,7 @@ src/poller/
 ```rust
 // poller/fetchers.rs
 pub async fn fetch_stream_tables(client: &Client) -> Result<Vec<StreamTableInfo>, PgErr> { ... }
-pub async fn fetch_dog_feeding_status(client: &Client) -> Result<Option<DogFeedingStatus>, PgErr> { ... }
+pub async fn fetch_self_monitoring_status(client: &Client) -> Result<Option<DogFeedingStatus>, PgErr> { ... }
 pub async fn fetch_anomaly_signals(client: &Client) -> Result<Vec<AnomalySignal>, PgErr> { ... }
 // ... one per poll query
 ```
@@ -536,14 +536,14 @@ pub fn apply_stream_tables(state: &mut AppState, tables: Vec<StreamTableInfo>) {
     // preserve sparkline_data from previous poll
     state.stream_tables.tables = tables;
 }
-pub fn apply_dog_feeding_status(state: &mut AppState, status: Option<DogFeedingStatus>) {
-    state.dog_feeding.enabled = status.is_some();
-    state.dog_feeding.retention_warning = status.as_ref()
+pub fn apply_self_monitoring_status(state: &mut AppState, status: Option<DogFeedingStatus>) {
+    state.self_monitoring.enabled = status.is_some();
+    state.self_monitoring.retention_warning = status.as_ref()
         .and_then(|s| s.retention_warning.clone());
-    state.dog_feeding.status = status;
+    state.self_monitoring.status = status;
 }
 pub fn apply_anomaly_signals(state: &mut AppState, signals: Vec<AnomalySignal>) {
-    state.dog_feeding.anomaly_signals = signals;
+    state.self_monitoring.anomaly_signals = signals;
 }
 // ... one per domain
 ```
@@ -564,21 +564,21 @@ Create `commands/domain.rs` with shared command logic:
 ```rust
 // commands/domain.rs
 
-pub async fn enable_dog_feeding(client: &Client) -> Result<String, CliError> {
-    client.execute("SELECT pgtrickle.setup_dog_feeding()", &[]).await?;
+pub async fn enable_self_monitoring(client: &Client) -> Result<String, CliError> {
+    client.execute("SELECT pgtrickle.setup_self_monitoring()", &[]).await?;
     Ok("Dog-feeding enabled".to_string())
 }
 
-pub async fn disable_dog_feeding(client: &Client) -> Result<String, CliError> {
-    client.execute("SELECT pgtrickle.teardown_dog_feeding()", &[]).await?;
+pub async fn disable_self_monitoring(client: &Client) -> Result<String, CliError> {
+    client.execute("SELECT pgtrickle.teardown_self_monitoring()", &[]).await?;
     Ok("Dog-feeding disabled".to_string())
 }
 
-pub async fn dog_feeding_status(
+pub async fn self_monitoring_status(
     client: &Client,
     format: OutputFormat,
 ) -> Result<String, CliError> {
-    let rows = client.query("SELECT * FROM pgtrickle.dog_feeding_status()", &[]).await?;
+    let rows = client.query("SELECT * FROM pgtrickle.self_monitoring_status()", &[]).await?;
     format_rows(rows, format)
 }
 
@@ -596,12 +596,12 @@ pub async fn export_dag(
 
 **CLI uses it:**
 ```rust
-// commands/dog_feeding.rs
+// commands/self_monitoring.rs
 pub async fn execute(client: &Client, args: &DogFeedingArgs) -> Result<(), CliError> {
     match args.action {
-        DogFeedingAction::Enable => println!("{}", domain::enable_dog_feeding(client).await?),
-        DogFeedingAction::Disable => println!("{}", domain::disable_dog_feeding(client).await?),
-        DogFeedingAction::Status => println!("{}", domain::dog_feeding_status(client, args.format).await?),
+        DogFeedingAction::Enable => println!("{}", domain::enable_self_monitoring(client).await?),
+        DogFeedingAction::Disable => println!("{}", domain::disable_self_monitoring(client).await?),
+        DogFeedingAction::Status => println!("{}", domain::self_monitoring_status(client, args.format).await?),
     }
     Ok(())
 }
@@ -611,7 +611,7 @@ pub async fn execute(client: &Client, args: &DogFeedingArgs) -> Result<(), CliEr
 ```rust
 // poller.rs → execute_action()
 ActionRequest::DogFeedingEnable => {
-    match domain::enable_dog_feeding(client).await {
+    match domain::enable_self_monitoring(client).await {
         Ok(msg) => PollMsg::ActionResult(ActionResult { success: true, message: msg }),
         Err(e) => PollMsg::ActionResult(ActionResult { success: false, message: e.to_string() }),
     }
@@ -620,7 +620,7 @@ ActionRequest::DogFeedingEnable => {
 
 ---
 
-## Dog-Feeding Data Model
+## Self-Monitoring Data Model
 
 ### New State Types
 
@@ -682,11 +682,11 @@ pub struct ThresholdAdviceRecord {
 }
 ```
 
-### Dog-Feeding SQL Queries
+### Self-Monitoring SQL Queries
 
 | Query | Source | Fields | Used By |
 |-------|--------|--------|---------|
-| `SELECT * FROM pgtrickle.dog_feeding_status()` | SQL func | `active_count`, `total_count`, `setup_at`, `retention_warning` | TUI-8, TUI-12 |
+| `SELECT * FROM pgtrickle.self_monitoring_status()` | SQL func | `active_count`, `total_count`, `setup_at`, `retention_warning` | TUI-8, TUI-12 |
 | `SELECT * FROM pgtrickle.df_anomaly_signals` | DF-2 ST | `st_name`, `anomaly_type`, `severity`, `detected_at`, `delta_from_baseline`, `window_seconds` | TUI-1, TUI-2, TUI-10, TUI-13 |
 | `SELECT * FROM pgtrickle.df_cdc_buffer_trends` | DF-4 ST | `source_table`, `buffer_counts`, `growth_rate`, `spill_risk` | TUI-3, TUI-4 |
 | `SELECT * FROM pgtrickle.df_scheduling_interference` | DF-5 ST | `st_a`, `st_b`, `overlap_count`, `total_overlap_ms`, `last_seen` | TUI-5 |
@@ -700,10 +700,10 @@ pub struct ThresholdAdviceRecord {
 ### TUI-1 — Anomaly Detection View
 
 **Key:** `a`
-**Data source:** `df_anomaly_signals` via `state.dog_feeding.anomaly_signals`
+**Data source:** `df_anomaly_signals` via `state.self_monitoring.anomaly_signals`
 
 New view accessible via `a` key. Renders a table of active anomaly signals
-from the `df_anomaly_signals` dog-feeding stream table.
+from the `df_anomaly_signals` self-monitoring stream table.
 
 **Columns:**
 | Column | Width | Source |
@@ -715,12 +715,12 @@ from the `df_anomaly_signals` dog-feeding stream table.
 | Delta | 10 | `delta_from_baseline` (e.g., "+3.2×") |
 | Window | 8 | `window_seconds` (e.g., "5 min") |
 
-**Empty state:** When dog-feeding is not enabled:
+**Empty state:** When self-monitoring is not enabled:
 ```
 ┌─ Anomaly Detection ──────────────────────────────┐
 │                                                   │
 │  Dog-feeding is not active.                       │
-│  Run :dog-feeding enable for anomaly detection.   │
+│  Run :self-monitoring enable for anomaly detection.   │
 │                                                   │
 └───────────────────────────────────────────────────┘
 ```
@@ -731,7 +731,7 @@ from the `df_anomaly_signals` dog-feeding stream table.
 ### TUI-2 — Dashboard Anomaly Badge
 
 **View:** Dashboard (key `1`)
-**Data source:** `state.dog_feeding.anomaly_signals.len()`
+**Data source:** `state.self_monitoring.anomaly_signals.len()`
 
 In `render_status_ribbon()`, after existing status counters (active, paused,
 error, suspended), append an anomaly badge:
@@ -741,28 +741,28 @@ error, suspended), append an anomaly badge:
 ```
 
 - Badge text: `🔍 N anomalies` (cyan icon, red count when N > 0)
-- Hidden when N = 0 or dog-feeding is off
+- Hidden when N = 0 or self-monitoring is off
 - Implementation: ~10 LOC in `dashboard.rs::render_status_ribbon()`
 
 ### TUI-3 — CDC Health Sparkline Column
 
 **View:** CDC Health (key `6`)
-**Data source:** `state.dog_feeding.cdc_trends`
+**Data source:** `state.self_monitoring.cdc_trends`
 
-When dog-feeding is active, each source table row in the CDC buffers section
+When self-monitoring is active, each source table row in the CDC buffers section
 gains a 20-character sparkline column showing buffer row-count trend over
 the last 10 poll cycles.
 
 **Rendering:**
 - Use braille block characters (`⣀⣤⣶⣿` etc.) for compact sparkline
 - Data: `cdc_trends.buffer_counts` (Vec<f64>, last 10 values)
-- Falls back to `—` when dog-feeding is off or no trend data available
+- Falls back to `—` when self-monitoring is off or no trend data available
 - Column header: `Trend`
 
 ### TUI-4 — CDC Health Spill-Risk Badge
 
 **View:** CDC Health (key `6`)
-**Data source:** `state.dog_feeding.cdc_trends.spill_risk` + `state.cdc.health`
+**Data source:** `state.self_monitoring.cdc_trends.spill_risk` + `state.cdc.health`
 
 When `check_cdc_health()` reports spill risk via OPS-2 enrichment:
 - `IMMINENT` → red badge, overrides normal buffer-size highlight
@@ -775,7 +775,7 @@ Implementation: extend the existing CDC view's row rendering to check
 ### TUI-5 — Workers Interference Sub-Tab
 
 **View:** Workers (key `w`)
-**Data source:** `state.dog_feeding.interference`
+**Data source:** `state.self_monitoring.interference`
 
 New `Interference` tab (second tab, switched with `Tab` key) in the Workers
 view. Shows rows from `df_scheduling_interference`:
@@ -790,7 +790,7 @@ view. Shows rows from `df_scheduling_interference`:
 | Last Seen | 19 | `last_seen` |
 
 **Sorting:** Default by `overlap_count` DESC.
-**Empty state:** Same pattern as TUI-1 (dog-feeding hint).
+**Empty state:** Same pattern as TUI-1 (self-monitoring hint).
 
 App struct gains `workers_tab: usize` (0=Overview, 1=Interference).
 `Tab` key cycles between tabs when in Workers view.
@@ -831,54 +831,54 @@ Press `Ctrl+E` in the overlay to export to file
 Implementation: new `ActionRequest::FetchExplainDag(String)` for format
 selection. New overlay state `mermaid_overlay: Option<String>` in `App`.
 
-### TUI-8 — Header Dog-Feeding Status Badge
+### TUI-8 — Header Self-Monitoring Status Badge
 
 **View:** All views (header bar)
-**Data source:** `state.dog_feeding.status`
+**Data source:** `state.self_monitoring.status`
 
 In the shared header bar (rendered by `draw_header()` in `app.rs`), add:
 
-- `df:5/5` in green when all 5 dog-feeding STs are active
+- `df:5/5` in green when all 5 self-monitoring STs are active
 - `df:3/5` in yellow when some are active
-- `df:off` dimmed when dog-feeding not configured
+- `df:off` dimmed when self-monitoring not configured
 - `df:⚠` in orange when `retention_warning` is set
 
 Position: after the scheduler indicator, before the poll interval.
 
-### TUI-9 — Dog-Feeding Commands in Palette
+### TUI-9 — Self-Monitoring Commands in Palette
 
 **View:** Command palette (`:` mode)
 
 Add three commands:
-- `dog-feeding enable` → calls `setup_dog_feeding()` → toast "Dog-feeding enabled (5 stream tables created)"
-- `dog-feeding disable` → confirmation dialog → calls `teardown_dog_feeding()` → toast "Dog-feeding disabled"
-- `dog-feeding status` → calls `dog_feeding_status()` → toast with summary
+- `self-monitoring enable` → calls `setup_self_monitoring()` → toast "Dog-feeding enabled (5 stream tables created)"
+- `self-monitoring disable` → confirmation dialog → calls `teardown_self_monitoring()` → toast "Dog-feeding disabled"
+- `self-monitoring status` → calls `self_monitoring_status()` → toast with summary
 
 Implementation:
 1. Add `DogFeedingEnable`, `DogFeedingDisable` variants to `ActionRequest`
-2. Add `("dog-feeding enable", ...)`, `("dog-feeding disable", ...)`,
-   `("dog-feeding status", ...)` to command list in `CommandPalette`
+2. Add `("self-monitoring enable", ...)`, `("self-monitoring disable", ...)`,
+   `("self-monitoring status", ...)` to command list in `CommandPalette`
 3. Add execution handlers in `execute_action()` using unified domain logic
-4. `dog-feeding disable` requires confirmation (same as `pause`)
+4. `self-monitoring disable` requires confirmation (same as `pause`)
 
 ### TUI-10 — Detail View Anomaly Summary
 
 **View:** Detail (key `2`)
-**Data source:** `state.dog_feeding.anomaly_signals` filtered by selected ST
+**Data source:** `state.self_monitoring.anomaly_signals` filtered by selected ST
 
 In the Properties section of the Detail view, after the existing rows
 (status, mode, staleness, etc.), add an `Anomalies` row:
 
 - When anomalies exist: `⚠ 2 active: DURATION_SPIKE, ERROR_BURST` (red)
 - When no anomalies: `—` (dim)
-- When dog-feeding off: row not shown
+- When self-monitoring off: row not shown
 
 ### TUI-11 — Refresh Log Auto Tag
 
 **View:** Refresh Log (key `4`)
 **Data source:** `initiated_by` column in `pgt_refresh_history`
 
-When a refresh log entry has `initiated_by = 'DOG_FEED'`, display an
+When a refresh log entry has `initiated_by = 'SELF_MONITOR'`, display an
 orange `[auto]` tag in the Mode column, after the mode label:
 
 ```
@@ -888,36 +888,36 @@ orange `[auto]` tag in the Mode column, after the mode label:
 Implementation:
 1. Extend `poll_refresh_log_query()` to include `initiated_by` column
 2. Add `initiated_by: Option<String>` to `RefreshLogEntry` state struct
-3. In `refresh_log.rs`, check for `DOG_FEED` value and render tag
+3. In `refresh_log.rs`, check for `SELF_MONITOR` value and render tag
 
-### TUI-12 — First-Launch Dog-Feeding Toast
+### TUI-12 — First-Launch Self-Monitoring Toast
 
 **View:** Any (on first poll result)
-**Data source:** `state.dog_feeding.enabled`
+**Data source:** `state.self_monitoring.enabled`
 
-On the first successful poll, if `dog_feeding_status()` returns zero active
-stream tables (dog-feeding not set up), show a one-time info toast:
+On the first successful poll, if `self_monitoring_status()` returns zero active
+stream tables (self-monitoring not set up), show a one-time info toast:
 
 ```
-Dog-feeding not active. Run :dog-feeding enable for enhanced monitoring.
+Dog-feeding not active. Run :self-monitoring enable for enhanced monitoring.
 ```
 
 - Dismissed automatically after 10 s or on any keypress
 - Only shown once per TUI session (tracked by `shown_df_hint: bool` in `App`)
-- Not shown if dog-feeding is already active
+- Not shown if self-monitoring is already active
 
 ### TUI-13 — Anomaly Signals as Issues
 
 **View:** Issues (key `i`)
-**Data source:** `state.dog_feeding.anomaly_signals`
+**Data source:** `state.self_monitoring.anomaly_signals`
 
 Extend `detect_issues()` in `state.rs` to include anomaly signals when
-dog-feeding is active:
+self-monitoring is active:
 
 ```rust
 // In detect_issues():
-if self.dog_feeding.enabled {
-    for signal in &self.dog_feeding.anomaly_signals {
+if self.self_monitoring.enabled {
+    for signal in &self.self_monitoring.anomaly_signals {
         let severity = match signal.severity.as_str() {
             "CRITICAL" => IssueSeverity::Critical,
             _ => IssueSeverity::Warning,
@@ -943,7 +943,7 @@ if self.dog_feeding.enabled {
 **View:** Alerts (key `9`)
 **Data source:** `state.monitoring.alerts` (filtered by event type)
 
-Events with `event_type = "dog_feed_anomaly"` get a distinct cyan `🔍` icon
+Events with `event_type = "self_monitor_anomaly"` get a distinct cyan `🔍` icon
 instead of the standard `⚠` or `✗`. Applied in `alert.rs` rendering.
 
 ### TUI-15 — Dashboard Snapshot Tests
@@ -955,19 +955,19 @@ Add snapshot tests for Dashboard view covering all rendering branches:
 - `test_dashboard_standard_80x24` — standard layout
 - `test_dashboard_wide_160x40` — wide layout with sparklines and DAG minimap
 - `test_dashboard_empty_80x24` — empty state (no stream tables)
-- `test_dashboard_with_anomalies_80x24` — badge visible (uses `sample_state_dog_feeding()`)
+- `test_dashboard_with_anomalies_80x24` — badge visible (uses `sample_state_self_monitoring()`)
 - `test_dashboard_narrow_60x20` — narrow terminal, graceful truncation
 
 ### TUI-16 — Diagnostics Efficiency Summary
 
 **View:** Diagnostics (key `5`)
-**Data source:** `state.dog_feeding.efficiency_rolling`
+**Data source:** `state.self_monitoring.efficiency_rolling`
 
-When dog-feeding is active, add a compact "Efficiency" panel below the
+When self-monitoring is active, add a compact "Efficiency" panel below the
 existing diagnostics recommendations:
 
 ```
-┌─ Dog-Feeding Efficiency ─────────────────────────┐
+┌─ Self-Monitoring Efficiency ─────────────────────────┐
 │ Avg Diff Speedup: 4.2×  |  Diff: 847  Full: 23  │
 │ Last Hour: 98% differential                       │
 └───────────────────────────────────────────────────┘
@@ -975,7 +975,7 @@ existing diagnostics recommendations:
 
 - Computed from `efficiency_rolling`: aggregate `diff_speedup` across all STs,
   sum `diff_count` and `full_count`
-- Shows `—` when dog-feeding is off
+- Shows `—` when self-monitoring is off
 
 ---
 
@@ -992,16 +992,16 @@ sla_breach_risk = (avg_diff_ms > freshness_deadline_ms)
 
 This completes the v0.20.0 exit criterion UX-8 that was left unchecked.
 
-**Files:** `src/api/dog_feeding.rs` (DF-3 query definition)
+**Files:** `src/api/self_monitoring.rs` (DF-3 query definition)
 **Test:** Synthetic-data E2E test asserting `sla_breach_risk = true` when
   `avg_diff_ms` exceeds `freshness_deadline_ms`
 
 ### DF-22 — auto_apply Full Mode
 
-Implement the `dog_feeding_auto_apply = 'full'` scheduling mode documented
+Implement the `self_monitoring_auto_apply = 'full'` scheduling mode documented
 as "future enhancement" in `docs/CONFIGURATION.md`.
 
-When `full` is active, `dog_feeding_auto_apply_tick()` additionally:
+When `full` is active, `self_monitoring_auto_apply_tick()` additionally:
 1. Reads `df_scheduling_interference.overlap_count` for all pairs
 2. Widens the dispatch interval for high-overlap pairs (> 5 overlaps)
    by 20% per 5 overlaps, capped at 2× baseline
@@ -1013,26 +1013,26 @@ When `full` is active, `dog_feeding_auto_apply_tick()` additionally:
 
 ### DF-23 — Retention Warning
 
-Add a `retention_warning` column to `dog_feeding_status()` output that is
+Add a `retention_warning` column to `self_monitoring_status()` output that is
 set when `pg_trickle.history_retention_days` is below the minimum window
 needed by DF-1 (`df_efficiency_rolling`) and DF-3 (`df_threshold_advice`).
 
 Minimum requirement: retention ≥ 1 day (both STs use rolling 24h windows).
 
-**Files:** `src/api/dog_feeding.rs` (`dog_feeding_status()` function)
+**Files:** `src/api/self_monitoring.rs` (`self_monitoring_status()` function)
 **Test:** E2E test setting `history_retention_days = 0` and verifying
   warning is non-NULL
 
 ### DF-24 — recommend_refresh_mode Reads DF
 
-When dog-feeding is active, `recommend_refresh_mode()` reads from the
+When self-monitoring is active, `recommend_refresh_mode()` reads from the
 maintained `df_threshold_advice` stream table instead of recomputing on
 demand. Same results, lower latency. Falls back to on-demand computation
-when dog-feeding is off.
+when self-monitoring is off.
 
-**Files:** `src/api/dog_feeding.rs`, `src/refresh.rs`
+**Files:** `src/api/self_monitoring.rs`, `src/refresh.rs`
   (recommend_refresh_mode integration)
-**Test:** E2E test verifying that with dog-feeding active,
+**Test:** E2E test verifying that with self-monitoring active,
   `recommend_refresh_mode()` returns data consistent with
   `df_threshold_advice`
 
@@ -1040,20 +1040,20 @@ when dog-feeding is off.
 
 ## CLI Integration
 
-### CLI-1 — Dog-Feeding Subcommand Group
+### CLI-1 — Self-Monitoring Subcommand Group
 
-Add `pgtrickle dog-feeding` with three subcommands:
+Add `pgtrickle self-monitoring` with three subcommands:
 
 ```
-pgtrickle dog-feeding enable          # calls setup_dog_feeding()
-pgtrickle dog-feeding disable         # calls teardown_dog_feeding()
-pgtrickle dog-feeding status          # calls dog_feeding_status()
-pgtrickle dog-feeding status --format json   # JSON output
+pgtrickle self-monitoring enable          # calls setup_self_monitoring()
+pgtrickle self-monitoring disable         # calls teardown_self_monitoring()
+pgtrickle self-monitoring status          # calls self_monitoring_status()
+pgtrickle self-monitoring status --format json   # JSON output
 ```
 
 **Files:**
 - `pgtrickle-tui/src/cli.rs` — add `DogFeeding` variant to `Commands` enum
-- `pgtrickle-tui/src/commands/dog_feeding.rs` — new command module
+- `pgtrickle-tui/src/commands/self_monitoring.rs` — new command module
 - `pgtrickle-tui/src/commands/domain.rs` — shared logic (see architecture section)
 - `pgtrickle-tui/src/main.rs` — dispatch
 
@@ -1080,7 +1080,7 @@ pgtrickle graph --format dot          # calls explain_dag('dot')
 
 | Struct | Fixture Builder | Used By |
 |--------|-----------------|---------|
-| `DogFeedingStatus` | `dog_feeding_status(active, total, setup_at, warning)` | TUI-8, TUI-12 |
+| `DogFeedingStatus` | `self_monitoring_status(active, total, setup_at, warning)` | TUI-8, TUI-12 |
 | `AnomalySignal` | `anomaly_signal(st, type_, severity, delta)` | TUI-1, TUI-2, TUI-10, TUI-13 |
 | `CdcBufferTrend` | `cdc_buffer_trend(source, counts, growth, risk)` | TUI-3, TUI-4 |
 | `InterferenceRecord` | `interference_record(st_a, st_b, overlaps, duration)` | TUI-5 |
@@ -1089,25 +1089,25 @@ pgtrickle graph --format dot          # calls explain_dag('dot')
 
 ### Extended Fixtures
 
-Add `sample_state_dog_feeding()` to `test_fixtures.rs`:
+Add `sample_state_self_monitoring()` to `test_fixtures.rs`:
 
 ```rust
-pub fn sample_state_dog_feeding() -> AppState {
+pub fn sample_state_self_monitoring() -> AppState {
     let mut state = sample_state_full();  // from Part 2
-    state.dog_feeding.enabled = true;
-    state.dog_feeding.status = Some(dog_feeding_status(5, 5, Some("2026-04-15T10:00:00Z"), None));
-    state.dog_feeding.anomaly_signals = vec![
+    state.self_monitoring.enabled = true;
+    state.self_monitoring.status = Some(self_monitoring_status(5, 5, Some("2026-04-15T10:00:00Z"), None));
+    state.self_monitoring.anomaly_signals = vec![
         anomaly_signal("order_totals", "DURATION_SPIKE", "WARNING", 2.3),
         anomaly_signal("revenue_daily", "ERROR_BURST", "CRITICAL", 5.1),
     ];
-    state.dog_feeding.cdc_trends = vec![
+    state.self_monitoring.cdc_trends = vec![
         cdc_buffer_trend("orders", vec![10.0, 12.0, 15.0, 18.0, 22.0], 1.5, None),
         cdc_buffer_trend("events", vec![5.0, 5.0, 8.0, 12.0, 50.0], 4.2, Some("ELEVATED")),
     ];
-    state.dog_feeding.interference = vec![
+    state.self_monitoring.interference = vec![
         interference_record("order_totals", "revenue_daily", 12, 3400.0),
     ];
-    state.dog_feeding.efficiency_rolling = vec![
+    state.self_monitoring.efficiency_rolling = vec![
         efficiency_rolling("order_totals", 847, 23, 4.2),
         efficiency_rolling("revenue_daily", 612, 8, 6.1),
     ];
@@ -1121,41 +1121,41 @@ New stubs required in `test_db.rs`:
 
 | SQL Function/View | Returns | Stub Data |
 |---|---|---|
-| `dog_feeding_status()` | `active_count int, total_count int, setup_at text, retention_warning text` | `5, 5, '2026-04-15', NULL` |
+| `self_monitoring_status()` | `active_count int, total_count int, setup_at text, retention_warning text` | `5, 5, '2026-04-15', NULL` |
 | `df_anomaly_signals` (view) | `st_name text, anomaly_type text, severity text, detected_at text, delta_from_baseline float8, window_seconds int8` | Two rows |
 | `df_cdc_buffer_trends` (view) | `source_table text, buffer_counts float8[], growth_rate float8, spill_risk text` | Two rows |
 | `df_scheduling_interference` (view) | `st_a text, st_b text, overlap_count int8, total_overlap_ms float8, last_seen text` | One row |
 | `df_efficiency_rolling` (view) | `st_name text, diff_count int8, full_count int8, avg_diff_ms float8, avg_full_ms float8, diff_speedup float8` | Two rows |
 | `df_threshold_advice` (view) | `st_name text, recommended_threshold float8, confidence float8, sla_headroom_pct float8, sla_breach_risk bool` | Two rows |
-| `setup_dog_feeding()` | `void` | No-op |
-| `teardown_dog_feeding()` | `void` | No-op |
+| `setup_self_monitoring()` | `void` | No-op |
+| `teardown_self_monitoring()` | `void` | No-op |
 | `explain_dag(text)` | `text` | Mermaid string |
 
 ### Snapshot Test Plan
 
 | Feature | Test Name | State | Terminal Size | Key Assertions |
 |---------|-----------|-------|---------------|----------------|
-| TUI-1 | `test_anomaly_view_populated_80x24` | `sample_state_dog_feeding()` | 80×24 | Signal table with severity colors, type labels |
+| TUI-1 | `test_anomaly_view_populated_80x24` | `sample_state_self_monitoring()` | 80×24 | Signal table with severity colors, type labels |
 | TUI-1 | `test_anomaly_view_empty_80x24` | `sample_state()` (df off) | 80×24 | Empty state with setup hint |
-| TUI-2 | `test_dashboard_anomaly_badge_80x24` | `sample_state_dog_feeding()` | 80×24 | Ribbon shows `🔍 2 anomalies` |
-| TUI-3 | `test_cdc_sparkline_with_trends_100x30` | `sample_state_dog_feeding()` | 100×30 | Sparkline chars visible in Trend column |
+| TUI-2 | `test_dashboard_anomaly_badge_80x24` | `sample_state_self_monitoring()` | 80×24 | Ribbon shows `🔍 2 anomalies` |
+| TUI-3 | `test_cdc_sparkline_with_trends_100x30` | `sample_state_self_monitoring()` | 100×30 | Sparkline chars visible in Trend column |
 | TUI-3 | `test_cdc_sparkline_no_df_100x30` | `sample_state()` | 100×30 | `—` in Trend column |
 | TUI-4 | `test_cdc_spill_risk_badge_100x30` | Trend with `spill_risk = "ELEVATED"` | 100×30 | Orange ELEVATED badge visible |
-| TUI-5 | `test_workers_interference_tab_100x30` | `sample_state_dog_feeding()` | 100×30 | Interference table with overlap data |
+| TUI-5 | `test_workers_interference_tab_100x30` | `sample_state_self_monitoring()` | 100×30 | Interference table with overlap data |
 | TUI-5 | `test_workers_interference_empty_100x30` | `sample_state()` | 100×30 | Empty state with hint |
 | TUI-6 | `test_workers_overhead_bar_100x30` | Scheduler overhead populated | 100×30 | One-line summary visible |
 | TUI-7 | `test_graph_mermaid_overlay_80x30` | Mermaid text in overlay state | 80×30 | Mermaid markdown visible, scrollable |
-| TUI-8 | `test_header_df_active_80x24` | `sample_state_dog_feeding()` | 80×24 | `df:5/5` in green |
+| TUI-8 | `test_header_df_active_80x24` | `sample_state_self_monitoring()` | 80×24 | `df:5/5` in green |
 | TUI-8 | `test_header_df_off_80x24` | `sample_state()` | 80×24 | `df:off` dimmed |
 | TUI-8 | `test_header_df_warning_80x24` | Status with `retention_warning` | 80×24 | `df:⚠` in orange |
 | TUI-10 | `test_detail_anomaly_row_80x40` | Selected ST with anomalies | 80×40 | `⚠ 1 active: DURATION_SPIKE` |
-| TUI-11 | `test_refresh_log_auto_tag_80x24` | Log entry with `initiated_by = DOG_FEED` | 80×24 | Orange `[auto]` tag |
-| TUI-13 | `test_issues_with_anomalies_80x24` | `sample_state_dog_feeding()` | 80×24 | Anomaly category in issues list |
-| TUI-14 | `test_alert_dog_feed_icon_80x24` | Alert with `dog_feed_anomaly` event | 80×24 | Cyan `🔍` icon |
+| TUI-11 | `test_refresh_log_auto_tag_80x24` | Log entry with `initiated_by = SELF_MONITOR` | 80×24 | Orange `[auto]` tag |
+| TUI-13 | `test_issues_with_anomalies_80x24` | `sample_state_self_monitoring()` | 80×24 | Anomaly category in issues list |
+| TUI-14 | `test_alert_dog_feed_icon_80x24` | Alert with `self_monitor_anomaly` event | 80×24 | Cyan `🔍` icon |
 | TUI-15 | `test_dashboard_standard_80x24` | `sample_state()` | 80×24 | Standard layout, no panics |
 | TUI-15 | `test_dashboard_wide_160x40` | `sample_state()` | 160×40 | Wide layout with sparklines + minimap |
 | TUI-15 | `test_dashboard_empty_80x24` | `empty_state()` | 80×24 | Empty placeholder |
-| TUI-16 | `test_diagnostics_efficiency_panel_80x40` | `sample_state_dog_feeding()` | 80×40 | Efficiency panel with speedup and counts |
+| TUI-16 | `test_diagnostics_efficiency_panel_80x40` | `sample_state_self_monitoring()` | 80×40 | Efficiency panel with speedup and counts |
 | TUI-16 | `test_diagnostics_no_df_80x40` | `sample_state()` | 80×40 | No efficiency panel |
 
 ### Unit Test Plan
@@ -1163,27 +1163,27 @@ New stubs required in `test_db.rs`:
 | Module | Test Name | What It Verifies |
 |--------|-----------|------------------|
 | `state.rs` | `test_detect_issues_includes_anomalies` | `detect_issues()` adds WARNING/CRITICAL for anomaly signals |
-| `state.rs` | `test_detect_issues_no_anomalies_when_df_off` | `detect_issues()` skips anomalies when `dog_feeding.enabled = false` |
-| `state.rs` | `test_dog_feeding_domain_default` | `DogFeedingDomain::default()` has `enabled = false`, empty vecs |
+| `state.rs` | `test_detect_issues_no_anomalies_when_df_off` | `detect_issues()` skips anomalies when `self_monitoring.enabled = false` |
+| `state.rs` | `test_self_monitoring_domain_default` | `DogFeedingDomain::default()` has `enabled = false`, empty vecs |
 | `state.rs` | `test_anomaly_signal_severity_mapping` | CRITICAL maps to `IssueSeverity::Critical`, WARNING to Warning |
 | `app.rs` | `test_key_a_switches_to_anomaly_view` | `a` key dispatches to `View::Anomalies` |
 | `app.rs` | `test_tab_in_workers_cycles_tabs` | Tab cycles between Overview and Interference |
 | `app.rs` | `test_x_in_graph_fetches_mermaid` | `x` key dispatches `FetchExplainDag` action |
-| `app.rs` | `test_dog_feeding_enable_command` | `:dog-feeding enable` parsed correctly |
-| `app.rs` | `test_dog_feeding_disable_requires_confirm` | `:dog-feeding disable` shows confirmation dialog |
-| `cli.rs` | `test_dog_feeding_enable_subcommand` | `pgtrickle dog-feeding enable` parses correctly |
+| `app.rs` | `test_self_monitoring_enable_command` | `:self-monitoring enable` parsed correctly |
+| `app.rs` | `test_self_monitoring_disable_requires_confirm` | `:self-monitoring disable` shows confirmation dialog |
+| `cli.rs` | `test_self_monitoring_enable_subcommand` | `pgtrickle self-monitoring enable` parses correctly |
 | `cli.rs` | `test_graph_format_mermaid` | `pgtrickle graph --format mermaid` parses correctly |
 | `cli.rs` | `test_graph_format_default_ascii` | `pgtrickle graph` defaults to ASCII |
 | `poller.rs` | `test_subscriptions_for_dashboard` | Dashboard subscribes to anomaly_signals but not interference |
 | `poller.rs` | `test_subscriptions_for_cdc` | CDC subscribes to cdc_health, dedup, shared_buffer, cdc_trends |
 | `poller.rs` | `test_subscriptions_for_workers` | Workers subscribes to scheduler_overhead, interference |
-| `poller.rs` | `test_subscriptions_df_disabled` | All DF subscriptions false when dog_feeding_enabled = false |
+| `poller.rs` | `test_subscriptions_df_disabled` | All DF subscriptions false when self_monitoring_enabled = false |
 
 ### Degradation Test Plan
 
 | Test | What It Verifies |
 |------|------------------|
-| `test_poll_dog_feeding_status_missing` | TUI renders with `df:off` when `dog_feeding_status()` is absent |
+| `test_poll_self_monitoring_status_missing` | TUI renders with `df:off` when `self_monitoring_status()` is absent |
 | `test_poll_anomaly_signals_missing` | Anomaly view shows empty state when `df_anomaly_signals` query fails |
 | `test_poll_cdc_trends_missing` | CDC sparkline shows `—` when `df_cdc_buffer_trends` query fails |
 | `test_poll_interference_missing` | Workers Interference tab shows empty when query fails |
@@ -1220,22 +1220,22 @@ Add selective polling infrastructure. No user-visible changes.
 **Exit:** `AppState` uses domain structs. Poller respects subscriptions.
 All existing tests pass. No user-visible behavior change. `just lint` clean.
 
-### Phase T16 — Dog-Feeding Data Layer (Day 3–5)
+### Phase T16 — Self-Monitoring Data Layer (Day 3–5)
 
-**Goal:** Add dog-feeding state types, polling queries, fixture builders,
+**Goal:** Add self-monitoring state types, polling queries, fixture builders,
 and contract stubs. No new views yet.
 
 | Item | Description | Effort |
 |------|-------------|--------|
 | T16a | Add `DogFeedingStatus`, `AnomalySignal`, `CdcBufferTrend`, `InterferenceRecord`, `EfficiencyRollingRecord`, `ThresholdAdviceRecord` to `state.rs` | 2h |
 | T16b | Add `DogFeedingDomain` fields to `AppState` (already defined in T15a, now populate types) | 30m |
-| T16c | Add `fetch_dog_feeding_status()`, `fetch_anomaly_signals()`, `fetch_cdc_trends()`, `fetch_interference()`, `fetch_efficiency_rolling()`, `fetch_threshold_advice()` to `poller/fetchers.rs` | 3h |
-| T16d | Add `apply_dog_feeding_status()`, `apply_anomaly_signals()`, `apply_cdc_trends()`, `apply_interference()`, `apply_efficiency_rolling()` to `poller/updaters.rs` | 1h |
-| T16e | Wire dog-feeding fetchers into `poll_all()` under subscription flags | 2h |
+| T16c | Add `fetch_self_monitoring_status()`, `fetch_anomaly_signals()`, `fetch_cdc_trends()`, `fetch_interference()`, `fetch_efficiency_rolling()`, `fetch_threshold_advice()` to `poller/fetchers.rs` | 3h |
+| T16d | Add `apply_self_monitoring_status()`, `apply_anomaly_signals()`, `apply_cdc_trends()`, `apply_interference()`, `apply_efficiency_rolling()` to `poller/updaters.rs` | 1h |
+| T16e | Wire self-monitoring fetchers into `poll_all()` under subscription flags | 2h |
 | T16f | Add `RefreshLogEntry.initiated_by: Option<String>` field; extend `poll_refresh_log_query()` to fetch `initiated_by` column | 1h |
 | T16g | **Fixtures:** Add fixture builders for all 6 new structs in `test_fixtures.rs` | 1h |
-| T16h | **Fixtures:** Add `sample_state_dog_feeding()` to `test_fixtures.rs` | 1h |
-| T16i | **Contract stubs:** Add 9 new stubs to `test_db.rs` (dog_feeding_status, df_* views, setup/teardown, explain_dag) | 2h |
+| T16h | **Fixtures:** Add `sample_state_self_monitoring()` to `test_fixtures.rs` | 1h |
+| T16i | **Contract stubs:** Add 9 new stubs to `test_db.rs` (self_monitoring_status, df_* views, setup/teardown, explain_dag) | 2h |
 | T16j | **Contract tests:** 6 new `test_poll_df_*_executes` tests against stubs | 1h |
 | T16k | **Degradation tests:** 5 `test_poll_df_*_graceful_missing` tests | 1h |
 | T16l | **Unit tests:** Dog-feeding domain defaults, status parsing, anomaly signal severity | 1h |
@@ -1243,7 +1243,7 @@ and contract stubs. No new views yet.
 **Exit:** Dog-feeding data flows from DB → state. All new types have fixtures.
 Contract stubs match expected column signatures. Degradation verified.
 
-### Phase T17 — Dog-Feeding TUI Views (Day 5–9)
+### Phase T17 — Self-Monitoring TUI Views (Day 5–9)
 
 **Goal:** Implement all 16 TUI items. New Anomaly view, enhanced existing
 views, header badge, command palette commands, first-launch toast.
@@ -1258,13 +1258,13 @@ views, header badge, command palette commands, first-launch toast.
 | T17f | **TUI-5:** Workers Interference sub-tab — `workers_tab` state, `Tab` cycling, interference table | 3h |
 | T17g | **TUI-6:** Workers scheduler overhead bar — shared helper from diagnostics, one-line render | 1h |
 | T17h | **TUI-7:** Dependencies Mermaid overlay — `x` key, `FetchExplainDag` action, scrollable overlay, `Ctrl+E` export | 2h |
-| T17i | **TUI-8:** Header dog-feeding status badge — `df:N/M`, color logic, retention warning | 1h |
-| T17j | **TUI-9:** Command palette `dog-feeding enable/disable/status` — ActionRequest variants, execution, confirmation | 2h |
+| T17i | **TUI-8:** Header self-monitoring status badge — `df:N/M`, color logic, retention warning | 1h |
+| T17j | **TUI-9:** Command palette `self-monitoring enable/disable/status` — ActionRequest variants, execution, confirmation | 2h |
 | T17k | **TUI-10:** Detail view anomaly summary row in Properties section | 1h |
-| T17l | **TUI-11:** Refresh Log `[auto]` tag for `initiated_by = 'DOG_FEED'` | 1h |
-| T17m | **TUI-12:** First-launch dog-feeding toast — `shown_df_hint` flag, 10s expiry | 1h |
+| T17l | **TUI-11:** Refresh Log `[auto]` tag for `initiated_by = 'SELF_MONITOR'` | 1h |
+| T17m | **TUI-12:** First-launch self-monitoring toast — `shown_df_hint` flag, 10s expiry | 1h |
 | T17n | **TUI-13:** Anomaly signals in `detect_issues()` — severity mapping, category "Anomaly" | 1h |
-| T17o | **TUI-14:** Alert view `dog_feed_anomaly` event styling — cyan `🔍` icon | 30m |
+| T17o | **TUI-14:** Alert view `self_monitor_anomaly` event styling — cyan `🔍` icon | 30m |
 | T17p | **TUI-16:** Diagnostics efficiency panel — aggregate speedup, diff/full counts | 2h |
 | T17q | Update help overlay for Anomaly view, Workers tabs, Graph `x` key, header badge | 1h |
 | T17r | **Snapshot tests (TUI-T1):** 22 new snapshot tests per test plan table above | 4h |
@@ -1273,7 +1273,7 @@ views, header badge, command palette commands, first-launch toast.
 
 **Exit:** All 16 TUI items implemented. Anomaly view renders. Dashboard badge
 shows. CDC sparklines visible. Workers has Interference tab. Header badge
-reflects DF status. Command palette supports dog-feeding. All snapshot and
+reflects DF status. Command palette supports self-monitoring. All snapshot and
 unit tests pass. `just lint` clean.
 
 ### Phase T18 — Backend Enhancements (Day 9–12)
@@ -1282,13 +1282,13 @@ unit tests pass. `just lint` clean.
 
 | Item | Description | Effort |
 |------|-------------|--------|
-| T18a | **DF-21:** Add `sla_breach_risk` boolean to `df_threshold_advice` query in `src/api/dog_feeding.rs` | 2h |
+| T18a | **DF-21:** Add `sla_breach_risk` boolean to `df_threshold_advice` query in `src/api/self_monitoring.rs` | 2h |
 | T18b | **DF-21:** E2E test asserting `sla_breach_risk = true` with synthetic data where `avg_diff_ms > freshness_deadline_ms` | 1h |
-| T18c | **DF-22:** Implement `full` mode in `dog_feeding_auto_apply_tick()`: read interference data, widen dispatch for high-overlap pairs | 4h |
+| T18c | **DF-22:** Implement `full` mode in `self_monitoring_auto_apply_tick()`: read interference data, widen dispatch for high-overlap pairs | 4h |
 | T18d | **DF-22:** E2E test verifying dispatch interval widened after synthetic interference insertion | 2h |
-| T18e | **DF-23:** Add `retention_warning` column to `dog_feeding_status()` output; check `history_retention_days` vs minimum window | 2h |
+| T18e | **DF-23:** Add `retention_warning` column to `self_monitoring_status()` output; check `history_retention_days` vs minimum window | 2h |
 | T18f | **DF-23:** E2E test setting retention below minimum and verifying warning | 1h |
-| T18g | **DF-24:** Modify `recommend_refresh_mode()` to read from `df_threshold_advice` when dog-feeding active | 3h |
+| T18g | **DF-24:** Modify `recommend_refresh_mode()` to read from `df_threshold_advice` when self-monitoring active | 3h |
 | T18h | **DF-24:** E2E test verifying consistent results between `recommend_refresh_mode()` and `df_threshold_advice` | 1h |
 | T18i | **TEST-21:** Proptest for `df_threshold_advice` bounds — 10k cases verifying `[0.01, 0.80]` clamping | 2h |
 | T18j | Update upgrade SQL script `pg_trickle--0.20.0--0.21.0.sql` with new/altered functions | 2h |
@@ -1298,21 +1298,21 @@ passes. Upgrade path works. `just lint` clean.
 
 ### Phase T19 — CLI Integration (Day 12–13)
 
-**Goal:** Add CLI subcommands for dog-feeding lifecycle and graph export.
+**Goal:** Add CLI subcommands for self-monitoring lifecycle and graph export.
 
 | Item | Description | Effort |
 |------|-------------|--------|
 | T19a | **CLI-1:** Add `DogFeeding` variant to `Commands` enum in `cli.rs` with `enable`, `disable`, `status` subcommands | 1h |
-| T19b | **CLI-1:** Implement `commands/dog_feeding.rs` using `commands/domain.rs` shared logic | 2h |
+| T19b | **CLI-1:** Implement `commands/self_monitoring.rs` using `commands/domain.rs` shared logic | 2h |
 | T19c | **CLI-1:** Wire dispatch in `main.rs` | 30m |
 | T19d | **CLI-1:** `--format json|table|csv` for `status` subcommand | 1h |
 | T19e | **CLI-2:** Add `--format ascii|mermaid|dot` flag to `GraphArgs` in `cli.rs` | 30m |
 | T19f | **CLI-2:** Implement mermaid/dot paths in `commands/graph.rs` using `domain::export_dag()` | 1h |
 | T19g | **Tests:** CLI parsing tests for new subcommands and flags | 1h |
-| T19h | **Tests:** Integration tests for `dog-feeding enable/disable/status` against stubs | 1h |
+| T19h | **Tests:** Integration tests for `self-monitoring enable/disable/status` against stubs | 1h |
 | T19i | **Tests:** Integration tests for `graph --format mermaid` and `--format dot` | 1h |
 
-**Exit:** `pgtrickle dog-feeding enable/disable/status` works.
+**Exit:** `pgtrickle self-monitoring enable/disable/status` works.
 `pgtrickle graph --format mermaid` outputs valid Mermaid. All tests pass.
 
 ### Phase T20 — Documentation, Polish & Final Testing (Day 13–15)
@@ -1325,21 +1325,21 @@ final polish.
 | Item | Description | Effort |
 |------|-------------|--------|
 | T20a-1 | **TUI-D1:** Update `docs/TUI.md` — new Anomaly view, CDC sparklines, Workers interference, Mermaid export, header badge, command palette commands | 2h |
-| T20a-2 | **DOC-21:** Update `docs/GETTING_STARTED.md` Day 2 section — dog-feeding CLI and TUI integration | 1h |
+| T20a-2 | **DOC-21:** Update `docs/GETTING_STARTED.md` Day 2 section — self-monitoring CLI and TUI integration | 1h |
 | T20a-3 | **DOC-22:** Update `docs/SQL_REFERENCE.md` — `df_threshold_advice.sla_breach_risk` column | 30m |
-| T20a-4 | Update `docs/CONFIGURATION.md` — `dog_feeding_auto_apply = 'full'` mode now implemented | 30m |
+| T20a-4 | Update `docs/CONFIGURATION.md` — `self_monitoring_auto_apply = 'full'` mode now implemented | 30m |
 | T20a-5 | Update CHANGELOG.md with all v0.21.0 features | 1h |
 
 #### T20-B: Cross-Cutting Tests (Day 14)
 
 | Item | Description | Effort |
 |------|-------------|--------|
-| T20b-1 | **All views with dog-feeding off:** Verify every view renders correctly when `dog_feeding.enabled = false`; no panics, no visual artifacts | 1h |
-| T20b-2 | **All views with dog-feeding on:** Full `sample_state_dog_feeding()` render pass; all panels populated | 1h |
+| T20b-1 | **All views with self-monitoring off:** Verify every view renders correctly when `self_monitoring.enabled = false`; no panics, no visual artifacts | 1h |
+| T20b-2 | **All views with self-monitoring on:** Full `sample_state_self_monitoring()` render pass; all panels populated | 1h |
 | T20b-3 | **Narrow terminal (60×20):** All 15 views (incl. Anomalies) render without panics | 1h |
 | T20b-4 | **View switching:** Verify subscriptions update when switching views; no stale data after switching from CDC → Dashboard | 1h |
-| T20b-5 | **Reconnect with dog-feeding:** Verify dog-feeding data clears on disconnect and repopulates on reconnect | 1h |
-| T20b-6 | **Action lifecycle:** `dog-feeding enable` → poll → verify `df:5/5` badge → anomalies appear → `dog-feeding disable` → confirm → verify `df:off` | 1h |
+| T20b-5 | **Reconnect with self-monitoring:** Verify self-monitoring data clears on disconnect and repopulates on reconnect | 1h |
+| T20b-6 | **Action lifecycle:** `self-monitoring enable` → poll → verify `df:5/5` badge → anomalies appear → `self-monitoring disable` → confirm → verify `df:off` | 1h |
 
 #### T20-C: Coverage Audit (Day 14–15)
 
@@ -1380,41 +1380,41 @@ clean. Version sync passes. Upgrade path verified.
 - [ ] **TUI-4:** CDC Health `IMMINENT`/`ELEVATED` spill-risk badge from `check_cdc_health()`
 - [ ] **TUI-5:** Workers `Interference` sub-tab shows `df_scheduling_interference` sorted by overlap count
 - [ ] **TUI-6:** Workers scheduler overhead bar from `scheduler_overhead()`; greyed when < 5 cycles
-- [ ] **TUI-7:** Dependencies `x` key opens Mermaid overlay; `Ctrl+E` exports; dog-feeding nodes green
+- [ ] **TUI-7:** Dependencies `x` key opens Mermaid overlay; `Ctrl+E` exports; self-monitoring nodes green
 - [ ] **TUI-8:** Header bar shows `df:5/5` (green), `df:off` (dim), or `df:⚠` (orange)
-- [ ] **TUI-9:** Command palette `dog-feeding enable/disable` works; disable requires confirmation
+- [ ] **TUI-9:** Command palette `self-monitoring enable/disable` works; disable requires confirmation
 - [ ] **TUI-10:** Detail view anomaly summary row from `df_anomaly_signals`; `—` when off
-- [ ] **TUI-11:** Refresh Log `[auto]` tag on `initiated_by = 'DOG_FEED'` rows
-- [ ] **TUI-12:** First-connect toast when dog-feeding not active; dismissed after 10 s
+- [ ] **TUI-11:** Refresh Log `[auto]` tag on `initiated_by = 'SELF_MONITOR'` rows
+- [ ] **TUI-12:** First-connect toast when self-monitoring not active; dismissed after 10 s
 - [ ] **TUI-13:** Issues view surfaces anomaly signals as WARNING/CRITICAL entries
-- [ ] **TUI-14:** Alerts view uses cyan `🔍` icon for `dog_feed_anomaly` events
+- [ ] **TUI-14:** Alerts view uses cyan `🔍` icon for `self_monitor_anomaly` events
 - [ ] **TUI-15:** Dashboard snapshot tests cover standard, wide, empty, anomalies, narrow
 - [ ] **TUI-16:** Diagnostics efficiency panel with aggregate speedup and diff/full counts
 - [ ] **DF-21:** `df_threshold_advice.sla_breach_risk` column computed correctly
-- [ ] **DF-22:** `dog_feeding_auto_apply = 'full'` widens dispatch for high-overlap pairs
-- [ ] **DF-23:** `dog_feeding_status()` `retention_warning` set when retention too short
+- [ ] **DF-22:** `self_monitoring_auto_apply = 'full'` widens dispatch for high-overlap pairs
+- [ ] **DF-23:** `self_monitoring_status()` `retention_warning` set when retention too short
 - [ ] **DF-24:** `recommend_refresh_mode()` reads from `df_threshold_advice` when DF active
-- [ ] **CLI-1:** `pgtrickle dog-feeding enable/disable/status` with `--format json`
+- [ ] **CLI-1:** `pgtrickle self-monitoring enable/disable/status` with `--format json`
 - [ ] **CLI-2:** `pgtrickle graph --format mermaid|dot` outputs valid Mermaid/DOT
 - [ ] **TEST-21:** Proptest for threshold bounds passes 10k cases
-- [ ] All dog-feeding panels degrade gracefully when dog-feeding not configured
+- [ ] All self-monitoring panels degrade gracefully when self-monitoring not configured
 
 ### Test Coverage
 
-- [ ] **Fixtures:** 6 new struct builders + `sample_state_dog_feeding()` in `test_fixtures.rs`
+- [ ] **Fixtures:** 6 new struct builders + `sample_state_self_monitoring()` in `test_fixtures.rs`
 - [ ] **Unit tests:** ≥16 new unit tests (state, app, cli, poller subscriptions)
 - [ ] **Snapshot tests:** ≥22 new snapshots covering all new/modified view panels
 - [ ] **Contract stubs:** 9 new SQL stubs in `test_db.rs`
 - [ ] **Contract tests:** 6 new `test_poll_df_*_executes` tests
 - [ ] **Degradation tests:** 6 tests verifying graceful degradation when DF functions absent
-- [ ] **CLI tests:** Parsing + integration tests for `dog-feeding` and `graph --format`
+- [ ] **CLI tests:** Parsing + integration tests for `self-monitoring` and `graph --format`
 - [ ] **Cross-cutting:** All views render with DF on and off; narrow terminal verified
 - [ ] **Coverage:** `state.rs` ≥85%, `poller/` ≥70%, `views/` ≥80%
 
 ### Documentation & CI
 
 - [ ] `docs/TUI.md` updated with all new views, keybindings, panels
-- [ ] `docs/GETTING_STARTED.md` Day 2 section includes dog-feeding CLI and TUI
+- [ ] `docs/GETTING_STARTED.md` Day 2 section includes self-monitoring CLI and TUI
 - [ ] `docs/SQL_REFERENCE.md` documents `sla_breach_risk` column
 - [ ] `docs/CONFIGURATION.md` updates `auto_apply = 'full'` as implemented
 - [ ] CHANGELOG.md includes all features
@@ -1429,7 +1429,7 @@ clean. Version sync passes. Upgrade path verified.
 - [PLAN_TUI.md](PLAN_TUI.md) — v0.14.0 TUI foundation (T1–T8)
 - [PLAN_TUI_PART_2.md](PLAN_TUI_PART_2.md) — v0.15.0 TUI improvements (T9–T14)
 - [ROADMAP.md](../../ROADMAP.md) — v0.21.0 milestone definition
-- [plans/PLAN_DOG_FEEDING.md](../PLAN_DOG_FEEDING.md) — Dog-feeding design plan
+- [plans/PLAN_SELF_MONITORING.md](../PLAN_SELF_MONITORING.md) — Dog-feeding design plan
 - [docs/TUI.md](../../docs/TUI.md) — TUI user documentation
 - [docs/SQL_REFERENCE.md](../../docs/SQL_REFERENCE.md) — SQL API reference
 - [docs/CONFIGURATION.md](../../docs/CONFIGURATION.md) — GUC reference

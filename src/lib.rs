@@ -333,14 +333,14 @@ CREATE TABLE IF NOT EXISTS pgtrickle.pgt_refresh_history (
     status          TEXT NOT NULL
                      CHECK (status IN ('RUNNING', 'COMPLETED', 'FAILED', 'SKIPPED')),
     initiated_by    TEXT
-                     CHECK (initiated_by IN ('SCHEDULER', 'MANUAL', 'INITIAL', 'DOG_FEED')),
+                     CHECK (initiated_by IN ('SCHEDULER', 'MANUAL', 'INITIAL', 'SELF_MONITOR')),
     freshness_deadline TIMESTAMPTZ,
     tick_watermark_lsn PG_LSN,
     fixpoint_iteration INT
 );
 
 CREATE INDEX IF NOT EXISTS idx_hist_pgt_ts ON pgtrickle.pgt_refresh_history (pgt_id, data_timestamp);
--- PERF-1: Fast lookup by (pgt_id, start_time) for dog-feeding and scheduler_overhead queries.
+-- PERF-1: Fast lookup by (pgt_id, start_time) for self-monitoring and scheduler_overhead queries.
 CREATE INDEX IF NOT EXISTS idx_hist_pgt_start ON pgtrickle.pgt_refresh_history (pgt_id, start_time);
 
 -- Per-source CDC slot tracking

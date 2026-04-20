@@ -373,7 +373,7 @@ The investments in v0.21–v0.23 paid off: the previously-flagged
   with no error logged. There is no built-in monitor that says "ST
   X has not advanced its frontier in N intervals despite source
   activity".
-- **Recommendation:** Add a dog-feeding view
+- **Recommendation:** Add a self-monitoring view
   `df_frozen_stream_tables` that flags any ST whose
   `last_refresh_at < now() - 5 × refresh_interval` *and* whose source
   has had recent CDC writes. Alert via the existing
@@ -708,7 +708,7 @@ The investments in v0.21–v0.23 paid off: the previously-flagged
 - **Shared shmem template cache** to close the connection-pooler
   latency gap.
 - **TOAST-aware CDC hashing** + corresponding edge-case test suite.
-- **Frozen-stream-table detector** in dog-feeding.
+- **Frozen-stream-table detector** in self-monitoring.
 - **Subscriber-LSN tracking** for downstream publications;
   publication-lag warning.
 - **Robustness guards on the predictive cost model** (median+MAD,
@@ -764,7 +764,7 @@ The investments in v0.21–v0.23 paid off: the previously-flagged
 ### Component: `src/scheduler.rs`, `src/dag.rs`
 
 - **Current state:** Parallel worker pool, SLA tier auto-assignment,
-  predictive preemption, dog-feeding, and canary-mode all wired in.
+  predictive preemption, self-monitoring, and canary-mode all wired in.
   ~5,800 + 4,100 LOC respectively.
 - **Issues:** Catalog reload on every tick; full DAG rebuild under
   exclusive lock; cluster-wide worker budget shared without
@@ -775,7 +775,7 @@ The investments in v0.21–v0.23 paid off: the previously-flagged
 ### Component: `src/api/`
 
 - **Current state:** Cleanly split into `mod.rs`, `helpers.rs`,
-  `diagnostics.rs`, `publication.rs`, `dog_feeding.rs`. The v0.21
+  `diagnostics.rs`, `publication.rs`, `self_monitoring.rs`. The v0.21
   TEST-1/2/3 sweep added 75+ unit tests.
 - **Issues:** `publication.rs` and `diagnostics.rs` are the
   current under-tested modules; predictive cost model has no
@@ -921,7 +921,7 @@ report's status:
 | 3.1 | No parallel refresh | Shipped (PAR-1..5) | §2 |
 | 3.2 | No downstream CDC | Shipped (CDC-PUB-*) | §2 + §4 (durability gap) |
 | 3.3 | Multi-DB isolation | Per-DB isolated; cluster-wide budget shared | §4 |
-| 3.6 | Reactive-only dog-feeding | Predictive shipped | §2 + §4 (no guards) |
+| 3.6 | Reactive-only self-monitoring | Predictive shipped | §2 + §4 (no guards) |
 | 4.3 | `diff_project` allocations | Unchanged | §5 |
 | 4.4 | Per-backend template cache | Unchanged | §4 + §5 + §7 |
 | 4.5 | Change-buffer full-scan | Unchanged | §5 |
