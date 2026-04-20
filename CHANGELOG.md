@@ -42,7 +42,76 @@ For future plans and upcoming features, see [ROADMAP.md](ROADMAP.md).
 
 ## [Unreleased]
 
-<!-- No unreleased changes yet. -->
+### Safety
+
+- **Frontier Visibility Holdback** (issue #536) — Closes a silent data-loss
+  window where rows inserted by a long-running transaction could be
+  permanently skipped. When a transaction commits after the scheduler has
+  already ticked, its CDC rows (recorded at the insert LSN) were previously
+  invisible to the next refresh because the frontier had already advanced
+  past them. The holdback probes `pg_stat_activity` and `pg_prepared_xacts`
+  each tick and holds the frontier ceiling at the safe LSN derived from the
+  oldest active `xmin`.
+
+  New GUCs:
+  - `pg_trickle.frontier_holdback_mode` (default `xmin`) — `xmin` (probe
+    pg_stat_activity/pg_prepared_xacts), `lsn:<bytes>` (fixed byte lag), or
+    `none` (disable).
+  - `pg_trickle.frontier_holdback_warn_seconds` (default 60) — Emits a
+    warning when a long-running transaction holds the frontier back beyond
+    this threshold.
+
+- **Scheduler restart safety** — The scheduler now seeds `prev_tick_watermark`
+  from shared memory on startup, preserving the last known-safe LSN baseline
+  across restarts and eliminating a one-tick window where the frontier could
+  advance past a long-running transaction already open before the restart.
+
+- **Atomic holdback state update** — New `set_last_tick_holdback_state(xmin,
+  lsn)` shmem helper updates both fields under a single exclusive lock,
+  preventing dynamic workers from observing an inconsistent xmin/LSN pair.
+
+### Managed PostgreSQL Compatibility
+
+- **Restricted `pg_stat_activity` detection** — On managed services (AWS RDS,
+  Cloud SQL, Azure Database for PostgreSQL), `pg_stat_activity` is restricted
+  to the current role's own sessions. The holdback probe now detects this
+  condition (visible background process count = 0) and emits a one-time
+  `WARNING` instructing operators to run:
+  ```sql
+  GRANT pg_monitor TO <pg_trickle_service_role>;
+  ```
+  Without this grant, the holdback silently returns `min_xmin = 0`, which is
+  the same unsafe state the holdback was designed to prevent.
+  Documented in `docs/TROUBLESHOOTING.md` section 14.
+
+### Monitoring & Observability
+
+- **New Prometheus metrics** for frontier holdback state:
+  - `pg_trickle_frontier_holdback_lsn_bytes` — LSN lag (bytes) held back by
+    the longest active transaction.
+  - `pg_trickle_frontier_holdback_seconds` — Age (seconds) of the transaction
+    holding the frontier back.
+
+- **Metric prefix fix** — Prometheus metrics exposed by the holdback and
+  monitor modules now consistently use the `pg_trickle_` prefix (previously
+  some metrics used the shorter `pgtrickle_` prefix). Update any alerting
+  rules or dashboards that reference the old names.
+
+### Testing
+
+- **5 new E2E tests** in `tests/e2e_long_txn_visibility_tests.rs` covering:
+  - GUC defaults and `mode = 'none'` regression guard
+  - `READ COMMITTED` long transaction holdback
+  - `REPEATABLE READ` long transaction holdback
+  - `PREPARE TRANSACTION` (2PC) holdback
+  - CDC mode forced to `trigger` so tests exercise the trigger-based path
+
+### Documentation
+
+- `docs/ARCHITECTURE.md` — New "Frontier Visibility Holdback" subsection
+  explaining the detection algorithm and GUC tuning guidance.
+- `docs/TROUBLESHOOTING.md` — New section 14: "Frontier Held Back on Managed
+  PostgreSQL" with diagnosis steps and `GRANT pg_monitor` resolution.
 
 ---
 
