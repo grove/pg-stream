@@ -410,8 +410,10 @@ pub fn needs_publication_rebuild(source_relid: pg_sys::Oid) -> Result<bool, PgTr
 pub fn rebuild_publication_for_partitioned_source(
     source_relid: pg_sys::Oid,
 ) -> Result<(), PgTrickleError> {
+    // Use pg_catalog.quote_ident so the returned name is already safe for
+    // direct interpolation into DDL — no further escaping needed.
     let table_name = Spi::get_one_with_args::<String>(
-        "SELECT n.nspname::text || '.' || c.relname::text \
+        "SELECT pg_catalog.quote_ident(n.nspname) || '.' || pg_catalog.quote_ident(c.relname) \
          FROM pg_catalog.pg_class c \
          JOIN pg_catalog.pg_namespace n ON c.relnamespace = n.oid \
          WHERE c.oid = $1",
@@ -425,12 +427,15 @@ pub fn rebuild_publication_for_partitioned_source(
         ))
     })?;
 
-    let pub_name = format!("pgt_pub_{}", source_relid.to_u32());
+    // pub_name is derived from a numeric OID — safe, but quote for consistency.
+    let pub_name_raw = format!("pgt_pub_{}", source_relid.to_u32());
+    let pub_name_quoted = crate::dvm::diff::quote_ident(&pub_name_raw);
 
-    // Drop and recreate to ensure publish_via_partition_root is set
+    // Drop and recreate to ensure publish_via_partition_root is set.
+    // Both identifiers are properly quoted above before interpolation.
     Spi::run(&format!(
-        "DROP PUBLICATION IF EXISTS \"{pub_name}\"; \
-         CREATE PUBLICATION \"{pub_name}\" FOR TABLE {table_name} \
+        "DROP PUBLICATION IF EXISTS {pub_name_quoted}; \
+         CREATE PUBLICATION {pub_name_quoted} FOR TABLE {table_name} \
          WITH (publish_via_partition_root = true)"
     ))
     .map_err(|e| PgTrickleError::PublicationRebuildFailed(e.to_string()))?;
@@ -438,7 +443,7 @@ pub fn rebuild_publication_for_partitioned_source(
     pgrx::log!(
         "[pg_trickle] CDC-2: rebuilt publication '{}' for partitioned source {} \
          with publish_via_partition_root = true (refresh_reason = 'publication_rebuild')",
-        pub_name,
+        pub_name_raw,
         table_name,
     );
 
