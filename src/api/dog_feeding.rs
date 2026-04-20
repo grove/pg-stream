@@ -187,7 +187,7 @@ SELECT
     st.status,
     st.refresh_tier,
     st.last_refresh_at,
-    st.effective_schedule_seconds,
+    pgtrickle.parse_duration_seconds(st.schedule) AS effective_schedule_seconds,
     now() - st.last_refresh_at AS stale_duration,
     (SELECT max(h.start_time) \
      FROM pgtrickle.pgt_refresh_history h \
@@ -198,8 +198,8 @@ SELECT
 FROM pgtrickle.pgt_stream_tables st
 WHERE st.status IN ('ACTIVE', 'ERROR')
   AND st.last_refresh_at IS NOT NULL
-  AND st.effective_schedule_seconds IS NOT NULL
-  AND st.last_refresh_at < now() - make_interval(secs => st.effective_schedule_seconds * 5)";
+  AND st.schedule IS NOT NULL
+  AND st.last_refresh_at < now() - make_interval(secs => pgtrickle.parse_duration_seconds(st.schedule) * 5)";
 
 // ── Schedule and mode assignments ───────────────────────────────────────────
 
