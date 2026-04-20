@@ -313,6 +313,7 @@ fn teardown_dog_feeding() {
 fn teardown_dog_feeding_impl() -> Result<(), PgTrickleError> {
     // Drop in reverse dependency order: downstream first.
     let reverse_order = [
+        "df_frozen_stream_tables",
         "df_scheduling_interference",
         "df_cdc_buffer_trends",
         "df_threshold_advice",
