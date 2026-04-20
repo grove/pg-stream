@@ -57,17 +57,17 @@ AS 'MODULE_PATHNAME', 'write_and_refresh_wrapper';
 
 -- ── DF: Dog-feeding API (0.20.0) ───────────────────────────────────────────
 
-CREATE OR REPLACE FUNCTION pgtrickle."setup_self_monitoring"() RETURNS void
+CREATE OR REPLACE FUNCTION pgtrickle."setup_dog_feeding"() RETURNS void
 STRICT
 LANGUAGE c
-AS 'MODULE_PATHNAME', 'setup_self_monitoring_wrapper';
+AS 'MODULE_PATHNAME', 'setup_dog_feeding_wrapper';
 
-CREATE OR REPLACE FUNCTION pgtrickle."teardown_self_monitoring"() RETURNS void
+CREATE OR REPLACE FUNCTION pgtrickle."teardown_dog_feeding"() RETURNS void
 STRICT
 LANGUAGE c
-AS 'MODULE_PATHNAME', 'teardown_self_monitoring_wrapper';
+AS 'MODULE_PATHNAME', 'teardown_dog_feeding_wrapper';
 
-CREATE OR REPLACE FUNCTION pgtrickle."self_monitoring_status"() RETURNS TABLE (
+CREATE OR REPLACE FUNCTION pgtrickle."dog_feeding_status"() RETURNS TABLE (
     "st_name" TEXT,
     "exists" bool,
     "status" TEXT,
@@ -77,7 +77,7 @@ CREATE OR REPLACE FUNCTION pgtrickle."self_monitoring_status"() RETURNS TABLE (
 )
 STRICT
 LANGUAGE c
-AS 'MODULE_PATHNAME', 'self_monitoring_status_wrapper';
+AS 'MODULE_PATHNAME', 'dog_feeding_status_wrapper';
 
 CREATE OR REPLACE FUNCTION pgtrickle."scheduler_overhead"() RETURNS TABLE (
     "total_refreshes_1h" bigint,
