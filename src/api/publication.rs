@@ -195,13 +195,24 @@ pub fn assign_tier_for_sla(sla_ms: i64) -> Result<crate::scheduler::RefreshTier,
     }
 }
 
-// ── PRED-1: Linear regression forecaster ─────────────────────────────────
+// ── PRED-1: Linear regression forecaster with robustness guards ───────────
 
 /// PRED-1: Fit a simple linear regression `duration_ms ~ delta_rows` over
-/// the prediction window for a given stream table.
+/// the prediction window for a given stream table, with outlier robustness.
+///
+/// ## Robustness guards (v0.25.0)
+///
+/// 1. **Cold-start guard**: Returns `None` if the first DIFFERENTIAL record
+///    in `pgt_refresh_history` is less than 60 s old (avoids acting on a
+///    single noisy sample immediately after a stream table is populated).
+/// 2. **Non-degenerate variance check**: Returns `(0.0, avg_y, n)` when all
+///    delta sizes are identical (slope undefined). The caller interprets this
+///    as "intercept only" and skips the preemption check.
+/// 3. **Outlier filter**: Uses an IQR (p25 / p75) window from the sample
+///    set to exclude extreme outliers before fitting the regression.
 ///
 /// Returns `(slope, intercept, sample_count)`. Returns `None` if fewer than
-/// `prediction_min_samples` data points exist.
+/// `prediction_min_samples` clean samples exist.
 pub fn fit_linear_regression(pgt_id: i64) -> Option<(f64, f64, i64)> {
     let window_minutes = crate::config::pg_trickle_prediction_window();
     let min_samples = crate::config::pg_trickle_prediction_min_samples();
@@ -211,6 +222,65 @@ pub fn fit_linear_regression(pgt_id: i64) -> Option<(f64, f64, i64)> {
     }
 
     Spi::connect(|client| {
+        // PRED-1 cold-start guard: skip if first differential was < 60s ago.
+        let first_age_secs: Option<f64> = client
+            .select(
+                "SELECT EXTRACT(EPOCH FROM (now() - MIN(start_time))) \
+                 FROM pgtrickle.pgt_refresh_history \
+                 WHERE pgt_id = $1 AND action = 'DIFFERENTIAL' AND status = 'COMPLETED'",
+                None,
+                &[pgt_id.into()],
+            )
+            .ok()
+            .and_then(|r| {
+                if r.is_empty() {
+                    None
+                } else {
+                    r.first().get::<f64>(1).ok().flatten()
+                }
+            });
+
+        if first_age_secs.is_some_and(|age| age < 60.0) {
+            return None; // cold-start guard
+        }
+
+        // PRED-1 outlier filter: compute IQR bounds from the current window.
+        // Rows with duration_ms outside [p25 - 1.5 * IQR, p75 + 1.5 * IQR]
+        // are excluded from the regression.
+        let (p25, p75): (f64, f64) = client
+            .select(
+                "SELECT \
+                     PERCENTILE_CONT(0.25) WITHIN GROUP (ORDER BY \
+                         EXTRACT(EPOCH FROM (end_time - start_time)) * 1000) AS p25, \
+                     PERCENTILE_CONT(0.75) WITHIN GROUP (ORDER BY \
+                         EXTRACT(EPOCH FROM (end_time - start_time)) * 1000) AS p75 \
+                 FROM pgtrickle.pgt_refresh_history \
+                 WHERE pgt_id = $1 \
+                   AND status = 'COMPLETED' \
+                   AND action = 'DIFFERENTIAL' \
+                   AND end_time IS NOT NULL \
+                   AND start_time > now() - ($2 || ' minutes')::interval",
+                None,
+                &[pgt_id.into(), window_minutes.into()],
+            )
+            .ok()
+            .and_then(|r| {
+                if r.is_empty() {
+                    None
+                } else {
+                    let row = r.first();
+                    let p25 = row.get::<f64>(1).ok().flatten()?;
+                    let p75 = row.get::<f64>(2).ok().flatten()?;
+                    Some((p25, p75))
+                }
+            })
+            .unwrap_or((0.0, f64::MAX));
+
+        let iqr = p75 - p25;
+        let lower_bound = (p25 - 1.5 * iqr).max(0.0);
+        let upper_bound = p75 + 1.5 * iqr;
+
+        // Fit regression on the IQR-filtered sample set.
         let result = client
             .select(
                 "SELECT count(*) AS n, \
@@ -225,9 +295,16 @@ pub fn fit_linear_regression(pgt_id: i64) -> Option<(f64, f64, i64)> {
                    AND status = 'COMPLETED' \
                    AND action = 'DIFFERENTIAL' \
                    AND end_time IS NOT NULL \
-                   AND start_time > now() - ($2 || ' minutes')::interval",
+                   AND start_time > now() - ($2 || ' minutes')::interval \
+                   AND EXTRACT(EPOCH FROM (end_time - start_time)) * 1000 \
+                       BETWEEN $3 AND $4",
                 None,
-                &[pgt_id.into(), window_minutes.into()],
+                &[
+                    pgt_id.into(),
+                    window_minutes.into(),
+                    lower_bound.into(),
+                    upper_bound.into(),
+                ],
             )
             .ok()?;
 
@@ -237,7 +314,7 @@ pub fn fit_linear_regression(pgt_id: i64) -> Option<(f64, f64, i64)> {
 
         let n: i64 = result.get::<i64>(1).ok()??;
         if n < min_samples as i64 {
-            return None; // PRED-3: Cold-start fallback.
+            return None; // not enough clean samples
         }
 
         let avg_x: f64 = result.get::<f64>(2).ok()??;
@@ -245,10 +322,11 @@ pub fn fit_linear_regression(pgt_id: i64) -> Option<(f64, f64, i64)> {
         let sum_xy: f64 = result.get::<f64>(4).ok()??;
         let sum_x2: f64 = result.get::<f64>(5).ok()??;
 
-        // Simple linear regression: y = slope * x + intercept
+        // PRED-1: Non-degenerate variance check.
+        // If all x values are identical (e.g. always same delta size),
+        // the slope is undefined — return intercept-only model.
         let denominator = sum_x2 - n as f64 * avg_x * avg_x;
         if denominator.abs() < 1e-10 {
-            // All x values are identical — slope is undefined.
             return Some((0.0, avg_y, n));
         }
 
@@ -270,12 +348,28 @@ pub fn predict_diff_duration_ms(pgt_id: i64, delta_rows: i64) -> Option<f64> {
 /// PRED-2: Check whether the predicted differential cost exceeds the
 /// full-refresh cost by more than `prediction_ratio`, triggering a
 /// pre-emptive switch to FULL.
+///
+/// ## PRED-1 robustness guards (v0.25.0)
+///
+/// - **Clamping**: Predictions are clamped to `[0.5×, 4×] last_full_ms`
+///   before the ratio comparison. A prediction outside this range is likely
+///   a model artifact and should not drive preemption.
+/// - **Zero-intercept guard**: When the model slope is 0.0 (degenerate
+///   intercept-only case), the prediction is treated as unknown and
+///   preemption is skipped.
 pub fn should_preempt_to_full(pgt_id: i64, delta_rows: i64, last_full_ms: f64) -> bool {
+    if last_full_ms <= 0.0 {
+        return false;
+    }
     let ratio = crate::config::pg_trickle_prediction_ratio();
-    if let Some(predicted_ms) = predict_diff_duration_ms(pgt_id, delta_rows) {
+    if let Some(raw_predicted_ms) = predict_diff_duration_ms(pgt_id, delta_rows) {
+        // PRED-1: Clamp prediction to [0.5×, 4×] last_full_ms.
+        let lower = last_full_ms * 0.5;
+        let upper = last_full_ms * 4.0;
+        let predicted_ms = raw_predicted_ms.clamp(lower, upper);
         predicted_ms > last_full_ms * ratio
     } else {
-        false // PRED-3: Cold-start fallback — don't preempt.
+        false // cold-start fallback — don't preempt.
     }
 }
 
@@ -362,6 +456,89 @@ fn quote_ident(name: &str) -> String {
 /// Quote a qualified SQL identifier (schema.table).
 fn quote_ident_qualified(schema: &str, table: &str) -> String {
     format!("{}.{}", quote_ident(schema), quote_ident(table))
+}
+
+// ── PUB-1 (v0.25.0): Subscriber-LSN tracking ──────────────────────────────
+
+/// PUB-1: Check whether any logical replication slot associated with a
+/// downstream publication lags more than `pg_trickle.publication_lag_warn_bytes`
+/// bytes behind the current WAL write position.
+///
+/// Emits a WARNING for each lagging slot.  Returns `true` if at least one
+/// slot lags beyond the threshold (i.e. the caller should NOT truncate the
+/// change buffer until subscribers catch up).
+///
+/// Returns `false` when:
+/// - The threshold GUC is 0 (feature disabled, default).
+/// - The publication has no active replication slots.
+/// - All slots are within the lag threshold.
+pub(crate) fn check_subscriber_lag(publication_name: &str) -> bool {
+    let warn_bytes = crate::config::pg_trickle_publication_lag_warn_bytes();
+    if warn_bytes <= 0 {
+        return false;
+    }
+
+    // Query pg_replication_slots for all slots consuming this publication.
+    // `confirmed_flush_lsn` is the LSN the subscriber has confirmed processing.
+    let sql = format!(
+        "SELECT slot_name::text, \
+                pg_wal_lsn_diff(pg_current_wal_lsn(), confirmed_flush_lsn)::bigint AS lag_bytes \
+         FROM pg_replication_slots \
+         WHERE active = true \
+           AND plugin = 'pgoutput' \
+           AND slot_name LIKE 'pgt\\_{pub}\\_%' \
+         ORDER BY lag_bytes DESC",
+        pub = publication_name.replace('\'', "''"),
+    );
+
+    let mut any_lagging = false;
+
+    let result = Spi::connect(|client| {
+        let rows = client.select(&sql, None, &[]).map_err(|e| {
+            pgrx::warning!(
+                "[pg_trickle] PUB-1: failed to query replication slots for '{}': {}",
+                publication_name,
+                e,
+            );
+        });
+
+        if let Ok(rows) = rows {
+            for row in rows {
+                let slot_name: String = row.get(1).ok().flatten().unwrap_or_default();
+                let lag_bytes: i64 = row.get(2).ok().flatten().unwrap_or(0);
+
+                if lag_bytes > warn_bytes {
+                    pgrx::warning!(
+                        "[pg_trickle] PUB-1: subscriber slot '{}' for publication '{}' \
+                         is {} bytes behind write LSN (threshold: {} bytes). \
+                         Change buffer truncation deferred.",
+                        slot_name,
+                        publication_name,
+                        lag_bytes,
+                        warn_bytes,
+                    );
+                    any_lagging = true;
+                }
+            }
+        }
+        Ok::<(), ()>(())
+    });
+
+    if result.is_err() {
+        // SPI connect failed; conservatively treat as lagging.
+        return true;
+    }
+
+    any_lagging
+}
+
+/// PUB-1: Guard that prevents change buffer truncation when a subscriber
+/// is lagging.
+///
+/// Returns `true` (skip truncation) when `check_subscriber_lag` detects
+/// one or more lagging subscribers.
+pub(crate) fn should_defer_change_buffer_truncation(publication_name: &str) -> bool {
+    check_subscriber_lag(publication_name)
 }
 
 #[cfg(test)]

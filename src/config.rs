@@ -1014,6 +1014,37 @@ pub static PGS_FRONTIER_HOLDBACK_MODE: GucSetting<Option<std::ffi::CString>> =
 /// Set to 0 to disable the warning (not recommended for production).
 pub static PGS_FRONTIER_HOLDBACK_WARN_SECONDS: GucSetting<i32> = GucSetting::<i32>::new(60);
 
+// ── v0.25.0: Scheduler scalability & pooler performance ───────────────────
+
+/// SCAL-5: Persistent worker pool size.
+///
+/// When set to > 0, the scheduler maintains a pool of persistent background
+/// workers that loop on a shmem work queue instead of being registered and
+/// deregistered on each refresh. This eliminates the ~2 ms per-worker spawn
+/// cost at high task rates.
+///
+/// Set to 0 (default) to use the existing spawn-per-task model.
+/// Recommended range: 2–8 for workloads with many short refreshes.
+pub static PGS_WORKER_POOL_SIZE: GucSetting<i32> = GucSetting::<i32>::new(0);
+
+/// CACHE-2: Maximum number of entries in the per-backend L1 template cache.
+///
+/// When the cache reaches this size, the least-recently-used entry is evicted.
+/// Set to 0 to use an unbounded cache (default, matching pre-v0.25.0 behavior).
+/// Recommended range: 64–1024 depending on number of stream tables per database.
+pub static PGS_TEMPLATE_CACHE_MAX_ENTRIES: GucSetting<i32> = GucSetting::<i32>::new(0);
+
+/// PUB-1: Warn when a publication subscriber lags behind the change buffer
+/// by more than this many bytes of WAL.
+///
+/// When a subscriber's `confirmed_flush_lsn` is more than this many bytes
+/// behind the change buffer's maximum LSN, a WARNING is emitted and the
+/// change buffer truncation is deferred until the subscriber catches up.
+///
+/// Set to 0 to disable subscriber lag tracking (default).
+/// Recommended value: 104857600 (100 MB).
+pub static PGS_PUBLICATION_LAG_WARN_BYTES: GucSetting<i32> = GucSetting::<i32>::new(0);
+
 /// #536: Frontier holdback mode enum.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FrontierHoldbackMode {
@@ -2049,6 +2080,46 @@ pub fn register_gucs() {
         GucContext::Suset,
         GucFlags::default(),
     );
+
+    // ── v0.25.0 GUCs ─────────────────────────────────────────────────────────
+
+    GucRegistry::define_int_guc(
+        c"pg_trickle.worker_pool_size",
+        c"SCAL-5: Persistent worker pool size (0 = spawn-per-task, default).",
+        c"When > 0, the scheduler maintains a pool of this many persistent background \
+           workers that loop on a shmem queue, eliminating ~2 ms per-worker spawn cost. \
+           Set to 0 to use the existing spawn-per-task model.",
+        &PGS_WORKER_POOL_SIZE,
+        0,  // min
+        64, // max
+        GucContext::Suset,
+        GucFlags::default(),
+    );
+
+    GucRegistry::define_int_guc(
+        c"pg_trickle.template_cache_max_entries",
+        c"CACHE-2: Maximum L1 template cache entries per backend (0 = unbounded).",
+        c"When the cache reaches this limit, the least-recently-used entry is evicted. \
+           Set to 0 for unbounded cache (default).",
+        &PGS_TEMPLATE_CACHE_MAX_ENTRIES,
+        0,     // min (0 = unbounded)
+        65536, // max
+        GucContext::Suset,
+        GucFlags::default(),
+    );
+
+    GucRegistry::define_int_guc(
+        c"pg_trickle.publication_lag_warn_bytes",
+        c"PUB-1: Emit WARNING when subscriber WAL lag exceeds this many bytes (0 = disabled).",
+        c"When a downstream publication subscriber's confirmed_flush_lsn lags behind \
+           the change buffer by more than this many bytes, a WARNING is emitted and \
+           the change buffer truncation is deferred. Set to 0 to disable (default).",
+        &PGS_PUBLICATION_LAG_WARN_BYTES,
+        0,             // min (0 = disabled)
+        2_147_483_647, // max
+        GucContext::Suset,
+        GucFlags::default(),
+    );
 }
 
 // ── Convenience accessors ──────────────────────────────────────────────────
@@ -2543,6 +2614,23 @@ pub fn pg_trickle_frontier_holdback_mode() -> FrontierHoldbackMode {
 /// #536: Returns the frontier holdback warning threshold in seconds (0 = disabled).
 pub fn pg_trickle_frontier_holdback_warn_seconds() -> i32 {
     PGS_FRONTIER_HOLDBACK_WARN_SECONDS.get()
+}
+
+// ── v0.25.0 accessor functions ─────────────────────────────────────────────
+
+/// SCAL-5: Returns the persistent worker pool size (0 = spawn-per-task).
+pub fn pg_trickle_worker_pool_size() -> i32 {
+    PGS_WORKER_POOL_SIZE.get()
+}
+
+/// CACHE-2: Returns the L1 template cache max entries (0 = unbounded).
+pub fn pg_trickle_template_cache_max_entries() -> i32 {
+    PGS_TEMPLATE_CACHE_MAX_ENTRIES.get()
+}
+
+/// PUB-1: Returns the publication subscriber lag warning threshold in bytes (0 = disabled).
+pub fn pg_trickle_publication_lag_warn_bytes() -> i64 {
+    PGS_PUBLICATION_LAG_WARN_BYTES.get() as i64
 }
 
 #[cfg(test)]

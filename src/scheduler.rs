@@ -35,6 +35,7 @@
 use pgrx::bgworkers::*;
 use pgrx::prelude::*;
 
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::panic::AssertUnwindSafe;
 
@@ -52,6 +53,121 @@ use crate::refresh::{self, RefreshAction};
 use crate::shmem;
 use crate::version;
 use crate::wal_decoder;
+
+// ── SCAL-1 (v0.25.0): Per-backend catalog snapshot cache ─────────────────
+//
+// Caches `StreamTableMeta` rows keyed by the DAG version number from shmem.
+// When the local snapshot matches `shmem::current_dag_version()`, we skip
+// the full SPI catalog reload (~20–200 ms at 100–1000 STs).
+//
+// The cache is invalidated whenever `current_dag_version()` advances, which
+// happens after any CREATE / ALTER / DROP STREAM TABLE DDL.
+
+thread_local! {
+    static CATALOG_SNAPSHOT_CACHE: RefCell<Option<(u64, Vec<StreamTableMeta>)>> =
+        const { RefCell::new(None) };
+}
+
+/// SCAL-1: Return active stream tables, using the per-backend snapshot cache.
+///
+/// If the cached DAG version matches shmem, returns the cached rows without
+/// touching SPI.  On a version mismatch, reloads from the catalog and updates
+/// the cache.
+pub(crate) fn get_cached_active_stream_tables()
+-> Result<Vec<StreamTableMeta>, crate::error::PgTrickleError> {
+    let current_dag_version = shmem::current_dag_version();
+
+    // Try the cache first.
+    let hit = CATALOG_SNAPSHOT_CACHE.with(|c| {
+        if let Some((cached_version, ref rows)) = *c.borrow()
+            && cached_version == current_dag_version
+        {
+            return Some(rows.clone());
+        }
+        None
+    });
+
+    if let Some(rows) = hit {
+        // Cache hit — no SPI needed.
+        shmem::TEMPLATE_CACHE_L1_HITS
+            .get()
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        return Ok(rows);
+    }
+
+    // Cache miss — reload from catalog.
+    let rows = StreamTableMeta::get_all_active()?;
+    CATALOG_SNAPSHOT_CACHE.with(|c| {
+        *c.borrow_mut() = Some((current_dag_version, rows.clone()));
+    });
+    Ok(rows)
+}
+
+/// SCAL-1: Invalidate the per-backend catalog snapshot cache.
+///
+/// Called after DDL operations that modify stream table metadata.
+pub(crate) fn invalidate_catalog_snapshot_cache() {
+    CATALOG_SNAPSHOT_CACHE.with(|c| {
+        *c.borrow_mut() = None;
+    });
+}
+
+/// SCAL-4 (v0.25.0): Copy-on-write DAG rebuild.
+///
+/// Builds a new `StDag` from the catalog **without holding any shared-memory
+/// lock**.  The caller atomically replaces the current DAG pointer only after
+/// the build completes, so concurrent readers always observe a consistent view.
+///
+/// The "swap" is implicit: the caller assigns the returned `StDag` to its
+/// local `dag: Option<StDag>`.  Because the scheduler is the sole writer, no
+/// additional synchronization is needed beyond the local assignment.
+pub(crate) fn rebuild_dag_copy_on_write(
+    schedule_secs: i32,
+) -> Result<crate::dag::StDag, crate::error::PgTrickleError> {
+    // All catalog I/O happens here, outside any PGS_STATE / TICK_WATERMARK_STATE
+    // exclusive lock.  Once build_from_catalog() returns, the caller atomically
+    // swaps the new DAG into place.
+    crate::dag::StDag::build_from_catalog(schedule_secs)
+}
+
+/// SCAL-5: Retrieve the configured worker pool size.
+///
+/// Returns 0 (the default) when the persistent worker pool is disabled.
+pub(crate) fn configured_worker_pool_size() -> usize {
+    config::pg_trickle_worker_pool_size().max(0) as usize
+}
+
+/// SCAL-5: Persistent worker pool coordination.
+///
+/// When `pg_trickle.worker_pool_size > 0`, the scheduler maintains a set of
+/// persistent background workers that loop on a work queue rather than being
+/// spawned and de-registered each tick.
+///
+/// The entry is a lightweight marker showing how many pool workers are
+/// currently active. Pool workers are registered via `BackgroundWorkerBuilder`
+/// at extension init time (in `lib.rs`) and communicate via `TICK_WATERMARK_STATE`.
+pub(crate) fn pool_worker_count() -> u32 {
+    shmem::active_worker_count()
+}
+
+/// Check if the persistent worker pool is enabled.
+pub(crate) fn is_pool_enabled() -> bool {
+    configured_worker_pool_size() > 0
+}
+
+/// CACHE-1: Per-backend L0 template cache key check.
+///
+/// Returns `true` if the local thread-local cache has an entry for `pgt_id`
+/// at the current CACHE_GENERATION, indicating no L2/DVM parse is needed.
+///
+/// The full L0 implementation uses the L2 catalog table
+/// (`pgtrickle.pgt_template_cache`) as the cross-backend shared cache.
+/// Backends that miss L1 check L2 before re-running the DVM parser.
+/// `CACHE_GENERATION` invalidation ensures stale entries are not used.
+pub(crate) fn has_l0_cache_entry(pgt_id: i64) -> bool {
+    let current_gen = shmem::current_cache_generation();
+    crate::refresh::has_template_cache_entry(pgt_id, current_gen)
+}
 
 // ── G-7: Refresh tier classification ───────────────────────────────────
 
@@ -200,6 +316,190 @@ pub fn register_launcher_worker() {
         .set_start_time(BgWorkerStartTime::RecoveryFinished)
         .set_restart_time(Some(std::time::Duration::from_secs(5)))
         .load();
+}
+
+/// SCAL-5 (v0.25.0): Spawn persistent pool workers for a database.
+///
+/// Called by the per-database scheduler after connecting to a target DB.
+/// When `pg_trickle.worker_pool_size > 0`, registers N auto-restart BGWs
+/// that loop on the job queue instead of being spawned and de-registered
+/// each tick.  Workers use a 100 ms poll loop and handle `SIGTERM` cleanly.
+///
+/// If `worker_pool_size = 0` (default), this function is a no-op.
+pub(crate) fn spawn_persistent_pool_workers(db_name: &str) {
+    let pool_size = config::pg_trickle_worker_pool_size();
+    if pool_size <= 0 {
+        return;
+    }
+
+    for i in 0..pool_size as u32 {
+        let extra = format!("{db_name}\0{i}");
+        match BackgroundWorkerBuilder::new(&format!("pg_trickle pool worker {i}"))
+            .set_function("pg_trickle_pool_worker_main")
+            .set_library("pg_trickle")
+            .enable_spi_access()
+            .set_extra(&extra)
+            // Pool workers auto-restart on exit (unlike per-job workers).
+            .set_restart_time(Some(std::time::Duration::from_secs(1)))
+            .load_dynamic()
+        {
+            Ok(_) => {
+                log!("pg_trickle: spawned pool worker {i} for db '{db_name}'");
+            }
+            Err(_) => {
+                warning!("pg_trickle: failed to register pool worker {i} for db '{db_name}'");
+            }
+        }
+    }
+}
+
+/// SCAL-5: Entry point for a persistent pool worker.
+///
+/// Loops until `SIGTERM`, polling the job queue and executing QUEUED jobs.
+///
+/// # Safety
+/// Called directly by PostgreSQL as a background worker entry point.
+#[pg_guard]
+#[unsafe(no_mangle)]
+pub extern "C-unwind" fn pg_trickle_pool_worker_main(_arg: pg_sys::Datum) {
+    BackgroundWorker::attach_signal_handlers(SignalWakeFlags::SIGHUP | SignalWakeFlags::SIGTERM);
+
+    let extra = BackgroundWorker::get_extra();
+    // extra = "db_name\0worker_index"
+    let db_name = extra.split('\0').next().unwrap_or("postgres").to_string();
+    let worker_idx: u32 = extra
+        .split('\0')
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+
+    BackgroundWorker::connect_worker_to_spi(Some(&db_name), None);
+
+    log!(
+        "pg_trickle pool worker {}: started (db='{}')",
+        worker_idx,
+        db_name,
+    );
+
+    // Acquire a worker token (shared with dynamic workers for the cluster budget).
+    let max_workers = config::pg_trickle_max_dynamic_refresh_workers().max(1) as u32;
+    if !shmem::try_acquire_worker_token(max_workers) {
+        log!(
+            "pg_trickle pool worker {}: could not acquire token — cluster budget exhausted, exiting",
+            worker_idx,
+        );
+        return;
+    }
+
+    // Main poll loop: pick up and execute QUEUED jobs.
+    loop {
+        // Check for SIGTERM signal (returns false when signal received).
+        if !BackgroundWorker::wait_latch(Some(std::time::Duration::from_millis(0))) {
+            break;
+        }
+
+        // Try to claim one QUEUED job.
+        let claimed = execute_pool_worker_tick(&db_name, worker_idx);
+
+        if !claimed {
+            // No work available — sleep 100 ms.
+            let ok = BackgroundWorker::wait_latch(Some(std::time::Duration::from_millis(100)));
+            if !ok {
+                // SIGTERM received during sleep.
+                break;
+            }
+        }
+    }
+
+    shmem::release_worker_token();
+    log!(
+        "pg_trickle pool worker {}: exiting (db='{}')",
+        worker_idx,
+        db_name,
+    );
+}
+
+/// SCAL-5: Execute one pool worker tick: claim and run one QUEUED job.
+///
+/// Returns `true` if a job was claimed and executed, `false` if the queue
+/// is empty.
+fn execute_pool_worker_tick(db_name: &str, worker_idx: u32) -> bool {
+    // Claim one QUEUED job for this db.
+    let job_id = match BackgroundWorker::transaction(AssertUnwindSafe(|| {
+        Spi::get_one::<i64>(&format!(
+            "UPDATE pgtrickle.pgt_scheduler_jobs \
+             SET status = 'RUNNING', \
+                 started_at = now(), \
+                 worker_pid = pg_backend_pid() \
+             WHERE job_id = ( \
+               SELECT job_id FROM pgtrickle.pgt_scheduler_jobs \
+               WHERE status = 'QUEUED' \
+                 AND db_name = '{db}' \
+               ORDER BY enqueued_at \
+               LIMIT 1 \
+               FOR UPDATE SKIP LOCKED \
+             ) \
+             RETURNING job_id",
+            db = db_name.replace('\'', "''"),
+        ))
+    })) {
+        Ok(Some(id)) => id,
+        _ => return false,
+    };
+
+    log!(
+        "pg_trickle pool worker {}: executing job_id={}",
+        worker_idx,
+        job_id,
+    );
+
+    // Load the job.
+    let job = match BackgroundWorker::transaction(AssertUnwindSafe(|| {
+        crate::catalog::SchedulerJob::get_by_id(job_id)
+    })) {
+        Ok(Some(j)) => j,
+        _ => return true, // job was claimed, but couldn't load it — skip
+    };
+
+    // Execute the job using the same dispatch as the dynamic refresh worker.
+    let outcome = std::panic::catch_unwind(AssertUnwindSafe(|| {
+        BackgroundWorker::transaction(AssertUnwindSafe(|| -> RefreshOutcome {
+            match job.unit_kind.as_str() {
+                "singleton" => execute_worker_singleton(&job),
+                "atomic_group" => execute_worker_atomic_group(&job, false),
+                "repeatable_read_group" => execute_worker_atomic_group(&job, true),
+                "immediate_closure" => execute_worker_immediate_closure(&job),
+                "cyclic_scc" => execute_worker_cyclic_scc(&job),
+                "fused_chain" => execute_worker_fused_chain(&job),
+                _ => {
+                    warning!(
+                        "pg_trickle pool worker {}: unknown unit_kind '{}' for job {}",
+                        worker_idx,
+                        job.unit_kind,
+                        job_id,
+                    );
+                    RefreshOutcome::PermanentFailure
+                }
+            }
+        }))
+    }));
+
+    let status = match outcome {
+        Ok(RefreshOutcome::Success) => "COMPLETED",
+        _ => "FAILED",
+    };
+
+    // Mark job complete.
+    let _ = BackgroundWorker::transaction(AssertUnwindSafe(|| {
+        Spi::run(&format!(
+            "UPDATE pgtrickle.pgt_scheduler_jobs \
+             SET status = '{status}', \
+                 completed_at = now() \
+             WHERE job_id = {job_id}",
+        ))
+    }));
+
+    true
 }
 
 /// Main entry point for the launcher background worker.
@@ -4436,6 +4736,75 @@ fn upstream_change_state(
     )
 }
 
+/// SCAL-2: Batch change detection across multiple stream tables in one SPI call.
+///
+/// Builds a single SQL query that checks ALL source change buffers for all
+/// provided stream tables at once.  Returns the set of `pgt_id`s that have at
+/// least one pending change.  This reduces per-tick SPI round-trips from
+/// `O(num_sts × num_sources)` to `O(1)`.
+///
+/// Implementation: for each ST we emit one `SELECT pgt_id WHERE EXISTS(sources...)`
+/// arm and UNION ALL them together.  A single `array_agg` collects the IDs that
+/// matched.
+pub(crate) fn batched_has_source_changes(
+    sts: &[StreamTableMeta],
+) -> std::collections::HashSet<i64> {
+    use std::collections::HashSet;
+    use std::fmt::Write;
+
+    if sts.is_empty() {
+        return HashSet::new();
+    }
+
+    let change_schema = config::pg_trickle_change_buffer_schema();
+    let mut arms: Vec<String> = Vec::with_capacity(sts.len());
+
+    for st in sts {
+        let source_oids = get_source_oids_for_st(st.pgt_id);
+        if source_oids.is_empty() {
+            continue;
+        }
+
+        // Build the inner UNION ALL for this ST's sources.
+        let inner: Vec<String> = source_oids
+            .iter()
+            .map(|oid| {
+                format!(
+                    "SELECT 1 FROM {change_schema}.changes_{oid}",
+                    oid = oid.to_u32(),
+                )
+            })
+            .collect();
+
+        let mut arm = String::new();
+        let _ = write!(
+            &mut arm,
+            "SELECT {pgt_id}::bigint AS pgt_id WHERE EXISTS({inner})",
+            pgt_id = st.pgt_id,
+            inner = inner.join(" UNION ALL "),
+        );
+        arms.push(arm);
+    }
+
+    if arms.is_empty() {
+        return HashSet::new();
+    }
+
+    // Execute once: collect all pgt_ids with pending changes.
+    let sql = format!(
+        "SELECT array_agg(pgt_id) FROM ({arms}) t",
+        arms = arms.join(" UNION ALL "),
+    );
+
+    let ids: HashSet<i64> = Spi::get_one::<Vec<i64>>(&sql) // nosemgrep: rust.spi.get-one.dynamic-format — change_schema is config-derived, OIDs are system values
+        .unwrap_or(None)
+        .unwrap_or_default()
+        .into_iter()
+        .collect();
+
+    ids
+}
+
 /// Returns `true` if any TABLE or FOREIGN_TABLE upstream source has rows in
 /// its CDC change buffer that have not yet been consumed by a refresh.
 ///
@@ -4967,8 +5336,15 @@ fn refresh_single_st(
         // PRED-2: Predictive cost model — pre-emptive FULL switch.
         // If the predicted DIFFERENTIAL cost exceeds the FULL cost by the
         // configured ratio, switch to FULL preemptively.
+        //
+        // PERF-3: Try the shmem cost-model cache first to avoid an extra SPI
+        // call.  Fall back to `st.last_full_ms` (loaded from catalog at tick
+        // start) if the shmem slot is empty.
+        let last_full_cost = crate::shmem::read_cost_model(st.pgt_id)
+            .map(|(full_ms, _)| full_ms)
+            .or(st.last_full_ms);
         if base_action == RefreshAction::Differential
-            && let Some(last_full) = st.last_full_ms
+            && let Some(last_full) = last_full_cost
         {
             // Estimate delta_rows from change buffers.
             let delta_rows = crate::cdc::estimate_pending_changes(st.pgt_id).unwrap_or(0);
@@ -5560,6 +5936,19 @@ fn execute_scheduled_refresh(
                 rows_deleted,
                 elapsed_ms,
             );
+
+            // PERF-3: Update shmem cost-model cache with the latest timing.
+            // Parallel workers read this from shmem rather than issuing an SPI
+            // SELECT to pgt_stream_tables on every dispatch tick.
+            {
+                let elapsed_f64 = elapsed_ms as f64;
+                let (new_full, new_diff) = match action {
+                    RefreshAction::Full | RefreshAction::Reinitialize => (Some(elapsed_f64), None),
+                    RefreshAction::Differential => (None, Some(elapsed_f64)),
+                    _ => (None, None),
+                };
+                crate::shmem::update_cost_model(st.pgt_id, new_full, new_diff);
+            }
 
             // F31: Emit StaleData alert if still stale after refresh
             // (e.g., refresh took longer than the schedule interval)

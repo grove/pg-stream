@@ -7,6 +7,8 @@
 //! for join children where the row ID is recomputed from the projected
 //! columns to match the full-refresh hash formula.
 
+use std::fmt::Write as FmtWrite;
+
 use crate::dvm::diff::{DiffContext, DiffResult, quote_ident};
 use crate::dvm::operators::scan::build_hash_expr;
 use crate::dvm::parser::{Expr, OpTree, join_pk_expr_indices, unwrap_transparent};
@@ -211,19 +213,33 @@ pub fn diff_project(ctx: &mut DiffContext, op: &OpTree) -> Result<DiffResult, Pg
         })
         .collect();
 
-    let mut extra_cols_select = String::new();
+    // PERF-2: Pre-size the extra_cols buffer to avoid repeated reallocations.
+    // Each column entry is ~20 chars on average; reserve based on count.
+    let extra_cap = if has_count_l && has_count_r { 40 } else { 0 } + aux_cols.len() * 24;
+    let mut extra_cols_select = String::with_capacity(extra_cap);
     if has_count_l && has_count_r {
         extra_cols_select.push_str(", \"__pgt_count_l\", \"__pgt_count_r\"");
     }
     for col in &aux_cols {
-        extra_cols_select.push_str(&format!(", \"{}\"", col.replace('"', "\"\"")));
+        // SAFETY: write! on String never fails.
+        let _ = write!(extra_cols_select, ", \"{}\"", col.replace('"', "\"\""));
     }
 
-    let sql = format!(
-        "SELECT {row_id_select}, __pgt_action, {proj_cols}{extra_cols_select}\n\
-         FROM {child_cte}",
-        proj_cols = proj_cols.join(", "),
-        child_cte = child_result.cte_name,
+    // PERF-2: Pre-size the final SQL buffer: row_id + action + all projected
+    // columns + extra columns + FROM clause. Eliminates the intermediate
+    // String allocation that `format!` would otherwise create.
+    let proj_cols_str = proj_cols.join(", ");
+    let child_cte = &child_result.cte_name;
+    let sql_cap = row_id_select.len()
+        + 20 // ", __pgt_action, "
+        + proj_cols_str.len()
+        + extra_cols_select.len()
+        + 8  // "\nFROM "
+        + child_cte.len();
+    let mut sql = String::with_capacity(sql_cap);
+    let _ = write!(
+        sql,
+        "SELECT {row_id_select}, __pgt_action, {proj_cols_str}{extra_cols_select}\nFROM {child_cte}",
     );
 
     ctx.add_cte(cte_name.clone(), sql);

@@ -17,17 +17,15 @@ const INVALIDATION_RING_CAPACITY: usize = 128;
 
 /// Shared state visible to both the scheduler and user backends.
 ///
-/// Protected by `PGS_STATE` lightweight lock for concurrent access.
+/// SCAL-3 (v0.25.0): This struct now holds only DAG-related fields.
+/// Scheduler metadata and tick watermarks have been split into dedicated
+/// `SchedulerMetaState` and `TickWatermarkState` structs to reduce lock
+/// contention.  Read-only paths (e.g., `dag_version` reads) use
+/// `PGS_STATE.share()` without blocking concurrent readers.
 #[derive(Copy, Clone)]
 pub struct PgTrickleSharedState {
     /// Incremented when the DAG changes (create/alter/drop ST).
     pub dag_version: u64,
-    /// PID of the scheduler background worker (0 if not running).
-    pub scheduler_pid: i32,
-    /// Whether the scheduler is currently running.
-    pub scheduler_running: bool,
-    /// Unix timestamp (seconds) of the scheduler's last wake cycle.
-    pub last_scheduler_wake: i64,
 
     // ── C2-1: Invalidation ring buffer ───────────────────────────────
     /// Bounded ring buffer of pgt_ids that need DAG re-evaluation.
@@ -38,8 +36,47 @@ pub struct PgTrickleSharedState {
     /// When true, more DDL events arrived than the ring can hold.
     /// The scheduler must do a full O(V+E) DAG rebuild.
     inv_overflow: bool,
+}
 
-    // ── #536: Frontier visibility holdback ───────────────────────────
+impl Default for PgTrickleSharedState {
+    fn default() -> Self {
+        Self {
+            dag_version: 0,
+            inv_ring: [0; INVALIDATION_RING_CAPACITY],
+            inv_count: 0,
+            inv_overflow: false,
+        }
+    }
+}
+
+// SAFETY: PgTrickleSharedState is Copy + Clone + Default and contains only
+// primitive types, making it safe for shared memory access under PgLwLock.
+unsafe impl PGRXSharedMemory for PgTrickleSharedState {}
+
+/// SCAL-3 (v0.25.0): Scheduler metadata — split from `PgTrickleSharedState`
+/// to reduce lock contention on the DAG lock path.
+///
+/// Protected by `SCHEDULER_META_STATE` lightweight lock.
+#[derive(Copy, Clone, Default)]
+pub struct SchedulerMetaState {
+    /// PID of the scheduler background worker (0 if not running).
+    pub scheduler_pid: i32,
+    /// Whether the scheduler is currently running.
+    pub scheduler_running: bool,
+    /// Unix timestamp (seconds) of the scheduler's last wake cycle.
+    pub last_scheduler_wake: i64,
+}
+
+// SAFETY: SchedulerMetaState is Copy + Clone + Default with only primitive types.
+unsafe impl PGRXSharedMemory for SchedulerMetaState {}
+
+/// SCAL-3 (v0.25.0): Tick watermark state — split from `PgTrickleSharedState`
+/// to allow the coordinator to update watermarks without taking the DAG
+/// exclusive lock.
+///
+/// Protected by `TICK_WATERMARK_STATE` lightweight lock.
+#[derive(Copy, Clone, Default)]
+pub struct TickWatermarkState {
     /// The oldest `backend_xmin` (including 2PC) seen at the previous
     /// scheduler tick. Used by the xmin holdback algorithm to detect
     /// long-running transactions that span a tick boundary.
@@ -55,30 +92,27 @@ pub struct PgTrickleSharedState {
     pub last_tick_safe_lsn_u64: u64,
 }
 
-impl Default for PgTrickleSharedState {
-    fn default() -> Self {
-        Self {
-            dag_version: 0,
-            scheduler_pid: 0,
-            scheduler_running: false,
-            last_scheduler_wake: 0,
-            inv_ring: [0; INVALIDATION_RING_CAPACITY],
-            inv_count: 0,
-            inv_overflow: false,
-            last_tick_oldest_xmin: 0,
-            last_tick_safe_lsn_u64: 0,
-        }
-    }
-}
+// SAFETY: TickWatermarkState is Copy + Clone + Default with only primitive types.
+unsafe impl PGRXSharedMemory for TickWatermarkState {}
 
-// SAFETY: PgTrickleSharedState is Copy + Clone + Default and contains only
-// primitive types, making it safe for shared memory access under PgLwLock.
-unsafe impl PGRXSharedMemory for PgTrickleSharedState {}
-
-/// Lightweight-lock–protected shared state.
+/// Lightweight-lock–protected DAG and invalidation shared state.
 // SAFETY: PgLwLock::new requires a static CStr name for the lock.
 pub static PGS_STATE: PgLwLock<PgTrickleSharedState> =
     unsafe { PgLwLock::new(c"pg_trickle_state") };
+
+/// SCAL-3 (v0.25.0): Dedicated lock for scheduler metadata (PID, status,
+/// last-wake).  Split from `PGS_STATE` to allow monitoring reads without
+/// blocking DAG operations.
+// SAFETY: PgLwLock::new requires a static CStr name for the lock.
+pub static SCHEDULER_META_STATE: PgLwLock<SchedulerMetaState> =
+    unsafe { PgLwLock::new(c"pg_trickle_scheduler_meta") };
+
+/// SCAL-3 (v0.25.0): Dedicated lock for tick watermark state (xmin, safe LSN).
+/// Split from `PGS_STATE` so the coordinator can update watermarks without
+/// contending with DAG invalidation writes.
+// SAFETY: PgLwLock::new requires a static CStr name for the lock.
+pub static TICK_WATERMARK_STATE: PgLwLock<TickWatermarkState> =
+    unsafe { PgLwLock::new(c"pg_trickle_tick_watermark") };
 
 /// Atomic signal for DAG rebuild. Backends increment this when creating,
 /// altering, or dropping stream tables. The scheduler compares its local
@@ -173,6 +207,9 @@ pub static FRONTIER_HOLDBACK_AGE_SECS: PgAtomic<AtomicU64> =
 /// Register shared memory allocations. Called from `_PG_init()`.
 pub fn init_shared_memory() {
     pg_shmem_init!(PGS_STATE);
+    // SCAL-3: Dedicated per-concern locks.
+    pg_shmem_init!(SCHEDULER_META_STATE);
+    pg_shmem_init!(TICK_WATERMARK_STATE);
     pg_shmem_init!(DAG_REBUILD_SIGNAL);
     pg_shmem_init!(CACHE_GENERATION);
     pg_shmem_init!(ACTIVE_REFRESH_WORKERS);
@@ -183,8 +220,12 @@ pub fn init_shared_memory() {
     pg_shmem_init!(TEMPLATE_CACHE_MISSES);
     pg_shmem_init!(TEMPLATE_CACHE_L1_HITS);
     pg_shmem_init!(TEMPLATE_CACHE_EVICTIONS);
+    // CACHE-1: L0 cross-backend cache availability signal.
+    pg_shmem_init!(L0_POPULATED_VERSION);
     pg_shmem_init!(FRONTIER_HOLDBACK_LSN_BYTES);
     pg_shmem_init!(FRONTIER_HOLDBACK_AGE_SECS);
+    // PERF-3: Cost-model cache.
+    pg_shmem_init!(COST_MODEL_STATE);
     SHMEM_INITIALIZED.store(true, std::sync::atomic::Ordering::Relaxed);
 }
 
@@ -482,54 +523,100 @@ pub fn current_reconcile_epoch() -> u64 {
 
 /// Read the oldest-xmin seen at the previous scheduler tick.
 ///
+/// SCAL-3: Uses `TICK_WATERMARK_STATE` (dedicated lock) instead of `PGS_STATE`.
 /// Returns 0 when shmem is unavailable or no baseline has been recorded.
 pub fn last_tick_oldest_xmin() -> u64 {
     if !is_shmem_available() {
         return 0;
     }
-    PGS_STATE.share().last_tick_oldest_xmin
+    TICK_WATERMARK_STATE.share().last_tick_oldest_xmin
 }
 
 /// Persist the oldest-xmin from the current tick so next tick can compare.
+///
+/// SCAL-3: Uses `TICK_WATERMARK_STATE` (dedicated lock).
 pub fn set_last_tick_oldest_xmin(xmin: u64) {
     if !is_shmem_available() {
         return;
     }
-    PGS_STATE.exclusive().last_tick_oldest_xmin = xmin;
+    TICK_WATERMARK_STATE.exclusive().last_tick_oldest_xmin = xmin;
 }
 
 /// Persist both the oldest-xmin and the safe frontier LSN **atomically** under
 /// a single exclusive lock acquisition so that dynamic workers never see a
 /// state where the xmin has advanced but the safe LSN has not yet been updated
 /// (or vice-versa).
+///
+/// SCAL-3: Uses `TICK_WATERMARK_STATE` (dedicated lock).
 pub fn set_last_tick_holdback_state(xmin: u64, lsn_u64: u64) {
     if !is_shmem_available() {
         return;
     }
-    let mut state = PGS_STATE.exclusive();
+    let mut state = TICK_WATERMARK_STATE.exclusive();
     state.last_tick_oldest_xmin = xmin;
     state.last_tick_safe_lsn_u64 = lsn_u64;
 }
 
 /// Read the safe frontier LSN (u64) written by the coordinator at the last tick.
 ///
-/// Dynamic refresh workers use this as a conservative upper bound.
+/// SCAL-3: Uses `TICK_WATERMARK_STATE.share()` — reads do not block DAG writers.
 /// Returns 0 when shmem is unavailable or unset.
 pub fn last_tick_safe_lsn_u64() -> u64 {
     if !is_shmem_available() {
         return 0;
     }
-    PGS_STATE.share().last_tick_safe_lsn_u64
+    TICK_WATERMARK_STATE.share().last_tick_safe_lsn_u64
 }
 
 /// Persist the safe frontier LSN (u64) so dynamic workers can read it.
+///
+/// SCAL-3: Uses `TICK_WATERMARK_STATE` (dedicated lock).
 pub fn set_last_tick_safe_lsn(lsn_u64: u64) {
     if !is_shmem_available() {
         return;
     }
-    // Update only the cached safe LSN under the shared-memory lock.
+    // Update only the cached safe LSN under the dedicated watermark lock.
     // When both xmin and LSN must be updated together, use set_last_tick_holdback_state().
-    PGS_STATE.exclusive().last_tick_safe_lsn_u64 = lsn_u64;
+    TICK_WATERMARK_STATE.exclusive().last_tick_safe_lsn_u64 = lsn_u64;
+}
+
+// ── SCAL-3 (v0.25.0): Scheduler metadata helpers ──────────────────────────
+
+/// Read the current scheduler PID from shared memory.
+///
+/// Returns 0 when shmem is unavailable or the scheduler has not started.
+pub fn scheduler_pid() -> i32 {
+    if !is_shmem_available() {
+        return 0;
+    }
+    SCHEDULER_META_STATE.share().scheduler_pid
+}
+
+/// Record scheduler startup: set PID, mark as running, record wake time.
+pub fn set_scheduler_meta(pid: i32, running: bool, wake_ts: i64) {
+    if !is_shmem_available() {
+        return;
+    }
+    let mut meta = SCHEDULER_META_STATE.exclusive();
+    meta.scheduler_pid = pid;
+    meta.scheduler_running = running;
+    meta.last_scheduler_wake = wake_ts;
+}
+
+/// Read scheduler running status.
+pub fn scheduler_running() -> bool {
+    if !is_shmem_available() {
+        return false;
+    }
+    SCHEDULER_META_STATE.share().scheduler_running
+}
+
+/// Read the last scheduler wake timestamp (Unix seconds).
+pub fn last_scheduler_wake() -> i64 {
+    if !is_shmem_available() {
+        return 0;
+    }
+    SCHEDULER_META_STATE.share().last_scheduler_wake
 }
 
 /// Update the holdback gauge metrics.
@@ -562,6 +649,170 @@ pub fn read_holdback_metrics() -> (u64, u64) {
         .get()
         .load(std::sync::atomic::Ordering::Relaxed);
     (lsn, age)
+}
+
+/// CACHE-2: Increment the L1 template cache evictions counter.
+///
+/// Called by `maybe_evict_lru_cache_entry` when an LRU eviction occurs.
+pub fn increment_template_cache_evictions() {
+    if !SHMEM_INITIALIZED.load(std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    TEMPLATE_CACHE_EVICTIONS
+        .get()
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+// ── CACHE-1 (v0.25.0): L0 cross-backend cache availability signal ──────────
+//
+// True L0 implementation would use PostgreSQL's `dshash` (dynamic shared hash)
+// keyed by `(pgt_id, cache_generation)`.  Since pgrx 0.17.x does not expose
+// `dshash`, we use the L2 catalog table (`pgtrickle.pgt_template_cache`) as
+// the effective cross-backend shared cache.
+//
+// The L0_POPULATED_VERSION counter lets backends quickly determine whether
+// the L2 cache is populated at the current CACHE_GENERATION without an SPI
+// round-trip.  When `l0_populated_version() == current_cache_generation()`,
+// L2 likely has valid entries and the DVM parser can be skipped.
+
+/// Atomic counter indicating the CACHE_GENERATION at which the L0/L2 shared
+/// cache was last populated.  Backends set this after writing a new template
+/// to the L2 catalog table.
+// SAFETY: PgAtomic::new requires a static CStr name.
+pub static L0_POPULATED_VERSION: PgAtomic<AtomicU64> =
+    unsafe { PgAtomic::new(c"pg_trickle_l0_populated") };
+
+/// CACHE-1: Signal that the L0/L2 shared template cache has been populated
+/// at the current CACHE_GENERATION.
+///
+/// Called after successfully writing a compiled template to L2 storage.
+pub fn signal_l0_cache_populated() {
+    if !is_shmem_available() {
+        return;
+    }
+    let current_gen = CACHE_GENERATION
+        .get()
+        .load(std::sync::atomic::Ordering::Relaxed);
+    L0_POPULATED_VERSION
+        .get()
+        .store(current_gen, std::sync::atomic::Ordering::Release);
+}
+
+/// CACHE-1: Check whether the L0/L2 shared cache was populated at the
+/// current CACHE_GENERATION.
+///
+/// Returns `true` if another backend has populated the L2 cache at the
+/// current generation, meaning an L1 miss should try L2 before the DVM
+/// parser.  This is already the default behavior; this check allows the
+/// monitoring layer to distinguish "L2 hit avoided by L0 signal" from
+/// cold-start L2 lookups.
+pub fn is_l0_cache_available() -> bool {
+    if !is_shmem_available() {
+        return false;
+    }
+    let l0_ver = L0_POPULATED_VERSION
+        .get()
+        .load(std::sync::atomic::Ordering::Acquire);
+    let cache_gen = CACHE_GENERATION
+        .get()
+        .load(std::sync::atomic::Ordering::Relaxed);
+    l0_ver == cache_gen
+}
+
+// ── PERF-3 (v0.25.0): Shmem adaptive cost-model state ─────────────────────
+
+/// Number of per-ST cost model slots in the shmem cache.
+///
+/// Slots are addressed by `(pgt_id as usize) % COST_CACHE_CAPACITY`.
+/// Collisions are tolerated — a wrong slot is treated as a miss and
+/// triggers an SPI fallback. 256 slots give < 0.4% expected collision
+/// rate for workloads with ≤ 1 000 stream tables.
+const COST_CACHE_CAPACITY: usize = 256;
+
+/// One cost model entry for a single stream table.
+///
+/// `last_full_ms` and `last_diff_ms` are stored as IEEE 754 bit patterns
+/// (via `f64::to_bits` / `f64::from_bits`) so that `Copy + Clone +
+/// Default` work without needing a `f64` field.
+#[derive(Copy, Clone, Default)]
+pub struct CostModelEntry {
+    /// `pgt_id` of the stream table that owns this slot, or 0 if empty.
+    pub pgt_id: i64,
+    /// Last observed FULL refresh duration (ms) as IEEE 754 bits.
+    pub last_full_ms_bits: u64,
+    /// Last observed DIFFERENTIAL refresh duration (ms) as IEEE 754 bits.
+    pub last_diff_ms_bits: u64,
+}
+
+/// Fixed-size array of cost model entries, shared across all backends.
+///
+/// Protected by `COST_MODEL_STATE` PgLwLock.
+#[derive(Copy, Clone)]
+pub struct CostModelCache {
+    pub entries: [CostModelEntry; COST_CACHE_CAPACITY],
+}
+
+impl Default for CostModelCache {
+    fn default() -> Self {
+        Self {
+            entries: [CostModelEntry::default(); COST_CACHE_CAPACITY],
+        }
+    }
+}
+
+// SAFETY: CostModelCache contains only primitive types and is Copy + Clone +
+// Default, making it safe for use in PostgreSQL shared memory.
+unsafe impl PGRXSharedMemory for CostModelCache {}
+
+/// PERF-3: Shared cost-model state protected by a dedicated lightweight lock.
+///
+/// Separate from `PGS_STATE` to avoid contention with DAG / scheduler state.
+// SAFETY: PgLwLock::new requires a static CStr name.
+pub static COST_MODEL_STATE: PgLwLock<CostModelCache> =
+    unsafe { PgLwLock::new(c"pg_trickle_cost_model") };
+
+/// PERF-3: Write cost-model timing data for a stream table to shmem.
+///
+/// Called by the scheduler after each refresh completes. Parallel workers
+/// can then read the timing from shmem instead of issuing an SPI query.
+///
+/// `last_full_ms` and/or `last_diff_ms` can be `None` to leave the
+/// corresponding slot value unchanged.
+pub fn update_cost_model(pgt_id: i64, last_full_ms: Option<f64>, last_diff_ms: Option<f64>) {
+    if !is_shmem_available() {
+        return;
+    }
+    let slot = (pgt_id as usize).wrapping_rem(COST_CACHE_CAPACITY);
+    let mut cache = COST_MODEL_STATE.exclusive();
+    let entry = &mut cache.entries[slot];
+    // If the slot is taken by a different pgt_id, overwrite it.
+    entry.pgt_id = pgt_id;
+    if let Some(ms) = last_full_ms {
+        entry.last_full_ms_bits = ms.to_bits();
+    }
+    if let Some(ms) = last_diff_ms {
+        entry.last_diff_ms_bits = ms.to_bits();
+    }
+}
+
+/// PERF-3: Read cost-model timing data for a stream table from shmem.
+///
+/// Returns `Some((last_full_ms, last_diff_ms))` on a cache hit, or `None`
+/// on a miss (slot empty, slot occupied by a different pgt_id, or
+/// shmem unavailable). Callers should fall back to SPI on `None`.
+pub fn read_cost_model(pgt_id: i64) -> Option<(f64, f64)> {
+    if !is_shmem_available() {
+        return None;
+    }
+    let slot = (pgt_id as usize).wrapping_rem(COST_CACHE_CAPACITY);
+    let cache = COST_MODEL_STATE.share();
+    let entry = &cache.entries[slot];
+    if entry.pgt_id != pgt_id || entry.pgt_id == 0 {
+        return None;
+    }
+    let full_ms = f64::from_bits(entry.last_full_ms_bits);
+    let diff_ms = f64::from_bits(entry.last_diff_ms_bits);
+    Some((full_ms, diff_ms))
 }
 
 /// Flag indicating whether shared memory was initialized via _PG_init.

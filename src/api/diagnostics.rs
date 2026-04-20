@@ -1451,6 +1451,142 @@ pub(super) fn refresh_groups_fn() -> TableIterator<
     TableIterator::new(rows)
 }
 
+// ── PUB-2 (v0.25.0): Multi-DB worker allocation status ─────────────────
+
+/// PUB-2: Return per-database worker allocation status.
+///
+/// Reports the current running-worker count, effective worker quota, and
+/// queued-job count for the current database. Useful for capacity planning
+/// and diagnosing scheduler starvation when multiple databases share the
+/// cluster-wide worker pool.
+///
+/// Columns:
+/// - `db_name`: The current database name.
+/// - `workers_used`: Number of scheduler jobs currently RUNNING.
+/// - `workers_quota`: Effective per-database worker quota (from GUC settings).
+/// - `workers_queued`: Number of scheduler jobs currently QUEUED.
+/// - `cluster_active`: Cluster-wide active worker count (across all DBs).
+/// - `cluster_max`: Cluster-wide maximum worker count.
+#[pg_extern(schema = "pgtrickle", name = "worker_allocation_status")]
+#[allow(clippy::type_complexity)]
+pub(super) fn worker_allocation_status_fn() -> TableIterator<
+    'static,
+    (
+        name!(db_name, String),
+        name!(workers_used, i64),
+        name!(workers_quota, i64),
+        name!(workers_queued, i64),
+        name!(cluster_active, i64),
+        name!(cluster_max, i64),
+    ),
+> {
+    use crate::shmem;
+
+    // Count RUNNING and QUEUED jobs in the current database.
+    let (running, queued) = Spi::connect(|client| {
+        let running: i64 = client
+            .select(
+                "SELECT COUNT(*) FROM pgtrickle.pgt_scheduler_jobs WHERE status = 'RUNNING'",
+                None,
+                &[],
+            )
+            .ok()
+            .and_then(|r| {
+                if r.is_empty() {
+                    None
+                } else {
+                    r.first().get::<i64>(1).ok().flatten()
+                }
+            })
+            .unwrap_or(0);
+        let queued: i64 = client
+            .select(
+                "SELECT COUNT(*) FROM pgtrickle.pgt_scheduler_jobs WHERE status = 'QUEUED'",
+                None,
+                &[],
+            )
+            .ok()
+            .and_then(|r| {
+                if r.is_empty() {
+                    None
+                } else {
+                    r.first().get::<i64>(1).ok().flatten()
+                }
+            })
+            .unwrap_or(0);
+        (running, queued)
+    });
+
+    let cluster_active = shmem::active_worker_count() as i64;
+    let max_cluster = crate::config::pg_trickle_max_dynamic_refresh_workers().max(1) as i64;
+
+    // Compute effective per-DB quota using the same logic as the scheduler.
+    let quota = crate::scheduler::compute_per_db_quota(
+        crate::config::pg_trickle_per_database_worker_quota(),
+        crate::config::pg_trickle_max_concurrent_refreshes(),
+        max_cluster as u32,
+        cluster_active as u32,
+    ) as i64;
+
+    let db_name = Spi::get_one::<String>("SELECT current_database()")
+        .unwrap_or(None)
+        .unwrap_or_else(|| "unknown".to_string());
+
+    TableIterator::new(vec![(
+        db_name,
+        running,
+        quota,
+        queued,
+        cluster_active,
+        max_cluster,
+    )])
+}
+
+// ── CACHE-3 (v0.25.0): Manual cache flush ──────────────────────────────
+
+/// CACHE-3: Flush all delta-template cache levels in the current database.
+///
+/// Clears:
+/// - **L1** (thread-local): The in-process `MERGE_TEMPLATE_CACHE` for the
+///   current backend. Forces a re-parse on the next refresh in this session.
+/// - **L2** (catalog table): `pgtrickle.pgt_template_cache` is truncated.
+///   All backends will miss the L2 cache on their next cache-miss and will
+///   re-populate it from a fresh DVM parse.
+/// - **Generation bump**: `CACHE_GENERATION` is incremented so that all
+///   other connected backends detect the invalidation on their next refresh
+///   and flush their own L1 caches.
+///
+/// Returns the number of L2 entries that were removed.
+///
+/// Use during debugging, emergency migration rollback, or after a query
+/// definition change that was not captured by the normal DDL invalidation path.
+#[pg_extern(schema = "pgtrickle")]
+pub(super) fn clear_caches() -> i64 {
+    use crate::shmem;
+
+    // Count L2 entries before clearing.
+    let l2_count: i64 = Spi::get_one::<i64>("SELECT COUNT(*) FROM pgtrickle.pgt_template_cache")
+        .unwrap_or(Some(0))
+        .unwrap_or(0);
+
+    // Flush L1: thread-local MERGE_TEMPLATE_CACHE in the current backend.
+    crate::refresh::flush_local_template_cache();
+
+    // Flush L2: truncate the shared catalog cache table.
+    crate::template_cache::invalidate_all();
+
+    // Advance CACHE_GENERATION so all other backends detect the invalidation
+    // on their next refresh and flush their own L1 caches.
+    shmem::bump_cache_generation();
+
+    pgrx::info!(
+        "pg_trickle: clear_caches() flushed L1 (thread-local) + L2 ({} entries) + bumped CACHE_GENERATION",
+        l2_count
+    );
+
+    l2_count
+}
+
 // ── TEST-7 (v0.24.0): Unit tests for diagnostics pure-logic helpers ─────
 
 #[cfg(test)]

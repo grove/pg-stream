@@ -188,6 +188,14 @@ pub fn invalidate_delta_cache(pgt_id: i64) {
     });
 }
 
+/// CACHE-3: Flush all entries from the thread-local delta template cache.
+///
+/// Called by `refresh::flush_local_template_cache()` as part of the
+/// full `pgtrickle.clear_caches()` operation.
+pub fn flush_all_delta_caches() {
+    DELTA_TEMPLATE_CACHE.with(|cache| cache.borrow_mut().clear());
+}
+
 /// UX-1 / CACHE-OBS: Return the current number of entries in the L1
 /// (thread-local) delta template cache for this backend connection.
 pub fn delta_cache_size() -> usize {
@@ -605,6 +613,13 @@ pub fn generate_delta_query_cached(
             is_all_algebraic,
         },
     );
+
+    // CACHE-1: Signal that the L0/L2 shared cache has been populated at the
+    // current CACHE_GENERATION.  Other backends can check this before deciding
+    // whether to run the expensive DVM parse.
+    if crate::shmem::is_shmem_available() {
+        crate::shmem::signal_l0_cache_populated();
+    }
 
     // Resolve placeholders for this invocation.
     let delta_sql =
