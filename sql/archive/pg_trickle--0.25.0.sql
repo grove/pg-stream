@@ -1836,7 +1836,7 @@ RETURNS TABLE (
     "cluster_max"    bigint
 )
     LANGUAGE c STRICT
-AS 'MODULE_PATHNAME', 'worker_allocation_status_wrapper';
+AS 'MODULE_PATHNAME', 'worker_allocation_status_fn_wrapper';
 
 /* </end connected objects> */
 

@@ -37,7 +37,7 @@ RETURNS TABLE (
     "cluster_max"    bigint
 )
     LANGUAGE c STRICT
-AS 'MODULE_PATHNAME', 'worker_allocation_status_wrapper';
+AS 'MODULE_PATHNAME', 'worker_allocation_status_fn_wrapper';
 
 -- Record the schema version for the upgrade chain.
 INSERT INTO pgtrickle.pgt_schema_version (version, description)
