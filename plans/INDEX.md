@@ -125,3 +125,23 @@ new entries when creating documents.
 | [PLAN_TEST_SUITE_TPC_H.md](testing/PLAN_TEST_SUITE_TPC_H.md) | PLAN | Complete | TPC-H test suite |
 | [PLAN_TEST_PYRAMID_REBALANCE.md](testing/PLAN_TEST_PYRAMID_REBALANCE.md) | PLAN | Proposed | Shift coverage down the pyramid — extract unit tests, light-E2E tier |
 | [STATUS_TESTING.md](testing/STATUS_TESTING.md) | STATUS | — | Testing & coverage status |
+
+## ui/
+
+| File | Type | Status | Summary |
+|------|------|--------|---------|
+| [PLAN_TUI.md](ui/PLAN_TUI.md) | PLAN | Implemented | Terminal UI v0.14 (F1–F21) |
+| [PLAN_TUI_PART_2.md](ui/PLAN_TUI_PART_2.md) | PLAN | Implemented | TUI v0.15 operational features (T9–T14) |
+| [PLAN_TUI_PART_3.md](ui/PLAN_TUI_PART_3.md) | PLAN | Planned | TUI v0.21 self-monitoring integration |
+
+## relay/
+
+| File | Type | Status | Summary |
+|------|------|--------|---------|
+| [PLAN_RELAY_CLI.md](relay/PLAN_RELAY_CLI.md) | PLAN | Design review complete | Bidirectional relay CLI (`pgtrickle-relay`) |
+
+## webui/
+
+| File | Type | Status | Summary |
+|------|------|--------|---------|
+| [PLAN_WEBUI.md](webui/PLAN_WEBUI.md) | PLAN | Draft | Web dashboard & management console — analysis and implementation plan |
