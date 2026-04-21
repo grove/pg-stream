@@ -230,7 +230,7 @@ fn restore_from_snapshot_impl(name: &str, source: &str) -> Result<(), PgTrickleE
     );
 
     // Truncate, then bulk-insert from snapshot (excluding metadata columns)
-    Spi::run(&format!("TRUNCATE {}", storage_fqn))
+    Spi::run(&format!("TRUNCATE {}", storage_fqn)) // nosemgrep: rust.spi.run.dynamic-format — DDL cannot be parameterized; storage_fqn is a double-quoted and escaped catalog identifier.
         .map_err(|e| PgTrickleError::SpiError(format!("truncate failed: {e}")))?;
 
     // PostgreSQL 18+ supports SELECT * EXCEPT (...) — fall back to explicit
@@ -241,7 +241,7 @@ fn restore_from_snapshot_impl(name: &str, source: &str) -> Result<(), PgTrickleE
          FROM {}",
         storage_fqn, src_fqn
     );
-    Spi::run(&insert_sql)
+    Spi::run(&insert_sql) // nosemgrep: rust.spi.run.dynamic-format — DDL/DML cannot be parameterized for table names; storage_fqn and src_fqn are double-quoted and escaped catalog identifiers.
         .map_err(|e| PgTrickleError::SpiError(format!("restore insert failed: {e}")))?;
 
     // Restore frontier so next refresh is DIFFERENTIAL (not FULL)
@@ -384,7 +384,7 @@ fn drop_snapshot_impl(snapshot_table: &str) -> Result<(), PgTrickleError> {
         snap_table.replace('"', r#"\""#)
     );
 
-    Spi::run(&format!("DROP TABLE IF EXISTS {}", fqn))
+    Spi::run(&format!("DROP TABLE IF EXISTS {}", fqn)) // nosemgrep: rust.spi.run.dynamic-format — DDL cannot be parameterized; fqn is a double-quoted and escape-hardened catalog identifier.
         .map_err(|e| PgTrickleError::SpiError(format!("drop snapshot failed: {e}")))?;
 
     pgrx::log!("[pg_trickle] SNAP-3: dropped snapshot '{}'", snapshot_table);
