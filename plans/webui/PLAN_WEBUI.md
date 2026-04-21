@@ -40,6 +40,10 @@
   - [OpenAPI Specification](#openapi-specification)
 - [Comparison with RisingWave Dashboard](#comparison-with-risingwave-dashboard)
 - [Sequencing & Dependencies](#sequencing--dependencies)
+  - [Prerequisites](#prerequisites)
+  - [Delivery Phases](#delivery-phases)
+  - [Relay `AppState` Requirements (Day 1)](#relay-appstate-requirements-day-1)
+  - [Self-Monitoring via Stream Tables (Dogfooding)](#self-monitoring-via-stream-tables-dogfooding)
 - [Open Questions](#open-questions)
 
 ---
@@ -279,16 +283,69 @@ modes. In `none` mode, writes use the relay's PG connection.
 
 ### Real-Time Data
 
-Two mechanisms for live updates:
+Two distinct live-update tiers, both delivered via the same WebSocket
+channel (`/api/v1/ws`):
 
-**WebSocket** (`/api/v1/ws`): Subscribed to the `pg_trickle_alert` NOTIFY
-channel and relay pipeline state changes. The frontend connects on load
-and receives structured JSON events for: alerts, staleness changes,
-refresh completions, relay lag updates, fuse state changes.
+#### Tier A — State Live (badge/metric updates)
 
-**Polling fallback:** For environments where WebSocket is blocked (some
-corporate proxies), the frontend falls back to polling `/api/v1/health`
-and `/api/v1/dag/topology` at a configurable interval (default 5s).
+Node decorations update without changing graph structure: staleness
+counters tick up, buffer depth badges change, relay lag updates, SLA
+colour transitions (green → amber → red), alert feed entries appear.
+
+Source: `pg_trickle_alert` NOTIFY channel + relay pipeline state
+changes broadcast from `AppState.ws_broadcast`. Frontend receives
+`WsEvent::StateUpdate` and patches node/edge data in-place — no
+graph re-layout required.
+
+#### Tier B — Structure Live (topology changes)
+
+Graph nodes and edges appear or disappear: a new stream table is
+created, a relay pipeline is added, a CDC trigger is enabled on a
+source table. This requires a graph re-fetch and re-render.
+
+Source: a new `pgtrickle_structure_changed` NOTIFY channel emitted
+by the existing DDL event trigger hooks in the extension. The relay
+listens on this channel alongside `pg_trickle_alert` and broadcasts
+`WsEvent::TopologyChanged` to connected WebSocket clients.
+
+Frontend behaviour on `WsEvent::TopologyChanged`:
+1. Re-fetch `GET /api/v1/dag/topology`
+2. Diff the new node/edge list against the current graph
+3. Animate nodes appearing (fade-in) or disappearing (fade-out)
+4. Preserve current zoom/pan position and node layout where possible
+
+The topology payload is small (tens of nodes in typical deployments),
+so a full re-fetch is simpler and sufficient — no differential graph
+patching needed.
+
+**Round-trip latency** from "Apply" click to node appearing on graph:
+- PG DDL execution + trigger: ~5–20 ms
+- NOTIFY delivery: ~1 ms
+- Relay LISTEN → `WsEvent::TopologyChanged`: ~1 ms
+- Browser re-fetch + re-render: ~50–100 ms
+- **Total: ~100 ms** — tight enough to feel instantaneous
+
+**Multi-user coordination:** All connected WebUI clients (multiple
+browser tabs, multiple team members) receive the same
+`WsEvent::TopologyChanged` event simultaneously. An SRE watching the
+topology dashboard sees a new stream table appear the moment a data
+engineer or LLM agent applies the `CREATE STREAM TABLE` SQL — without
+refreshing the page.
+
+**Optimistic updates (Tier 2+):** When the current user applies SQL
+via the WebUI's SQL preview model, the frontend can show the new node
+*immediately* (before PG confirms) and reconcile with the server
+response. If execution fails, the optimistic node is removed and the
+error is shown. This requires the frontend to predict the topology
+change from the SQL statement — feasible for simple cases
+(`CREATE STREAM TABLE`, relay pipeline insert) but not for complex DDL.
+Implemented as a Tier 2 enhancement, not required for Tier 1.
+
+**Polling fallback:** For environments where WebSocket is blocked
+(some corporate proxies), the frontend falls back to polling
+`/api/v1/health` and `/api/v1/dag/topology` at a configurable
+interval (default 5s). Structure changes are detected by comparing
+the node list on each poll.
 
 ---
 
@@ -405,9 +462,15 @@ complete event flow, including relay nodes:
 - Zoom/pan, drag-to-rearrange
 - Deep-linkable: `/ui/topology?focus=revenue_7d` highlights a node
 
+**Live updates:**
+- `WsEvent::StateUpdate` → badge values update in-place (no re-layout)
+- `WsEvent::TopologyChanged` → re-fetch topology, animate new/removed
+  nodes, preserve zoom/pan and existing node positions
+- Optimistic node insertion when the current user applies SQL (Tier 2+)
+
 **Implementation:** Cytoscape.js or reactflow for the graph layout. DAG
 data from `/api/v1/dag/topology` (extends `dependency_tree()` with relay
-pipeline nodes). Refreshed every 5s via WebSocket push or polling.
+pipeline nodes). WebSocket-driven updates; 5s polling fallback.
 
 ### SLA Budget & Lag Monitoring
 
@@ -806,6 +869,14 @@ with:
 - A stubbed `/ui` route returning 200 OK (placeholder for the frontend)
 - The JSON API layer (`/api/v1/...`) as the backend for the WebUI
 
+The pg-trickle extension must emit a `pgtrickle_structure_changed`
+NOTIFY whenever topology changes: stream table created/dropped,
+CDC trigger enabled/disabled, relay pipeline config changed. The relay
+listens on this channel alongside `pg_trickle_alert` and uses it to
+drive `WsEvent::TopologyChanged` broadcasts. This NOTIFY is cheap
+(~2 µs, inside the existing DDL trigger path) and can be added in the
+same release as the relay.
+
 ### Delivery Phases
 
 | Phase | Content | Depends on |
@@ -835,7 +906,12 @@ pub struct AppState {
     /// Shutdown token (coordinates relay workers + HTTP server)
     pub shutdown: CancellationToken,
 
-    /// WebSocket broadcast channel (NOTIFY alerts, pipeline state changes)
+    /// WebSocket broadcast channel (NOTIFY alerts, topology changes, state updates)
+    /// WsEvent variants:
+    ///   StateUpdate { table, staleness_secs, buffer_rows, lag_rows, sla_status }
+    ///   TopologyChanged { source: "ddl" | "relay_config" }
+    ///   Alert { channel, payload }
+    ///   RelayPipelineChanged { pipeline_name, status }
     pub ws_broadcast: broadcast::Sender<WsEvent>,
 
     /// Configuration (auth mode, log level, feature flags)
@@ -846,6 +922,102 @@ pub struct AppState {
 This structure is shared between relay worker tasks and HTTP handlers.
 Designing it correctly in RELAY-1 avoids a painful refactor when the
 WebUI is added.
+
+### Self-Monitoring via Stream Tables (Dogfooding)
+
+The WebUI uses pg-trickle stream tables to power several of its own
+derived metrics. This is the canonical dogfooding use case: the product
+monitoring itself, with those monitoring stream tables visible as
+first-class nodes in the topology graph.
+
+**Governing rule:** The `/health` endpoint and the live-badge
+`WsEvent::StateUpdate` path **always use direct queries** — they must
+never depend on stream tables. If the scheduler is stopped or the
+extension is degraded, those paths must still work. Stream tables are
+only used for **derived aggregate metrics** where a small amount of
+staleness is acceptable and the value comes from incremental maintenance
+over time.
+
+#### Candidate stream tables
+
+The relay creates these stream tables during its own initialisation
+(via `pgtrickle.relay_setup()`), sourced exclusively from stable,
+public-facing catalog views and relay-owned sample tables:
+
+| Stream table | Source | WebUI consumer | Refresh mode |
+|---|---|---|---|
+| `pgtrickle._staleness_samples` | Relay worker polls `get_staleness()`, inserts rows | N/A — source table | N/A |
+| `pgtrickle.sla_burn_rate` | `_staleness_samples` (1 h window) | SLA budget progress bars, burn-rate trend arrows | DIFFERENTIAL (`regr_slope` via aux cols) |
+| `pgtrickle.refresh_percentiles` | `pgt_refresh_log` (rolling 1 h / 24 h) | Refresh timeline P50/P95/P99 overlays | DIFFERENTIAL (algebraic aggregates) |
+| `pgtrickle.buffer_growth_rate` | `_staleness_samples` (derivative per table) | Buffer depth trend badges | DIFFERENTIAL |
+| `pgtrickle.end_to_end_lag` | `pg_stat_stream_tables` + DAG edges | Topology graph edge widths | FULL (recursive CTE — upgraded when recursive IVM ships) |
+
+#### Example: `sla_burn_rate`
+
+The relay inserts a staleness sample for each stream table every
+`pg_trickle.relay_sample_interval` seconds (default 15 s):
+
+```sql
+-- Source table: populated by the relay worker, not user-managed
+CREATE TABLE pgtrickle._staleness_samples (
+    sampled_at  timestamptz NOT NULL DEFAULT now(),
+    table_name  text        NOT NULL,
+    staleness_s float4      NOT NULL
+);
+
+-- Stream table: rolling SLA burn rate, refreshed every 15 s
+CREATE STREAM TABLE pgtrickle.sla_burn_rate AS
+SELECT
+    table_name,
+    avg(staleness_s)                                            AS mean_staleness_s,
+    max(staleness_s)                                            AS max_staleness_s,
+    regr_slope(staleness_s, extract(epoch FROM sampled_at))     AS staleness_trend_s_per_s,
+    count(*)                                                    AS sample_count
+FROM pgtrickle._staleness_samples
+WHERE sampled_at > now() - interval '1 hour'
+GROUP BY table_name;
+SCHEDULE '15 seconds';
+```
+
+`staleness_trend_s_per_s` is the burn rate: a value of `0.5` means the
+table is gaining half a second of staleness for every wall-clock second
+elapsed. Given a 30 s SLA and current staleness of 20 s, it will breach
+in `(30 − 20) / 0.5 = 20 s`. This is exactly the value the SLA budget
+progress bar displays as remaining budget.
+
+The aggregate uses `regr_slope()`, which is algebraic and maintained
+incremantally by the DVM engine via auxiliary sum/count columns — no
+full-table rescan on each 15 s tick.
+
+#### Meta-observability property
+
+Because these stream tables are registered in `pgt_stream_tables`, they
+appear in the topology graph as first-class nodes. An SRE investigating
+a staleness spike can see at a glance whether `sla_burn_rate` itself is
+stale — meaning the burn-rate indicators in the WebUI are running on
+outdated data. The monitoring is transparent about its own freshness.
+No external monitoring tool provides this self-describing property.
+
+Further: clicking the `sla_burn_rate` node in the topology graph opens
+the DVM operator inspector showing the `regr_slope` aggregate strategy,
+its auxiliary columns, and the current change buffer depth of
+`_staleness_samples`. The observability stack is fully introspectable.
+
+#### Bootstrap safety rule
+
+| Data path | Source | Stream table allowed? |
+|---|---|---|
+| `/health` endpoint | `health_check()` — direct query | **No** |
+| `WsEvent::StateUpdate` live badges | NOTIFY + direct queries | **No** |
+| SLA burn rate chart | `pgtrickle.sla_burn_rate` | **Yes** |
+| Refresh percentiles overlay | `pgtrickle.refresh_percentiles` | **Yes** |
+| Topology edge width (throughput) | `pgtrickle.end_to_end_lag` | **Yes** (with polling fallback to direct query) |
+| Buffer depth badge (live) | Direct `change_buffer_sizes()` | **No** |
+| Buffer growth trend line | `pgtrickle.buffer_growth_rate` | **Yes** |
+
+The invariant: anything that must work when the scheduler is stopped or
+the extension is degraded uses direct queries. Derived, time-aggregated,
+trend data uses stream tables.
 
 ---
 
