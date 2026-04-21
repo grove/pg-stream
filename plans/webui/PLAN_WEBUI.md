@@ -318,11 +318,12 @@ GET  /api/v1/relay/pipelines/:id        Single pipeline detail
 GET  /api/v1/relay/pipelines/:id/lag    Lag metrics for a pipeline
 
 # Dead letter queue
-GET  /api/v1/dlq                        All unresolved dead letters (paginated)
-GET  /api/v1/dlq/:pipeline              Dead letters for one pipeline
-POST /api/v1/dlq/:id/retry              Re-attempt delivery of one dead letter
-POST /api/v1/dlq/:id/discard           Mark resolved without retry
-POST /api/v1/dlq/discard-all/:pipeline Bulk discard for a pipeline
+GET   /api/v1/dlq                        All unresolved dead letters (paginated)
+GET   /api/v1/dlq/:pipeline              Dead letters for one pipeline
+PATCH /api/v1/dlq/:id/annotate           Update operator_notes (raw_payload immutable)
+POST  /api/v1/dlq/:id/retry              Re-attempt delivery of one dead letter
+POST  /api/v1/dlq/:id/discard           Mark resolved without retry
+POST  /api/v1/dlq/discard-all/:pipeline Bulk discard for a pipeline
 
 # Operational detail (sub-resources of Health in the UI)
 GET  /api/v1/cdc/sources                CDC source table status
@@ -856,32 +857,56 @@ failure surfaced here and in `breach_events`.
 
 ```sql
 CREATE TABLE pgtrickle.relay_dead_letters (
-    id           BIGSERIAL PRIMARY KEY,
-    failed_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+    id            BIGSERIAL PRIMARY KEY,
+    failed_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
     pipeline_name TEXT NOT NULL,         -- FK to relay_inbox/outbox_config.name
-    direction    TEXT NOT NULL,          -- 'inbox' or 'outbox'
-    error_type   TEXT NOT NULL,          -- 'decode', 'sink_permanent', 'inbox_permanent'
+    direction     TEXT NOT NULL,          -- 'inbox' or 'outbox'
+    error_type    TEXT NOT NULL,          -- 'decode', 'sink_permanent', 'inbox_permanent', 'claim_check'
     error_message TEXT NOT NULL,
-    raw_payload  JSONB,                  -- best-effort capture of the failed message
-    retry_count  INT NOT NULL DEFAULT 0,
-    resolved_at  TIMESTAMPTZ,            -- NULL = unresolved
-    resolved_by  TEXT                   -- 'manual', 'retry_success', 'discarded'
+    raw_payload   JSONB,                  -- immutable; best-effort capture of the failed message
+    retry_count   INT NOT NULL DEFAULT 0,
+    operator_notes TEXT,                 -- free-text annotation added before retry or discard
+    resolved_at   TIMESTAMPTZ,            -- NULL = unresolved
+    resolved_by   TEXT                   -- 'manual', 'retry_success', 'discarded'
 );
 ```
 
+**`raw_payload` is immutable.** The relay writes it once on failure and
+neither the WebUI nor the API may modify it. It is the forensic record
+of exactly what the upstream system sent. Editing it would silently
+corrupt the audit trail (e.g. "Kafka offset 4521" would no longer
+match the actual bytes received).
+
+**Handling bad data (permanent schema/data mismatch).** Retrying the
+original message will never succeed. The correct pattern is:
+
+1. Annotate the DLQ entry with `operator_notes` explaining the root
+   cause (e.g. "NULL in non-nullable column `user_id`").
+2. **Discard** the DLQ entry.
+3. Fix the data manually: insert a corrected row directly into the
+   target inbox table using the Tier 2 `POST /api/v1/sql/execute`
+   endpoint. The inbox is a plain PostgreSQL table. The execute
+   endpoint records the operator, timestamp, and SQL in the audit
+   log — making the correction fully traceable.
+
+This pattern keeps `raw_payload` honest, reuses existing infrastructure,
+and produces a clear audit trail: DLQ entry (what failed + why) +
+execute-log entry (what the operator inserted instead).
+
 The WebUI DLQ view (linked from Health) shows unresolved dead letters
-per pipeline with payload inspection, retry, and discard actions.
-A table's inbox dead letter count is also visible in the Tables list
-when the table has an associated relay inbox — a non-zero count is
-another signal that data is not arriving as expected.
+per pipeline with payload inspection, annotation, retry, and discard
+actions. A table's inbox dead letter count is also visible in the
+Tables list when the table has an associated relay inbox — a non-zero
+count is another signal that data is not arriving as expected.
 
 API:
 ```
-GET  /api/v1/dlq                        All unresolved dead letters (paginated)
-GET  /api/v1/dlq/:pipeline              Dead letters for one pipeline
-POST /api/v1/dlq/:id/retry              Re-attempt delivery of one dead letter
-POST /api/v1/dlq/:id/discard           Mark as resolved without retry
-POST /api/v1/dlq/discard-all/:pipeline Bulk discard for a pipeline
+GET   /api/v1/dlq                        All unresolved dead letters (paginated)
+GET   /api/v1/dlq/:pipeline              Dead letters for one pipeline
+PATCH /api/v1/dlq/:id/annotate           Update operator_notes on one entry
+POST  /api/v1/dlq/:id/retry              Re-attempt delivery of one dead letter
+POST  /api/v1/dlq/:id/discard           Mark as resolved without retry
+POST  /api/v1/dlq/discard-all/:pipeline Bulk discard for a pipeline
 ```
 
 Links in the "Remediation" column navigate to the relevant detail page

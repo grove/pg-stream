@@ -956,8 +956,13 @@ Silent discard (log + skip) is not acceptable — see AGENTS.md:
 "Data loss is unacceptable."
 
 `raw_payload` is captured best-effort (may be NULL if the message was
-undecipherable before any fields could be extracted). `pipeline_name`,
-`error_type`, `error_message`, and `failed_at` are always recorded.
+undecipherable before any fields could be extracted) and is **immutable
+after write** — neither the relay nor the WebUI may modify it, as it is
+the forensic record of exactly what the upstream system sent.
+`pipeline_name`, `error_type`, `error_message`, and `failed_at` are
+always recorded. `operator_notes` is a free-text field that operators
+may fill in via the WebUI before retrying, to document root cause and
+remediation steps.
 
 All retries use jittered exponential backoff to avoid thundering herds.
 
