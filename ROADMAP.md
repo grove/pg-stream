@@ -95,7 +95,7 @@ from the v0.1.x series to 1.0 and beyond.
 | v0.22.0 | Production scalability & downstream integration | ✅ Released |
 | v0.23.0 | TPC-H DVM scaling — diagnose and fix differential refresh perf | ✅ Released |
 | v0.24.0 | Join correctness & durability hardening | ✅ Released |
-| v0.25.0 | Scheduler scalability & pooler performance | Planned |
+| v0.25.0 | Scheduler scalability & pooler performance | ✅ Released |
 | v0.26.0 | Test & concurrency hardening | Planned |
 | v0.27.0 | Transactional inbox & outbox patterns | Planned |
 | v0.28.0 | Relay CLI (`pgtrickle-relay`) — bidirectional outbox→sinks + sources→inbox | Planned |
@@ -6522,7 +6522,7 @@ Phase 1–5 DVM code changes and the TPC-H scaling investigation. Items marked
 
 ## v0.25.0 — Scheduler Scalability & Pooler Performance
 
-**Status: Planned.** Sourced from [PLAN_OVERALL_ASSESSMENT_2.md](plans/PLAN_OVERALL_ASSESSMENT_2.md) §4, §5, §7.
+**Status: ✅ Released.** Sourced from [PLAN_OVERALL_ASSESSMENT_2.md](plans/PLAN_OVERALL_ASSESSMENT_2.md) §4, §5, §7.
 
 > **Release Theme**
 > This release pushes the comfortable operating point from "hundreds" to
@@ -6582,23 +6582,23 @@ Phase 1–5 DVM code changes and the TPC-H scaling investigation. Items marked
 > **v0.25.0 total: ~8–9 weeks** (~42 person-days solo)
 
 **Exit criteria:**
-- [ ] SCAL-1: Scheduler tick at 1000 STs completes in < 20 ms (down from ~200 ms)
-- [ ] SCAL-2: Change detection for 10-source ST issues 1 query instead of 10
-- [ ] SCAL-3: PGS_STATE replaced by 3 per-concern locks; read-only paths use `share()`
-- [ ] SCAL-4: DAG rebuild does not hold exclusive lock during computation; swap is atomic
-- [ ] SCAL-5: `worker_pool_size = 4` starts persistent workers; spawn cost eliminated
-- [ ] CACHE-1: Second backend connecting to same DB hits L0 cache; no parse/differentiate cost
-- [ ] CACHE-2: L1 cache respects `template_cache_max_entries`; evicts LRU on overflow
-- [ ] CACHE-3: `pgtrickle.clear_caches()` flushes all three levels; next refresh re-populates
-- [ ] PERF-1: `pg_trickle_hash_multi` allocates zero intermediate Strings per row
-- [ ] PERF-2: Project operator uses single pre-sized buffer; 50-column ST shows measurable improvement
-- [ ] PERF-3: Parallel workers read cost-model state from shmem, not SPI
-- [ ] PRED-1: Sawtooth workload test: model recovers within 5 samples after outlier spike
-- [ ] PUB-1: Publication with lagged subscriber emits WARNING; change buffer not truncated until ack
-- [ ] PUB-2: `worker_allocation_status()` returns per-DB used/quota/queued
-- [ ] Benchmark regression gate passes (no regressions vs v0.24.0 baseline)
-- [ ] Extension upgrade path tested (`0.24.0 → 0.25.0`)
-- [ ] `just check-version-sync` passes
+- [x] SCAL-1: Scheduler tick at 1000 STs completes in < 20 ms (down from ~200 ms)
+- [x] SCAL-2: Change detection for 10-source ST issues 1 query instead of 10
+- [x] SCAL-3: PGS_STATE replaced by 3 per-concern locks; read-only paths use `share()`
+- [x] SCAL-4: DAG rebuild does not hold exclusive lock during computation; swap is atomic
+- [x] SCAL-5: `worker_pool_size = 4` starts persistent workers; spawn cost eliminated
+- [x] CACHE-1: Second backend connecting to same DB hits L0 cache; no parse/differentiate cost
+- [x] CACHE-2: L1 cache respects `template_cache_max_entries`; evicts LRU on overflow
+- [x] CACHE-3: `pgtrickle.clear_caches()` flushes all three levels; next refresh re-populates
+- [x] PERF-1: `pg_trickle_hash_multi` allocates zero intermediate Strings per row
+- [x] PERF-2: Project operator uses single pre-sized buffer; 50-column ST shows measurable improvement
+- [x] PERF-3: Parallel workers read cost-model state from shmem, not SPI
+- [x] PRED-1: Sawtooth workload test: model recovers within 5 samples after outlier spike
+- [x] PUB-1: Publication with lagged subscriber emits WARNING; change buffer not truncated until ack
+- [x] PUB-2: `worker_allocation_status()` returns per-DB used/quota/queued
+- [x] Benchmark regression gate passes (no regressions vs v0.24.0 baseline)
+- [x] Extension upgrade path tested (`0.24.0 → 0.25.0`)
+- [x] `just check-version-sync` passes
 
 ---
 

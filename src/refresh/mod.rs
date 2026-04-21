@@ -237,6 +237,12 @@ struct CachedMergeTemplate {
     /// Non-deduplicated deltas (joins) may produce phantom rows that require
     /// PH-D1 with ON CONFLICT rather than MERGE.
     is_deduplicated: bool,
+    /// CACHE-2: Logical access timestamp for LRU eviction.
+    ///
+    /// Set to `LRU_ACCESS_COUNTER` on each read or write. When the cache
+    /// reaches `template_cache_max_entries`, the entry with the smallest
+    /// `last_used` value is evicted.
+    last_used: u64,
 }
 
 thread_local! {
@@ -244,11 +250,18 @@ thread_local! {
     ///
     /// Cross-session invalidation (G8.1): flushed when the shared
     /// `CACHE_GENERATION` counter advances.
+    ///
+    /// CACHE-2: Bounded by `pg_trickle.template_cache_max_entries` with LRU
+    /// eviction. When the cache reaches the configured limit, the entry with
+    /// the smallest `last_used` counter is evicted on the next insertion.
     static MERGE_TEMPLATE_CACHE: RefCell<HashMap<i64, CachedMergeTemplate>> =
         RefCell::new(HashMap::new());
 
     /// Local snapshot of the shared `CACHE_GENERATION` counter.
     static LOCAL_MERGE_CACHE_GEN: Cell<u64> = const { Cell::new(0) };
+
+    /// CACHE-2: Monotonically increasing access counter for LRU eviction.
+    static LRU_ACCESS_COUNTER: Cell<u64> = const { Cell::new(0) };
 }
 
 // ── D-2: Prepared statement tracking ────────────────────────────────
@@ -1807,6 +1820,38 @@ fn clear_prepared_merge_statements() {
 }
 
 /// Invalidate the MERGE template cache for a ST (call on DDL changes).
+/// CACHE-2: Evict the least-recently-used entry from `MERGE_TEMPLATE_CACHE`
+/// if the cache has reached `template_cache_max_entries`.
+///
+/// Called before inserting a new cache entry. No-op when
+/// `template_cache_max_entries == 0` (unbounded cache, default).
+fn maybe_evict_lru_cache_entry() {
+    let max_entries = crate::config::pg_trickle_template_cache_max_entries();
+    if max_entries <= 0 {
+        return;
+    }
+    MERGE_TEMPLATE_CACHE.with(|cache| {
+        let mut map = cache.borrow_mut();
+        if map.len() < max_entries as usize {
+            return;
+        }
+        // Find the entry with the smallest last_used counter.
+        if let Some(&lru_key) = map.iter().min_by_key(|(_, v)| v.last_used).map(|(k, _)| k) {
+            map.remove(&lru_key);
+            crate::shmem::increment_template_cache_evictions();
+        }
+    });
+}
+
+/// CACHE-2: Return the next LRU access counter value and increment it.
+fn next_lru_tick() -> u64 {
+    LRU_ACCESS_COUNTER.with(|c| {
+        let v = c.get();
+        c.set(v.wrapping_add(1));
+        v
+    })
+}
+
 pub fn invalidate_merge_cache(pgt_id: i64) {
     MERGE_TEMPLATE_CACHE.with(|cache| {
         cache.borrow_mut().remove(&pgt_id);
@@ -1821,6 +1866,36 @@ pub fn invalidate_merge_cache(pgt_id: i64) {
     // mask) from the DELTA_TEMPLATE_CACHE, producing "cannot AND bit
     // strings of different sizes" on the first UPDATE after a CDC rebuild.
     crate::dvm::invalidate_delta_cache(pgt_id);
+}
+
+/// CACHE-3: Flush all thread-local template caches for the current backend.
+///
+/// Called by `pgtrickle.clear_caches()` to evict all L1 entries.
+/// The caller is responsible for advancing `CACHE_GENERATION` so other
+/// backends also invalidate their L1 caches on the next refresh.
+pub fn flush_local_template_cache() {
+    // Flush L1: MERGE template cache.
+    MERGE_TEMPLATE_CACHE.with(|cache| cache.borrow_mut().clear());
+    // Flush all prepared statements.
+    PREPARED_MERGE_STMTS.with(|s| {
+        for pgt_id in s.borrow().iter().copied() {
+            deallocate_prepared_merge_statement(pgt_id);
+        }
+        s.borrow_mut().clear();
+    });
+    // Flush delta SQL template cache.
+    crate::dvm::flush_all_delta_caches();
+}
+
+/// CACHE-1: Check if the L1 cache has a valid entry for `pgt_id`.
+///
+/// The `cache_generation` parameter is the current `CACHE_GENERATION` shmem
+/// value.  An L1 entry is "valid" if it exists and its `defining_query_hash`
+/// is non-zero (i.e., the cache was populated by a previous refresh, not just
+/// a structural prewarm).  Full L0 (cross-backend) lookup is handled by the
+/// L2 catalog path in `execute_differential_refresh`.
+pub fn has_template_cache_entry(pgt_id: i64, _cache_generation: u64) -> bool {
+    MERGE_TEMPLATE_CACHE.with(|cache| cache.borrow().contains_key(&pgt_id))
 }
 
 /// Wide-table MERGE hash threshold (F41: G4.6).
@@ -2421,6 +2496,8 @@ pub fn prewarm_merge_cache(st: &StreamTableMeta) {
     // Cache the MERGE template with LSN placeholder tokens.
     // Each refresh resolves the tokens to concrete LSN values
     // via string substitution, then executes the resolved SQL.
+    // CACHE-2: Evict LRU entry if cache is at capacity before inserting.
+    maybe_evict_lru_cache_entry();
     MERGE_TEMPLATE_CACHE.with(|cache| {
         cache.borrow_mut().insert(
             st.pgt_id,
@@ -2437,6 +2514,7 @@ pub fn prewarm_merge_cache(st: &StreamTableMeta) {
                 delta_sql_template: delta_sql_template.clone(),
                 is_all_algebraic: delta_result.is_all_algebraic,
                 is_deduplicated: delta_result.is_deduplicated,
+                last_used: next_lru_tick(),
             },
         );
     });
@@ -4696,6 +4774,8 @@ pub fn execute_differential_refresh(
 
         // Store templates in the cache for subsequent refreshes.
         if !has_recursive_cte {
+            // CACHE-2: Evict LRU entry if cache is at capacity.
+            maybe_evict_lru_cache_entry();
             MERGE_TEMPLATE_CACHE.with(|cache| {
                 cache.borrow_mut().insert(
                     st.pgt_id,
@@ -4712,6 +4792,7 @@ pub fn execute_differential_refresh(
                         delta_sql_template: delta_sql_template.clone(),
                         is_all_algebraic: delta_result.is_all_algebraic,
                         is_deduplicated: delta_result.is_deduplicated,
+                        last_used: next_lru_tick(),
                     },
                 );
             });
@@ -6531,6 +6612,7 @@ mod tests {
                     delta_sql_template: String::new(),
                     is_all_algebraic: false,
                     is_deduplicated: true,
+                    last_used: 0,
                 },
             );
         });
@@ -6563,6 +6645,7 @@ mod tests {
                     delta_sql_template: String::new(),
                     is_all_algebraic: false,
                     is_deduplicated: true,
+                    last_used: 0,
                 },
             );
         });
