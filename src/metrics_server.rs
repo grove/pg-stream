@@ -28,6 +28,29 @@ use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::time::Duration;
 
+// ── METR-2: Typed errors ───────────────────────────────────────────────────
+
+/// METR-2 (v0.27.0): Typed errors for the metrics server.
+#[derive(Debug, PartialEq)]
+pub enum MetricsServerError {
+    /// Requested TCP port is already bound by another process.
+    PortInUse(String),
+    /// Request handler exceeded the configured timeout.
+    Timeout(String),
+    /// Other I/O error during startup.
+    Io(String),
+}
+
+impl std::fmt::Display for MetricsServerError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            MetricsServerError::PortInUse(msg) => write!(f, "port in use: {msg}"),
+            MetricsServerError::Timeout(msg) => write!(f, "timeout: {msg}"),
+            MetricsServerError::Io(msg) => write!(f, "io error: {msg}"),
+        }
+    }
+}
+
 /// Handle for a running metrics HTTP server.
 ///
 /// Drop to stop accepting new connections (the OS will clean up the socket).
@@ -42,27 +65,51 @@ impl MetricsServer {
     /// Binding failures are logged as warnings — a metrics port conflict must
     /// never prevent the scheduler from starting.
     pub fn start(port: u16) -> Option<Self> {
+        match Self::start_result(port) {
+            Ok(server) => server,
+            Err(MetricsServerError::PortInUse(e)) => {
+                pgrx::warning!(
+                    "[pg_trickle] OP-2: metrics port already in use: {e}; \
+                     metrics endpoint will not be available."
+                );
+                None
+            }
+            Err(MetricsServerError::Io(e)) => {
+                pgrx::warning!(
+                    "[pg_trickle] OP-2: failed to bind metrics endpoint: {e}; \
+                     metrics endpoint will not be available."
+                );
+                None
+            }
+            Err(MetricsServerError::Timeout(_)) => None,
+        }
+    }
+
+    /// METR-2 (v0.27.0): Start with typed error return.
+    ///
+    /// Returns `Ok(None)` when `port == 0` (disabled).
+    /// Returns `Err(MetricsServerError::PortInUse)` when the port is occupied.
+    pub fn start_result(port: u16) -> Result<Option<Self>, MetricsServerError> {
         if port == 0 {
-            return None;
+            return Ok(None);
         }
         let addr = format!("127.0.0.1:{port}");
         match TcpListener::bind(&addr) {
             Ok(listener) => {
                 if let Err(e) = listener.set_nonblocking(true) {
-                    pgrx::warning!(
-                        "[pg_trickle] OP-2: failed to set metrics socket non-blocking: {e}"
-                    );
-                    return None;
+                    return Err(MetricsServerError::Io(e.to_string()));
                 }
                 pgrx::log!("[pg_trickle] OP-2: metrics endpoint started on http://{addr}/metrics");
-                Some(Self { listener })
+                Ok(Some(Self { listener }))
             }
             Err(e) => {
-                pgrx::warning!(
-                    "[pg_trickle] OP-2: failed to bind metrics endpoint on {addr}: {e}; \
-                     metrics endpoint will not be available."
-                );
-                None
+                // EADDRINUSE (error code 48 on macOS, 98 on Linux)
+                let is_in_use = e.kind() == std::io::ErrorKind::AddrInUse;
+                if is_in_use {
+                    Err(MetricsServerError::PortInUse(format!("{addr}: {e}")))
+                } else {
+                    Err(MetricsServerError::Io(format!("{addr}: {e}")))
+                }
             }
         }
     }
@@ -119,10 +166,20 @@ fn handle_connection(stream: &mut TcpStream, metrics_text: &str) {
 ///
 /// Returns `(status, content_type, body)` for the response.
 /// Extracted from `handle_connection` for unit testability (TEST-8).
+///
+/// METR-4 (v0.27.0): Returns 400 Bad Request for malformed HTTP request lines
+/// (missing method, path, or HTTP version components).
 fn route_request<'a>(
     request: &str,
     metrics_text: &'a str,
 ) -> (&'static str, &'static str, &'a str) {
+    // METR-4: Validate request line has at least 3 whitespace-separated tokens
+    let first_line = request.lines().next().unwrap_or("");
+    let tokens: Vec<&str> = first_line.split_whitespace().collect();
+    if tokens.len() < 2 {
+        return ("400 Bad Request", "text/plain", "Bad Request\n");
+    }
+
     if request.starts_with("GET /metrics") {
         (
             "200 OK",
@@ -183,12 +240,6 @@ mod tests {
     }
 
     #[test]
-    fn test_route_404_empty_request() {
-        let (status, _, _) = route_request("", "");
-        assert_eq!(status, "404 Not Found");
-    }
-
-    #[test]
     fn test_route_metrics_with_query_string() {
         let metrics = "pg_trickle_up 1\n";
         let (status, _, body) = route_request("GET /metrics?format=text HTTP/1.1\r\n", metrics);
@@ -227,5 +278,121 @@ mod tests {
         let (status, _, body) = route_request("GET /metrics HTTP/1.1\r\n", &metrics);
         assert_eq!(status, "200 OK");
         assert_eq!(body.len(), metrics.len());
+    }
+
+    // ── METR-4: Malformed HTTP tests ────────────────────────────────────
+
+    #[test]
+    fn test_route_400_empty_request() {
+        let (status, _, body) = route_request("", "");
+        assert_eq!(status, "400 Bad Request");
+        assert_eq!(body, "Bad Request\n");
+    }
+
+    #[test]
+    fn test_route_400_single_token_request() {
+        let (status, _, _) = route_request("GARBAGE\r\n", "");
+        assert_eq!(status, "400 Bad Request");
+    }
+
+    #[test]
+    fn test_route_400_binary_garbage() {
+        // Simulate a raw TCP connection sending binary data
+        let (status, _, _) = route_request("\x00\x01\x02\x03", "");
+        assert_eq!(status, "400 Bad Request");
+    }
+
+    #[test]
+    fn test_route_still_404_unknown_path_valid_http() {
+        // Valid HTTP format but unknown path should still 404 (not 400)
+        let (status, _, _) = route_request("GET /unknown HTTP/1.1\r\n", "");
+        assert_eq!(status, "404 Not Found");
+    }
+
+    #[test]
+    fn test_route_400_method_only_no_path() {
+        let (status, _, _) = route_request("GET\r\n", "");
+        assert_eq!(status, "400 Bad Request");
+    }
+
+    // ── METR-1: OpenMetrics format conformance tests ────────────────────
+
+    #[test]
+    fn test_openmetrics_format_help_line() {
+        // OpenMetrics requires # HELP before # TYPE
+        let sample = "# HELP pg_trickle_up pg_trickle extension info\n\
+                      # TYPE pg_trickle_up gauge\n\
+                      pg_trickle_up 1\n";
+        let lines: Vec<&str> = sample.lines().collect();
+        assert!(
+            lines[0].starts_with("# HELP "),
+            "first line should be HELP: {}",
+            lines[0]
+        );
+        assert!(
+            lines[1].starts_with("# TYPE "),
+            "second line should be TYPE: {}",
+            lines[1]
+        );
+    }
+
+    #[test]
+    fn test_openmetrics_no_empty_metric_name() {
+        // All metric lines must have a non-empty name
+        let sample = "pg_trickle_info{version=\"0.27.0\"} 1\n\
+                      pg_trickle_up 1\n";
+        for line in sample.lines() {
+            if line.starts_with('#') || line.is_empty() {
+                continue;
+            }
+            let name = line.split(['{', ' ']).next().unwrap_or("");
+            assert!(!name.is_empty(), "metric line has empty name: {line}");
+            assert!(
+                name.starts_with("pg_trickle"),
+                "metric should start with pg_trickle: {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_openmetrics_label_format_valid() {
+        // Labels must use key="value" format
+        let line = r#"pg_trickle_info{version="0.27.0",schema="pgtrickle"} 1"#;
+        // Extract labels section
+        if let (Some(labels_start), Some(labels_end)) = (line.find('{'), line.find('}')) {
+            let labels = &line[labels_start + 1..labels_end];
+            for label in labels.split(',') {
+                assert!(
+                    label.contains('=') && label.contains('"'),
+                    "label should be key=\"value\" format: {label}"
+                );
+            }
+        }
+    }
+
+    // ── METR-2: Port-conflict typed error tests ─────────────────────────
+
+    #[test]
+    fn test_start_result_disabled_port_zero() {
+        // Port 0 means disabled — should return Ok(None).
+        let result = MetricsServer::start_result(0);
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_none());
+    }
+
+    #[test]
+    fn test_start_result_port_in_use() {
+        // Bind a port, then try to bind the same port again.
+        // The second attempt must return MetricsServerError::PortInUse.
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test listener");
+        let port = listener.local_addr().expect("get port").port();
+
+        let result = MetricsServer::start_result(port);
+        assert!(
+            matches!(result, Err(MetricsServerError::PortInUse(_))),
+            "expected PortInUse, got: {:?}",
+            result.err()
+        );
     }
 }

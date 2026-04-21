@@ -98,8 +98,8 @@ from the v0.1.x series to 1.0 and beyond.
 | v0.24.0 | Join correctness & durability hardening | ✅ Released |
 | v0.25.0 | Scheduler scalability & pooler performance | ✅ Released |
 | v0.26.0 | Test & concurrency hardening | ✅ Released |
-| v0.27.0 | Transactional inbox & outbox patterns | Planned |
-| v0.28.0 | Relay CLI (`pgtrickle-relay`) — bidirectional outbox→sinks + sources→inbox | Planned |
+| v0.27.0 | Operability, observability & DR — snapshot/PITR, schedule planner, cluster metrics | ✅ Released |
+| v0.28.0 | Transactional inbox & outbox patterns | Planned |
 | v0.29.0 | Operability, observability & DR — snapshot/PITR, schedule planner, cluster metrics | Planned |
 | v1.0.0 | Stable release (incl. PG 19 compatibility) | Planned |
 | v1.1.0 | PostgreSQL 17 support | Planned |
@@ -6821,27 +6821,27 @@ Phase 1–5 DVM code changes and the TPC-H scaling investigation. Items marked
 > **v0.27.0 total: ~3–4 weeks** (~24 person-days solo)
 
 **Exit criteria:**
-- [ ] SNAP-1: `snapshot_stream_table()` creates archival table with correct frontier and row data
-- [ ] SNAP-2: `restore_from_snapshot()` rehydrates ST; first refresh cycle after restore is DIFFERENTIAL (not FULL)
-- [ ] SNAP-3: `list_snapshots()` lists all snapshots for a ST; `drop_snapshot()` removes archival table and catalog row
-- [ ] SNAP-4: Fresh-replica bootstrap via snapshot completes in < 5 s for 1M-row ST
-- [ ] SNAP-5: BACKUP_AND_RESTORE.md updated; PATTERNS.md "Replica Bootstrap & PITR Alignment" section added
-- [ ] PLAN-1: `recommend_schedule()` returns `confidence = 0.0` before `min_samples`; returns non-trivial recommendation with synthetic history
-- [ ] PLAN-2: `schedule_recommendations()` returns one row per ST; sortable by `delta_pct`
-- [ ] PLAN-3: `predicted_sla_breach` alert fires once per cooldown window; no duplicate alerts
-- [ ] PLAN-4: All unit tests for planner pass; two new GUCs documented
-- [ ] CLUS-1: `cluster_worker_summary()` returns accurate per-DB worker counts from any database in the cluster
-- [ ] CLUS-2: All Prometheus metrics carry `db_oid` and `db_name` labels; existing Grafana dashboard templates updated
-- [ ] CLUS-3: `docs/integrations/multi-tenant.md` published with quota formula and Grafana snippets
-- [ ] CLUS-4: `docs/SCALING.md` cluster-wide fairness section added
-- [ ] METR-1: OpenMetrics conformance test passes; zero parse errors on live `/metrics` output
-- [ ] METR-2: Port-conflict test returns `MetricsServerError::PortInUse`; timeout test returns `MetricsServerError::Timeout`
-- [ ] METR-3: `metrics_summary()` returns aggregated counters; Grafana cluster-overview query documented
-- [ ] METR-4: Malformed HTTP request returns 400 Bad Request; no panic
-- [ ] DEP-1: pgrx bumped to 0.18.0; all API breakage resolved; extension builds clean
-- [ ] DEP-2: `just test-all` passes under pgrx 0.18.0; `AGENTS.md` pgrx version reference updated
-- [ ] Extension upgrade path tested (`0.26.0 → 0.27.0`)
-- [ ] `just check-version-sync` passes
+- [x] SNAP-1: `snapshot_stream_table()` creates archival table with correct frontier and row data
+- [x] SNAP-2: `restore_from_snapshot()` rehydrates ST; first refresh cycle after restore is DIFFERENTIAL (not FULL)
+- [x] SNAP-3: `list_snapshots()` lists all snapshots for a ST; `drop_snapshot()` removes archival table and catalog row
+- [x] SNAP-4: Fresh-replica bootstrap via snapshot completes in < 5 s for 1M-row ST
+- [x] SNAP-5: BACKUP_AND_RESTORE.md updated; PATTERNS.md "Replica Bootstrap & PITR Alignment" section added
+- [x] PLAN-1: `recommend_schedule()` returns `confidence = 0.0` before `min_samples`; returns non-trivial recommendation with synthetic history
+- [x] PLAN-2: `schedule_recommendations()` returns one row per ST; sortable by `delta_pct`
+- [x] PLAN-3: `predicted_sla_breach` alert fires once per cooldown window; no duplicate alerts
+- [x] PLAN-4: All unit tests for planner pass; two new GUCs documented
+- [x] CLUS-1: `cluster_worker_summary()` returns accurate per-DB worker counts from any database in the cluster
+- [x] CLUS-2: All Prometheus metrics carry `db_oid` and `db_name` labels; existing Grafana dashboard templates updated
+- [x] CLUS-3: `docs/integrations/multi-tenant.md` published with quota formula and Grafana snippets
+- [x] CLUS-4: `docs/SCALING.md` cluster-wide fairness section added
+- [x] METR-1: OpenMetrics conformance test passes; zero parse errors on live `/metrics` output
+- [x] METR-2: Port-conflict test returns `MetricsServerError::PortInUse`; timeout test returns `MetricsServerError::Timeout`
+- [x] METR-3: `metrics_summary()` returns aggregated counters; Grafana cluster-overview query documented
+- [x] METR-4: Malformed HTTP request returns 400 Bad Request; no panic
+- [x] DEP-1: pgrx bumped to 0.18.0; all API breakage resolved; extension builds clean
+- [x] DEP-2: `just test-all` passes under pgrx 0.18.0; `AGENTS.md` pgrx version reference updated
+- [x] Extension upgrade path tested (`0.26.0 → 0.27.0`)
+- [x] `just check-version-sync` passes
 
 ---
 

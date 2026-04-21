@@ -442,6 +442,49 @@ fn raise_error_with_context(e: PgTrickleError) -> ! {
             .report(PgLogLevel::ERROR);
             unreachable!()
         }
+        // SNAP-1/2/3 (v0.27.0): Snapshot errors
+        PgTrickleError::SnapshotAlreadyExists(target) => {
+            ErrorReport::new(
+                PgSqlErrorCode::ERRCODE_DUPLICATE_TABLE,
+                format!("snapshot already exists: {}", target),
+                "",
+            )
+            .set_hint(
+                "Choose a different target table name or drop the existing snapshot with \
+                 pgtrickle.drop_snapshot()."
+                    .to_string(),
+            )
+            .report(PgLogLevel::ERROR);
+            unreachable!()
+        }
+        PgTrickleError::SnapshotSourceNotFound(source) => {
+            ErrorReport::new(
+                PgSqlErrorCode::ERRCODE_UNDEFINED_TABLE,
+                format!("snapshot source not found: {}", source),
+                "",
+            )
+            .set_hint(
+                "Verify the snapshot table exists and is accessible. Use \
+                 pgtrickle.list_snapshots() to see available snapshots."
+                    .to_string(),
+            )
+            .report(PgLogLevel::ERROR);
+            unreachable!()
+        }
+        PgTrickleError::SnapshotSchemaVersionMismatch(msg) => {
+            ErrorReport::new(
+                PgSqlErrorCode::ERRCODE_INVALID_TABLE_DEFINITION,
+                format!("snapshot schema version mismatch: {}", msg),
+                "",
+            )
+            .set_hint(
+                "Snapshots taken with a different major version of pg_trickle may not be \
+                 compatible. Re-create the snapshot with the current version."
+                    .to_string(),
+            )
+            .report(PgLogLevel::ERROR);
+            unreachable!()
+        }
     }
 }
 
@@ -4727,13 +4770,17 @@ fn get_data_timestamp_str() -> String {
     format!("{now_secs}Z")
 }
 
+pub(crate) mod cluster;
 /// Return the pg_trickle extension version (from `Cargo.toml`).
 ///
 /// This matches the version reported by `pg_extension.extversion`.
 // ── Sub-modules ─────────────────────────────────────────────────────────────
 mod diagnostics;
 mod helpers;
+pub(crate) mod metrics_ext;
+pub(crate) mod planner;
 mod self_monitoring;
+pub(crate) mod snapshot;
 
 // Re-export public items from sub-modules so external callers are unaffected.
 pub use helpers::*;

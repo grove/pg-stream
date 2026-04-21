@@ -148,6 +148,19 @@ pub enum PgTrickleError {
     /// An unexpected internal error. Indicates a bug.
     #[error("internal error: {0}")]
     InternalError(String),
+
+    // ── Snapshot errors (SNAP, v0.27.0) ──────────────────────────────────
+    /// SNAP-1 (v0.27.0): A snapshot with the given target name already exists.
+    #[error("snapshot already exists: {0}")]
+    SnapshotAlreadyExists(String),
+
+    /// SNAP-2 (v0.27.0): The specified snapshot source table was not found.
+    #[error("snapshot source not found: {0}")]
+    SnapshotSourceNotFound(String),
+
+    /// SNAP-2 (v0.27.0): The snapshot schema version does not match the current extension version.
+    #[error("snapshot schema version mismatch: {0}")]
+    SnapshotSchemaVersionMismatch(String),
 }
 
 impl PgTrickleError {
@@ -338,6 +351,11 @@ impl PgTrickleError {
             // ERR-1 (v0.26.0): Diagnostic errors are system-level (SPI failures,
             // catalog query issues). They are not retried but are surfaced to the user.
             PgTrickleError::DiagnosticError(_) => PgTrickleErrorKind::System,
+
+            // SNAP-1/2/3 (v0.27.0): Snapshot errors are user-facing.
+            PgTrickleError::SnapshotAlreadyExists(_)
+            | PgTrickleError::SnapshotSourceNotFound(_)
+            | PgTrickleError::SnapshotSchemaVersionMismatch(_) => PgTrickleErrorKind::User,
         }
     }
 }

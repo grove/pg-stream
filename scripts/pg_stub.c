@@ -253,6 +253,36 @@ uint32_t exprType(const void *expr) { (void)expr; return 0; }
 /* ── jsonb input ──────────────────────────────────────────────────────── */
 uintptr_t jsonb_in(void *fcinfo) { (void)fcinfo; return 0; }
 
+/* ── pgrx 0.18.0: message level filter ───────────────────────────────── */
+/*
+ * pgrx 0.18.0 calls message_level_is_interesting() before emitting any log
+ * message.  Return 1 (true) so that pgrx::error!() correctly triggers the
+ * panic path (panic_any) in unit tests.  Lower-level messages (WARNING,
+ * INFO, etc.) then try do_ereport(), but our errstart() stub returns 0
+ * (false) so the actual message body is never built.
+ */
+int message_level_is_interesting(int elevel) { (void)elevel; return 1; }
+
+/* ── Error state helpers ──────────────────────────────────────────────── */
+/*
+ * FlushErrorState is referenced by pgrx 0.18.0 error-recovery paths.
+ * In unit tests, error recovery never actually runs; we just need the
+ * symbol to satisfy the dynamic linker.
+ */
+void FlushErrorState(void) {}
+
+/* ── Crypto stubs ─────────────────────────────────────────────────────── */
+/*
+ * CCRandomGenerateBytes is a macOS Security framework function referenced
+ * by some pgrx random-number helpers.  Return success (0) with zeroed bytes.
+ */
+int CCRandomGenerateBytes(void *bytes, size_t count) {
+    if (bytes && count > 0) {
+        __builtin_memset(bytes, 0, count);
+    }
+    return 0;
+}
+
 /* ── sigsetjmp stub ──────────────────────────────────────────────────── */
 /*
  * pgrx's PG_exception_stack references sigsetjmp indirectly. On macOS the

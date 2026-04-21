@@ -8,6 +8,7 @@ For future plans and upcoming features, see [ROADMAP.md](ROADMAP.md).
 
 <!-- TOC start -->
 - [Unreleased](#unreleased)
+- [0.27.0 — Operability, Observability & DR](#0270--operability-observability--dr)
 - [0.26.0 — Test & Concurrency Hardening](#0260--test--concurrency-hardening)
 - [0.25.0 — Scheduler Scalability & Pooler Performance](#0250--scheduler-scalability--pooler-performance)
 - [0.24.0 — Join Correctness & Durability Hardening](#0240--join-correctness--durability-hardening)
@@ -45,6 +46,74 @@ For future plans and upcoming features, see [ROADMAP.md](ROADMAP.md).
 ---
 
 ## [Unreleased]
+
+---
+
+## [0.27.0] — Operability, Observability & DR
+
+### Highlights
+
+- **Stream table snapshots**: Export and restore stream table content with
+  full frontier alignment for zero-downtime replica bootstrap and PITR workflows.
+- **Predictive schedule planner**: Data-driven refresh schedule recommendations
+  using the cost-model history with MAD-based confidence scoring.
+- **Cluster-wide observability**: Per-database worker allocation from shared
+  memory; per-DB labels on all Prometheus metrics for multi-tenant Grafana dashboards.
+- **pgrx 0.18.0 upgrade**: Updated from pgrx 0.17.0 with full test suite validation.
+- **Metrics server hardening**: OpenMetrics conformance, typed port-conflict errors,
+  malformed-HTTP 400 responses, and a new `metrics_summary()` SQL function.
+
+### New SQL Functions
+
+| Function | Description |
+|----------|-------------|
+| `pgtrickle.snapshot_stream_table(name, target)` | SNAP-1: Export stream table to archival table |
+| `pgtrickle.restore_from_snapshot(name, source)` | SNAP-2: Rehydrate from snapshot; aligns frontier |
+| `pgtrickle.list_snapshots(name)` | SNAP-3: List snapshots with size and frontier info |
+| `pgtrickle.drop_snapshot(snapshot_table)` | SNAP-3: Drop archival table and catalog row |
+| `pgtrickle.recommend_schedule(name)` | PLAN-1: JSONB schedule recommendation with confidence |
+| `pgtrickle.schedule_recommendations()` | PLAN-2: Set-returning; all STs sortable by delta_pct |
+| `pgtrickle.cluster_worker_summary()` | CLUS-1: Per-DB worker counts from shmem + pg_stat_activity |
+| `pgtrickle.metrics_summary()` | METR-3: Cluster-wide refresh/error counters for Grafana |
+
+### New GUCs
+
+| GUC | Default | Description |
+|-----|---------|-------------|
+| `pg_trickle.schedule_recommendation_min_samples` | `20` | Minimum history samples before non-zero confidence |
+| `pg_trickle.schedule_alert_cooldown_seconds` | `300` | Debounce window for `predicted_sla_breach` alerts |
+| `pg_trickle.metrics_request_timeout_ms` | `5000` | Metrics server request handler timeout (ms) |
+
+### New Alert Events
+
+- **`predicted_sla_breach`** (PLAN-3): Emitted when the cost model predicts the
+  next refresh will exceed `freshness_deadline_ms` by > 20%. Debounced by
+  `pg_trickle.schedule_alert_cooldown_seconds`.
+
+### Improvements
+
+- **CLUS-2**: All Prometheus metrics now include `db_oid` and `db_name` labels
+  for per-database Grafana panels in multi-tenant deployments.
+- **METR-1**: Added OpenMetrics format conformance unit tests.
+- **METR-2**: `MetricsServer::start()` now returns typed `MetricsServerError::PortInUse`
+  when the configured port is already bound (instead of silently failing).
+- **METR-4**: Metrics HTTP server returns `400 Bad Request` for malformed
+  requests (previously returned `404 Not Found`).
+
+### Documentation
+
+- **`docs/integrations/multi-tenant.md`** (new): Multi-DB deployment guide
+  with quota formula, Prometheus config, and Grafana snippets.
+- **`docs/SCALING.md`**: Added "Cluster-wide Worker Fairness" section.
+- **`docs/BACKUP_AND_RESTORE.md`**: Added snapshot API workflow documentation.
+- **`docs/PATTERNS.md`**: Added "Replica Bootstrap & PITR Alignment" section.
+
+### Dependencies
+
+- pgrx upgraded from `0.17.0` to `0.18.0`. Removed the `pgrx_embed` binary
+  target (no longer needed in pgrx 0.18.x). Added `FlushErrorState`,
+  `CCRandomGenerateBytes`, and `message_level_is_interesting` stubs to
+  `scripts/pg_stub.c` for unit test compatibility.
 
 ---
 

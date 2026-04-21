@@ -68,6 +68,9 @@ pub enum AlertEvent {
     /// STAB-3 / PH-E2: Delta MERGE spilled to temp files, exceeding the
     /// configured `pg_trickle.spill_threshold_blocks` for consecutive refreshes.
     SpillThresholdExceeded,
+    /// PLAN-3 (v0.27.0): Cost model predicts next refresh will exceed the
+    /// ST's `freshness_deadline_ms` SLA by > 20%.
+    PredictedSlaBreach,
 }
 
 impl AlertEvent {
@@ -89,6 +92,7 @@ impl AlertEvent {
             AlertEvent::CleanupFailure => "cleanup_failure",
             AlertEvent::NoUpstreamChanges => "no_upstream_changes",
             AlertEvent::SpillThresholdExceeded => "spill_threshold_exceeded",
+            AlertEvent::PredictedSlaBreach => "predicted_sla_breach",
         }
     }
 }
@@ -664,12 +668,21 @@ pub(crate) fn collect_metrics_text() -> String {
 
     let mut out = String::with_capacity(4096);
 
+    // CLUS-2 (v0.27.0): Resolve current database OID and name for per-DB labels
+    let (db_oid, db_name) = crate::api::cluster::current_db_labels();
+    let db_oid_str = db_oid
+        .map(|o| o.to_string())
+        .unwrap_or_else(|| "0".to_string());
+    let db_name_str = db_name.as_deref().unwrap_or("unknown").replace('"', "\\\"");
+
     // Version metadata
     out.push_str("# HELP pg_trickle_info pg_trickle extension information\n");
     out.push_str("# TYPE pg_trickle_info gauge\n");
     out.push_str(&format!(
-        "pg_trickle_info{{version=\"{}\"}} 1\n",
-        env!("CARGO_PKG_VERSION")
+        "pg_trickle_info{{version=\"{}\",db_oid=\"{}\",db_name=\"{}\"}} 1\n",
+        env!("CARGO_PKG_VERSION"),
+        db_oid_str,
+        db_name_str
     ));
 
     // Per-ST metrics
@@ -693,7 +706,10 @@ pub(crate) fn collect_metrics_text() -> String {
     out.push_str("# TYPE pg_trickle_active gauge\n");
 
     for (name, schema, status, successful, failed, total_rows, errors) in &rows {
-        let labels = format!("schema=\"{schema}\",name=\"{name}\"");
+        // CLUS-2: include db_oid and db_name labels on every per-ST metric
+        let labels = format!(
+            "schema=\"{schema}\",name=\"{name}\",db_oid=\"{db_oid_str}\",db_name=\"{db_name_str}\""
+        );
         out.push_str(&format!(
             "pg_trickle_refreshes_total{{{labels}}} {successful}\n"
         ));

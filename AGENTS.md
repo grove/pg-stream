@@ -2,7 +2,7 @@
 
 ## Project Overview
 
-PostgreSQL 18 extension written in Rust using **pgrx 0.17.x** that implements
+PostgreSQL 18 extension written in Rust using **pgrx 0.18.x** that implements
 streaming tables with incremental view maintenance (differential dataflow).
 Targets PostgreSQL 18.x.
 

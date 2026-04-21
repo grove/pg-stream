@@ -1045,6 +1045,28 @@ pub static PGS_TEMPLATE_CACHE_MAX_ENTRIES: GucSetting<i32> = GucSetting::<i32>::
 /// Recommended value: 104857600 (100 MB).
 pub static PGS_PUBLICATION_LAG_WARN_BYTES: GucSetting<i32> = GucSetting::<i32>::new(0);
 
+// ── v0.27.0 GUCs ──────────────────────────────────────────────────────────
+
+/// PLAN-1/PLAN-4 (v0.27.0): Minimum number of cost-model observations required
+/// before `recommend_schedule()` returns a non-trivial recommendation.
+///
+/// When fewer samples are available, `confidence` is returned as 0.0 and
+/// the recommendation fields are NULL or conservative defaults.
+pub static PGS_SCHEDULE_RECOMMENDATION_MIN_SAMPLES: GucSetting<i32> = GucSetting::<i32>::new(20);
+
+/// PLAN-3/PLAN-4 (v0.27.0): Minimum interval (seconds) between consecutive
+/// `predicted_sla_breach` alerts for the same stream table.
+///
+/// Prevents alert spam when the cost model consistently predicts SLA breach.
+/// Set to 0 to disable debouncing (fire on every tick).
+pub static PGS_SCHEDULE_ALERT_COOLDOWN_SECONDS: GucSetting<i32> = GucSetting::<i32>::new(300);
+
+/// METR-2 (v0.27.0): Maximum time (milliseconds) allowed for a single metrics
+/// HTTP request handler to complete before the connection is closed.
+///
+/// Protects the scheduler from a slow client stalling the tick loop.
+pub static PGS_METRICS_REQUEST_TIMEOUT_MS: GucSetting<i32> = GucSetting::<i32>::new(5000);
+
 /// #536: Frontier holdback mode enum.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FrontierHoldbackMode {
@@ -2117,6 +2139,45 @@ pub fn register_gucs() {
         &PGS_PUBLICATION_LAG_WARN_BYTES,
         0,             // min (0 = disabled)
         2_147_483_647, // max
+        GucContext::Suset,
+        GucFlags::default(),
+    );
+
+    // ── v0.27.0 GUCs ──────────────────────────────────────────────────────
+
+    GucRegistry::define_int_guc(
+        c"pg_trickle.schedule_recommendation_min_samples",
+        c"PLAN-4: Minimum cost-model observations before recommend_schedule() returns a recommendation.",
+        c"When fewer than this many refresh cycles have been recorded for a stream table, \
+           recommend_schedule() returns confidence=0.0. Raise this for better accuracy; \
+           lower it to get early recommendations.",
+        &PGS_SCHEDULE_RECOMMENDATION_MIN_SAMPLES,
+        1,    // min
+        1000, // max
+        GucContext::Suset,
+        GucFlags::default(),
+    );
+
+    GucRegistry::define_int_guc(
+        c"pg_trickle.schedule_alert_cooldown_seconds",
+        c"PLAN-3: Minimum seconds between consecutive predicted_sla_breach alerts for the same ST.",
+        c"Debounces the spike-forecast alert so operators are not spammed when the cost model \
+           consistently predicts an SLA breach. Set to 0 to disable debouncing.",
+        &PGS_SCHEDULE_ALERT_COOLDOWN_SECONDS,
+        0,      // min (0 = disabled)
+        86_400, // max (1 day)
+        GucContext::Suset,
+        GucFlags::default(),
+    );
+
+    GucRegistry::define_int_guc(
+        c"pg_trickle.metrics_request_timeout_ms",
+        c"METR-2: Maximum milliseconds for a single metrics HTTP request handler.",
+        c"When the metrics endpoint takes longer than this to respond, the connection \
+           is dropped. Protects the scheduler tick loop from slow HTTP clients.",
+        &PGS_METRICS_REQUEST_TIMEOUT_MS,
+        0,       // min (0 = no timeout)
+        600_000, // max (10 minutes)
         GucContext::Suset,
         GucFlags::default(),
     );
