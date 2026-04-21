@@ -410,9 +410,11 @@ The graph transitions to show individual nodes within that scope:
 Breadcrumb at top allows navigation back to Level 0. Individual
 nodes show their staleness badges and SLA colours inline.
 
-For **small deployments** (all objects in `public`, no relay), Level 0
-and Level 1 collapse into a single flat graph showing all nodes
-directly — no extra clicks needed.
+**Single-schema auto-navigation.** When only one schema exists, the
+topology opens directly at Level 1. The breadcrumb still renders
+`Systems > <schema>` so the user can navigate back to Level 0 and
+discover the grouping model — useful when they later add a second
+schema.
 
 **Overlays on the graph canvas:**
 

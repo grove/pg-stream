@@ -523,9 +523,12 @@ table nodes appear with their status badges.
 full pipeline detail — every node from source to sink with staleness,
 buffer depth, SLA budget.
 
-For **small deployments** (all objects in `public`, no relay), Level 0
-and Level 1 collapse into a single flat graph showing all nodes
-directly.
+**Single-schema auto-navigation.** If the deployment has only one
+schema, the topology automatically opens at Level 1 (the schema
+detail view) rather than stopping at a Level 0 with a single node.
+The breadcrumb always shows `Systems > <schema>` so the user can
+navigate back to Level 0, see that schemas are the grouping unit,
+and understand how a second schema would appear.
 
 **Node types and visual encoding:**
 
@@ -1261,10 +1264,10 @@ those two schemas.
 detail (every node with staleness, buffer depth, SLA). Same as the
 pipeline detail view.
 
-**Fallback for no grouping.** If all objects are in the `public` schema
-and no relay connections are configured, the topology renders a flat
-graph with all individual nodes directly. No extra clicks required for
-small deployments.
+**Single-schema auto-navigation.** If only one schema exists, the
+topology opens directly at Level 1. The breadcrumb always renders
+`Systems > <schema>` so the user can click back to Level 0 and
+discover that schemas are the grouping primitive.
 
 **Why schemas only, not a custom grouping table.** Schemas are
 PostgreSQL's native organizational primitive. They align with dbt's
