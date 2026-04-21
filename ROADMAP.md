@@ -7171,6 +7171,19 @@ Phase 1–5 DVM code changes and the TPC-H scaling investigation. Items marked
 
 > **Metrics hardening subtotal: ~4 days**
 
+### Dependency Upgrades
+
+> **In plain terms:** pgrx 0.18.0 updates the proc-macro and SPI interfaces.
+> This item upgrades the dependency, audits all `pg_sys::*` call sites for
+> breaking changes, and validates the full test suite under the new version.
+
+| Item | Description | Effort | Ref |
+|------|-------------|--------|-----|
+| DEP-1 | **pgrx 0.17.0 → 0.18.0 upgrade.** Bump `pgrx` and `pgrx-tests` in `Cargo.toml`; run `cargo pgrx init` for the target PG 18 version; resolve any API breakage in proc-macro annotations, SPI call sites, memory-context helpers, and `pg_sys::*` usages. | 1–2d | — |
+| DEP-2 | **Full test suite validation.** Run `just test-all` under pgrx 0.18.0; fix any regressions. Update `AGENTS.md` pgrx version reference. | 0.5d | — |
+
+> **Dependency upgrades subtotal: ~1.5–2.5 days**
+
 ### Implementation Phases
 
 | Phase | Description | Duration |
@@ -7179,9 +7192,10 @@ Phase 1–5 DVM code changes and the TPC-H scaling investigation. Items marked
 | Phase 2 | Predictive planner: `recommend_schedule`, `schedule_recommendations`, spike-forecast alert, tests | Days 6–11.5 |
 | Phase 3 | Cluster observability: `cluster_worker_summary`, per-DB labels, multi-tenant docs, SCALING.md | Days 11.5–15.5 |
 | Phase 4 | Metrics hardening: OpenMetrics conformance, port-conflict tests, aggregation view, malformed-HTTP handler | Days 15.5–19.5 |
-| Phase 5 | Integration testing, upgrade script, documentation review | Days 19.5–22 |
+| Phase 5 | Dependency upgrades: pgrx 0.18.0, full test-suite validation | Days 19.5–21.5 |
+| Phase 6 | Integration testing, upgrade script, documentation review | Days 21.5–24 |
 
-> **v0.29.0 total: ~3–4 weeks** (~22 person-days solo)
+> **v0.29.0 total: ~3–4 weeks** (~24 person-days solo)
 
 **Exit criteria:**
 - [ ] SNAP-1: `snapshot_stream_table()` creates archival table with correct frontier and row data
@@ -7201,6 +7215,8 @@ Phase 1–5 DVM code changes and the TPC-H scaling investigation. Items marked
 - [ ] METR-2: Port-conflict test returns `MetricsServerError::PortInUse`; timeout test returns `MetricsServerError::Timeout`
 - [ ] METR-3: `metrics_summary()` returns aggregated counters; Grafana cluster-overview query documented
 - [ ] METR-4: Malformed HTTP request returns 400 Bad Request; no panic
+- [ ] DEP-1: pgrx bumped to 0.18.0; all API breakage resolved; extension builds clean
+- [ ] DEP-2: `just test-all` passes under pgrx 0.18.0; `AGENTS.md` pgrx version reference updated
 - [ ] Extension upgrade path tested (`0.28.0 → 0.29.0`)
 - [ ] `just check-version-sync` passes
 
