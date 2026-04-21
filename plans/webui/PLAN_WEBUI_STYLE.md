@@ -29,13 +29,13 @@
   - [Breadcrumbs](#breadcrumbs)
 - [Screen Layouts](#screen-layouts)
   - [Landing: Topology Graph](#landing-topology-graph)
-  - [Stream Table List](#stream-table-list)
+  - [Pipelines List](#pipelines-list)
+  - [Pipeline Detail](#pipeline-detail)
   - [Stream Table Detail](#stream-table-detail)
   - [SLA Budget Dashboard](#sla-budget-dashboard)
   - [Health Scorecard](#health-scorecard)
   - [Refresh Timeline](#refresh-timeline)
-  - [Relay Pipelines](#relay-pipelines)
-  - [Alerts Feed](#alerts-feed)
+  - [Alerts & Activity Feed](#alerts--activity-feed)
   - [SQL Preview Modal](#sql-preview-modal)
 - [Responsive Behaviour](#responsive-behaviour)
 - [Accessibility](#accessibility)
@@ -259,18 +259,20 @@ Two font families, strictly separated by purpose:
 Left sidebar, collapsible to icons-only. Fixed-position, does not
 scroll with page content. Width: 240 px expanded, 48 px collapsed.
 
+Four top-level items based on user intent, not internal subsystems.
+CDC, fuses, slots, and workers are operational details — they live
+under Health as sub-sections, not as top-level navigation.
+
 ```
 ┌─────────────────────────────────────────────────────────┐
 │ [≡]  pg-trickle                          [dark/light ☾] │
 ├──────────────┬──────────────────────────────────────────┤
 │              │                                          │
 │  ◈ Topology  │         [main content area]              │
-│  ☰ Tables    │                                          │
-│  ⇄ Pipelines │                                          │
-│  ◉ CDC       │                                          │
-│  ♥ Health    │                                          │
-│  ▲ Alerts  3 │                                          │
-│  ⏱ Timeline  │                                          │
+│  ⇀ Pipelines │                                          │
+│  ♥ Health  2 │                                          │
+│  ▲ Activity 3│                                          │
+│              │                                          │
 │              │                                          │
 │              │                                          │
 │              │                                          │
@@ -285,12 +287,9 @@ scroll with page content. Width: 240 px expanded, 48 px collapsed.
 | Item | Icon | Badge | Target |
 |------|------|-------|--------|
 | Topology | Graph icon | — | `/ui/topology` (landing) |
-| Tables | Table icon | Count of tables in breach | `/ui/tables` |
-| Pipelines | Arrow-right-left icon | Count of disconnected | `/ui/pipelines` |
-| CDC | Database icon | Count of unhealthy sources | `/ui/cdc` |
-| Health | Heart icon | Count of critical checks | `/ui/health` |
-| Alerts | Bell icon | Count of unread alerts | `/ui/alerts` |
-| Timeline | Clock icon | — | `/ui/timeline` |
+| Pipelines | Arrow-right-left icon | Count of flows in breach | `/ui/pipelines` |
+| Health | Heart icon | Count of critical + warning checks | `/ui/health` |
+| Activity | Bell icon | Count of unread alerts | `/ui/activity` |
 | Settings | Gear icon (bottom-pinned) | — | `/ui/settings` |
 
 The sidebar uses Lucide icons (included with shadcn/ui). Badges on nav
@@ -310,16 +309,15 @@ Next.js App Router with the following route structure:
 /ui                         → redirect to /ui/topology
 /ui/topology                → Topology graph (landing page)
 /ui/topology?focus=<name>   → Topology with node highlighted
-/ui/tables                  → Stream table list
-/ui/tables/[name]           → Stream table detail (tabbed)
+/ui/topology?focus=<name>&depth=2 → Scoped neighbourhood graph
+/ui/pipelines               → Pipelines (end-to-end flows) list
+/ui/pipelines/[id]          → Pipeline detail (ordered node list)
+/ui/pipelines/[id]/[name]   → Stream table detail within a pipeline
+/ui/tables/[name]           → Stream table detail (standalone, for deep links)
 /ui/tables/[name]/lineage   → Column-level lineage (full page)
 /ui/tables/[name]/operators → DVM operator inspector (full page)
-/ui/pipelines               → Relay pipeline list
-/ui/pipelines/[id]          → Pipeline detail
-/ui/cdc                     → CDC sources + buffers + slots
-/ui/health                  → Health scorecard
-/ui/alerts                  → Alerts feed (paginated, filterable)
-/ui/timeline                → Refresh timeline chart
+/ui/health                  → Health scorecard (CDC, fuses, slots, workers as sub-sections)
+/ui/activity                → Alerts + refresh timeline (tabbed or stacked)
 /ui/settings                → Configuration view
 ```
 
@@ -328,10 +326,10 @@ Next.js App Router with the following route structure:
 Displayed at the top of the content area, below the page heading:
 
 ```
-Topology                          ← no breadcrumb (root page)
-Tables > revenue_7d               ← table detail
-Tables > revenue_7d > Lineage     ← column lineage deep page
-Pipelines > kafka-forward-1       ← pipeline detail
+Topology                                  ← no breadcrumb (root page)
+Pipelines > orders → analytics            ← pipeline detail
+Pipelines > orders → analytics > revenue_7d ← table detail within a pipeline
+Health > CDC Sources                      ← health sub-section
 ```
 
 Breadcrumbs use `text-sm text-muted-foreground` with `>` separators.
@@ -374,34 +372,73 @@ shifts/compresses to accommodate. The sheet shows:
 
 Clicking "View detail →" navigates to the full detail page.
 
-### Stream Table List
+### Pipelines List
+
+The primary list view. Shows end-to-end data flows derived from the
+DAG, sorted worst-first by default.
 
 ```
 ┌──────────────────────────────────────────────────────────────┐
-│  Stream Tables                                    [search 🔍] │
+│  Pipelines                                      [search 🔍] │
+│                    [All ▼] [Mode: All ▼] [SLA: All ▼]     │
 ├──────────────────────────────────────────────────────────────┤
-│  Name           Mode    Staleness   Buffer   SLA     Trend  │
-│  ─────────────  ──────  ──────────  ───────  ──────  ─────  │
-│  revenue_7d     DIFF    12s / 60s   0        ██░ 20% ↔      │
-│  regional_sum   DIFF    45s / 60s   1,204    ████ 75% ↑     │
-│  orders_hourly  FULL    61s / 60s   8,102    █████ 🔴 ↑     │
-│  customer_agg   DIFF    3s / 30s    0        █░ 10%  ↔      │
-│  ...                                                         │
+│  Flow                  Nodes  E2E Lag    SLA      Status  │
+│  ───────────────────  ─────  ─────────  ───────  ────── │
+│  orders → regional_sum  5      45s        ████ 75% 🟡     │
+│  Kafka → analytics      3      12s        ██░ 20%  🟢     │
+│  events → NATS          2      3s         █░ 10%   🟢     │
+│  customers (orphan)     1      0s         ─         ─     │
+│  ...                                                      │
 ├──────────────────────────────────────────────────────────────┤
-│  Showing 12 of 12 stream tables        [< 1 2 3 >]          │
+│  8 flows                                                  │
 └──────────────────────────────────────────────────────────────┘
 ```
 
-- **Sortable columns:** Click any header to sort. Default: SLA budget
-  descending (worst first — problems at the top).
-- **Row click:** Navigates to detail page.
-- **Name column:** Monospace. Prefixed with schema if not `public`.
-- **Mode column:** `DIFF` badge (green) or `FULL` badge (amber).
-- **SLA column:** Progress bar using semantic status colours. Text shows
-  percentage consumed.
-- **Trend column:** Arrow icon (↑ burning, ↔ stable, ↓ recovering).
-- **Search:** Filters by table name, schema, or refresh mode. Debounced
-  client-side filter (no API call — the full table list is small).
+- **Flow column:** Source → sink shorthand. Monospace.
+- **Nodes column:** Count of stream tables + relay connectors in the path.
+- **E2E Lag:** Cumulative staleness from source to sink.
+- **SLA column:** Progress bar of the worst node in the flow.
+- **Status column:** Coloured dot (green/amber/red) for quick scanning.
+- **Sortable columns:** Default sort by SLA budget descending (worst
+  first — problems at the top).
+- **Row click:** Navigates to pipeline detail.
+- **Faceted filters:** Schema, refresh mode (DIFF/FULL), SLA status
+  (healthy/warning/breach).
+- **Search:** Matches any node name in the flow.
+
+### Pipeline Detail
+
+Ordered list of every node in the flow, from source to sink.
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│  ← Pipelines                                               │
+│  orders → regional_summary             [View in Topology]  │
+│  ● Warning · 5 nodes · E2E lag: 45s                         │
+├──────────────────────────────────────────────────────────────┤
+│                                                            │
+│  ○ orders (base table)          CDC: trigger · 0 buffer    │
+│  │                                                        │
+│  ● orders_raw (stream, DIFF)    3s stale · 0 buffer       │
+│  │                                                        │
+│  ● revenue_7d (stream, DIFF)    12s stale · 0 buffer      │
+│  │                                                        │
+│  ● regional_summary (stream)    45s stale · 1,204 buffer  │
+│  │                                        ⚠️ SLA 75%       │
+│  ○ NATS:analytics (relay fwd)   ● Connected · 0 lag        │
+│                                                            │
+└──────────────────────────────────────────────────────────────┘
+```
+
+- Each node row is clickable → opens stream table detail (inline
+  expand or navigate to `/ui/pipelines/[id]/[name]`).
+- "View in Topology" button opens the topology graph focused on this
+  flow's nodes.
+- The vertical line connecting nodes visualizes the flow direction.
+- Nodes are annotated with: type (base/stream/relay), refresh mode,
+  staleness, buffer depth, SLA status.
+- Cumulative lag builds up visually down the list — you can see where
+  in the chain the latency is added.
 
 ### Stream Table Detail
 
@@ -496,7 +533,8 @@ Compact — no cards, no whitespace waste.
 
 ### Refresh Timeline
 
-Full-width ECharts time-series. Controls above the chart.
+Full-width ECharts time-series. Lives on the Activity page as a
+prominent section above the alerts feed. Controls above the chart.
 
 ```
 ┌──────────────────────────────────────────────────────────────┐
@@ -526,30 +564,11 @@ Full-width ECharts time-series. Controls above the chart.
 - Brush zoom: click-drag to zoom into a time range
 - Table filter: dropdown to show one table or all
 
-### Relay Pipelines
+### Alerts & Activity Feed
 
-```
-┌──────────────────────────────────────────────────────────────┐
-│  Relay Pipelines                              [+ New] (Tier 2)│
-├──────────────────────────────────────────────────────────────┤
-│  Forward Pipelines                                            │
-│  Name             Backend   Status       Lag       Throughput │
-│  ──────────────   ───────   ──────────   ───────   ────────  │
-│  kafka-analytics  Kafka     ● Connected  0 rows    1.2k/s    │
-│  nats-events      NATS      ● Connected  342 rows  450/s     │
-│                                                               │
-│  Reverse Pipelines                                            │
-│  Name             Backend   Status       Buffer    Throughput │
-│  ──────────────   ───────   ──────────   ───────   ────────  │
-│  kafka-orders     Kafka     ● Connected  0 rows    800/s     │
-└──────────────────────────────────────────────────────────────┘
-```
-
-Grouped by direction (forward/reverse). Each row click opens detail
-panel. Backend column shows an icon for the backend type (Kafka, NATS,
-Redis, etc.).
-
-### Alerts Feed
+Merges alerts and refresh timeline into a single Activity page
+(two tabs, or stacked with the timeline above and the alerts feed
+below).
 
 ```
 ┌──────────────────────────────────────────────────────────────┐
@@ -626,9 +645,9 @@ human review layer for LLM-generated SQL.
 
 **Phone priority pages** (the views an SRE on-call actually needs):
 1. Health scorecard
-2. Alerts feed
-3. SLA budget overview
-4. Stream table list (simplified)
+2. Alerts feed (Activity page)
+3. SLA budget overview (Pipelines, sorted worst-first)
+4. Pipeline detail (simplified)
 
 The topology graph on phone is a "view-only, pinch-zoom" experience —
 useful for a quick glance but not for exploration. A "View on desktop"

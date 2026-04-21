@@ -26,6 +26,7 @@
   - [Tier 2 — Relay Pipeline Management](#tier-2--relay-pipeline-management)
   - [Tier 3 — Stream Table Wizard & Full Setup](#tier-3--stream-table-wizard--full-setup)
 - [Key Features — Detailed Design](#key-features--detailed-design)
+  - [Pipelines (End-to-End Flows)](#pipelines-end-to-end-flows)
   - [Unified Topology Graph](#unified-topology-graph)
   - [SLA Budget & Lag Monitoring](#sla-budget--lag-monitoring)
   - [DVM Operator Inspector](#dvm-operator-inspector)
@@ -246,6 +247,11 @@ guarantees from Phase 0. Breaking changes require a version bump
 and automation scripts depend on predictable schemas.
 
 ```
+# Flows — end-to-end data paths derived from the DAG
+GET  /api/v1/flows                      All end-to-end flows (source → sink paths)
+GET  /api/v1/flows/:id                  Single flow detail (all nodes in the path)
+
+# Stream tables
 GET  /api/v1/tables                     Stream table list + status
 GET  /api/v1/tables/:name               Detail view for one stream table
 GET  /api/v1/tables/:name/history       Refresh history
@@ -253,31 +259,41 @@ GET  /api/v1/tables/:name/lineage       Column-level lineage
 GET  /api/v1/tables/:name/operator-tree DVM operator tree (DOT format)
 GET  /api/v1/tables/:name/sample        Sample rows (LIMIT 50)
 
+# Health (aggregates CDC, fuses, slots, workers, relay status)
 GET  /api/v1/health                     Health scorecard
 GET  /api/v1/health/checks              Individual health checks
+
+# DAG / topology
 GET  /api/v1/dag                        Full DAG (nodes + edges + metadata)
 GET  /api/v1/dag/topology               Extended DAG with relay nodes
 
+# Relay connectors
 GET  /api/v1/relay/pipelines            All relay pipelines (forward + reverse)
 GET  /api/v1/relay/pipelines/:id        Single pipeline detail
 GET  /api/v1/relay/pipelines/:id/lag    Lag metrics for a pipeline
 
+# Operational detail (sub-resources of Health in the UI)
 GET  /api/v1/cdc/sources                CDC source table status
 GET  /api/v1/cdc/buffers                Change buffer sizes
 GET  /api/v1/cdc/slots                  Replication slot health
-
 GET  /api/v1/scheduler/workers          Worker pool status
 GET  /api/v1/scheduler/jobs             Job queue depth
 GET  /api/v1/fuses                      Fuse/circuit-breaker state
 
+# Activity
 GET  /api/v1/timeline                   Refresh timeline (time-series)
 GET  /api/v1/alerts                     Recent alerts (paginated)
 
+# Write operations
 POST /api/v1/sql/preview                Validate SQL, return DVM analysis
 POST /api/v1/sql/execute                Execute SQL (with auth check)
 POST /api/v1/fuses/:name/reset          Reset a blown fuse
 POST /api/v1/tables/:name/refresh       Trigger manual refresh
 ```
+
+The CDC, fuse, scheduler, and slot endpoints remain in the API for
+programmatic access and the Health page's drill-down views. They are
+not top-level navigation items in the WebUI — they live under Health.
 
 Every write endpoint (`POST`) requires authentication in `pg` and `oidc`
 modes. In `none` mode, writes use the relay's PG connection.
@@ -421,6 +437,56 @@ writing SQL manually.
 ---
 
 ## Key Features — Detailed Design
+
+### Pipelines (End-to-End Flows)
+
+The primary navigational concept in the WebUI. A **pipeline** (also
+called a **flow**) is an end-to-end data path derived from the DAG:
+every maximal path from a leaf source (base table or relay reverse
+input) to a leaf sink (stream table with no dependents, or relay
+forward output).
+
+```
+Kafka:orders → orders_raw → revenue_7d → regional_summary → NATS:analytics
+```
+
+That is one pipeline. pg-trickle doesn't store pipelines as a formal
+object — they are computed at query time from the DAG. The
+`GET /api/v1/flows` endpoint returns all maximal source-to-sink paths,
+each with:
+
+- A stable ID (hash of the node sequence)
+- The ordered list of nodes in the path
+- Aggregate SLA status (worst node determines the flow's status)
+- End-to-end latency (cumulative staleness from source to sink)
+- Throughput (minimum throughput across edges — the bottleneck)
+
+**Why pipelines instead of tables or relay connectors as the list view:**
+Users think in terms of data flows, not individual nodes. "Is my
+orders-to-analytics flow healthy?" is a more natural question than
+"Is `regional_summary` healthy?" The pipeline view answers the first
+question directly. Individual node detail (stream table stats, relay
+connector config) is accessed by clicking a node within a pipeline.
+
+A stream table that appears in multiple flows (e.g., a shared dimension
+table like `customers`) appears in multiple pipeline rows — correctly
+reflecting its operational blast radius.
+
+**Orphan tables** (stream tables with no downstream consumers and no
+upstream relay source) appear as single-node pipelines. This makes
+orphans visible rather than hidden.
+
+The **Pipelines** page is the list/tabular view of the same information
+that the **Topology** page shows spatially. Two views of the same data,
+optimized for different tasks:
+
+| Task | Best view |
+|---|---|
+| Understand system architecture | Topology (graph) |
+| Find the flow breaching SLA | Pipelines (sorted by worst SLA) |
+| Trace data from source to sink | Pipeline detail (ordered node list) |
+| Filter by refresh mode or schema | Pipelines list with faceted filters |
+| See end-to-end latency | Pipeline detail (cumulative lag) |
 
 ### Unified Topology Graph
 
@@ -1118,6 +1184,54 @@ transport: Streamable HTTP (HTTP+SSE). This is the simplest,
 most firewall-friendly option and covers remote agents, CI/CD
 pipelines, and browser-based tools. stdio transport (for local agents)
 and raw WebSocket can be added later if needed.
+
+### OQ-12: Large-deployment UI scalability
+
+pg-trickle can scale to 1000+ stream tables. The WebUI's topology
+graph and list views must handle this, but the right approach is an
+open design question.
+
+**Industry precedent:** No comparable tool shows a global topology
+graph at scale. RisingWave's relation graph breaks above ~100 nodes.
+Snowflake and Databricks both use **per-object lineage** (click a
+table → see its upstream/downstream) rather than a global graph, plus
+hierarchical browsing and search for discovery.
+
+The pattern across all three:
+
+| Concern | How they solve it |
+|---|---|
+| Discovery | Search + filter + hierarchical browse |
+| Understanding relationships | Per-object scoped lineage graph |
+| Global overview | Lists with status indicators, not graphs |
+| Scale | Pagination / virtual scroll + server-side filtering |
+
+**What we know:**
+
+- The global topology graph works well for small deployments (<50–100
+  nodes) and is the right landing page for them.
+- For large deployments, the primary navigation shifts to search +
+  pipeline list + per-object scoped lineage.
+- The API must support server-side filtering, pagination, and scoped
+  topology queries (`GET /api/v1/dag/topology?focus=<name>&depth=N`).
+- Virtual scrolling (`@tanstack/react-table`) handles 10k-row lists
+  in the browser.
+
+**Open sub-questions:**
+
+1. At what node count should the landing page switch from global graph
+   to pipeline list? (~50? ~100? User-configurable?)
+2. Should the global graph show a clustered/summarized view at scale
+   (collapsed groups with health badges) or simply not render?
+3. Should the scoped graph (per-object lineage) be a separate page or
+   a filtered state of the topology page
+   (`/ui/topology?focus=revenue_7d&depth=2`)?
+4. How should the search experience work — command palette, search bar
+   in sidebar, or both?
+
+This requires prototyping and user testing. The Tier 1 implementation
+should target the <100 node case (global graph + pipeline list). The
+large-deployment UX is a Tier 2 design task.
 
 ### OQ-11: Agent guardrails
 
