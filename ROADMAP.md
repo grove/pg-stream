@@ -1,6 +1,6 @@
 # pg_trickle — Project Roadmap
 
-> **Last updated:** 2026-04-19
+> **Last updated:** 2026-04-21
 > **Latest release:** 0.24.0 (2026-04-20)
 > **Current milestone:** v0.25.0 — Scheduler Scalability & Pooler Performance
 
@@ -46,13 +46,13 @@ coverage, all in plain language.
 - [v0.27.0 — Transactional Inbox & Outbox Patterns](#v0270--transactional-inbox--outbox-patterns)
 - [v0.28.0 — Relay CLI (`pgtrickle-relay`)](#v0280--relay-cli-pgtrickle-relay)
 - [v0.29.0 — Operability, Observability & DR](#v0290--operability-observability--dr)
-- [v1.6.0 — TUI Self-Monitoring Integration](#v160--tui-self-monitoring-integration)
+- [v1.0.0 — Stable Release](#v100--stable-release)
 - [v1.1.0 — PostgreSQL 17 Support](#v110--postgresql-17-support)
 - [v1.2.0 — PGlite Proof of Concept](#v120--pglite-proof-of-concept)
 - [v1.3.0 — Core Extraction (`pg_trickle_core`)](#v130--core-extraction-pg_trickle_core)
 - [v1.4.0 — PGlite WASM Extension](#v140--pglite-wasm-extension)
 - [v1.5.0 — PGlite Reactive Integration](#v150--pglite-reactive-integration)
-- [v1.0.0 — Stable Release](#v100--stable-release)
+- [v1.6.0 — TUI Self-Monitoring Integration](#v160--tui-self-monitoring-integration)
 - [Post-1.0 — Scale, Ecosystem & Platform Expansion](#post-10--scale-ecosystem--platform-expansion)
 <!-- TOC end -->
 
@@ -101,13 +101,13 @@ from the v0.1.x series to 1.0 and beyond.
 | v0.27.0 | Transactional inbox & outbox patterns | Planned |
 | v0.28.0 | Relay CLI (`pgtrickle-relay`) — bidirectional outbox→sinks + sources→inbox | Planned |
 | v0.29.0 | Operability, observability & DR — snapshot/PITR, schedule planner, cluster metrics | Planned |
-| v1.6.0 | TUI self-monitoring integration | Planned |
+| v1.0.0 | Stable release (incl. PG 19 compatibility) | Planned |
 | v1.1.0 | PostgreSQL 17 support | Planned |
 | v1.2.0 | PGlite proof of concept | Planned |
 | v1.3.0 | Core extraction (`pg_trickle_core`) | Planned |
 | v1.4.0 | PGlite WASM extension | Planned |
 | v1.5.0 | PGlite reactive integration | Planned |
-| v1.0.0 | Stable release (incl. PG 19 compatibility) | Planned |
+| v1.6.0 | TUI self-monitoring integration | Planned |
 
 ---
 
@@ -6433,6 +6433,9 @@ Phase 1–5 DVM code changes and the TPC-H scaling investigation. Items marked
 
 **Status: Released (2026-04-20).** Sourced from [PLAN_OVERALL_ASSESSMENT_2.md](plans/PLAN_OVERALL_ASSESSMENT_2.md) §3, §4, §6.
 
+<details>
+<summary>Completed items (click to expand)</summary>
+
 > **Release Theme**
 > This release closes the remaining **critical correctness bugs** and
 > **data-durability gaps** identified in the v0.23.0 deep assessment.
@@ -6519,6 +6522,8 @@ Phase 1–5 DVM code changes and the TPC-H scaling investigation. Items marked
 - [x] TEST-8: 10+ metrics_server.rs unit tests pass (port conflict, timeout, format)
 - [x] Extension upgrade path tested (`0.23.0 → 0.24.0`)
 - [x] `just check-version-sync` passes
+
+</details>
 
 ---
 
@@ -6932,7 +6937,7 @@ Phase 1–5 DVM code changes and the TPC-H scaling investigation. Items marked
 - [ ] INBOX-B4: `inbox_is_my_partition(aggregate_id, worker_id, total_workers)` returns BOOLEAN; no messages lost across N workers; usable in prepared statements without SQL interpolation
 - [ ] SHARED-B3: Ordered inbox E2E: 10 out-of-order arrivals per aggregate delivered to processor in order
 - [ ] SHARED-B4: dbt adapter updated with consumer group and inbox ordering properties
-- [ ] Extension upgrade path tested (`0.26.0 → 0.27.0`) — `sql/pg_trickle--0.23.0--0.24.0.sql` validated by `scripts/check_upgrade_completeness.sh`
+- [ ] Extension upgrade path tested (`0.26.0 → 0.27.0`) — `sql/pg_trickle--0.26.0--0.27.0.sql` validated by `scripts/check_upgrade_completeness.sh`
 - [ ] `just check-version-sync` passes
 
 ---
@@ -7076,7 +7081,7 @@ Phase 1–5 DVM code changes and the TPC-H scaling investigation. Items marked
 - [ ] RELAY-30: Reverse config: event type extraction + column mapping works
 - [ ] RELAY-31: All reverse Testcontainers integration tests pass per source
 - [ ] RELAY-32: Reverse dedup: duplicate source message produces 1 inbox row; crash recovery zero loss
-- [ ] Extension upgrade path tested (`0.23.0 → 0.24.0`)
+- [ ] Extension upgrade path tested (`0.27.0 → 0.28.0`)
 - [ ] `just check-version-sync` passes
 
 ---
@@ -7201,136 +7206,65 @@ Phase 1–5 DVM code changes and the TPC-H scaling investigation. Items marked
 
 ---
 
-## Post-1.0 Addendum — Cross-Cluster & Visual Tooling
+## v1.0.0 — Stable Release
 
-The following items from [PLAN_OVERALL_ASSESSMENT_2.md](plans/PLAN_OVERALL_ASSESSMENT_2.md) §7 are explicitly post-1.0 and are tracked here rather than in a numbered milestone:
+**Goal:** First officially supported release. Semantic versioning locks in.
+API, catalog schema, and GUC names are considered stable. Focus is
+distribution — getting pg_trickle onto package registries — and PostgreSQL 19
+forward-compatibility.
 
-| Item | Description | Priority | Ref |
-|------|-------------|----------|-----|
-| POST-XC | **Cross-cluster fan-out via `pgtrickle-relay`.** A relay mode that reads from one cluster's outbox and applies to another cluster's inbox. Optional CRDT-style conflict resolution for last-write-wins counters. Enables multi-region read-replica patterns without a full replication setup. | Medium | [PLAN_OVERALL_ASSESSMENT_2.md](plans/PLAN_OVERALL_ASSESSMENT_2.md) §7 |
-| POST-VIS | **GUI workflow designer + visual DAG editor.** Extend `pgtrickle-tui` with a visual DAG editor and an EXPLAIN-DIFF preview that shows the rewritten DVM SQL alongside expected delta size. Lowers on-boarding ramp for SQL developers unfamiliar with IVM semantics. | Medium | [PLAN_OVERALL_ASSESSMENT_2.md](plans/PLAN_OVERALL_ASSESSMENT_2.md) §7 |
+### PostgreSQL 19 Forward-Compatibility (A3)
 
----
-
-## v1.6.0 — TUI Self-Monitoring Integration
-
-**Status: Planned.** See [plans/ui/PLAN_TUI_PART_3.md](plans/ui/PLAN_TUI_PART_3.md) for the full design.
-
-> **Release Theme**
-> This release wires the v0.20.0 self-monitoring stream tables (`df_*`) into
-> the TUI, giving operators live visibility into anomaly signals, CDC buffer
-> trends, scheduling interference, and efficiency metrics — all driven by
-> the same incremental refresh engine. Alongside the new views, the TUI
-> architecture is refactored: `AppState` is split into 8 domain-scoped
-> sub-structs, polling becomes subscription-based (only active-view data is
-> fetched), and CLI/TUI command logic is unified into a shared domain layer.
-> Four backend enhancements (`DF-21`–`DF-24`) and two new CLI subcommands
-> complete the milestone.
->
-> See [plans/ui/PLAN_TUI_PART_3.md](plans/ui/PLAN_TUI_PART_3.md) for the
-> full architecture, feature specifications, and phased implementation plan.
-
-### Phase 1 — Architecture Foundation (T15–T16)
+> **In plain terms:** When PostgreSQL 19 beta stabilises and pgrx 0.18.x
+> ships with PG 19 support, this milestone bumps the pgrx dependency,
+> audits every internal `pg_sys::*` API call for breaking changes, adds
+> conditional compilation gates, and validates the WAL decoder against any
+> pgoutput format changes introduced in PG 19. Moved here from the
+> earlier v0.26.0 milestone because PG 19 beta availability is uncertain.
 
 | Item | Description | Effort | Ref |
 |------|-------------|--------|-----|
-| T15 | **AppState domain decomposition.** Split `AppState` into 8 domain structs: `StreamTableDomain`, `CdcDomain`, `DiagnosticsDomain`, `MonitoringDomain`, `SchedulingDomain`, `WatermarkDomain`, `ConfigDomain`, `DogFeedingDomain`. | 1d | [PLAN_TUI_PART_3.md](plans/ui/PLAN_TUI_PART_3.md) §T15 |
-| T15 | **Selective polling.** `DataSubscriptions::for_view()` gates Phase 2 queries behind the active view; reduces wasted queries on average. | 0.5d | [PLAN_TUI_PART_3.md](plans/ui/PLAN_TUI_PART_3.md) §T15 |
-| T15 | **Poller logic extraction.** Extract `poller/fetchers.rs` (21 `fetch_*()` functions) and `poller/updaters.rs` (21 `apply_*()` functions) for testability. | 1d | [PLAN_TUI_PART_3.md](plans/ui/PLAN_TUI_PART_3.md) §T15 |
-| T15 | **CLI/TUI command unification.** Introduce `commands/domain.rs` with shared logic for refresh, pause, resume, fuse reset, repair, and gate/ungate. | 0.5d | [PLAN_TUI_PART_3.md](plans/ui/PLAN_TUI_PART_3.md) §T15 |
-| T16 | **Dog-feeding data layer.** Add `DogFeedingDomain` state types, polling queries for all 5 `df_*` stream tables, fixture builders, and contract stubs. | 1d | [PLAN_TUI_PART_3.md](plans/ui/PLAN_TUI_PART_3.md) §T16 |
+| A3-1 | pgrx version bump to 0.18.x (PG 19 support) + `cargo pgrx init --pg19` | 2–4h | [PLAN_PG19_COMPAT.md](plans/infra/PLAN_PG19_COMPAT.md) §2 |
+| A3-2 | `pg_sys::*` API audit: heap access, catalog structs, WAL decoder `LogicalDecodingContext` | 8–16h | [PLAN_PG19_COMPAT.md](plans/infra/PLAN_PG19_COMPAT.md) §3 |
+| A3-3 | Conditional compilation (`#[cfg(feature = "pg19")]`) for changed APIs | 4–8h | [PLAN_PG19_COMPAT.md](plans/infra/PLAN_PG19_COMPAT.md) §4 |
+| A3-4 | CI matrix expansion for PG 19 + full E2E suite run | 4–8h | [PLAN_PG19_COMPAT.md](plans/infra/PLAN_PG19_COMPAT.md) |
 
-### Phase 2 — Self-Monitoring TUI Views (T17)
+> **A3 subtotal: ~18–36 hours**
 
-| Item | Description | Effort | Ref |
-|------|-------------|--------|-----|
-| TUI-1 | **Anomaly Detection view (`a` key).** New view showing `df_anomaly_signals` with severity colors, anomaly type, count, and first/last-seen timestamps. | 4h | [PLAN_TUI_PART_3.md](plans/ui/PLAN_TUI_PART_3.md) §TUI-1 |
-| TUI-2 | **Dashboard anomaly badge.** Status ribbon shows active anomaly count in red when `df_anomaly_signals` is non-empty. | 1h | [PLAN_TUI_PART_3.md](plans/ui/PLAN_TUI_PART_3.md) §TUI-2 |
-| TUI-3 | **CDC Health sparkline column.** Braille sparkline in CDC Health view showing buffer row-count trend from `df_cdc_buffer_trends`. | 3h | [PLAN_TUI_PART_3.md](plans/ui/PLAN_TUI_PART_3.md) §TUI-3 |
-| TUI-4 | **CDC Health spill-risk badge.** `⚠ spill` badge when `df_cdc_buffer_trends` growth rate extrapolates to a breach within 2 cycles. | 1h | [PLAN_TUI_PART_3.md](plans/ui/PLAN_TUI_PART_3.md) §TUI-4 |
-| TUI-5 | **Workers Interference sub-tab.** Second tab in Workers view showing `df_scheduling_interference` overlap pairs. | 3h | [PLAN_TUI_PART_3.md](plans/ui/PLAN_TUI_PART_3.md) §TUI-5 |
-| TUI-6 | **Workers scheduler overhead bar.** Busy-time ratio bar from `scheduler_overhead()` in the Workers view. | 1h | [PLAN_TUI_PART_3.md](plans/ui/PLAN_TUI_PART_3.md) §TUI-6 |
-| TUI-7 | **Dependencies Mermaid/DOT export (`x` key).** Scrollable overlay showing `explain_dag()` Mermaid output; `Ctrl+E` writes to file. | 2h | [PLAN_TUI_PART_3.md](plans/ui/PLAN_TUI_PART_3.md) §TUI-7 |
-| TUI-8 | **Header self-monitoring status badge.** `df:N/M` pill in the TUI header bar; turns amber on retention warning. | 1h | [PLAN_TUI_PART_3.md](plans/ui/PLAN_TUI_PART_3.md) §TUI-8 |
-| TUI-9 | **Command palette self-monitoring commands.** `self-monitoring enable / disable / status` in palette with confirmation dialogs. | 2h | [PLAN_TUI_PART_3.md](plans/ui/PLAN_TUI_PART_3.md) §TUI-9 |
-| TUI-10 | **Detail view anomaly summary.** Active anomaly count row in the Properties section of the detail overlay. | 1h | [PLAN_TUI_PART_3.md](plans/ui/PLAN_TUI_PART_3.md) §TUI-10 |
-| TUI-11 | **Refresh Log `[auto]` tag.** Annotate rows with `initiated_by = 'SELF_MONITOR'` in the Refresh Log view. | 1h | [PLAN_TUI_PART_3.md](plans/ui/PLAN_TUI_PART_3.md) §TUI-11 |
-| TUI-12 | **First-launch self-monitoring toast.** 10-second hint toast on first launch when self-monitoring is not set up. | 1h | [PLAN_TUI_PART_3.md](plans/ui/PLAN_TUI_PART_3.md) §TUI-12 |
-| TUI-13 | **Anomaly signals as Issues.** `detect_issues()` maps active anomaly signals to the Issues view with category "Anomaly". | 1h | [PLAN_TUI_PART_3.md](plans/ui/PLAN_TUI_PART_3.md) §TUI-13 |
-| TUI-14 | **`self_monitor_anomaly` alert styling.** Cyan `🔍` icon for anomaly alert type in the Alerts view. | 0.5h | [PLAN_TUI_PART_3.md](plans/ui/PLAN_TUI_PART_3.md) §TUI-14 |
-| TUI-15 | **Dashboard snapshot tests.** 5 snapshot branches: standard, wide, empty, anomalies-present, narrow. | 2h | [PLAN_TUI_PART_3.md](plans/ui/PLAN_TUI_PART_3.md) §TUI-15 |
-| TUI-16 | **Diagnostics `df_efficiency_rolling` panel.** Aggregate speedup ratio and DIFF/FULL counts from `df_efficiency_rolling`. | 2h | [PLAN_TUI_PART_3.md](plans/ui/PLAN_TUI_PART_3.md) §TUI-16 |
-| TUI-D1 | **`docs/TUI.md` documentation update.** Document Anomaly view, CDC sparklines, Workers interference tab, Mermaid export, header badge, and command palette additions. | 2h | [PLAN_TUI_PART_3.md](plans/ui/PLAN_TUI_PART_3.md) §T20 |
+### Release engineering
 
-### Phase 3 — Backend Enhancements (T18)
+> **In plain terms:** The 1.0 release is the official "we stand behind this
+> API" declaration — from this point on the function names, catalog schema,
+> and configuration settings won't change without a major version bump. The
+> practical work is getting pg_trickle onto standard package registries
+> (PGXN, apt, rpm) so it can be installed with the same commands as any
+> other PostgreSQL extension, and hardening the CloudNativePG integration
+> for Kubernetes deployments.
 
 | Item | Description | Effort | Ref |
 |------|-------------|--------|-----|
-| DF-21 | **`sla_breach_risk` column in `df_threshold_advice`.** Boolean: `true` when `avg_diff_ms > freshness_deadline_ms`. | 2h | [PLAN_TUI_PART_3.md](plans/ui/PLAN_TUI_PART_3.md) §DF-21 |
-| DF-22 | **`self_monitoring_auto_apply = 'full'` mode.** Widen dispatch interval when `df_scheduling_interference` detects high overlap. | 4h | [PLAN_TUI_PART_3.md](plans/ui/PLAN_TUI_PART_3.md) §DF-22 |
-| DF-23 | **`self_monitoring_status()` retention warning.** `retention_warning` column when `history_retention_days` is below the minimum window. | 2h | [PLAN_TUI_PART_3.md](plans/ui/PLAN_TUI_PART_3.md) §DF-23 |
-| DF-24 | **`recommend_refresh_mode()` reads from `df_threshold_advice`.** Returns consistent results with the incremental view when self-monitoring is active. | 3h | [PLAN_TUI_PART_3.md](plans/ui/PLAN_TUI_PART_3.md) §DF-24 |
-| TEST-21 | **Proptest for `df_threshold_advice` bounds.** 10,000 cases verifying `[0.01, 0.80]` clamping invariant. | 2h | [PLAN_TUI_PART_3.md](plans/ui/PLAN_TUI_PART_3.md) §TEST-21 |
+| R1 | Semantic versioning policy + compatibility guarantees | 2–3h | [PLAN_VERSIONING.md](plans/infra/PLAN_VERSIONING.md) |
+| R2 | apt / rpm packaging (Debian/Ubuntu `.deb` + RHEL `.rpm` via PGDG) | 8–12h | [PLAN_PACKAGING.md](plans/infra/PLAN_PACKAGING.md) |
+| R2b | PGXN `release_status` → `"stable"` (flip one field; PGXN testing release ships in v0.7.0) | 30min | [PLAN_PACKAGING.md](plans/infra/PLAN_PACKAGING.md) |
+| R3 | ~~Docker Hub official image~~ → CNPG extension image | ✅ Done | [PLAN_CLOUDNATIVEPG.md](plans/ecosystem/PLAN_CLOUDNATIVEPG.md) |
+| R4 | ~~CNPG operator hardening (K8s 1.33+ native ImageVolume)~~ ➡️ Pulled to v0.15.0 | 4–6h | [PLAN_CLOUDNATIVEPG.md](plans/ecosystem/PLAN_CLOUDNATIVEPG.md) |
+| R5 | **Docker Hub official image.** Publish `pgtrickle/pg_trickle:1.0.0-pg18` and `:latest` to Docker Hub. Sync Dockerfile.hub version tag with release. Automate via GitHub Actions release workflow. | 2–4h | — |
+| R6 | **Version sync automation.** Ensure `just check-version-sync` covers all version references (Cargo.toml, extension control files, Dockerfile.hub, dbt_project.yml, CNPG manifests). Add to CI as a blocking check. | 2–3h | — |
+| SAST-SEMGREP | **Elevate Semgrep to blocking in CI.** CodeQL and cargo-deny already block; Semgrep is advisory-only. Flip to blocking for consistent safety gating. Before flipping, verify zero findings across all current rules. | 1–2h | [PLAN_SAST.md](plans/testing/PLAN_SAST.md) |
 
-### Phase 4 — CLI Integration (T19)
-
-| Item | Description | Effort | Ref |
-|------|-------------|--------|-----|
-| CLI-1 | **`pgtrickle self-monitoring` subcommand group.** `enable / disable / status` subcommands with `--format json\|table\|csv` for status. | 4h | [PLAN_TUI_PART_3.md](plans/ui/PLAN_TUI_PART_3.md) §CLI-1 |
-| CLI-2 | **`pgtrickle graph --format` flag.** `ascii` (existing) / `mermaid` / `dot` format options for the graph subcommand. | 2h | [PLAN_TUI_PART_3.md](plans/ui/PLAN_TUI_PART_3.md) §CLI-2 |
-
-### Phase 5 — Documentation & Polish (T20)
-
-| Item | Description | Effort | Ref |
-|------|-------------|--------|-----|
-| DOC-21 | **`docs/GETTING_STARTED.md` Day 2 update.** Document self-monitoring CLI and TUI integration for new users. | 1h | [PLAN_TUI_PART_3.md](plans/ui/PLAN_TUI_PART_3.md) §T20 |
-| DOC-22 | **`docs/SQL_REFERENCE.md` update.** Document `df_threshold_advice.sla_breach_risk` column. | 0.5h | [PLAN_TUI_PART_3.md](plans/ui/PLAN_TUI_PART_3.md) §T20 |
-
-### Phase 6 — TUI/CLI Visualization Polish
-
-TUI/CLI visualization enhancement for the self-monitoring views. Recommended from [PLAN_OVERALL_ASSESSMENT.md](plans/PLAN_OVERALL_ASSESSMENT.md) §9.11.
-
-| Item | Description | Effort | Ref |
-|------|-------------|--------|-----|
-| OP-1 | **DAG runtime overlay in `explain_dag()`.** Colour nodes by p95 latency, width by rows/refresh using `pgt_refresh_history`. Enhances `explain_dag()` visualization for TUI/CLI. | XS (2d) | [PLAN_OVERALL_ASSESSMENT.md](plans/PLAN_OVERALL_ASSESSMENT.md) §9.11 |
-
-### Implementation Phases
-
-| Phase | Description | Duration |
-|-------|-------------|----------|
-| T15 | Architecture Foundation — AppState decomp, selective polling, poller extraction, CLI unification | Days 1–3 |
-| T16 | Self-Monitoring Data Layer — types, polling queries, fixtures, contract stubs | Days 3–5 |
-| T17 | Self-Monitoring TUI Views — all 16 TUI items, snapshot + unit tests | Days 5–9 |
-| T18 | Backend Enhancements — DF-21 through DF-24, proptest, upgrade SQL | Days 9–12 |
-| T19 | CLI Integration — `pgtrickle self-monitoring`, `pgtrickle graph --format` | Days 12–13 |
-| T20 | Documentation, Polish & Final Testing — docs, cross-cutting tests, coverage audit | Days 13–15 |
-| T21 (OP) | TUI/CLI Polish — DAG runtime overlay in `explain_dag()` | Days 15–16 (parallel or interleaved) |
-
-> **v0.26.0 total: ~3–4 weeks** (TUI self-monitoring integration + DAG visualization polish: architecture + 16 views + 4 backend items + 2 CLI commands + tests + docs)
+> **v1.0.0 total: ~36–66 hours** (incl. PG 19 compat ~18–36h + release engineering ~18–30h)
 
 **Exit criteria:**
-- [ ] T15: `AppState` uses 8 domain structs; all existing tests pass; `just lint` clean
-- [ ] T15: Selective polling reduces Phase 2 query count for non-subscribed views
-- [ ] TUI-1: Anomaly Detection view renders; severity colors correct; empty-state hint shown
-- [ ] TUI-2: Dashboard ribbon shows anomaly count; turns red when anomalies present
-- [ ] TUI-3: CDC Health sparkline column renders for all sources with trend data
-- [ ] TUI-4: Spill-risk badge appears when `df_cdc_buffer_trends` growth rate extrapolates to breach
-- [ ] TUI-5: Workers view has Interference sub-tab; overlap pairs render
-- [ ] TUI-6: Scheduler overhead bar visible in Workers view after ≥ 5 refresh cycles
-- [ ] TUI-7: `x` key on Dependencies view opens Mermaid overlay; `Ctrl+E` exports to file
-- [ ] TUI-8: Header `df:N/M` badge reflects active self-monitoring stream tables
-- [ ] TUI-9: Command palette `self-monitoring enable/disable` completes with confirmation
-- [ ] TUI-15/TUI-T1: All new snapshot tests pass; dashboard snapshots cover 5 branches
-- [ ] DF-21: `sla_breach_risk = true` when `avg_diff_ms > freshness_deadline_ms`
-- [ ] DF-22: Dispatch interval widens after synthetic interference insertion
-- [ ] DF-23: `retention_warning` column non-null when retention below minimum
-- [ ] DF-24: `recommend_refresh_mode()` consistent with `df_threshold_advice` when self-monitoring active
-- [ ] TEST-21: Proptest passes 10,000 iterations
-- [ ] CLI-1: `pgtrickle self-monitoring enable/disable/status` functional
-- [ ] CLI-2: `pgtrickle graph --format mermaid` outputs valid Mermaid
-- [ ] TUI-D1/DOC-21/DOC-22: Documentation updated
-- [ ] Extension upgrade path tested (`0.24.0 → 0.25.0`)
-- [ ] `just check-version-sync` passes
+- [ ] A3: PG 19 builds and passes full E2E suite
+- [ ] CI matrix includes PG 19
+- [ ] Published on PGXN (stable) and apt/rpm via PGDG
+- [ ] Docker Hub image published (`pgtrickle/pg_trickle:1.0.0-pg18` and `:latest`)
+- [x] CNPG extension image published to GHCR (`pg_trickle-ext`)
+- [x] CNPG cluster-example.yaml validated (Image Volume approach)
+- [ ] `just check-version-sync` passes and blocks CI on mismatch
+- [ ] SAST-SEMGREP: Semgrep elevated to blocking in CI; zero findings verified
+- [ ] Upgrade path from v0.29.0 tested
+- [ ] Semantic versioning policy in effect
 
 ---
 
@@ -7407,7 +7341,7 @@ Low-hanging PostgreSQL feature opportunities identified in [plans/sql/PLAN_POSTG
 
 > **PostgreSQL feature integration subtotal: ~4–5 hours** (PGFEAT-1 through PGFEAT-5) **+ ~10–18 hours** (PGFEAT-6 through PGFEAT-9, optional but recommended)
 
-> **v0.27.0 total: ~2–4 days** (PG 17 support) **+ ~14–23 hours** (PostgreSQL feature integration, all items)
+> **v1.1.0 total: ~2–4 days** (PG 17 support) **+ ~14–23 hours** (PostgreSQL feature integration, all items)
 
 **Exit criteria:**
 - [ ] PG17-1: `cargo build --features pg17 --no-default-features` compiles cleanly
@@ -7427,7 +7361,7 @@ Low-hanging PostgreSQL feature opportunities identified in [plans/sql/PLAN_POSTG
 - [ ] PGFEAT-7: Skip scan index optimization evaluated; benchmarks quantify benefit; indexes created if beneficial
 - [ ] PGFEAT-8: `MERGE ... RETURNING OLD.*, NEW.*` integrated in `build_merge_sql()`; ST-to-ST change buffer performance improved
 - [ ] PGFEAT-9: Virtual generated columns correctly excluded from CDC change buffer schemas; E2E tests pass with virtual column sources
-- [ ] Extension upgrade path tested (`0.25.0 → 0.26.0`)
+- [ ] Extension upgrade path tested (`1.0.0 → 1.1.0`)
 - [ ] `just check-version-sync` passes
 
 ---
@@ -7802,7 +7736,7 @@ Dependencies: None. Schema change: No (PG extension unchanged).
    compensate — consider porting the proptest approach to a JS property-
    testing library (e.g., fast-check).
 
-> **v0.28.0 total: ~2–3 weeks (PGlite plugin) + ~1–2 days (PG extension version bump)**
+> **v1.2.0 total: ~2–3 weeks (PGlite plugin) + ~1–2 days (PG extension version bump)**
 
 **Exit criteria:**
 - [ ] PGL-0-1: Statement-level triggers with transition tables confirmed working in PGlite
@@ -7824,7 +7758,7 @@ Dependencies: None. Schema change: No (PG extension unchanged).
 - [ ] UX-4: TypeScript type definitions ship with strict-mode compatibility
 - [ ] TEST-1: > 50 correctness test cases pass on PGlite latest
 - [ ] TEST-2: CI tests pass against PGlite N, N-1, N-2
-- [ ] TEST-5: Extension upgrade path tested (`0.26.0 -> 0.27.0`)
+- [ ] TEST-5: Extension upgrade path tested (`1.1.0 → 1.2.0`)
 - [ ] `just check-version-sync` passes
 
 ---
@@ -8223,7 +8157,7 @@ Dependencies: PGL-1-1. Schema change: No.
    extraction order: types -> operators -> DAG -> diff -> rewrites ->
    sublinks.
 
-> **v0.29.0 total: ~3–4 weeks (extraction) + ~1–2 weeks (abstraction layer + testing)**
+> **v1.3.0 total: ~3–4 weeks (extraction) + ~1–2 weeks (abstraction layer + testing)**
 
 **Exit criteria:**
 - [ ] PGL-1-1: `pg_trickle_core` crate exists as a workspace member with zero pgrx dependencies
@@ -8240,7 +8174,7 @@ Dependencies: PGL-1-1. Schema change: No.
 - [ ] STAB-1: Zero `pg_sys::` references in `pg_trickle_core/src/`
 - [ ] STAB-2: `cargo build -p pg_trickle_core --no-default-features` passes in CI
 - [ ] STAB-3: `cargo pgrx package` and `cargo pgrx test` succeed with workspace layout
-- [ ] STAB-4: Extension upgrade path tested (`0.27.0 -> 0.28.0`)
+- [ ] STAB-4: Extension upgrade path tested (`1.2.0 → 1.3.0`)
 - [ ] STAB-5: WASM target builds in CI
 - [ ] PERF-1: Criterion shows < 1% regression on `diff_operators` benchmark
 - [ ] PERF-2: Full benchmark suite passes with < 5% regression threshold
@@ -8691,7 +8625,7 @@ Dependencies: PGL-2-3, PERF-2. Schema change: No.
    Add it to the existing CI matrix as a separate job that only runs when
    `pg_trickle_pglite/` or `pg_trickle_core/` files are modified.
 
-> **v0.30.0 total: ~5–7 weeks (WASM build) + ~2–3 weeks (testing + polish)**
+> **v1.4.0 total: ~5–7 weeks (WASM build) + ~2–3 weeks (testing + polish)**
 
 **Exit criteria:**
 - [ ] PGL-2-1: C shim compiles and links against PGlite's WASM PostgreSQL headers
@@ -8707,7 +8641,7 @@ Dependencies: PGL-2-3, PERF-2. Schema change: No.
 - [ ] STAB-1: OOM stress test: PGlite survives with actionable error
 - [ ] STAB-2: Panic from invalid SQL returns SQL error, not WASM trap
 - [ ] STAB-3: Load/unload/reload lifecycle test: zero leaked allocations
-- [ ] STAB-4: Extension upgrade path tested (`0.27.0 -> 0.28.0`)
+- [ ] STAB-4: Extension upgrade path tested (`1.3.0 → 1.4.0`)
 - [ ] PERF-1: WASM vs native benchmark report published (≤ 3× overhead)
 - [ ] PERF-2: WASM bundle ≤ 2 MB (CI gated)
 - [ ] PERF-3: Cold-start load time < 500 ms browser, < 200 ms Node.js
@@ -9158,7 +9092,7 @@ Dependencies: STAB-1, PGL-3-2. Schema change: No.
    (e.g., `LISTEN/NOTIFY` bridge, WebSocket push) should be deferred to
    post-1.0. Keep the scope tight: reactive bindings + examples + docs.
 
-> **v0.31.0 total: ~2–3 weeks (bridge + hooks) + ~1–2 weeks (examples + testing + polish)**
+> **v1.5.0 total: ~2–3 weeks (bridge + hooks) + ~1–2 weeks (examples + testing + polish)**
 
 **Exit criteria:**
 - [ ] PGL-3-1: Stream table changes appear in `live.changes()` event stream
@@ -9173,7 +9107,7 @@ Dependencies: STAB-1, PGL-3-2. Schema change: No.
 - [ ] STAB-1: 4-hour soak test: heap growth < 10%
 - [ ] STAB-2: 100 mount/unmount cycles: zero leaked subscriptions
 - [ ] STAB-3: Stream table dropped while hook active: error boundary catches
-- [ ] STAB-4: Extension upgrade path tested (`0.29.0 -> 0.30.0`)
+- [ ] STAB-4: Extension upgrade path tested (`1.4.0 → 1.5.0`)
 - [ ] STAB-5: CI matrix passes for React 18, React 19, Vue 3.4+
 - [ ] PERF-1: INSERT-to-render latency < 50% of `live.incrementalQuery()` at 10K rows
 - [ ] PERF-2: Render count = 1 for bulk DML (1, 10, 100, 1000 rows)
@@ -9189,65 +9123,136 @@ Dependencies: STAB-1, PGL-3-2. Schema change: No.
 
 ---
 
-## v1.0.0 — Stable Release
+## v1.6.0 — TUI Self-Monitoring Integration
 
-**Goal:** First officially supported release. Semantic versioning locks in.
-API, catalog schema, and GUC names are considered stable. Focus is
-distribution — getting pg_trickle onto package registries — and PostgreSQL 19
-forward-compatibility.
+**Status: Planned.** See [plans/ui/PLAN_TUI_PART_3.md](plans/ui/PLAN_TUI_PART_3.md) for the full design.
 
-### PostgreSQL 19 Forward-Compatibility (A3)
+> **Release Theme**
+> This release wires the v0.20.0 self-monitoring stream tables (`df_*`) into
+> the TUI, giving operators live visibility into anomaly signals, CDC buffer
+> trends, scheduling interference, and efficiency metrics — all driven by
+> the same incremental refresh engine. Alongside the new views, the TUI
+> architecture is refactored: `AppState` is split into 8 domain-scoped
+> sub-structs, polling becomes subscription-based (only active-view data is
+> fetched), and CLI/TUI command logic is unified into a shared domain layer.
+> Four backend enhancements (`DF-21`–`DF-24`) and two new CLI subcommands
+> complete the milestone.
+>
+> See [plans/ui/PLAN_TUI_PART_3.md](plans/ui/PLAN_TUI_PART_3.md) for the
+> full architecture, feature specifications, and phased implementation plan.
 
-> **In plain terms:** When PostgreSQL 19 beta stabilises and pgrx 0.18.x
-> ships with PG 19 support, this milestone bumps the pgrx dependency,
-> audits every internal `pg_sys::*` API call for breaking changes, adds
-> conditional compilation gates, and validates the WAL decoder against any
-> pgoutput format changes introduced in PG 19. Moved here from the
-> earlier v0.26.0 milestone because PG 19 beta availability is uncertain.
-
-| Item | Description | Effort | Ref |
-|------|-------------|--------|-----|
-| A3-1 | pgrx version bump to 0.18.x (PG 19 support) + `cargo pgrx init --pg19` | 2–4h | [PLAN_PG19_COMPAT.md](plans/infra/PLAN_PG19_COMPAT.md) §2 |
-| A3-2 | `pg_sys::*` API audit: heap access, catalog structs, WAL decoder `LogicalDecodingContext` | 8–16h | [PLAN_PG19_COMPAT.md](plans/infra/PLAN_PG19_COMPAT.md) §3 |
-| A3-3 | Conditional compilation (`#[cfg(feature = "pg19")]`) for changed APIs | 4–8h | [PLAN_PG19_COMPAT.md](plans/infra/PLAN_PG19_COMPAT.md) §4 |
-| A3-4 | CI matrix expansion for PG 19 + full E2E suite run | 4–8h | [PLAN_PG19_COMPAT.md](plans/infra/PLAN_PG19_COMPAT.md) |
-
-> **A3 subtotal: ~18–36 hours**
-
-### Release engineering
-
-> **In plain terms:** The 1.0 release is the official "we stand behind this
-> API" declaration — from this point on the function names, catalog schema,
-> and configuration settings won't change without a major version bump. The
-> practical work is getting pg_trickle onto standard package registries
-> (PGXN, apt, rpm) so it can be installed with the same commands as any
-> other PostgreSQL extension, and hardening the CloudNativePG integration
-> for Kubernetes deployments.
+### Phase 1 — Architecture Foundation (T15–T16)
 
 | Item | Description | Effort | Ref |
 |------|-------------|--------|-----|
-| R1 | Semantic versioning policy + compatibility guarantees | 2–3h | [PLAN_VERSIONING.md](plans/infra/PLAN_VERSIONING.md) |
-| R2 | apt / rpm packaging (Debian/Ubuntu `.deb` + RHEL `.rpm` via PGDG) | 8–12h | [PLAN_PACKAGING.md](plans/infra/PLAN_PACKAGING.md) |
-| R2b | PGXN `release_status` → `"stable"` (flip one field; PGXN testing release ships in v0.7.0) | 30min | [PLAN_PACKAGING.md](plans/infra/PLAN_PACKAGING.md) |
-| R3 | ~~Docker Hub official image~~ → CNPG extension image | ✅ Done | [PLAN_CLOUDNATIVEPG.md](plans/ecosystem/PLAN_CLOUDNATIVEPG.md) |
-| R4 | ~~CNPG operator hardening (K8s 1.33+ native ImageVolume)~~ ➡️ Pulled to v0.15.0 | 4–6h | [PLAN_CLOUDNATIVEPG.md](plans/ecosystem/PLAN_CLOUDNATIVEPG.md) |
-| R5 | **Docker Hub official image.** Publish `pgtrickle/pg_trickle:1.0.0-pg18` and `:latest` to Docker Hub. Sync Dockerfile.hub version tag with release. Automate via GitHub Actions release workflow. | 2–4h | — |
-| R6 | **Version sync automation.** Ensure `just check-version-sync` covers all version references (Cargo.toml, extension control files, Dockerfile.hub, dbt_project.yml, CNPG manifests). Add to CI as a blocking check. | 2–3h | — |
-| SAST-SEMGREP | **Elevate Semgrep to blocking in CI.** CodeQL and cargo-deny already block; Semgrep is advisory-only. Flip to blocking for consistent safety gating. Before flipping, verify zero findings across all current rules. | 1–2h | [PLAN_SAST.md](plans/testing/PLAN_SAST.md) |
+| T15 | **AppState domain decomposition.** Split `AppState` into 8 domain structs: `StreamTableDomain`, `CdcDomain`, `DiagnosticsDomain`, `MonitoringDomain`, `SchedulingDomain`, `WatermarkDomain`, `ConfigDomain`, `DogFeedingDomain`. | 1d | [PLAN_TUI_PART_3.md](plans/ui/PLAN_TUI_PART_3.md) §T15 |
+| T15 | **Selective polling.** `DataSubscriptions::for_view()` gates Phase 2 queries behind the active view; reduces wasted queries on average. | 0.5d | [PLAN_TUI_PART_3.md](plans/ui/PLAN_TUI_PART_3.md) §T15 |
+| T15 | **Poller logic extraction.** Extract `poller/fetchers.rs` (21 `fetch_*()` functions) and `poller/updaters.rs` (21 `apply_*()` functions) for testability. | 1d | [PLAN_TUI_PART_3.md](plans/ui/PLAN_TUI_PART_3.md) §T15 |
+| T15 | **CLI/TUI command unification.** Introduce `commands/domain.rs` with shared logic for refresh, pause, resume, fuse reset, repair, and gate/ungate. | 0.5d | [PLAN_TUI_PART_3.md](plans/ui/PLAN_TUI_PART_3.md) §T15 |
+| T16 | **Dog-feeding data layer.** Add `DogFeedingDomain` state types, polling queries for all 5 `df_*` stream tables, fixture builders, and contract stubs. | 1d | [PLAN_TUI_PART_3.md](plans/ui/PLAN_TUI_PART_3.md) §T16 |
 
-> **v1.0.0 total: ~36–66 hours** (incl. PG 19 compat ~18–36h + release engineering ~18–30h)
+### Phase 2 — Self-Monitoring TUI Views (T17)
+
+| Item | Description | Effort | Ref |
+|------|-------------|--------|-----|
+| TUI-1 | **Anomaly Detection view (`a` key).** New view showing `df_anomaly_signals` with severity colors, anomaly type, count, and first/last-seen timestamps. | 4h | [PLAN_TUI_PART_3.md](plans/ui/PLAN_TUI_PART_3.md) §TUI-1 |
+| TUI-2 | **Dashboard anomaly badge.** Status ribbon shows active anomaly count in red when `df_anomaly_signals` is non-empty. | 1h | [PLAN_TUI_PART_3.md](plans/ui/PLAN_TUI_PART_3.md) §TUI-2 |
+| TUI-3 | **CDC Health sparkline column.** Braille sparkline in CDC Health view showing buffer row-count trend from `df_cdc_buffer_trends`. | 3h | [PLAN_TUI_PART_3.md](plans/ui/PLAN_TUI_PART_3.md) §TUI-3 |
+| TUI-4 | **CDC Health spill-risk badge.** `⚠ spill` badge when `df_cdc_buffer_trends` growth rate extrapolates to a breach within 2 cycles. | 1h | [PLAN_TUI_PART_3.md](plans/ui/PLAN_TUI_PART_3.md) §TUI-4 |
+| TUI-5 | **Workers Interference sub-tab.** Second tab in Workers view showing `df_scheduling_interference` overlap pairs. | 3h | [PLAN_TUI_PART_3.md](plans/ui/PLAN_TUI_PART_3.md) §TUI-5 |
+| TUI-6 | **Workers scheduler overhead bar.** Busy-time ratio bar from `scheduler_overhead()` in the Workers view. | 1h | [PLAN_TUI_PART_3.md](plans/ui/PLAN_TUI_PART_3.md) §TUI-6 |
+| TUI-7 | **Dependencies Mermaid/DOT export (`x` key).** Scrollable overlay showing `explain_dag()` Mermaid output; `Ctrl+E` writes to file. | 2h | [PLAN_TUI_PART_3.md](plans/ui/PLAN_TUI_PART_3.md) §TUI-7 |
+| TUI-8 | **Header self-monitoring status badge.** `df:N/M` pill in the TUI header bar; turns amber on retention warning. | 1h | [PLAN_TUI_PART_3.md](plans/ui/PLAN_TUI_PART_3.md) §TUI-8 |
+| TUI-9 | **Command palette self-monitoring commands.** `self-monitoring enable / disable / status` in palette with confirmation dialogs. | 2h | [PLAN_TUI_PART_3.md](plans/ui/PLAN_TUI_PART_3.md) §TUI-9 |
+| TUI-10 | **Detail view anomaly summary.** Active anomaly count row in the Properties section of the detail overlay. | 1h | [PLAN_TUI_PART_3.md](plans/ui/PLAN_TUI_PART_3.md) §TUI-10 |
+| TUI-11 | **Refresh Log `[auto]` tag.** Annotate rows with `initiated_by = 'SELF_MONITOR'` in the Refresh Log view. | 1h | [PLAN_TUI_PART_3.md](plans/ui/PLAN_TUI_PART_3.md) §TUI-11 |
+| TUI-12 | **First-launch self-monitoring toast.** 10-second hint toast on first launch when self-monitoring is not set up. | 1h | [PLAN_TUI_PART_3.md](plans/ui/PLAN_TUI_PART_3.md) §TUI-12 |
+| TUI-13 | **Anomaly signals as Issues.** `detect_issues()` maps active anomaly signals to the Issues view with category "Anomaly". | 1h | [PLAN_TUI_PART_3.md](plans/ui/PLAN_TUI_PART_3.md) §TUI-13 |
+| TUI-14 | **`self_monitor_anomaly` alert styling.** Cyan `🔍` icon for anomaly alert type in the Alerts view. | 0.5h | [PLAN_TUI_PART_3.md](plans/ui/PLAN_TUI_PART_3.md) §TUI-14 |
+| TUI-15 | **Dashboard snapshot tests.** 5 snapshot branches: standard, wide, empty, anomalies-present, narrow. | 2h | [PLAN_TUI_PART_3.md](plans/ui/PLAN_TUI_PART_3.md) §TUI-15 |
+| TUI-16 | **Diagnostics `df_efficiency_rolling` panel.** Aggregate speedup ratio and DIFF/FULL counts from `df_efficiency_rolling`. | 2h | [PLAN_TUI_PART_3.md](plans/ui/PLAN_TUI_PART_3.md) §TUI-16 |
+| TUI-D1 | **`docs/TUI.md` documentation update.** Document Anomaly view, CDC sparklines, Workers interference tab, Mermaid export, header badge, and command palette additions. | 2h | [PLAN_TUI_PART_3.md](plans/ui/PLAN_TUI_PART_3.md) §T20 |
+
+### Phase 3 — Backend Enhancements (T18)
+
+| Item | Description | Effort | Ref |
+|------|-------------|--------|-----|
+| DF-21 | **`sla_breach_risk` column in `df_threshold_advice`.** Boolean: `true` when `avg_diff_ms > freshness_deadline_ms`. | 2h | [PLAN_TUI_PART_3.md](plans/ui/PLAN_TUI_PART_3.md) §DF-21 |
+| DF-22 | **`self_monitoring_auto_apply = 'full'` mode.** Widen dispatch interval when `df_scheduling_interference` detects high overlap. | 4h | [PLAN_TUI_PART_3.md](plans/ui/PLAN_TUI_PART_3.md) §DF-22 |
+| DF-23 | **`self_monitoring_status()` retention warning.** `retention_warning` column when `history_retention_days` is below the minimum window. | 2h | [PLAN_TUI_PART_3.md](plans/ui/PLAN_TUI_PART_3.md) §DF-23 |
+| DF-24 | **`recommend_refresh_mode()` reads from `df_threshold_advice`.** Returns consistent results with the incremental view when self-monitoring is active. | 3h | [PLAN_TUI_PART_3.md](plans/ui/PLAN_TUI_PART_3.md) §DF-24 |
+| TEST-21 | **Proptest for `df_threshold_advice` bounds.** 10,000 cases verifying `[0.01, 0.80]` clamping invariant. | 2h | [PLAN_TUI_PART_3.md](plans/ui/PLAN_TUI_PART_3.md) §TEST-21 |
+
+### Phase 4 — CLI Integration (T19)
+
+| Item | Description | Effort | Ref |
+|------|-------------|--------|-----|
+| CLI-1 | **`pgtrickle self-monitoring` subcommand group.** `enable / disable / status` subcommands with `--format json\|table\|csv` for status. | 4h | [PLAN_TUI_PART_3.md](plans/ui/PLAN_TUI_PART_3.md) §CLI-1 |
+| CLI-2 | **`pgtrickle graph --format` flag.** `ascii` (existing) / `mermaid` / `dot` format options for the graph subcommand. | 2h | [PLAN_TUI_PART_3.md](plans/ui/PLAN_TUI_PART_3.md) §CLI-2 |
+
+### Phase 5 — Documentation & Polish (T20)
+
+| Item | Description | Effort | Ref |
+|------|-------------|--------|-----|
+| DOC-21 | **`docs/GETTING_STARTED.md` Day 2 update.** Document self-monitoring CLI and TUI integration for new users. | 1h | [PLAN_TUI_PART_3.md](plans/ui/PLAN_TUI_PART_3.md) §T20 |
+| DOC-22 | **`docs/SQL_REFERENCE.md` update.** Document `df_threshold_advice.sla_breach_risk` column. | 0.5h | [PLAN_TUI_PART_3.md](plans/ui/PLAN_TUI_PART_3.md) §T20 |
+
+### Phase 6 — TUI/CLI Visualization Polish
+
+TUI/CLI visualization enhancement for the self-monitoring views. Recommended from [PLAN_OVERALL_ASSESSMENT.md](plans/PLAN_OVERALL_ASSESSMENT.md) §9.11.
+
+| Item | Description | Effort | Ref |
+|------|-------------|--------|-----|
+| OP-1 | **DAG runtime overlay in `explain_dag()`.** Colour nodes by p95 latency, width by rows/refresh using `pgt_refresh_history`. Enhances `explain_dag()` visualization for TUI/CLI. | XS (2d) | [PLAN_OVERALL_ASSESSMENT.md](plans/PLAN_OVERALL_ASSESSMENT.md) §9.11 |
+
+### Implementation Phases
+
+| Phase | Description | Duration |
+|-------|-------------|----------|
+| T15 | Architecture Foundation — AppState decomp, selective polling, poller extraction, CLI unification | Days 1–3 |
+| T16 | Self-Monitoring Data Layer — types, polling queries, fixtures, contract stubs | Days 3–5 |
+| T17 | Self-Monitoring TUI Views — all 16 TUI items, snapshot + unit tests | Days 5–9 |
+| T18 | Backend Enhancements — DF-21 through DF-24, proptest, upgrade SQL | Days 9–12 |
+| T19 | CLI Integration — `pgtrickle self-monitoring`, `pgtrickle graph --format` | Days 12–13 |
+| T20 | Documentation, Polish & Final Testing — docs, cross-cutting tests, coverage audit | Days 13–15 |
+| T21 (OP) | TUI/CLI Polish — DAG runtime overlay in `explain_dag()` | Days 15–16 (parallel or interleaved) |
+
+> **v1.6.0 total: ~3–4 weeks** (TUI self-monitoring integration + DAG visualization polish: architecture + 16 views + 4 backend items + 2 CLI commands + tests + docs)
 
 **Exit criteria:**
-- [ ] A3: PG 19 builds and passes full E2E suite
-- [ ] CI matrix includes PG 19
-- [ ] Published on PGXN (stable) and apt/rpm via PGDG
-- [ ] Docker Hub image published (`pgtrickle/pg_trickle:1.0.0-pg18` and `:latest`)
-- [x] CNPG extension image published to GHCR (`pg_trickle-ext`)
-- [x] CNPG cluster-example.yaml validated (Image Volume approach)
-- [ ] `just check-version-sync` passes and blocks CI on mismatch
-- [ ] SAST-SEMGREP: Semgrep elevated to blocking in CI; zero findings verified
-- [ ] Upgrade path from v0.17.0 tested
-- [ ] Semantic versioning policy in effect
+- [ ] T15: `AppState` uses 8 domain structs; all existing tests pass; `just lint` clean
+- [ ] T15: Selective polling reduces Phase 2 query count for non-subscribed views
+- [ ] TUI-1: Anomaly Detection view renders; severity colors correct; empty-state hint shown
+- [ ] TUI-2: Dashboard ribbon shows anomaly count; turns red when anomalies present
+- [ ] TUI-3: CDC Health sparkline column renders for all sources with trend data
+- [ ] TUI-4: Spill-risk badge appears when `df_cdc_buffer_trends` growth rate extrapolates to breach
+- [ ] TUI-5: Workers view has Interference sub-tab; overlap pairs render
+- [ ] TUI-6: Scheduler overhead bar visible in Workers view after ≥ 5 refresh cycles
+- [ ] TUI-7: `x` key on Dependencies view opens Mermaid overlay; `Ctrl+E` exports to file
+- [ ] TUI-8: Header `df:N/M` badge reflects active self-monitoring stream tables
+- [ ] TUI-9: Command palette `self-monitoring enable/disable` completes with confirmation
+- [ ] TUI-15/TUI-T1: All new snapshot tests pass; dashboard snapshots cover 5 branches
+- [ ] DF-21: `sla_breach_risk = true` when `avg_diff_ms > freshness_deadline_ms`
+- [ ] DF-22: Dispatch interval widens after synthetic interference insertion
+- [ ] DF-23: `retention_warning` column non-null when retention below minimum
+- [ ] DF-24: `recommend_refresh_mode()` consistent with `df_threshold_advice` when self-monitoring active
+- [ ] TEST-21: Proptest passes 10,000 iterations
+- [ ] CLI-1: `pgtrickle self-monitoring enable/disable/status` functional
+- [ ] CLI-2: `pgtrickle graph --format mermaid` outputs valid Mermaid
+- [ ] TUI-D1/DOC-21/DOC-22: Documentation updated
+- [ ] Extension upgrade path tested (`1.5.0 → 1.6.0`)
+- [ ] `just check-version-sync` passes
+
+---
+
+## Post-1.0 Addendum — Cross-Cluster & Visual Tooling
+
+The following items from [PLAN_OVERALL_ASSESSMENT_2.md](plans/PLAN_OVERALL_ASSESSMENT_2.md) §7 are explicitly post-1.0 and are tracked here rather than in a numbered milestone:
+
+| Item | Description | Priority | Ref |
+|------|-------------|----------|-----|
+| POST-XC | **Cross-cluster fan-out via `pgtrickle-relay`.** A relay mode that reads from one cluster's outbox and applies to another cluster's inbox. Optional CRDT-style conflict resolution for last-write-wins counters. Enables multi-region read-replica patterns without a full replication setup. | Medium | [PLAN_OVERALL_ASSESSMENT_2.md](plans/PLAN_OVERALL_ASSESSMENT_2.md) §7 |
+| POST-VIS | **GUI workflow designer + visual DAG editor.** Extend `pgtrickle-tui` with a visual DAG editor and an EXPLAIN-DIFF preview that shows the rewritten DVM SQL alongside expected delta size. Lowers on-boarding ramp for SQL developers unfamiliar with IVM semantics. | Medium | [PLAN_OVERALL_ASSESSMENT_2.md](plans/PLAN_OVERALL_ASSESSMENT_2.md) §7 |
 
 ---
 
