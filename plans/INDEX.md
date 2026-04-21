@@ -145,3 +145,4 @@ new entries when creating documents.
 | File | Type | Status | Summary |
 |------|------|--------|---------|
 | [PLAN_WEBUI.md](webui/PLAN_WEBUI.md) | PLAN | Draft | Web dashboard & management console — analysis and implementation plan |
+| [PLAN_WEBUI_STYLE.md](webui/PLAN_WEBUI_STYLE.md) | PLAN | Draft | WebUI style, navigation, colour system, and screen layouts |

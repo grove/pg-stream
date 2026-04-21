@@ -1,0 +1,696 @@
+# WebUI — Style & Navigation Plan
+
+> **Status:** Analysis & Design (DRAFT — 2026-04-21)
+> **Created:** 2026-04-21
+> **Category:** Tooling — Web Dashboard UI/UX
+> **Related:** [PLAN_WEBUI.md](PLAN_WEBUI.md) ·
+> [PLAN_RELAY_CLI.md](../relay/PLAN_RELAY_CLI.md) ·
+> [PLAN_TUI.md](../ui/PLAN_TUI.md)
+
+---
+
+## Table of Contents
+
+- [Design Principles](#design-principles)
+- [Design System & Component Library](#design-system--component-library)
+  - [Core Stack](#core-stack)
+  - [Charting](#charting)
+  - [Topology Graph](#topology-graph)
+  - [Rejected Alternatives](#rejected-alternatives)
+- [Colour System](#colour-system)
+  - [Theme Modes](#theme-modes)
+  - [Semantic Colours](#semantic-colours)
+  - [Node Colours (Topology)](#node-colours-topology)
+  - [Edge Colours (Topology)](#edge-colours-topology)
+- [Typography](#typography)
+- [Navigation Structure](#navigation-structure)
+  - [Sidebar Layout](#sidebar-layout)
+  - [Page Routing](#page-routing)
+  - [Breadcrumbs](#breadcrumbs)
+- [Screen Layouts](#screen-layouts)
+  - [Landing: Topology Graph](#landing-topology-graph)
+  - [Stream Table List](#stream-table-list)
+  - [Stream Table Detail](#stream-table-detail)
+  - [SLA Budget Dashboard](#sla-budget-dashboard)
+  - [Health Scorecard](#health-scorecard)
+  - [Refresh Timeline](#refresh-timeline)
+  - [Relay Pipelines](#relay-pipelines)
+  - [Alerts Feed](#alerts-feed)
+  - [SQL Preview Modal](#sql-preview-modal)
+- [Responsive Behaviour](#responsive-behaviour)
+- [Accessibility](#accessibility)
+- [Open Questions](#open-questions)
+
+---
+
+## Design Principles
+
+Five guiding rules for every screen:
+
+1. **Density over whitespace.** SREs on-call want maximum information
+   per screen. Card-heavy layouts with generous padding waste the
+   viewport. Tables, inline badges, and compact metric rows are
+   preferred over hero cards.
+
+2. **Status colours carry meaning.** Green, amber, and red are reserved
+   exclusively for health/SLA status. They must never be used for
+   decorative purposes, branding, or navigation highlighting. This
+   ensures an SRE scanning the screen can immediately locate problems
+   by colour alone.
+
+3. **Dark mode is the default.** The primary audience (SREs, data
+   engineers, platform engineers) overwhelmingly uses dark-themed
+   tools. Light mode is supported but not the design baseline.
+
+4. **Monospace for system values.** Table names, SQL, metric values,
+   durations, row counts, and column names are always rendered in a
+   monospace font. This visually separates *system data* from *UI
+   chrome* and improves scannability in dense tables.
+
+5. **The graph is the hero.** The topology graph is the centrepiece
+   feature — it gets full-viewport space on the landing page. Other
+   pages support it, not the other way around.
+
+---
+
+## Design System & Component Library
+
+### Core Stack
+
+**shadcn/ui + Tailwind CSS + Radix UI primitives.**
+
+Rationale:
+
+- **shadcn/ui** provides copy-paste components — we own the code, not a
+  dependency. Components are unstyled Radix primitives with Tailwind
+  classes. Customizable without fighting a design system's opinions.
+- **Tailwind CSS** is the standard for Next.js projects. Utility-first
+  means no CSS-in-JS runtime, no specificity wars, and dark mode is a
+  single `dark:` prefix.
+- **Radix UI** handles accessibility (ARIA attributes, keyboard
+  navigation, focus management) at the primitive level. Dialogs,
+  dropdowns, tooltips, and popovers "just work" for screen readers.
+
+Key shadcn/ui components used:
+
+| Component | Used for |
+|-----------|----------|
+| `Table` | Stream table list, CDC sources, relay pipelines, alerts |
+| `Badge` | Status indicators, refresh mode, CDC mode |
+| `Card` | Metric summary tiles (compact, not hero-sized) |
+| `Dialog` | SQL preview modal, confirmation dialogs |
+| `Sheet` | Side panel for node detail (opens from topology graph) |
+| `Tabs` | Stream table detail (overview / history / lineage / operator tree) |
+| `Command` | Command palette (Cmd+K) |
+| `Tooltip` | Hover explanations on badges, metric values |
+| `DropdownMenu` | Context menus on topology nodes, table rows |
+| `Separator` | Section dividers in dense layouts |
+| `ScrollArea` | Scrollable panels (alerts feed, change flow) |
+
+### Charting
+
+**Tremor + ECharts** — two libraries, each used where it excels:
+
+| Library | Used for | Why |
+|---------|----------|-----|
+| **Tremor** | Metric cards, sparklines, status badges, small inline charts | Purpose-built for dashboard metric displays. Tailwind-native. Matches the shadcn/ui aesthetic. |
+| **ECharts** | Refresh timeline (stacked area + bar overlay), SLA burn-rate over time, buffer depth history | Full-featured time-series charting with zoom, brush selection, custom overlays. Tremor's chart components are too limited for multi-axis time-series. |
+
+ECharts is loaded lazily (dynamic import) — only the pages that use
+time-series charts pay the ~400 KB bundle cost. Tremor components are
+included in the core bundle since they're used on nearly every page.
+
+### Topology Graph
+
+**Undecided — two candidates under evaluation:**
+
+| | reactflow | Cytoscape.js |
+|---|---|---|
+| **React integration** | Native React components per node | Imperative API, React wrapper needed |
+| **Custom node rendering** | JSX per node type — badges, status colours, tooltips trivially composable | HTML overlay or canvas rendering — more work for rich nodes |
+| **Layout algorithms** | Manual positioning or dagre plugin | Built-in dagre, cola, cose-bilkent, elk |
+| **Minimap** | Built-in `<MiniMap />` component | Plugin (`cytoscape-navigator`) |
+| **Edge animation** | CSS animation on SVG paths | Canvas-based, custom animation code |
+| **Compound nodes** | Supported via nested groups | Native compound node support |
+| **Bundle size** | ~45 KB gzipped | ~85 KB gzipped (+ layout plugins) |
+| **License** | MIT | MIT |
+
+**Leaning toward reactflow** because:
+- JSX-based custom nodes make the rich status badges and
+  inline metrics per node trivial. Cytoscape requires HTML overlays
+  or canvas drawing for the same result.
+- The topology is a DAG with tens of nodes (not thousands) — reactflow's
+  dagre plugin handles this scale easily.
+- Edge animation (animated dots for data flow) is simpler in SVG/CSS
+  than canvas.
+
+**Decision deferred** to implementation phase. A spike (½ day) should
+build the same 5-node topology in both libraries and compare DX,
+rendering quality, and animation smoothness.
+
+### Rejected Alternatives
+
+| Library | Reason for rejection |
+|---------|---------------------|
+| **Material UI (MUI)** | Wrong aesthetic register — consumer app feel, not developer tool. Excessive padding, opinionated theming system fights customization. Signal says "enterprise admin panel," not "infrastructure monitoring." |
+| **Ant Design** | Used by RisingWave. Viable but heavy (~1 MB), opinionated, and less modern-feeling than shadcn/ui. Data table component is excellent but overkill when we control the data shape. |
+| **Chakra UI** | Similar to MUI in spirit — component library with runtime CSS-in-JS. Tailwind is a better fit for Next.js static export. |
+| **Recharts** | Decent for simple charts but lacks the multi-axis, zoom, and overlay features needed for the refresh timeline. ECharts covers this with less custom code. |
+| **D3 (direct)** | Too low-level for a small frontend team. ECharts and Tremor provide the same visual output with 10× less code. |
+
+---
+
+## Colour System
+
+### Theme Modes
+
+| Mode | Activation | Baseline |
+|------|-----------|----------|
+| **Dark** (default) | System preference or toggle | `zinc-950` background, `zinc-50` foreground |
+| **Light** | Toggle in settings | `white` background, `zinc-950` foreground |
+
+Follows the shadcn/ui theming approach: CSS variables on `:root` and
+`.dark` class, toggled via `next-themes`. All colour references use
+semantic CSS variables (`--background`, `--foreground`, `--muted`, etc.)
+so both themes are maintained by changing ~20 variable values.
+
+### Semantic Colours
+
+These colours convey operational meaning. They are **never** used for
+decorative or branding purposes.
+
+| Token | Dark mode value | Light mode value | Meaning |
+|-------|----------------|-----------------|---------|
+| `--status-healthy` | `emerald-400` | `emerald-600` | Healthy / within SLA / connected |
+| `--status-warning` | `amber-400` | `amber-600` | Warning / SLA burning / degraded |
+| `--status-critical` | `red-400` | `red-600` | Breach / error / disconnected / fuse blown |
+| `--status-inactive` | `zinc-500` | `zinc-400` | Disabled / paused / no data |
+| `--status-info` | `blue-400` | `blue-600` | Informational / in-progress / refreshing |
+
+Status colours are used on:
+- Topology node borders and fills
+- Topology edge strokes
+- SLA budget progress bars
+- Health scorecard status icons
+- Badge backgrounds (`<Badge variant="healthy">`, etc.)
+- Inline staleness text colour
+
+### Node Colours (Topology)
+
+| Node type | Border colour | Fill colour (dark) | Fill colour (light) |
+|-----------|--------------|-------------------|-------------------|
+| External source (Kafka, NATS) | `zinc-600` | `zinc-800` | `zinc-100` |
+| Relay pipeline | `blue-500` (connected) / `red-500` (disconnected) | `blue-950` / `red-950` | `blue-50` / `red-50` |
+| Inbox / Outbox table | `teal-500` | `teal-950` | `teal-50` |
+| Source base table | `zinc-500` | `zinc-900` | `white` |
+| Stream table | `--status-*` (by SLA) | `zinc-900` | `white` |
+| Self-monitoring stream table | `--status-*` (by SLA), dashed border | `zinc-900` | `white` |
+
+Stream table nodes use their SLA status colour for the border: green
+when within budget, amber when burning, red on breach. This means a
+quick glance at the topology shows problem nodes by colour alone.
+
+### Edge Colours (Topology)
+
+| State | Stroke colour | Width | Animation |
+|-------|-------------|-------|-----------|
+| Healthy, flowing | `--status-healthy` | Proportional to throughput | Animated dots (data flowing) |
+| Lag growing | `--status-warning` | Proportional to throughput | Animated dots (slower) |
+| SLA breach on downstream | `--status-critical` | Thick | Animated dots (red) |
+| No recent data | `--status-inactive` | Thin | No animation |
+
+Edge width scales linearly between 1 px (0 rows/sec) and 6 px
+(max throughput in the graph). The animated dots use CSS `stroke-dasharray`
++ `stroke-dashoffset` animation on SVG paths (reactflow) or canvas
+frame animation (Cytoscape).
+
+---
+
+## Typography
+
+Two font families, strictly separated by purpose:
+
+| Font | Used for | Example |
+|------|----------|---------|
+| **Inter** (sans-serif) | UI chrome: nav labels, headings, descriptions, buttons, form labels | "Stream Tables", "Refresh Timeline", "Apply" |
+| **JetBrains Mono** (monospace) | System values: table names, SQL, durations, row counts, column names, staleness values, metric numbers | `revenue_7d`, `45ms`, `1,204 rows`, `SELECT ...` |
+
+**Size scale** (Tailwind defaults):
+
+| Element | Size | Weight |
+|---------|------|--------|
+| Page heading | `text-xl` (20 px) | `font-semibold` |
+| Section heading | `text-lg` (18 px) | `font-semibold` |
+| Table header | `text-sm` (14 px) | `font-medium` |
+| Table cell | `text-sm` (14 px) | `font-normal` |
+| Badge text | `text-xs` (12 px) | `font-medium` |
+| Metric value (large) | `text-2xl` (24 px) mono | `font-semibold` |
+| Metric label | `text-xs` (12 px) | `font-normal`, `text-muted-foreground` |
+| Tooltip | `text-xs` (12 px) | `font-normal` |
+| Nav item | `text-sm` (14 px) | `font-medium` |
+| SQL code block | `text-sm` (14 px) mono | `font-normal` |
+
+---
+
+## Navigation Structure
+
+### Sidebar Layout
+
+Left sidebar, collapsible to icons-only. Fixed-position, does not
+scroll with page content. Width: 240 px expanded, 48 px collapsed.
+
+```
+┌─────────────────────────────────────────────────────────┐
+│ [≡]  pg-trickle                          [dark/light ☾] │
+├──────────────┬──────────────────────────────────────────┤
+│              │                                          │
+│  ◈ Topology  │         [main content area]              │
+│  ☰ Tables    │                                          │
+│  ⇄ Pipelines │                                          │
+│  ◉ CDC       │                                          │
+│  ♥ Health    │                                          │
+│  ▲ Alerts  3 │                                          │
+│  ⏱ Timeline  │                                          │
+│              │                                          │
+│              │                                          │
+│              │                                          │
+│──────────────│                                          │
+│  ⚙ Settings  │                                          │
+│  v0.21.0     │                                          │
+└──────────────┴──────────────────────────────────────────┘
+```
+
+**Sidebar elements:**
+
+| Item | Icon | Badge | Target |
+|------|------|-------|--------|
+| Topology | Graph icon | — | `/ui/topology` (landing) |
+| Tables | Table icon | Count of tables in breach | `/ui/tables` |
+| Pipelines | Arrow-right-left icon | Count of disconnected | `/ui/pipelines` |
+| CDC | Database icon | Count of unhealthy sources | `/ui/cdc` |
+| Health | Heart icon | Count of critical checks | `/ui/health` |
+| Alerts | Bell icon | Count of unread alerts | `/ui/alerts` |
+| Timeline | Clock icon | — | `/ui/timeline` |
+| Settings | Gear icon (bottom-pinned) | — | `/ui/settings` |
+
+The sidebar uses Lucide icons (included with shadcn/ui). Badges on nav
+items are small count pills using `--status-critical` or
+`--status-warning` colours. They provide a persistent health summary
+visible from any page.
+
+**Collapse behaviour:** Clicking the hamburger icon `[≡]` collapses the
+sidebar to 48 px, showing only icons. Hovering expands temporarily.
+User preference is persisted in `localStorage`.
+
+### Page Routing
+
+Next.js App Router with the following route structure:
+
+```
+/ui                         → redirect to /ui/topology
+/ui/topology                → Topology graph (landing page)
+/ui/topology?focus=<name>   → Topology with node highlighted
+/ui/tables                  → Stream table list
+/ui/tables/[name]           → Stream table detail (tabbed)
+/ui/tables/[name]/lineage   → Column-level lineage (full page)
+/ui/tables/[name]/operators → DVM operator inspector (full page)
+/ui/pipelines               → Relay pipeline list
+/ui/pipelines/[id]          → Pipeline detail
+/ui/cdc                     → CDC sources + buffers + slots
+/ui/health                  → Health scorecard
+/ui/alerts                  → Alerts feed (paginated, filterable)
+/ui/timeline                → Refresh timeline chart
+/ui/settings                → Configuration view
+```
+
+### Breadcrumbs
+
+Displayed at the top of the content area, below the page heading:
+
+```
+Topology                          ← no breadcrumb (root page)
+Tables > revenue_7d               ← table detail
+Tables > revenue_7d > Lineage     ← column lineage deep page
+Pipelines > kafka-forward-1       ← pipeline detail
+```
+
+Breadcrumbs use `text-sm text-muted-foreground` with `>` separators.
+Each segment is a link except the current page.
+
+---
+
+## Screen Layouts
+
+Text descriptions of each key screen. These are structural layouts,
+not pixel-perfect mockups — they describe the information hierarchy
+and spatial arrangement.
+
+### Landing: Topology Graph
+
+**Full viewport** — the graph fills the entire content area (sidebar to
+right edge, top nav to bottom edge). No page heading, no padding. The
+graph IS the page.
+
+**Overlays on the graph canvas:**
+
+- **Top-left:** Minimap (reactflow built-in or Cytoscape plugin). ~200×120 px,
+  semi-transparent background. Shows full graph with current viewport
+  highlighted.
+- **Top-right:** Legend toggle button. Clicking opens a floating legend
+  showing node shapes, colours, and edge encodings.
+- **Bottom-left:** Zoom controls (+/−/fit), layout reset button.
+- **Bottom-right:** Time slider (for historical replay, Tier 2+).
+  Hidden by default, toggled by a clock icon.
+
+**Right panel (Sheet):** Clicking a node opens a `Sheet` (shadcn/ui
+slide-over panel) from the right edge, ~400 px wide. The graph
+shifts/compresses to accommodate. The sheet shows:
+
+- Node name (monospace, with copy button)
+- Status badge (healthy/warning/breach)
+- Key metrics (staleness, buffer depth, refresh duration)
+- Quick actions (Refresh, View detail, View lineage)
+- Mini refresh history sparkline (last 1 h)
+
+Clicking "View detail →" navigates to the full detail page.
+
+### Stream Table List
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│  Stream Tables                                    [search 🔍] │
+├──────────────────────────────────────────────────────────────┤
+│  Name           Mode    Staleness   Buffer   SLA     Trend  │
+│  ─────────────  ──────  ──────────  ───────  ──────  ─────  │
+│  revenue_7d     DIFF    12s / 60s   0        ██░ 20% ↔      │
+│  regional_sum   DIFF    45s / 60s   1,204    ████ 75% ↑     │
+│  orders_hourly  FULL    61s / 60s   8,102    █████ 🔴 ↑     │
+│  customer_agg   DIFF    3s / 30s    0        █░ 10%  ↔      │
+│  ...                                                         │
+├──────────────────────────────────────────────────────────────┤
+│  Showing 12 of 12 stream tables        [< 1 2 3 >]          │
+└──────────────────────────────────────────────────────────────┘
+```
+
+- **Sortable columns:** Click any header to sort. Default: SLA budget
+  descending (worst first — problems at the top).
+- **Row click:** Navigates to detail page.
+- **Name column:** Monospace. Prefixed with schema if not `public`.
+- **Mode column:** `DIFF` badge (green) or `FULL` badge (amber).
+- **SLA column:** Progress bar using semantic status colours. Text shows
+  percentage consumed.
+- **Trend column:** Arrow icon (↑ burning, ↔ stable, ↓ recovering).
+- **Search:** Filters by table name, schema, or refresh mode. Debounced
+  client-side filter (no API call — the full table list is small).
+
+### Stream Table Detail
+
+Tabbed layout. Page heading shows table name + status badge.
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│  ← Tables                                                     │
+│  revenue_7d                              [Refresh ↻] [⋯]    │
+│  ● Healthy · DIFFERENTIAL · every 60s                        │
+├──────────────────────────────────────────────────────────────┤
+│  [Overview]  [History]  [Lineage]  [Operators]  [SQL]        │
+├──────────────────────────────────────────────────────────────┤
+│                                                               │
+│  Staleness       Buffer Depth      Last Refresh     Avg (1h) │
+│  12s             0 rows            3s ago           45ms     │
+│                                                               │
+│  ┌─ Refresh History (sparkline, 1h) ────────────────────┐   │
+│  │  ▁▂▃▂▁▂▃▃▂▁▁▂▃▂▁▂▃▃▂▁▁▂▃▂▁▂▃▃▂▁▁▂▃▂▁▂▃▃▂▁        │   │
+│  └──────────────────────────────────────────────────────┘   │
+│                                                               │
+│  Columns                                                      │
+│  Name             Type         Nullable   Source              │
+│  ─────────────    ──────────   ────────   ──────────         │
+│  region           text         NO         customers.region   │
+│  total_revenue    numeric      NO         SUM(orders.amount) │
+│  order_count      bigint       NO         COUNT(*)           │
+│                                                               │
+└──────────────────────────────────────────────────────────────┘
+```
+
+**Tabs:**
+
+- **Overview:** Metrics cards + column list + sparkline (default tab)
+- **History:** Full refresh log table (paginated, sortable by duration/time/delta size)
+- **Lineage:** Column-level lineage graph (per-column DAG, rendered in a sub-graph)
+- **Operators:** DVM operator tree (graphviz-wasm rendering)
+- **SQL:** View definition + compiled delta SQL side-by-side (read-only code blocks)
+
+**Action buttons (top right):**
+
+- "Refresh ↻" — triggers manual refresh (SQL preview if Tier 2+)
+- "⋯" dropdown — Pause, Resume, View in Topology, Copy table name
+
+### SLA Budget Dashboard
+
+Accessed from the Tables page via a "SLA Budget" tab or a dedicated
+`/ui/tables?view=sla` toggle.
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│  SLA Budget Overview                          [worst first ▼] │
+├──────────────────────────────────────────────────────────────┤
+│                                                               │
+│  orders_hourly ████████████████████ 102% 🔴 BREACH           │
+│  61s / 60s · burning at 0.8s/s · breached 45s ago            │
+│                                                               │
+│  regional_summary ████████████░░░░ 75% ⚠️ WARNING            │
+│  45s / 60s · burning at 0.3s/s · breach in ~50s              │
+│                                                               │
+│  revenue_7d ████░░░░░░░░░░░░░░░░ 20% ✅                     │
+│  12s / 60s · stable · no breach expected                     │
+│                                                               │
+│  customer_agg █░░░░░░░░░░░░░░░░░░ 10% ✅                    │
+│  3s / 30s · stable · no breach expected                      │
+│                                                               │
+└──────────────────────────────────────────────────────────────┘
+```
+
+Each row is a wide progress bar coloured by status. Below the bar:
+staleness fraction, burn rate (from `sla_burn_rate` stream table),
+and time-to-breach prediction. Sorted worst-first by default.
+
+### Health Scorecard
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│  Health                                         4/6 passing  │
+├──────────────────────────────────────────────────────────────┤
+│  🔴 Buffer growth   orders: 15,204 rows, growing   [View →] │
+│  ⚠️ CDC triggers    customers: trigger disabled     [Fix →]  │
+│  ✅ Scheduler       Running · 12 tables · 3 workers          │
+│  ✅ Replication     Active · 2.1 MB retained WAL             │
+│  ✅ Relay: kafka    Connected · 0 lag rows                   │
+│  ✅ Fuses           All armed · 0 blown                      │
+└──────────────────────────────────────────────────────────────┘
+```
+
+Severity-sorted (critical → warning → healthy). Each row is a
+single line with: status icon, check name, detail text, action link.
+Compact — no cards, no whitespace waste.
+
+### Refresh Timeline
+
+Full-width ECharts time-series. Controls above the chart.
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│  Refresh Timeline                    [1h] [6h] [24h] [7d]   │
+│                                      [All tables ▼] [⚙]     │
+├──────────────────────────────────────────────────────────────┤
+│  ms                                              rows        │
+│  400 ┤                                           │ 2000      │
+│      │    ╭╮                                     │           │
+│  300 ┤   ╭╯╰╮        ╭──╮                       │ 1500      │
+│      │  ╭╯  ╰╮      ╭╯  ╰╮    ▓▓                │           │
+│  200 ┤──╯    ╰──────╯    ╰────▓▓───         --- │ 1000 SLA  │
+│      │                        ▓▓                 │           │
+│  100 ┤                                           │ 500       │
+│      │                    ●                      │           │
+│    0 ┼──────────────────────────────────────────>│ 0         │
+│      08:00        09:00        10:00       11:00             │
+├──────────────────────────────────────────────────────────────┤
+│  Legend: ── duration (ms)  ▓ row delta  ● error  --- SLA     │
+└──────────────────────────────────────────────────────────────┘
+```
+
+- Left Y axis: refresh duration (ms), stacked area per table
+- Right Y axis: row delta count (inserts + deletes), bar chart
+- SLA threshold: horizontal dashed red line
+- Error markers: red dots on timeline
+- Brush zoom: click-drag to zoom into a time range
+- Table filter: dropdown to show one table or all
+
+### Relay Pipelines
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│  Relay Pipelines                              [+ New] (Tier 2)│
+├──────────────────────────────────────────────────────────────┤
+│  Forward Pipelines                                            │
+│  Name             Backend   Status       Lag       Throughput │
+│  ──────────────   ───────   ──────────   ───────   ────────  │
+│  kafka-analytics  Kafka     ● Connected  0 rows    1.2k/s    │
+│  nats-events      NATS      ● Connected  342 rows  450/s     │
+│                                                               │
+│  Reverse Pipelines                                            │
+│  Name             Backend   Status       Buffer    Throughput │
+│  ──────────────   ───────   ──────────   ───────   ────────  │
+│  kafka-orders     Kafka     ● Connected  0 rows    800/s     │
+└──────────────────────────────────────────────────────────────┘
+```
+
+Grouped by direction (forward/reverse). Each row click opens detail
+panel. Backend column shows an icon for the backend type (Kafka, NATS,
+Redis, etc.).
+
+### Alerts Feed
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│  Alerts                              [All ▼] [Clear read]    │
+├──────────────────────────────────────────────────────────────┤
+│  ● 11:02:45  SLA breach    orders_hourly: 61s > 60s SLA     │
+│  ● 11:02:30  Fuse blown    revenue_7d: 3 consecutive errors  │
+│    11:01:15  CDC warning   customers: trigger disabled        │
+│    11:00:00  Refresh ok    revenue_7d: 45ms, +3/-1 rows      │
+│    10:59:45  Relay lag     nats-events: 342 rows behind      │
+│    ...                                                        │
+├──────────────────────────────────────────────────────────────┤
+│  Showing 50 of 234 alerts             [< 1 2 3 4 5 >]       │
+└──────────────────────────────────────────────────────────────┘
+```
+
+- **●** dot marks unread alerts. Reading clears them (per-session).
+- Severity-filtered dropdown: All, Critical, Warning, Info.
+- Timestamps in monospace, relative ("2m ago") with absolute on hover.
+- Alert text links to the relevant object (table name → table detail,
+  pipeline name → pipeline detail).
+
+### SQL Preview Modal
+
+A `Dialog` (modal) used for all write operations (Tier 2+). Also the
+human review layer for LLM-generated SQL.
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│  SQL Preview                                          [×]    │
+├──────────────────────────────────────────────────────────────┤
+│  ┌──────────────────────────────────────────────────────┐   │
+│  │  CREATE STREAM TABLE public.revenue_7d AS            │   │
+│  │  SELECT                                              │   │
+│  │      region,                                         │   │
+│  │      SUM(amount) AS total_revenue                    │   │
+│  │  FROM orders                                         │   │
+│  │  JOIN customers USING (customer_id)                  │   │
+│  │  WHERE order_date > now() - interval '7 days'        │   │
+│  │  GROUP BY region                                     │   │
+│  │  SCHEDULE '60 seconds';                              │   │
+│  └──────────────────────────────────────────────────────┘   │
+│                                                               │
+│  DVM Analysis:                                                │
+│  ✅ DIFFERENTIAL eligible                                    │
+│  ✅ All aggregates algebraic (SUM, COUNT)                    │
+│  ⚠️ WHERE clause uses now() — refreshes always see changes   │
+│                                                               │
+│                              [Copy SQL]  [Cancel]  [Apply]   │
+└──────────────────────────────────────────────────────────────┘
+```
+
+- SQL block uses JetBrains Mono with syntax highlighting (via
+  `shiki` or `prism`).
+- DVM analysis results shown below the SQL (from `/api/v1/sql/preview`).
+- "Copy SQL" copies to clipboard for migration files.
+- "Apply" executes the SQL. Button uses `--status-healthy` colour
+  (green) to signal a safe action. If DVM analysis shows warnings,
+  the button text changes to "Apply (with warnings)" in amber.
+- Editable (Tier 3): In Tier 3, the SQL block becomes a Monaco editor
+  where the user can modify the generated SQL before applying.
+
+---
+
+## Responsive Behaviour
+
+**Desktop-first. Tablet usable. Phone minimal.**
+
+| Breakpoint | Behaviour |
+|-----------|-----------|
+| ≥ 1280 px (desktop) | Full layout — expanded sidebar, full topology, all columns visible |
+| 768–1279 px (tablet) | Sidebar collapsed to icons by default. Tables hide low-priority columns (trend, throughput). Topology graph is full-width. |
+| < 768 px (phone) | Sidebar becomes a bottom tab bar (5 key items). Tables become card-based. Topology is zoomable/pannable but not ideal. Health scorecard and alerts are the primary phone views. |
+
+**Phone priority pages** (the views an SRE on-call actually needs):
+1. Health scorecard
+2. Alerts feed
+3. SLA budget overview
+4. Stream table list (simplified)
+
+The topology graph on phone is a "view-only, pinch-zoom" experience —
+useful for a quick glance but not for exploration. A "View on desktop"
+banner is shown.
+
+---
+
+## Accessibility
+
+Minimum target: **WCAG 2.1 Level AA.**
+
+| Requirement | Implementation |
+|------------|----------------|
+| Keyboard navigation | Radix primitives handle focus management. All interactive elements reachable via Tab. Topology graph supports arrow-key node traversal. |
+| Screen reader | ARIA labels on all status badges (`aria-label="healthy"`, not just colour). Topology nodes announced with name + status. Alert feed is a live region (`aria-live="polite"`). |
+| Colour contrast | All text meets 4.5:1 contrast ratio in both themes. Status colours are supplemented with icons (✅ ⚠️ 🔴) so colour-blind users don't depend on hue alone. |
+| Reduced motion | `prefers-reduced-motion` disables topology edge animations and transition effects. |
+| Focus indicators | Visible focus ring (2 px `--ring` colour) on all interactive elements. Never hidden. |
+
+---
+
+## Open Questions
+
+### SQ-1: Brand accent colour
+
+The accent colour is used for: active sidebar item, primary buttons
+(non-status), links, focus rings, selected tab underline. It must not
+conflict with the semantic status colours (green/amber/red).
+
+| Option | Notes |
+|--------|-------|
+| **Blue** (`blue-500`) | Safe, professional, clear separation from status colours. Common in dev tools (VS Code, Docker Desktop). |
+| **Teal/cyan** (`teal-500`) | Evokes streaming/data flow. Slightly less conventional. May be too close to the inbox/outbox node colour. |
+| **Purple** (`violet-500`) | Modern dev-tool feel (Linear, Vercel). Distinctive. |
+| **Green** (`emerald-500`) | PostgreSQL heritage. But conflicts with `--status-healthy` — rejected. |
+
+### SQ-2: Command palette
+
+A `Cmd+K` / `Ctrl+K` command palette (using shadcn/ui `Command`
+component, built on `cmdk`) enables power users to:
+
+- Jump to any stream table by name
+- Trigger a manual refresh
+- Navigate to any page
+- Search alerts
+- Toggle dark/light mode
+
+Implementation cost is low (~1 day with `cmdk`). Question: should it
+ship with Tier 1 or Tier 2?
+
+### SQ-3: Topology graph library
+
+reactflow vs Cytoscape.js — see the comparison table in
+[Topology Graph](#topology-graph). Decision deferred to a ½-day spike
+during implementation.
+
+### SQ-4: SQL syntax highlighting
+
+Options for the read-only SQL display (Tier 1–2) and editable SQL
+(Tier 3):
+
+| Tier | Library | Rationale |
+|------|---------|-----------|
+| 1–2 | **Shiki** | Static highlighting, no runtime JS. Supports PostgreSQL grammar. Used by Next.js docs. |
+| 3 | **Monaco Editor** | Full editing with autocomplete, inline errors, bracket matching. Heavy (~2 MB) but loaded only on the SQL editing page. |

@@ -5,6 +5,7 @@
 > **Category:** Tooling — Web Dashboard & Management Console
 > **Related:** [PLAN_RELAY_CLI.md](../relay/PLAN_RELAY_CLI.md) ·
 > [PLAN_TUI.md](../ui/PLAN_TUI.md) ·
+> [PLAN_WEBUI_STYLE.md](PLAN_WEBUI_STYLE.md) ·
 > [ROADMAP.md](../../ROADMAP.md)
 
 ---
