@@ -137,6 +137,13 @@ pub enum PgTrickleError {
     #[error("publication rebuild failed: {0}")]
     PublicationRebuildFailed(String),
 
+    // ── Diagnostic errors — failures in the diagnostics/monitoring API ──────
+    /// ERR-1 (v0.26.0): An error occurred inside a diagnostic or monitoring
+    /// function (e.g., `explain_refresh_mode`, `source_gates`, `watermarks`).
+    /// These surface as user-visible PostgreSQL errors with context info.
+    #[error("diagnostic error: {0}")]
+    DiagnosticError(String),
+
     // ── Internal errors — should not happen ──────────────────────────────
     /// An unexpected internal error. Indicates a bug.
     #[error("internal error: {0}")]
@@ -144,6 +151,14 @@ pub enum PgTrickleError {
 }
 
 impl PgTrickleError {
+    /// ERR-1/ERR-2 (v0.26.0): Convert this error into a PostgreSQL-level error.
+    ///
+    /// Call **only** at the `#[pg_extern]` SQL API boundary. Internal code must
+    /// propagate via `Result<T, PgTrickleError>` using `?`.
+    pub fn into_pg_error(self) -> ! {
+        pgrx::error!("{}", self)
+    }
+
     /// Whether this error is retryable by the scheduler.
     ///
     /// System errors and skipped refreshes are retryable.
@@ -319,6 +334,10 @@ impl PgTrickleError {
 
             PgTrickleError::ChangedColsBitmaskFailed(_)
             | PgTrickleError::PublicationRebuildFailed(_) => PgTrickleErrorKind::System,
+
+            // ERR-1 (v0.26.0): Diagnostic errors are system-level (SPI failures,
+            // catalog query issues). They are not retried but are surfaced to the user.
+            PgTrickleError::DiagnosticError(_) => PgTrickleErrorKind::System,
         }
     }
 }

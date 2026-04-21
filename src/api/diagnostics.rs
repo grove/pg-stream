@@ -186,7 +186,14 @@ pub(super) fn pgt_status() -> TableIterator<
                 None,
                 &[],
             )
-            .unwrap_or_else(|e| pgrx::error!("st_list: SPI select failed: {e}"));
+            .unwrap_or_else(|e| {
+                pgrx::error!(
+                    "{}",
+                    crate::error::PgTrickleError::DiagnosticError(format!(
+                        "st_list: SPI select failed: {e}"
+                    ))
+                )
+            });
 
         let mut out = Vec::new();
         for row in result {
@@ -241,7 +248,7 @@ pub(super) fn pgt_scc_status() -> TableIterator<
                 None,
                 &[],
             )
-            .unwrap_or_else(|e| pgrx::error!("pgt_scc_status: SPI select failed: {e}"));
+            .unwrap_or_else(|e| pgrx::error!("{}", crate::error::PgTrickleError::DiagnosticError(format!("pgt_scc_status: SPI select failed: {e}"))));
 
         let mut out = Vec::new();
         for row in result {
@@ -321,7 +328,14 @@ pub(super) fn explain_refresh_mode_impl(
                 None,
                 &[schema.as_str().into(), table_name.as_str().into()],
             )
-            .unwrap_or_else(|e| pgrx::error!("explain_refresh_mode: SPI error: {e}"))
+            .unwrap_or_else(|e| {
+                pgrx::error!(
+                    "{}",
+                    crate::error::PgTrickleError::DiagnosticError(format!(
+                        "explain_refresh_mode: SPI error: {e}"
+                    ))
+                )
+            })
             .first()
             .get_two::<String, String>()
             .unwrap_or((None, None))
@@ -329,7 +343,13 @@ pub(super) fn explain_refresh_mode_impl(
 
     let (configured_opt, effective_opt) = row;
     let configured = configured_opt.unwrap_or_else(|| {
-        pgrx::error!("stream table '{}' not found", name);
+        pgrx::error!(
+            "{}",
+            crate::error::PgTrickleError::DiagnosticError(format!(
+                "stream table '{}' not found",
+                name
+            ))
+        );
     });
 
     let downgrade_reason: Option<String> = match (configured.as_str(), effective_opt.as_deref()) {
@@ -955,8 +975,12 @@ pub(super) fn source_gates_fn() -> TableIterator<
             )
             .unwrap_or_else(|e| {
                 pgrx::warning!("source_gates: SPI error: {}", e);
-                // Return an empty iterator-compatible value via an empty Vec
-                pgrx::error!("source_gates: SPI error: {}", e)
+                pgrx::error!(
+                    "{}",
+                    crate::error::PgTrickleError::DiagnosticError(format!(
+                        "source_gates: SPI error: {e}"
+                    ))
+                )
             });
 
         let mut out = Vec::new();
@@ -1025,7 +1049,7 @@ pub(super) fn bootstrap_gate_status_fn() -> TableIterator<
                 None,
                 &[],
             )
-            .unwrap_or_else(|e| pgrx::error!("bootstrap_gate_status: SPI select failed: {e}"));
+            .unwrap_or_else(|e| pgrx::error!("{}", crate::error::PgTrickleError::DiagnosticError(format!("bootstrap_gate_status: SPI select failed: {e}"))));
 
         let mut out = Vec::new();
         for row in result {
@@ -1159,7 +1183,14 @@ pub(super) fn watermarks_fn() -> TableIterator<
                 None,
                 &[],
             )
-            .unwrap_or_else(|e| pgrx::error!("watermarks: SPI error: {}", e));
+            .unwrap_or_else(|e| {
+                pgrx::error!(
+                    "{}",
+                    crate::error::PgTrickleError::DiagnosticError(format!(
+                        "watermarks: SPI error: {e}"
+                    ))
+                )
+            });
 
         let mut out = Vec::new();
         for row in table {

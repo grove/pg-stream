@@ -15,10 +15,8 @@ use crate::error::PgTrickleError;
 /// receive change events without a separate replication slot.
 #[pg_extern(schema = "pgtrickle")]
 fn stream_table_to_publication(name: &str) {
-    let result = stream_table_to_publication_impl(name);
-    if let Err(e) = result {
-        pgrx::error!("{}", e);
-    }
+    // ERR-2 (v0.26.0): Use typed into_pg_error() at the API boundary.
+    stream_table_to_publication_impl(name).unwrap_or_else(|e| e.into_pg_error());
 }
 
 fn stream_table_to_publication_impl(name: &str) -> Result<(), PgTrickleError> {
@@ -74,10 +72,8 @@ fn stream_table_to_publication_impl(name: &str) -> Result<(), PgTrickleError> {
 /// CDC-PUB-2: Drop the logical replication publication for a stream table.
 #[pg_extern(schema = "pgtrickle")]
 fn drop_stream_table_publication(name: &str) {
-    let result = drop_stream_table_publication_impl(name);
-    if let Err(e) = result {
-        pgrx::error!("{}", e);
-    }
+    // ERR-2 (v0.26.0): Use typed into_pg_error() at the API boundary.
+    drop_stream_table_publication_impl(name).unwrap_or_else(|e| e.into_pg_error());
 }
 
 fn drop_stream_table_publication_impl(name: &str) -> Result<(), PgTrickleError> {
@@ -129,10 +125,8 @@ fn drop_stream_table_publication_impl(name: &str) -> Result<(), PgTrickleError> 
 /// The scheduler uses this to auto-assign the appropriate refresh tier.
 #[pg_extern(schema = "pgtrickle")]
 fn set_stream_table_sla(name: &str, sla: Interval) {
-    let result = set_stream_table_sla_impl(name, sla);
-    if let Err(e) = result {
-        pgrx::error!("{}", e);
-    }
+    // ERR-2 (v0.26.0): Use typed into_pg_error() at the API boundary.
+    set_stream_table_sla_impl(name, sla).unwrap_or_else(|e| e.into_pg_error());
 }
 
 fn set_stream_table_sla_impl(name: &str, sla: Interval) -> Result<(), PgTrickleError> {
@@ -375,10 +369,54 @@ pub fn should_preempt_to_full(pgt_id: i64, delta_rows: i64, last_full_ms: f64) -
 
 // ── SLA-3: Dynamic tier re-assignment ────────────────────────────────────
 
+/// SLA-2 (v0.26.0): Per-ST hysteresis counters for tier adjustment damping.
+///
+/// Stored in a thread-local so the scheduler's single-threaded tick loop
+/// persists the state between tick invocations without requiring a catalog
+/// schema change. State is lost on scheduler restart (acceptable — just
+/// means 3 more ticks are needed before a tier change fires).
+///
+/// Key: `pgt_id`.
+/// Value: `(consecutive_upgrade_pressure, consecutive_downgrade_pressure)`.
+///   - upgrade pressure: ideal tier is hotter than current → need to upgrade
+///   - downgrade pressure: ideal tier is colder than current → could downgrade
+///
+/// Requires 3 consecutive pressure signals in the same direction before
+/// actually changing the tier. This prevents oscillation at the SLA boundary.
+pub struct SlaTierHysteresis {
+    /// Consecutive ticks where the ideal tier is hotter than current.
+    pub upgrade_pressure: i32,
+    /// Consecutive ticks where the ideal tier is colder than current.
+    pub downgrade_pressure: i32,
+}
+
+impl SlaTierHysteresis {
+    const THRESHOLD: i32 = 3;
+}
+
+use std::cell::RefCell;
+use std::collections::HashMap as _HashMap;
+thread_local! {
+    /// SLA-2: Per-ST tier hysteresis state.  Keyed by `pgt_id`.
+    static SLA_TIER_HYSTERESIS: RefCell<_HashMap<i64, SlaTierHysteresis>> =
+        RefCell::new(_HashMap::new());
+}
+
+/// Numeric ordering for RefreshTier (lower = hotter = more frequent).
+fn tier_order(tier: &crate::scheduler::RefreshTier) -> u8 {
+    use crate::scheduler::RefreshTier;
+    match tier {
+        RefreshTier::Hot => 0,
+        RefreshTier::Warm => 1,
+        RefreshTier::Cold => 2,
+        RefreshTier::Frozen => 3,
+    }
+}
+
 /// SLA-3: Check and adjust tier for a stream table based on SLA and queue depth.
 ///
-/// Called after each refresh tick. Bumps tier up or down if the SLA is
-/// consistently exceeded or under-utilised.
+/// Called after each refresh tick. Bumps tier up or down only after 3
+/// consecutive signals in the same direction (SLA-2 hysteresis damping).
 pub fn maybe_adjust_tier_for_sla(meta: &StreamTableMeta) {
     let sla_ms = match meta.freshness_deadline_ms {
         Some(ms) => ms,
@@ -416,25 +454,99 @@ pub fn maybe_adjust_tier_for_sla(meta: &StreamTableMeta) {
     let current_tier = RefreshTier::from_sql_str(&meta.refresh_tier);
     let ideal_tier = assign_tier_for_sla(sla_ms).unwrap_or(RefreshTier::Hot);
 
-    // If the current tier doesn't match what the SLA demands, adjust.
-    if current_tier != ideal_tier {
-        Spi::connect_mut(|client| {
-            let _ = client.update(
-                "UPDATE pgtrickle.pgt_stream_tables \
-                 SET refresh_tier = $1, updated_at = now() \
-                 WHERE pgt_id = $2",
-                None,
-                &[ideal_tier.as_str().into(), meta.pgt_id.into()],
-            );
+    let current_order = tier_order(&current_tier);
+    let ideal_order = tier_order(&ideal_tier);
+
+    // SLA-2 (v0.26.0): Hysteresis damping — require THRESHOLD consecutive
+    // pressure signals before changing the tier.
+    if current_order == ideal_order {
+        // Tiers match — reset hysteresis counters.
+        SLA_TIER_HYSTERESIS.with(|map| {
+            if let Some(state) = map.borrow_mut().get_mut(&meta.pgt_id) {
+                state.upgrade_pressure = 0;
+                state.downgrade_pressure = 0;
+            }
         });
-        #[cfg(not(test))]
-        pgrx::info!(
-            "pg_trickle: SLA-driven tier adjustment for '{}': {} → {}",
-            meta.pgt_name,
-            current_tier.as_str(),
-            ideal_tier.as_str()
-        );
+        return;
     }
+
+    SLA_TIER_HYSTERESIS.with(|map| {
+        let mut map = map.borrow_mut();
+        let state = map.entry(meta.pgt_id).or_insert(SlaTierHysteresis {
+            upgrade_pressure: 0,
+            downgrade_pressure: 0,
+        });
+
+        if ideal_order < current_order {
+            // Upgrade pressure: ideal tier is hotter than current.
+            state.upgrade_pressure += 1;
+            state.downgrade_pressure = 0;
+
+            if state.upgrade_pressure >= SlaTierHysteresis::THRESHOLD {
+                // Upgrade by one step (don't jump directly to ideal — incremental).
+                let new_order = current_order.saturating_sub(1);
+                let new_tier = match new_order {
+                    0 => RefreshTier::Hot,
+                    1 => RefreshTier::Warm,
+                    2 => RefreshTier::Cold,
+                    _ => RefreshTier::Frozen,
+                };
+                Spi::connect_mut(|client| {
+                    let _ = client.update(
+                        "UPDATE pgtrickle.pgt_stream_tables \
+                         SET refresh_tier = $1, updated_at = now() \
+                         WHERE pgt_id = $2",
+                        None,
+                        &[new_tier.as_str().into(), meta.pgt_id.into()],
+                    );
+                });
+                #[cfg(not(test))]
+                pgrx::info!(
+                    "pg_trickle: SLA-2 tier upgrade for '{}': {} → {} \
+                     (after {} consecutive pressure signals)",
+                    meta.pgt_name,
+                    current_tier.as_str(),
+                    new_tier.as_str(),
+                    state.upgrade_pressure,
+                );
+                state.upgrade_pressure = 0;
+            }
+        } else {
+            // Downgrade pressure: ideal tier is colder than current.
+            state.downgrade_pressure += 1;
+            state.upgrade_pressure = 0;
+
+            if state.downgrade_pressure >= SlaTierHysteresis::THRESHOLD {
+                // Downgrade by one step.
+                let new_order = current_order + 1;
+                let new_tier = match new_order {
+                    0 => RefreshTier::Hot,
+                    1 => RefreshTier::Warm,
+                    2 => RefreshTier::Cold,
+                    _ => RefreshTier::Frozen,
+                };
+                Spi::connect_mut(|client| {
+                    let _ = client.update(
+                        "UPDATE pgtrickle.pgt_stream_tables \
+                         SET refresh_tier = $1, updated_at = now() \
+                         WHERE pgt_id = $2",
+                        None,
+                        &[new_tier.as_str().into(), meta.pgt_id.into()],
+                    );
+                });
+                #[cfg(not(test))]
+                pgrx::info!(
+                    "pg_trickle: SLA-2 tier downgrade for '{}': {} → {} \
+                     (after {} consecutive pressure signals)",
+                    meta.pgt_name,
+                    current_tier.as_str(),
+                    new_tier.as_str(),
+                    state.downgrade_pressure,
+                );
+                state.downgrade_pressure = 0;
+            }
+        }
+    });
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────

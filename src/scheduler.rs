@@ -5521,7 +5521,8 @@ fn execute_scheduled_refresh(
         .unwrap_or_else(|| {
             pgrx::warning!("now() returned NULL in scheduler");
             TimestampWithTimeZone::try_from(0i64).unwrap_or_else(|_| {
-                pgrx::error!("scheduler: failed to create epoch TimestampWithTimeZone")
+                // ERR-3 (v0.26.0): HINT added for system clock diagnostics.
+                pgrx::error!("scheduler: failed to create epoch TimestampWithTimeZone; HINT: check system clock configuration")
             })
         });
 
@@ -6121,7 +6122,8 @@ fn log_gated_skip(st: &StreamTableMeta) {
                 st.pgt_name
             );
             TimestampWithTimeZone::try_from(0i64).unwrap_or_else(|_| {
-                pgrx::error!("scheduler: failed to create epoch TimestampWithTimeZone")
+                // ERR-3 (v0.26.0): HINT added for system clock diagnostics.
+                pgrx::error!("scheduler: failed to create epoch TimestampWithTimeZone; HINT: check system clock configuration")
             })
         });
 
@@ -6206,7 +6208,8 @@ fn log_watermark_skip(st: &StreamTableMeta, reason: &str) {
                 st.pgt_name
             );
             TimestampWithTimeZone::try_from(0i64).unwrap_or_else(|_| {
-                pgrx::error!("scheduler: failed to create epoch TimestampWithTimeZone")
+                // ERR-3 (v0.26.0): HINT added for system clock diagnostics.
+                pgrx::error!("scheduler: failed to create epoch TimestampWithTimeZone; HINT: check system clock configuration")
             })
         });
 

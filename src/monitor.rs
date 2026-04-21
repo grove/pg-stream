@@ -269,7 +269,14 @@ fn collect_slot_health_rows() -> Vec<(String, i64, bool, i64, String)> {
                 None,
                 &[],
             )
-            .unwrap_or_else(|e| pgrx::error!("slot_health: SPI select failed: {e}"));
+            .unwrap_or_else(|e| {
+                pgrx::error!(
+                    "{}",
+                    crate::error::PgTrickleError::DiagnosticError(format!(
+                        "slot_health: SPI select failed: {e}"
+                    ))
+                )
+            });
 
         let mut out = Vec::new();
         for row in result {
@@ -542,7 +549,14 @@ fn st_refresh_stats() -> TableIterator<
                 None,
                 &[],
             )
-            .unwrap_or_else(|e| pgrx::error!("st_refresh_stats: SPI select failed: {e}"));
+            .unwrap_or_else(|e| {
+                pgrx::error!(
+                    "{}",
+                    crate::error::PgTrickleError::DiagnosticError(format!(
+                        "st_refresh_stats: SPI select failed: {e}"
+                    ))
+                )
+            });
 
         let mut out = Vec::new();
         for row in result {
@@ -775,12 +789,24 @@ fn get_refresh_history(
                 None,
                 &[schema.into(), table_name.into(), max_rows.into()],
             )
-            .unwrap_or_else(|e| pgrx::error!("get_refresh_history: SPI select failed: {e}"));
+            .unwrap_or_else(|e| {
+                pgrx::error!(
+                    "{}",
+                    crate::error::PgTrickleError::DiagnosticError(format!(
+                        "get_refresh_history: SPI select failed: {e}"
+                    ))
+                )
+            });
 
         let mut out = Vec::new();
         let epoch_zero = TimestampWithTimeZone::try_from(0i64).unwrap_or_else(|_| {
             // This should never fail, but if it does, fall through gracefully.
-            pgrx::error!("get_refresh_history: failed to construct epoch timestamp")
+            pgrx::error!(
+                "{}",
+                crate::error::PgTrickleError::DiagnosticError(
+                    "get_refresh_history: failed to construct epoch timestamp".into()
+                )
+            )
         });
         for row in result {
             let refresh_id = row.get::<i64>(1).unwrap_or(None).unwrap_or(0);
@@ -2084,7 +2110,14 @@ fn change_buffer_sizes() -> TableIterator<
                 None,
                 &[],
             )
-            .unwrap_or_else(|e| pgrx::error!("change_buffer_sizes: SPI select failed: {e}"));
+            .unwrap_or_else(|e| {
+                pgrx::error!(
+                    "{}",
+                    crate::error::PgTrickleError::DiagnosticError(format!(
+                        "change_buffer_sizes: SPI select failed: {e}"
+                    ))
+                )
+            });
 
         let mut out = Vec::new();
         for row in result {
@@ -2156,7 +2189,14 @@ fn list_sources(
                 None,
                 &[schema.into(), table_name.into()],
             )
-            .unwrap_or_else(|e| pgrx::error!("list_sources: SPI select failed: {e}"));
+            .unwrap_or_else(|e| {
+                pgrx::error!(
+                    "{}",
+                    crate::error::PgTrickleError::DiagnosticError(format!(
+                        "list_sources: SPI select failed: {e}"
+                    ))
+                )
+            });
 
         let mut out = Vec::new();
         for row in result {
@@ -2216,7 +2256,14 @@ fn dependency_tree() -> TableIterator<
                 None,
                 &[],
             )
-            .unwrap_or_else(|e| pgrx::error!("dependency_tree: failed to load stream tables: {e}"));
+            .unwrap_or_else(|e| {
+                pgrx::error!(
+                    "{}",
+                    crate::error::PgTrickleError::DiagnosticError(format!(
+                        "dependency_tree: failed to load stream tables: {e}"
+                    ))
+                )
+            });
 
         let mut m = std::collections::HashMap::new();
         for row in result {
@@ -2268,7 +2315,14 @@ fn dependency_tree() -> TableIterator<
                 None,
                 &[],
             )
-            .unwrap_or_else(|e| pgrx::error!("dependency_tree: failed to load dependencies: {e}"));
+            .unwrap_or_else(|e| {
+                pgrx::error!(
+                    "{}",
+                    crate::error::PgTrickleError::DiagnosticError(format!(
+                        "dependency_tree: failed to load dependencies: {e}"
+                    ))
+                )
+            });
 
         for row in result {
             let consumer = row.get::<String>(1).unwrap_or(None).unwrap_or_default();
@@ -2887,8 +2941,14 @@ fn refresh_timeline(
         name!(error_message, Option<String>),
     ),
 > {
-    let epoch_zero = TimestampWithTimeZone::try_from(0i64)
-        .unwrap_or_else(|_| pgrx::error!("refresh_timeline: failed to construct epoch timestamp"));
+    let epoch_zero = TimestampWithTimeZone::try_from(0i64).unwrap_or_else(|_| {
+        pgrx::error!(
+            "{}",
+            crate::error::PgTrickleError::DiagnosticError(
+                "refresh_timeline: failed to construct epoch timestamp".into()
+            )
+        )
+    });
 
     let rows: Vec<_> = Spi::connect(|client| {
         let result = client
@@ -2912,7 +2972,14 @@ fn refresh_timeline(
                 None,
                 &[max_rows.into()],
             )
-            .unwrap_or_else(|e| pgrx::error!("refresh_timeline: SPI select failed: {e}"));
+            .unwrap_or_else(|e| {
+                pgrx::error!(
+                    "{}",
+                    crate::error::PgTrickleError::DiagnosticError(format!(
+                        "refresh_timeline: SPI select failed: {e}"
+                    ))
+                )
+            });
 
         let mut out = Vec::new();
         for row in result {
@@ -2994,7 +3061,14 @@ fn trigger_inventory() -> TableIterator<
                 None,
                 &[],
             )
-            .unwrap_or_else(|e| pgrx::error!("trigger_inventory: SPI select failed: {e}"));
+            .unwrap_or_else(|e| {
+                pgrx::error!(
+                    "{}",
+                    crate::error::PgTrickleError::DiagnosticError(format!(
+                        "trigger_inventory: SPI select failed: {e}"
+                    ))
+                )
+            });
 
         let mut out = Vec::new();
         for row in result {
@@ -3124,7 +3198,13 @@ fn parallel_job_status(
                     .unwrap_or(None)
                     .unwrap_or_else(|| {
                         TimestampWithTimeZone::try_from(0i64).unwrap_or_else(|_| {
-                            pgrx::error!("parallel_job_status: failed to construct epoch timestamp")
+                            pgrx::error!(
+                                "{}",
+                                crate::error::PgTrickleError::DiagnosticError(
+                                    "parallel_job_status: failed to construct epoch timestamp"
+                                        .into()
+                                )
+                            )
                         })
                     });
                 let started_at = row.get::<TimestampWithTimeZone>(10).unwrap_or(None);

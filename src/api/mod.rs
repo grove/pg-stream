@@ -430,6 +430,18 @@ fn raise_error_with_context(e: PgTrickleError) -> ! {
             .report(PgLogLevel::ERROR);
             unreachable!()
         }
+        PgTrickleError::DiagnosticError(msg) => {
+            ErrorReport::new(
+                PgSqlErrorCode::ERRCODE_INTERNAL_ERROR,
+                format!("diagnostic error: {}", msg),
+                "",
+            )
+            .set_hint(
+                "A diagnostic operation failed. Check the PostgreSQL log for details.".to_string(),
+            )
+            .report(PgLogLevel::ERROR);
+            unreachable!()
+        }
     }
 }
 
