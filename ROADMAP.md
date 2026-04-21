@@ -45,6 +45,7 @@ coverage, all in plain language.
 - [v0.26.0 — Test & Concurrency Hardening](#v0260--test--concurrency-hardening)
 - [v0.27.0 — Transactional Inbox & Outbox Patterns](#v0270--transactional-inbox--outbox-patterns)
 - [v0.28.0 — Relay CLI (`pgtrickle-relay`)](#v0280--relay-cli-pgtrickle-relay)
+- [v0.29.0 — Operability, Observability & DR](#v0290--operability-observability--dr)
 - [v1.6.0 — TUI Self-Monitoring Integration](#v160--tui-self-monitoring-integration)
 - [v1.1.0 — PostgreSQL 17 Support](#v110--postgresql-17-support)
 - [v1.2.0 — PGlite Proof of Concept](#v120--pglite-proof-of-concept)
@@ -99,6 +100,7 @@ from the v0.1.x series to 1.0 and beyond.
 | v0.26.0 | Test & concurrency hardening | Planned |
 | v0.27.0 | Transactional inbox & outbox patterns | Planned |
 | v0.28.0 | Relay CLI (`pgtrickle-relay`) — bidirectional outbox→sinks + sources→inbox | Planned |
+| v0.29.0 | Operability, observability & DR — snapshot/PITR, schedule planner, cluster metrics | Planned |
 | v1.6.0 | TUI self-monitoring integration | Planned |
 | v1.1.0 | PostgreSQL 17 support | Planned |
 | v1.2.0 | PGlite proof of concept | Planned |
@@ -7076,6 +7078,137 @@ Phase 1–5 DVM code changes and the TPC-H scaling investigation. Items marked
 - [ ] RELAY-32: Reverse dedup: duplicate source message produces 1 inbox row; crash recovery zero loss
 - [ ] Extension upgrade path tested (`0.23.0 → 0.24.0`)
 - [ ] `just check-version-sync` passes
+
+---
+
+## v0.29.0 — Operability, Observability & DR
+
+**Status: Planned.** Sourced from [PLAN_OVERALL_ASSESSMENT_2.md](plans/PLAN_OVERALL_ASSESSMENT_2.md) §4, §7, §9 — the remaining actionable items not addressed in v0.24.0–v0.28.0.
+
+> **Release Theme**
+> This release closes the final pre-1.0 operability gaps identified in the
+> v0.23.0 deep-analysis report. Four complementary themes: (1) a **snapshot
+> and PITR API** so fresh replicas can bootstrap from a point-in-time
+> export rather than re-running the full defining query; (2) a
+> **predictive maintenance window planner** that turns the v0.22 cost model
+> into actionable schedule recommendations; (3) a **cluster-wide
+> observability layer** exposing per-database worker allocation from the
+> postmaster and adding per-DB Prometheus metric labels; and (4)
+> **OpenMetrics conformance hardening** for the metrics endpoint, including
+> cluster-wide aggregation and a conformance test. Together these items
+> leave pg_trickle well-positioned for the v1.0 stable release.
+
+### Stream-Table Snapshot & Point-in-Time Restore
+
+> **In plain terms:** `snapshot_stream_table()` exports the current content
+> of a stream table — its frontier, content hash, and all rows — into an
+> archival companion table. `restore_from_snapshot()` rehydrates that state
+> on a fresh replica in seconds, skipping the full defining-query
+> re-execution. Aligns ST state with logical wall-clock for PITR workflows.
+
+| Item | Description | Effort | Ref |
+|------|-------------|--------|-----|
+| SNAP-1 | **`snapshot_stream_table(name, target)` SQL function.** Exports `(pgt_id, frontier, content_hash, rows)` to an archival table `pgtrickle.snapshot_<name>_<timestamp>`. Creates the table if it does not exist; overwrites with `CREATE TABLE … AS SELECT`. Snapshot includes the frontier LSN and current `pgt_stream_tables` metadata row. `SnapshotAlreadyExists` error variant if `target` is given and already occupied. | 2d | [PLAN_OVERALL_ASSESSMENT_2.md](plans/PLAN_OVERALL_ASSESSMENT_2.md) §7 |
+| SNAP-2 | **`restore_from_snapshot(name, source)` SQL function.** Rehydrates a stream table from a snapshot table created by SNAP-1. Replays the archived frontier into `pgt_stream_tables`, bulk-inserts rows, skips the initial full-refresh cycle. `SnapshotSourceNotFound`, `SnapshotSchemaVersionMismatch` error variants. | 2d | [PLAN_OVERALL_ASSESSMENT_2.md](plans/PLAN_OVERALL_ASSESSMENT_2.md) §7 |
+| SNAP-3 | **`list_snapshots(name)` + `drop_snapshot(snapshot_table)`.** Monitoring function returning all snapshots for a given ST (name, creation time, row count, frontier, size_bytes). `drop_snapshot` drops the archival table and removes it from the metadata catalog. | 0.5d | [PLAN_OVERALL_ASSESSMENT_2.md](plans/PLAN_OVERALL_ASSESSMENT_2.md) §7 |
+| SNAP-4 | **Tests.** Integration: snapshot → drop ST → restore → verify rows and frontier match; schema-version mismatch returns error; snapshot on IMMEDIATE-mode ST. E2E: fresh-replica bootstrap via snapshot completes in < 5 s for 1M-row ST. | 1d | [PLAN_OVERALL_ASSESSMENT_2.md](plans/PLAN_OVERALL_ASSESSMENT_2.md) §7 |
+| SNAP-5 | **Documentation.** SQL_REFERENCE.md: snapshot/restore API. PATTERNS.md: "Replica Bootstrap & PITR Alignment" section. BACKUP_AND_RESTORE.md: updated to cover the snapshot path alongside `pg_dump`. | 0.5d | [PLAN_OVERALL_ASSESSMENT_2.md](plans/PLAN_OVERALL_ASSESSMENT_2.md) §7 |
+
+> **Snapshot/PITR subtotal: ~6 days**
+
+### Predictive Maintenance Window Planner
+
+> **In plain terms:** `recommend_schedule(name)` analyses the per-ST
+> cost-model history (accumulated since v0.22) and returns a recommended
+> `refresh_interval`, peak-window `cron` expression, and confidence score.
+> A longer-term extension can flag expected cost spikes in advance so
+> operators can act before SLA breaches occur.
+
+| Item | Description | Effort | Ref |
+|------|-------------|--------|-----|
+| PLAN-1 | **`pgtrickle.recommend_schedule(name)` SQL function.** Returns a single JSONB row with `recommended_interval_seconds`, `peak_window_cron`, `confidence` (0–1), and `reasoning` (text). Uses the per-ST `last_full_ms`/`last_diff_ms` history and the v0.25.0 median+MAD model. Confidence is `0.0` if fewer than `pg_trickle.schedule_recommendation_min_samples` (default 20) observations are available. | 2d | [PLAN_OVERALL_ASSESSMENT_2.md](plans/PLAN_OVERALL_ASSESSMENT_2.md) §7 |
+| PLAN-2 | **`pgtrickle.schedule_recommendations()` set-returning function.** Returns one row per registered ST with `name`, `current_interval_seconds`, `recommended_interval_seconds`, `delta_pct`, `confidence`, `reasoning`. Sortable by `delta_pct DESC` so operators can quickly find the most mis-tuned STs. | 1d | [PLAN_OVERALL_ASSESSMENT_2.md](plans/PLAN_OVERALL_ASSESSMENT_2.md) §7 |
+| PLAN-3 | **Spike-forecast alert.** Post-tick hook: if the cost model predicts the next refresh will exceed the ST's SLA by > 20 %, emit a `pg_trickle_alert` event `predicted_sla_breach` with `stream_table`, `predicted_ms`, and `sla_ms`. Alert is debounced — at most one per `pg_trickle.schedule_alert_cooldown_seconds` (default 300 s). | 1.5d | [PLAN_OVERALL_ASSESSMENT_2.md](plans/PLAN_OVERALL_ASSESSMENT_2.md) §7 |
+| PLAN-4 | **Tests + documentation.** Unit: `recommend_schedule` returns `confidence = 0.0` before `min_samples`; returns non-trivial recommendation after synthetic history injection; spike-forecast alert fires exactly once per cooldown window. SQL_REFERENCE.md: `recommend_schedule` + `schedule_recommendations` API. CONFIGURATION.md: two new GUCs. | 1d | [PLAN_OVERALL_ASSESSMENT_2.md](plans/PLAN_OVERALL_ASSESSMENT_2.md) §7 |
+
+> **Predictive planner subtotal: ~5.5 days**
+
+### Cluster-Wide Observability
+
+> **In plain terms:** The v0.25.0 `worker_allocation_status()` view covers
+> per-database quota usage but only from within a single database connection.
+> This adds a postmaster-level cluster summary visible from any database, tags
+> every Prometheus metric with `db_oid` (enabling per-DB Grafana panels across
+> a cluster), and publishes a multi-tenant deployment guide.
+
+| Item | Description | Effort | Ref |
+|------|-------------|--------|-----|
+| CLUS-1 | **`pgtrickle.cluster_worker_summary()` SQL function.** Reads the shared-memory worker-pool shmem block (already populated by all DB bgworkers) and returns one row per database: `db_oid`, `db_name`, `workers_active`, `workers_queued`, `quota`, `quota_utilization_pct`. Accessible from any database in the cluster without cross-DB SPI. | 2d | [PLAN_OVERALL_ASSESSMENT_2.md](plans/PLAN_OVERALL_ASSESSMENT_2.md) §4 |
+| CLUS-2 | **Per-DB Prometheus metric labels.** Tag all metrics emitted by `src/metrics_server.rs` with `db_oid=<oid>` and `db_name=<name>` labels. Enables per-DB Grafana panels and per-DB alerting rules without separate endpoints. | 1d | [PLAN_OVERALL_ASSESSMENT_2.md](plans/PLAN_OVERALL_ASSESSMENT_2.md) §4, §9 |
+| CLUS-3 | **`docs/integrations/multi-tenant.md` (new page).** Documents recommended multi-DB deployment patterns: quota allocation formula (`ceil(total_workers / N_databases)`), GUC configuration, Grafana dashboard snippets using `db_name` labels, and `cluster_worker_summary()` usage. | 0.5d | [PLAN_OVERALL_ASSESSMENT_2.md](plans/PLAN_OVERALL_ASSESSMENT_2.md) §4 |
+| CLUS-4 | **`docs/SCALING.md` update.** Add a "Cluster-wide worker fairness" section cross-referencing `cluster_worker_summary()`, the new quota GUC documentation, and the multi-tenant integration page. | 0.5d | [PLAN_OVERALL_ASSESSMENT_2.md](plans/PLAN_OVERALL_ASSESSMENT_2.md) §4 |
+
+> **Cluster observability subtotal: ~4 days**
+
+### OpenMetrics Conformance & Metrics Hardening
+
+> **In plain terms:** The `src/metrics_server.rs` endpoint introduced in
+> v0.20 has zero unit tests and no validation that its output conforms to
+> the OpenMetrics text format. This item adds a conformance test, port-conflict
+> and timeout handling, and a cluster-wide aggregation view.
+
+| Item | Description | Effort | Ref |
+|------|-------------|--------|-----|
+| METR-1 | **OpenMetrics conformance test.** Parse the `/metrics` output with the `openmetrics_parser` crate (or equivalent) and assert no validation errors. Run as a unit test in `src/metrics_server.rs` using a mock request. | 1d | [PLAN_OVERALL_ASSESSMENT_2.md](plans/PLAN_OVERALL_ASSESSMENT_2.md) §9 |
+| METR-2 | **Port-conflict and timeout unit tests.** Test that `metrics_server::start()` returns a typed `MetricsServerError::PortInUse` when the port is occupied, and `MetricsServerError::Timeout` when the request handler exceeds `pg_trickle.metrics_request_timeout_ms` (new GUC, default 5000 ms). | 1d | [PLAN_OVERALL_ASSESSMENT_2.md](plans/PLAN_OVERALL_ASSESSMENT_2.md) §9 |
+| METR-3 | **`pgtrickle.metrics_summary()` cluster-wide aggregation view.** Set-returning function that aggregates key counters across all databases visible in `pg_stat_activity` (refresh count, error count, worker utilisation). Feeds the cluster-level Grafana overview dashboard. | 1.5d | [PLAN_OVERALL_ASSESSMENT_2.md](plans/PLAN_OVERALL_ASSESSMENT_2.md) §9 |
+| METR-4 | **Malformed-HTTP handler.** Catch malformed HTTP requests to the metrics endpoint; return 400 Bad Request with a plain-text error body rather than panicking. Add unit test. | 0.5d | [PLAN_OVERALL_ASSESSMENT_2.md](plans/PLAN_OVERALL_ASSESSMENT_2.md) §9 |
+
+> **Metrics hardening subtotal: ~4 days**
+
+### Implementation Phases
+
+| Phase | Description | Duration |
+|-------|-------------|----------|
+| Phase 1 | Snapshot/PITR: catalog, SQL functions, tests, documentation | Days 1–6 |
+| Phase 2 | Predictive planner: `recommend_schedule`, `schedule_recommendations`, spike-forecast alert, tests | Days 6–11.5 |
+| Phase 3 | Cluster observability: `cluster_worker_summary`, per-DB labels, multi-tenant docs, SCALING.md | Days 11.5–15.5 |
+| Phase 4 | Metrics hardening: OpenMetrics conformance, port-conflict tests, aggregation view, malformed-HTTP handler | Days 15.5–19.5 |
+| Phase 5 | Integration testing, upgrade script, documentation review | Days 19.5–22 |
+
+> **v0.29.0 total: ~3–4 weeks** (~22 person-days solo)
+
+**Exit criteria:**
+- [ ] SNAP-1: `snapshot_stream_table()` creates archival table with correct frontier and row data
+- [ ] SNAP-2: `restore_from_snapshot()` rehydrates ST; first refresh cycle after restore is DIFFERENTIAL (not FULL)
+- [ ] SNAP-3: `list_snapshots()` lists all snapshots for a ST; `drop_snapshot()` removes archival table and catalog row
+- [ ] SNAP-4: Fresh-replica bootstrap via snapshot completes in < 5 s for 1M-row ST
+- [ ] SNAP-5: BACKUP_AND_RESTORE.md updated; PATTERNS.md "Replica Bootstrap & PITR Alignment" section added
+- [ ] PLAN-1: `recommend_schedule()` returns `confidence = 0.0` before `min_samples`; returns non-trivial recommendation with synthetic history
+- [ ] PLAN-2: `schedule_recommendations()` returns one row per ST; sortable by `delta_pct`
+- [ ] PLAN-3: `predicted_sla_breach` alert fires once per cooldown window; no duplicate alerts
+- [ ] PLAN-4: All unit tests for planner pass; two new GUCs documented
+- [ ] CLUS-1: `cluster_worker_summary()` returns accurate per-DB worker counts from any database in the cluster
+- [ ] CLUS-2: All Prometheus metrics carry `db_oid` and `db_name` labels; existing Grafana dashboard templates updated
+- [ ] CLUS-3: `docs/integrations/multi-tenant.md` published with quota formula and Grafana snippets
+- [ ] CLUS-4: `docs/SCALING.md` cluster-wide fairness section added
+- [ ] METR-1: OpenMetrics conformance test passes; zero parse errors on live `/metrics` output
+- [ ] METR-2: Port-conflict test returns `MetricsServerError::PortInUse`; timeout test returns `MetricsServerError::Timeout`
+- [ ] METR-3: `metrics_summary()` returns aggregated counters; Grafana cluster-overview query documented
+- [ ] METR-4: Malformed HTTP request returns 400 Bad Request; no panic
+- [ ] Extension upgrade path tested (`0.28.0 → 0.29.0`)
+- [ ] `just check-version-sync` passes
+
+---
+
+## Post-1.0 Addendum — Cross-Cluster & Visual Tooling
+
+The following items from [PLAN_OVERALL_ASSESSMENT_2.md](plans/PLAN_OVERALL_ASSESSMENT_2.md) §7 are explicitly post-1.0 and are tracked here rather than in a numbered milestone:
+
+| Item | Description | Priority | Ref |
+|------|-------------|----------|-----|
+| POST-XC | **Cross-cluster fan-out via `pgtrickle-relay`.** A relay mode that reads from one cluster's outbox and applies to another cluster's inbox. Optional CRDT-style conflict resolution for last-write-wins counters. Enables multi-region read-replica patterns without a full replication setup. | Medium | [PLAN_OVERALL_ASSESSMENT_2.md](plans/PLAN_OVERALL_ASSESSMENT_2.md) §7 |
+| POST-VIS | **GUI workflow designer + visual DAG editor.** Extend `pgtrickle-tui` with a visual DAG editor and an EXPLAIN-DIFF preview that shows the rewritten DVM SQL alongside expected delta size. Lowers on-boarding ramp for SQL developers unfamiliar with IVM semantics. | Medium | [PLAN_OVERALL_ASSESSMENT_2.md](plans/PLAN_OVERALL_ASSESSMENT_2.md) §7 |
 
 ---
 
