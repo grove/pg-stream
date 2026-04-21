@@ -614,6 +614,30 @@ orders_hourly      61s / 60s    8,102    ██████████   🔴 B
 SLA is "max 30s stale" and the table is 25s stale and trending upward,
 the burn rate shows the remaining time before breach.
 
+**Root cause vs inherited breach.** A table in SLA breach is classified
+as either:
+
+- **Root cause** — the breach originates here. The table's own refresh
+  is failing, stalled, or producing rows too slowly independent of its
+  inputs. Identified when: the table has no stream-table ancestors, or
+  all stream-table ancestors are healthy.
+- **Inherited breach** — the table is breached because an upstream node
+  is breached. Its own refresh is keeping pace; the staleness is flowing
+  down from the root. Identified when: at least one upstream node is
+  itself in root-cause breach.
+
+This distinction affects three things:
+
+1. **Table list:** Root cause rows show `🔴 root`; inherited rows show
+   `🔴 ⬆`. A "Root causes" view mode collapses all casualties under
+   their cause — 1 broken inbox + 10 downstream outputs = 1 entry, not 11.
+2. **Table detail header:** An inherited-breach table shows a banner:
+   "Root cause: `erp_raw.orders_raw` →" so the operator can jump
+   directly to the real problem without reading the lineage graph.
+3. **Alerts feed:** Downstream breach alerts are grouped under the root
+   cause event rather than firing separately. The sidebar badge counts
+   independent root cause events, not total breached tables.
+
 **End-to-end lag:** The topology graph shows cumulative lag through the
 dependency chain. A 2s delay in `orders` CDC that compounds to 45s
 end-to-end staleness in `regional_summary` is visible at a glance. No
@@ -1069,6 +1093,110 @@ public-facing catalog views and relay-owned sample tables:
 | `pgtrickle.refresh_percentiles` | `pgt_refresh_log` (rolling 1 h / 24 h) | Refresh timeline P50/P95/P99 overlays | DIFFERENTIAL (algebraic aggregates) |
 | `pgtrickle.buffer_growth_rate` | `_staleness_samples` (derivative per table) | Buffer depth trend badges | DIFFERENTIAL |
 | `pgtrickle.end_to_end_lag` | `pg_stat_stream_tables` + DAG edges | Topology graph edge widths | FULL (recursive CTE — upgraded when recursive IVM ships) |
+| `pgtrickle.breach_events` | `sla_burn_rate` + DAG ancestry | Root cause / inherited breach classification; Grafana alerts | DIFFERENTIAL |
+
+#### Why `breach_events` must be a stream table, not WebUI logic
+
+Root cause detection and blast radius attribution must live in the
+**database layer**, not in the WebUI. The reasons are:
+
+1. **Grafana / external alerting.** A Grafana dashboard pointing at
+   `pgtrickle.breach_events` gets the same root-cause deduplication
+   as the WebUI, for free. An alertmanager rule can fire on
+   `WHERE breach_type = 'root'` and suppress `inherited` rows —
+   without the WebUI involved at all.
+2. **Prometheus / OpenMetrics export.** The relay can expose
+   `/metrics` scraped from `breach_events` — one time-series per
+   independent root cause, not one per affected table.
+3. **API consumers.** `GET /api/v1/tables` simply reads the
+   `breach_type` and `root_cause_table` columns from `breach_events`
+   — the server does not recompute the DAG walk on every request.
+4. **WebSocket events.** `WsEvent::BreachStarted` carries the
+   `breach_type` field from the stream table row, not computed inline.
+
+The WebUI is a consumer of `breach_events`, not the owner of the logic.
+
+#### `pgtrickle.breach_events` schema
+
+```sql
+-- Source table: one row per breach-check tick per table
+-- Populated by relay worker alongside _staleness_samples
+CREATE TABLE pgtrickle._breach_snapshots (
+    snapped_at      timestamptz NOT NULL DEFAULT now(),
+    table_name      text        NOT NULL,
+    staleness_s     float4      NOT NULL,
+    sla_threshold_s float4      NOT NULL,  -- 3× schedule interval by default
+    in_breach       boolean     NOT NULL
+);
+
+-- Stream table: current breach state with root-cause attribution
+CREATE STREAM TABLE pgtrickle.breach_events AS
+SELECT
+    s.table_name,
+    s.staleness_s,
+    s.sla_threshold_s,
+    s.in_breach,
+    CASE
+        -- Root cause: in breach AND no upstream stream table is also in breach
+        WHEN s.in_breach AND NOT EXISTS (
+            SELECT 1
+            FROM pgtrickle.breach_events b
+            JOIN pgtrickle.dag_edges e
+              ON e.upstream_table = b.table_name
+             AND e.downstream_table = s.table_name
+            WHERE b.in_breach AND b.breach_type = 'root'
+        ) THEN 'root'
+        WHEN s.in_breach THEN 'inherited'
+        ELSE NULL
+    END AS breach_type,
+    -- For inherited breaches: name the root cause table
+    (
+        SELECT b.table_name
+        FROM pgtrickle.breach_events b
+        JOIN pgtrickle.dag_ancestors a
+          ON a.ancestor = b.table_name
+         AND a.descendant = s.table_name
+        WHERE b.breach_type = 'root'
+        ORDER BY a.depth ASC
+        LIMIT 1
+    ) AS root_cause_table,
+    -- Downstream blast radius count
+    (
+        SELECT count(*)
+        FROM pgtrickle.breach_events b
+        JOIN pgtrickle.dag_ancestors a
+          ON a.ancestor = s.table_name
+         AND a.descendant = b.table_name
+        WHERE b.in_breach
+    ) AS downstream_casualties
+FROM pgtrickle._breach_snapshots s
+WHERE s.snapped_at = (SELECT max(snapped_at) FROM pgtrickle._breach_snapshots);
+SCHEDULE '15 seconds';
+```
+
+The recursive self-reference (`breach_events` joining itself for
+ancestry) requires the DAG ancestry materialised view
+(`pgtrickle.dag_ancestors`) as an intermediate. This is a FULL refresh
+table until recursive IVM ships. At 15 s intervals and typical table
+counts (< 1000), the full rescan is fast.
+
+**Grafana usage example:**
+
+```promql
+# Alert on independent root cause breaches only (no noise from cascades)
+SELECT table_name, staleness_s, downstream_casualties
+FROM pgtrickle.breach_events
+WHERE breach_type = 'root'
+```
+
+**Prometheus export:**
+
+The relay's `/metrics` endpoint exposes:
+```
+pgtrickle_breach_root_total            # count of independent root causes
+pgtrickle_breach_inherited_total       # count of downstream casualties
+pgtrickle_table_staleness_seconds{table="...",breach_type="root|inherited|none"}
+```
 
 #### Example: `sla_burn_rate`
 
@@ -1132,6 +1260,9 @@ its auxiliary columns, and the current change buffer depth of
 | Topology edge width (throughput) | `pgtrickle.end_to_end_lag` | **Yes** (with polling fallback to direct query) |
 | Buffer depth badge (live) | Direct `change_buffer_sizes()` | **No** |
 | Buffer growth trend line | `pgtrickle.buffer_growth_rate` | **Yes** |
+| Root cause / blast radius classification | `pgtrickle.breach_events` | **Yes** |
+| `WsEvent::BreachStarted` breach type | `pgtrickle.breach_events` | **Yes** |
+| Prometheus `/metrics` breach gauges | `pgtrickle.breach_events` | **Yes** |
 
 The invariant: anything that must work when the scheduler is stopped or
 the extension is degraded uses direct queries. Derived, time-aggregated,

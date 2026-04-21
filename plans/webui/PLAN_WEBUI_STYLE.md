@@ -439,35 +439,75 @@ Clicking "View detail →" navigates to the full detail page.
 ### Tables List
 
 The primary list view. Every stream table annotated with its structural
-type, sorted worst SLA first by default.
+type. Has two display modes toggled by a button at the top right:
+**Flat** (default) and **Root Causes**.
+
+**Flat mode** — sorted worst SLA first:
 
 ```
 ┌──────────────────────────────────────────────────────────────┐
-│  Tables                                         [search 🔍] │
+│  Tables                     [Flat ●] [Root causes ○]  [🔍] │
 │             [Schema: All ▼] [Type: All ▼] [SLA: All ▼]    │
 ├──────────────────────────────────────────────────────────────┤
 │  Table                Type          Staleness  E2E Lag  SLA  │
 │  ───────────────────  ──────────    ─────────  ───────  ─── │
-│  analytics.regional_summary  leaf union  45s   61s  ████ 🔴  │
-│  analytics.revenue_7d        intermediate 12s  28s  ██░ 🟡   │
-│  erp_raw.orders_raw          inbox        3s    3s  █ 🟢     │
-│  erp_raw.customers           orphan       —     —   —        │
+│  erp_raw.orders_raw   inbox  🔴root  61s        61s  ████ 🔴 │
+│  analytics.regional_summary  leaf ⬆  45s        61s  ████ 🔴 │
+│  analytics.revenue_7d  intermediate ⬆  12s      61s  ████ 🔴 │
+│  analytics.exec_report  leaf ⬆       18s        61s  ████ 🔴 │
+│  erp_raw.customers    orphan         —           —    —      │
 │  ...                                                         │
 ├──────────────────────────────────────────────────────────────┤
-│  24 tables                                                   │
+│  24 tables · 1 root cause · 3 downstream casualties         │
 └──────────────────────────────────────────────────────────────┘
 ```
+
+**Root causes mode** — collapses downstream casualties under their cause:
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│  Tables                     [Flat ○] [Root causes ●]  [🔍] │
+├──────────────────────────────────────────────────────────────┤
+│  🔴 erp_raw.orders_raw  inbox · 61s stale · 3 downstream affected  │
+│     ↳ analytics.regional_summary  45s stale                 │
+│     ↳ analytics.revenue_7d        12s stale                 │
+│     ↳ analytics.exec_report       18s stale                 │
+│                                                              │
+│  ✅ erp_raw.customers   orphan · —                          │
+│  ...                                                         │
+└──────────────────────────────────────────────────────────────┘
+```
+
+Root causes mode shows only **independent problems** — one entry per
+root cause node. Downstream casualties are listed beneath it, indented.
+This immediately answers "how many real problems do I have?" A single
+broken inbox that cascades to 10 outputs appears as one entry, not 11.
+
+**Root cause detection.** A table is a root cause of a breach when it
+is in breach AND at least one of these is true:
+- It has no stream-table ancestors (it is an inbox or source table), or
+- All of its stream-table ancestors are healthy.
+
+A table is an **inherited breach** (`⬆` badge) when it is in breach
+solely because an upstream node is in breach and its own refresh
+is keeping up with its inputs.
+
+**SLA column semantics:**
+- 🔴 `root` — this node is the independent cause of the breach
+- 🔴 `⬆` — breach inherited from upstream; this node is a casualty
+- 🟡 — warning (approaching breach) independent of upstream
+- 🟢 — healthy
 
 - **Type column:** Badge chips (inbox / outbox / leaf / intermediate /
   union / orphan). Multiple badges allowed.
 - **Staleness:** How stale this table's own data is.
 - **E2E Lag:** Max cumulative staleness from any root to this table.
-- **SLA column:** Progress bar of the worst SLA breach in the upstream
-  chain, including this table.
 - **Row click:** Navigates to table detail.
-- **Sortable columns:** Default sort by SLA budget descending.
+- **Sortable columns:** Default sort by SLA budget descending (root
+  causes float above their casualties in flat mode).
 - **Faceted filters:** Schema, type badge, refresh mode (DIFF/FULL), SLA status.
 - **Search:** Matches table name or schema.
+- **Footer summary:** "N tables · M root causes · K downstream casualties"
 
 ### Table Detail
 
@@ -475,11 +515,15 @@ Shows the table's own metrics plus its **bidirectional lineage** —
 upstream (root causes) on the left, this table in the centre,
 downstream (blast radius) on the right.
 
+When the current table is in an inherited breach, the header shows a
+banner identifying the root cause so the operator can navigate there
+directly without reading through the lineage graph:
+
 ```
 ┌──────────────────────────────────────────────────────────────┐
 │  ← Tables                                                    │
 │  analytics.regional_summary       leaf union  [View in Topology] │
-│  🔴 SLA breach · 5 upstream · 2 downstream · E2E lag: 61s    │
+│  🔴 Inherited breach · root cause: erp_raw.orders_raw  [→]  │
 ├──────────────────────────────────────────────────────────────┤
 │  [Overview]  [Lineage]  [History]  [Operators]  [SQL]          │
 ├──────────────────────────────────────────────────────────────┤
@@ -716,15 +760,26 @@ Merges alerts and refresh timeline into a single Activity page
 (two tabs, or stacked with the timeline above and the alerts feed
 below).
 
+**Causal deduplication.** When a root cause event triggers cascading
+downstream breaches, the downstream alerts are suppressed into a
+single grouped event rather than flooding the feed. The feed shows
+one entry for the cause, with an expandable list of casualties beneath
+it. This prevents a single broken inbox from producing dozens of
+alert rows.
+
 ```
 ┌──────────────────────────────────────────────────────────────┐
 │  Alerts                              [All ▼] [Clear read]    │
 ├──────────────────────────────────────────────────────────────┤
-│  ● 11:02:45  SLA breach    orders_hourly: 61s > 60s SLA     │
-│  ● 11:02:30  Fuse blown    revenue_7d: 3 consecutive errors  │
-│    11:01:15  CDC warning   customers: trigger disabled        │
-│    11:00:00  Refresh ok    revenue_7d: 45ms, +3/-1 rows      │
-│    10:59:45  Relay lag     nats-events: 342 rows behind      │
+│  ● 11:02:45  🔴 SLA breach    erp_raw.orders_raw: 61s > 60s  │
+│              ↳ 3 downstream tables also in breach  [expand ▾]│
+│                ↳ analytics.regional_summary  45s stale       │
+│                ↳ analytics.revenue_7d        12s stale       │
+│                ↳ analytics.exec_report       18s stale       │
+│  ● 11:02:30  🔴 Fuse blown    revenue_7d: 3 consecutive errors│
+│    11:01:15  ⚠️ CDC warning   customers: trigger disabled    │
+│    11:00:00  ✅ Refresh ok    revenue_7d: 45ms, +3/−1 rows   │
+│    10:59:45  ⚠️ Relay lag     nats-events: 342 rows behind   │
 │    ...                                                        │
 ├──────────────────────────────────────────────────────────────┤
 │  Showing 50 of 234 alerts             [< 1 2 3 4 5 >]       │
@@ -732,10 +787,14 @@ below).
 ```
 
 - **●** dot marks unread alerts. Reading clears them (per-session).
+- Grouped entries are collapsed by default; clicking `[expand ▾]`
+  shows the casualty list inline.
+- The sidebar badge counts **root cause events only** — not downstream
+  casualties. "3 alerts" means 3 independent problems, not 3 + N
+  downstream noise.
 - Severity-filtered dropdown: All, Critical, Warning, Info.
 - Timestamps in monospace, relative ("2m ago") with absolute on hover.
-- Alert text links to the relevant object (table name → table detail,
-  pipeline name → pipeline detail).
+- Alert text links to the relevant table detail page.
 
 ### SQL Preview Modal
 
