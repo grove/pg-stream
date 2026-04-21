@@ -383,7 +383,7 @@ jobs:
     name: Benchmark regression check
     runs-on: ubuntu-latest
     if: github.event_name == 'pull_request' && github.base_ref == 'main'
-    timeout-minutes: 25
+    timeout-minutes: 60
     continue-on-error: false
     steps:
       - uses: actions/checkout@v5

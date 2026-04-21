@@ -36,7 +36,7 @@ CREATE INDEX IF NOT EXISTS idx_pgt_snapshots_pgt_id
     ON pgtrickle.pgt_snapshots (pgt_id);
 
 -- ── SNAP-1: snapshot_stream_table ────────────────────────────────────────
-CREATE OR REPLACE FUNCTION pgtrickle.snapshot_stream_table(
+CREATE OR REPLACE FUNCTION pgtrickle."snapshot_stream_table"(
     p_name        text,
     p_target      text DEFAULT NULL
 ) RETURNS text
@@ -51,7 +51,7 @@ snapshot table. If p_target is NULL, the target name is auto-generated as
 pgtrickle.snapshot_<name>_<epoch_ms>.';
 
 -- ── SNAP-2: restore_from_snapshot ─────────────────────────────────────────
-CREATE OR REPLACE FUNCTION pgtrickle.restore_from_snapshot(
+CREATE OR REPLACE FUNCTION pgtrickle."restore_from_snapshot"(
     p_name        text,
     p_source      text
 ) RETURNS void
@@ -66,7 +66,7 @@ mode — the frontier is aligned to the snapshot frontier, skipping the initial
 FULL refresh cycle.';
 
 -- ── SNAP-3a: list_snapshots ────────────────────────────────────────────────
-CREATE OR REPLACE FUNCTION pgtrickle.list_snapshots(
+CREATE OR REPLACE FUNCTION pgtrickle."list_snapshots"(
     p_name        text
 ) RETURNS TABLE (
     snapshot_table  text,
@@ -84,7 +84,7 @@ COMMENT ON FUNCTION pgtrickle.list_snapshots(text) IS
 Returns one row per snapshot, ordered by creation time descending.';
 
 -- ── SNAP-3b: drop_snapshot ────────────────────────────────────────────────
-CREATE OR REPLACE FUNCTION pgtrickle.drop_snapshot(
+CREATE OR REPLACE FUNCTION pgtrickle."drop_snapshot"(
     p_snapshot_table  text
 ) RETURNS void
 STRICT
@@ -96,7 +96,7 @@ COMMENT ON FUNCTION pgtrickle.drop_snapshot(text) IS
 snapshot_stream_table() and remove its pgtrickle.pgt_snapshots catalog row.';
 
 -- ── PLAN-1: recommend_schedule ────────────────────────────────────────────
-CREATE OR REPLACE FUNCTION pgtrickle.recommend_schedule(
+CREATE OR REPLACE FUNCTION pgtrickle."recommend_schedule"(
     p_name  text
 ) RETURNS jsonb
 STRICT
@@ -111,7 +111,7 @@ Returns confidence=0.0 when fewer than
 pg_trickle.schedule_recommendation_min_samples observations are available.';
 
 -- ── PLAN-2: schedule_recommendations ─────────────────────────────────────
-CREATE OR REPLACE FUNCTION pgtrickle.schedule_recommendations()
+CREATE OR REPLACE FUNCTION pgtrickle."schedule_recommendations"()
 RETURNS TABLE (
     name                          text,
     current_interval_seconds      double precision,
@@ -129,7 +129,7 @@ COMMENT ON FUNCTION pgtrickle.schedule_recommendations() IS
 stream table. Sort by delta_pct DESC to find the most mis-tuned stream tables.';
 
 -- ── CLUS-1: cluster_worker_summary ───────────────────────────────────────
-CREATE OR REPLACE FUNCTION pgtrickle.cluster_worker_summary()
+CREATE OR REPLACE FUNCTION pgtrickle."cluster_worker_summary"()
 RETURNS TABLE (
     db_oid                 bigint,
     db_name                text,
@@ -148,7 +148,7 @@ shared-memory worker-pool block and pg_stat_activity.
 Accessible from any database in the cluster.';
 
 -- ── METR-3: metrics_summary ───────────────────────────────────────────────
-CREATE OR REPLACE FUNCTION pgtrickle.metrics_summary()
+CREATE OR REPLACE FUNCTION pgtrickle."metrics_summary"()
 RETURNS TABLE (
     db_name                  text,
     total_stream_tables      bigint,
