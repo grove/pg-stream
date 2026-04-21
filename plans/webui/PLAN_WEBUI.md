@@ -443,8 +443,10 @@ with its structural role derived from the DAG. No separate "pipelines"
 concept — a pipeline is just a table plus its upstream lineage, so the
 two views are the same thing.
 
-**Structural type** is inferred from the DAG and relay config at query
-time:
+**Structural type** is served by the API from `pgtrickle.table_classifications`,
+a plain SQL view computed in the database — not derived in the API
+server or browser. This means Grafana dashboards and external tools
+can query the same type classifications directly:
 
 | Type | How inferred |
 |------|-------------|
@@ -459,12 +461,11 @@ time:
 These types are not mutually exclusive — a table can be `leaf + union`.
 They are shown as small badge chips on each row.
 
-**E2E lag** is computed for every table: the maximum cumulative
-staleness from any root source to this table. For a leaf table this is
-the end-to-end delivery latency. For an intermediate table it shows
-how stale its inputs are. This single metric is more useful than
-separating "pipeline E2E lag" (leaves only) from "table staleness"
-(all) — it degrades gracefully.
+**E2E lag** is served from `pgtrickle.end_to_end_lag` (a stream table
+maintained by the relay). It holds the maximum cumulative staleness
+from any root source to each table — not computed on request and not
+computed in the browser. Grafana can plot E2E lag time-series directly
+from this table.
 
 ```
 Table                 Type          Staleness  E2E Lag   SLA
@@ -1079,6 +1080,29 @@ extension is degraded, those paths must still work. Stream tables are
 only used for **derived aggregate metrics** where a small amount of
 staleness is acceptable and the value comes from incremental maintenance
 over time.
+
+#### Computation layer assignments
+
+Every derived value must be assigned to exactly one layer. The test:
+**if Grafana or an external alerting tool should see it, it belongs in
+the database — not in the API server and definitely not in JavaScript.**
+
+| Derived value | Layer | Rationale |
+|---|---|---|
+| Structural type (inbox / outbox / leaf / intermediate / union / orphan) | **DB view** `pgtrickle.table_classifications` | Trivial SQL joins on `pgt_stream_tables` + relay config tables; Grafana panels showing table-type breakdown need it |
+| SLA budget % (`staleness / sla_threshold`) | **DB view** alongside `sla_burn_rate` | Same number used in Grafana progress bars and Prometheus gauge |
+| E2E lag (cumulative staleness root→table) | **Stream table** `pgtrickle.end_to_end_lag` | Recursive DAG walk; updated on schedule |
+| Root cause / inherited breach classification | **Stream table** `pgtrickle.breach_events` | Grafana and Prometheus alert on `breach_type = 'root'` directly |
+| Transport annotations (which schemas have relay inboxes/outboxes) | **API layer** (relay reads `relay_inbox_config`, `relay_outbox_config`) | DB has the data; API assembles it; JS renders only |
+| Graph node positions (topology layout) | **Browser** (dagre / elkjs) | Rendering algorithm; meaningless outside the viewport |
+| Relative timestamps ("2m ago") | **Browser** | Time-zone-aware display formatting |
+| Collapsed / expanded state | **Browser** | UI state only |
+
+`pgtrickle.table_classifications` is a plain SQL view (not a stream
+table) because it is cheap to compute on read — it is a join of
+`pg_class`, `pgt_stream_tables`, `pgtrickle.dag_edges`,
+`relay_inbox_config`, and `relay_outbox_config`, all of which are
+already indexed. It does not need incremental maintenance.
 
 #### Candidate stream tables
 
