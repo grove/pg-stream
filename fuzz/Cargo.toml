@@ -16,6 +16,27 @@ path = "fuzz_targets/parser_fuzz.rs"
 test = false
 doc = false
 
+# FUZZ-1 (v0.26.0): Cron parser fuzz target.
+[[bin]]
+name = "cron_fuzz"
+path = "fuzz_targets/cron_fuzz.rs"
+test = false
+doc = false
+
+# FUZZ-2 (v0.26.0): GUC string→enum coercion fuzz target.
+[[bin]]
+name = "guc_fuzz"
+path = "fuzz_targets/guc_fuzz.rs"
+test = false
+doc = false
+
+# FUZZ-3 (v0.26.0): CDC trigger payload fuzz target.
+[[bin]]
+name = "cdc_fuzz"
+path = "fuzz_targets/cdc_fuzz.rs"
+test = false
+doc = false
+
 [dependencies]
 libfuzzer-sys = "0.4"
 pg_trickle = { path = "..", features = [] }

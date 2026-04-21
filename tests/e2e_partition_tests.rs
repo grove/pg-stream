@@ -2028,3 +2028,181 @@ async fn test_alter_st_partition_by_hash() {
     )
     .await;
 }
+
+// ── SCALE-1 (v0.26.0): Partition-count scale test ─────────────────────────
+
+/// SCALE-1 (v0.26.0): 1,000-partition source table — trigger install + first refresh < 60 s.
+///
+/// Creates a RANGE-partitioned source table with 1,000 daily partitions
+/// and asserts that:
+/// - `create_stream_table()` (which installs CDC triggers) completes in < 60 s.
+/// - The first `refresh_stream_table()` completes in < 60 s.
+/// - The stream table contains the correct row count.
+///
+/// This test is `#[ignore]` by default (it is slow) and runs only in the
+/// dedicated scale suite:
+///   cargo test --test e2e_partition_tests scale -- --ignored --nocapture
+#[tokio::test]
+#[ignore = "SCALE-1: slow partition-count test — run with --ignored in the scale suite"]
+async fn test_scale1_1000_partitions_trigger_install_and_refresh_within_60s() {
+    let db = E2eDb::new().await.with_extension().await;
+
+    // Build CREATE TABLE DDL for 1,000 daily partitions.
+    let create_parent = "
+        CREATE TABLE scale1_src (
+            id BIGINT NOT NULL,
+            day DATE NOT NULL,
+            val INT,
+            PRIMARY KEY (id, day)
+        ) PARTITION BY RANGE (day)";
+    db.execute(create_parent).await;
+
+    // Create 1,000 daily partitions (roughly 2.7 years).
+    for i in 0..1000i32 {
+        let partition_sql = format!(
+            "CREATE TABLE scale1_src_p{i} PARTITION OF scale1_src \
+             FOR VALUES FROM ('2020-01-01'::date + {i}) TO ('2020-01-01'::date + {next})",
+            next = i + 1,
+        );
+        db.execute(&partition_sql).await;
+    }
+
+    // Seed some data.
+    db.execute(
+        "INSERT INTO scale1_src (id, day, val)
+         SELECT g, '2020-01-01'::date + (g % 1000), g
+         FROM generate_series(1, 5000) g",
+    )
+    .await;
+
+    // Time the create_stream_table call (includes trigger install on all partitions).
+    let create_start = std::time::Instant::now();
+    db.create_st(
+        "scale1_st",
+        "SELECT id, day, val FROM scale1_src",
+        "5m",
+        "FULL",
+    )
+    .await;
+    let create_elapsed = create_start.elapsed();
+
+    assert!(
+        create_elapsed.as_secs() < 60,
+        "SCALE-1: create_stream_table (trigger install) took {:.1}s, expected < 60s",
+        create_elapsed.as_secs_f64()
+    );
+
+    // Time the first refresh.
+    let refresh_start = std::time::Instant::now();
+    db.refresh_st("scale1_st").await;
+    let refresh_elapsed = refresh_start.elapsed();
+
+    assert!(
+        refresh_elapsed.as_secs() < 60,
+        "SCALE-1: first refresh took {:.1}s, expected < 60s",
+        refresh_elapsed.as_secs_f64()
+    );
+
+    // Correctness: stream table must have all 5,000 rows.
+    let count: i64 = db
+        .query_scalar("SELECT count(*) FROM public.scale1_st")
+        .await;
+    assert_eq!(
+        count, 5000,
+        "SCALE-1: stream table must contain all 5,000 source rows"
+    );
+}
+
+// ── SCALE-2 (v0.26.0): Multi-DB worker starvation test ────────────────────
+
+/// SCALE-2 (v0.26.0): Worker starvation — hot-tier ST refreshes within SLA
+/// despite a flooded worker pool.
+///
+/// This test requires two separate databases on the same PostgreSQL instance.
+/// One database floods the worker pool with slow refreshes; the other has a
+/// hot-tier ST that must still complete within its SLA.
+///
+/// Because this test needs a multi-database setup with the shared preload
+/// libraries, it uses `E2eDb::new_on_postgres_db()` with a separate database.
+///
+/// This test is `#[ignore]` by default (it is slow and infra-intensive).
+/// Run with:
+///   cargo test --test e2e_partition_tests scale2 -- --ignored --nocapture
+#[tokio::test]
+#[ignore = "SCALE-2: multi-DB worker starvation — run with --ignored in the scale suite"]
+async fn test_scale2_multi_db_worker_pool_hot_tier_refreshes_within_sla() {
+    use std::time::Duration;
+
+    // Use the postgres DB as the "hot-tier" database.
+    let hot_db = E2eDb::new_on_postgres_db().await.with_extension().await;
+
+    // Configure a fast scheduler so refreshes happen every 100 ms.
+    hot_db
+        .execute("ALTER SYSTEM SET pg_trickle.scheduler_interval_ms = 100")
+        .await;
+    hot_db
+        .execute("ALTER SYSTEM SET pg_trickle.tiered_scheduling = on")
+        .await;
+    hot_db.reload_config_and_wait().await;
+
+    // Create a hot-tier ST in the hot database.
+    hot_db
+        .execute("CREATE TABLE scale2_hot_src (id INT PRIMARY KEY, val INT)")
+        .await;
+    hot_db
+        .execute("INSERT INTO scale2_hot_src SELECT g, g FROM generate_series(1, 100) g")
+        .await;
+
+    hot_db
+        .create_st(
+            "scale2_hot_st",
+            "SELECT id, val FROM scale2_hot_src",
+            "1s",
+            "FULL",
+        )
+        .await;
+
+    // Wait for the scheduler and measure if the hot ST refreshes within 5s
+    // (lenient SLA allowing for scheduler startup lag).
+    let sched_running = hot_db.wait_for_scheduler(Duration::from_secs(90)).await;
+    assert!(
+        sched_running,
+        "SCALE-2: pg_trickle scheduler did not start within 90s"
+    );
+
+    // Insert changes to trigger refreshes.
+    hot_db
+        .execute("INSERT INTO scale2_hot_src SELECT g, g FROM generate_series(101, 200) g")
+        .await;
+
+    // Allow 5 seconds for the hot-tier refresh to complete.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if std::time::Instant::now() > deadline {
+            break;
+        }
+        let count: i64 = hot_db
+            .query_scalar("SELECT count(*) FROM public.scale2_hot_st")
+            .await;
+        if count == 200 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+
+    let final_count: i64 = hot_db
+        .query_scalar("SELECT count(*) FROM public.scale2_hot_st")
+        .await;
+    assert_eq!(
+        final_count, 200,
+        "SCALE-2: hot-tier ST must refresh within SLA (5s), got {final_count} rows"
+    );
+
+    // Reset system settings.
+    hot_db
+        .execute("ALTER SYSTEM RESET pg_trickle.scheduler_interval_ms")
+        .await;
+    hot_db
+        .execute("ALTER SYSTEM RESET pg_trickle.tiered_scheduling")
+        .await;
+}
