@@ -44,9 +44,9 @@ coverage, all in plain language.
 - [v0.25.0 — Scheduler Scalability & Pooler Performance](#v0250--scheduler-scalability--pooler-performance)
 - [v0.26.0 — Test & Concurrency Hardening](#v0260--test--concurrency-hardening)
 - [v0.27.0 — Operability, Observability & DR](#v0270--operability-observability--dr)
-- [v0.28.0 — Pre-GA Correctness & Stability Sprint](#v0280--pre-ga-correctness--stability-sprint)
-- [v0.29.0 — Transactional Inbox & Outbox Patterns](#v0290--transactional-inbox--outbox-patterns)
-- [v0.30.0 — Relay CLI (`pgtrickle-relay`)](#v0300--relay-cli-pgtrickle-relay)
+- [v0.28.0 — Transactional Inbox & Outbox Patterns](#v0280--transactional-inbox--outbox-patterns)
+- [v0.29.0 — Relay CLI (`pgtrickle-relay`)](#v0290--relay-cli-pgtrickle-relay)
+- [v0.30.0 — Pre-GA Correctness & Stability Sprint](#v0300--pre-ga-correctness--stability-sprint)
 - [v1.0.0 — Stable Release](#v100--stable-release)
 - [v1.1.0 — PostgreSQL 17 Support](#v110--postgresql-17-support)
 - [v1.2.0 — PGlite Proof of Concept](#v120--pglite-proof-of-concept)
@@ -103,9 +103,9 @@ from the v0.1.x series to 1.0 and beyond.
 | v0.25.0 | Scheduler scalability & pooler performance | ✅ Released |
 | v0.26.0 | Test & concurrency hardening | ✅ Released |
 | v0.27.0 | Operability, observability & DR — snapshot/PITR, schedule planner, cluster metrics | ✅ Released |
-| v0.28.0 | Pre-GA correctness & stability sprint — EC-01 fix, snapshot atomicity, SQLSTATE classifier, caches | Planned |
-| v0.29.0 | Transactional inbox & outbox patterns | Planned |
-| v0.30.0 | Relay CLI (`pgtrickle-relay`) | Planned |
+| v0.28.0 | Transactional inbox & outbox patterns | Planned |
+| v0.29.0 | Relay CLI (`pgtrickle-relay`) | Planned |
+| v0.30.0 | Pre-GA correctness & stability sprint — EC-01 fix, snapshot atomicity, SQLSTATE classifier, caches | Planned |
 | v1.0.0 | Stable release (incl. PG 19 compatibility) | Planned |
 | v1.1.0 | PostgreSQL 17 support | Planned |
 | v1.2.0 | PGlite proof of concept | Planned |
@@ -6853,7 +6853,7 @@ Phase 1–5 DVM code changes and the TPC-H scaling investigation. Items marked
 
 ---
 
-## v0.28.0 — Pre-GA Correctness & Stability Sprint
+## v0.30.0 — Pre-GA Correctness & Stability Sprint
 
 **Status: Planned.** Derived from [plans/PLAN_OVERALL_ASSESSMENT_3.md](plans/PLAN_OVERALL_ASSESSMENT_3.md) §3, §4, §7, §8.
 This release must land **before** v1.0.0 GA. Its purpose is to close every
@@ -6861,7 +6861,7 @@ P0 and P1 gap identified in the v0.27.0 assessment so that the stable
 release inherits a clean correctness baseline.
 
 > **Release Theme**
-> v0.28.0 is the quality gate before the feature-rich v0.29–v0.30 arc and
+> v0.30.0 is the quality gate before the feature-rich v0.28–v0.29 arc and
 > the v1.0 stable release. It fixes the remaining correctness defects that
 > could produce silent wrong answers (EC-01 phantom drift, snapshot
 > non-atomicity), eliminates the operational failure modes that could
@@ -7213,7 +7213,7 @@ it is tested against. Add a compatibility matrix row (e.g.
   `pg_trickle.use_sqlstate_classification` GUC (default `false`) initially,
   flip to `true` in v0.31.0 after one release of parallel validation.
 - **UX-14** (CNPG 1.29) depends on CNPG 1.29 being available; if the release
-  slips past the v0.28.0 window, defer to v1.0.0 but keep the tracking issue
+  slips past the v0.30.0 window, defer to v1.0.0 but keep the tracking issue
   open.
 - **UX-15** (dbt 1.11) is purely a tracking concern — no code changes are
   required in this release.
@@ -7229,7 +7229,7 @@ it is tested against. Add a compatibility matrix row (e.g.
 | Phase 5 | P1/P2 test coverage: TEST-1 through TEST-19, PERF-3 | Days 19–27 |
 | Phase 6 | P1/P2/P3 docs & UX: UX-3 through UX-18, TUI parity | Days 27–34 |
 
-> **v0.28.0 total: ~7–8 weeks** (correctness-critical path ~10 days;
+> **v0.30.0 total: ~7–8 weeks** (correctness-critical path ~10 days;
 > documentation and test coverage ~14 days; architecture improvements ~8 days;
 > new test targets ~8 days; Low-priority doc polish ~4 days)
 
@@ -7265,7 +7265,7 @@ it is tested against. Add a compatibility matrix row (e.g.
 
 ---
 
-## v0.29.0 — Transactional Inbox & Outbox Patterns
+## v0.28.0 — Transactional Inbox & Outbox Patterns
 
 **Status: Planned.** Driven by [PLAN_TRANSACTIONAL_OUTBOX_HELPER.md](plans/patterns/PLAN_TRANSACTIONAL_OUTBOX_HELPER.md) and [PLAN_TRANSACTIONAL_INBOX_HELPER.md](plans/patterns/PLAN_TRANSACTIONAL_INBOX_HELPER.md). Outbox helper moved here from v0.22.0 to ship alongside the inbox helper and production-grade advanced features as a complete transactional messaging solution.
 
@@ -7289,18 +7289,18 @@ it is tested against. Add a compatibility matrix row (e.g.
 
 ---
 
-### Known Limitations in v0.29.0
+### Known Limitations in v0.28.0
 
 | Limitation | Rationale | Future Path |
 |------------|-----------|-------------|
 | **Outbox requires DIFFERENTIAL mode.** `enable_outbox()` on `IMMEDIATE`-mode stream tables returns `OutboxRequiresNotImmediateMode`. | Outbox writes one row per refresh cycle inside the refresh transaction. IMMEDIATE refreshes fire inside every source transaction; adding an outbox INSERT there imposes that cost on every application write. | Post-1.0 opt-in GUC if demand justifies. |
 | **Ordering and priority are mutually exclusive per inbox.** Calling both `enable_inbox_ordering()` and `enable_inbox_priority()` on the same inbox returns `InboxOrderingPriorityConflict`. | Per-aggregate sequence ordering must surface the next message in sequence regardless of priority level; priority tiers violate that guarantee. | Use separate inboxes per priority class, each with `enable_inbox_ordering()` applied independently. |
-| **Gap detection degrades above ~100K aggregates.** The `gaps_<inbox>` stream table uses `LEAD()` over pending messages, which is O(N log N) in pending message count — not O(sequence range). This is a significant improvement over the `generate_series` approach; however, refresh time still scales with pending message volume. | Acceptable up to ~1M pending messages at 30 s schedule. Above 10M pending messages, auto-refresh may be slow; use `inbox_ordering_gaps()` for on-demand checks. | Post-v0.29.0: delta-based detection scanning only aggregates with recent activity. |
+| **Gap detection degrades above ~100K aggregates.** The `gaps_<inbox>` stream table uses `LEAD()` over pending messages, which is O(N log N) in pending message count — not O(sequence range). This is a significant improvement over the `generate_series` approach; however, refresh time still scales with pending message volume. | Acceptable up to ~1M pending messages at 30 s schedule. Above 10M pending messages, auto-refresh may be slow; use `inbox_ordering_gaps()` for on-demand checks. | Post-v0.28.0: delta-based detection scanning only aggregates with recent activity. |
 | **Consumer groups provide at-least-once delivery per consumer instance, not exactly-once globally.** | Exactly-once is achieved by composition: relay uses broker idempotency keys; inbox uses `ON CONFLICT (event_id) DO NOTHING`. Three-layer deduplication is more resilient than a monolithic exactly-once guarantee. | Design decision. Documented in PATTERNS.md and SQL_REFERENCE.md. |
-| **AUTO mode may fall back to FULL refresh while outbox is enabled.** When AUTO refresh falls back to FULL, the outbox header row carries `"full_refresh": true`. If the number of current rows exceeds `outbox_inline_threshold_rows`, the claim-check path applies: rows land in `outbox_delta_rows_<st>` and the relay fetches via cursor. A `pg_trickle_alert outbox_full_refresh` event is emitted regardless of which path is taken. Relays must detect the `full_refresh` flag, apply snapshot semantics (upsert rather than publish-as-new), and handle either inline or claim-check payloads. | AUTO refresh adapts to IVM cost at runtime; blocking the FULL fallback permanently would compromise the adaptation that makes AUTO useful. The sentinel flag preserves correctness; the claim-check path prevents memory exhaustion on large tables. | Reference relay updated in OUTBOX-8 to demonstrate all combinations. Post-v0.29.0: consider a GUC to disable FULL fallback per ST when outbox is enabled. |
-| **`next_<inbox>` ordered ST scans all processed rows.** The `last_processed` CTE in the aggregate-ordered ST runs `MAX(sequence_num) GROUP BY aggregate_id` over every processed row on each refresh. For inboxes with large volumes of processed history this grows without bound. | A partial index `(aggregate_id, sequence_num) WHERE processed_at IS NOT NULL` is created by `enable_inbox_ordering()` to mitigate this at v0.29.0, making it an index-only scan. Scaling thresholds: < 100K rows → < 5 ms at 1 s schedule; 100K–1M → increase schedule to `5s`; > 1M → increase to `10s–30s`; > 10M → use `inbox_ordering_gaps()` on-demand only. | Post-v0.29.0: introduce `pgt_inbox_sequence_state` catalog table updated atomically via `advance_inbox_sequence()`, making the CTE O(changed aggregates). |
+| **AUTO mode may fall back to FULL refresh while outbox is enabled.** When AUTO refresh falls back to FULL, the outbox header row carries `"full_refresh": true`. If the number of current rows exceeds `outbox_inline_threshold_rows`, the claim-check path applies: rows land in `outbox_delta_rows_<st>` and the relay fetches via cursor. A `pg_trickle_alert outbox_full_refresh` event is emitted regardless of which path is taken. Relays must detect the `full_refresh` flag, apply snapshot semantics (upsert rather than publish-as-new), and handle either inline or claim-check payloads. | AUTO refresh adapts to IVM cost at runtime; blocking the FULL fallback permanently would compromise the adaptation that makes AUTO useful. The sentinel flag preserves correctness; the claim-check path prevents memory exhaustion on large tables. | Reference relay updated in OUTBOX-8 to demonstrate all combinations. Post-v0.28.0: consider a GUC to disable FULL fallback per ST when outbox is enabled. |
+| **`next_<inbox>` ordered ST scans all processed rows.** The `last_processed` CTE in the aggregate-ordered ST runs `MAX(sequence_num) GROUP BY aggregate_id` over every processed row on each refresh. For inboxes with large volumes of processed history this grows without bound. | A partial index `(aggregate_id, sequence_num) WHERE processed_at IS NOT NULL` is created by `enable_inbox_ordering()` to mitigate this at v0.28.0, making it an index-only scan. Scaling thresholds: < 100K rows → < 5 ms at 1 s schedule; 100K–1M → increase schedule to `5s`; > 1M → increase to `10s–30s`; > 10M → use `inbox_ordering_gaps()` on-demand only. | Post-v0.28.0: introduce `pgt_inbox_sequence_state` catalog table updated atomically via `advance_inbox_sequence()`, making the CTE O(changed aggregates). |
 | **Global consumer monitoring STs created once, not reference-counted.** `pgt_consumer_status`, `pgt_consumer_group_lag`, `pgt_consumer_active_leases` are auto-created on the first `create_consumer_group()` call. They must be created idempotently and torn down only when the last consumer group for an outbox is dropped. | A single set of monitoring STs per outbox is correct and cheaper than per-group STs. | Implementation: `create_stream_table()` called with `if_not_exists := true`; `drop_consumer_group()` decrements a reference count and drops STs at zero. |
-| **Outbox relay latency bounded by poll interval.** Relays discover new outbox rows by polling. The pg_trickle extension emits `pg_notify('pgtrickle_outbox_new', outbox_table_name)` after each outbox INSERT (v0.29.0), but the `pgtrickle-relay` binary does not yet use LISTEN — it starts polling on the standard interval. Minimum relay latency today equals the poll interval (`visibility_seconds`). | The NOTIFY is cheap (≈2 µs, inside the existing refresh transaction) and is emitted from v0.29.0 onwards so relay authors can begin using it immediately. The `pgtrickle-relay` CLI will use LISTEN/NOTIFY in v0.30.0. | v0.30.0 relay: subscribe to `pgtrickle_outbox_new` for sub-100 ms wake-up (see E2E latency benchmark in PLAN_RELAY_CLI.md §E.5). |
+| **Outbox relay latency bounded by poll interval.** Relays discover new outbox rows by polling. The pg_trickle extension emits `pg_notify('pgtrickle_outbox_new', outbox_table_name)` after each outbox INSERT (v0.28.0), but the `pgtrickle-relay` binary does not yet use LISTEN — it starts polling on the standard interval. Minimum relay latency today equals the poll interval (`visibility_seconds`). | The NOTIFY is cheap (≈2 µs, inside the existing refresh transaction) and is emitted from v0.28.0 onwards so relay authors can begin using it immediately. The `pgtrickle-relay` CLI will use LISTEN/NOTIFY in v0.29.0. | v0.29.0 relay: subscribe to `pgtrickle_outbox_new` for sub-100 ms wake-up (see E2E latency benchmark in PLAN_RELAY_CLI.md §E.5). |
 | **`replay_inbox_messages()` accepts only explicit event ID lists.** A free-form `where_clause` parameter was removed to eliminate SQL injection risk. | `EXPLAIN`-based validation of dynamic SQL is insufficient; parameterised `WHERE event_id = ANY($1)` is the safe API. | Operators who need filter-based replay should run a parameterised `SELECT ARRAY_AGG(event_id) ... WHERE <condition>` first, then pass the result to `replay_inbox_messages()`. |
 
 ---
@@ -7451,7 +7451,7 @@ it is tested against. Add a compatibility matrix row (e.g.
 | B-TEST | Part B integration tests, multi-relay E2E, ordered inbox E2E | Days 28–31 |
 | B-DOC | Part B documentation, advanced PATTERNS.md sections, reference relay implementations | Days 31–33 |
 
-> **v0.29.0 total: ~6–7 weeks solo / ~4–5 weeks with two developers working Part A and Part B tracks in parallel** (Part A: essential patterns + Part B: production patterns)
+> **v0.28.0 total: ~6–7 weeks solo / ~4–5 weeks with two developers working Part A and Part B tracks in parallel** (Part A: essential patterns + Part B: production patterns)
 
 **Exit criteria:**
 - [ ] OUTBOX-1/2: `enable_outbox()` creates outbox table + `pgt_outbox_latest_<st>` view with correct schema; catalog row present
@@ -7498,7 +7498,7 @@ it is tested against. Add a compatibility matrix row (e.g.
 
 ---
 
-## v0.30.0 — Relay CLI (`pgtrickle-relay`)
+## v0.29.0 — Relay CLI (`pgtrickle-relay`)
 
 **Status: Planned.** See [plans/relay/PLAN_RELAY_CLI.md](plans/relay/PLAN_RELAY_CLI.md) for the full design.
 
@@ -7510,7 +7510,7 @@ it is tested against. Add a compatibility matrix row (e.g.
 > sources and writes them into pg-trickle inbox tables. Both directions share
 > symmetric Source/Sink trait abstractions, config system, observability, and
 > error handling. Implemented as a workspace member alongside `pgtrickle-tui`,
-> with 8 backends behind Cargo feature flags. The relay makes the v0.29.0
+> with 8 backends behind Cargo feature flags. The relay makes the v0.28.0
 > outbox and inbox immediately usable — zero custom relay code required.
 >
 > See [plans/relay/PLAN_RELAY_CLI.md](plans/relay/PLAN_RELAY_CLI.md)
@@ -7594,9 +7594,9 @@ it is tested against. Add a compatibility matrix row (e.g.
 | Phase 4 | Tests: unit, Testcontainers integration (forward + reverse), consumer group E2E, benchmarks | Days 25–32 |
 | Phase 5 | Distribution: Docker, CI binaries, Homebrew, docs, cargo publish | Days 32–34.5 |
 
-> **v0.30.0 total: ~36.5 days solo / ~23 days with two developers**
+> **v0.29.0 total: ~36.5 days solo / ~23 days with two developers**
 > (Phases 1–2 forward sinks and Phase 3 reverse sources can be parallelised.
-> Requires v0.29.0 outbox + consumer groups for full forward E2E; reverse
+> Requires v0.28.0 outbox + consumer groups for full forward E2E; reverse
 > mode only needs inbox table schema.)
 
 **Exit criteria:**
@@ -9698,7 +9698,7 @@ TUI/CLI visualization enhancement for the self-monitoring views. Recommended fro
 > is paid once per source per cycle; plan-aware delta routing selects
 > `merge_strategy` per-refresh from `EXPLAIN ANALYZE` output instead of
 > requiring per-stream-table tuning; and the L0 shared-shmem dshash cache
-> (if not completed in v0.28.0) finishes the three-tier caching story by
+> (if not completed in v0.30.0) finishes the three-tier caching story by
 > placing hot delta SQL in shared memory, making cold backends
 > indistinguishable from warm ones. Each improvement is independently
 > deployable and hidden behind a GUC, so operators can adopt them
@@ -9714,7 +9714,7 @@ TUI/CLI visualization enhancement for the self-monitoring views. Recommended fro
 | PERF-2 | Plan-aware delta routing: auto-select `merge_strategy` | M | P1 |
 | PERF-3 | IVM lock-mode observability counter | XS | P1 |
 | PERF-4 | Switch IVM transition tables to ENR (drop temp tables) | M | P1 |
-| PERF-5 | L0 dshash shared-shmem cache (if deferred from v0.28.0) | L | P1 |
+| PERF-5 | L0 dshash shared-shmem cache (if deferred from v0.30.0) | L | P1 |
 
 **PERF-1 — Adaptive batching.**
 The scheduler currently dispatches each ready stream table independently.
@@ -9760,7 +9760,7 @@ Rewrite the trigger function builders to reference the ENR by name.
 |----|-------|--------|----------|
 | SCAL-1 | Back-pressure signal when change buffer exceeds threshold | S | P2 |
 | SCAL-2 | Multi-DB singleton refresh broker concept (design only) | S | P2 |
-| SCAL-3 | Shared catalog snapshot for `metrics_summary()` / `cluster_worker_summary()` (if deferred from v0.28.0) | M | P2 |
+| SCAL-3 | Shared catalog snapshot for `metrics_summary()` / `cluster_worker_summary()` (if deferred from v0.30.0) | M | P2 |
 
 **SCAL-1** — Expose a `pgtrickle_alert change_buffer_backpressure` event
 when a change buffer grows past `pg_trickle.buffer_alert_threshold` for
@@ -9843,7 +9843,7 @@ table listener: after every successful differential or full refresh, if the
 delta is non-empty, the refresh path emits `pg_notify(channel, payload_jsonb::text)`
 within the same transaction. The payload carries `{"name": …, "refresh_id": …,
 "inserted_count": N, "deleted_count": N}`. Build on the `pg_notify`
-infrastructure already wired by the v0.29.0 outbox. `pgtrickle.unsubscribe(name, channel)`
+infrastructure already wired by the v0.28.0 outbox. `pgtrickle.unsubscribe(name, channel)`
 removes the registration; `pgtrickle.list_subscriptions()` returns all active
 registrations. **Schema change:** Yes — new `pgtrickle.pgt_subscriptions`
 catalog table.
