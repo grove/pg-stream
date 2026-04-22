@@ -49,7 +49,7 @@ jobs:
           # RUSTSEC-2026-0104: rustls-webpki reachable panic in CRL parsing.
           # Pulled in transitively via ureq (dev/test path). We do not parse CRLs.
           # Will be resolved when upstream updates to >=0.103.13.
-          ignore: RUSTSEC-2023-0071 RUSTSEC-2026-0104
+          ignore: RUSTSEC-2023-0071,RUSTSEC-2026-0104
 
   scheduled_audit:
     if: github.event_name == 'schedule'
@@ -73,4 +73,4 @@ jobs:
           # RUSTSEC-2026-0104: rustls-webpki reachable panic in CRL parsing.
           # Pulled in transitively via ureq (dev/test path). We do not parse CRLs.
           # Will be resolved when upstream updates to >=0.103.13.
-          ignore: RUSTSEC-2023-0071 RUSTSEC-2026-0104
+          ignore: RUSTSEC-2023-0071,RUSTSEC-2026-0104
