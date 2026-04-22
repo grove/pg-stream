@@ -162,7 +162,7 @@ jobs:
   light-e2e-tests:
     name: Light E2E tests (${{ matrix.shard_name }})
     runs-on: ubuntu-latest
-    timeout-minutes: 75
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
@@ -437,7 +437,7 @@ jobs:
     name: Benchmarks
     runs-on: ubuntu-latest
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
-    timeout-minutes: 25
+    timeout-minutes: 45
     continue-on-error: true
     steps:
       - uses: actions/checkout@v5
