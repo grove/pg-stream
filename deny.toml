@@ -36,6 +36,10 @@ ignore = [
   # requires a custom logger + specific log feature interaction. sqlx 0.8.x does not
   # expose a patched 0.8.x; resolved in rand >=0.9.3 (our non-sqlx deps are updated).
   "RUSTSEC-2026-0097",
+  # rustls-webpki reachable panic in CRL parsing. Pulled in transitively via
+  # ureq (dev / test path). We do not parse CRLs; unaffected in practice.
+  # Will be resolved when upstream updates to rustls-webpki >=0.103.13.
+  "RUSTSEC-2026-0104",
 ]
 
 [bans]
