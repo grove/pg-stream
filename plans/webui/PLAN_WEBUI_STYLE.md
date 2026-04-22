@@ -29,14 +29,16 @@
   - [Breadcrumbs](#breadcrumbs)
 - [Screen Layouts](#screen-layouts)
   - [Landing: Topology Graph](#landing-topology-graph)
-  - [Pipelines List](#pipelines-list)
-  - [Pipeline Detail](#pipeline-detail)
-  - [Stream Table Detail](#stream-table-detail)
+  - [Tables List](#tables-list)
+  - [Table Detail](#table-detail)
+  - [Table Detail — Full Page](#table-detail--full-page)
   - [SLA Budget Dashboard](#sla-budget-dashboard)
   - [Health Scorecard](#health-scorecard)
+  - [Dead Letter Queue](#dead-letter-queue)
   - [Refresh Timeline](#refresh-timeline)
   - [Alerts & Activity Feed](#alerts--activity-feed)
   - [SQL Preview Modal](#sql-preview-modal)
+  - [Loading, Empty & Error States](#loading-empty--error-states)
 - [Responsive Behaviour](#responsive-behaviour)
 - [Accessibility](#accessibility)
 - [Open Questions](#open-questions)
@@ -106,6 +108,7 @@ Key shadcn/ui components used:
 | `DropdownMenu` | Context menus on topology nodes, table rows |
 | `Separator` | Section dividers in dense layouts |
 | `ScrollArea` | Scrollable panels (alerts feed, change flow) |
+| `Toast` (Sonner) | Success/error feedback for write operations (Tier 2+): fuse reset, manual refresh, DLQ retry/discard |
 
 ### Charting
 
@@ -200,7 +203,6 @@ Status colours are used on:
 | Node type | Border colour | Fill colour (dark) | Fill colour (light) |
 |-----------|--------------|-------------------|-------------------|
 | Schema group (Level 0) | Worst-child SLA colour | `zinc-900` | `white` |
-| Relay pipeline | `blue-500` (connected) / `red-500` (disconnected) | `blue-950` / `red-950` | `blue-50` / `red-50` |
 | Inbox / Outbox table | `teal-500` | `teal-950` | `teal-50` |
 | Source base table | `zinc-500` | `zinc-900` | `white` |
 | Stream table | `--status-*` (by SLA) | `zinc-900` | `white` |
@@ -713,6 +715,7 @@ and time-to-breach prediction. Sorted worst-first by default.
 │  ✅ Scheduler       Running · 12 tables · 3 workers          │
 │  ✅ Replication     Active · 2.1 MB retained WAL             │
 │  ✅ Relay: kafka    Connected · 0 lag rows                   │
+│  🔴 Dead letters    47 unresolved across 2 pipelines [DLQ →] │
 │  ✅ Fuses           All armed · 0 blown                      │
 └──────────────────────────────────────────────────────────────┘
 ```
@@ -720,6 +723,61 @@ and time-to-breach prediction. Sorted worst-first by default.
 Severity-sorted (critical → warning → healthy). Each row is a
 single line with: status icon, check name, detail text, action link.
 Compact — no cards, no whitespace waste.
+
+### Dead Letter Queue
+
+Linked from the Health scorecard's "DLQ →" action. Shows unresolved
+dead letters per relay pipeline with payload inspection and operator
+actions.
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│  Dead Letter Queue                    47 unresolved  [🔍]   │
+│             [Pipeline: All ▼] [Error type: All ▼]           │
+├──────────────────────────────────────────────────────────────┤
+│  ID    Failed       Pipeline     Error       Message         │
+│  ────  ───────────  ──────────   ─────────   ──────────────  │
+│  1204  2m ago       kafka-fwd    decode      invalid JSON at │
+│  1203  5m ago       kafka-fwd    decode      unexpected EOF  │
+│  1198  12m ago      nats-rev     sink_perm   NOT NULL violat │
+│  ...                                                         │
+├──────────────────────────────────────────────────────────────┤
+│  Showing 20 of 47               [< 1 2 3 >]                 │
+└──────────────────────────────────────────────────────────────┘
+```
+
+**Row expansion.** Clicking a row expands to show:
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│  ▾ #1204 · kafka-fwd · decode · 2m ago                       │
+│                                                               │
+│  Error:  invalid JSON at byte 42: unexpected '}' after ','   │
+│  Retry count: 0                                               │
+│                                                               │
+│  Payload (read-only):                                        │
+│  ┌────────────────────────────────────────────────────────┐  │
+│  │  {"order_id": 9102, "amount": 45.00, }                │  │
+│  └────────────────────────────────────────────────────────┘  │
+│                                                               │
+│  Operator notes:                                             │
+│  ┌────────────────────────────────────────────────────────┐  │
+│  │  (add annotation before retry or discard)              │  │
+│  └────────────────────────────────────────────────────────┘  │
+│                                                               │
+│                           [Retry]  [Discard]  [Copy payload] │
+└──────────────────────────────────────────────────────────────┘
+```
+
+- Payload panel is read-only (syntax-highlighted JSON). The
+  `raw_payload` is immutable — see PLAN_WEBUI.md §Health Scorecard.
+- Operator notes is an editable text area (saved via
+  `PATCH /api/v1/dlq/:id/annotate`).
+- "Retry" re-attempts delivery of the original message.
+- "Discard" marks resolved without retry.
+- "Copy payload" copies JSON to clipboard for manual correction
+  via the SQL execute endpoint.
+- Bulk discard: checkbox column + "Discard selected" button at top.
 
 ### Refresh Timeline
 
@@ -836,6 +894,37 @@ human review layer for LLM-generated SQL.
 - Editable (Tier 3): In Tier 3, the SQL block becomes a Monaco editor
   where the user can modify the generated SQL before applying.
 
+### Loading, Empty & Error States
+
+Every data-fetching screen must handle three non-happy-path states.
+Without these, an SRE cannot distinguish "the system is healthy" from
+"the dashboard is broken."
+
+**Loading.** Skeleton screens (shadcn/ui `Skeleton` component) matching
+the shape of the expected content. No spinners. Tables show skeleton
+rows; metric cards show skeleton values; the topology graph shows a
+pulsing placeholder canvas. Loading state must be visually distinct
+from empty state.
+
+**Empty (zero state).** Shown when the query succeeds but returns no
+data (e.g. no stream tables created yet, no alerts in the feed, no
+dead letters). Each screen has a contextual empty message:
+
+| Screen | Empty message |
+|--------|--------------|
+| Tables list | "No stream tables yet. Create one with SQL or ask an agent." |
+| Topology | "No stream tables. The graph will appear when the first stream table is created." |
+| Alerts | "No alerts. The system is healthy." |
+| DLQ | "No dead letters. All relay messages delivered successfully." |
+| Refresh timeline | "No refresh history. Tables will appear here after their first refresh." |
+
+**Error.** API-unreachable or 5xx responses show a banner at the top of
+the content area (not a modal — the user may still need to navigate).
+Includes: error summary, last successful data timestamp, and a "Retry"
+button. WebSocket disconnection shows a persistent amber banner:
+"Live updates disconnected. Retrying…" with a countdown to next
+reconnection attempt.
+
 ---
 
 ## Responsive Behaviour
@@ -851,8 +940,8 @@ human review layer for LLM-generated SQL.
 **Phone priority pages** (the views an SRE on-call actually needs):
 1. Health scorecard
 2. Alerts feed (Activity page)
-3. SLA budget overview (Pipelines, sorted worst-first)
-4. Pipeline detail (simplified)
+3. Tables list (sorted worst SLA first)
+4. Table detail (simplified)
 
 The topology graph on phone is a "view-only, pinch-zoom" experience —
 useful for a quick glance but not for exploration. A "View on desktop"
@@ -918,3 +1007,36 @@ Options for the read-only SQL display (Tier 1–2) and editable SQL
 |------|---------|-----------|
 | 1–2 | **Shiki** | Static highlighting, no runtime JS. Supports PostgreSQL grammar. Used by Next.js docs. |
 | 3 | **Monaco Editor** | Full editing with autocomplete, inline errors, bracket matching. Heavy (~2 MB) but loaded only on the SQL editing page. |
+
+### SQ-5: Animation and transition timing
+
+No timing guidelines are specified for: page transitions, tab
+switching, modal open/close, topology drill-in (Level 0 → Level 1),
+node appear/disappear on structure changes, edge dot animation speed.
+Without a shared timing spec, implementation will be inconsistent.
+
+Suggested baseline:
+- Page/tab transitions: 150 ms ease-out
+- Modal/sheet open: 200 ms ease-out; close: 150 ms ease-in
+- Topology drill-in: 300 ms with node crossfade
+- Edge dot animation: 2s loop (healthy), 4s (warning), 1s (breach)
+- `prefers-reduced-motion`: all durations → 0 ms
+
+### SQ-6: Accessibility testing in CI
+
+WCAG 2.1 AA is the target but no testing tooling or CI integration is
+specified. Options:
+
+- `axe-core` in unit tests (via `@axe-core/react`)
+- Lighthouse CI accessibility audit on every build
+- Manual screen-reader testing cadence (quarterly?)
+
+### SQ-7: Topology graph keyboard navigation
+
+The accessibility section mentions "arrow-key node traversal" but does
+not specify the interaction model. Questions:
+
+- How does focus enter the graph canvas? (Tab into graph → first node?)
+- Arrow keys: follow edges (directional) or cycle through all nodes?
+- Enter/Space on a focused node: opens Sheet? Drills into Level 1?
+- Escape: returns focus to sidebar?

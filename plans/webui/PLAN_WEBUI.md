@@ -1236,7 +1236,8 @@ public-facing catalog views and relay-owned sample tables:
 | `pgtrickle.refresh_percentiles` | `pgt_refresh_log` (rolling 1 h / 24 h) | Refresh timeline P50/P95/P99 overlays | DIFFERENTIAL (algebraic aggregates) |
 | `pgtrickle.buffer_growth_rate` | `_staleness_samples` (derivative per table) | Buffer depth trend badges | DIFFERENTIAL |
 | `pgtrickle.end_to_end_lag` | `pg_stat_stream_tables` + DAG edges | Topology graph edge widths | FULL (recursive CTE — upgraded when recursive IVM ships) |
-| `pgtrickle.breach_events` | `sla_burn_rate` + DAG ancestry | Root cause / inherited breach classification; Grafana alerts | DIFFERENTIAL |
+| `pgtrickle._breach_state` | `_breach_snapshots` (latest snapshot) | Internal — feeds `breach_events` | FULL |
+| `pgtrickle.breach_events` | `_breach_state` + DAG ancestry | Root cause / inherited breach classification; Grafana alerts | FULL |
 
 #### Why `breach_events` must be a stream table, not WebUI logic
 
@@ -1261,6 +1262,11 @@ The WebUI is a consumer of `breach_events`, not the owner of the logic.
 
 #### `pgtrickle.breach_events` schema
 
+The breach classification requires two passes — first determine which
+tables are in breach, then attribute root cause vs inherited. A single
+self-referential query cannot compute `breach_type` while simultaneously
+reading it. The design uses two stream tables:
+
 ```sql
 -- Source table: one row per breach-check tick per table
 -- Populated by relay worker alongside _staleness_samples
@@ -1272,7 +1278,18 @@ CREATE TABLE pgtrickle._breach_snapshots (
     in_breach       boolean     NOT NULL
 );
 
--- Stream table: current breach state with root-cause attribution
+-- Pass 1: current breach state per table (no attribution yet)
+CREATE STREAM TABLE pgtrickle._breach_state AS
+SELECT
+    s.table_name,
+    s.staleness_s,
+    s.sla_threshold_s,
+    s.in_breach
+FROM pgtrickle._breach_snapshots s
+WHERE s.snapped_at = (SELECT max(snapped_at) FROM pgtrickle._breach_snapshots);
+SCHEDULE '15 seconds';
+
+-- Pass 2: root-cause attribution, reading _breach_state (not itself)
 CREATE STREAM TABLE pgtrickle.breach_events AS
 SELECT
     s.table_name,
@@ -1283,11 +1300,11 @@ SELECT
         -- Root cause: in breach AND no upstream stream table is also in breach
         WHEN s.in_breach AND NOT EXISTS (
             SELECT 1
-            FROM pgtrickle.breach_events b
+            FROM pgtrickle._breach_state b
             JOIN pgtrickle.dag_edges e
               ON e.upstream_table = b.table_name
              AND e.downstream_table = s.table_name
-            WHERE b.in_breach AND b.breach_type = 'root'
+            WHERE b.in_breach
         ) THEN 'root'
         WHEN s.in_breach THEN 'inherited'
         ELSE NULL
@@ -1295,33 +1312,41 @@ SELECT
     -- For inherited breaches: name the root cause table
     (
         SELECT b.table_name
-        FROM pgtrickle.breach_events b
+        FROM pgtrickle._breach_state b
         JOIN pgtrickle.dag_ancestors a
           ON a.ancestor = b.table_name
          AND a.descendant = s.table_name
-        WHERE b.breach_type = 'root'
+        WHERE b.in_breach
+          AND NOT EXISTS (
+              SELECT 1
+              FROM pgtrickle._breach_state u
+              JOIN pgtrickle.dag_edges e2
+                ON e2.upstream_table = u.table_name
+               AND e2.downstream_table = b.table_name
+              WHERE u.in_breach
+          )
         ORDER BY a.depth ASC
         LIMIT 1
     ) AS root_cause_table,
     -- Downstream blast radius count
     (
         SELECT count(*)
-        FROM pgtrickle.breach_events b
+        FROM pgtrickle._breach_state b
         JOIN pgtrickle.dag_ancestors a
           ON a.ancestor = s.table_name
          AND a.descendant = b.table_name
         WHERE b.in_breach
     ) AS downstream_casualties
-FROM pgtrickle._breach_snapshots s
-WHERE s.snapped_at = (SELECT max(snapped_at) FROM pgtrickle._breach_snapshots);
+FROM pgtrickle._breach_state s;
 SCHEDULE '15 seconds';
 ```
 
-The recursive self-reference (`breach_events` joining itself for
-ancestry) requires the DAG ancestry materialised view
-(`pgtrickle.dag_ancestors`) as an intermediate. This is a FULL refresh
-table until recursive IVM ships. At 15 s intervals and typical table
-counts (< 1000), the full rescan is fast.
+`_breach_state` is a thin materialisation of the latest breach
+snapshot — it exists solely to break the circular reference.
+`breach_events` reads `_breach_state` (not itself) for the upstream
+breach check, so there is no self-referential join. Both are FULL
+refresh tables until recursive IVM ships. At 15 s intervals and
+typical table counts (< 1000), the full rescan is fast.
 
 **Grafana usage example:**
 
@@ -1603,3 +1628,138 @@ so the audit log records which agent made each change, or require
    (agents can skip it), but the audit log records whether a preview
    was performed. This encourages the safe pattern (validate → review
    → apply) without blocking automation that needs to skip it.
+
+### OQ-13: Pagination strategy
+
+Multiple API endpoints return "paginated" data but no pagination
+contract is defined. Questions:
+
+- Cursor-based (opaque token) or offset-based (`?page=N&limit=M`)?
+  Cursor-based is more robust for live data (no skips/duplicates when
+  rows arrive between pages), but offset-based is simpler for UIs.
+- Default page size? Max limit? (Suggested: 50 default, 200 max.)
+- Response format: `{ data: [...], next_cursor: "..." }` or
+  RFC 8288 `Link` headers?
+
+### OQ-14: API rate limiting and agent throttling
+
+The API is a public contract for LLM agents. A runaway agent loop
+calling `POST /api/v1/sql/execute` repeatedly could be destructive.
+Questions:
+
+- Per-IP or per-session rate limiting on write endpoints?
+- Per-agent quotas (via `X-Agent-Name`)?
+- Circuit-breaker on the API itself (e.g. 429 after N writes/minute)?
+- Read endpoints: rate-limited or unlimited?
+
+### OQ-15: Audit log schema
+
+Multiple features reference "the audit log" (DLQ bad-data remediation,
+agent guardrails, SQL execute) but no schema exists. Need to define:
+
+- Table schema (`pgtrickle.audit_log`?)
+- Columns: timestamp, operator/agent, action type, SQL, result, source IP
+- Retention policy (rolling window? Partition by month? Manual cleanup?)
+- Whether the audit log is a stream table itself (dogfooding)
+
+### OQ-16: `table_classifications` relay dependency
+
+The `table_classifications` view joins `relay_inbox_config` and
+`relay_outbox_config`. If the extension is installed without the relay
+(valid — the relay is optional), the view breaks. Options:
+
+- (a) `LEFT JOIN` with `NULL` transport columns — view always works
+- (b) View is only created by `pgtrickle.relay_setup()`, not by the
+  extension itself
+- (c) `IF EXISTS` conditional join (not standard SQL)
+
+### OQ-17: WebSocket reconnection and event replay
+
+The plan describes WS events and a 5s polling fallback but no
+client-side reconnection strategy. Questions:
+
+- Exponential backoff on disconnect? (Suggested: 1s → 2s → 4s → 30s cap)
+- Event sequence numbers for replay of missed events during disconnect?
+- Stale badge detection: how does the frontend know its live data is
+  outdated after a long disconnect? (Suggested: server sends a
+  `WsEvent::Heartbeat` every 5s; if missed for 15s, show "stale" banner.)
+
+### OQ-18: HTTP caching strategy
+
+The API serves the frontend (high-frequency), Grafana (periodic scrape),
+and scripts (ad hoc). No caching is documented. Questions:
+
+- `Cache-Control` headers for read endpoints? (Suggested: `max-age=5`
+  for topology, `no-cache` for alerts and health.)
+- `ETag` / `If-None-Match` for large payloads (topology, table list)?
+- Server-side response caching for `/api/v1/dag/topology`?
+
+### OQ-19: MCP manifest derivation
+
+The plan defines both a hand-written MCP tool manifest and an
+auto-generated OpenAPI spec (via `utoipa`). These describe the same
+endpoints and can drift. Should the MCP manifest be generated from the
+OpenAPI spec rather than maintained separately?
+
+### OQ-20: Frontend version negotiation
+
+The frontend is embedded via `rust-embed`. After a relay upgrade,
+browser tabs with the old frontend cached may call new/changed API
+endpoints. Questions:
+
+- Force-reload mechanism? (Suggested: relay serves
+  `X-App-Version: <hash>` header; frontend compares on each API
+  response; mismatch triggers a reload prompt.)
+- `ETag`-based cache busting for static assets?
+- Graceful degradation for minor API additions?
+
+### OQ-21: SLA inference for slow-refresh tables
+
+The "2× schedule = warning, 3× = breach" formula does not account for
+refresh duration. A table with a 60s schedule and a 50s P95 refresh
+duration reaches ~110s staleness even when perfectly healthy (refresh
+starts, takes 50s, next refresh not due for 60s). This table would be
+perpetually in warning. Should the formula be:
+
+```
+effective_threshold = multiplier × (schedule_interval + p95_refresh_duration)
+```
+
+### OQ-22: CORS and Content Security Policy
+
+The API may be called cross-origin (Grafana annotation queries,
+embedded iframes — see OQ-7). Questions:
+
+- CORS policy: allow `*` for read endpoints? Restrict writes to
+  same-origin?
+- CSP headers for the frontend: ECharts, graphviz-wasm, and Monaco
+  all require `script-src` relaxation. Document the minimum CSP.
+- Security headers: `X-Frame-Options`, `X-Content-Type-Options`,
+  `Strict-Transport-Security`.
+
+### OQ-23: DLQ retention policy
+
+`relay_dead_letters` stores forensic payload data indefinitely
+(`resolved_at` is set but rows are never deleted). For high-throughput
+systems with persistent schema mismatches, this table grows without
+bound. Questions:
+
+- Auto-cleanup of resolved entries after N days? (Suggested: 30 days.)
+- Archival to cold storage before deletion?
+- Partition by month for efficient cleanup?
+- Size-based cap (e.g. max 100K unresolved entries, oldest auto-discarded)?
+
+### OQ-24: Internationalisation
+
+English only for the initial release. Is there a future need for i18n?
+If not, document the decision explicitly.
+
+### OQ-25: Bundle size budget
+
+ECharts (~400 KB), graphviz-wasm (~1.5 MB), Monaco (~2 MB) — the
+embedded binary carries all of these. Questions:
+
+- Total budget for `rust-embed` static assets? (Suggested: < 5 MB
+  gzipped for Tier 1.)
+- CI gate: fail build if bundle exceeds budget?
+- Lazy-load everything except the core shell + topology page?
