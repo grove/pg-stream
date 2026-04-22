@@ -351,7 +351,7 @@ jobs:
     runs-on: ubuntu-latest
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     needs: [e2e-tests, upgrade-e2e-prepare]
-    timeout-minutes: 35
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix: ${{ fromJson(needs.upgrade-e2e-prepare.outputs.matrix) }}
