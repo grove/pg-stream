@@ -125,8 +125,8 @@ pub fn create_inbox(
     p_schema: default!(&str, "'pgtrickle'"),
     p_max_retries: default!(i32, 3),
     p_schedule: default!(&str, "'1s'"),
-    p_with_dead_letter: default!(bool, true),
-    p_with_stats: default!(bool, true),
+    with_dead_letter: default!(bool, true),
+    with_stats: default!(bool, true),
     p_retention_hours: default!(i32, 72),
 ) {
     create_inbox_impl(
@@ -134,8 +134,8 @@ pub fn create_inbox(
         p_schema,
         p_max_retries,
         p_schedule,
-        p_with_dead_letter,
-        p_with_stats,
+        with_dead_letter,
+        with_stats,
         p_retention_hours,
     )
     .unwrap_or_else(|e| pgrx::error!("{}", e))
@@ -184,7 +184,7 @@ fn create_inbox_impl(
         name.replace('"', "\\\""),
         max_retries
     );
-    create_inbox_stream_table(schema, &pending_st, &pending_query, schedule)?;
+    create_inbox_stream_table(schema, &pending_st, &pending_query, schedule, None)?;
 
     // Create DLQ stream table (if enabled)
     if with_dead_letter {
@@ -195,7 +195,7 @@ fn create_inbox_impl(
             name.replace('"', "\\\""),
             max_retries
         );
-        create_inbox_stream_table(schema, &dlq_st, &dlq_query, schedule)?;
+        create_inbox_stream_table(schema, &dlq_st, &dlq_query, schedule, None)?;
     }
 
     // Create stats stream table (if enabled)
@@ -210,7 +210,7 @@ fn create_inbox_impl(
             schema.replace('"', "\\\""),
             name.replace('"', "\\\"")
         );
-        create_inbox_stream_table(schema, &stats_st, &stats_query, schedule)?;
+        create_inbox_stream_table(schema, &stats_st, &stats_query, schedule, None)?;
     }
 
     // Register in catalog
@@ -246,16 +246,24 @@ fn create_inbox_stream_table(
     st_name: &str,
     query: &str,
     schedule: &str,
+    refresh_mode: Option<&str>,
 ) -> Result<(), PgTrickleError> {
-    let fqn = format!(
-        r#""{}"."{}"#,
-        schema.replace('"', "\\\""),
-        st_name.replace('"', "\\\"")
-    );
-    Spi::run_with_args(
-        "SELECT pgtrickle.create_stream_table($1, $2, schedule => $3)",
-        &[fqn.as_str().into(), query.into(), schedule.into()],
-    )
+    let fqn = format!("{}.{}", schema, st_name);
+    match refresh_mode {
+        Some(mode) => Spi::run_with_args(
+            "SELECT pgtrickle.create_stream_table($1, $2, schedule => $3, refresh_mode => $4)",
+            &[
+                fqn.as_str().into(),
+                query.into(),
+                schedule.into(),
+                mode.into(),
+            ],
+        ),
+        None => Spi::run_with_args(
+            "SELECT pgtrickle.create_stream_table($1, $2, schedule => $3)",
+            &[fqn.as_str().into(), query.into(), schedule.into()],
+        ),
+    }
     .map_err(|e| {
         PgTrickleError::SpiError(format!(
             "create inbox stream table '{}' failed: {e}",
@@ -299,7 +307,7 @@ fn drop_inbox_impl(name: &str, if_exists: bool, cascade: bool) -> Result<(), PgT
         &[name.into()],
     );
 
-    // Drop stream tables
+    // Drop stream tables (only those that actually exist in the catalog)
     let st_names = vec![
         format!("{}_pending", name),
         format!("{}_dlq", name),
@@ -307,11 +315,19 @@ fn drop_inbox_impl(name: &str, if_exists: bool, cascade: bool) -> Result<(), PgT
         format!("next_{}", name),
     ];
     for st in &st_names {
-        let fqn = format!(r#""{}"."{}"#, cfg.inbox_schema, st);
-        let _ = Spi::run_with_args(
-            "SELECT pgtrickle.drop_stream_table($1, if_exists => true)",
-            &[fqn.as_str().into()],
-        );
+        let st_exists = Spi::get_one_with_args::<bool>(
+            "SELECT EXISTS(SELECT 1 FROM pgtrickle.pgt_stream_tables WHERE pgt_name = $1)",
+            &[st.as_str().into()],
+        )
+        .unwrap_or(None)
+        .unwrap_or(false);
+        if st_exists {
+            let fqn = format!("{}.{}", cfg.inbox_schema, st);
+            let _ = Spi::run_with_args(
+                "SELECT pgtrickle.drop_stream_table($1)",
+                &[fqn.as_str().into()],
+            );
+        }
     }
 
     // Remove catalog entry
@@ -451,6 +467,7 @@ fn enable_inbox_tracking_impl(
         &format!("{}_pending", name),
         &pending_query,
         schedule,
+        None,
     )?;
 
     pgrx::log!(
@@ -633,12 +650,12 @@ fn replay_inbox_messages_impl(name: &str, event_ids: Vec<String>) -> Result<i64,
     let arr_literal = format!("ARRAY[{}]::text[]", quoted.join(", "));
 
     let count_sql = format!(
-        r#"SELECT COUNT(*) FROM (
+        r#"WITH upd AS (
            UPDATE "{}"."{}"
            SET {} = NULL, {} = 0, {} = NULL
            WHERE {} = ANY({})
            RETURNING 1
-        ) sub"#,
+        ) SELECT COUNT(*) FROM upd"#,
         cfg.inbox_schema,
         cfg.inbox_name,
         cfg.processed_at_column,
@@ -702,10 +719,26 @@ fn enable_inbox_ordering_impl(
         }
     }
 
+    // Expand * to explicit column names to avoid the DVM rewriter producing
+    // `__pgt_do.*` (an invalid column reference) from DISTINCT ON queries.
+    let select_list = Spi::get_one_with_args::<String>(
+        "SELECT string_agg(quote_ident(attname), ', ' ORDER BY attnum) \
+         FROM pg_attribute \
+         WHERE attrelid = ($1 || '.' || $2)::regclass \
+           AND attnum > 0 \
+           AND NOT attisdropped",
+        &[
+            cfg.inbox_schema.as_str().into(),
+            cfg.inbox_name.as_str().into(),
+        ],
+    )
+    .map_err(|e| PgTrickleError::SpiError(format!("get inbox columns failed: {e}")))?
+    .unwrap_or_else(|| "*".to_string());
+
     // Create the `next_<inbox>` stream table
     let next_st = format!("next_{}", inbox);
     let next_query = format!(
-        r#"SELECT DISTINCT ON ({agg}) * FROM "{}"."{}"
+        r#"SELECT DISTINCT ON ({agg}) {select_list} FROM "{}"."{}"
            WHERE {} IS NULL AND {} < {}
            ORDER BY {agg}, {} ASC"#,
         cfg.inbox_schema,
@@ -714,9 +747,16 @@ fn enable_inbox_ordering_impl(
         cfg.retry_count_column,
         cfg.max_retries,
         sequence_num_col,
-        agg = aggregate_id_col
+        agg = aggregate_id_col,
+        select_list = select_list
     );
-    create_inbox_stream_table(&cfg.inbox_schema, &next_st, &next_query, &cfg.schedule)?;
+    create_inbox_stream_table(
+        &cfg.inbox_schema,
+        &next_st,
+        &next_query,
+        &cfg.schedule,
+        Some("FULL"),
+    )?;
 
     // Register ordering config
     Spi::run_with_args(
@@ -767,12 +807,21 @@ fn disable_inbox_ordering_impl(inbox: &str, if_exists: bool) -> Result<(), PgTri
         )));
     }
 
-    // Drop the next_<inbox> stream table
-    let next_fqn = format!(r#""{}".next_{}"#, cfg.inbox_schema, inbox);
-    let _ = Spi::run_with_args(
-        "SELECT pgtrickle.drop_stream_table($1, if_exists => true)",
-        &[next_fqn.as_str().into()],
-    );
+    // Drop the next_<inbox> stream table if it exists
+    let next_st = format!("next_{}", inbox);
+    let next_st_exists = Spi::get_one_with_args::<bool>(
+        "SELECT EXISTS(SELECT 1 FROM pgtrickle.pgt_stream_tables WHERE pgt_name = $1)",
+        &[next_st.as_str().into()],
+    )
+    .unwrap_or(None)
+    .unwrap_or(false);
+    if next_st_exists {
+        let next_fqn = format!("{}.next_{}", cfg.inbox_schema, inbox);
+        let _ = Spi::run_with_args(
+            "SELECT pgtrickle.drop_stream_table($1)",
+            &[next_fqn.as_str().into()],
+        );
+    }
 
     Ok(())
 }
@@ -931,12 +980,15 @@ fn inbox_ordering_gaps_impl(inbox_name: &str) -> Result<Vec<(String, i64, i64)>,
     };
 
     let gaps_sql = format!(
-        r#"SELECT {agg}::text,
-              LAG({seq}) OVER (PARTITION BY {agg} ORDER BY {seq}) + 1 AS expected_seq,
-              {seq} AS found_seq
-          FROM "{}"."{}"
-          WHERE {processed} IS NULL
-        HAVING LAG({seq}) OVER (PARTITION BY {agg} ORDER BY {seq}) + 1 < {seq}"#,
+        r#"SELECT {agg}::text, expected_seq, found_seq
+           FROM (
+               SELECT {agg}::text AS {agg},
+                      LAG({seq}) OVER (PARTITION BY {agg} ORDER BY {seq}) + 1 AS expected_seq,
+                      {seq} AS found_seq
+               FROM "{}"."{}"
+               WHERE {processed} IS NULL
+           ) _gaps
+           WHERE expected_seq < found_seq"#,
         cfg.inbox_schema,
         cfg.inbox_name,
         agg = agg_col,

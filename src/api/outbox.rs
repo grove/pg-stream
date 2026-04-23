@@ -199,7 +199,7 @@ fn enable_outbox_impl(name: &str, retention_hours: i32) -> Result<(), PgTrickleE
                retention_hours   = EXCLUDED.retention_hours",
         &[
             pgrx::pg_sys::Oid::from(meta.pgt_id as u32).into(),
-            format!("{}.{}", schema, st_name).as_str().into(),
+            st_name.as_str().into(),
             outbox_name.as_str().into(),
             retention_hours.into(),
         ],

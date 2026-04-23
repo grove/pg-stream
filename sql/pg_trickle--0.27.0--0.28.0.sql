@@ -338,8 +338,8 @@ CREATE OR REPLACE FUNCTION pgtrickle."create_inbox"(
     p_schema           text    DEFAULT 'pgtrickle',
     p_max_retries      integer DEFAULT 3,
     p_schedule         text    DEFAULT '1s',
-    p_with_dead_letter boolean DEFAULT true,
-    p_with_stats       boolean DEFAULT true,
+    with_dead_letter   boolean DEFAULT true,
+    with_stats         boolean DEFAULT true,
     p_retention_hours  integer DEFAULT 72
 ) RETURNS void
 LANGUAGE c /* Rust */
