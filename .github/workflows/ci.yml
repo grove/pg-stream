@@ -701,20 +701,22 @@ jobs:
             -p 15433:5432 \
             pg_trickle_e2e:latest
 
-          echo "Waiting for PostgreSQL to be ready..."
-          for i in $(seq 1 30); do
+          # pg_isready returns true before docker-entrypoint-initdb.d scripts
+          # finish, which causes a race condition: dbt tries to connect before
+          # postgres has finished initialising and published the host port.
+          # Poll pg_extension directly to ensure initdb.d has completed before
+          # running dbt (mirrors the approach used in the dbt-integration job).
+          echo "Waiting for pg_trickle extension to be ready..."
+          for i in $(seq 1 60); do
             if docker exec pgtrickle-getting-started \
-              pg_isready -U postgres -q 2>/dev/null; then
-              echo "PostgreSQL is ready (attempt $i)"
+              psql -U postgres -qtAc \
+                "SELECT 1 FROM pg_extension WHERE extname='pg_trickle'" \
+              2>/dev/null | grep -q 1; then
+              echo "pg_trickle extension is ready (attempt $i)"
               break
             fi
             sleep 1
           done
-
-      - name: Create pg_trickle extension
-        run: |
-          docker exec pgtrickle-getting-started \
-            psql -U postgres -c "CREATE EXTENSION IF NOT EXISTS pg_trickle;"
 
       - uses: actions/setup-python@v6
         with:
