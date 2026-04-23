@@ -7267,7 +7267,7 @@ it is tested against. Add a compatibility matrix row (e.g.
 
 ## v0.28.0 — Transactional Inbox & Outbox Patterns
 
-**Status: Planned.** Driven by [PLAN_TRANSACTIONAL_OUTBOX_HELPER.md](plans/patterns/PLAN_TRANSACTIONAL_OUTBOX_HELPER.md) and [PLAN_TRANSACTIONAL_INBOX_HELPER.md](plans/patterns/PLAN_TRANSACTIONAL_INBOX_HELPER.md). Outbox helper moved here from v0.22.0 to ship alongside the inbox helper and production-grade advanced features as a complete transactional messaging solution.
+**Status: Released.** Driven by [PLAN_TRANSACTIONAL_OUTBOX_HELPER.md](plans/patterns/PLAN_TRANSACTIONAL_OUTBOX_HELPER.md) and [PLAN_TRANSACTIONAL_INBOX_HELPER.md](plans/patterns/PLAN_TRANSACTIONAL_INBOX_HELPER.md). Outbox helper moved here from v0.22.0 to ship alongside the inbox helper and production-grade advanced features as a complete transactional messaging solution.
 
 > **Release Theme**
 > This release delivers a **complete, production-grade solution** for the two
@@ -7454,47 +7454,47 @@ it is tested against. Add a compatibility matrix row (e.g.
 > **v0.28.0 total: ~6–7 weeks solo / ~4–5 weeks with two developers working Part A and Part B tracks in parallel** (Part A: essential patterns + Part B: production patterns)
 
 **Exit criteria:**
-- [ ] OUTBOX-1/2: `enable_outbox()` creates outbox table + `pgt_outbox_latest_<st>` view with correct schema; catalog row present
-- [ ] OUTBOX-1: `enable_outbox()` on IMMEDIATE-mode stream table returns `OutboxRequiresNotImmediateMode` with clear message
-- [ ] OUTBOX-2: Naming collision resolution: truncation + hex suffix tested end-to-end; final name stored in catalog
-- [ ] OUTBOX-3/CC: Initial load (first refresh, all rows as `"inserted"`) above `outbox_inline_threshold_rows` uses claim-check path; `outbox_delta_rows_<st>` populated atomically; no data loss
-- [ ] OUTBOX-3/CC: Bulk source update (many rows changed in one cycle) above threshold uses claim-check path; relay cursor returns all inserted + deleted rows correctly
-- [ ] OUTBOX-3: Refresh populates outbox payload within same transaction; rollback on outbox INSERT failure leaves no orphan delta rows
-- [ ] OUTBOX-4: Small deltas (≤ `outbox_inline_threshold_rows`) produce inline `{"v":1, "inserted":[…], "deleted":[…]}`; large deltas produce claim-check header `{"v":1, "claim_check": true, …}` with rows in `outbox_delta_rows_<st>`; relay cursor consumption + `outbox_rows_consumed()` documented + tested; no truncation path exists
-- [ ] OUTBOX-5: Retention drain removes rows older than `outbox_retention_hours`; respects batch size
-- [ ] OUTBOX-6: `drop_stream_table()` cascades to outbox + latest-row view; `outbox_status()` returns correct data
-- [ ] OUTBOX-7: Benchmark shows < 10 % overhead vs baseline at small payloads
-- [ ] INBOX-1/2: `create_inbox()` creates inbox table + 3 stream tables + metadata
-- [ ] INBOX-3: Pending ST reflects unprocessed messages; DLQ ST reflects poisoned messages
-- [ ] INBOX-4: `enable_inbox_tracking()` works with non-standard column names on existing tables
-- [ ] INBOX-5: `pg_trickle_alert` fires when new DLQ entries appear
-- [ ] INBOX-6: `inbox_health()` returns correct health status; `inbox_status()` lists all inboxes
-- [ ] INBOX-7: `replay_inbox_messages()` resets messages by explicit `event_ids` array (no `where_clause`); uses parameterised `WHERE event_id = ANY($1)` — no dynamic SQL; retention drain respects DLQ; processor crash + replay recovery path documented
-- [ ] INBOX-8: `drop_inbox(cascade := true)` drops managed table; preserves adopted tables
-- [ ] SHARED-3: End-to-end inbox → business logic → outbox pipeline test passes
-- [ ] SHARED-4: dbt adapter updated with `outbox_enabled` and `inbox_config` properties; integration tests pass
-- [ ] OUTBOX-B1: `create_consumer_group()` creates group + offset + lease tables; idempotent re-create
-- [ ] OUTBOX-3/4: FULL-refresh fallback writes `"full_refresh": true` in header; claim-check applies when row count exceeds `outbox_inline_threshold_rows`; reference relay handles all four combinations (inline/claim-check × differential/full-refresh) correctly
-- [ ] OUTBOX-B2: `poll_outbox()` returns correct batch; no overlap between concurrent relays; visibility timeout expires and row re-delivered
-- [ ] OUTBOX-B2a: `extend_lease()` extends visibility_until for all active consumer leases; re-delivery does not occur when relay calls extend_lease before timeout
-- [ ] OUTBOX-B3: `commit_offset()` advances monotonically; `seek_offset()` enables replay from any position
-- [ ] OUTBOX-B4: Heartbeat tracks liveness; `consumer_unhealthy` alert fires on timeout
-- [ ] OUTBOX-B5: Three monitoring STs (status/FULL, group lag/DIFFERENTIAL, active leases/FULL) created idempotently (second `create_consumer_group()` does not fail); refreshed correctly; dropped when last group is dropped (reference count reaches zero)
-- [ ] OUTBOX-B6: Dead relay reaped after `consumer_dead_threshold_hours` (default 24 h, configurable); leases released; `consumer_reaped` alert emitted
-- [ ] OUTBOX-B7: Retention drain respects `MIN(last_offset)`; `outbox_force_retention` override works
-- [ ] OUTBOX-B8: Multi-relay group E2E: each outbox row published exactly once across 3 concurrent relays
-- [ ] OUTBOX-B8b: Concurrent relay stress test: 10 relays, 100K outbox rows, < 0.1% duplicate rate before broker dedup; 0% after
-- [ ] INBOX-B1: `next_<inbox>` ST surfaces only next expected sequence per aggregate; withholds future sequences; partial index `(aggregate_id, sequence_num) WHERE processed_at IS NOT NULL` created by `enable_inbox_ordering()`
-- [ ] INBOX-B1: `enable_inbox_ordering()` + `enable_inbox_priority()` together returns `InboxOrderingPriorityConflict` with clear message
-- [ ] INBOX-B2: `gaps_<inbox>` ST detects missing sequences using `LEAD()` window function; `inbox_ordering_gap` alert fires; gap detection benchmark passes (< 1 s at 10K aggregates, 1M messages; O(N log N) not O(sequence_range))
-- [ ] INBOX-B3: Priority tier STs refresh at configured schedules; messages route to correct tier
-- [ ] INBOX-B3: `disable_inbox_priority()` drops all tier STs + config row; unified `pending_<inbox>` is restored
-- [ ] INBOX-B1: `disable_inbox_ordering()` drops `next_<inbox>` ST + config row; inbox resumes normal pending behaviour
-- [ ] INBOX-B4: `inbox_is_my_partition(aggregate_id, worker_id, total_workers)` returns BOOLEAN; no messages lost across N workers; usable in prepared statements without SQL interpolation
-- [ ] SHARED-B3: Ordered inbox E2E: 10 out-of-order arrivals per aggregate delivered to processor in order
-- [ ] SHARED-B4: dbt adapter updated with consumer group and inbox ordering properties
-- [ ] Extension upgrade path tested (`0.27.0 → 0.28.0`) — `sql/pg_trickle--0.27.0--0.28.0.sql` validated by `scripts/check_upgrade_completeness.sh`
-- [ ] `just check-version-sync` passes
+- [x] OUTBOX-1/2: `enable_outbox()` creates outbox table + `pgt_outbox_latest_<st>` view with correct schema; catalog row present
+- [x] OUTBOX-1: `enable_outbox()` on IMMEDIATE-mode stream table returns `OutboxRequiresNotImmediateMode` with clear message
+- [x] OUTBOX-2: Naming collision resolution: truncation + hex suffix tested end-to-end; final name stored in catalog
+- [x] OUTBOX-3/CC: Initial load (first refresh, all rows as `"inserted"`) above `outbox_inline_threshold_rows` uses claim-check path; `outbox_delta_rows_<st>` populated atomically; no data loss
+- [x] OUTBOX-3/CC: Bulk source update (many rows changed in one cycle) above threshold uses claim-check path; relay cursor returns all inserted + deleted rows correctly
+- [x] OUTBOX-3: Refresh populates outbox payload within same transaction; rollback on outbox INSERT failure leaves no orphan delta rows
+- [x] OUTBOX-4: Small deltas (≤ `outbox_inline_threshold_rows`) produce inline `{"v":1, "inserted":[…], "deleted":[…]}`; large deltas produce claim-check header `{"v":1, "claim_check": true, …}` with rows in `outbox_delta_rows_<st>`; relay cursor consumption + `outbox_rows_consumed()` documented + tested; no truncation path exists
+- [x] OUTBOX-5: Retention drain removes rows older than `outbox_retention_hours`; respects batch size
+- [x] OUTBOX-6: `drop_stream_table()` cascades to outbox + latest-row view; `outbox_status()` returns correct data
+- [x] OUTBOX-7: Benchmark shows < 10 % overhead vs baseline at small payloads
+- [x] INBOX-1/2: `create_inbox()` creates inbox table + 3 stream tables + metadata
+- [x] INBOX-3: Pending ST reflects unprocessed messages; DLQ ST reflects poisoned messages
+- [x] INBOX-4: `enable_inbox_tracking()` works with non-standard column names on existing tables
+- [x] INBOX-5: `pg_trickle_alert` fires when new DLQ entries appear
+- [x] INBOX-6: `inbox_health()` returns correct health status; `inbox_status()` lists all inboxes
+- [x] INBOX-7: `replay_inbox_messages()` resets messages by explicit `event_ids` array (no `where_clause`); uses parameterised `WHERE event_id = ANY($1)` — no dynamic SQL; retention drain respects DLQ; processor crash + replay recovery path documented
+- [x] INBOX-8: `drop_inbox(cascade := true)` drops managed table; preserves adopted tables
+- [x] SHARED-3: End-to-end inbox → business logic → outbox pipeline test passes
+- [x] SHARED-4: dbt adapter updated with `outbox_enabled` and `inbox_config` properties; integration tests pass
+- [x] OUTBOX-B1: `create_consumer_group()` creates group + offset + lease tables; idempotent re-create
+- [x] OUTBOX-3/4: FULL-refresh fallback writes `"full_refresh": true` in header; claim-check applies when row count exceeds `outbox_inline_threshold_rows`; reference relay handles all four combinations (inline/claim-check × differential/full-refresh) correctly
+- [x] OUTBOX-B2: `poll_outbox()` returns correct batch; no overlap between concurrent relays; visibility timeout expires and row re-delivered
+- [x] OUTBOX-B2a: `extend_lease()` extends visibility_until for all active consumer leases; re-delivery does not occur when relay calls extend_lease before timeout
+- [x] OUTBOX-B3: `commit_offset()` advances monotonically; `seek_offset()` enables replay from any position
+- [x] OUTBOX-B4: Heartbeat tracks liveness; `consumer_unhealthy` alert fires on timeout
+- [x] OUTBOX-B5: Three monitoring STs (status/FULL, group lag/DIFFERENTIAL, active leases/FULL) created idempotently (second `create_consumer_group()` does not fail); refreshed correctly; dropped when last group is dropped (reference count reaches zero)
+- [x] OUTBOX-B6: Dead relay reaped after `consumer_dead_threshold_hours` (default 24 h, configurable); leases released; `consumer_reaped` alert emitted
+- [x] OUTBOX-B7: Retention drain respects `MIN(last_offset)`; `outbox_force_retention` override works
+- [x] OUTBOX-B8: Multi-relay group E2E: each outbox row published exactly once across 3 concurrent relays
+- [x] OUTBOX-B8b: Concurrent relay stress test: 10 relays, 100K outbox rows, < 0.1% duplicate rate before broker dedup; 0% after
+- [x] INBOX-B1: `next_<inbox>` ST surfaces only next expected sequence per aggregate; withholds future sequences; partial index `(aggregate_id, sequence_num) WHERE processed_at IS NOT NULL` created by `enable_inbox_ordering()`
+- [x] INBOX-B1: `enable_inbox_ordering()` + `enable_inbox_priority()` together returns `InboxOrderingPriorityConflict` with clear message
+- [x] INBOX-B2: `gaps_<inbox>` ST detects missing sequences using `LEAD()` window function; `inbox_ordering_gap` alert fires; gap detection benchmark passes (< 1 s at 10K aggregates, 1M messages; O(N log N) not O(sequence_range))
+- [x] INBOX-B3: Priority tier STs refresh at configured schedules; messages route to correct tier
+- [x] INBOX-B3: `disable_inbox_priority()` drops all tier STs + config row; unified `pending_<inbox>` is restored
+- [x] INBOX-B1: `disable_inbox_ordering()` drops `next_<inbox>` ST + config row; inbox resumes normal pending behaviour
+- [x] INBOX-B4: `inbox_is_my_partition(aggregate_id, worker_id, total_workers)` returns BOOLEAN; no messages lost across N workers; usable in prepared statements without SQL interpolation
+- [x] SHARED-B3: Ordered inbox E2E: 10 out-of-order arrivals per aggregate delivered to processor in order
+- [x] SHARED-B4: dbt adapter updated with consumer group and inbox ordering properties
+- [x] Extension upgrade path tested (`0.27.0 → 0.28.0`) — `sql/pg_trickle--0.27.0--0.28.0.sql` validated by `scripts/check_upgrade_completeness.sh`
+- [x] `just check-version-sync` passes
 
 ---
 
