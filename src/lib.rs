@@ -1007,6 +1007,240 @@ COMMENT ON TABLE pgtrickle.pgt_inbox_priority_config IS
     requires = [],
 );
 
+// ── Relay catalog tables + SQL API (v0.29.0) ──────────────────────────
+extension_sql!(
+    r#"
+-- RELAY-CAT (v0.29.0): Forward pipelines — outbox → external sink.
+CREATE TABLE IF NOT EXISTS pgtrickle.relay_outbox_config (
+    name     TEXT    NOT NULL PRIMARY KEY,
+    enabled  BOOLEAN NOT NULL DEFAULT true,
+    config   JSONB   NOT NULL
+);
+
+COMMENT ON TABLE pgtrickle.relay_outbox_config IS
+    'RELAY-CAT (v0.29.0): Forward relay pipeline definitions (outbox → external sink).';
+
+-- RELAY-CAT (v0.29.0): Reverse pipelines — external source → pg-trickle inbox.
+CREATE TABLE IF NOT EXISTS pgtrickle.relay_inbox_config (
+    name     TEXT    NOT NULL PRIMARY KEY,
+    enabled  BOOLEAN NOT NULL DEFAULT true,
+    config   JSONB   NOT NULL
+);
+
+COMMENT ON TABLE pgtrickle.relay_inbox_config IS
+    'RELAY-CAT (v0.29.0): Reverse relay pipeline definitions (external source → inbox).';
+
+-- RELAY-CAT (v0.29.0): Durable per-pipeline offset tracking.
+CREATE TABLE IF NOT EXISTS pgtrickle.relay_consumer_offsets (
+    relay_group_id  TEXT        NOT NULL,
+    pipeline_id     TEXT        NOT NULL,
+    last_change_id  BIGINT      NOT NULL DEFAULT 0,
+    worker_id       TEXT,
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (relay_group_id, pipeline_id)
+);
+
+COMMENT ON TABLE pgtrickle.relay_consumer_offsets IS
+    'RELAY-CAT (v0.29.0): Durable per-pipeline offset tracking for the relay binary.';
+
+-- RELAY-CAT (v0.29.0): Shared trigger function for config hot-reload.
+CREATE OR REPLACE FUNCTION pgtrickle.relay_config_notify()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+SECURITY DEFINER
+AS $$
+BEGIN
+    PERFORM pg_notify(
+        'pgtrickle_relay_config',
+        json_build_object(
+            'direction', TG_TABLE_NAME,
+            'event',     TG_OP,
+            'name',      COALESCE(NEW.name, OLD.name),
+            'enabled',   COALESCE(NEW.enabled, OLD.enabled)
+        )::text
+    );
+    RETURN NULL;
+END;
+$$;
+
+DROP TRIGGER IF EXISTS relay_outbox_config_notify ON pgtrickle.relay_outbox_config;
+CREATE TRIGGER relay_outbox_config_notify
+    AFTER INSERT OR UPDATE OR DELETE ON pgtrickle.relay_outbox_config
+    FOR EACH ROW EXECUTE FUNCTION pgtrickle.relay_config_notify();
+
+DROP TRIGGER IF EXISTS relay_inbox_config_notify ON pgtrickle.relay_inbox_config;
+CREATE TRIGGER relay_inbox_config_notify
+    AFTER INSERT OR UPDATE OR DELETE ON pgtrickle.relay_inbox_config
+    FOR EACH ROW EXECUTE FUNCTION pgtrickle.relay_config_notify();
+
+-- RELAY-CAT (v0.29.0): set_relay_outbox — upsert a forward pipeline.
+CREATE OR REPLACE FUNCTION pgtrickle.set_relay_outbox(
+    p_name            TEXT,
+    p_outbox          TEXT,
+    p_group           TEXT,
+    p_sink            JSONB,
+    p_retention_hours INT     DEFAULT 24,
+    p_enabled         BOOLEAN DEFAULT true
+) RETURNS void
+LANGUAGE plpgsql
+SECURITY DEFINER
+AS $$
+DECLARE
+    v_sink_type TEXT;
+    v_config    JSONB;
+BEGIN
+    v_sink_type := p_sink ->> 'type';
+    IF v_sink_type IS NULL OR v_sink_type = '' THEN
+        RAISE EXCEPTION 'relay.invalid_config: sink JSONB must contain a "type" key. Got: %', p_sink
+            USING ERRCODE = 'raise_exception';
+    END IF;
+    IF p_outbox IS NULL OR p_outbox = '' THEN
+        RAISE EXCEPTION 'relay.invalid_config: outbox name must not be empty'
+            USING ERRCODE = 'raise_exception';
+    END IF;
+    v_config := jsonb_build_object(
+        'source_type', 'outbox',
+        'source',      jsonb_build_object('outbox', p_outbox, 'group', p_group, 'retention_hours', p_retention_hours),
+        'sink_type',   v_sink_type,
+        'sink',        p_sink
+    );
+    INSERT INTO pgtrickle.relay_outbox_config (name, enabled, config)
+    VALUES (p_name, p_enabled, v_config)
+    ON CONFLICT (name) DO UPDATE SET enabled = EXCLUDED.enabled, config = EXCLUDED.config;
+END;
+$$;
+
+-- RELAY-CAT (v0.29.0): set_relay_inbox — upsert a reverse pipeline.
+CREATE OR REPLACE FUNCTION pgtrickle.set_relay_inbox(
+    p_name             TEXT,
+    p_inbox            TEXT,
+    p_source           JSONB,
+    p_max_retries      INT     DEFAULT 3,
+    p_schedule         TEXT    DEFAULT '1s',
+    p_with_dead_letter BOOLEAN DEFAULT true,
+    p_retention_hours  INT     DEFAULT 24,
+    p_enabled          BOOLEAN DEFAULT true
+) RETURNS void
+LANGUAGE plpgsql
+SECURITY DEFINER
+AS $$
+DECLARE
+    v_source_type TEXT;
+    v_config      JSONB;
+BEGIN
+    v_source_type := p_source ->> 'type';
+    IF v_source_type IS NULL OR v_source_type = '' THEN
+        RAISE EXCEPTION 'relay.invalid_config: source JSONB must contain a "type" key. Got: %', p_source
+            USING ERRCODE = 'raise_exception';
+    END IF;
+    IF p_inbox IS NULL OR p_inbox = '' THEN
+        RAISE EXCEPTION 'relay.invalid_config: inbox name must not be empty'
+            USING ERRCODE = 'raise_exception';
+    END IF;
+    v_config := jsonb_build_object(
+        'source_type', v_source_type,
+        'source',      p_source,
+        'sink_type',   'pg-inbox',
+        'sink',        jsonb_build_object('inbox', p_inbox, 'max_retries', p_max_retries,
+                           'schedule', p_schedule, 'with_dead_letter', p_with_dead_letter,
+                           'retention_hours', p_retention_hours)
+    );
+    INSERT INTO pgtrickle.relay_inbox_config (name, enabled, config)
+    VALUES (p_name, p_enabled, v_config)
+    ON CONFLICT (name) DO UPDATE SET enabled = EXCLUDED.enabled, config = EXCLUDED.config;
+END;
+$$;
+
+-- RELAY-CAT (v0.29.0): enable_relay — enable a named pipeline.
+CREATE OR REPLACE FUNCTION pgtrickle.enable_relay(p_name TEXT) RETURNS void
+LANGUAGE plpgsql SECURITY DEFINER AS $$
+DECLARE v_o INT; v_i INT;
+BEGIN
+    UPDATE pgtrickle.relay_outbox_config SET enabled = true WHERE name = p_name;
+    GET DIAGNOSTICS v_o = ROW_COUNT;
+    UPDATE pgtrickle.relay_inbox_config  SET enabled = true WHERE name = p_name;
+    GET DIAGNOSTICS v_i = ROW_COUNT;
+    IF v_o + v_i = 0 THEN
+        RAISE EXCEPTION 'relay: pipeline "%" not found', p_name USING ERRCODE = 'no_data_found';
+    END IF;
+END;
+$$;
+
+-- RELAY-CAT (v0.29.0): disable_relay — disable a named pipeline.
+CREATE OR REPLACE FUNCTION pgtrickle.disable_relay(p_name TEXT) RETURNS void
+LANGUAGE plpgsql SECURITY DEFINER AS $$
+DECLARE v_o INT; v_i INT;
+BEGIN
+    UPDATE pgtrickle.relay_outbox_config SET enabled = false WHERE name = p_name;
+    GET DIAGNOSTICS v_o = ROW_COUNT;
+    UPDATE pgtrickle.relay_inbox_config  SET enabled = false WHERE name = p_name;
+    GET DIAGNOSTICS v_i = ROW_COUNT;
+    IF v_o + v_i = 0 THEN
+        RAISE EXCEPTION 'relay: pipeline "%" not found', p_name USING ERRCODE = 'no_data_found';
+    END IF;
+END;
+$$;
+
+-- RELAY-CAT (v0.29.0): delete_relay — delete a named pipeline.
+CREATE OR REPLACE FUNCTION pgtrickle.delete_relay(p_name TEXT) RETURNS void
+LANGUAGE plpgsql SECURITY DEFINER AS $$
+DECLARE v_o INT; v_i INT;
+BEGIN
+    DELETE FROM pgtrickle.relay_outbox_config WHERE name = p_name;
+    GET DIAGNOSTICS v_o = ROW_COUNT;
+    DELETE FROM pgtrickle.relay_inbox_config  WHERE name = p_name;
+    GET DIAGNOSTICS v_i = ROW_COUNT;
+    IF v_o + v_i = 0 THEN
+        RAISE EXCEPTION 'relay: pipeline "%" not found', p_name USING ERRCODE = 'no_data_found';
+    END IF;
+END;
+$$;
+
+-- RELAY-CAT (v0.29.0): get_relay_config — fetch config for a single pipeline.
+CREATE OR REPLACE FUNCTION pgtrickle.get_relay_config(p_name TEXT)
+RETURNS TABLE (name TEXT, direction TEXT, enabled BOOLEAN, config JSONB)
+LANGUAGE plpgsql SECURITY DEFINER AS $$
+BEGIN
+    RETURN QUERY
+        SELECT r.name, 'forward'::TEXT, r.enabled, r.config
+          FROM pgtrickle.relay_outbox_config r WHERE r.name = p_name
+        UNION ALL
+        SELECT r.name, 'reverse'::TEXT, r.enabled, r.config
+          FROM pgtrickle.relay_inbox_config  r WHERE r.name = p_name;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'relay: pipeline "%" not found', p_name USING ERRCODE = 'no_data_found';
+    END IF;
+END;
+$$;
+
+-- RELAY-CAT (v0.29.0): list_relay_configs — list all pipelines.
+CREATE OR REPLACE FUNCTION pgtrickle.list_relay_configs()
+RETURNS TABLE (name TEXT, direction TEXT, enabled BOOLEAN, config JSONB)
+LANGUAGE plpgsql SECURITY DEFINER AS $$
+BEGIN
+    RETURN QUERY
+        SELECT r.name, 'forward'::TEXT, r.enabled, r.config
+          FROM pgtrickle.relay_outbox_config r
+        UNION ALL
+        SELECT r.name, 'reverse'::TEXT, r.enabled, r.config
+          FROM pgtrickle.relay_inbox_config  r
+        ORDER BY name;
+END;
+$$;
+
+-- Create the relay role if it does not exist.
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'pgtrickle_relay') THEN
+        CREATE ROLE pgtrickle_relay NOLOGIN;
+    END IF;
+END;
+$$;
+"#,
+    name = "pg_trickle_relay_catalog",
+    requires = ["pg_trickle_outbox_inbox_catalog"],
+);
+
 // ── Launcher notification (must be last) ──────────────────────────────
 //
 // Signal the launcher background worker to re-probe this database.

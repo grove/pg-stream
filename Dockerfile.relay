@@ -1,0 +1,45 @@
+# syntax=docker/dockerfile:1
+# Dockerfile.relay — multi-stage build for pgtrickle-relay binary
+# Result: minimal distroless image (~30 MB) with the relay binary only.
+
+# ─── Stage 1: Build ────────────────────────────────────────────────────────────
+FROM rust:1.79-slim-bookworm AS builder
+
+WORKDIR /build
+
+# Install build-time system dependencies (openssl for reqwest, cmake for rdkafka)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    pkg-config \
+    libssl-dev \
+    cmake \
+    make \
+    g++ \
+    && rm -rf /var/lib/apt/lists/*
+
+# Cache Cargo registry and build dependencies before copying source.
+COPY Cargo.toml Cargo.lock ./
+COPY pgtrickle-relay/Cargo.toml ./pgtrickle-relay/Cargo.toml
+COPY pgtrickle-tui/Cargo.toml ./pgtrickle-tui/Cargo.toml
+
+# Create dummy workspace member sources so Cargo can resolve dependencies.
+RUN mkdir -p src pgtrickle-relay/src pgtrickle-tui/src && \
+    echo "fn main() {}" > src/main.rs && \
+    echo "" > src/lib.rs && \
+    echo "fn main() {}" > pgtrickle-relay/src/main.rs && \
+    echo "fn main() {}" > pgtrickle-tui/src/main.rs
+
+# Pre-fetch and compile dependencies (cached layer).
+RUN cargo build -p pgtrickle-relay --release --features "nats,webhook,stdout" 2>/dev/null || true
+
+# Now copy the real source and build for real.
+COPY pgtrickle-relay/src ./pgtrickle-relay/src
+RUN cargo build -p pgtrickle-relay --release --features "nats,webhook,stdout"
+
+# ─── Stage 2: Runtime ──────────────────────────────────────────────────────────
+FROM gcr.io/distroless/cc-debian12:nonroot
+
+COPY --from=builder /build/target/release/pgtrickle-relay /usr/local/bin/pgtrickle-relay
+
+EXPOSE 9090
+
+ENTRYPOINT ["/usr/local/bin/pgtrickle-relay"]

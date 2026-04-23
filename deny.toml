@@ -40,6 +40,13 @@ ignore = [
   # ureq (dev / test path). We do not parse CRLs; unaffected in practice.
   # Will be resolved when upstream updates to rustls-webpki >=0.103.13.
   "RUSTSEC-2026-0104",
+  # rustls-webpki 0.101.7 name-constraint bugs. Pulled in via aws-smithy-http-client
+  # 1.1.12 (transitive dep of the optional `sqs` feature in pgtrickle-relay).
+  # Not reachable in the relay's use of SQS (no TLS cert validation in the relay
+  # code path uses these name-constraint APIs). Will be resolved when the AWS SDK
+  # migrates to rustls 0.23.x (aws-smithy-http-client >=1.2.0).
+  "RUSTSEC-2026-0098",
+  "RUSTSEC-2026-0099",
 ]
 
 [bans]

@@ -8,6 +8,7 @@ For future plans and upcoming features, see [ROADMAP.md](ROADMAP.md).
 
 <!-- TOC start -->
 - [Unreleased](#unreleased)
+- [0.29.0 — Relay CLI (pgtrickle-relay)](#0290--relay-cli-pgtrickle-relay)
 - [0.28.0 — Transactional Inbox & Outbox Patterns](#0280--transactional-inbox--outbox-patterns)
 - [0.27.0 — Operability, Observability & DR](#0270--operability-observability--dr)
 - [0.26.0 — Test & Concurrency Hardening](#0260--test--concurrency-hardening)
@@ -47,6 +48,55 @@ For future plans and upcoming features, see [ROADMAP.md](ROADMAP.md).
 ---
 
 ## [Unreleased]
+
+---
+
+## [0.29.0] — Relay CLI (pgtrickle-relay)
+
+### Highlights
+
+- **`pgtrickle-relay` CLI binary**: Standalone Rust binary added as a Cargo workspace
+  member. Bridges pg-trickle outbox and inbox tables with external messaging systems
+  in both forward and reverse directions.
+- **Forward mode**: Polls pg-trickle outbox tables and publishes deltas to external
+  sinks (NATS JetStream, Kafka, HTTP webhooks, Redis Streams, SQS, RabbitMQ, stdout).
+- **Reverse mode**: Consumes messages from external sources and writes them into
+  pg-trickle inbox tables, enabling bidirectional event-driven pipelines.
+- **Relay catalog schema**: New SQL tables `pgtrickle.relay_outbox_config` and
+  `pgtrickle.relay_inbox_config` with a full SQL API (`set_relay_outbox`,
+  `set_relay_inbox`, `enable_relay`, `disable_relay`, `delete_relay`,
+  `get_relay_config`, `list_relay_configs`). Configuration is SQL-only — no YAML.
+- **8 backend feature flags**: `nats`, `webhook`, `kafka`, `redis`, `sqs`,
+  `rabbitmq`, `pg-inbox`, `stdout`. Default build includes `nats`, `webhook`,
+  `stdout`.
+- **Built-in observability**: Prometheus metrics (`/metrics`) and health check
+  (`/health`) served from an axum HTTP server (`:9090` by default).
+- **Advisory lock coordination**: Multiple relay instances distribute pipelines via
+  PostgreSQL advisory locks — no external coordination service required.
+- **Hot-reload**: Config changes are applied without restart via `LISTEN/NOTIFY`
+  on the `pgtrickle_relay_config` channel.
+- **Idempotent delivery**: Every backend uses source-specific dedup keys
+  (`Nats-Msg-Id`, `Idempotency-Key`, Kafka record key, XADD stream ID, SQS
+  MessageDeduplicationId, RabbitMQ message-id property).
+
+### What's Changed
+
+- New crate `pgtrickle-relay` added to workspace (`pgtrickle-relay/`).
+- New SQL migration `sql/pg_trickle--0.28.0--0.29.0.sql` with relay catalog tables,
+  trigger function `relay_config_notify()`, and all 7 SQL API functions.
+- `pgtrickle_relay` role created with `EXECUTE` on the SQL API functions only
+  (direct table access revoked).
+
+### Upgrade Notes
+
+Apply the upgrade script on your PostgreSQL instance:
+
+```sql
+ALTER EXTENSION pg_trickle UPDATE TO '0.29.0';
+```
+
+The relay binary is distributed separately (see `Dockerfile.relay`). No changes
+to existing stream tables, views, or outbox/inbox APIs.
 
 ---
 

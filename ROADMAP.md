@@ -107,7 +107,7 @@ from the v0.1.x series to 1.0 and beyond.
 | v0.26.0 | Test & concurrency hardening | ✅ Released |
 | v0.27.0 | Operability, observability & DR — snapshot/PITR, schedule planner, cluster metrics | ✅ Released |
 | v0.28.0 | Transactional inbox & outbox patterns | ✅ Released |
-| v0.29.0 | Relay CLI (`pgtrickle-relay`) | Planned |
+| v0.29.0 | Relay CLI (`pgtrickle-relay`) | ✅ Released |
 | v0.30.0 | Pre-GA correctness & stability sprint — EC-01 fix, snapshot atomicity, SQLSTATE classifier, caches | Planned |
 | v0.31.0 | Performance & scheduler intelligence — adaptive batching, plan-aware routing, L0 dshash cache | Planned |
 | v0.32.0 | Reactive subscriptions & zero-downtime operations — subscribe() API, shadow-ST ALTER QUERY | Planned |
@@ -7523,7 +7523,7 @@ it is tested against. Add a compatibility matrix row (e.g.
 
 ## v0.29.0 — Relay CLI (`pgtrickle-relay`)
 
-**Status: Planned.** See [plans/relay/PLAN_RELAY_CLI.md](plans/relay/PLAN_RELAY_CLI.md) for the full design.
+**Status: ✅ Released.** See [plans/relay/PLAN_RELAY_CLI.md](plans/relay/PLAN_RELAY_CLI.md) for the full design.
 
 > **Release Theme**
 > This release ships `pgtrickle-relay` — a standalone bidirectional Rust CLI
