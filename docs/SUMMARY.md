@@ -17,6 +17,10 @@
 - [Installation](installation.md)
 - [Upgrading](UPGRADING.md)
 - [Backup and Restore](BACKUP_AND_RESTORE.md)
+- [Transactional Outbox](OUTBOX.md)
+- [Transactional Inbox](INBOX.md)
+- [Relay Service](RELAY_GUIDE.md)
+- [Relay Architecture & Operations](RELAY.md)
 - [TUI Tool](TUI.md)
 - [Contributing](contributing.md)
 
