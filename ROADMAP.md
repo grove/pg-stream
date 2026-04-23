@@ -6539,6 +6539,9 @@ Phase 1–5 DVM code changes and the TPC-H scaling investigation. Items marked
 
 **Status: ✅ Released.** Sourced from [PLAN_OVERALL_ASSESSMENT_2.md](plans/PLAN_OVERALL_ASSESSMENT_2.md) §4, §5, §7.
 
+<details>
+<summary>Completed items (click to expand)</summary>
+
 > **Release Theme**
 > This release pushes the comfortable operating point from "hundreds" to
 > **thousands** of stream tables on commodity hardware. The scheduler stops
@@ -6615,11 +6618,16 @@ Phase 1–5 DVM code changes and the TPC-H scaling investigation. Items marked
 - [x] Extension upgrade path tested (`0.24.0 → 0.25.0`)
 - [x] `just check-version-sync` passes
 
+</details>
+
 ---
 
 ## v0.26.0 — Test & Concurrency Hardening
 
 **Status: Shipped.** Sourced from [PLAN_OVERALL_ASSESSMENT_2.md](plans/PLAN_OVERALL_ASSESSMENT_2.md) §4, §6, §9.
+
+<details>
+<summary>Completed items (click to expand)</summary>
 
 > **Release Theme**
 > This release closes the **test coverage and concurrency gaps** identified
@@ -6715,11 +6723,16 @@ Phase 1–5 DVM code changes and the TPC-H scaling investigation. Items marked
 - [x] Extension upgrade path tested (`0.25.0 → 0.26.0`)
 - [x] `just check-version-sync` passes
 
+</details>
+
 ---
 
 ## v0.27.0 — Operability, Observability & DR
 
 **Status: Planned.** Sourced from [PLAN_OVERALL_ASSESSMENT_2.md](plans/PLAN_OVERALL_ASSESSMENT_2.md) §4, §7, §9 — the remaining actionable items not addressed in v0.24.0–v0.26.0.
+
+<details>
+<summary>Completed items (click to expand)</summary>
 
 > **Release Theme**
 > This release closes the final pre-1.0 operability gaps identified in the
@@ -6850,6 +6863,8 @@ Phase 1–5 DVM code changes and the TPC-H scaling investigation. Items marked
 - [x] DEP-2: `just test-all` passes under pgrx 0.18.0; `AGENTS.md` pgrx version reference updated
 - [x] Extension upgrade path tested (`0.26.0 → 0.27.0`)
 - [x] `just check-version-sync` passes
+
+</details>
 
 ---
 
@@ -7269,6 +7284,9 @@ it is tested against. Add a compatibility matrix row (e.g.
 
 **Status: Released.** Driven by [PLAN_TRANSACTIONAL_OUTBOX_HELPER.md](plans/patterns/PLAN_TRANSACTIONAL_OUTBOX_HELPER.md) and [PLAN_TRANSACTIONAL_INBOX_HELPER.md](plans/patterns/PLAN_TRANSACTIONAL_INBOX_HELPER.md). Outbox helper moved here from v0.22.0 to ship alongside the inbox helper and production-grade advanced features as a complete transactional messaging solution.
 
+<details>
+<summary>Completed items (click to expand)</summary>
+
 > **Release Theme**
 > This release delivers a **complete, production-grade solution** for the two
 > most common event-driven integration patterns in microservice architectures.
@@ -7495,6 +7513,8 @@ it is tested against. Add a compatibility matrix row (e.g.
 - [x] SHARED-B4: dbt adapter updated with consumer group and inbox ordering properties
 - [x] Extension upgrade path tested (`0.27.0 → 0.28.0`) — `sql/pg_trickle--0.27.0--0.28.0.sql` validated by `scripts/check_upgrade_completeness.sh`
 - [x] `just check-version-sync` passes
+
+</details>
 
 ---
 
