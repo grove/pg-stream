@@ -39,6 +39,32 @@ RETURNS TABLE (
     LANGUAGE c STRICT
 AS 'MODULE_PATHNAME', 'worker_allocation_status_fn_wrapper';
 
+-- MON-1: Register self-monitoring functions.
+-- setup_self_monitoring() — installs the self-monitoring background worker.
+CREATE OR REPLACE FUNCTION pgtrickle."setup_self_monitoring"() RETURNS void
+    STRICT
+    LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'setup_self_monitoring_wrapper';
+
+-- teardown_self_monitoring() — uninstalls the self-monitoring background worker.
+CREATE OR REPLACE FUNCTION pgtrickle."teardown_self_monitoring"() RETURNS void
+    STRICT
+    LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'teardown_self_monitoring_wrapper';
+
+-- self_monitoring_status() — returns per-stream monitoring status.
+CREATE OR REPLACE FUNCTION pgtrickle."self_monitoring_status"() RETURNS TABLE (
+    "st_name"        TEXT,
+    "exists"         bool,
+    "status"         TEXT,
+    "refresh_mode"   TEXT,
+    "last_refresh_at" TEXT,
+    "total_refreshes" bigint
+)
+    STRICT
+    LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'self_monitoring_status_wrapper';
+
 -- Record the schema version for the upgrade chain.
 INSERT INTO pgtrickle.pgt_schema_version (version, description)
 VALUES ('0.25.0', 'Scheduler Scalability & Pooler Performance')
