@@ -3,6 +3,9 @@
 > **Audience:** Product managers, stakeholders, and technically curious readers
 > who want to understand what each release delivers and why it matters —
 > without needing to read Rust code or SQL specifications.
+>
+> For the full technical roadmap with exit criteria and implementation phases,
+> see [ROADMAP.md](../ROADMAP.md).
 
 ## Versions
 
@@ -41,5 +44,5 @@ engine underneath remains stable.
 
 ---
 
-For the full technical roadmap with exit criteria and implementation phases,
-see [ROADMAP.md](../ROADMAP.md).
+*For the full technical roadmap with exit criteria and implementation phases,
+see [ROADMAP.md](../ROADMAP.md).*

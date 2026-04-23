@@ -10,6 +10,9 @@ MATERIALIZED VIEW` recomputation), how the differential dataflow approach
 solves it, the hybrid trigger→WAL CDC architecture, and the broad SQL
 coverage, all in plain language.
 
+For plain-language feature descriptions aimed at a non-technical audience,
+see [roadmap/README.md](roadmap/README.md).
+
 ## Table of Contents
 
 <!-- TOC start -->
