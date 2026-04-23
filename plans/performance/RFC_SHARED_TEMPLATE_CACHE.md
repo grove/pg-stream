@@ -4,7 +4,7 @@
 **Author:** pg_trickle team  
 **Date:** 2025-07-15  
 **Target:** v0.16.0  
-**Ref:** REPORT_OVERALL_STATUS.md §14 · PLAN_0_15_0.md Phase 7
+**Ref:** REPORT_OVERALL_STATUS.md §14
 
 ---
 

@@ -395,7 +395,6 @@ show 0 heap fetches). This is a one-hour validation task at the start of A1-3.
 ## References
 
 - [PLAN_NEW_STUFF.md §A-1](plans/performance/PLAN_NEW_STUFF.md) — Original feature proposal
-- [PLAN_0_11_0.md](plans/PLAN_0_11_0.md) — Sprint plan
 - PostgreSQL documentation: [Table Partitioning](https://www.postgresql.org/docs/18/ddl-partitioning.html)
 - PostgreSQL documentation: [MERGE](https://www.postgresql.org/docs/18/sql-merge.html)
 - TimescaleDB hypertable implementation: chunk-scoped operations prior art

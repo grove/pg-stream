@@ -81,9 +81,10 @@ make 1000-ST deployments routine.
   [docs/DVM_OPERATORS.md](../docs/DVM_OPERATORS.md),
   [docs/DVM_REWRITE_RULES.md](../docs/DVM_REWRITE_RULES.md)
 - 134 integration test files in [tests/](../tests/)
-- Plan documents under [plans/](.) including
-  [PLAN_0_21_0.md](PLAN_0_21_0.md), [PLAN_0_22_0.md](PLAN_0_22_0.md),
-  [PLAN_0_23_0.md](PLAN_0_23_0.md)
+- Plan documents under [plans/](.) and version implementation details in
+  [roadmap/v0.21.0.md-full.md](../roadmap/v0.21.0.md-full.md),
+  [roadmap/v0.22.0.md-full.md](../roadmap/v0.22.0.md-full.md),
+  [roadmap/v0.23.0.md-full.md](../roadmap/v0.23.0.md-full.md)
 
 **Out of scope**
 

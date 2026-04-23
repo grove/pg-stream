@@ -56,79 +56,93 @@ git branch --show-current
 Determine:
 - **Target version** (from the argument or user's message)
 - **Current version** (from `pg_trickle.control`)
-- **Plan file path**: `plans/PLAN_0_<VER_WITH_UNDERSCORES>.md`
-  - Example: v0.20.0 → `plans/PLAN_0_20_0.md`
+- **Full details file**: `roadmap/v<VERSION>.md-full.md`
+  - Example: v0.34.0 → `roadmap/v0.34.0.md-full.md`
 - **Branch**: if on `main`, a new branch must be created before making any
   changes: `git checkout -b <version>-implementation`
 
 ---
 
-### Step 1a — Parse the Plan File
+### Step 1a — Parse the Full Details File
 
-Read `plans/PLAN_0_<version>.md` and extract:
+Read `roadmap/v<VERSION>.md-full.md` and extract:
 
 1. **All item IDs and titles** (e.g. `DOG-1`, `PG17-3`)
 2. **Current status** of each item in the Implementation Status table
    (⬜ Not started / 🔄 In progress / ✅ Done / ⏭ Skipped)
 3. **Phase groupings** — respect the recommended implementation order
-4. **Exit criteria** — the checklist at the bottom of the plan file
+4. **Exit criteria** — the checklist at the bottom of the full details file
 5. **Items already done** — skip these, but record them for the completion
    report
 
 ---
 
-### Step 1b — Create the Plan File if Missing
+### Step 1b — Create the Full Details File if Missing
 
-If `plans/PLAN_0_<version>.md` does not exist:
+If `roadmap/v<VERSION>.md-full.md` does not exist:
 
 1. Read the roadmap section for the target version from `ROADMAP.md`.
-2. Create a plan file using this skeleton:
+2. Create `roadmap/v<VERSION>.md-full.md` using this skeleton:
 
 ```markdown
-# PLAN_0_<VERSION>.md — v<VERSION> Implementation Order
+> **Plain-language companion:** [v<VERSION>.md](v<VERSION>.md)
 
-**Milestone:** v<VERSION> — <Theme from ROADMAP>
-**Status:** 🚧 In progress
-**Last updated:** <today's date>
+## v<VERSION> — <Theme from ROADMAP>
 
-This document defines the recommended implementation order for all v<VERSION>
-roadmap items. See [ROADMAP.md §v<VERSION>](../ROADMAP.md#v<anchor>) for the
-full feature descriptions and effort estimates.
+**Status: Planned.** Derived from [ROADMAP.md](../ROADMAP.md).
 
----
-
-## Milestone Goals
-
-<bullet list from roadmap section>
+> **Release Theme**
+> <one-paragraph summary>
 
 ---
 
-## Recommended Implementation Order
+### Correctness
+
+| ID | Title | Effort | Priority |
+|----|-------|--------|----------|
+<rows>
+
+### Ease of Use
+
+| ID | Title | Effort | Priority |
+|----|-------|--------|----------|
+<rows>
+
+### Test Coverage
+
+| ID | Title | Effort | Priority |
+|----|-------|--------|----------|
+<rows>
+
+---
+
+### Recommended Implementation Order
 
 <phases derived from roadmap items, ordered by dependency>
 
 ---
 
-## Implementation Status
+### Implementation Status
 
-| ID | Feature | Status |
-|----|---------|--------|
+| ID | Title | Status |
+|----|-------|--------|
 <one row per item, all "⬜ Not started" initially>
 
 ---
 
-## Release Exit Criteria
+### Exit Criteria
 
-- [ ] All items marked ✅ Done
-- [ ] `just test-all` passes with zero failures
+- [ ] All P0 items ✅ Done
+- [ ] `just test-all` passes
 - [ ] `just check-version-sync` exits 0
-- [ ] CHANGELOG.md `## [<VERSION>]` entry written
-- [ ] ROADMAP.md v<VERSION> section marked ✅ Released
+- [ ] CHANGELOG.md entry written
+- [ ] ROADMAP.md v<VERSION> row marked ✅ Released
 ```
 
-3. After creating the file, add it to git staging:
+3. Also create the plain-language companion `roadmap/v<VERSION>.md` if missing.
+4. Add both files to git staging:
    ```bash
-   git add plans/PLAN_0_<version>.md
+   git add roadmap/v<VERSION>.md roadmap/v<VERSION>.md-full.md
    ```
 
 ---
@@ -137,9 +151,9 @@ full feature descriptions and effort estimates.
 
 Construct an ordered list of items to implement:
 
-1. Take all items from the plan file in phase order.
+1. Take all items from the full details file in phase order.
 2. **Skip** items already marked ✅ Done or ⏭ Skipped.
-3. Mark the first actionable item as `🔄 In progress` in the plan file.
+3. Mark the first actionable item as `🔄 In progress` in the full details file.
 4. Use `manage_todo_list` to track all items, using the item ID as the todo ID.
 
 If no items remain (all ✅ / ⏭), jump directly to [Step 6 — Completion
@@ -208,10 +222,10 @@ these for phase boundaries (see Step 3e).
 
 Immediately after each item is implemented and lint passes:
 
-1. Update the item's row in the plan file's Implementation Status table:
+1. Update the item's row in the full details file's Implementation Status table:
    `⬜ Not started` → `✅ Done`
 2. If the item was in-progress (`🔄`), also update that row.
-3. Update the **Last updated** date at the top of the plan file.
+3. Update the **Status** line at the top of the full details file.
 
 ```markdown
 <!-- Example update in Implementation Status table -->
@@ -247,7 +261,7 @@ If an item cannot be implemented because:
 - **Compilation or test failure that is not fixable within the item scope**:
   pause and ask the user for guidance before continuing.
 
-Never silently skip items without recording the skip reason in the plan file.
+Never silently skip items without recording the skip reason in the full details file.
 
 ---
 
@@ -297,7 +311,7 @@ After the implementation loop finishes, output a structured report:
 - Create PR using the `create-pull-request` skill
 ```
 
-If all exit criteria in the plan file's checklist are met, add:
+If all exit criteria in the full details file's checklist are met, add:
 
 > **Release-ready.** All exit criteria satisfied. Ready for `create-pull-request`.
 
