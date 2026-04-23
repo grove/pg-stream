@@ -136,26 +136,84 @@ per source kind, registered on `shared_preload_libraries =
 'pg_trickle'` startup, gated by `pg_trickle.enabled` and per-source
 GUCs.
 
+### 2.4  Long-tail sources via Debezium + relay
+
+For source databases we do **not** ship a native poller for — Oracle,
+Db2, MongoDB, Cassandra, Vitess, Spanner, Yugabyte, Informix — the
+official answer is "run Debezium Server externally, point it at the
+relay, set `wire_format = debezium`."
+
+Concretely:
+
+```
+Oracle / Db2 / Mongo / …
+        │
+        ▼
+Debezium Server (external, user-operated)
+        │  (Kafka / NATS / Redis Streams / RabbitMQ / HTTP)
+        ▼
+pgtrickle-relay (reverse pipeline, wire_format = debezium)
+        │
+        ▼
+inbox table on the appliance ──▶ stream table treats inbox as source
+```
+
+The decoder lives in [pgtrickle-relay](../../pgtrickle-relay) and is
+specified in [../relay/PLAN_RELAY_WIRE_FORMATS.md](../relay/PLAN_RELAY_WIRE_FORMATS.md),
+which treats Debezium support as **bidirectional** — the same
+plan also covers emitting Debezium-shaped messages on the destination
+side, see §3.
+
+**Crucially, no JVM enters the appliance** — Debezium Server runs in
+the user's existing infrastructure, the relay stays pure Rust, and
+the appliance still only sees PG inbox rows.
+
+This is the escape hatch that turns "we support 5 sources natively"
+into "we support 5 sources natively + everything Debezium covers."
+It does not absolve us of building the native pollers — latency,
+operational simplicity, and the no-broker story still favour native
+where we have it — but it gives users a credible answer for the long
+tail without years of connector engineering on our side.
+
 ---
 
-## 3  How Destinations Plug In: FDW Writes
+## 3  How Destinations Plug In: FDW Writes or Debezium Emit
 
-The destination is the mirror image and uses **only the FDW write
-path**. No CDC, no bgworker — pg_trickle's existing merge codegen
-([src/refresh/merge.rs](../../src/refresh/merge.rs)) emits an `INSERT
-… ON CONFLICT DO UPDATE` (or a `MERGE`) at the end of each refresh
-cycle. If the target table is a foreign table, that DML is shipped to
-the remote source by the FDW.
+There are two destination paths, picked per stream table:
 
-| Destination                  | Writer path                                       |
-|------------------------------|---------------------------------------------------|
-| Same PG appliance (default)  | Local table, no FDW needed                        |
-| Source PG itself             | Foreign table via `postgres_fdw`, `INSERT … ON CONFLICT` |
-| Other PG (e.g. serving tier) | Same                                              |
-| MySQL / MariaDB              | Foreign table via `mysql_fdw` (FDW translates)    |
-| MSSQL                        | Foreign table via `tds_fdw`, `MERGE` translation  |
-| Snowflake / BigQuery         | Foreign table via warehouse FDW, batched MERGE    |
-| Iceberg / Kafka              | Out of scope (FDW model does not fit)             |
+1. **FDW write path** — the appliance writes maintained results
+   directly to a local or foreign table via
+   [src/refresh/merge.rs](../../src/refresh/merge.rs)'s `INSERT … ON
+   CONFLICT DO UPDATE` (or `MERGE`). Used when the destination is a
+   database the FDW catalogue covers.
+2. **Debezium emit path** — the appliance writes maintained results
+   into an **outbox table**; the relay encodes them as Debezium
+   messages and pushes them onto Kafka / NATS / Redis Streams /
+   RabbitMQ / HTTP. Used when the destination is a tool that already
+   speaks the Debezium envelope.
+
+| Destination                                            | Writer path                                       |
+|--------------------------------------------------------|---------------------------------------------------|
+| Same PG appliance (default)                            | Local table, no FDW needed                        |
+| Source PG itself                                       | Foreign table via `postgres_fdw`, `INSERT … ON CONFLICT` |
+| Other PG (e.g. serving tier)                           | Same                                              |
+| MySQL / MariaDB                                        | Foreign table via `mysql_fdw` (FDW translates)    |
+| MSSQL                                                  | Foreign table via `tds_fdw`, `MERGE` translation  |
+| Snowflake / BigQuery                                   | Foreign table via warehouse FDW, batched MERGE    |
+| Apache Iceberg                                         | Outbox → relay → Debezium → Kafka → Iceberg sink connector |
+| Apache Hudi / Delta                                    | Outbox → relay → Debezium → Kafka → lakehouse sink |
+| ClickHouse / Apache Pinot / Apache Doris / StarRocks   | Outbox → relay → Debezium → Kafka → OLAP-engine sink |
+| Apache Druid                                           | Outbox → relay → Debezium → Kafka → indexing service |
+| Materialize / Flink CDC / ksqlDB                       | Outbox → relay → Debezium → Kafka, consumed as a CDC source |
+| Snowflake (via Kafka Connector instead of FDW)         | Outbox → relay → Debezium → Kafka → Snowflake Kafka Connector |
+| Anything else that consumes the Debezium envelope      | Outbox → relay → Debezium → transport of choice    |
+
+The Debezium-emit path means we do **not** ship Iceberg / Hudi /
+ClickHouse / Pinot / Doris writers ourselves — the relay emits a
+format the existing connector ecosystem already consumes, and the
+destination is reached through tools the user likely already operates.
+This quietly reopens the lakehouse / OLAP destination story without
+forcing us to write per-destination writers.
 
 ### 3.1  Worked example
 
@@ -476,9 +534,13 @@ concrete tickets and ADRs.
 | 0.47    | BigQuery                           | CHANGES TVF poller, BQ FDW integration, bytes-scanned budgets |
 | 0.48    | DAG split across appliances        | Documented multi-appliance pattern, intermediate-table contract, integration tests |
 
-Lakehouse and Kafka outputs are deferred indefinitely — they don't fit
-the FDW model and would require a custom output-plugin path, which
-belongs in a separate plan.
+Lakehouse, OLAP-engine, and Kafka destinations are reached through
+the **Debezium emit path** (relay 0.31+, see
+[../relay/PLAN_RELAY_WIRE_FORMATS.md](../relay/PLAN_RELAY_WIRE_FORMATS.md))
+rather than via custom output plugins. The appliance writes to a
+local outbox table; the relay encodes Debezium messages and ships
+them onto the user's transport of choice. No new code path inside
+the extension.
 
 ---
 
@@ -647,10 +709,11 @@ Recommendation, prioritised:
    value is workload-specific.
 6. **Treat 0.45 (Citus) as opportunistic.** The PLAN_CITUS work is
    independent; do not architect around it.
-7. **Kill lakehouse/Kafka from this plan.** They do not fit the FDW
-   model. If we want them they belong in their own plan with their
-   own architecture (custom output plugin, append-only writers,
-   different operator semantics).
+7. **Lakehouse / OLAP / Kafka destinations come for free via the
+   relay's Debezium emit path** — not via custom writers in the
+   extension. The cost is in the relay, not the appliance, and is
+   covered by
+   [../relay/PLAN_RELAY_WIRE_FORMATS.md](../relay/PLAN_RELAY_WIRE_FORMATS.md).
 
 One-line verdict: **the appliance shape is right; the PG-source slice
 is a high-confidence ship; non-PG sources are the strategic prize but
