@@ -64,9 +64,10 @@ FROM build-env AS build-deps
 WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
 COPY pgtrickle-tui/Cargo.toml pgtrickle-tui/Cargo.toml
+COPY pgtrickle-relay/Cargo.toml pgtrickle-relay/Cargo.toml
 
 # Minimal stubs so cargo can resolve the dependency graph.
-RUN mkdir -p src/bin src/dvm/operators benches pgtrickle-tui/src && \
+RUN mkdir -p src/bin src/dvm/operators benches pgtrickle-tui/src pgtrickle-relay/src && \
     echo '#![allow(warnings)] fn main() {}' > src/bin/pgrx_embed.rs && \
     echo '#![allow(warnings)]' > src/lib.rs && \
     echo '' > src/dvm/mod.rs && \
@@ -75,7 +76,8 @@ RUN mkdir -p src/bin src/dvm/operators benches pgtrickle-tui/src && \
     echo 'fn main() {}' > benches/refresh_bench.rs && \
     echo 'fn main() {}' > benches/diff_operators.rs && \
     echo 'fn main() {}' > benches/scheduler_bench.rs && \
-    echo 'fn main() {}' > pgtrickle-tui/src/main.rs
+    echo 'fn main() {}' > pgtrickle-tui/src/main.rs && \
+    echo 'fn main() {}' > pgtrickle-relay/src/main.rs
 
 # Pre-fetch dependencies. Docker caches this layer independently.
 # If only src/ changes on the next build, this layer is reused.

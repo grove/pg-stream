@@ -44,8 +44,9 @@ RUN cargo pgrx init --pg18 /usr/bin/pg_config
 WORKDIR /build
 COPY Cargo.toml ./
 COPY pgtrickle-tui/Cargo.toml pgtrickle-tui/Cargo.toml
+COPY pgtrickle-relay/Cargo.toml pgtrickle-relay/Cargo.toml
 
-RUN mkdir -p src/bin src/dvm/operators benches pgtrickle-tui/src && \
+RUN mkdir -p src/bin src/dvm/operators benches pgtrickle-tui/src pgtrickle-relay/src && \
     echo '#![allow(warnings)] fn main() {}' > src/bin/pgrx_embed.rs && \
     echo '#![allow(warnings)]' > src/lib.rs && \
     echo '' > src/dvm/mod.rs && \
@@ -55,6 +56,7 @@ RUN mkdir -p src/bin src/dvm/operators benches pgtrickle-tui/src && \
     echo 'fn main() {}' > benches/diff_operators.rs && \
     echo 'fn main() {}' > benches/scheduler_bench.rs && \
     echo 'fn main() {}' > pgtrickle-tui/src/main.rs && \
+    echo 'fn main() {}' > pgtrickle-relay/src/main.rs && \
     cargo generate-lockfile && \
     cargo fetch
 
