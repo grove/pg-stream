@@ -79,6 +79,8 @@
 | [v0.31.0](roadmap/v0.31.0.md) | Smarter scheduling and faster hot paths | Planned | Medium | [Full details](roadmap/v0.31.0.md-full.md) |
 | [v0.32.0](roadmap/v0.32.0.md) | Live push notifications and safe live schema changes | Planned | Medium | [Full details](roadmap/v0.32.0.md-full.md) |
 | [v0.33.0](roadmap/v0.33.0.md) | Time-travel queries and analytic storage | Planned | Medium | [Full details](roadmap/v0.33.0.md-full.md) |
+| [v0.34.0](roadmap/v0.34.0.md) | Citus: stable object naming and per-source frontier foundation | Planned | Medium | [Full details](roadmap/v0.34.0.md-full.md) |
+| [v0.35.0](roadmap/v0.35.0.md) | Citus: world-class distributed source CDC and stream table support | Planned | Large | [Full details](roadmap/v0.35.0.md-full.md) |
 
 ### Beyond v1.0
 
@@ -115,6 +117,8 @@ v0.30    ─── Quality gate: correctness, stability, docs (required for 1.0)
     │
 v0.31–33 ─── Scheduler intelligence, push notifications, time-travel
     │
+v0.34–35 ─── Citus distributed-table support (world-class quality)
+    │
 v1.0.0   ─── Stable release, PostgreSQL 19, package registries
 ```
 
@@ -122,4 +126,7 @@ v0.1.0 through v0.27.0 build the complete core engine and harden it for
 production use. v0.28.0 and v0.29.0 deliver the event-driven integration
 story. v0.30.0 is a mandatory correctness and polish gate before 1.0.
 v0.31.0 through v0.33.0 each add a distinct new capability while the core
-IVM engine remains stable.
+IVM engine remains stable. v0.34.0 and v0.35.0 deliver world-class Citus
+support in two stages: v0.34.0 lays the naming and frontier foundations
+(safe to ship to all users), and v0.35.0 unlocks distributed-source CDC,
+distributed ST placement, and the full Citus test suite.
