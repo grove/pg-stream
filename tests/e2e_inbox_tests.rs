@@ -394,11 +394,12 @@ async fn test_enable_inbox_ordering_creates_next_stream_table() {
     db.execute("SELECT pgtrickle.create_inbox('ib_ord_a')")
         .await;
 
-    // Add ordering columns to the inbox table
-    db.execute(
-        "ALTER TABLE pgtrickle.ib_ord_a \
-         ADD COLUMN aggregate_id TEXT, ADD COLUMN seq_num BIGINT",
-    )
+    // Add seq_num ordering column (aggregate_id is already part of the inbox table schema)
+    db.execute_seq(&[
+        "SET pg_trickle.block_source_ddl = false",
+        "ALTER TABLE pgtrickle.ib_ord_a ADD COLUMN seq_num BIGINT",
+        "SET pg_trickle.block_source_ddl = true",
+    ])
     .await;
 
     db.execute("SELECT pgtrickle.enable_inbox_ordering('ib_ord_a', 'aggregate_id', 'seq_num')")
@@ -431,10 +432,11 @@ async fn test_disable_inbox_ordering_removes_next_stream_table() {
 
     db.execute("SELECT pgtrickle.create_inbox('ib_ord_b')")
         .await;
-    db.execute(
-        "ALTER TABLE pgtrickle.ib_ord_b \
-         ADD COLUMN aggregate_id TEXT, ADD COLUMN seq_num BIGINT",
-    )
+    db.execute_seq(&[
+        "SET pg_trickle.block_source_ddl = false",
+        "ALTER TABLE pgtrickle.ib_ord_b ADD COLUMN seq_num BIGINT",
+        "SET pg_trickle.block_source_ddl = true",
+    ])
     .await;
     db.execute("SELECT pgtrickle.enable_inbox_ordering('ib_ord_b', 'aggregate_id', 'seq_num')")
         .await;
@@ -472,8 +474,12 @@ async fn test_enable_inbox_priority_registers_config() {
 
     db.execute("SELECT pgtrickle.create_inbox('ib_pri_a')")
         .await;
-    db.execute("ALTER TABLE pgtrickle.ib_pri_a ADD COLUMN priority INT NOT NULL DEFAULT 5")
-        .await;
+    db.execute_seq(&[
+        "SET pg_trickle.block_source_ddl = false",
+        "ALTER TABLE pgtrickle.ib_pri_a ADD COLUMN priority INT NOT NULL DEFAULT 5",
+        "SET pg_trickle.block_source_ddl = true",
+    ])
+    .await;
 
     db.execute("SELECT pgtrickle.enable_inbox_priority('ib_pri_a', 'priority')")
         .await;
@@ -494,8 +500,12 @@ async fn test_disable_inbox_priority_removes_config() {
 
     db.execute("SELECT pgtrickle.create_inbox('ib_pri_b')")
         .await;
-    db.execute("ALTER TABLE pgtrickle.ib_pri_b ADD COLUMN priority INT NOT NULL DEFAULT 5")
-        .await;
+    db.execute_seq(&[
+        "SET pg_trickle.block_source_ddl = false",
+        "ALTER TABLE pgtrickle.ib_pri_b ADD COLUMN priority INT NOT NULL DEFAULT 5",
+        "SET pg_trickle.block_source_ddl = true",
+    ])
+    .await;
     db.execute("SELECT pgtrickle.enable_inbox_priority('ib_pri_b', 'priority')")
         .await;
     db.execute("SELECT pgtrickle.disable_inbox_priority('ib_pri_b')")
@@ -517,11 +527,11 @@ async fn test_enable_priority_conflicts_with_ordering() {
 
     db.execute("SELECT pgtrickle.create_inbox('ib_conflict')")
         .await;
-    db.execute(
-        "ALTER TABLE pgtrickle.ib_conflict \
-         ADD COLUMN aggregate_id TEXT, ADD COLUMN seq_num BIGINT, \
-         ADD COLUMN priority INT NOT NULL DEFAULT 5",
-    )
+    db.execute_seq(&[
+        "SET pg_trickle.block_source_ddl = false",
+        "ALTER TABLE pgtrickle.ib_conflict ADD COLUMN seq_num BIGINT, ADD COLUMN priority INT NOT NULL DEFAULT 5",
+        "SET pg_trickle.block_source_ddl = true",
+    ])
     .await;
 
     db.execute("SELECT pgtrickle.enable_inbox_ordering('ib_conflict', 'aggregate_id', 'seq_num')")
@@ -547,10 +557,11 @@ async fn test_inbox_ordering_gaps_no_gaps_sequential() {
 
     db.execute("SELECT pgtrickle.create_inbox('ib_gaps_a')")
         .await;
-    db.execute(
-        "ALTER TABLE pgtrickle.ib_gaps_a \
-         ADD COLUMN aggregate_id TEXT, ADD COLUMN seq_num BIGINT",
-    )
+    db.execute_seq(&[
+        "SET pg_trickle.block_source_ddl = false",
+        "ALTER TABLE pgtrickle.ib_gaps_a ADD COLUMN seq_num BIGINT",
+        "SET pg_trickle.block_source_ddl = true",
+    ])
     .await;
 
     db.execute("SELECT pgtrickle.enable_inbox_ordering('ib_gaps_a', 'aggregate_id', 'seq_num')")
@@ -577,10 +588,11 @@ async fn test_inbox_ordering_gaps_detects_gap() {
 
     db.execute("SELECT pgtrickle.create_inbox('ib_gaps_b')")
         .await;
-    db.execute(
-        "ALTER TABLE pgtrickle.ib_gaps_b \
-         ADD COLUMN aggregate_id TEXT, ADD COLUMN seq_num BIGINT",
-    )
+    db.execute_seq(&[
+        "SET pg_trickle.block_source_ddl = false",
+        "ALTER TABLE pgtrickle.ib_gaps_b ADD COLUMN seq_num BIGINT",
+        "SET pg_trickle.block_source_ddl = true",
+    ])
     .await;
 
     db.execute("SELECT pgtrickle.enable_inbox_ordering('ib_gaps_b', 'aggregate_id', 'seq_num')")
