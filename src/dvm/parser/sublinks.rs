@@ -186,6 +186,62 @@ pub(crate) fn node_tree_contains_sublink(node: *mut pg_sys::Node) -> bool {
             }
         }
     }
+    // CORR-2 (v0.30.0): Recurse into CASE expressions (T_CaseExpr → arg, defresult, CaseWhen args).
+    if let Some(case_expr) = cast_node!(node, T_CaseExpr, pg_sys::CaseExpr) {
+        // SAFETY: CaseExpr fields are valid parser-allocated nodes.
+        if !case_expr.arg.is_null()
+            && node_tree_contains_sublink(case_expr.arg as *mut pg_sys::Node)
+        {
+            return true;
+        }
+        if !case_expr.defresult.is_null()
+            && node_tree_contains_sublink(case_expr.defresult as *mut pg_sys::Node)
+        {
+            return true;
+        }
+        if !case_expr.args.is_null() {
+            let whens = pg_list::<pg_sys::CaseWhen>(case_expr.args);
+            for when_ptr in whens.iter_ptr() {
+                if when_ptr.is_null() {
+                    continue;
+                }
+                // SAFETY: CaseWhen is a valid parser node with expr and result fields.
+                let when = unsafe { &*when_ptr };
+                if !when.expr.is_null()
+                    && node_tree_contains_sublink(when.expr as *mut pg_sys::Node)
+                {
+                    return true;
+                }
+                if !when.result.is_null()
+                    && node_tree_contains_sublink(when.result as *mut pg_sys::Node)
+                {
+                    return true;
+                }
+            }
+        }
+    }
+    // CORR-2 (v0.30.0): Recurse into COALESCE expressions (T_CoalesceExpr → args list).
+    if let Some(coalesce) = cast_node!(node, T_CoalesceExpr, pg_sys::CoalesceExpr)
+        && !coalesce.args.is_null()
+    {
+        let args = pg_list::<pg_sys::Node>(coalesce.args);
+        for arg_ptr in args.iter_ptr() {
+            if !arg_ptr.is_null() && node_tree_contains_sublink(arg_ptr) {
+                return true;
+            }
+        }
+    }
+    // CORR-2 (v0.30.0): Recurse into function-call argument lists (T_FuncCall → args).
+    if let Some(fcall) = cast_node!(node, T_FuncCall, pg_sys::FuncCall)
+        && !fcall.args.is_null()
+    {
+        let args = pg_list::<pg_sys::Node>(fcall.args);
+        for arg_ptr in args.iter_ptr() {
+            if !arg_ptr.is_null() && node_tree_contains_sublink(arg_ptr) {
+                return true;
+            }
+        }
+    }
     false
 }
 
@@ -1352,6 +1408,24 @@ pub fn parse_defining_query_full(query: &str) -> Result<ParseResult, PgTrickleEr
 unsafe fn parse_defining_query_inner(query: &str) -> Result<ParseResult, PgTrickleError> {
     // Clear the per-parse warning accumulator so each invocation starts fresh.
     PARSE_ADVISORY_WARNINGS.with(|w| w.borrow_mut().clear());
+
+    // PERF-2 (v0.30.0): Reject queries whose approximate parse-node count
+    // would exceed pg_trickle.max_parse_nodes.  We estimate node count
+    // conservatively as query_len / 4 (typical average node is ~4 chars
+    // of SQL, e.g. ", 1" in an IN list).  This guard fires before the
+    // OpTree builder allocates per-node structures, keeping peak memory bounded.
+    // When max_parse_nodes == 0 (default changed to 0 for opt-in), the check is disabled.
+    let max_nodes = crate::config::pg_trickle_max_parse_nodes();
+    if max_nodes > 0 {
+        let estimated_nodes = (query.len() / 4).max(1);
+        if estimated_nodes > max_nodes {
+            return Err(PgTrickleError::QueryTooComplex(format!(
+                "Query rejected by pg_trickle.max_parse_nodes: \
+                 estimated {estimated_nodes} parse nodes exceeds limit {max_nodes}. \
+                 Raise pg_trickle.max_parse_nodes or simplify the query."
+            )));
+        }
+    }
 
     let list = parse_query(query)?;
     if list.len() != 1 {

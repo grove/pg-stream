@@ -29,13 +29,39 @@ pub(crate) mod merge;
 pub(crate) mod orchestrator;
 pub(crate) mod phd1;
 
-// Re-export everything from sub-modules so callers use `refresh::foo` as before.
-pub use codegen::*;
-pub use merge::*;
-pub use orchestrator::*;
+// SCAL-2 (v0.30.0): Explicit re-export lists enforce module boundary discipline.
+// Adding a new public symbol to a sub-module no longer silently promotes it;
+// each export is intentional and visible at a glance.
+// SCAL-2 (v0.30.0): Make the external public API explicit so that callers
+// outside this crate see a well-defined surface.  Crate-internal access
+// (including tests via `use super::*`) is preserved via `pub(crate) use *`
+// globs; the named `pub use` lines promote specific items to fully public.
+//
+// Precedence: explicit `pub use` overrides the `pub(crate) use *` glob for
+// the same name, giving those items public (not just crate) visibility.
+pub(crate) use codegen::*;
+pub(crate) use merge::*;
+pub(crate) use orchestrator::*;
+
+// ── External public API surface ─────────────────────────────────────────
+// Only items that are actually imported via the `crate::refresh::*` path
+// (rather than the full `crate::refresh::codegen::*` path) need to appear here.
+pub use codegen::{
+    capture_delta_to_bypass_table, clear_all_st_bypass, clear_fallback_leaf_oids,
+    flush_local_template_cache, flush_pending_cleanups_for_oids, get_fallback_leaf_oids,
+    get_st_bypass_tables, get_st_user_columns, get_st_user_columns_typed,
+    has_downstream_st_consumers, has_template_cache_entry, invalidate_merge_cache,
+    prewarm_merge_cache, set_fallback_leaf_oids,
+};
+pub use merge::{
+    execute_differential_refresh, execute_full_refresh, execute_no_data_refresh,
+    execute_topk_refresh, poll_foreign_table_sources_for_st, post_full_refresh_cleanup,
+};
+pub use orchestrator::{
+    RefreshAction, determine_refresh_action, execute_reinitialize_refresh, validate_topk_metadata,
+};
 // phd1 exports only the cross-cycle phantom cleanup utility used internally.
-#[allow(unused_imports)]
-pub(crate) use phd1::*;
+pub(crate) use phd1::cleanup_cross_cycle_phantoms;
 
 use std::cell::{Cell, RefCell};
 

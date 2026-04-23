@@ -583,7 +583,7 @@ fn test_adaptive_threshold_converges_downward() {
 #[test]
 fn test_adaptive_threshold_converges_upward() {
     // Simulate iterations of INCR being 10% of FULL
-    let mut threshold = 0.10;
+    let mut threshold = 0.10_f64;
     for _ in 0..50 {
         threshold = compute_adaptive_threshold(threshold, 10.0, 100.0);
     }

@@ -108,6 +108,10 @@ Complete reference for all pg_trickle GUC (Grand Unified Configuration) variable
   - [pg\_trickle.inbox\_drain\_batch\_size](#pg_trickleinbox_drain_batch_size)
   - [pg\_trickle.inbox\_drain\_interval\_seconds](#pg_trickleinbox_drain_interval_seconds)
   - [pg\_trickle.inbox\_dlq\_alert\_max\_per\_refresh](#pg_trickleinbox_dlq_alert_max_per_refresh)
+- [Pre-GA Correctness & Stability (v0.30.0)](#pre-ga-correctness--stability-v0300)
+  - [pg\_trickle.use\_sqlstate\_classification](#pg_trickleuse_sqlstate_classification)
+  - [pg\_trickle.template\_cache\_max\_age\_hours](#pg_trickletemplate_cache_max_age_hours)
+  - [pg\_trickle.max\_parse\_nodes](#pg_tricklemax_parse_nodes)
 - [GUC Interaction Matrix](#guc-interaction-matrix)
 - [Tuning Profiles](#tuning-profiles)
   - [Low-Latency Profile](#low-latency-profile)
@@ -2489,6 +2493,91 @@ DLQ alerting.
 | Range | 0 (disabled) – 100 |
 | Context | `SUSET` (superuser) |
 | Restart required | No |
+
+---
+
+## Pre-GA Correctness & Stability (v0.30.0)
+
+### pg_trickle.use_sqlstate_classification
+
+> **Added in v0.30.0 (SCAL-1).**
+
+When `true`, the retry classification for SPI errors uses the five-character
+PostgreSQL SQLSTATE class rather than message-text pattern matching. This
+makes retry decisions locale-independent (safe with `lc_messages=fr_FR` or
+other non-English locales).
+
+| Property | Value |
+|---|---|
+| Type | `boolean` |
+| Default | `false` |
+| Context | `SUSET` (superuser) |
+| Restart required | No |
+
+```sql
+-- Enable locale-safe SQLSTATE-based retry classification
+ALTER SYSTEM SET pg_trickle.use_sqlstate_classification = true;
+SELECT pg_reload_conf();
+```
+
+Set to `true` in any deployment where `lc_messages` is not `en_US.UTF-8`, or
+in mixed-locale clusters.
+
+### pg_trickle.template_cache_max_age_hours
+
+> **Added in v0.30.0 (STAB-3).**
+
+Maximum age (in hours) for entries in the L2 catalog-backed template cache
+(`pgtrickle.pgt_template_cache`). Entries older than this limit are purged
+by the background scheduler on each tick. Keeping the cache fresh ensures
+stale delta SQL templates do not persist after a stream table schema change.
+
+| Property | Value |
+|---|---|
+| Type | `integer` |
+| Default | `168` (7 days) |
+| Range | 1 – 8760 (1 year) |
+| Context | `SUSET` (superuser) |
+| Restart required | No |
+
+```sql
+-- Purge L2 cache entries older than 24 hours
+ALTER SYSTEM SET pg_trickle.template_cache_max_age_hours = 24;
+SELECT pg_reload_conf();
+```
+
+Lower values reduce the risk of stale templates surviving a schema change.
+Higher values improve performance by retaining warm cache entries across
+long maintenance windows.
+
+### pg_trickle.max_parse_nodes
+
+> **Added in v0.30.0 (PERF-2).**
+
+Maximum estimated number of parse-tree nodes allowed in a stream table
+defining query. When `> 0`, queries whose estimated node count exceeds this
+limit are rejected with a `QueryTooComplex` error before the OpTree builder
+allocates memory. This guards against pathological queries such as
+`WHERE id IN (1, 2, …, 1 000 000)` that would otherwise exhaust per-backend
+memory during delta SQL generation.
+
+| Property | Value |
+|---|---|
+| Type | `integer` |
+| Default | `0` (disabled) |
+| Range | 0 (disabled) – 10,000,000 |
+| Context | `SUSET` (superuser) |
+| Restart required | No |
+
+```sql
+-- Reject defining queries with more than 100 000 estimated nodes
+ALTER SYSTEM SET pg_trickle.max_parse_nodes = 100000;
+SELECT pg_reload_conf();
+```
+
+Node count is estimated conservatively as `len(query) / 4`.  The default of
+`0` disables the check for backward compatibility.  A value of `100000` is
+recommended for production deployments.
 
 ---
 

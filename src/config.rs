@@ -1045,6 +1045,31 @@ pub static PGS_TEMPLATE_CACHE_MAX_ENTRIES: GucSetting<i32> = GucSetting::<i32>::
 /// Recommended value: 104857600 (100 MB).
 pub static PGS_PUBLICATION_LAG_WARN_BYTES: GucSetting<i32> = GucSetting::<i32>::new(0);
 
+// ── v0.30.0 GUCs ──────────────────────────────────────────────────────────
+
+/// SCAL-1 (v0.30.0): When true, classify SPI error retryability by SQLSTATE code
+/// instead of English message-text patterns.
+///
+/// The SQLSTATE-based classification is locale-safe: it works correctly regardless
+/// of `lc_messages`. Set to `false` (default) during the v0.30.0 validation window;
+/// will flip to `true` as the default in v0.31.0.
+pub static PGS_USE_SQLSTATE_CLASSIFICATION: GucSetting<bool> = GucSetting::<bool>::new(false);
+
+/// STAB-3 (v0.30.0): Maximum age (hours) of L2 catalog template cache entries
+/// before they are eligible for deletion during the scheduler's launcher tick.
+///
+/// Prevents stale entries accumulating after ALTER QUERY without DROP or
+/// source-OID renumbering. Set to 0 to disable age-based purging.
+/// Default: 168 hours (7 days).
+pub static PGS_TEMPLATE_CACHE_MAX_AGE_HOURS: GucSetting<i32> = GucSetting::<i32>::new(168);
+
+/// PERF-2 (v0.30.0): Maximum number of parse tree nodes allowed in a single query.
+///
+/// Queries that exceed this limit are rejected with `QueryTooComplex` to prevent
+/// unbounded memory allocation in the parse advisory warnings cache and CTE registry.
+/// Set to 0 to disable the limit (default).
+pub static PGS_MAX_PARSE_NODES: GucSetting<i32> = GucSetting::<i32>::new(0);
+
 // ── v0.27.0 GUCs ──────────────────────────────────────────────────────────
 
 /// PLAN-1/PLAN-4 (v0.27.0): Minimum number of cost-model observations required
@@ -2205,6 +2230,45 @@ pub fn register_gucs() {
         GucFlags::default(),
     );
 
+    // ── v0.30.0 GUCs ──────────────────────────────────────────────────────
+
+    GucRegistry::define_bool_guc(
+        c"pg_trickle.use_sqlstate_classification",
+        c"SCAL-1: Use SQLSTATE codes for SPI error retry classification instead of message text.",
+        c"When true, retry decisions use the numeric SQLSTATE code from pg_sys::ErrorData \
+           rather than English message patterns. Locale-safe: works with any lc_messages. \
+           Default false for v0.30.0 validation; will become true in v0.31.0.",
+        &PGS_USE_SQLSTATE_CLASSIFICATION,
+        GucContext::Suset,
+        GucFlags::default(),
+    );
+
+    GucRegistry::define_int_guc(
+        c"pg_trickle.template_cache_max_age_hours",
+        c"STAB-3: Maximum age (hours) for L2 catalog template cache entries (0 = no age purge).",
+        c"Entries older than this threshold are deleted during the scheduler launcher tick. \
+           Prevents accumulation of stale entries after ALTER QUERY without DROP. \
+           Default: 168 hours (7 days). Set to 0 to disable age-based purging.",
+        &PGS_TEMPLATE_CACHE_MAX_AGE_HOURS,
+        0,      // min (0 = disabled)
+        87_600, // max (10 years)
+        GucContext::Suset,
+        GucFlags::default(),
+    );
+
+    GucRegistry::define_int_guc(
+        c"pg_trickle.max_parse_nodes",
+        c"PERF-2: Maximum parse tree nodes per query (0 = unlimited).",
+        c"Queries with more than this many nodes are rejected with QueryTooComplex to prevent \
+           unbounded memory allocation. Does not apply to queries already registered. \
+           Default: 0 (unlimited). Recommended: 100000 for production deployments.",
+        &PGS_MAX_PARSE_NODES,
+        0,          // min (0 = unlimited)
+        10_000_000, // max
+        GucContext::Suset,
+        GucFlags::default(),
+    );
+
     // ── v0.27.0 GUCs ──────────────────────────────────────────────────────
 
     GucRegistry::define_int_guc(
@@ -2949,6 +3013,21 @@ pub fn pg_trickle_template_cache_max_entries() -> i32 {
 /// PUB-1: Returns the publication subscriber lag warning threshold in bytes (0 = disabled).
 pub fn pg_trickle_publication_lag_warn_bytes() -> i64 {
     PGS_PUBLICATION_LAG_WARN_BYTES.get() as i64
+}
+
+/// SCAL-1 (v0.30.0): Returns whether SQLSTATE-based SPI error classification is enabled.
+pub fn pg_trickle_use_sqlstate_classification() -> bool {
+    PGS_USE_SQLSTATE_CLASSIFICATION.get()
+}
+
+/// STAB-3 (v0.30.0): Returns the maximum age (hours) for L2 template cache entries.
+pub fn pg_trickle_template_cache_max_age_hours() -> i32 {
+    PGS_TEMPLATE_CACHE_MAX_AGE_HOURS.get()
+}
+
+/// PERF-2 (v0.30.0): Returns the maximum parse node count allowed per query.
+pub fn pg_trickle_max_parse_nodes() -> usize {
+    PGS_MAX_PARSE_NODES.get() as usize
 }
 
 #[cfg(test)]

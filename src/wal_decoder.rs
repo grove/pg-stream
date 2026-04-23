@@ -302,8 +302,8 @@ fn create_replication_slot_internal(slot_name: &str) -> Result<String, PgTrickle
 
     let c_slot_name = CString::new(slot_name)
         .map_err(|e| PgTrickleError::ReplicationSlotError(format!("Invalid slot name: {}", e)))?;
-    let c_plugin = CString::new("test_decoding") // nosemgrep: rust.panic-in-sql-path — literal has no NUL bytes; CString::new never fails here
-        .expect("'test_decoding' contains no NUL bytes");
+    // STAB-5: Use compile-time CStr literal — no NUL bytes possible, no runtime allocation.
+    let c_plugin = c"test_decoding";
 
     // SAFETY: Calling PostgreSQL C API functions for replication slot management.
     // These are the same functions called by pg_create_logical_replication_slot(),

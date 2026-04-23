@@ -135,6 +135,30 @@ pub fn invalidate(pgt_id: i64) {
     );
 }
 
+/// STAB-3 (v0.30.0): Delete L2 catalog template cache entries older than
+/// `max_age_hours` hours in a single batched DELETE.
+///
+/// Called from the per-database scheduler tick to prevent stale entries from
+/// accumulating after ALTER QUERY without DROP or source-OID renumbering.
+/// Returns the number of rows deleted (0 if nothing to purge or GUC disabled).
+///
+/// `max_age_hours = 0` means "no age purge" (disabled).
+pub fn purge_stale_entries(max_age_hours: i32) -> i64 {
+    if max_age_hours <= 0 || !crate::config::pg_trickle_template_cache_enabled() {
+        return 0;
+    }
+    Spi::get_one_with_args::<i64>(
+        "WITH deleted AS ( \
+             DELETE FROM pgtrickle.pgt_template_cache \
+             WHERE cached_at < now() - ($1 * interval '1 hour') \
+             RETURNING 1 \
+         ) SELECT count(*) FROM deleted",
+        &[(max_age_hours as i64).into()],
+    )
+    .unwrap_or(None)
+    .unwrap_or(0)
+}
+
 /// Invalidate all cached templates.
 ///
 /// Called when a bulk cache flush is needed (e.g., extension upgrade).

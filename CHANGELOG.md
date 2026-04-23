@@ -8,6 +8,7 @@ For future plans and upcoming features, see [ROADMAP.md](ROADMAP.md).
 
 <!-- TOC start -->
 - [Unreleased](#unreleased)
+- [0.30.0 — Pre-GA Correctness & Stability Sprint](#0300--pre-ga-correctness--stability-sprint)
 - [0.29.0 — Relay CLI (pgtrickle-relay)](#0290--relay-cli-pgtrickle-relay)
 - [0.28.0 — Transactional Inbox & Outbox Patterns](#0280--transactional-inbox--outbox-patterns)
 - [0.27.0 — Operability, Observability & DR](#0270--operability-observability--dr)
@@ -48,6 +49,67 @@ For future plans and upcoming features, see [ROADMAP.md](ROADMAP.md).
 ---
 
 ## [Unreleased]
+
+---
+
+## [0.30.0] — Pre-GA Correctness & Stability Sprint
+
+### Highlights
+
+- **EC-01 phantom-row convergence** (CORR-1): Cross-cycle phantom rows from
+  interrupted differential refresh cycles are now cleaned up unconditionally
+  after every join query refresh, ensuring eventual convergence.
+- **Snapshot atomicity** (STAB-1): `snapshot_stream_table()` and
+  `restore_from_snapshot()` now wrap critical operations in PostgreSQL
+  subtransactions. An orphan snapshot table can no longer be left behind on
+  error; a failed catalog INSERT rolls back the snapshot table creation.
+- **Explicit snapshot restore column list** (CORR-3): The restore path now
+  walks `pg_attribute` to build an explicit column list instead of `SELECT *`,
+  eliminating sensitivity to PostgreSQL minor-version catalog differences.
+- **CASE/COALESCE/FuncCall SubLink detection** (CORR-2): The DVM parser now
+  correctly identifies subqueries nested inside `CASE`, `COALESCE`, and
+  function arguments, preventing incorrect differential plans for those patterns.
+- **SQLSTATE-based error classification** (SCAL-1): Infrastructure for
+  retryability classification keyed on SQL error class rather than message
+  text. Opt-in via `pg_trickle.use_sqlstate_classification = true`.
+- **IVM cache eviction bounds** (STAB-2): `IVM_DELTA_CACHE` now enforces
+  `pg_trickle.ivm_cache_max_entries` via clock-style eviction, preventing
+  unbounded per-backend memory growth on wide stream table deployments.
+- **IVM cache subxact abort** (STAB-6): A subtransaction abort callback
+  registered lazily on first IVM delta application clears the delta cache on
+  subxact abort, preventing stale data from reaching the MERGE step.
+- **L2 template-cache age purge** (STAB-3): The background scheduler now
+  periodically purges L2 template-cache entries older than
+  `pg_trickle.template_cache_max_age_hours` (default 168 h / 7 days).
+- **Parser node-count guard** (PERF-2): New `pg_trickle.max_parse_nodes` GUC
+  (default 0 = off). When set, queries whose estimated parse-node count
+  exceeds the limit are rejected with `QueryTooComplex` before the OpTree
+  builder allocates memory.
+- **Explicit re-exports** (SCAL-2): `src/refresh/mod.rs` now uses an explicit
+  `pub use` list instead of blanket glob re-exports, making public API surface
+  visible at a glance and catching accidental symbol leakage at compile time.
+
+### New GUCs
+
+| GUC | Default | Description |
+|-----|---------|-------------|
+| `pg_trickle.use_sqlstate_classification` | `false` | Use SQLSTATE class for retry decisions |
+| `pg_trickle.template_cache_max_age_hours` | `168` | Max age (hours) for L2 template-cache entries |
+| `pg_trickle.max_parse_nodes` | `0` | Max estimated parse nodes (0 = disabled) |
+
+### Fixes
+
+- **STAB-4**: Snapshot catalog `INSERT` failure is now surfaced as an error
+  (previously silently discarded). The snapshot table is rolled back on failure.
+- **STAB-5**: Replaced `.expect()` CString call in WAL decoder with a
+  compile-time `c""` literal, eliminating a panic path in WAL decoding.
+- **SCAL-3**: Removed 11 dead `#[allow(unused_imports)]` suppressors from
+  `refresh/orchestrator.rs`.
+
+### No schema changes
+
+Upgrading from v0.29.0 requires no DDL changes. All improvements are confined
+to the Rust extension binary and new GUC registrations.
 
 ---
 

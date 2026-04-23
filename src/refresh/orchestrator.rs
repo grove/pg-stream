@@ -2,30 +2,14 @@
 //
 // Contains: RefreshAction enum, determine_refresh_action, validate_topk_metadata,
 // cost-model helpers, and execute_reinitialize_refresh.
+// SCAL-3 (v0.30.0): Removed dead #[allow(unused_imports)] shims; imports are now
+// concrete and will warn if unused, catching future stale imports early.
 
-#[allow(unused_imports)]
-use crate::catalog::{StDependency, StreamTableMeta};
-#[allow(unused_imports)]
+use super::{QueryComplexityClass, execute_full_refresh};
+use crate::catalog::StreamTableMeta;
 use crate::dag::RefreshMode;
-#[allow(unused_imports)]
-use crate::dvm;
-#[allow(unused_imports)]
 use crate::error::PgTrickleError;
-#[allow(unused_imports)]
-use crate::version::Frontier;
-#[allow(unused_imports)]
 use pgrx::prelude::*;
-#[allow(unused_imports)]
-use std::cell::{Cell, RefCell};
-#[allow(unused_imports)]
-use std::collections::HashMap;
-#[allow(unused_imports)]
-use std::collections::HashSet;
-#[allow(unused_imports)]
-use std::time::Instant;
-
-#[allow(unused_imports)]
-use super::*;
 
 /// Determines what kind of refresh action should be taken.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -1,0 +1,16 @@
+-- pg_trickle 0.29.0 → 0.30.0 upgrade migration
+-- ============================================
+--
+-- v0.30.0 — Pre-GA Correctness & Stability Sprint
+--
+-- This migration has no schema changes.  All v0.30.0 improvements are
+-- confined to Rust extension code (GUC registrations, phantom cleanup,
+-- snapshot atomicity, parser guards, error classification).  The
+-- pg_trickle catalog tables and SQL API are unchanged from v0.29.0.
+--
+-- New GUCs (set in postgresql.conf or ALTER SYSTEM):
+--   pg_trickle.use_sqlstate_classification  — opt-in SQLSTATE-based retry
+--   pg_trickle.template_cache_max_age_hours — L2 cache entry TTL (default 168)
+--   pg_trickle.max_parse_nodes              — parser node-count guard (0=off)
+
+-- No DDL changes required for this version upgrade.

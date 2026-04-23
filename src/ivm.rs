@@ -123,6 +123,8 @@ struct CachedIvmDelta {
     delta_sql: String,
     /// User-facing column names from the delta result.
     user_columns: Vec<String>,
+    /// STAB-2 (v0.30.0): Insertion order counter for clock-style eviction.
+    last_used: u64,
 }
 
 fn hash_str(s: &str) -> u64 {
@@ -141,6 +143,38 @@ thread_local! {
 
     /// Local snapshot of the shared cache generation counter.
     static LOCAL_IVM_CACHE_GEN: Cell<u64> = const { Cell::new(0) };
+
+    /// STAB-2 (v0.30.0): Monotone insertion counter for clock-style eviction.
+    static IVM_CACHE_CLOCK: Cell<u64> = const { Cell::new(0) };
+
+    /// STAB-6 (v0.30.0): Whether the subxact-abort callback has been registered
+    /// for this session.  Reset to false only on new session init (never in practice
+    /// since thread-locals persist for the session lifetime).
+    static IVM_ABORT_CALLBACK_REGISTERED: Cell<bool> = const { Cell::new(false) };
+}
+
+/// STAB-6 (v0.30.0): Register a subxact-abort callback that clears IVM_DELTA_CACHE
+/// on subxact abort.  Idempotent: uses a thread-local guard to register only once
+/// per session.
+fn ensure_ivm_abort_callback_registered() {
+    IVM_ABORT_CALLBACK_REGISTERED.with(|registered| {
+        if registered.get() {
+            return;
+        }
+        // SAFETY: register_subxact_callback is safe to call from a PG function context.
+        let _receipt = pgrx::register_subxact_callback(
+            pgrx::PgSubXactCallbackEvent::AbortSub,
+            |_subid, _parent_subid| {
+                // Clear the IVM delta cache on any subxact abort.
+                // This ensures stale entries from a failed apply are not reused.
+                IVM_DELTA_CACHE.with(|cache| cache.borrow_mut().clear());
+                pgrx::debug1!("[pg_trickle] STAB-6: IVM_DELTA_CACHE cleared on subxact abort");
+            },
+        );
+        // Intentionally leak the receipt — we want the callback to live forever.
+        std::mem::forget(_receipt);
+        registered.set(true);
+    });
 }
 
 /// Invalidate all cached IVM delta templates for a given pgt_id.
@@ -541,6 +575,12 @@ fn pgt_ivm_apply_delta(
 ) -> Result<(), PgTrickleError> {
     use crate::catalog::StreamTableMeta;
 
+    // STAB-6 (v0.30.0): Register a per-session subxact-abort callback (once) so
+    // that if this trigger function fails mid-statement, the thread-local
+    // IVM_DELTA_CACHE is cleared.  Without this, a stale entry can survive
+    // a failed apply and be reused in the next statement.
+    ensure_ivm_abort_callback_registered();
+
     // EC-25/EC-26: Set the internal_refresh flag so DML guard triggers
     // allow the IVM delta application to modify the storage table.
     Spi::run("SET LOCAL pg_trickle.internal_refresh = 'true'")
@@ -819,13 +859,32 @@ fn get_or_compute_ivm_delta(
         ctx.differentiate_with_columns(&op_tree)?;
 
     // Store in cache.
+    // STAB-2 (v0.30.0): Clock-style eviction respecting `template_cache_max_entries`.
     IVM_DELTA_CACHE.with(|cache| {
-        cache.borrow_mut().insert(
+        let max_entries = crate::config::pg_trickle_template_cache_max_entries();
+        let clock = IVM_CACHE_CLOCK.with(|c| {
+            let v = c.get().wrapping_add(1);
+            c.set(v);
+            v
+        });
+        let mut map = cache.borrow_mut();
+        // Evict the oldest entry (smallest `last_used`) when the cache is full.
+        if max_entries > 0
+            && map.len() >= max_entries as usize
+            && let Some(oldest_key) = map
+                .iter()
+                .min_by_key(|(_, v)| v.last_used)
+                .map(|(k, _)| k.clone())
+        {
+            map.remove(&oldest_key);
+        }
+        map.insert(
             cache_key,
             CachedIvmDelta {
                 defining_query_hash: query_hash,
                 delta_sql: delta_sql.clone(),
                 user_columns: user_columns.clone(),
+                last_used: clock,
             },
         );
     });

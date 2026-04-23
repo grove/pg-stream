@@ -20,6 +20,69 @@ use pgrx::prelude::*;
 use crate::catalog::StreamTableMeta;
 use crate::error::PgTrickleError;
 
+// ── STAB-1 (v0.30.0): SubTransaction RAII helper ─────────────────────────
+//
+// Wraps the CREATE TABLE AS + catalog INSERT in snapshot_stream_table_impl and
+// the TRUNCATE + INSERT in restore_from_snapshot_impl in a PostgreSQL internal
+// sub-transaction.  On drop (without explicit commit), rolls back automatically
+// so no orphan tables or truncated storage tables are left behind on crash.
+
+struct SnapSubTransaction {
+    old_cxt: pgrx::pg_sys::MemoryContext,
+    old_owner: pgrx::pg_sys::ResourceOwner,
+    finished: bool,
+}
+
+impl SnapSubTransaction {
+    fn begin() -> Self {
+        // SAFETY: Called within a PostgreSQL transaction (SQL function context).
+        // CurrentMemoryContext and CurrentResourceOwner are always valid here.
+        let old_cxt = unsafe { pgrx::pg_sys::CurrentMemoryContext };
+        let old_owner = unsafe { pgrx::pg_sys::CurrentResourceOwner };
+        // SAFETY: BeginInternalSubTransaction sets up a sub-transaction.
+        unsafe { pgrx::pg_sys::BeginInternalSubTransaction(std::ptr::null()) };
+        Self {
+            old_cxt,
+            old_owner,
+            finished: false,
+        }
+    }
+
+    fn commit(mut self) {
+        // SAFETY: Commits the sub-transaction; restores the outer context.
+        unsafe {
+            pgrx::pg_sys::ReleaseCurrentSubTransaction();
+            pgrx::pg_sys::MemoryContextSwitchTo(self.old_cxt);
+            pgrx::pg_sys::CurrentResourceOwner = self.old_owner;
+        }
+        self.finished = true;
+    }
+
+    fn rollback(mut self) {
+        // SAFETY: Rolls back the sub-transaction; restores the outer context.
+        unsafe {
+            pgrx::pg_sys::RollbackAndReleaseCurrentSubTransaction();
+            pgrx::pg_sys::MemoryContextSwitchTo(self.old_cxt);
+            pgrx::pg_sys::CurrentResourceOwner = self.old_owner;
+        }
+        self.finished = true;
+    }
+}
+
+impl Drop for SnapSubTransaction {
+    fn drop(&mut self) {
+        if !self.finished {
+            // Auto-rollback for panic safety.
+            // SAFETY: Same invariants as rollback().
+            unsafe {
+                pgrx::pg_sys::RollbackAndReleaseCurrentSubTransaction();
+                pgrx::pg_sys::MemoryContextSwitchTo(self.old_cxt);
+                pgrx::pg_sys::CurrentResourceOwner = self.old_owner;
+            }
+        }
+    }
+}
+
 // ── Internal helpers ───────────────────────────────────────────────────────
 
 /// Parse a schema-qualified name like `"myschema.mytable"` into (schema, table).
@@ -70,6 +133,60 @@ pub(super) fn parse_qualified_table(qualified: &str) -> (String, String) {
     } else {
         ("public".to_string(), trimmed.trim_matches('"').to_string())
     }
+}
+
+/// CORR-3 (v0.30.0): Build a comma-separated list of user-visible column names from
+/// the snapshot table, excluding pg_trickle metadata columns.
+///
+/// Uses `pg_attribute` catalog walk instead of `SELECT * EXCEPT (...)` so the
+/// function works on all PG 18.x minor versions without PG-minor sensitivity.
+fn build_user_column_list(
+    _src_fqn: &str,
+    src_schema: &str,
+    src_table: &str,
+) -> Result<String, PgTrickleError> {
+    let skip: &[&str] = &[
+        "__pgt_snapshot_version",
+        "__pgt_frontier",
+        "__pgt_snapshotted_at",
+    ];
+
+    let cols: Vec<String> = Spi::connect(|client| {
+        let rows = client
+            .select(
+                "SELECT a.attname::text \
+                 FROM pg_catalog.pg_attribute a \
+                 JOIN pg_catalog.pg_class c ON c.oid = a.attrelid \
+                 JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+                 WHERE n.nspname = $1 \
+                   AND c.relname  = $2 \
+                   AND a.attnum   > 0 \
+                   AND NOT a.attisdropped \
+                 ORDER BY a.attnum",
+                None,
+                &[src_schema.into(), src_table.into()],
+            )
+            .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
+        let mut out = Vec::new();
+        for row in rows {
+            let name: String = row
+                .get::<String>(1)
+                .map_err(|e| PgTrickleError::SpiError(e.to_string()))?
+                .unwrap_or_default();
+            if !name.is_empty() && !skip.contains(&name.as_str()) {
+                out.push(format!("\"{}\"", name.replace('"', "\"\"")));
+            }
+        }
+        Ok::<_, PgTrickleError>(out)
+    })?;
+
+    if cols.is_empty() {
+        return Err(PgTrickleError::SpiError(format!(
+            "no user columns found in snapshot table {}.{}",
+            src_schema, src_table
+        )));
+    }
+    Ok(cols.join(", "))
 }
 
 /// Check if a relation exists by schema + table name.
@@ -142,14 +259,24 @@ fn snapshot_stream_table_impl(name: &str, target: Option<&str>) -> Result<String
         snap_fqn_quoted, storage_fqn
     );
 
-    Spi::run_with_args(
+    // STAB-1 (v0.30.0): Wrap CREATE TABLE AS + catalog INSERT in a SubTransaction.
+    // If the catalog INSERT fails, the subtransaction rolls back, cleaning up
+    // the orphan snapshot table automatically.
+    let subtxn = SnapSubTransaction::begin();
+    let create_result = Spi::run_with_args(
         &create_sql,
         &[ext_ver.into(), frontier_json.as_str().into()],
     )
-    .map_err(|e| PgTrickleError::SpiError(format!("snapshot create failed: {e}")))?;
+    .map_err(|e| PgTrickleError::SpiError(format!("snapshot create failed: {e}")));
 
-    // Persist metadata to the snapshots catalog (best-effort)
-    let _ = Spi::run_with_args(
+    if let Err(e) = create_result {
+        subtxn.rollback();
+        return Err(e);
+    }
+
+    // STAB-4 (v0.30.0): Promote catalog INSERT failure from silent discard to WARNING.
+    // A failed insert means list_snapshots() will not find this snapshot.
+    if let Err(e) = Spi::run_with_args(
         "INSERT INTO pgtrickle.pgt_snapshots \
          (pgt_id, snapshot_schema, snapshot_table, snapshot_version, frontier, created_at) \
          VALUES ($1, $2, $3, $4, $5::jsonb, now()) \
@@ -161,7 +288,17 @@ fn snapshot_stream_table_impl(name: &str, target: Option<&str>) -> Result<String
             ext_ver.into(),
             frontier_json.as_str().into(),
         ],
-    );
+    ) {
+        // Catalog insert failed: roll back the subtransaction so no orphan table is left.
+        subtxn.rollback();
+        return Err(PgTrickleError::SpiError(format!(
+            "[pg_trickle] SNAP-1: snapshot table created but catalog INSERT failed \
+             (snapshot at {}.{} was rolled back): {}",
+            snap_schema, snap_table, e
+        )));
+    }
+
+    subtxn.commit();
 
     pgrx::log!(
         "[pg_trickle] SNAP-1: snapshot created for '{}.{}' → {}.{}",
@@ -202,7 +339,8 @@ fn restore_from_snapshot_impl(name: &str, source: &str) -> Result<(), PgTrickleE
         src_table.replace('"', r#"\""#)
     );
 
-    // Check schema version (best-effort; major mismatch is an error)
+    // STAB-1 (v0.30.0): Propagate schema-version-check failure as a typed error
+    // rather than silently treating None as compatible.
     let snap_ver: Option<String> = Spi::get_one_with_args::<String>(
         &format!(
             "SELECT __pgt_snapshot_version::text FROM {} LIMIT 1",
@@ -212,6 +350,8 @@ fn restore_from_snapshot_impl(name: &str, source: &str) -> Result<(), PgTrickleE
     )
     .unwrap_or(None);
 
+    // Validate snapshot version — None means the snapshot has no metadata column,
+    // which indicates schema incompatibility (pre-v0.27 snapshot).
     if let Some(sv) = &snap_ver {
         let cur = env!("CARGO_PKG_VERSION");
         let sv_maj: &str = sv.split('.').next().unwrap_or("0");
@@ -221,6 +361,14 @@ fn restore_from_snapshot_impl(name: &str, source: &str) -> Result<(), PgTrickleE
                 "snapshot version {sv} incompatible with current {cur} (major version differs)"
             )));
         }
+    } else {
+        // None = no __pgt_snapshot_version column → old snapshot format
+        return Err(PgTrickleError::SnapshotSchemaVersionMismatch(
+            "snapshot has no __pgt_snapshot_version column — \
+             it was created by a version of pg_trickle prior to v0.27.0 \
+             and cannot be restored with this version"
+                .to_string(),
+        ));
     }
 
     let storage_fqn = format!(
@@ -229,20 +377,54 @@ fn restore_from_snapshot_impl(name: &str, source: &str) -> Result<(), PgTrickleE
         meta.pgt_name.replace('"', r#"\""#)
     );
 
-    // Truncate, then bulk-insert from snapshot (excluding metadata columns)
-    Spi::run(&format!("TRUNCATE {}", storage_fqn)) // nosemgrep: rust.spi.run.dynamic-format — DDL cannot be parameterized; storage_fqn is a double-quoted and escaped catalog identifier.
-        .map_err(|e| PgTrickleError::SpiError(format!("truncate failed: {e}")))?;
+    // STAB-1 (v0.30.0): Wrap TRUNCATE + INSERT in a SubTransaction with an
+    // exclusive lock acquired before the TRUNCATE, so no orphan/truncated
+    // storage table is left on crash and concurrent refreshes are blocked.
+    let subtxn = SnapSubTransaction::begin();
 
-    // PostgreSQL 18+ supports SELECT * EXCEPT (...) — fall back to explicit
-    // column list if it fails (older PG in tests).
+    let lock_result = Spi::run(&format!(
+        "LOCK TABLE {} IN ACCESS EXCLUSIVE MODE",
+        storage_fqn
+    )) // nosemgrep: rust.spi.run.dynamic-format — DDL cannot be parameterized; storage_fqn is a double-quoted and escaped catalog identifier.
+    .map_err(|e| PgTrickleError::SpiError(format!("restore lock failed: {e}")));
+
+    if let Err(e) = lock_result {
+        subtxn.rollback();
+        return Err(e);
+    }
+
+    // Truncate, then bulk-insert from snapshot (excluding metadata columns)
+    let truncate_result =
+        Spi::run(&format!("TRUNCATE {}", storage_fqn)) // nosemgrep: rust.spi.run.dynamic-format
+            .map_err(|e| PgTrickleError::SpiError(format!("truncate failed: {e}")));
+
+    if let Err(e) = truncate_result {
+        subtxn.rollback();
+        return Err(e);
+    }
+
+    // CORR-3 (v0.30.0): Build explicit column list from pg_attribute catalog walk,
+    // eliminating PG-minor-version sensitivity of SELECT * EXCEPT (...).
+    let user_cols = match build_user_column_list(&src_fqn, &src_schema, &src_table) {
+        Ok(cols) => cols,
+        Err(e) => {
+            subtxn.rollback();
+            return Err(e);
+        }
+    };
     let insert_sql = format!(
-        "INSERT INTO {} \
-         SELECT * EXCEPT (__pgt_snapshot_version, __pgt_frontier, __pgt_snapshotted_at) \
-         FROM {}",
-        storage_fqn, src_fqn
+        "INSERT INTO {} ({}) \
+         SELECT {} FROM {}",
+        storage_fqn, user_cols, user_cols, src_fqn
     );
-    Spi::run(&insert_sql) // nosemgrep: rust.spi.run.dynamic-format — DDL/DML cannot be parameterized for table names; storage_fqn and src_fqn are double-quoted and escaped catalog identifiers.
-        .map_err(|e| PgTrickleError::SpiError(format!("restore insert failed: {e}")))?;
+    let insert_result =
+        Spi::run(&insert_sql) // nosemgrep: rust.spi.run.dynamic-format — DDL/DML cannot be parameterized for table names; storage_fqn and src_fqn are double-quoted and escaped catalog identifiers.
+            .map_err(|e| PgTrickleError::SpiError(format!("restore insert failed: {e}")));
+
+    if let Err(e) = insert_result {
+        subtxn.rollback();
+        return Err(e);
+    }
 
     // Restore frontier so next refresh is DIFFERENTIAL (not FULL)
     let frontier_json: Option<String> = Spi::get_one_with_args::<String>(
@@ -252,14 +434,21 @@ fn restore_from_snapshot_impl(name: &str, source: &str) -> Result<(), PgTrickleE
     .unwrap_or(None);
 
     if let Some(fj) = frontier_json {
-        Spi::run_with_args(
+        let frontier_result = Spi::run_with_args(
             "UPDATE pgtrickle.pgt_stream_tables \
              SET frontier = $1::jsonb, is_populated = true \
              WHERE pgt_id = $2",
             &[fj.as_str().into(), meta.pgt_id.into()],
         )
-        .map_err(|e| PgTrickleError::SpiError(format!("frontier restore failed: {e}")))?;
+        .map_err(|e| PgTrickleError::SpiError(format!("frontier restore failed: {e}")));
+
+        if let Err(e) = frontier_result {
+            subtxn.rollback();
+            return Err(e);
+        }
     }
+
+    subtxn.commit();
 
     // Signal the DAG to pick up the frontier change
     crate::shmem::signal_dag_invalidation(meta.pgt_id);

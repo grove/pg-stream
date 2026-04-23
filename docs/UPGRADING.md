@@ -484,6 +484,214 @@ continue to work as before.
 
 ---
 
+### 0.14.0 → 0.15.0
+
+**No schema changes.** New features: interactive TUI (`pgtrickle-tui` binary),
+bulk `create_stream_tables_from_schema()`, and per-table runaway-refresh
+protection (`max_refresh_duration_ms`).
+
+**New GUC variables:**
+
+| GUC | Default | Purpose |
+|-----|---------|---------|
+| `pg_trickle.ivm_cache_max_entries` | `0` (unbounded) | Bound per-backend IVM delta cache |
+
+---
+
+### 0.15.0 → 0.16.0
+
+**No schema changes.** Performance improvements to the delta pipeline and
+refresh path. L2 catalog-backed template cache (`pgtrickle.pgt_template_cache`)
+introduced.
+
+---
+
+### 0.16.0 → 0.17.0
+
+**No schema changes.** Query intelligence improvements: window function
+differentiation, correlated-sublink rewriting.
+
+---
+
+### 0.17.0 → 0.18.0
+
+**No schema changes.** Hardening pass: tightened unsafe blocks, improved error
+propagation, delta performance improvements (prepared-statement MERGE path).
+
+---
+
+### 0.18.0 → 0.19.0
+
+**No schema changes.** Security enhancements: SECURITY DEFINER on all
+public-facing functions, improved RLS awareness in delta generation.
+
+---
+
+### 0.19.0 → 0.20.0
+
+**New catalog table:** `pgtrickle.pgt_self_monitoring` for extension health
+metrics. New function: `pgtrickle.metrics_summary()`.
+
+---
+
+### 0.20.0 → 0.21.0
+
+**No schema changes.** Reliability improvements: advisory-lock hardening,
+WAL-receiver retry, graceful SIGTERM in background workers.
+
+---
+
+### 0.21.0 → 0.22.0
+
+**No schema changes.** New features: downstream CDC pipeline, parallel refresh
+scheduling, predictive cost model for FULL vs DIFFERENTIAL selection.
+
+---
+
+### 0.22.0 → 0.23.0
+
+**No schema changes.** Performance tuning and diagnostics: delta amplification
+detection, EXPLAIN capture (`PGS_PROFILE_DELTA`), adaptive threshold
+auto-tuning.
+
+**New GUC variables:**
+
+| GUC | Default | Purpose |
+|-----|---------|---------|
+| `pg_trickle.delta_amplification_threshold` | `10.0` | Warn when output/input delta ratio exceeds this |
+| `pg_trickle.log_delta_sql` | `false` | Log resolved delta SQL at `DEBUG1` |
+
+---
+
+### 0.23.0 → 0.24.0
+
+**No schema changes.** Join correctness hardening: phantom-row detection
+infrastructure, durability improvements for committed change buffers.
+
+---
+
+### 0.24.0 → 0.25.0
+
+**No schema changes.** Scheduler scalability: worker pool, L1 template cache
+with LRU eviction.
+
+**New GUC variables:**
+
+| GUC | Default | Purpose |
+|-----|---------|---------|
+| `pg_trickle.worker_pool_size` | `0` | Persistent worker pool size |
+| `pg_trickle.template_cache_max_entries` | `0` | L1 delta SQL template cache cap |
+
+---
+
+### 0.25.0 → 0.26.0
+
+**No schema changes.** Concurrency hardening: improved lock ordering, stress
+test suite, fixed MERGE race under high concurrency.
+
+---
+
+### 0.26.0 → 0.27.0
+
+**New catalog columns** added to `pgtrickle.pgt_stream_tables`:
+
+| Column | Type | Default | Purpose |
+|--------|------|---------|---------|
+| `last_full_ms` | `FLOAT8` | `NULL` | Duration of last FULL refresh (ms) |
+| `auto_threshold` | `FLOAT8` | `NULL` | Adaptive FULL/DIFF cost-ratio threshold |
+
+**New catalog table:** `pgtrickle.pgt_template_cache` for L2 cross-backend
+delta SQL storage.
+
+**New SQL functions:**
+
+| Function | Purpose |
+|----------|---------|
+| `pgtrickle.snapshot_stream_table(name, dest)` | Consistent snapshot copy |
+| `pgtrickle.restore_from_snapshot(name, source)` | Restore from snapshot |
+| `pgtrickle.list_snapshots(name)` | List available snapshots |
+| `pgtrickle.recommend_schedule(name)` | SLA-based scheduling recommendation |
+| `pgtrickle.schedule_recommendations()` | Multi-table scheduling report |
+| `pgtrickle.cluster_worker_summary()` | Cross-database scheduler health |
+| `pgtrickle.metrics_summary()` | Prometheus-compatible extension metrics |
+
+**New GUC variables:**
+
+| GUC | Default | Purpose |
+|-----|---------|---------|
+| `pg_trickle.metrics_port` | `9187` | Prometheus metrics port |
+| `pg_trickle.metrics_request_timeout_ms` | `5000` | Metrics endpoint timeout |
+| `pg_trickle.frontier_holdback_mode` | `warn` | Holdback action on stale frontier |
+| `pg_trickle.frontier_holdback_warn_seconds` | `300` | Frontier holdback warning threshold |
+| `pg_trickle.publication_lag_warn_bytes` | `104857600` | WAL lag warning threshold |
+| `pg_trickle.schedule_recommendation_min_samples` | `20` | Min samples for schedule recommendation |
+| `pg_trickle.schedule_alert_cooldown_seconds` | `300` | Min interval between schedule alerts |
+| `pg_trickle.change_buffer_durability` | `unlogged` | Change buffer WAL level |
+
+No breaking changes.
+
+---
+
+### 0.27.0 → 0.28.0
+
+**New catalog tables:** `pgtrickle.outbox_events`, `pgtrickle.inbox_messages`,
+`pgtrickle.inbox_dead_letters` for transactional outbox and inbox patterns.
+
+**New SQL functions:** `pgtrickle.enable_outbox(name, ...)`,
+`pgtrickle.enable_inbox(name, ...)`, and related management functions.
+
+No breaking changes.
+
+---
+
+### 0.28.0 → 0.29.0
+
+**New catalog tables:** `pgtrickle.relay_outbox_config`,
+`pgtrickle.relay_inbox_config`, `pgtrickle.relay_consumer_offsets` for the
+relay CLI binary.
+
+**New SQL functions:** `pgtrickle.set_relay_outbox(...)`,
+`pgtrickle.set_relay_inbox(...)`, `pgtrickle.enable_relay(name)`,
+`pgtrickle.disable_relay(name)`, `pgtrickle.delete_relay(name)`,
+`pgtrickle.get_relay_config(name)`, `pgtrickle.list_relay_configs()`.
+
+**New binary:** `pgtrickle-relay` — standalone relay CLI. No PostgreSQL
+configuration changes required to use the extension itself.
+
+No breaking changes.
+
+---
+
+### 0.29.0 → 0.30.0
+
+**No schema changes.** All improvements are confined to the Rust extension
+binary. The migration file (`sql/pg_trickle--0.29.0--0.30.0.sql`) is empty
+other than documentation comments.
+
+**New GUC variables:**
+
+| GUC | Default | Purpose |
+|-----|---------|---------|
+| `pg_trickle.use_sqlstate_classification` | `false` | Locale-safe SQLSTATE-based retry classification |
+| `pg_trickle.template_cache_max_age_hours` | `168` | Max age for L2 template-cache entries (hours) |
+| `pg_trickle.max_parse_nodes` | `0` | Parser node-count guard (0 = disabled) |
+
+**Behavioral changes:**
+
+- `restore_from_snapshot()` now returns a typed error
+  (`SnapshotSchemaVersionMismatch`) when the snapshot has no
+  `__pgt_snapshot_version` column (pre-v0.27 snapshots).  Previously it
+  silently treated the missing column as compatible.
+- `snapshot_stream_table()` and `restore_from_snapshot()` now wrap critical
+  operations in PostgreSQL subtransactions.  A failed catalog INSERT rolls
+  back the snapshot table creation, preventing orphan tables.
+- Cross-cycle phantom rows are now cleaned up unconditionally after every
+  differential refresh of a join query.
+
+No breaking changes.
+
+---
+
 ## Supported Upgrade Paths
 
 The following migration hops are available. PostgreSQL chains them

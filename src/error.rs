@@ -86,6 +86,15 @@ pub enum PgTrickleError {
     #[error("SPI error: {0}")]
     SpiError(String),
 
+    /// SCAL-1 (v0.30.0): An SPI error with SQLSTATE code preserved.
+    ///
+    /// Used when `pg_trickle.use_sqlstate_classification = true` to classify
+    /// retryability by 5-character SQLSTATE code instead of English message text.
+    /// The first field is the PostgreSQL integer error code (`pg_sys::ErrorData.sqlerrcode`);
+    /// the second is the human-readable message (may be in any locale).
+    #[error("SPI error [{0}]: {1}")]
+    SpiErrorCode(u32, String),
+
     /// An SPI permission error (SQLSTATE 42xxx) — not retryable.
     ///
     /// F34 (G3.4): Surfaces clear error message when the background worker's
@@ -230,6 +239,9 @@ impl PgTrickleError {
             // retryable. Permission errors (42xxx), constraint violations (23xxx),
             // and division-by-zero are NOT retryable.
             PgTrickleError::SpiError(msg) => classify_spi_error_retryable(msg),
+            // SCAL-1 (v0.30.0): SpiErrorCode uses SQLSTATE for classification —
+            // locale-safe and works with any lc_messages setting.
+            PgTrickleError::SpiErrorCode(code, _msg) => classify_spi_sqlstate_retryable(*code),
             // Permission errors are never retryable.
             PgTrickleError::SpiPermissionError(_) => false,
             _ => false,
@@ -333,6 +345,118 @@ pub fn classify_spi_error_retryable(msg: &str) -> bool {
     true
 }
 
+/// SCAL-1 (v0.30.0): Classify an SPI error by PostgreSQL integer SQLSTATE code.
+///
+/// This function is locale-safe: it classifies by the numeric error code
+/// (`pg_sys::ErrorData.sqlerrcode`) rather than the human-readable message text,
+/// so it works correctly regardless of `lc_messages` setting.
+///
+/// Non-retryable SQLSTATE classes (first 2 chars):
+/// - 42xxx — syntax error or access rule violation (undefined table, column, etc.)
+/// - 23xxx — integrity constraint violation (unique, FK, not-null, check)
+/// - 22xxx — data exception (division by zero, numeric overflow, etc.)
+/// - 28xxx — invalid authorization specification
+///
+/// Retryable SQLSTATE codes:
+/// - 40001 — serialization_failure
+/// - 40P01 — deadlock_detected
+/// - 55P03 — lock_not_available (lock timeout)
+/// - 57014 — query_canceled (statement_timeout)
+/// - 08xxx — connection exception class
+///
+/// Unknown codes default to retryable (conservative).
+///
+/// Used when `PgTrickleError::SpiErrorCode` is constructed (SCAL-1 active).
+pub fn classify_spi_sqlstate_retryable(sqlstate_code: u32) -> bool {
+    // PostgreSQL SQLSTATE codes use MAKE_SQLSTATE('C1','C2','C3','C4','C5').
+    // The numeric value encodes the 5-character code. The class is the first 2 chars.
+    // pgrx/pg_sys exposes integer error codes; we check against known constants.
+    //
+    // The ERRCODE macros below are defined in PostgreSQL's errcodes.h and available
+    // via pg_sys. For SCAL-1 these are replicated as integer literals to avoid
+    // build-time dependencies on the pg_sys bindings for every variant.
+    //
+    // Format: MAKE_SQLSTATE(c1,c2,c3,c4,c5) where each char is 6-bit encoded.
+    // Class = first 2 chars. Non-retryable classes: 42 (syntax/access), 23 (constraint),
+    //         22 (data exception), 28 (auth).  Retryable: 40 (transaction rollback), 08 (conn).
+
+    // Both the non-test and test paths use the class-based helper so that the
+    // classification is locale-independent and doesn't rely on pg_sys::ERRCODE_*
+    // constants (which are not reliably available across all pgrx versions/targets).
+    classify_spi_sqlstate_retryable_for_test(sqlstate_code)
+}
+
+/// Test-only SQLSTATE classification using raw integer codes computed from
+/// PostgreSQL's MAKE_SQLSTATE macro, so tests don't need a live PG backend.
+///
+/// MAKE_SQLSTATE(c1,c2,c3,c4,c5) = ((c1-'A')<<24)|((c2-'A')<<18)|...
+/// For 5 chars c[0..5], each encoded in 6 bits.
+pub fn classify_spi_sqlstate_retryable_for_test(sqlstate_code: u32) -> bool {
+    // Well-known integer codes for tests (from PostgreSQL errcodes.h):
+    // 40001 → serialization_failure   → MAKE_SQLSTATE('4','0','0','0','1')
+    // 40P01 → deadlock_detected       → MAKE_SQLSTATE('4','0','P','0','1')
+    // 55P03 → lock_not_available      → MAKE_SQLSTATE('5','5','P','0','3')
+    // 57014 → query_canceled          → MAKE_SQLSTATE('5','7','0','1','4')
+    // 42xxx → syntax/access errors    → many codes starting with '4','2'
+    // 23xxx → constraint violations   → codes starting with '2','3'
+    // 22xxx → data exceptions         → codes starting with '2','2'
+    //
+    // We use a helper to extract the 5-char string from the integer.
+    let class = sqlstate_class(sqlstate_code);
+    match class.as_str() {
+        "40" => true, // transaction rollback (serialization, deadlock)
+        "08" => true, // connection exception
+        "55" => {
+            // 55P03 = lock_not_available: retryable; others are not
+            let code_str = sqlstate_to_string(sqlstate_code);
+            code_str == "55P03"
+        }
+        "57" => {
+            // 57014 = query_canceled: retryable; others (57P01 admin abort) not
+            let code_str = sqlstate_to_string(sqlstate_code);
+            code_str == "57014"
+        }
+        "42" | "23" | "22" | "28" => false, // permanent errors
+        _ => true,                          // conservative default: retry unknown codes
+    }
+}
+
+/// Extract the 2-character SQLSTATE class from a PostgreSQL integer error code.
+fn sqlstate_class(code: u32) -> String {
+    let s = sqlstate_to_string(code);
+    s.chars().take(2).collect()
+}
+
+/// Convert a PostgreSQL integer SQLSTATE code to its 5-character string representation.
+///
+/// PostgreSQL uses `MAKE_SQLSTATE(c1,c2,c3,c4,c5)` which encodes each character
+/// in 6 bits. Characters 'A'..'Z' map to 1..26; '0'..'9' map to values offset
+/// by the alphabet. Digit characters use an offset that differs from letter chars.
+/// This reverses that encoding.
+pub fn sqlstate_to_string(code: u32) -> String {
+    // PostgreSQL MAKE_SQLSTATE packs chars as:
+    //   result = 0
+    //   for each char c (left to right):
+    //       result = (result << 6) | encode(c)
+    // where encode('A'..='Z') = 1..26, encode('0'..='9') = 27..36.
+    // Unpack: extract 6-bit groups from MSB to LSB.
+    let mut chars = Vec::with_capacity(5);
+    let mut v = code;
+    for _ in 0..5 {
+        let c6 = (v >> 24) & 0x3F;
+        v <<= 6;
+        let ch = if (1..=26).contains(&c6) {
+            (b'A' + (c6 as u8 - 1)) as char
+        } else if (27..=36).contains(&c6) {
+            (b'0' + (c6 as u8 - 27)) as char
+        } else {
+            '?'
+        };
+        chars.push(ch);
+    }
+    chars.into_iter().collect()
+}
+
 /// Classification of error severity/kind for monitoring.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PgTrickleErrorKind {
@@ -381,6 +505,7 @@ impl PgTrickleError {
             | PgTrickleError::ReplicationSlotError(_)
             | PgTrickleError::WalTransitionError(_)
             | PgTrickleError::SpiError(_)
+            | PgTrickleError::SpiErrorCode(_, _)
             | PgTrickleError::RefreshSkipped(_) => PgTrickleErrorKind::System,
 
             // F34: Permission errors are user-facing, not system-level.

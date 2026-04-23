@@ -561,6 +561,13 @@ pub extern "C-unwind" fn pg_trickle_launcher_main(_arg: pg_sys::Datum) {
     // so DROP EXTENSION + CREATE EXTENSION doesn't stall for 5 minutes.
     let retry_ttl = std::time::Duration::from_secs(15);
 
+    // STAB-3 (v0.30.0): Track last time we ran the age-based template-cache purge.
+    // The purge runs at most once per hour per launcher tick to avoid per-tick
+    // catalog load. It is not per-database (the launcher connects to `postgres`).
+    let last_cache_purge = std::time::Instant::now()
+        .checked_sub(std::time::Duration::from_secs(7200))
+        .unwrap_or_else(std::time::Instant::now);
+
     loop {
         // ── Collect all connectable, non-template databases  ──────────────
         let databases: Vec<String> = BackgroundWorker::transaction(AssertUnwindSafe(|| {
@@ -688,6 +695,12 @@ pub extern "C-unwind" fn pg_trickle_launcher_main(_arg: pg_sys::Datum) {
                 }
             }
         }
+
+        // STAB-3 (v0.30.0): Age-based purge of the L2 catalog template cache.
+        // Run at most once per hour. The launcher connects to `postgres` which
+        // does not have pg_trickle installed, so we skip the purge here — the
+        // per-database scheduler workers run the purge in their own DB context.
+        let _ = last_cache_purge; // suppress unused-variable warning
 
         // Wake every 10 s or on SIGHUP/SIGTERM.
         let should_continue =
@@ -2912,6 +2925,24 @@ pub extern "C-unwind" fn pg_trickle_scheduler_main(_arg: pg_sys::Datum) {
                 monitor::check_cdc_trigger_health();
             }));
             last_trigger_health_ms = now_for_trigger_check;
+
+            // STAB-3 (v0.30.0): Age-based purge of the L2 catalog template cache.
+            // Runs on the same ~60s cadence as the CDC trigger health check to
+            // avoid adding another time-tracking variable.
+            let max_age_hours = config::pg_trickle_template_cache_max_age_hours();
+            if max_age_hours > 0 {
+                BackgroundWorker::transaction(AssertUnwindSafe(|| {
+                    let purged = crate::template_cache::purge_stale_entries(max_age_hours);
+                    if purged > 0 {
+                        pgrx::log!(
+                            "[pg_trickle] STAB-3: purged {} stale template cache entries \
+                             older than {} hours",
+                            purged,
+                            max_age_hours,
+                        );
+                    }
+                }));
+            }
         }
 
         // WM-7: Periodic stuck-watermark detection and alerting (~every 60s).

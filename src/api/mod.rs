@@ -301,6 +301,21 @@ fn raise_error_with_context(e: PgTrickleError) -> ! {
             .report(PgLogLevel::ERROR);
             unreachable!()
         }
+        PgTrickleError::SpiErrorCode(code, msg) => {
+            ErrorReport::new(
+                PgSqlErrorCode::ERRCODE_INTERNAL_ERROR,
+                format!("SPI error [{}]: {}", code, msg),
+                "",
+            )
+            .set_hint(
+                "An internal query failed with a specific SQLSTATE code. \
+                 This may be transient — retry the operation. \
+                 If it persists, check the PostgreSQL log for details."
+                    .to_string(),
+            )
+            .report(PgLogLevel::ERROR);
+            unreachable!()
+        }
         PgTrickleError::SpiPermissionError(msg) => {
             ErrorReport::new(
                 PgSqlErrorCode::ERRCODE_INSUFFICIENT_PRIVILEGE,
