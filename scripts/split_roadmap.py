@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-Split ROADMAP.md into per-version files in the roadmap/ directory.
+Split the old monolithic ROADMAP.md into per-version files in the roadmap/ directory.
 Each section starting with '## v' becomes roadmap/vX.Y.Z.md-full.md
-Then update roadmap/README.md to add a 'Full details' column.
+Then update ROADMAP.md to add a 'Full details' column.
 """
 
 import re
@@ -56,10 +56,7 @@ def split_roadmap():
         filename = f"{slug}.md-full.md"
         out_path = ROADMAP_DIR / filename
 
-        header_note = (
-            f"> This file is extracted from [ROADMAP.md](../ROADMAP.md). "
-            f"See that file for the full technical roadmap.\n\n"
-        )
+        header_note = "> **See also:** [ROADMAP.md](../ROADMAP.md)\n\n"
 
         content = header_note + "".join(section_lines) + "\n"
         out_path.write_text(content, encoding="utf-8")
@@ -70,7 +67,7 @@ def split_roadmap():
 
 
 def update_readme(created_files):
-    readme_path = ROADMAP_DIR / "README.md"
+    readme_path = Path("ROADMAP.md")
     text = readme_path.read_text(encoding="utf-8")
 
     # Build a lookup: version slug → filename
@@ -135,7 +132,7 @@ def update_readme(created_files):
         i += 1
 
     readme_path.write_text("".join(new_lines), encoding="utf-8")
-    print(f"\n  updated: roadmap/README.md")
+    print(f"\n  updated: ROADMAP.md")
 
 
 if __name__ == "__main__":
@@ -148,6 +145,6 @@ if __name__ == "__main__":
     created = split_roadmap()
     print(f"\nCreated {len(created)} files.")
 
-    print("\nUpdating roadmap/README.md...")
+    print("\nUpdating ROADMAP.md...")
     update_readme(created)
     print("Done.")
