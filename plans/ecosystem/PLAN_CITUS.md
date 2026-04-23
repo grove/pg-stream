@@ -1,702 +1,577 @@
 # PLAN_CITUS.md — Citus Compatibility for pg_trickle
 
+> **Date:** 2026-04-23
+> **Status:** PROPOSED
+> **Targets:** Citus 13.x on PostgreSQL 18.x
+> **Supersedes:** previous draft of this file (pre-WAL-decoder, pre-relay)
+
 ## 1. Executive Summary
 
-This plan makes pg_trickle work transparently with Citus-distributed source tables and optionally distributed ST storage tables, with auto-detection at runtime. The extension currently has **zero multi-node awareness** — every core module assumes a single PostgreSQL instance with local OIDs, local WAL, local triggers, and a single background worker.
+pg_trickle today targets a single PostgreSQL instance. Citus changes three
+load-bearing assumptions:
 
-The plan touches all 13 source files across 7 phases, replacing OID-based naming with stable identifiers, LSN-based frontiers with a coordinator-managed logical sequence, local-only triggers with worker-propagated triggers, and single-node MERGE with Citus-compatible apply logic.
+1. **OIDs are local.** A distributed table has a different OID on every
+   worker; the coordinator OID may not even point at any data.
+2. **WAL is local.** Each worker has its own WAL stream;
+   `pg_current_wal_lsn()` on the coordinator says nothing about what
+   happened on workers.
+3. **DML lands on workers, not the coordinator.** Coordinator triggers
+   never fire for DML against a distributed table — Citus rewrites the
+   statement and ships shard-targeted SQL straight to the workers.
 
-**Estimated scope:** ~6 months of focused engineering.
+**Crucially, pg_trickle has changed since the previous Citus plan was
+written.** Two features turn what was a 6‑month rewrite into a
+much narrower integration:
 
-**Target:** Citus 13.x on PostgreSQL 18 (the extension already targets PG 18 exclusively).
+- **WAL-based CDC** ([src/wal_decoder.rs](src/wal_decoder.rs)) — pg_trickle
+  can already capture changes from a logical replication slot using
+  `pg_logical_slot_get_changes()` polling, with a documented
+  `TRIGGER → TRANSITIONING → WAL` lifecycle. Slots and publications can
+  live on **other PostgreSQL nodes**; the polling SPI just needs a
+  connection. This lines up exactly with the user-suggested architecture
+  in [discussion #619](https://github.com/grove/pg-trickle/discussions/619):
+  publications + slots on workers, consumed from the coordinator.
+- **Outbox + `pgtrickle-relay`** (v0.28.0–0.29.0) give us a battle-tested
+  way to **fan deltas out across nodes** (NATS / Kafka / HTTP / pg-inbox)
+  with idempotent delivery and consumer-group leases. We can reuse this
+  for the inverse problem too: relay deltas **between** PostgreSQL
+  nodes inside the same Citus cluster when triggers can't be propagated.
 
----
+Result: **the Citus path is a per-source CDC backend choice plus a
+storage-table placement decision**, not a wholesale rearchitecture.
 
-## 2. Current Incompatibilities
-
-### 2.1. OID-Based Change Buffer Naming (HIGH — pervasive)
-
-Change buffer tables are named `pg_trickle_changes.changes_<oid>` where `<oid>` is the **local PostgreSQL OID** of the source table. OIDs are **not globally unique** across Citus nodes. A table distributed across worker nodes will have different OIDs on each worker. The coordinator OID ≠ worker OIDs.
-
-**~25 locations** across `src/cdc.rs`, `src/refresh.rs`, `src/dvm/operators/scan.rs`, `src/dvm/operators/aggregate.rs`, `src/dvm/operators/recursive_cte.rs`.
-
-Affected patterns:
-- Table creation: `CREATE TABLE IF NOT EXISTS {schema}.changes_{oid}`
-- Trigger creation: `INSERT INTO {change_schema}.changes_{oid}`
-- Trigger naming: `pg_trickle_cdc_{oid}`
-- Function naming: `pg_trickle_cdc_fn_{oid}`
-- Index creation: `idx_changes_{oid}_lsn_pk_cid`
-- Cleanup: `DELETE FROM {schema}.changes_{oid}`
-- Delta CTE SQL: `"{}.changes_{}"` keyed by `table_oid`
-- Frontier storage: JSONB keyed by `"oid_string"` in `pg_trickle.pgt_stream_tables.frontier`
-
-### 2.2. `pg_current_wal_lsn()` as Change Frontier (HIGH — architectural)
-
-The entire CDC and frontier system depends on WAL LSN as an ordering/versioning mechanism. In Citus, each worker has its own WAL with independent LSN sequences. `pg_current_wal_lsn()` on worker A returns a value incomparable to worker B.
-
-Affected code:
-- Trigger function: `VALUES (pg_current_wal_lsn(), 'I', ...)` — 7 call sites in `src/cdc.rs`
-- `get_current_wal_lsn()` in `src/cdc.rs` (L380-L387)
-- `SourceVersion.lsn` in `src/version.rs` (L37-L43)
-- `Frontier.sources` HashMap keyed by OID string in `src/version.rs` (L29-L34)
-- Change detection query: `WHERE lsn > ... AND lsn <=` in `src/refresh.rs` (L375-L393)
-- LSN placeholder generation: `__PGS_PREV_LSN_{oid}__` in `src/dvm/diff.rs` (L122-L137)
-- LSN resolution: `resolve_lsn_placeholders()` in `src/refresh.rs` (L59-L72)
-
-### 2.3. Trigger-based CDC on Distributed Tables (HIGH — fundamental)
-
-Triggers are created on the coordinator but DML on distributed tables executes on workers. Citus does **not propagate** arbitrary triggers to workers. DML goes to workers directly, bypassing coordinator triggers entirely. Only Citus reference tables fire triggers on the coordinator.
-
-Affected code:
-- `CREATE TRIGGER ... ON {source_table}` in `src/cdc.rs` (L135-L145)
-- `trigger_exists()` check in `src/cdc.rs` (L570-L576) — queries `pg_trigger` on local node
-- `setup_cdc_for_source()` in `src/api.rs` (L519-L550)
-
-### 2.4. MERGE Statement Compatibility (MEDIUM — query generation)
-
-Citus has limited MERGE support. The USING subquery references local change buffer tables while the target may be distributed. JOIN between a distributed ST table and a local change buffer is a cross-shard join.
-
-Affected code:
-- MERGE generation in `src/refresh.rs` (L165-L175) — 2 MERGE templates
-- `CachedMergeTemplate` in `src/refresh.rs` (L28-L52)
-
-### 2.5. Shared Memory & Background Worker (MEDIUM — coordination)
-
-1 background worker, 2 shared memory structures. All coordinator-local. Advisory locks are node-local.
-
-Affected code:
-- `BackgroundWorkerBuilder::new("pg_trickle scheduler")` in `src/scheduler.rs` (L41-L48)
-- `PGS_STATE: PgLwLock<PgTrickleSharedState>` in `src/shmem.rs` (L31)
-- `DAG_REBUILD_SIGNAL: PgAtomic<AtomicU64>` in `src/shmem.rs` (L37)
-- `pg_try_advisory_lock(st.pgt_id)` in `src/scheduler.rs` (L281-L296, L425-L431)
-
-### 2.6. System Catalog & Row Estimates (LOW — manageable)
-
-`pg_class.reltuples` on the coordinator only reflects the coordinator's local shard (which is empty for distributed tables). Event triggers fire only on the coordinator.
-
-Affected code:
-- `pg_class WHERE oid = {oid}::oid` in `src/refresh.rs` (L371-L393)
-- `pg_event_trigger_ddl_commands()` in `src/hooks.rs` (L55)
+**Scope target:** correctness on a stable Citus topology
+(no automatic shard rebalancing, no failover during refresh — both
+explicit constraints from the discussion thread). Rebalance support is a
+follow-up release.
 
 ---
 
-## 3. Design Decisions
+## 2. What Changed Since the Previous Plan
+
+| Old assumption | Reality (v0.29.0) |
+|---|---|
+| CDC is trigger-only | Two backends: triggers and a WAL decoder, with hot transition |
+| `src/api.rs` | Split into [src/api/mod.rs](src/api/mod.rs) + 9 submodules (`cluster`, `publication`, `inbox`, `outbox`, `planner`, `snapshot`, `self_monitoring`, `helpers`, `metrics_ext`, `diagnostics`) |
+| `src/refresh.rs` | Split into [src/refresh/mod.rs](src/refresh/mod.rs) + `codegen.rs`, `merge.rs`, `orchestrator.rs`, `phd1.rs`, `tests.rs` |
+| Schemas `pg_trickle` / `pg_trickle_changes` | `pgtrickle` / `pgtrickle_changes` |
+| Row-level triggers only | Statement-level triggers default (transition tables, 3 triggers per source) |
+| MERGE only | MERGE plus alternative apply paths (`refresh/merge.rs`, append-only fast path) |
+| No downstream API | `stream_table_to_publication()` exposes ST storage tables for logical replication |
+| No relay | `pgtrickle-relay` Rust binary bridges outbox/inbox with NATS, Kafka, HTTP, Redis, SQS, RabbitMQ, pg-inbox |
+| LSN-only frontier | Frontier still LSN-based, but now per-source and tracked in `pgtrickle.pgt_change_tracking`; ST chains use `changes_pgt_<pgt_id>` |
+| Single-node scheduler only | Multi-tenant scheduler, tiered scheduling, parallel refresh, per-DB metrics ([src/api/cluster.rs](src/api/cluster.rs)) |
+| Partitioned sources unsupported | Fully supported with `publish_via_partition_root = true` (CDC-2) |
+
+The naming and frontier work the old plan called for is **still
+required**, but it now lands on top of a much more flexible CDC layer.
+
+---
+
+## 3. Citus-Specific Incompatibilities (current code)
+
+### 3.1 OID-keyed object naming (HIGH — pervasive)
+
+`pgtrickle_changes.changes_<oid>` and trigger / function names embed the
+**local** OID of the source table:
+
+- [src/cdc.rs](src/cdc.rs#L94) — `create_change_trigger`, names like
+  `pg_trickle_cdc_ins_{oid}`, `pg_trickle_cdc_fn_{oid}`
+- [src/cdc.rs](src/cdc.rs#L541) — `create_change_buffer_table`,
+  `changes_{oid}` and `idx_changes_{oid}_lsn_pk_cid`
+- [src/cdc.rs](src/cdc.rs#L860) — compaction queries by OID
+- [src/wal_decoder.rs](src/wal_decoder.rs#L48-L54) — `slot_name_for_source`
+  and `publication_name_for_source` use `oid.to_u32()`
+- [src/dvm/diff.rs](src/dvm/diff.rs) — `__PGS_PREV_LSN_{oid}__`
+  placeholder tokens
+- Catalog columns in [src/lib.rs](src/lib.rs) — `source_relid OID` joins
+
+A distributed table has a different OID on every worker. Even with
+`publish_via_partition_root = true`, the publication name on each worker
+must match a coordinator-side identifier. **OID is the wrong key in a
+multi-node world.**
+
+### 3.2 Trigger-based CDC on distributed tables (HIGH)
+
+Citus does not propagate `CREATE TRIGGER` to workers. DML on a hash-distributed
+table never triggers a coordinator-side `pg_trickle_cdc_*` function. **Reference
+tables** are the exception — they live on every node including the coordinator,
+so coordinator triggers do fire.
+
+Affected:
+- [src/cdc.rs](src/cdc.rs#L94-L280)
+- [src/api/mod.rs](src/api/mod.rs) `setup_cdc_for_source`-equivalent paths
+- [src/hooks.rs](src/hooks.rs) DDL event triggers — only fire on the
+  coordinator
+
+### 3.3 LSN as a global frontier (MEDIUM — narrower than before)
+
+`pg_current_wal_lsn()` is per-node. The good news is that the WAL decoder
+already operates on **per-source slot LSNs**, not the global cluster
+LSN, so the change buffer is happy to carry whatever LSN-shaped value
+the source produced. The bad news is that comparison logic
+(`lsn_gt`, frontier merging, placeholder substitution in
+[src/refresh/codegen.rs](src/refresh/codegen.rs#L1170)) implicitly
+assumes one LSN namespace.
+
+Affected:
+- [src/version.rs](src/version.rs) — `SourceVersion`, `Frontier.sources`
+- [src/refresh/codegen.rs](src/refresh/codegen.rs#L937-L1453) — LSN
+  literals embedded in SQL
+- [src/scheduler.rs](src/scheduler.rs#L1027-L1054) — global watermark gating
+- [src/api/publication.rs](src/api/publication.rs#L597) — replication-lag
+  metrics
+
+### 3.4 MERGE / row-id apply on distributed STs (MEDIUM)
+
+[src/refresh/codegen.rs](src/refresh/codegen.rs#L2088) generates
+`MERGE INTO {st} USING (delta) ON st.__pgt_row_id = d.__pgt_row_id`. Citus
+support for MERGE is improving but still constrained: cross-shard MERGE
+is rejected, the USING side must co-locate, and `__pgt_row_id` is a
+synthesized BIGINT that has no natural distribution key.
+
+### 3.5 Coordination is node-local (MEDIUM)
+
+- `pg_try_advisory_lock` in [src/scheduler.rs](src/scheduler.rs)
+- Shared memory state in [src/shmem.rs](src/shmem.rs)
+- LISTEN/NOTIFY (`pgtrickle_wake`) — only delivered to backends connected
+  to the same node
+
+### 3.6 Catalog estimates (LOW)
+
+`pg_class.reltuples` for a distributed table on the coordinator reflects
+only the (usually empty) local placeholder. The DAG planner uses this in
+[src/dag.rs](src/dag.rs) and the cost model in v0.22.0
+predictive-cost code paths.
+
+### 3.7 Things that already work
+
+- **Reference tables** — coordinator triggers fire; current code works
+  unchanged for reference-only sources.
+- **Local tables in a Citus cluster** — same.
+- **Stream table storage on the coordinator** — STs are just regular
+  tables; if all sources are local/reference and you keep the ST local
+  too, nothing changes.
+- **Outbox / inbox / `stream_table_to_publication`** — already speak
+  logical replication, so they cross node boundaries today as long as
+  the consumer can reach the coordinator.
+
+---
+
+## 4. Design Decisions
 
 | Concern | Decision | Rationale |
-|---------|----------|-----------|
-| **Naming** | Deterministic schema-name hash | Survives pg_dump/restore, predictable across nodes without coordination |
-| **Frontier** | Citus-distributed sequence | Single total ordering without multi-frontier merge logic |
-| **Change buffer placement** | Citus-distributed table | Best balance of write performance (local writes) and read simplicity (coordinator queries route to all workers) |
-| **MERGE replacement** | INSERT ON CONFLICT + DELETE | Fully supported by Citus for distributed tables; MERGE support is limited |
-| **Scheduler location** | Coordinator-only | Citus naturally routes distributed queries from coordinator; avoids multi-scheduler coordination |
-| **Lock mechanism** | Catalog-based locks | Advisory locks are node-local; catalog locks are visible cluster-wide |
-| **DAG signaling** | LISTEN/NOTIFY | Works across connections, naturally HA-safe; replaces shared memory atomics |
-| **Detection** | Auto-detect Citus at runtime | Users don't need to set a GUC; extension adapts behavior automatically |
-| **Backward compat** | OID columns kept alongside stable_name | Non-Citus deployments continue with zero behavior change; Citus path is additive |
+|---|---|---|
+| **Default CDC backend for distributed sources** | WAL decoder against per-worker slots | Triggers don't propagate; this is also what discussion #619 asked for |
+| **Naming** | Stable hash of `(database_oid, schema_name, table_name)` | Identical on every node, survives OID churn and pg_dump/restore |
+| **Frontier** | Per-source LSN keyed by stable name; **no global frontier** | LSNs are per-WAL; we already track per-source frontiers, just need cross-node identity |
+| **ST storage placement** | User-selectable, auto-suggested: `local` (default), `reference`, `distributed` | Mirrors Citus's own table types; small reference STs avoid join blowups |
+| **MERGE replacement (distributed STs)** | `DELETE … WHERE __pgt_row_id IN (...)` + `INSERT … ON CONFLICT (__pgt_row_id) DO UPDATE` | Citus-supported; same semantics |
+| **Worker→coordinator transport** | Logical replication (publications + slots) — **no triggers on workers** | Matches WAL-decoder model already in tree; zero new write-path overhead |
+| **Reference-table sources** | Keep trigger CDC path | Already works; no reason to change |
+| **Locking** | Catalog table for cross-node locks; advisory locks remain the local fast path | Advisory locks are node-local |
+| **Wake signalling** | `LISTEN/NOTIFY` on coordinator only; workers don't run a scheduler | Single scheduler per database (today's model) is fine for Citus |
+| **Detection** | Auto-detect Citus at extension load + per-source at create time | No new GUC required for the common case |
+| **Rebalance** | Out of scope for v1 (matches user's constraint in #619) | Slot location follows shard placement; rebalance would invalidate slots |
 
 ---
 
-## 4. Implementation Phases
+## 5. Architecture
 
-### Phase 1: Citus Detection & Abstraction Layer (~2 weeks)
-
-**Goal:** Add runtime Citus detection and introduce table placement abstractions used throughout subsequent phases.
-
-**P1.1: Create `src/citus.rs` module**
-
-Add a new module with detection utilities:
-
-```rust
-/// Check if Citus extension is loaded
-pub fn is_citus_available() -> bool
-// Queries: SELECT 1 FROM pg_extension WHERE extname = 'citus'
-
-/// Check if a table is Citus-distributed
-pub fn is_distributed_table(oid: pg_sys::Oid) -> bool
-// Queries: SELECT 1 FROM pg_dist_partition WHERE logicalrelid = $1
-
-/// Check if a table is a Citus reference table
-pub fn is_reference_table(oid: pg_sys::Oid) -> bool
-// Queries: SELECT partmethod = 'n' FROM pg_dist_partition WHERE logicalrelid = $1
-
-/// Get the distribution column for a distributed table
-pub fn get_distribution_column(oid: pg_sys::Oid) -> Option<String>
-// Queries: SELECT column_to_column_name(logicalrelid, partkey)
-//          FROM pg_dist_partition WHERE logicalrelid = $1
-
-/// Get all worker nodes in the cluster
-pub fn get_worker_nodes() -> Vec<(String, i32)>
-// Queries: SELECT nodename, nodeport FROM pg_dist_node WHERE isactive AND noderole = 'primary'
-
-/// Execute SQL on all nodes (coordinator + workers)
-pub fn run_on_all_nodes(sql: &str) -> Result<(), PgTrickleError>
-// Wraps: SELECT run_command_on_all_nodes($1)
-
-/// Execute SQL on workers only
-pub fn run_on_workers(sql: &str) -> Result<(), PgTrickleError>
-// Wraps: SELECT run_command_on_workers($1)
+```
+        ┌──────────────────────────  COORDINATOR  ──────────────────────────┐
+        │                                                                   │
+        │   pg_trickle scheduler ─┐                                         │
+        │                         │                                         │
+        │   ┌─────────────────────▼──────────────────────┐                  │
+        │   │ pgtrickle_changes.changes_<stable_hash>    │  (one per source)│
+        │   │   ▲                                         │                 │
+        │   └───┼─────────────────────────────────────────┘                 │
+        │       │            ▲                       ▲                      │
+        │       │ trigger    │ pg_logical_slot_get_changes (over dblink     │
+        │       │ (local +   │  / postgres_fdw / libpq) per worker          │
+        │       │  reference)│                                              │
+        │       │            │                       │                      │
+        │   ┌───┴────────┐   │                       │                      │
+        │   │ Local /    │   │                       │                      │
+        │   │ reference  │   │                       │                      │
+        │   │ tables     │   │                       │                      │
+        │   └────────────┘   │                       │                      │
+        │                                                                   │
+        │   STs:  local | citus reference | citus distributed (__pgt_row_id)│
+        └───┼───────────────┼───────────────────────┼──────────────────────┘
+            │               │                       │
+        ┌───▼────┐      ┌───▼────┐              ┌───▼────┐
+        │WORKER 1│      │WORKER 2│      …       │WORKER N│
+        │        │      │        │              │        │
+        │ shard  │      │ shard  │              │ shard  │
+        │ tables │      │ tables │              │ tables │
+        │  +     │      │  +     │              │  +     │
+        │  pub   │      │  pub   │              │  pub   │
+        │  +     │      │  +     │              │  +     │
+        │  slot  │      │  slot  │              │  slot  │
+        └────────┘      └────────┘              └────────┘
 ```
 
-**P1.2: Introduce `TablePlacement` enum**
+Two CDC paths coexist:
 
-```rust
-pub enum TablePlacement {
-    Local,
-    CitusReference,
-    CitusDistributed { dist_column: String },
-}
-```
+- **Reference / local sources** — current trigger pipeline, unchanged.
+- **Distributed sources** — coordinator creates a publication and a
+  logical slot **on every worker** that hosts a shard of the source. The
+  scheduler polls each slot via libpq (reusing the WAL-decoder code in
+  [src/wal_decoder.rs](src/wal_decoder.rs)) and writes decoded rows into
+  the coordinator's `changes_<stable_hash>` buffer.
 
-Used throughout the codebase to branch behavior.
-
-**P1.3: Enrich source dependencies with placement**
-
-- Add `source_placement TEXT` column to `pg_trickle.pgt_dependencies` in `src/lib.rs`
-- In `extract_source_relations()` at `src/api.rs` (L702), after resolving OIDs, call `citus::is_distributed_table()` / `citus::is_reference_table()` to determine each source's placement
-- Store placement in `StDependency` struct in `src/catalog.rs`
-
-**Files modified:** `src/citus.rs` (new), `src/lib.rs`, `src/api.rs`, `src/catalog.rs`
+The decoder already speaks `pgoutput`, already handles INSERT/UPDATE/
+DELETE/TRUNCATE, already understands REPLICA IDENTITY FULL vs DEFAULT,
+and already advances the slot when the refresh commits. It does **not**
+yet know how to talk to a remote node — that is the principal new code
+in this plan.
 
 ---
 
-### Phase 2: Stable Naming — Replace OID-Based Identifiers (~2 weeks)
+## 6. Implementation Phases
 
-**Goal:** Replace all OID-based object naming with a deterministic stable hash that is identical across Citus nodes.
+### Phase 1 — Citus Detection + Stable Naming (foundation)
 
-**P2.1: Introduce `SourceIdentifier` type**
+**Goal:** Land the additive groundwork that benefits even non-Citus
+deployments, with no behaviour change on single-node.
 
-```rust
-pub struct SourceIdentifier {
-    pub oid: pg_sys::Oid,
-    pub stable_name: String,  // pg_trickle_hash(schema_name || '.' || table_name)
-}
-```
+**P1.1 — `src/citus.rs` module.** Detection helpers:
 
-The `stable_name` is a deterministic short hash of the fully-qualified table name. This survives pg_dump/restore and is identical across all Citus nodes.
+- `is_citus_loaded()` — `SELECT 1 FROM pg_extension WHERE extname='citus'`
+- `placement(oid)` → `Local | Reference | Distributed { dist_column }`
+  via `pg_dist_partition`
+- `worker_nodes()` → `Vec<NodeAddr>` from `pg_dist_node`
+- `shard_placements(table_oid)` — which workers actually host shards
+- Wraps `run_command_on_workers(...)` and `run_command_on_all_nodes(...)`
 
-**P2.2: Rename change buffer objects**
+**P1.2 — `SourceIdentifier`.** Carries `(oid, stable_name)`.
+`stable_name = stable_hash(database_oid || '/' || schema_name ||
+'.' || table_name)` (16-char hex). Serialised in catalog and used in
+all object names.
 
-Replace `changes_{oid}` with `changes_{stable_hash}` in all locations:
-
-| Location | Current | New |
-|----------|---------|-----|
-| `src/cdc.rs` `create_change_buffer_table()` (L209) | `changes_{oid}` | `changes_{stable_hash}` |
-| `src/cdc.rs` `create_change_trigger()` (L37) | `pg_trickle_cdc_fn_{oid}` | `pg_trickle_cdc_fn_{stable_hash}` |
-| `src/cdc.rs` trigger name (L577) | `pg_trickle_cdc_{oid}` | `pg_trickle_cdc_{stable_hash}` |
-| `src/cdc.rs` index name (L245-L259) | `idx_changes_{oid}_*` | `idx_changes_{stable_hash}_*` |
-| `src/cdc.rs` `delete_consumed_changes()` (L430) | `changes_{oid}` | `changes_{stable_hash}` |
-| `src/refresh.rs` cleanup (L617-L624) | `changes_{oid}` | `changes_{stable_hash}` |
-| `src/dvm/operators/scan.rs` (L52) | `changes_{oid}` | `changes_{stable_hash}` |
-| `src/dvm/operators/aggregate.rs` (L116) | `changes_{oid}` | `changes_{stable_hash}` |
-| `src/dvm/operators/recursive_cte.rs` (L117) | `changes_{oid}` | `changes_{stable_hash}` |
-
-**P2.3: Update frontier key format**
-
-- `Frontier.sources` HashMap in `src/version.rs` (L29): Key changes from OID string to `stable_name`
-- `get_lsn(source_oid)` → `get_lsn(stable_name)` and all callers
-- `set_source(source_oid, ...)` → `set_source(stable_name, ...)`
-- JSONB serialization automatically adapts (no schema change needed)
-
-**P2.4: Update LSN placeholder tokens**
-
-- `DiffContext.get_prev_lsn()` / `get_new_lsn()` in `src/dvm/diff.rs` (L122-L137): `__PGS_PREV_LSN_{stable_name}__`
-- `resolve_lsn_placeholders()` in `src/refresh.rs` (L59-L72): Match new placeholder format
-
-**P2.5: Catalog migration**
-
-- Add `source_stable_name TEXT` column to `pg_trickle.pgt_dependencies` and `pg_trickle.pgt_change_tracking` in `src/lib.rs`
-- OID columns kept for local lookups; `stable_name` becomes the join key for cross-node operations
-- Write SQL migration (`ALTER EXTENSION ... UPDATE`) that backfills `stable_name` for existing tracked sources by joining `pg_class` + `pg_namespace`
-
-**Files modified:** `src/cdc.rs`, `src/version.rs`, `src/dvm/diff.rs`, `src/refresh.rs`, `src/dvm/operators/scan.rs`, `src/dvm/operators/aggregate.rs`, `src/dvm/operators/recursive_cte.rs`, `src/lib.rs`, `src/catalog.rs`, `src/api.rs`
-
----
-
-### Phase 3: Logical Sequence Frontier — Replace WAL LSN (~3 weeks)
-
-**Goal:** Replace `pg_current_wal_lsn()` with a coordinator-managed monotonic sequence that provides a single total ordering across all nodes.
-
-**P3.1: Create coordinator sequence**
-
-Add to catalog DDL in `src/lib.rs`:
+**P1.3 — Catalog migration.** Add nullable columns; old rows continue to
+function with OID-derived synthetic stable names:
 
 ```sql
-CREATE SEQUENCE pg_trickle.change_seq;
+ALTER TABLE pgtrickle.pgt_change_tracking
+  ADD COLUMN source_stable_name TEXT,
+  ADD COLUMN source_placement TEXT NOT NULL DEFAULT 'local';
+ALTER TABLE pgtrickle.pgt_dependencies
+  ADD COLUMN source_stable_name TEXT,
+  ADD COLUMN source_placement TEXT NOT NULL DEFAULT 'local';
+ALTER TABLE pgtrickle.pgt_stream_tables
+  ADD COLUMN st_placement TEXT NOT NULL DEFAULT 'local';
+CREATE SCHEMA IF NOT EXISTS pgtrickle_changes;  -- already exists
 ```
 
-This provides globally-ordered, monotonically-increasing values that replace `pg_current_wal_lsn()`.
+**P1.4 — Rename buffer objects.** Replace `changes_{oid}`,
+`pg_trickle_cdc_*_{oid}`, `idx_changes_{oid}_*` and the LSN
+placeholder tokens in [src/dvm/diff.rs](src/dvm/diff.rs) with
+`{stable_name}`. Provide an upgrade SQL script that renames in place
+(stable hash of existing source row).
 
-**P3.2: Introduce `FrontierMode` enum**
+**Files:** `src/citus.rs` (new), `src/lib.rs`, `src/catalog.rs`,
+`src/cdc.rs`, `src/wal_decoder.rs`, `src/dvm/diff.rs`,
+`src/refresh/codegen.rs`, `src/dvm/operators/*`, `sql/pg_trickle--<n>--<n+1>.sql`.
 
-```rust
-pub enum FrontierMode {
-    Lsn,         // Single-node: use pg_current_wal_lsn()
-    LogicalSeq,  // Citus: use nextval('pg_trickle.change_seq')
-}
-```
-
-Determined at ST creation time based on whether any source is `CitusDistributed`.
-
-**P3.3: Dual-mode trigger function**
-
-Modify the trigger function template in `src/cdc.rs` (L102-L131):
-
-- **Local/reference sources:** Keep `pg_current_wal_lsn()` for backward compatibility
-- **Distributed sources:** Use `nextval('pg_trickle.change_seq')` instead:
-  ```sql
-  VALUES (nextval('pg_trickle.change_seq'), 'I', ...);
-  ```
-
-**P3.4: Dual-mode change buffer schema**
-
-For distributed sources, the `lsn PG_LSN` column in change buffer tables (`src/cdc.rs` L212) becomes `seq_id BIGINT`. The covering index changes from `(lsn, pk_hash, change_id)` to `(seq_id, pk_hash, change_id)`.
-
-**P3.5: Extend `SourceVersion` with versioning modes**
-
-In `src/version.rs` (L37-L43):
-
-```rust
-pub enum VersionMarker {
-    Lsn(String),   // e.g. "0/1A2B3C4"
-    Seq(i64),      // e.g. 42000
-}
-```
-
-Update all frontier comparison logic. The `lsn_gt()` comparator at L109 needs a `seq_gt()` counterpart (simple integer comparison).
-
-**P3.6: Update frontier acquisition**
-
-`get_current_wal_lsn()` in `src/cdc.rs` (L380) becomes `get_current_frontier_position()`:
-- Local mode: Returns `VersionMarker::Lsn(pg_current_wal_lsn())`
-- Citus mode: Returns `VersionMarker::Seq(currval('pg_trickle.change_seq'))`
-
-**P3.7: Update change detection query**
-
-In `src/refresh.rs` (L375-L393), the `WHERE lsn > ... AND lsn <=` clause becomes `WHERE seq_id > ... AND seq_id <=` for sequence-mode sources.
-
-**P3.8: Distributed sequence propagation**
-
-Citus sequences on the coordinator are not automatically available on workers. Options:
-1. Use `citus.enable_ddl_propagation` to propagate `CREATE SEQUENCE`
-2. Use `run_command_on_workers()` to create matching sequence on each worker
-3. Use Citus metadata sequences with 2PC for global uniqueness
-
-**Decision needed:** Benchmark which Citus sequence propagation mechanism works most reliably under high-frequency trigger calls. The trigger on each worker must call `nextval('pg_trickle.change_seq')` and get globally-unique, monotonically-increasing values.
-
-**Files modified:** `src/cdc.rs`, `src/version.rs`, `src/refresh.rs`, `src/dvm/diff.rs`, `src/lib.rs`, `src/config.rs`
+**Ships in:** a regular release. Non-breaking.
 
 ---
 
-### Phase 4: Distributed CDC — Worker-Side Triggers (~4 weeks)
+### Phase 2 — Per-Source Frontier Cleanup
 
-**Goal:** Make CDC triggers fire on Citus worker nodes where DML actually executes, with change buffers accessible from the coordinator for refresh.
+**Goal:** Make the frontier per-source-LSN-namespace correct, not
+"whatever the coordinator's WAL says".
 
-**P4.1: Branch CDC setup on placement**
+**P2.1.** `Frontier.sources` is already a `HashMap`; rekey from OID
+string to `stable_name`. Serialised JSONB schema gets a side migration.
 
-In `setup_cdc_for_source()` at `src/api.rs` (L519):
+**P2.2.** Ban global LSN comparisons across sources. Audit
+[src/refresh/codegen.rs](src/refresh/codegen.rs) and
+[src/scheduler.rs](src/scheduler.rs#L1054) for places that read
+`pg_current_wal_lsn()` and compare across sources; replace with
+per-source watermark logic that already exists in
+[src/wal_decoder.rs](src/wal_decoder.rs).
 
-| Placement | Trigger Strategy |
-|-----------|-----------------|
-| `Local` | Current behavior — create trigger on coordinator |
-| `CitusReference` | Current behavior — triggers fire on coordinator for reference tables |
-| `CitusDistributed` | Use `citus::run_on_all_nodes()` to create trigger function + trigger on every node |
+**P2.3.** When a source is `Distributed`, the LSN stored in
+`pgt_change_tracking` is **the per-worker slot LSN that produced the
+last consumed change** (a tuple keyed by `(worker_id, lsn)`), not a
+coordinator LSN. Add a `frontier_per_node JSONB` column for these
+sources.
 
-**P4.2: Worker-side trigger creation for distributed tables**
-
-Modify `create_change_trigger()` in `src/cdc.rs` (L37) to accept a `placement` parameter:
-
-```rust
-pub fn create_change_trigger(
-    source_id: &SourceIdentifier,
-    change_schema: &str,
-    pk_columns: &[String],
-    columns: &[(String, String)],
-    placement: &TablePlacement,
-) -> Result<String, PgTrickleError>
-```
-
-For `CitusDistributed`:
-1. Generate the trigger function SQL (same template, with `nextval()` instead of `pg_current_wal_lsn()`)
-2. Wrap in `citus::run_on_all_nodes()` to execute on coordinator + all workers
-3. The `CREATE TRIGGER` is also propagated via `run_on_all_nodes()`
-
-**P4.3: Distributed change buffer tables**
-
-For distributed sources, the change buffer table must exist on all workers where triggers fire:
-
-1. Create `pg_trickle_changes.changes_{stable_hash}` on coordinator
-2. Call `SELECT create_distributed_table('pg_trickle_changes.changes_{stable_hash}', 'seq_id')` to distribute the buffer by sequence ID
-3. Workers write locally to their shard of the change buffer
-4. The coordinator can query the entire buffer via normal SQL — Citus routes to all workers and unions results
-
-**Why distributed table (not reference table):** Reference tables replicate every write to all nodes via 2PC, creating unacceptable overhead for high-frequency trigger writes. A distributed buffer localizes writes to the worker where DML occurred.
-
-**P4.4: Update trigger existence checks**
-
-`trigger_exists()` in `src/cdc.rs` (L570-L576) must check on workers for distributed tables:
-
-```rust
-pub fn trigger_exists(source_id: &SourceIdentifier, placement: &TablePlacement) -> bool {
-    match placement {
-        TablePlacement::CitusDistributed { .. } => {
-            // Check on coordinator — if trigger exists here, it was propagated to workers
-            local_trigger_exists(source_id)
-        }
-        _ => local_trigger_exists(source_id),
-    }
-}
-```
-
-**P4.5: Update cleanup for distributed change buffers**
-
-`delete_consumed_changes()` in `src/cdc.rs` (L430) and the TRUNCATE path in `src/refresh.rs` (L617):
-- Citus supports `TRUNCATE` on distributed tables — works as-is
-- `DELETE ... WHERE seq_id > ... AND seq_id <=` also works via Citus routing
-
-**P4.6: DDL event trigger handling**
-
-In `src/hooks.rs` (L53): When Citus propagates schema changes to workers, the coordinator event trigger fires. The hook must detect if the affected table is distributed and rebuild triggers on workers via `run_on_all_nodes()`, not just locally.
-
-**Files modified:** `src/cdc.rs`, `src/api.rs`, `src/hooks.rs`, `src/refresh.rs`
+**Files:** `src/version.rs`, `src/refresh/codegen.rs`,
+`src/scheduler.rs`, `src/wal_decoder.rs`, `src/lib.rs`.
 
 ---
 
-### Phase 5: Distributed Refresh — MERGE Rewrite (~4 weeks)
+### Phase 3 — Distributed CDC via Per-Worker Slots
 
-**Goal:** Make the refresh pipeline work when the ST storage table is distributed or when change buffers are distributed.
+**This is the heart of the plan.** Reuses the WAL decoder; doesn't
+introduce a new mechanism.
 
-**P5.1: ST storage table placement decision**
+**P3.1 — Remote slot consumption.** Today
+[src/wal_decoder.rs](src/wal_decoder.rs#L495) calls
+`pg_logical_slot_get_changes()` via SPI on the local node. Add a
+sibling code path that calls it on a **remote** node. Two options,
+benched in Phase 6:
 
-When creating a ST, auto-select placement:
+- **A: `dblink` / `postgres_fdw`** wrapping the same SQL. Simplest,
+  fewest dependencies; relies on plain SPI from the coordinator.
+- **B: native libpq + `START_REPLICATION` streaming**. Lower latency
+  but a much bigger code surface; we already depend on the
+  `pgoutput` parser, so the marginal cost is moderate.
 
-| Source Configuration | ST Placement | Rationale |
-|---------------------|-------------|-----------|
-| All sources local | `local` | Current behavior, no changes |
-| Any source is reference, none distributed | `local` | Reference table data is on coordinator |
-| Any source is distributed, ST estimated < 100K rows | `reference` | Small STs replicated everywhere for fast reads |
-| Any source is distributed, ST estimated ≥ 100K rows | `distributed` | Large STs distributed by `__pgt_row_id` |
+**Default to A for the first release.** It composes with existing
+connection pooling and Citus user mapping.
 
-Add `st_placement TEXT` column to `pg_trickle.pgt_stream_tables` in `src/lib.rs` (L80). Values: `'local'`, `'reference'`, `'distributed'`. Default: `'local'`.
+**P3.2 — Setup for distributed sources.** When `setup_cdc_for_source`
+sees `placement == Distributed`:
 
-**P5.2: Storage table distribution**
+1. `create_publication(stable_name, partitioned=true)` is wrapped in
+   `run_command_on_all_nodes(...)` so every worker has the
+   publication on its local shard.
+2. `pg_create_logical_replication_slot('pgtrickle_<stable_name>',
+   'pgoutput')` is also issued on every worker via
+   `run_command_on_all_nodes`.
+3. The coordinator records `(worker_id, slot_name)` per-source in a
+   new `pgtrickle.pgt_remote_slots` catalog.
 
-After `CREATE TABLE {pgt_schema}.{pgt_name}`, based on placement:
+**P3.3 — REPLICA IDENTITY enforcement on workers.** The pre-flight check
+already at [src/wal_decoder.rs](src/wal_decoder.rs#L1509) needs to run
+**on each worker** (run_command_on_workers) for distributed sources.
+
+**P3.4 — Slot polling.** Scheduler tick iterates over
+`pgt_remote_slots` for the source and pulls from each worker, writing
+into the coordinator's `changes_<stable_name>` buffer with
+`(worker_id, slot_lsn)` recorded in two new columns
+(`origin_node SMALLINT`, `origin_lsn PG_LSN`). Compaction uses the
+same `(origin_node, origin_lsn)` tuple as a watermark.
+
+**P3.5 — TRUNCATE + DDL.** `pg_logical_slot_get_changes()` already
+emits a TRUNCATE message; the existing decoder writes an action='T'
+marker. DDL (column add/drop, partition attach) on a distributed
+table is propagated by Citus; the coordinator's existing event
+triggers fire there. Add a worker-side `IF EXISTS` re-create of the
+publication when the column set changes.
+
+**P3.6 — Reference / local sources stay on triggers.** No change.
+
+**Files:** `src/wal_decoder.rs`, `src/cdc.rs`, `src/api/mod.rs`,
+`src/api/publication.rs`, `src/scheduler.rs`, `src/lib.rs`.
+
+---
+
+### Phase 4 — Distributed ST Storage & Apply Path
+
+**P4.1 — ST placement at create time.** Extend
+`create_stream_table()` in [src/api/mod.rs](src/api/mod.rs) with an
+optional `placement => 'local' | 'reference' | 'distributed'`
+parameter. Auto-select when omitted using the placement of declared
+sources:
+
+| Sources | Default placement |
+|---|---|
+| All `Local` | `local` |
+| Includes `Reference`, no `Distributed` | `local` |
+| Includes `Distributed`, projected ST < 1M rows | `reference` |
+| Includes `Distributed`, projected ST ≥ 1M rows | `distributed` |
+
+Persisted in `pgtrickle.pgt_stream_tables.st_placement`. Threshold
+GUC: `pg_trickle.citus_reference_st_max_rows` (default `1_000_000`).
+
+**P4.2 — Apply for `distributed` STs.** The DELETE + INSERT…ON CONFLICT
+pair replaces MERGE. Distribution column is `__pgt_row_id`. Codegen
+in [src/refresh/codegen.rs](src/refresh/codegen.rs) gets a second
+template selected by `st_placement`.
 
 ```sql
--- For reference STs:
-SELECT create_reference_table('{pgt_schema}.{pgt_name}');
+WITH delta AS (...)
+DELETE FROM {st} st
+ USING delta d
+ WHERE d.__pgt_action = 'D'
+   AND st.__pgt_row_id = d.__pgt_row_id;
 
--- For distributed STs:
-SELECT create_distributed_table('{pgt_schema}.{pgt_name}', '__pgt_row_id');
+WITH delta AS (...)
+INSERT INTO {st} (__pgt_row_id, ...)
+SELECT __pgt_row_id, ... FROM delta WHERE __pgt_action = 'I'
+ON CONFLICT (__pgt_row_id) DO UPDATE SET ...;
 ```
 
-The unique index on `__pgt_row_id` serves as the distribution key.
+**P4.3 — Apply for `reference` STs.** MERGE works as today, but the
+USING side often pulls data from workers; add a hint to **materialise
+the delta** to a `TEMP` table when the planner reports a non-pushable
+plan (Phase 6 gate).
 
-**P5.3: Replace MERGE with INSERT ON CONFLICT + DELETE**
+**P4.4 — `__pgt_row_id` distribution.** It's a `BIGINT` already; mark
+it as the distribution column at `create_distributed_table` time.
+Validation: refuse `distributed` placement if the user supplied an
+ORDER BY / GROUP BY shape that would produce skew on row id (rare —
+row id is a monotonically increasing surrogate).
 
-For `st_placement = 'distributed'`, replace the MERGE statement in `src/refresh.rs` (L165-L175) with two Citus-compatible statements:
+**P4.5 — `reltuples` fix.** `src/dag.rs` and the predictive cost
+model (`src/api/planner.rs`) sum `pg_dist_shard` row counts when the
+table is distributed.
 
-```sql
--- Step 1: Delete rows that are removed or updated
-DELETE FROM {st} WHERE __pgt_row_id IN (
-    SELECT __pgt_row_id FROM ({delta_cte}) d WHERE d.__pgt_action = 'D'
-);
-
--- Step 2: Insert new rows or update existing
-INSERT INTO {st} ({columns})
-SELECT {columns} FROM ({delta_cte}) d WHERE d.__pgt_action = 'I'
-ON CONFLICT (__pgt_row_id) DO UPDATE SET
-    {col1} = EXCLUDED.{col1},
-    {col2} = EXCLUDED.{col2},
-    ...;
-```
-
-This is fully supported by Citus when `__pgt_row_id` is the distribution column.
-
-**P5.4: Extend `CachedMergeTemplate`**
-
-In `src/refresh.rs` (L28-L52), add a variant for the INSERT ON CONFLICT + DELETE pattern:
-
-```rust
-pub struct CachedMergeTemplate {
-    pub merge_sql: Option<String>,          // MERGE (local/reference)
-    pub delete_sql: Option<String>,         // DELETE step (distributed)
-    pub upsert_sql: Option<String>,         // INSERT ON CONFLICT step (distributed)
-    pub is_deduplicated: bool,
-    pub column_count: usize,
-    pub source_oids: Vec<u32>,
-    pub st_placement: String,
-}
-```
-
-**P5.5: Update IVM output for distributed mode**
-
-`src/dvm/mod.rs` must emit the two-statement form when `st_placement = 'distributed'`. The delta CTE chain itself is unchanged — only the final apply statement differs.
-
-**P5.6: Distributed CTE execution concerns**
-
-The delta CTE chain (generated by `src/dvm/operators/`) references `changes_{stable_hash}` tables. When these are Citus-distributed, the CTE executes on the coordinator which pulls data from workers.
-
-**Performance concern:** Citus may not push down complex multi-CTE pipelines. Mitigation:
-1. Profile with `EXPLAIN ANALYZE` in integration tests
-2. If push-down fails, materialize the delta into a temp table before apply:
-   ```sql
-   CREATE TEMP TABLE __pgt_delta AS ({delta_cte});
-   DELETE FROM {st} WHERE __pgt_row_id IN (SELECT __pgt_row_id FROM __pgt_delta WHERE __pgt_action = 'D');
-   INSERT INTO {st} SELECT ... FROM __pgt_delta WHERE __pgt_action = 'I' ON CONFLICT ...;
-   DROP TABLE __pgt_delta;
-   ```
-
-**P5.7: Fix row count estimates for distributed tables**
-
-Update the `pg_class.reltuples` query in `src/refresh.rs` (L371-L393) for distributed tables:
-
-```sql
--- For distributed tables, use citus_stat_statements or sum across shards:
-SELECT sum(reltuples)::bigint AS table_size
-FROM pg_dist_shard s
-JOIN pg_class c ON c.oid = s.shardid
-WHERE s.logicalrelid = {oid}::oid
-```
-
-Or use `SELECT count(*) FROM citus_shards WHERE table_name = ...` as a fallback.
-
-**Files modified:** `src/refresh.rs`, `src/dvm/mod.rs`, `src/lib.rs`, `src/api.rs`
+**Files:** `src/api/mod.rs`, `src/refresh/codegen.rs`,
+`src/refresh/merge.rs`, `src/dag.rs`, `src/api/planner.rs`,
+`src/lib.rs`.
 
 ---
 
-### Phase 6: Distributed Coordination (~3 weeks)
+### Phase 5 — Coordination & Operability
 
-**Goal:** Replace node-local coordination mechanisms (shared memory, advisory locks) with cluster-aware alternatives.
+**P5.1 — Catalog locks.** Add
+`pgtrickle.pgt_st_locks(pgt_id BIGINT PRIMARY KEY, locked_by INT,
+locked_at TIMESTAMPTZ, lease_until TIMESTAMPTZ)`. Replace
+advisory-lock acquisition in [src/scheduler.rs](src/scheduler.rs)
+with `INSERT … ON CONFLICT … DO NOTHING`. Lease expiry handled by
+`now() > lease_until`. Advisory locks remain a fast in-process check.
 
-**P6.1: Scheduler remains coordinator-only**
+**P5.2 — Wake.** Stay with `LISTEN/NOTIFY` on the coordinator. In
+the rare case the user runs the extension on a worker (e.g. for
+debugging), the wake is a no-op — that worker has no scheduler.
 
-The background worker at `src/scheduler.rs` (L41) stays on the coordinator node. It discovers STs from the local `pg_trickle.pgt_stream_tables` catalog and executes refreshes that Citus routes to workers as needed. No changes to worker registration.
+**P5.3 — Cluster observability.** Extend
+[src/api/cluster.rs](src/api/cluster.rs) `cluster_worker_summary()`
+to expose Citus context: which sources are distributed, slot
+positions per worker, replication lag per worker. New view
+`pgtrickle.citus_status`.
 
-**P6.2: Replace advisory locks with catalog-based locks**
+**P5.4 — Failure modes.**
+- Worker unreachable: pause refresh of any ST whose source has a
+  stuck slot, surface via `monitor`/Prometheus.
+- Worker WAL recycled past slot: the existing fallback to FULL
+  refresh (already implemented for local WAL gaps in
+  [src/wal_decoder.rs](src/wal_decoder.rs)) applies.
+- Slot not found on worker after a node addition: re-create on
+  next tick, log warning.
 
-Add a new lock table to `src/lib.rs`:
-
-```sql
-CREATE TABLE pg_trickle.st_locks (
-    pgt_id      BIGINT PRIMARY KEY REFERENCES pg_trickle.pgt_stream_tables(pgt_id),
-    locked_by  INT,            -- PID of lock holder
-    locked_at  TIMESTAMPTZ
-);
-```
-
-Lock acquisition (replaces `pg_try_advisory_lock` at `src/scheduler.rs` L281, L425):
-
-```sql
-INSERT INTO pg_trickle.st_locks (pgt_id, locked_by, locked_at)
-VALUES ($1, pg_backend_pid(), now())
-ON CONFLICT (pgt_id) DO NOTHING
-```
-
-Returns 1 row if acquired, 0 if already locked. Release:
-
-```sql
-DELETE FROM pg_trickle.st_locks WHERE pgt_id = $1 AND locked_by = pg_backend_pid()
-```
-
-Add a stale-lock cleanup: locks older than `pg_trickle.lock_timeout` (default: 10 minutes) are automatically released by the scheduler loop.
-
-**P6.3: Replace shared memory DAG signal with LISTEN/NOTIFY**
-
-Replace `PgAtomic<AtomicU64>` DAG rebuild signal at `src/shmem.rs` (L37) with PostgreSQL's LISTEN/NOTIFY:
-
-- `signal_dag_rebuild()` → `NOTIFY pg_trickle_dag_rebuild`
-- Scheduler loop → `LISTEN pg_trickle_dag_rebuild` + poll with `pg_sleep_for()`
-
-This works across all connections to the same database (coordinator). For multi-coordinator HA setups, only one coordinator is writable at a time, so LISTEN/NOTIFY is sufficient.
-
-**P6.4: Conditional shared memory usage**
-
-Keep `PgLwLock<PgTrickleSharedState>` for `scheduler_pid` and `scheduler_running` — these are coordinator-local state that doesn't need cross-node visibility. Only replace the DAG rebuild signal.
-
-Update `src/shmem.rs`:
-```rust
-pub fn signal_dag_rebuild() {
-    // Use NOTIFY for Citus-safe signaling
-    let _ = Spi::run("NOTIFY pg_trickle_dag_rebuild");
-    // Also update atomic for backward compat with local shmem consumers
-    if is_shmem_available() {
-        DAG_REBUILD_SIGNAL.get().fetch_add(1, Ordering::SeqCst);
-    }
-}
-```
-
-**Files modified:** `src/scheduler.rs`, `src/shmem.rs`, `src/lib.rs`
+**Files:** `src/scheduler.rs`, `src/shmem.rs`, `src/api/cluster.rs`,
+`src/monitor.rs`, `src/lib.rs`.
 
 ---
 
-### Phase 7: Testing & Migration (~3 weeks)
+### Phase 6 — Validation, Benchmarks, Migration, Docs
 
-**Goal:** Comprehensive testing against Citus clusters and safe migration for existing installations.
+**P6.1 — Test harness.** New
+`tests/e2e_citus_tests.rs` using a `citusdata/citus:13.0`-based
+testcontainer set (1 coord + 2 workers via docker-compose).
+`tests/Dockerfile.e2e-citus` builds the extension into the Citus
+image. Reuse `cargo pgrx package` artefacts where possible — most of
+this should be light-E2E once the image is available.
 
-**P7.1: Citus test infrastructure**
+**P6.2 — Test matrix.**
 
-Add `tests/e2e_citus_tests.rs` using `citusdata/citus:13.0` Docker image with Testcontainers:
+| Source(s) | ST placement | Exercises |
+|---|---|---|
+| Local table | local | regression — trigger CDC |
+| Reference table | local | trigger CDC, coordinator fires |
+| Distributed table | reference | per-worker slots, MERGE, replication of ST |
+| Distributed table | distributed | per-worker slots, DELETE + UPSERT |
+| Mixed (ref + dist) | local | mixed CDC backends, frontier per source |
+| Distributed ⇒ outbox | distributed | downstream pub + relay against distributed ST |
+| ALTER TABLE on dist source | distributed | DDL propagation, slot rebuild |
+| Worker restart | distributed | slot survives, refresh resumes |
+| TRUNCATE on dist source | any | full-refresh fallback |
+| Concurrent DML + refresh | distributed | apply correctness under load |
 
-```rust
-// tests/e2e_citus_tests.rs
-// Uses a 1-coordinator + 2-worker Citus cluster via Docker Compose or
-// testcontainers with a custom Citus image that includes the extension
-```
+**P6.3 — Benchmarks.** Add to `benches/`:
+- `bench_remote_slot_poll` — throughput of `dblink`-wrapped
+  `pg_logical_slot_get_changes()` vs local SPI.
+- `bench_distributed_apply` — DELETE+UPSERT vs MERGE on a 100M-row
+  distributed ST.
 
-Add `tests/Dockerfile.e2e-citus` for building the extension against the Citus image:
+Set a non-Citus regression budget of **0%** — when Citus isn't
+present, code paths must compile out or short-circuit on the
+detection check.
 
-```dockerfile
-FROM citusdata/citus:13.0
-# Install Rust, pgrx, build extension
-COPY . /app
-WORKDIR /app
-RUN cargo pgrx package
-# Copy artifacts into PG extension dir
-```
+**P6.4 — Migration script.**
+`sql/pg_trickle--<prev>--<next>.sql` performs P1.3 column adds, then
+backfills `source_stable_name`/`source_placement` from
+`pg_class`+`pg_namespace`+`pg_dist_partition`. Renames existing
+`changes_<oid>` tables and trigger functions to the stable-hash form
+in a single transaction. Provides a downgrade path that renames back
+when `pg_dist_partition` is empty.
 
-**P7.2: Test matrix**
+**P6.5 — Docs.** New page `docs/integrations/citus.md` covering
+prerequisites (`wal_level=logical` on every worker, `max_replication_slots`
+sized appropriately, `REPLICA IDENTITY FULL` on distributed sources,
+matching extension version on coordinator and workers, stable shard
+placement). Update [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) with
+the multi-node diagram from §5. Update [INSTALL.md](INSTALL.md) with
+"installing on a Citus cluster".
 
-| Test | Sources | ST Placement | Exercises |
-|------|---------|-------------|-----------|
-| Local regression | Local tables | Local | All existing behavior — no regressions |
-| Reference source | Citus reference table | Local | Triggers on coordinator, LSN frontier |
-| Distributed source → local ST | Hash-distributed table | Local | Worker triggers, seq frontier, coordinator MERGE |
-| Distributed source → reference ST | Hash-distributed table | Reference | Worker triggers, seq frontier, reference MERGE |
-| Distributed source → distributed ST | Hash-distributed table | Distributed | Full pipeline: worker triggers, seq frontier, INSERT ON CONFLICT |
-| Mixed sources | Distributed + reference | Local | Multi-mode frontier, mixed CDC |
-| Concurrent DML + refresh | Distributed table | Distributed | Workers writing + coordinator refreshing |
-| Schema change on distributed source | Distributed table | Local | DDL event trigger → rebuild triggers on workers |
-| DROP STREAM TABLE cleanup | Distributed source | Distributed | Cleanup triggers on all workers, drop distributed buffer |
-| Multi-ST sharing source | 2 STs on 1 distributed table | Distributed | Change buffer sharing, TRUNCATE safety |
-
-**P7.3: SQL migration scripts**
-
-Write `ALTER EXTENSION pg_trickle UPDATE` migration that:
-
-1. Add `source_stable_name TEXT` and `source_placement TEXT` columns to `pg_trickle.pgt_dependencies`
-2. Add `source_stable_name TEXT` column to `pg_trickle.pgt_change_tracking`
-3. Add `st_placement TEXT DEFAULT 'local'` column to `pg_trickle.pgt_stream_tables`
-4. Create `pg_trickle.change_seq` sequence
-5. Create `pg_trickle.st_locks` table
-6. Backfill `stable_name` from current OID-based data:
-   ```sql
-   UPDATE pg_trickle.pgt_dependencies d SET source_stable_name = (
-       SELECT pg_trickle.stable_hash(n.nspname || '.' || c.relname)
-       FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
-       WHERE c.oid = d.source_relid
-   );
-   ```
-7. Rename existing `changes_{oid}` tables to `changes_{stable_hash}`
-8. Rebuild trigger functions with new naming
-
-**P7.4: Documentation updates**
-
-Update:
-- `docs/ARCHITECTURE.md` — Citus architecture diagrams, placement modes
-- `docs/CONFIGURATION.md` — New GUCs (if any), placement auto-selection behavior
-- `docs/SQL_REFERENCE.md` — ST creation with distributed sources, new columns
-- `README.md` — Citus compatibility section
-- `INSTALL.md` — Citus cluster installation instructions
-
-**Files modified/created:** `tests/e2e_citus_tests.rs`, `tests/Dockerfile.e2e-citus`, `sql/` migration files, `docs/*`
+**Files:** `tests/e2e_citus_tests.rs`, `tests/Dockerfile.e2e-citus`,
+`benches/`, `sql/`, `docs/integrations/citus.md`,
+`docs/ARCHITECTURE.md`, `INSTALL.md`.
 
 ---
 
-## 5. File Impact Summary
+## 7. Sequencing & Release Mapping
 
-| File | Phase(s) | Change Scope |
-|------|----------|-------------|
-| `src/citus.rs` (new) | 1 | New module — detection utilities, ~200 lines |
-| `src/lib.rs` | 1, 2, 3, 5, 6 | Catalog DDL additions, module registration |
-| `src/cdc.rs` | 2, 3, 4 | Stable naming, dual-mode triggers, frontier mode |
-| `src/api.rs` | 1, 2, 4, 5 | Placement detection, branched CDC setup, ST distribution |
-| `src/catalog.rs` | 1, 2 | SourceIdentifier, placement in StDependency |
-| `src/version.rs` | 2, 3 | VersionMarker enum, stable_name keys |
-| `src/refresh.rs` | 2, 3, 5 | Placeholder format, seq-mode detection, MERGE rewrite |
-| `src/dvm/diff.rs` | 2, 3 | Stable_name placeholders, frontier mode |
-| `src/dvm/mod.rs` | 5 | Dual-mode output (MERGE vs INSERT ON CONFLICT) |
-| `src/dvm/operators/scan.rs` | 2 | Stable naming for change table references |
-| `src/dvm/operators/aggregate.rs` | 2 | Stable naming for change table references |
-| `src/dvm/operators/recursive_cte.rs` | 2 | Stable naming for change table references |
-| `src/scheduler.rs` | 6 | Catalog locks, LISTEN/NOTIFY |
-| `src/shmem.rs` | 6 | NOTIFY-based DAG signal |
-| `src/hooks.rs` | 4 | Worker trigger rebuild for distributed sources |
-| `src/config.rs` | 3 | FrontierMode GUC (if needed) |
-| `src/error.rs` | 1 | Citus-specific error variants |
+| Phase | Ships in | User-visible? |
+|---|---|---|
+| P1 — detection + stable naming | next minor (e.g. v0.30.0) | No (internal); enables Citus |
+| P2 — per-source frontier | same release as P1 | Bug fixes for users hitting WAL recycling |
+| P3 — per-worker slot CDC | follow-up minor | New: distributed sources supported |
+| P4 — distributed ST apply | same release as P3 | New: `placement` option |
+| P5 — coordination | same release as P3 | Operability |
+| P6 — validation / docs | rolls in continuously, gated on P3 + P4 | Yes |
+
+P1 and P2 are safe single-node ships and produce immediate quality
+benefits (better naming through pg_dump/restore, cleaner per-source
+LSN tracking). P3–P5 are the Citus-specific deliverable.
 
 ---
 
-## 6. Implementation Priority & Sequencing
-
-```
-Phase 1: Citus Detection           ← Foundation: all subsequent phases depend on this
-    │
-    ▼
-Phase 2: Stable Naming             ← Breaking change — must be done early with migration
-    │
-    ▼
-Phase 3: Logical Sequence          ← Unblocks distributed CDC
-    │       Frontier
-    ▼
-Phase 4: Distributed CDC           ← Core distributed functionality
-    │
-    ▼
-Phase 5: Distributed Refresh       ← Makes STs queryable across the cluster
-    │       (MERGE rewrite)
-    ▼
-Phase 6: Distributed               ← Operational robustness
-    │       Coordination
-    ▼
-Phase 7: Testing & Migration       ← Validation (also runs incrementally per phase)
-```
-
-Phases 1–2 can be shipped as a non-breaking release (Citus not required). Phase 2's stable naming improves pg_dump/restore even on single-node.
-
-Phases 3–6 are Citus-specific and should ship together as a feature release.
-
-Phase 7 testing runs incrementally throughout all phases.
-
----
-
-## 7. Risk Assessment
+## 8. Risk Register
 
 | Risk | Likelihood | Impact | Mitigation |
-|------|-----------|--------|------------|
-| Citus distributed sequence performance under high-frequency triggers | Medium | High — if `nextval()` across nodes is slow, trigger overhead explodes | Benchmark early in Phase 3; fallback to worker-local sequences with coordinator merge |
-| Complex CTE push-down failures in Citus | High | Medium — delta queries may run entirely on coordinator, pulling all data | Materialize delta into temp table before apply (Phase 5 P5.6) |
-| Citus version compatibility (targeting Citus 13.x for PG 18) | Medium | High — Citus 13.x may not be released yet | Track Citus release schedule; test against Citus nightly builds |
-| MERGE → INSERT ON CONFLICT semantic differences | Low | High — edge cases in concurrent updates | Thorough testing of concurrent DML + refresh (Phase 7) |
-| Migration breaks existing single-node installs | Low | Critical — data loss for existing users | OID columns retained; migration is additive; rollback path via `ALTER EXTENSION ... UPDATE TO 'prev_version'` |
-| `run_command_on_workers()` failure mid-setup | Medium | Medium — partial trigger creation across workers | Wrap in transaction where possible; add cleanup/retry logic |
-| Advisory lock → catalog lock performance | Low | Low — catalog locks slightly slower than advisory | Advisory locks still used as fast path on non-Citus; catalog locks only for Citus |
-| Reference table STs limited by replication overhead | Low | Low — only used for small STs | Document size recommendation; auto-selection threshold at 100K rows |
+|---|---|---|---|
+| `dblink`-wrapped slot polling has unacceptable latency | Medium | Med | Bench in P6.3; fallback path is direct libpq streaming (P3.1 option B) |
+| Citus rejects MERGE on `__pgt_row_id`-distributed STs in some shapes | Med | High | DELETE + INSERT ON CONFLICT (P4.2) is the primary path anyway; MERGE only used for `reference` STs |
+| Slot fills WAL on a worker if the coordinator scheduler stops | High | High | Document monitoring requirement; expose lag in `pgtrickle.citus_status`; auto-drop slot after configurable lease expiry |
+| `__pgt_row_id` skew on distributed STs | Low | Med | It's monotonic; warn if user attempts to repurpose the column |
+| Shard rebalance invalidates slots | Low (user opted out) | High | Out of scope for v1; emit a hard error in slot-poll path if `pg_dist_node` topology hash changes |
+| Schema/role differences on workers | Med | Med | `run_command_on_all_nodes` for `CREATE SCHEMA pgtrickle_changes` and grants; document required roles |
+| Mixed extension versions across nodes | Med | High | Pre-flight: `SELECT extversion FROM pg_extension WHERE extname='pg_trickle'` on every worker; refuse to start if mismatched |
+| User runs without `wal_level=logical` on workers | High | Low | Detected at slot-create; clear error message |
+| Citus columnar STs requested | Low | Low | Refuse `distributed` placement when `USING columnar`; columnar can't be UPDATE/DELETE'd |
 
 ---
 
-## 8. Open Questions
+## 9. Open Questions
 
-1. **Citus 13.x availability for PG 18:** Is Citus 13.x released and stable for PG 18.x? If not, what is the timeline?
-
-2. **Distributed sequence semantics:** Does `nextval()` on a Citus-distributed sequence provide **strict monotonic ordering** across workers, or only uniqueness? If only uniqueness, the frontier ordering assumption breaks and we need an alternative (e.g., `(worker_id, local_seq)` composite ordering).
-
-3. **Schema `pg_trickle_changes` on workers:** Workers may not have the `pg_trickle_changes` schema. The extension `CREATE SCHEMA` runs on coordinator only. Must use `run_on_all_nodes('CREATE SCHEMA IF NOT EXISTS pg_trickle_changes')` during setup.
-
-4. **Extension loading on workers:** Do workers need `shared_preload_libraries = 'pg_trickle'`? The background worker is coordinator-only, but the trigger functions reference the extension. If workers don't load the extension, PL/pgSQL triggers (not C triggers) should work without it.
-
-5. **Citus columnar storage:** Should ST storage tables support Citus columnar? Columnar doesn't support UPDATE/DELETE, so it's incompatible with incremental refresh. Document as unsupported.
+1. **`dblink` vs streaming libpq.** Bench result determines P3.1 default.
+   Streaming gives push-based wake-ups (no polling latency) but adds a
+   long-running connection per worker.
+2. **Reference vs distributed ST default for medium-sized outputs.** The
+   1M-row threshold in P4.1 is a guess — instrument and tune in P6.3.
+3. **Multi-database Citus.** Citus 13 supports multiple databases per
+   cluster; each pg_trickle scheduler is per-database. No change
+   expected, but verify in P6.2.
+4. **Interaction with `pgtrickle-relay`.** A distributed ST exposed via
+   `stream_table_to_publication()` already streams over logical
+   replication from the coordinator's storage table — works today
+   regardless of placement. No new code; document the pattern.
+5. **CitusData vs Microsoft fork divergence.** Track the upstream
+   (microsoft/citus) repo; pin tested versions in CI.
 
 ---
 
-## 9. Milestone Checkpoints
+## 10. Cross-References
 
-| Milestone | Phase | Deliverable | Verification |
-|-----------|-------|-------------|-------------|
-| M1: Citus detection works | 1 | `is_citus_available()` returns true on Citus cluster | Unit test with mocked catalog |
-| M2: Stable naming deployed | 2 | All change buffers use `stable_hash` naming | Existing e2e tests pass with new naming |
-| M3: Sequence frontier works | 3 | Trigger writes `seq_id` on distributed table | e2e test: INSERT on worker → change buffer has seq_id |
-| M4: Worker CDC operational | 4 | Triggers fire on workers, changes visible from coordinator | e2e test: DML on distributed table → coordinator reads changes |
-| M5: Distributed refresh works | 5 | Full INCR refresh pipeline on distributed ST | e2e test: create ST → mutate → refresh → verify results |
-| M6: Coordination is cluster-safe | 6 | Scheduler uses catalog locks, NOTIFY signaling | e2e test: concurrent refresh attempts on Citus |
-| M7: Migration from single-node | 7 | Existing single-node install upgrades cleanly | Migration test: pre-Citus data → upgrade → verify |
-| M8: Full test suite green | 7 | All existing + new Citus tests pass | CI pipeline with Citus cluster |
+- [src/wal_decoder.rs](src/wal_decoder.rs) — already-implemented
+  WAL-based CDC; foundation of Phase 3.
+- [src/api/publication.rs](src/api/publication.rs) — downstream
+  publication API for ST storage; reused as-is.
+- [pgtrickle-relay/](pgtrickle-relay/) — outbox/inbox bridge
+  available for cross-cluster fan-out.
+- [plans/infra/PLAN_PARTITIONING_SHARDING.md](plans/infra/PLAN_PARTITIONING_SHARDING.md)
+  — adjacent partitioning work; some primitives overlap.
+- [plans/infra/PLAN_MULTI_DATABASE.md](plans/infra/PLAN_MULTI_DATABASE.md)
+  — multi-database scheduler.
+- [discussion #619](https://github.com/grove/pg-trickle/discussions/619)
+  — original user request that motivated the rewrite.
