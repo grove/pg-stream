@@ -25,3 +25,15 @@
 -- Function signatures are updated automatically by pgrx during ALTER EXTENSION UPDATE.
 
 -- No DDL changes required for this version upgrade.
+
+-- PERF-4: New ENR-based IVM delta application function.
+-- Called by trigger bodies generated when pg_trickle.ivm_use_enr = true.
+CREATE OR REPLACE FUNCTION pgtrickle."pgt_ivm_apply_delta_enr"(
+    "pgt_id"     bigint,
+    "source_oid" INT,
+    "has_new"    bool,
+    "has_old"    bool
+) RETURNS VOID
+STRICT
+LANGUAGE c
+AS 'MODULE_PATHNAME', 'pgt_ivm_apply_delta_enr_wrapper';
