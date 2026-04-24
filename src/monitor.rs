@@ -71,6 +71,9 @@ pub enum AlertEvent {
     /// PLAN-3 (v0.27.0): Cost model predicts next refresh will exceed the
     /// ST's `freshness_deadline_ms` SLA by > 20%.
     PredictedSlaBreach,
+    /// SCAL-1 (v0.31.0): Change buffer has exceeded `buffer_alert_threshold`
+    /// for N consecutive refresh cycles — back-pressure is building.
+    ChangeBufferBackpressure,
 }
 
 impl AlertEvent {
@@ -93,6 +96,7 @@ impl AlertEvent {
             AlertEvent::NoUpstreamChanges => "no_upstream_changes",
             AlertEvent::SpillThresholdExceeded => "spill_threshold_exceeded",
             AlertEvent::PredictedSlaBreach => "predicted_sla_breach",
+            AlertEvent::ChangeBufferBackpressure => "change_buffer_backpressure",
         }
     }
 }
@@ -257,6 +261,31 @@ pub fn alert_slot_lag(slot_name: &str, retained_wal_bytes: i64, threshold_bytes:
     let sql = format!("NOTIFY pg_trickle_alert, '{}'", escaped);
     if let Err(e) = Spi::run(&sql) {
         pgrx::warning!("pg_trickle: failed to emit slot_lag_warning: {}", e);
+    }
+}
+
+/// SCAL-1 (v0.31.0): Emit a change-buffer back-pressure alert.
+///
+/// Fired when a source table's change buffer has exceeded
+/// `pg_trickle.buffer_alert_threshold` for N consecutive refresh cycles,
+/// indicating that consumers are not keeping up with producers.
+pub fn alert_change_buffer_backpressure(
+    source_oid: u32,
+    pending_rows: i64,
+    consecutive_cycles: i32,
+    threshold: i64,
+) {
+    let payload = format!(
+        r#"{{"event":"change_buffer_backpressure","source_oid":{},"pending_rows":{},"consecutive_cycles":{},"threshold":{}}}"#,
+        source_oid, pending_rows, consecutive_cycles, threshold,
+    );
+    let escaped = payload.replace('\'', "''");
+    let sql = format!("NOTIFY pg_trickle_alert, '{}'", escaped);
+    if let Err(e) = Spi::run(&sql) {
+        pgrx::warning!(
+            "pg_trickle: failed to emit change_buffer_backpressure alert: {}",
+            e
+        );
     }
 }
 
@@ -3246,6 +3275,50 @@ fn parallel_job_status(
     });
 
     TableIterator::new(rows)
+}
+
+/// SCAL-1 (v0.31.0): Check all change buffers and return a list of
+/// (source_relid_u32, pending_row_count) pairs for sources that exceed
+/// the configured `buffer_alert_threshold`.
+///
+/// Called from the scheduler's periodic health-check tick. The caller
+/// maintains a per-source consecutive-cycle counter and calls
+/// `alert_change_buffer_backpressure` when the limit is reached.
+pub fn check_change_buffer_sizes() -> Vec<(u32, i64)> {
+    let change_schema = crate::config::pg_trickle_change_buffer_schema();
+    let threshold = crate::config::pg_trickle_buffer_alert_threshold();
+    if threshold <= 0 {
+        return Vec::new();
+    }
+
+    let sources: Vec<i64> = Spi::connect(|client| {
+        match client.select(
+            "SELECT DISTINCT source_relid::bigint FROM pgtrickle.pgt_change_tracking",
+            None,
+            &[],
+        ) {
+            Ok(result) => result
+                .into_iter()
+                .filter_map(|row| row.get::<i64>(1).ok().flatten())
+                .collect(),
+            Err(_) => Vec::new(),
+        }
+    });
+
+    let mut over_threshold = Vec::new();
+    for relid in sources {
+        let oid_u32 = relid as u32;
+        let pending = Spi::get_one::<i64>(&format!(
+            "SELECT count(*)::bigint FROM {}.changes_{}",
+            change_schema, oid_u32
+        ))
+        .unwrap_or(Some(0))
+        .unwrap_or(0);
+        if pending > threshold {
+            over_threshold.push((oid_u32, pending));
+        }
+    }
+    over_threshold
 }
 
 #[cfg(test)]

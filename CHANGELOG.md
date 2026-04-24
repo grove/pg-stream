@@ -8,6 +8,7 @@ For future plans and upcoming features, see [ROADMAP.md](ROADMAP.md).
 
 <!-- TOC start -->
 - [Unreleased](#unreleased)
+- [0.31.0 — Performance & Scheduler Intelligence](#0310--performance--scheduler-intelligence)
 - [0.30.0 — Pre-GA Correctness & Stability Sprint](#0300--pre-ga-correctness--stability-sprint)
 - [0.29.0 — Relay CLI (pgtrickle-relay)](#0290--relay-cli-pgtrickle-relay)
 - [0.28.0 — Transactional Inbox & Outbox Patterns](#0280--transactional-inbox--outbox-patterns)
@@ -49,6 +50,68 @@ For future plans and upcoming features, see [ROADMAP.md](ROADMAP.md).
 ---
 
 ## [Unreleased]
+
+---
+
+## [0.31.0] — Performance & Scheduler Intelligence
+
+### Highlights
+
+- **ENR-based IVM delta execution** (PERF-4): IMMEDIATE-mode stream tables
+  now use PostgreSQL Ephemeral Named Relations (ENRs) for transition tables
+  instead of OID-suffixed temporary tables. This eliminates unnecessary
+  `CREATE TEMP TABLE … AS SELECT` overhead on every DML. Controlled by the
+  new `pg_trickle.ivm_use_enr` GUC (default `true`).
+
+- **Adaptive batch coalescing** (PERF-1): A new `pg_trickle.adaptive_batch_coalescing`
+  GUC (default `true`) documents and gates the existing scheduler optimisation
+  that coalesces change-buffer scans when multiple stream tables share the same
+  source table, reducing redundant catalog look-ups at high stream-table fan-out.
+
+- **Plan-aware merge strategy logging** (PERF-2): When `pg_trickle.adaptive_merge_strategy`
+  is enabled, the refresh engine emits a `DEBUG1` log after each delta
+  application suggesting whether to switch between `MERGE` and `DELETE+INSERT`
+  strategies based on the observed change-to-target-row ratio. Useful for
+  diagnosing suboptimal strategy choices without requiring a restart.
+
+- **IVM lock-mode parse-error counter** (PERF-3): Parse failures in
+  `IvmLockMode::for_query` (which cause a safe fall-back to `EXCLUSIVE` mode)
+  are now counted in shared memory and exposed via
+  `pgtrickle.metrics_summary()` as `ivm_lock_parse_error_count`. This makes
+  previously invisible degraded-mode operation observable.
+
+- **Change-buffer back-pressure signal** (SCAL-1): The scheduler now tracks
+  how many consecutive cycles a source table's change buffer remains above the
+  alert threshold and emits a `pg_trickle_alert` NOTIFY event
+  (`change_buffer_backpressure`) once the `pg_trickle.backpressure_consecutive_limit`
+  (default `3`) is reached. Downstream operators can use this signal to pause
+  producers or scale consumers.
+
+- **Multi-database refresh broker design** (SCAL-2): A detailed architecture
+  document (`docs/research/multi_db_refresh_broker.md`) has been added
+  describing a cross-database broker worker protocol. Implementation is
+  planned for v0.32.0+.
+
+### Changes
+
+- `pg_trickle.use_sqlstate_classification` now **defaults to `true`**. Error
+  messages are classified by SQLSTATE by default. Set to `false` to restore
+  the previous behaviour.
+
+### New GUCs
+
+| GUC | Default | Description |
+|-----|---------|-------------|
+| `pg_trickle.ivm_use_enr` | `true` | Use ENR transition tables in IMMEDIATE mode |
+| `pg_trickle.adaptive_batch_coalescing` | `true` | Coalesce change-buffer scans for shared sources |
+| `pg_trickle.adaptive_merge_strategy` | `false` | Log suggested merge strategy after delta apply |
+| `pg_trickle.backpressure_consecutive_limit` | `3` | Consecutive over-threshold cycles before alert |
+
+### Upgrade
+
+Run `ALTER EXTENSION pg_trickle UPDATE TO '0.31.0';` — no manual DDL changes
+are required. The `ivm_use_enr` GUC defaults to `true`; set it to `false` if
+you observe issues with ENR propagation in nested SPI contexts.
 
 ---
 

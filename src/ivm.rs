@@ -15,13 +15,16 @@
 //!
 //! 2. **Statement-level AFTER triggers** with transition tables
 //!    (`REFERENCING NEW TABLE AS ... OLD TABLE AS ...`).
-//!    The PL/pgSQL trigger body copies transition table data into
-//!    temp tables (`__pgt_newtable_<oid>` / `__pgt_oldtable_<oid>`),
-//!    then calls the Rust `pgt_ivm_apply_delta` function.
+//!    When `pg_trickle.ivm_use_enr = true` (default, PG18+), the trigger
+//!    body calls `pgt_ivm_apply_delta_enr` which references the ENR names
+//!    directly. When false (legacy mode), the trigger body copies
+//!    transition table data into temp tables
+//!    (`__pgt_newtable_<oid>` / `__pgt_oldtable_<oid>`), then calls
+//!    `pgt_ivm_apply_delta`.
 //!
 //! 3. **Delta computation** reuses the existing DVM engine with
 //!    `DeltaSource::TransitionTable` — the `Scan` operator reads
-//!    from the temp tables instead of change buffer tables.
+//!    from the ENR or temp tables.
 //!
 //! 4. **Delta application** uses the same explicit DML path (DELETE +
 //!    UPDATE + INSERT) as the deferred mode's user-trigger path.
@@ -29,7 +32,6 @@
 //! ## Current Limitations
 //!
 //! - TRUNCATE on a base table causes a full refresh of the stream table.
-//! - Uses temp tables for transition table access (ENR-based access is a
 //!   future optimization).
 //! - Recursive CTEs emit a warning about potential stack-depth issues.
 //! - TopK tables use micro-refresh (recompute top-K on each DML) gated by
@@ -68,7 +70,11 @@ impl IvmLockMode {
         // Try to parse the defining query. If parsing fails, default to Exclusive.
         let result = match crate::dvm::parse_defining_query(defining_query) {
             Ok(tree) => tree,
-            Err(_) => return IvmLockMode::Exclusive,
+            Err(_) => {
+                // PERF-3 (v0.31.0): Count parse failures that force Exclusive lock mode.
+                crate::shmem::increment_ivm_lock_parse_errors();
+                return IvmLockMode::Exclusive;
+            }
         };
 
         if Self::is_simple_scan_chain(&result) {
@@ -99,18 +105,23 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 
-/// Cache key for IVM delta templates: (pgt_id, source_oid, has_new, has_old).
+/// Cache key for IVM delta templates: (pgt_id, source_oid, has_new, has_old, use_enr).
 ///
 /// The delta SQL varies by which transition tables are present:
 /// - INSERT: has_new=true, has_old=false
 /// - UPDATE: has_new=true, has_old=true
 /// - DELETE: has_new=false, has_old=true
+///
+/// The `use_enr` flag determines whether the SQL references ENR names
+/// (`__pgt_newtable`/`__pgt_oldtable`) or OID-suffixed temp table names.
 #[derive(Hash, PartialEq, Eq, Clone)]
 struct IvmCacheKey {
     pgt_id: i64,
     source_oid: u32,
     has_new: bool,
     has_old: bool,
+    /// PERF-4 (v0.31.0): true = ENR names, false = temp-table names.
+    use_enr: bool,
 }
 
 /// Cached IVM delta template — stores the pre-computed delta SQL,
@@ -359,9 +370,29 @@ pub fn setup_ivm_triggers(
 
     // ── AFTER triggers (statement-level, with transition tables) ─────
 
+    // PERF-4 (v0.31.0): Choose trigger body based on ENR mode GUC.
+    // When use_enr = true, reference ENRs directly (no CTAS to temp table).
+    // When use_enr = false, use legacy temp-table copy approach.
+    let use_enr = crate::config::pg_trickle_ivm_use_enr();
+
     // AFTER INSERT: only NEW table
-    let create_after_ins_fn = format!(
-        "CREATE OR REPLACE FUNCTION {fn}()
+    let create_after_ins_fn = if use_enr {
+        format!(
+            "CREATE OR REPLACE FUNCTION {fn}()
+         RETURNS trigger LANGUAGE plpgsql
+         SECURITY DEFINER
+         SET search_path = pg_catalog, pgtrickle, pgtrickle_changes, public
+         AS $$
+         BEGIN
+             PERFORM pgtrickle.pgt_ivm_apply_delta_enr({pgt_id}, {oid_u32}, true, false);
+             RETURN NULL;
+         END;
+         $$",
+            fn = names.after_ins_fn,
+        )
+    } else {
+        format!(
+            "CREATE OR REPLACE FUNCTION {fn}()
          RETURNS trigger LANGUAGE plpgsql
          SECURITY DEFINER
          SET search_path = pg_catalog, pgtrickle, pgtrickle_changes, public
@@ -374,8 +405,9 @@ pub fn setup_ivm_triggers(
              RETURN NULL;
          END;
          $$",
-        fn = names.after_ins_fn,
-    );
+            fn = names.after_ins_fn,
+        )
+    };
     Spi::run(&create_after_ins_fn).map_err(|e| {
         PgTrickleError::SpiError(format!("Failed to create IVM AFTER INSERT function: {}", e))
     })?;
@@ -397,8 +429,23 @@ pub fn setup_ivm_triggers(
     })?;
 
     // AFTER UPDATE: both OLD and NEW tables
-    let create_after_upd_fn = format!(
-        "CREATE OR REPLACE FUNCTION {fn}()
+    let create_after_upd_fn = if use_enr {
+        format!(
+            "CREATE OR REPLACE FUNCTION {fn}()
+         RETURNS trigger LANGUAGE plpgsql
+         SECURITY DEFINER
+         SET search_path = pg_catalog, pgtrickle, pgtrickle_changes, public
+         AS $$
+         BEGIN
+             PERFORM pgtrickle.pgt_ivm_apply_delta_enr({pgt_id}, {oid_u32}, true, true);
+             RETURN NULL;
+         END;
+         $$",
+            fn = names.after_upd_fn,
+        )
+    } else {
+        format!(
+            "CREATE OR REPLACE FUNCTION {fn}()
          RETURNS trigger LANGUAGE plpgsql
          SECURITY DEFINER
          SET search_path = pg_catalog, pgtrickle, pgtrickle_changes, public
@@ -414,8 +461,9 @@ pub fn setup_ivm_triggers(
              RETURN NULL;
          END;
          $$",
-        fn = names.after_upd_fn,
-    );
+            fn = names.after_upd_fn,
+        )
+    };
     Spi::run(&create_after_upd_fn).map_err(|e| {
         PgTrickleError::SpiError(format!("Failed to create IVM AFTER UPDATE function: {}", e))
     })?;
@@ -437,8 +485,23 @@ pub fn setup_ivm_triggers(
     })?;
 
     // AFTER DELETE: only OLD table
-    let create_after_del_fn = format!(
-        "CREATE OR REPLACE FUNCTION {fn}()
+    let create_after_del_fn = if use_enr {
+        format!(
+            "CREATE OR REPLACE FUNCTION {fn}()
+         RETURNS trigger LANGUAGE plpgsql
+         SECURITY DEFINER
+         SET search_path = pg_catalog, pgtrickle, pgtrickle_changes, public
+         AS $$
+         BEGIN
+             PERFORM pgtrickle.pgt_ivm_apply_delta_enr({pgt_id}, {oid_u32}, false, true);
+             RETURN NULL;
+         END;
+         $$",
+            fn = names.after_del_fn,
+        )
+    } else {
+        format!(
+            "CREATE OR REPLACE FUNCTION {fn}()
          RETURNS trigger LANGUAGE plpgsql
          SECURITY DEFINER
          SET search_path = pg_catalog, pgtrickle, pgtrickle_changes, public
@@ -451,8 +514,9 @@ pub fn setup_ivm_triggers(
              RETURN NULL;
          END;
          $$",
-        fn = names.after_del_fn,
-    );
+            fn = names.after_del_fn,
+        )
+    };
     Spi::run(&create_after_del_fn).map_err(|e| {
         PgTrickleError::SpiError(format!("Failed to create IVM AFTER DELETE function: {}", e))
     })?;
@@ -602,7 +666,7 @@ fn pgt_ivm_apply_delta(
 
     // Try to get cached delta SQL template.
     let (delta_sql, user_columns) =
-        get_or_compute_ivm_delta(pgt_id, source_oid_u32, has_new, has_old, &st)?;
+        get_or_compute_ivm_delta(pgt_id, source_oid_u32, has_new, has_old, &st, false)?;
 
     // Build the qualified stream table name.
     let st_qualified = format!(
@@ -662,6 +726,93 @@ fn pgt_ivm_apply_delta(
 
     pgrx::debug1!(
         "[pg_trickle] IVM delta applied for pgt_id={}, source_oid={}, delta_rows={}",
+        pgt_id,
+        source_oid_u32,
+        delta_count,
+    );
+
+    Ok(())
+}
+
+/// PERF-4 (v0.31.0): SQL-callable function: apply IVM delta using ENR names.
+///
+/// ENR variant of `pgt_ivm_apply_delta`. Called from AFTER trigger bodies
+/// when `pg_trickle.ivm_use_enr = true`. References the ephemeral named
+/// relations (ENRs) `__pgt_newtable` / `__pgt_oldtable` directly, eliminating
+/// the `CREATE TEMP TABLE … AS SELECT * FROM __pgt_newtable` copy overhead.
+///
+/// Requires PostgreSQL 18+ which propagates ENRs to nested SPI calls within
+/// trigger execution contexts.
+#[pg_extern(schema = "pgtrickle")]
+fn pgt_ivm_apply_delta_enr(
+    pgt_id: i64,
+    source_oid: i32,
+    has_new: bool,
+    has_old: bool,
+) -> Result<(), PgTrickleError> {
+    use crate::catalog::StreamTableMeta;
+
+    ensure_ivm_abort_callback_registered();
+
+    Spi::run("SET LOCAL pg_trickle.internal_refresh = 'true'")
+        .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
+
+    let source_oid_u32 = source_oid as u32;
+
+    let st = StreamTableMeta::get_by_id(pgt_id)?.ok_or_else(|| {
+        PgTrickleError::NotFound(format!("Stream table with pgt_id={pgt_id} not found"))
+    })?;
+
+    if st.topk_limit.is_some() {
+        return apply_topk_micro_refresh(&st);
+    }
+
+    // PERF-4: use ENR names (__pgt_newtable / __pgt_oldtable) in delta SQL.
+    let (delta_sql, user_columns) =
+        get_or_compute_ivm_delta(pgt_id, source_oid_u32, has_new, has_old, &st, true)?;
+
+    let st_qualified = format!(
+        "\"{}\".\"{}\"",
+        st.pgt_schema.replace('"', "\"\""),
+        st.pgt_name.replace('"', "\"\""),
+    );
+
+    let delta_table = format!("__pgt_ivm_delta_enr_{pgt_id}");
+    let materialize_sql = format!("CREATE TEMP TABLE {delta_table} ON COMMIT DROP AS {delta_sql}");
+    Spi::run(&materialize_sql).map_err(|e| {
+        PgTrickleError::SpiError(format!("Failed to materialize IVM delta (ENR): {e}"))
+    })?;
+
+    let delta_count = Spi::get_one::<i64>(&format!("SELECT count(*) FROM {delta_table}"))
+        .unwrap_or(Some(0))
+        .unwrap_or(0);
+
+    if delta_count > 0 {
+        let delete_sql = build_ivm_delete_sql(&st_qualified, &delta_table, st.has_keyless_source);
+        Spi::run(&delete_sql)
+            .map_err(|e| PgTrickleError::SpiError(format!("IVM delta DELETE (ENR) failed: {e}")))?;
+
+        let insert_sql = build_ivm_insert_sql(
+            &st_qualified,
+            &delta_table,
+            &user_columns,
+            st.has_keyless_source,
+        );
+        Spi::run(&insert_sql)
+            .map_err(|e| PgTrickleError::SpiError(format!("IVM delta INSERT (ENR) failed: {e}")))?;
+    }
+
+    let _ = Spi::run(&format!("DROP TABLE IF EXISTS {delta_table}"));
+
+    if delta_count > 0 {
+        let now = Spi::get_one::<pgrx::datum::TimestampWithTimeZone>("SELECT now()")
+            .map_err(|e| PgTrickleError::SpiError(e.to_string()))?
+            .ok_or_else(|| PgTrickleError::InternalError("now() returned NULL".into()))?;
+        StreamTableMeta::update_after_refresh(pgt_id, now, delta_count)?;
+    }
+
+    pgrx::debug1!(
+        "[pg_trickle] IVM delta (ENR) applied for pgt_id={}, source_oid={}, delta_rows={}",
         pgt_id,
         source_oid_u32,
         delta_count,
@@ -772,14 +923,19 @@ fn apply_topk_micro_refresh(st: &crate::catalog::StreamTableMeta) -> Result<(), 
 ///
 /// Uses a thread-local cache to avoid re-parsing and re-differentiating
 /// the defining query on every trigger invocation. Cache entries are
-/// keyed by (pgt_id, source_oid, has_new, has_old) and invalidated when
+/// keyed by (pgt_id, source_oid, has_new, has_old, use_enr) and invalidated when
 /// the defining query changes or the shared cache generation advances.
+///
+/// When `use_enr = true` (PERF-4), the generated SQL references the ENR names
+/// `__pgt_newtable` / `__pgt_oldtable` directly. When `false`, it uses the
+/// OID-suffixed temp-table names `__pgt_newtable_{source_oid}` / etc.
 fn get_or_compute_ivm_delta(
     pgt_id: i64,
     source_oid: u32,
     has_new: bool,
     has_old: bool,
     st: &crate::catalog::StreamTableMeta,
+    use_enr: bool,
 ) -> Result<(String, Vec<String>), PgTrickleError> {
     use crate::dvm::diff::{DeltaSource, DiffContext, TransitionTableNames};
     use crate::dvm::parser::parse_defining_query_full;
@@ -793,6 +949,7 @@ fn get_or_compute_ivm_delta(
         source_oid,
         has_new,
         has_old,
+        use_enr,
     };
 
     // Cross-session invalidation: flush if the shared generation counter
@@ -825,17 +982,26 @@ fn get_or_compute_ivm_delta(
     let cte_registry = result.cte_registry;
 
     // Build transition table names.
+    // PERF-4: when use_enr = true, reference the ENR names directly.
     let mut tables = HashMap::new();
     tables.insert(
         source_oid,
         TransitionTableNames {
             new_name: if has_new {
-                Some(format!("__pgt_newtable_{source_oid}"))
+                if use_enr {
+                    Some("__pgt_newtable".to_string())
+                } else {
+                    Some(format!("__pgt_newtable_{source_oid}"))
+                }
             } else {
                 None
             },
             old_name: if has_old {
-                Some(format!("__pgt_oldtable_{source_oid}"))
+                if use_enr {
+                    Some("__pgt_oldtable".to_string())
+                } else {
+                    Some(format!("__pgt_oldtable_{source_oid}"))
+                }
             } else {
                 None
             },

@@ -76,7 +76,7 @@
 | [v0.28.0](roadmap/v0.28.0.md) | Reliable event messaging built into PostgreSQL | ✅ Released | Large | [Full details](roadmap/v0.28.0.md-full.md) |
 | [v0.29.0](roadmap/v0.29.0.md) | Off-the-shelf connector to Kafka, NATS, SQS, and more | ✅ Released | Large | [Full details](roadmap/v0.29.0.md-full.md) |
 | [v0.30.0](roadmap/v0.30.0.md) | Quality gate before 1.0 — correctness, stability, and docs | ✅ Released | Medium | [Full details](roadmap/v0.30.0.md-full.md) |
-| [v0.31.0](roadmap/v0.31.0.md) | Smarter scheduling and faster hot paths | Planned | Medium | [Full details](roadmap/v0.31.0.md-full.md) |
+| [v0.31.0](roadmap/v0.31.0.md) | Smarter scheduling and faster hot paths | ✅ Released | Medium | [Full details](roadmap/v0.31.0.md-full.md) |
 | [v0.32.0](roadmap/v0.32.0.md) | Citus: stable object naming and per-source frontier foundation | Planned | Medium | [Full details](roadmap/v0.32.0.md-full.md) |
 | [v0.33.0](roadmap/v0.33.0.md) | Live push notifications and safe live schema changes | Planned | Medium | [Full details](roadmap/v0.33.0.md-full.md) |
 | [v0.34.0](roadmap/v0.34.0.md) | Time-travel queries and analytic storage | Planned | Medium | [Full details](roadmap/v0.34.0.md-full.md) |

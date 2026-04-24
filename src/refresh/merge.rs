@@ -3222,6 +3222,48 @@ pub fn execute_differential_refresh(
         strategy_label,
     );
 
+    // PERF-2 (v0.31.0): Plan-aware delta routing log.
+    // When adaptive_merge_strategy = true, log a recommendation if the
+    // alternative strategy would have been a better fit based on the
+    // current delta/target ratio.
+    if crate::config::pg_trickle_adaptive_merge_strategy() {
+        let threshold = crate::config::pg_trickle_merge_strategy_threshold();
+        let target_rows: i64 = Spi::get_one::<i64>(&format!(
+            "SELECT CASE WHEN reltuples >= 1 THEN reltuples::bigint \
+                    ELSE (SELECT COUNT(*) FROM \"{}\".\"{}\" ) END \
+             FROM pg_class WHERE oid = {}::oid",
+            schema.replace('"', "\"\""),
+            name.replace('"', "\"\""),
+            st.pgt_relid.to_u32(),
+        ))
+        .unwrap_or(Some(0))
+        .unwrap_or(0);
+        if target_rows > 0 && total_change_count > 0 {
+            let ratio = total_change_count as f64 / target_rows as f64;
+            let suggested = if ratio < threshold {
+                "delete_insert"
+            } else {
+                "merge"
+            };
+            if suggested != strategy_label {
+                pgrx::debug1!(
+                    "[pg_trickle] PERF-2: {}.{} used strategy='{}' but ratio={:.4} suggests \
+                     '{}' ({} changes / {} target rows, threshold={:.4}) — consider \
+                     setting pg_trickle.merge_strategy='{}' for this table",
+                    schema,
+                    name,
+                    strategy_label,
+                    ratio,
+                    suggested,
+                    total_change_count,
+                    target_rows,
+                    threshold,
+                    suggested,
+                );
+            }
+        }
+    }
+
     // ── Session 7: Adaptive threshold auto-tuning ───────────────────
     // Compare INCR total time against the last known FULL time. If INCR
     // is approaching or exceeding FULL, lower the threshold so future

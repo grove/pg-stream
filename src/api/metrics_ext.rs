@@ -19,6 +19,9 @@ use pgrx::prelude::*;
 /// Aggregates refresh counts, error counts, and worker utilisation from
 /// all stream tables registered in this database. Includes `db_name` so
 /// multi-database Grafana panels can use this as a single data source.
+///
+/// v0.31.0 (PERF-3): Added `ivm_lock_parse_error_count` — cumulative count
+/// of IMMEDIATE-mode lock-mode downgrades due to query parse failures.
 #[pg_extern(schema = "pgtrickle")]
 #[allow(clippy::type_complexity)]
 pub fn metrics_summary() -> TableIterator<
@@ -33,6 +36,7 @@ pub fn metrics_summary() -> TableIterator<
         name!(failed_refreshes, Option<i64>),
         name!(total_rows_processed, Option<i64>),
         name!(active_workers, Option<i32>),
+        name!(ivm_lock_parse_error_count, Option<i64>),
     ),
 > {
     let rows = metrics_summary_impl();
@@ -50,8 +54,11 @@ fn metrics_summary_impl() -> Vec<(
     Option<i64>,
     Option<i64>,
     Option<i32>,
+    Option<i64>,
 )> {
     let active_workers = crate::shmem::active_worker_count() as i32;
+    // PERF-3 (v0.31.0): Read the IVM lock-mode parse error counter.
+    let ivm_parse_errors = crate::shmem::read_ivm_lock_parse_errors() as i64;
 
     let row = Spi::connect(|client| {
         let result = client.select(
@@ -117,6 +124,7 @@ fn metrics_summary_impl() -> Vec<(
                 fr,
                 rp,
                 Some(active_workers),
+                Some(ivm_parse_errors),
             )]
         }
         None => Vec::new(),

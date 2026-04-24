@@ -2693,6 +2693,11 @@ pub extern "C-unwind" fn pg_trickle_scheduler_main(_arg: pg_sys::Datum) {
     // avoid spamming the NOTIFY channel every check cycle.
     let mut reported_stuck_sources: HashSet<u32> = HashSet::new();
 
+    // SCAL-1 (v0.31.0): Per-source consecutive-cycle counter for back-pressure
+    // alerting. Maps source_relid (u32) to the number of consecutive scheduler
+    // ticks where that source's change buffer has exceeded the alert threshold.
+    let mut backpressure_cycles: HashMap<u32, i32> = HashMap::new();
+
     // DB-5: Timestamp for daily history retention cleanup.
     let mut last_history_cleanup_ms: u64 = 0;
     const HISTORY_CLEANUP_INTERVAL_MS: u64 = 24 * 60 * 60 * 1000; // 24 hours
@@ -2916,6 +2921,44 @@ pub extern "C-unwind" fn pg_trickle_scheduler_main(_arg: pg_sys::Datum) {
         BackgroundWorker::transaction(AssertUnwindSafe(|| {
             monitor::check_slot_health_and_alert();
         }));
+
+        // SCAL-1 (v0.31.0): Back-pressure detection — check change buffer sizes
+        // and emit change_buffer_backpressure alerts when buffers are persistently
+        // large across multiple consecutive refresh cycles.
+        {
+            let limit = config::pg_trickle_backpressure_consecutive_limit();
+            if limit > 0 {
+                BackgroundWorker::transaction(AssertUnwindSafe(|| {
+                    let threshold = config::pg_trickle_buffer_alert_threshold();
+                    let over = monitor::check_change_buffer_sizes();
+                    // Update consecutive-cycle counters for each source.
+                    let now_over: std::collections::HashSet<u32> =
+                        over.iter().map(|(oid, _)| *oid).collect();
+                    // Increment counters for sources over threshold.
+                    for (oid, pending) in &over {
+                        let cnt = backpressure_cycles
+                            .entry(*oid)
+                            .and_modify(|c| *c += 1)
+                            .or_insert(1);
+                        if *cnt >= limit {
+                            monitor::alert_change_buffer_backpressure(
+                                *oid, *pending, *cnt, threshold,
+                            );
+                            pgrx::log!(
+                                "[pg_trickle] SCAL-1: back-pressure alert for source OID {} \
+                                 — {} rows over threshold {} for {} consecutive cycles",
+                                oid,
+                                pending,
+                                threshold,
+                                cnt,
+                            );
+                        }
+                    }
+                    // Reset counters for sources that came back under threshold.
+                    backpressure_cycles.retain(|oid, _| now_over.contains(oid));
+                }));
+            }
+        }
 
         // Periodic CDC trigger health check: detect disabled/missing triggers
         // on source tables.  Runs every ~60s to avoid per-tick overhead.

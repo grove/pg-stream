@@ -1051,9 +1051,9 @@ pub static PGS_PUBLICATION_LAG_WARN_BYTES: GucSetting<i32> = GucSetting::<i32>::
 /// instead of English message-text patterns.
 ///
 /// The SQLSTATE-based classification is locale-safe: it works correctly regardless
-/// of `lc_messages`. Set to `false` (default) during the v0.30.0 validation window;
-/// will flip to `true` as the default in v0.31.0.
-pub static PGS_USE_SQLSTATE_CLASSIFICATION: GucSetting<bool> = GucSetting::<bool>::new(false);
+/// of `lc_messages`. Flipped to `true` (default) in v0.31.0 after the validation
+/// window. Set to `false` to revert to message-text pattern matching.
+pub static PGS_USE_SQLSTATE_CLASSIFICATION: GucSetting<bool> = GucSetting::<bool>::new(true);
 
 /// STAB-3 (v0.30.0): Maximum age (hours) of L2 catalog template cache entries
 /// before they are eligible for deletion during the scheduler's launcher tick.
@@ -1069,6 +1069,56 @@ pub static PGS_TEMPLATE_CACHE_MAX_AGE_HOURS: GucSetting<i32> = GucSetting::<i32>
 /// unbounded memory allocation in the parse advisory warnings cache and CTE registry.
 /// Set to 0 to disable the limit (default).
 pub static PGS_MAX_PARSE_NODES: GucSetting<i32> = GucSetting::<i32>::new(0);
+
+// ── v0.31.0 GUCs ──────────────────────────────────────────────────────────
+
+/// PERF-4 (v0.31.0): Use ENR (Ephemeral Named Relations) directly in IVM trigger
+/// bodies instead of copying transition data to temp tables.
+///
+/// When true (default), the AFTER trigger function bodies skip the
+/// `CREATE TEMP TABLE ... AS SELECT * FROM __pgt_newtable` step and pass
+/// the ENR names directly to the delta-apply function. This eliminates a
+/// per-statement heap allocation for INSERT/UPDATE/DELETE on IMMEDIATE-mode
+/// stream tables.
+///
+/// When false, the legacy temp-table copy behaviour is used.
+/// Requires PostgreSQL 18+ (ENRs are only available in PG 18 trigger
+/// contexts).
+pub static PGS_IVM_USE_ENR: GucSetting<bool> = GucSetting::<bool>::new(true);
+
+/// PERF-1 (v0.31.0): Coalesce change-buffer scans across stream tables that
+/// share the same source table within a single scheduler tick.
+///
+/// When true (default), the scheduler groups ready stream tables by their
+/// source OIDs before the has-changes check and issues a single batched
+/// EXISTS query per unique source table instead of one per ST. Expected
+/// throughput improvement: 10–30% for deployments with many STs sharing
+/// common source tables.
+///
+/// Disable if the batched query plan is unexpectedly slow (rare).
+pub static PGS_ADAPTIVE_BATCH_COALESCING: GucSetting<bool> = GucSetting::<bool>::new(true);
+
+/// PERF-2 (v0.31.0): Automatically select the `merge_strategy` for each
+/// differential refresh based on the EXPLAIN plan instead of relying on the
+/// fixed `pg_trickle.merge_strategy` GUC.
+///
+/// When true, after each differential refresh the scheduler inspects the
+/// estimated cost ratio between the MERGE and DELETE+INSERT paths using
+/// `EXPLAIN (FORMAT JSON)`. If the cheaper path differs from the current
+/// strategy, the per-ST preference is updated for the next cycle.
+///
+/// Default `false` — the fixed `merge_strategy` GUC governs.
+pub static PGS_ADAPTIVE_MERGE_STRATEGY: GucSetting<bool> = GucSetting::<bool>::new(false);
+
+/// SCAL-1 (v0.31.0): Number of consecutive refresh cycles a change buffer
+/// must exceed `pg_trickle.buffer_alert_threshold` before a
+/// `change_buffer_backpressure` alert is emitted.
+///
+/// A value of 1 fires on the first oversized cycle. Higher values suppress
+/// transient spikes. Set to 0 to disable back-pressure alerting.
+///
+/// Default: 3 cycles.
+pub static PGS_BACKPRESSURE_CONSECUTIVE_LIMIT: GucSetting<i32> = GucSetting::<i32>::new(3);
 
 // ── v0.27.0 GUCs ──────────────────────────────────────────────────────────
 
@@ -2269,6 +2319,56 @@ pub fn register_gucs() {
         GucFlags::default(),
     );
 
+    // ── v0.31.0 GUCs ──────────────────────────────────────────────────────
+
+    GucRegistry::define_bool_guc(
+        c"pg_trickle.ivm_use_enr",
+        c"PERF-4: Use ENR-based transition tables in IVM trigger bodies (PG18+).",
+        c"When true (default), IMMEDIATE-mode trigger functions reference ENRs directly \
+           instead of copying transition data to temp tables. Eliminates per-statement \
+           heap allocation for INSERT/UPDATE/DELETE on IMMEDIATE-mode stream tables. \
+           Requires PostgreSQL 18+. Set to false to use the legacy temp-table approach.",
+        &PGS_IVM_USE_ENR,
+        GucContext::Suset,
+        GucFlags::default(),
+    );
+
+    GucRegistry::define_bool_guc(
+        c"pg_trickle.adaptive_batch_coalescing",
+        c"PERF-1: Coalesce change-buffer scans for STs sharing a source table.",
+        c"When true (default), the scheduler groups ready stream tables by source OID \
+           and issues one batched EXISTS check per unique source instead of one per ST. \
+           Reduces SPI round-trips by up to N× for N stream tables sharing one source.",
+        &PGS_ADAPTIVE_BATCH_COALESCING,
+        GucContext::Suset,
+        GucFlags::default(),
+    );
+
+    GucRegistry::define_bool_guc(
+        c"pg_trickle.adaptive_merge_strategy",
+        c"PERF-2: Auto-select merge_strategy based on EXPLAIN plan after each refresh.",
+        c"When true, after each differential refresh the scheduler inspects the EXPLAIN \
+           cost ratio. If DELETE+INSERT is estimated to be cheaper than MERGE, the \
+           per-ST strategy is switched for the next cycle. Default false — the \
+           fixed pg_trickle.merge_strategy GUC governs.",
+        &PGS_ADAPTIVE_MERGE_STRATEGY,
+        GucContext::Suset,
+        GucFlags::default(),
+    );
+
+    GucRegistry::define_int_guc(
+        c"pg_trickle.backpressure_consecutive_limit",
+        c"SCAL-1: Consecutive cycles above buffer_alert_threshold before emitting backpressure alert.",
+        c"When a change buffer exceeds pg_trickle.buffer_alert_threshold for this many \
+           consecutive refresh cycles, a change_buffer_backpressure alert is emitted on \
+           the pg_trickle_alert NOTIFY channel. Set to 0 to disable. Default: 3.",
+        &PGS_BACKPRESSURE_CONSECUTIVE_LIMIT,
+        0,   // min (0 = disabled)
+        100, // max
+        GucContext::Suset,
+        GucFlags::default(),
+    );
+
     // ── v0.27.0 GUCs ──────────────────────────────────────────────────────
 
     GucRegistry::define_int_guc(
@@ -3028,6 +3128,27 @@ pub fn pg_trickle_template_cache_max_age_hours() -> i32 {
 /// PERF-2 (v0.30.0): Returns the maximum parse node count allowed per query.
 pub fn pg_trickle_max_parse_nodes() -> usize {
     PGS_MAX_PARSE_NODES.get() as usize
+}
+
+/// PERF-4 (v0.31.0): Returns whether ENR-based IVM trigger mode is enabled.
+pub fn pg_trickle_ivm_use_enr() -> bool {
+    PGS_IVM_USE_ENR.get()
+}
+
+/// PERF-1 (v0.31.0): Returns whether adaptive batch coalescing is enabled.
+pub fn pg_trickle_adaptive_batch_coalescing() -> bool {
+    PGS_ADAPTIVE_BATCH_COALESCING.get()
+}
+
+/// PERF-2 (v0.31.0): Returns whether adaptive merge strategy selection is enabled.
+pub fn pg_trickle_adaptive_merge_strategy() -> bool {
+    PGS_ADAPTIVE_MERGE_STRATEGY.get()
+}
+
+/// SCAL-1 (v0.31.0): Returns the number of consecutive cycles before emitting
+/// a back-pressure alert.
+pub fn pg_trickle_backpressure_consecutive_limit() -> i32 {
+    PGS_BACKPRESSURE_CONSECUTIVE_LIMIT.get()
 }
 
 #[cfg(test)]

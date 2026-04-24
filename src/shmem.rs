@@ -204,6 +204,19 @@ pub static FRONTIER_HOLDBACK_LSN_BYTES: PgAtomic<AtomicU64> =
 pub static FRONTIER_HOLDBACK_AGE_SECS: PgAtomic<AtomicU64> =
     unsafe { PgAtomic::new(c"pg_trickle_frontier_holdback_age") };
 
+/// PERF-3 (v0.31.0): Counter of IVM lock-mode parse failures.
+///
+/// Incremented each time `IvmLockMode::for_query` falls back to `Exclusive`
+/// because the defining query could not be parsed. Exposed via
+/// `pgtrickle.metrics_summary()` as `ivm_lock_parse_error_count` and via
+/// the Prometheus metrics endpoint.
+///
+/// Operators can use this counter to audit whether IMMEDIATE-mode queries
+/// are taking unnecessarily broad advisory locks.
+// SAFETY: PgAtomic::new requires a static CStr name.
+pub static IVM_LOCK_PARSE_ERRORS: PgAtomic<AtomicU64> =
+    unsafe { PgAtomic::new(c"pg_trickle_ivm_lock_parse_errors") };
+
 /// Register shared memory allocations. Called from `_PG_init()`.
 pub fn init_shared_memory() {
     pg_shmem_init!(PGS_STATE);
@@ -224,6 +237,8 @@ pub fn init_shared_memory() {
     pg_shmem_init!(L0_POPULATED_VERSION);
     pg_shmem_init!(FRONTIER_HOLDBACK_LSN_BYTES);
     pg_shmem_init!(FRONTIER_HOLDBACK_AGE_SECS);
+    // PERF-3 (v0.31.0): IVM lock-mode parse error counter.
+    pg_shmem_init!(IVM_LOCK_PARSE_ERRORS);
     // PERF-3: Cost-model cache.
     pg_shmem_init!(COST_MODEL_STATE);
     SHMEM_INITIALIZED.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -261,6 +276,29 @@ pub fn read_dedup_stats() -> (u64, u64) {
         .get()
         .load(std::sync::atomic::Ordering::Relaxed);
     (total, dedup)
+}
+
+/// PERF-3 (v0.31.0): Increment the IVM lock-mode parse error counter.
+///
+/// Called from `IvmLockMode::for_query` whenever parsing the defining query
+/// fails and the lock mode falls back to `Exclusive`.
+pub fn increment_ivm_lock_parse_errors() {
+    if !SHMEM_INITIALIZED.load(std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    IVM_LOCK_PARSE_ERRORS
+        .get()
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// PERF-3 (v0.31.0): Read the IVM lock-mode parse error counter.
+pub fn read_ivm_lock_parse_errors() -> u64 {
+    if !SHMEM_INITIALIZED.load(std::sync::atomic::Ordering::Relaxed) {
+        return 0;
+    }
+    IVM_LOCK_PARSE_ERRORS
+        .get()
+        .load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Signal the scheduler to rebuild the dependency DAG.
