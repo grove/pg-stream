@@ -60,8 +60,7 @@ pub use merge::{
 pub use orchestrator::{
     RefreshAction, determine_refresh_action, execute_reinitialize_refresh, validate_topk_metadata,
 };
-// phd1 exports only the cross-cycle phantom cleanup utility used internally.
-pub(crate) use phd1::cleanup_cross_cycle_phantoms;
+// phd1: cross-cycle phantom cleanup (CORR-1, deferred — see merge.rs).
 
 use std::cell::{Cell, RefCell};
 

@@ -3316,38 +3316,12 @@ pub fn execute_differential_refresh(
         );
     }
 
-    // CORR-1 (v0.30.0): After differential refresh of a non-deduplicated query (join),
-    // run cross-cycle phantom cleanup unconditionally with a small batch size.
-    // This removes orphaned __pgt_row_id values that survived prior cycles where
-    // Part 1a inserted a row but the corresponding Part 1b delete was dropped.
-    // Option A per the roadmap: unconditional cleanup with a small batch size of 1000.
-    if !resolved.is_deduplicated {
-        let st_fqn = format!(
-            r#""{}"."{}""#,
-            schema.replace('"', r#"\""#),
-            name.replace('"', r#"\""#)
-        );
-        match crate::refresh::cleanup_cross_cycle_phantoms(
-            st.pgt_id,
-            &st_fqn,
-            &st.defining_query,
-            1000, // small batch size to avoid long lock holds
-        ) {
-            Ok(0) => {}
-            Ok(n) => pgrx::debug1!(
-                "[pg_trickle] CORR-1: removed {} cross-cycle phantom rows from {}.{}",
-                n,
-                schema,
-                name
-            ),
-            Err(e) => pgrx::warning!(
-                "[pg_trickle] CORR-1: phantom cleanup failed for {}.{}: {}",
-                schema,
-                name,
-                e
-            ),
-        }
-    }
+    // CORR-1 (v0.30.0): cross-cycle phantom cleanup is deferred — the
+    // cleanup_cross_cycle_phantoms() helper referenced cf.__pgt_row_id from
+    // the user's defining query CTE which never contains that column, causing
+    // a PostgreSQL error for all non-join query shapes (DISTINCT ON, EXCEPT,
+    // non-recursive CTE, FULL JOIN).  A proper key-based comparison is
+    // required; this will be addressed in a follow-up.
 
     // G12-ERM-1: Record the effective mode for this execution path.
     set_effective_mode("DIFFERENTIAL");
