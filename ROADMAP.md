@@ -78,9 +78,9 @@
 | [v0.30.0](roadmap/v0.30.0.md) | Quality gate before 1.0 — correctness, stability, and docs | ✅ Released | Medium | [Full details](roadmap/v0.30.0.md-full.md) |
 | [v0.31.0](roadmap/v0.31.0.md) | Smarter scheduling and faster hot paths | ✅ Released | Medium | [Full details](roadmap/v0.31.0.md-full.md) |
 | [v0.32.0](roadmap/v0.32.0.md) | Citus: stable object naming and per-source frontier foundation | Planned | Medium | [Full details](roadmap/v0.32.0.md-full.md) |
-| [v0.33.0](roadmap/v0.33.0.md) | Live push notifications and safe live schema changes | Planned | Medium | [Full details](roadmap/v0.33.0.md-full.md) |
-| [v0.34.0](roadmap/v0.34.0.md) | Time-travel queries and analytic storage | Planned | Medium | [Full details](roadmap/v0.34.0.md-full.md) |
-| [v0.35.0](roadmap/v0.35.0.md) | Citus: world-class distributed source CDC and stream table support | Planned | Large | [Full details](roadmap/v0.35.0.md-full.md) |
+| [v0.33.0](roadmap/v0.33.0.md) | Citus: world-class distributed source CDC and stream table support | Planned | Large | [Full details](roadmap/v0.33.0.md-full.md) |
+| [v0.34.0](roadmap/v0.34.0.md) | Live push notifications and safe live schema changes | Planned | Medium | [Full details](roadmap/v0.34.0.md-full.md) |
+| [v0.35.0](roadmap/v0.35.0.md) | Time-travel queries and analytic storage | Planned | Medium | [Full details](roadmap/v0.35.0.md-full.md) |
 
 ### Beyond v1.0
 
@@ -119,9 +119,9 @@ v0.31    ─── Scheduler intelligence and performance hot paths
     │
 v0.32    ─── Citus: stable naming foundation (additive, safe for all users)
     │
-v0.33–34 ─── Push notifications, zero-downtime schema changes, time-travel
+v0.33    ─── Citus: distributed CDC and stream table support
     │
-v0.35    ─── Citus: distributed CDC and stream table support
+v0.34–35 ─── Push notifications, zero-downtime schema changes, time-travel
     │
 v1.0.0   ─── Stable release, PostgreSQL 19, package registries
 ```
@@ -130,10 +130,11 @@ v0.1.0 through v0.27.0 build the complete core engine and harden it for
 production use. v0.28.0 and v0.29.0 deliver the event-driven integration
 story. v0.30.0 is a mandatory correctness and polish gate before 1.0.
 v0.31.0 sharpens scheduler intelligence before new features are added.
-v0.32.0 is scheduled early — before v0.33.0 and v0.34.0 — so that every
-subscription object and temporal history table is created with the new
-stable naming scheme from day one, reducing migration scope later.
-v0.33.0 and v0.34.0 each add a distinct new capability (push notifications
-and time-travel/columnar storage) while the core IVM engine remains stable.
-v0.35.0 builds on v0.32.0's foundations to unlock distributed-source CDC,
-distributed ST placement, and the full Citus test suite.
+v0.32.0 is the first of two Citus releases, shipping stable object naming
+and detection helpers as an additive, non-breaking foundation. v0.33.0
+delivers the full Citus integration immediately after — per-worker slot CDC,
+distributed ST placement, cross-node coordination, and the Citus test suite.
+Pulling v0.33.0 forward means users with Citus topologies (including
+billion-row all-distributed deployments) are unblocked two releases earlier.
+v0.34.0 and v0.35.0 add push notifications and time-travel/columnar storage;
+both are independent of the Citus work and ship in their own right.
