@@ -1229,14 +1229,16 @@ END;
 $$;
 
 -- Create the relay role if it does not exist.
--- Use EXCEPTION rather than IF NOT EXISTS to avoid a TOCTOU race condition
--- when multiple concurrent transactions (parallel test workers) all try to
--- CREATE EXTENSION simultaneously on the same PostgreSQL instance.
+-- Use EXCEPTION to handle both race conditions:
+--   * duplicate_object (42710): role created between our check and our CREATE
+--   * unique_violation (23505): two concurrent CREATE EXTENSION calls hit the
+--     pg_authid unique index simultaneously (parallel test workers)
 DO $$
 BEGIN
     CREATE ROLE pgtrickle_relay NOLOGIN;
-EXCEPTION WHEN duplicate_object THEN
-    NULL; -- role already exists, nothing to do
+EXCEPTION
+    WHEN duplicate_object THEN NULL   -- role already exists
+    WHEN unique_violation THEN NULL   -- concurrent CREATE ROLE race
 END;
 $$;
 "#,
