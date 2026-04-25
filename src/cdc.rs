@@ -893,15 +893,18 @@ pub fn compact_change_buffer(
         return Ok(0);
     }
 
+    // CITUS-4: Use stable buffer name (v0.32.0+).
+    let buf_name = buffer_base_name_for_oid(pg_sys::Oid::from(source_oid));
+
     // Quick count check — skip if below threshold.
     let pending_count: i64 = Spi::get_one::<i64>(&format!(
         "SELECT count(*)::bigint FROM (\
-           SELECT 1 FROM \"{schema}\".changes_{oid} \
+           SELECT 1 FROM \"{schema}\".{buf} \
            WHERE lsn > '{prev_lsn}'::pg_lsn AND lsn <= '{new_lsn}'::pg_lsn \
            LIMIT {limit}\
          ) __pgt_cnt",
         schema = change_schema,
-        oid = source_oid,
+        buf = buf_name,
         limit = threshold + 1,
     ))
     .unwrap_or(Some(0))
@@ -939,7 +942,7 @@ pub fn compact_change_buffer(
     // The delta query pipeline handles 2-row groups (first + last) correctly
     // via FIRST_VALUE/LAST_VALUE window functions.
     let compact_sql = format!(
-        "DELETE FROM \"{schema}\".changes_{oid} \
+        "DELETE FROM \"{schema}\".{buf} \
          WHERE change_id IN (\
            SELECT change_id FROM (\
              SELECT change_id, \
@@ -952,14 +955,14 @@ pub fn compact_change_buffer(
                       PARTITION BY pk_hash ORDER BY change_id \
                       ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING\
                     ) AS last_act \
-             FROM \"{schema}\".changes_{oid} \
+             FROM \"{schema}\".{buf} \
              WHERE lsn > '{prev_lsn}'::pg_lsn AND lsn <= '{new_lsn}'::pg_lsn\
            ) __pgt_ranked \
            WHERE (first_act = 'I' AND last_act = 'D') \
               OR (rn_asc > 1 AND rn_desc > 1)\
          )",
         schema = change_schema,
-        oid = source_oid,
+        buf = buf_name,
     );
 
     let deleted = Spi::connect_mut(|client| {
@@ -3216,11 +3219,13 @@ pub fn count_pending_changes(
     prev_lsn: &str,
     new_lsn: &str,
 ) -> i64 {
+    // CITUS-4: Use stable buffer name (v0.32.0+).
+    let buf_name = buffer_base_name_for_oid(pg_sys::Oid::from(source_oid));
     Spi::get_one::<i64>(&format!(
-        "SELECT count(*)::bigint FROM \"{schema}\".changes_{oid} \
+        "SELECT count(*)::bigint FROM \"{schema}\".{buf} \
          WHERE lsn > '{prev_lsn}'::pg_lsn AND lsn <= '{new_lsn}'::pg_lsn",
         schema = change_schema,
-        oid = source_oid,
+        buf = buf_name,
     ))
     .unwrap_or(Some(0))
     .unwrap_or(0)

@@ -158,7 +158,7 @@ async fn test_stmt_cdc_bulk_insert_all_rows_captured() {
     db.refresh_st("bulk_ins_st").await;
 
     let source_oid = db.table_oid("bulk_ins").await;
-    let buf = format!("pgtrickle_changes.changes_{}", source_oid);
+    let buf = db.change_buffer_table(source_oid as i64).await;
 
     // Bulk-insert 100 rows in one SQL statement.
     db.execute(
@@ -211,7 +211,7 @@ async fn test_stmt_cdc_bulk_update_keyed_table() {
     db.refresh_st("bulk_upd_st").await;
 
     let source_oid = db.table_oid("bulk_upd").await;
-    let buf = format!("pgtrickle_changes.changes_{}", source_oid);
+    let buf = db.change_buffer_table(source_oid as i64).await;
     // Clear post-create changes from the buffer.
     db.execute(&format!("TRUNCATE {buf}")).await;
 
@@ -276,7 +276,7 @@ async fn test_stmt_cdc_bulk_delete_keyed_table() {
     db.refresh_st("bulk_del_st").await;
 
     let source_oid = db.table_oid("bulk_del").await;
-    let buf = format!("pgtrickle_changes.changes_{}", source_oid);
+    let buf = db.change_buffer_table(source_oid as i64).await;
     db.execute(&format!("TRUNCATE {buf}")).await;
 
     // Delete all rows where id is odd (15 rows).
@@ -324,7 +324,7 @@ async fn test_stmt_cdc_keyless_update_captured_as_delete_plus_insert() {
     db.refresh_st("keyless_upd_st").await;
 
     let source_oid = db.table_oid("keyless_upd").await;
-    let buf = format!("pgtrickle_changes.changes_{}", source_oid);
+    let buf = db.change_buffer_table(source_oid as i64).await;
     db.execute(&format!("TRUNCATE {buf}")).await;
 
     // Update all 3 rows in a single statement.
@@ -501,7 +501,7 @@ async fn test_stmt_cdc_mixed_dml_in_transaction() {
     db.refresh_st("mixed_dml_st").await;
 
     let source_oid = db.table_oid("mixed_dml").await;
-    let buf = format!("pgtrickle_changes.changes_{}", source_oid);
+    let buf = db.change_buffer_table(source_oid as i64).await;
     db.execute(&format!("TRUNCATE {buf}")).await;
 
     // Mix of DML in a single transaction.

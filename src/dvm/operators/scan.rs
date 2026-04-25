@@ -2,7 +2,7 @@
 //!
 //! ΔI(Scan(T)) reads from the change buffer table for T.
 //!
-//! The change buffer table `pgtrickle_changes.changes_<oid>` contains:
+//! The change buffer table `pgtrickle_changes.changes_<stable_name>` contains:
 //! - change_id BIGSERIAL — insertion ordering (CACHE 1 invariant, see cdc.rs)
 //! - lsn PG_LSN
 //! - action CHAR(1) — 'I', 'U', 'D'
@@ -201,8 +201,9 @@ fn diff_scan_change_buffer(
     pk_columns: &[String],
     alias: &str,
 ) -> Result<DiffResult, PgTrickleError> {
-    // ST-ST-4: Use `changes_pgt_{pgt_id}` for ST sources, `changes_{oid}` for base tables.
+    // ST-ST-4: Use `changes_pgt_{pgt_id}` for ST sources, `changes_{stable_name}` for base tables.
     // DAG-4: When a bypass table is registered (fused-chain), read from it instead.
+    // CITUS-4: Base table buffers use the stable hash name (v0.32.0+), not the OID.
     let is_st_source = ctx.st_source_pgt_ids.contains_key(&table_oid);
     let change_table = if let Some(&pgt_id) = ctx.st_source_pgt_ids.get(&table_oid) {
         if let Some(bypass) = ctx.st_bypass_tables.get(&pgt_id) {
@@ -215,11 +216,11 @@ fn diff_scan_change_buffer(
             )
         }
     } else {
-        format!(
-            "{}.changes_{}",
-            quote_ident(&ctx.change_buffer_schema),
-            table_oid,
-        )
+        // CITUS-4: Use stable_name (from pgt_change_tracking) so the generated delta SQL
+        // references the correct change buffer table (created as changes_{stable_name}).
+        let buf_name =
+            crate::cdc::buffer_base_name_for_oid(pgrx::pg_sys::Oid::from(table_oid));
+        format!("{}.{}", quote_ident(&ctx.change_buffer_schema), buf_name)
     };
 
     let prev_lsn = ctx.get_prev_lsn(table_oid);

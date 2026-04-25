@@ -114,7 +114,7 @@ async fn test_trigger_captures_insert() {
     .await;
 
     let source_oid = db.table_oid("cdc_src").await;
-    let buffer_table = format!("pgtrickle_changes.changes_{}", source_oid);
+    let buffer_table = db.change_buffer_table(source_oid as i64).await;
 
     // Consume any existing changes from create
     db.refresh_st("cdc_st").await;
@@ -157,7 +157,7 @@ async fn test_trigger_captures_update() {
     .await;
 
     let source_oid = db.table_oid("cdc_upd").await;
-    let buffer_table = format!("pgtrickle_changes.changes_{}", source_oid);
+    let buffer_table = db.change_buffer_table(source_oid as i64).await;
 
     // Consume existing changes
     db.refresh_st("cdc_upd_st").await;
@@ -205,7 +205,7 @@ async fn test_trigger_captures_delete() {
     .await;
 
     let source_oid = db.table_oid("cdc_del").await;
-    let buffer_table = format!("pgtrickle_changes.changes_{}", source_oid);
+    let buffer_table = db.change_buffer_table(source_oid as i64).await;
 
     // Consume existing changes
     db.refresh_st("cdc_del_st").await;
@@ -251,7 +251,7 @@ async fn test_trigger_captures_bulk_insert() {
     .await;
 
     let source_oid = db.table_oid("cdc_bulk").await;
-    let buffer_table = format!("pgtrickle_changes.changes_{}", source_oid);
+    let buffer_table = db.change_buffer_table(source_oid as i64).await;
 
     // Consume existing changes
     db.refresh_st("cdc_bulk_st").await;
@@ -284,7 +284,7 @@ async fn test_trigger_lsn_ordering() {
     .await;
 
     let source_oid = db.table_oid("cdc_lsn").await;
-    let buffer_table = format!("pgtrickle_changes.changes_{}", source_oid);
+    let buffer_table = db.change_buffer_table(source_oid as i64).await;
 
     // Consume existing
     db.refresh_st("cdc_lsn_st").await;
@@ -327,7 +327,7 @@ async fn test_trigger_typed_columns_captured() {
     .await;
 
     let source_oid = db.table_oid("cdc_typed").await;
-    let buffer_table = format!("pgtrickle_changes.changes_{}", source_oid);
+    let buffer_table = db.change_buffer_table(source_oid as i64).await;
 
     // Consume existing
     db.refresh_st("cdc_typed_st").await;
@@ -370,7 +370,7 @@ async fn test_buffer_cleanup_after_refresh() {
     .await;
 
     let source_oid = db.table_oid("cdc_cleanup").await;
-    let buffer_table = format!("pgtrickle_changes.changes_{}", source_oid);
+    let buffer_table = db.change_buffer_table(source_oid as i64).await;
 
     // Insert data to create changes
     db.execute("INSERT INTO cdc_cleanup VALUES (2, 'b'), (3, 'c')")
@@ -410,12 +410,17 @@ async fn test_multiple_sources_independent_buffers() {
     let oid_a = db.table_oid("src_a").await;
     let oid_b = db.table_oid("src_b").await;
 
-    // Each source should have its own buffer table
+    // Each source should have its own buffer table (v0.32.0: named by stable hash)
+    let buf_a = db.change_buffer_table(oid_a as i64).await;
+    let buf_b = db.change_buffer_table(oid_b as i64).await;
+    // Extract the table name from the qualified name for table_exists
+    let buf_a_name = buf_a.trim_start_matches("pgtrickle_changes.").to_string();
+    let buf_b_name = buf_b.trim_start_matches("pgtrickle_changes.").to_string();
     let buf_a_exists = db
-        .table_exists("pgtrickle_changes", &format!("changes_{}", oid_a))
+        .table_exists("pgtrickle_changes", &buf_a_name)
         .await;
     let buf_b_exists = db
-        .table_exists("pgtrickle_changes", &format!("changes_{}", oid_b))
+        .table_exists("pgtrickle_changes", &buf_b_name)
         .await;
 
     assert!(buf_a_exists, "src_a should have its own change buffer");
@@ -511,7 +516,7 @@ async fn test_trigger_captures_partitioned_table_dml() {
 
     // Verify changes are captured in the change buffer
     let source_oid = db.table_oid("orders").await;
-    let buffer_table = format!("pgtrickle_changes.changes_{}", source_oid);
+    let buffer_table = db.change_buffer_table(source_oid as i64).await;
     let change_count: i64 = db.count(&buffer_table).await;
     assert!(
         change_count >= 2,
@@ -613,7 +618,7 @@ async fn test_f15_selective_cdc_buffer_has_only_referenced_columns() {
     .await;
 
     let source_oid = db.table_oid("f15_src").await;
-    let buffer_table = format!("pgtrickle_changes.changes_{}", source_oid);
+    let buffer_table = db.change_buffer_table(source_oid as i64).await;
 
     // Buffer must have new_id / old_id (PK) and new_name / old_name (referenced).
     let has_new_id: bool = db
@@ -701,7 +706,7 @@ async fn test_f15_selective_cdc_buffer_expands_for_second_stream_table() {
     .await;
 
     let source_oid = db.table_oid("f15_exp").await;
-    let buffer_table = format!("pgtrickle_changes.changes_{}", source_oid);
+    let buffer_table = db.change_buffer_table(source_oid as i64).await;
 
     // After first ST: new_status must NOT be present
     let has_status_before: bool = db
@@ -802,7 +807,7 @@ async fn test_f15_select_star_falls_back_to_full_capture() {
         "SELECT * source must report selective_capture = false"
     );
 
-    let buffer_table = format!("pgtrickle_changes.changes_{}", source_oid);
+    let buffer_table = db.change_buffer_table(source_oid as i64).await;
 
     // All columns must be present in buffer
     for col in &["new_id", "new_name", "new_extra"] {
@@ -1062,7 +1067,15 @@ async fn test_inv_cache1_change_buffer_sequence_cache_is_one() {
     db.refresh_st("cache1_st").await;
 
     let source_oid = db.table_oid("cache1_src").await;
-    let seq_name = format!("pgtrickle_changes.changes_{}_change_id_seq", source_oid);
+    // v0.32.0+: sequence name uses stable hash, not OID.
+    let stable_name: String = db
+        .query_scalar(&format!(
+            "SELECT source_stable_name FROM pgtrickle.pgt_change_tracking \
+             WHERE source_relid = {}",
+            source_oid
+        ))
+        .await;
+    let seq_name = format!("pgtrickle_changes.changes_{}_change_id_seq", stable_name);
 
     // 1. Fresh sequence must have CACHE = 1.
     let cache_size: i64 = db
@@ -1070,7 +1083,7 @@ async fn test_inv_cache1_change_buffer_sequence_cache_is_one() {
             "SELECT cache_size FROM pg_sequences \
              WHERE schemaname = 'pgtrickle_changes' \
                AND sequencename = 'changes_{}_change_id_seq'",
-            source_oid
+            stable_name
         ))
         .await;
     assert_eq!(

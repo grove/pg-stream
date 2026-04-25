@@ -450,8 +450,11 @@ async fn test_create_change_buffer_exists() {
         .await;
 
     let source_oid = db.table_oid("items").await;
+    // v0.32.0+: buffer table is named by stable hash, not OID.
+    let buf_table = db.change_buffer_table(source_oid as i64).await;
+    let buf_name = buf_table.trim_start_matches("pgtrickle_changes.").to_string();
     let buffer_exists = db
-        .table_exists("pgtrickle_changes", &format!("changes_{}", source_oid))
+        .table_exists("pgtrickle_changes", &buf_name)
         .await;
     assert!(buffer_exists, "Change buffer table should exist");
 }
