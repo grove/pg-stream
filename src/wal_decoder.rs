@@ -1729,6 +1729,89 @@ fn detect_schema_mismatch(
     false
 }
 
+// ── Per-worker change buffer write (Citus distributed CDC) ───────────────────
+
+/// Process change rows from a temp table (fetched from a remote Citus worker via
+/// `dblink`) and write decoded events into the local change buffer.
+///
+/// This mirrors [`poll_wal_changes`] but reads from a pre-fetched local temp
+/// table `temp_table` (columns: `lsn text, xid text, data text`) instead of
+/// calling `pg_logical_slot_get_changes()` directly.  The `test_decoding`
+/// text format is identical on remote workers and locally, so the same
+/// parsing logic applies.
+///
+/// Returns the number of change rows successfully written to the buffer.
+pub fn write_worker_changes_to_buffer(
+    temp_table: &str,
+    source_table_name: &str,
+    change_schema: &str,
+    source_oid: pg_sys::Oid,
+    pk_columns: &[String],
+    columns: &[(String, String)],
+) -> Result<i64, PgTrickleError> {
+    let oid_u32 = source_oid.to_u32();
+
+    // Fetch all rows from the temp table created by the dblink call.
+    let select_sql = format!(
+        "SELECT lsn, data FROM {} WHERE data IS NOT NULL AND data != '' ORDER BY lsn",
+        temp_table
+    );
+
+    let mut count: i64 = 0;
+
+    Spi::connect(|client| {
+        let result = client
+            .select(&select_sql, None, &[])
+            .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
+
+        let table_prefix = format!("table {}: ", source_table_name);
+
+        for row in result {
+            let lsn = row
+                .get::<String>(1)
+                .map_err(|e| PgTrickleError::SpiError(e.to_string()))?
+                .unwrap_or_default();
+            let data = row
+                .get::<String>(2)
+                .map_err(|e| PgTrickleError::SpiError(e.to_string()))?
+                .unwrap_or_default();
+
+            // Filter to rows for this source table (test_decoding decodes all tables).
+            if !data.starts_with(&table_prefix) {
+                continue;
+            }
+
+            if let Some(action) = parse_pgoutput_action(&data) {
+                if action != 'T' {
+                    let parsed = parse_pgoutput_columns(&data);
+                    if detect_schema_mismatch(&parsed, columns) {
+                        return Err(PgTrickleError::WalTransitionError(format!(
+                            "Schema change detected on worker for source OID {} — \
+                             decoded columns don't match expected",
+                            oid_u32
+                        )));
+                    }
+                }
+
+                write_decoded_change(
+                    oid_u32,
+                    &lsn,
+                    &action,
+                    &data,
+                    change_schema,
+                    pk_columns,
+                    columns,
+                )?;
+                count += 1;
+            }
+        }
+
+        Ok::<(), PgTrickleError>(())
+    })?;
+
+    Ok(count)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

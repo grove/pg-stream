@@ -324,6 +324,243 @@ pub fn shard_placements(table_oid: pg_sys::Oid) -> Vec<NodeAddr> {
     })
 }
 
+// ── Cross-node coordination: pgt_st_locks ────────────────────────────────────
+
+/// Attempt to acquire a named advisory lock in `pgtrickle.pgt_st_locks`.
+///
+/// Uses `INSERT … ON CONFLICT DO NOTHING` so the operation is safe for
+/// concurrent callers on multiple Citus workers.  The lease expires at
+/// `now() + lease_ms * interval '1 ms'`; stale entries from crashed holders
+/// are purged before each acquisition attempt.
+///
+/// Returns `true` if the lock was acquired, `false` if another holder owns it.
+pub fn try_acquire_st_lock(
+    lock_key: &str,
+    holder: &str,
+    lease_ms: i64,
+) -> Result<bool, PgTrickleError> {
+    // Expire any stale locks first so crashed holders don't block forever.
+    let expired = Spi::get_one::<i64>(
+        "DELETE FROM pgtrickle.pgt_st_locks WHERE expires_at < now() RETURNING 1",
+    )
+    .map_err(|e| PgTrickleError::SpiError(format!("pgt_st_locks expire: {e}")))?
+    .unwrap_or(0);
+    if expired > 0 {
+        pgrx::debug1!(
+            "[pg_trickle] pgt_st_locks: expired {} stale lock(s)",
+            expired
+        );
+    }
+
+    // Attempt acquisition.
+    let acquired = Spi::connect_mut(|client| {
+        let rows = client
+            .update(
+                "INSERT INTO pgtrickle.pgt_st_locks \
+                     (lock_key, holder, acquired_at, expires_at) \
+                 VALUES ($1, $2, now(), now() + ($3 * interval '1 ms')) \
+                 ON CONFLICT (lock_key) DO NOTHING",
+                None,
+                &[
+                    lock_key.into(),
+                    holder.into(),
+                    lease_ms.into(),
+                ],
+            )
+            .map_err(|e| PgTrickleError::SpiError(format!("pgt_st_locks insert: {e}")))?;
+        Ok::<bool, PgTrickleError>(rows.len() > 0)
+    })?;
+
+    Ok(acquired)
+}
+
+/// Release a named lock in `pgtrickle.pgt_st_locks` held by `holder`.
+///
+/// No-ops silently when the lock does not exist or is owned by a different holder.
+pub fn release_st_lock(lock_key: &str, holder: &str) -> Result<(), PgTrickleError> {
+    Spi::run_with_args(
+        "DELETE FROM pgtrickle.pgt_st_locks WHERE lock_key = $1 AND holder = $2",
+        &[lock_key.into(), holder.into()],
+    )
+    .map_err(|e| PgTrickleError::SpiError(format!("pgt_st_locks delete: {e}")))
+}
+
+/// Extend the expiry of an existing lock.
+///
+/// Returns `true` if the lock was found (and renewed), `false` otherwise.
+pub fn extend_st_lock(
+    lock_key: &str,
+    holder: &str,
+    lease_ms: i64,
+) -> Result<bool, PgTrickleError> {
+    let renewed = Spi::connect_mut(|client| {
+        let rows = client
+            .update(
+                "UPDATE pgtrickle.pgt_st_locks \
+                 SET expires_at = now() + ($3 * interval '1 ms') \
+                 WHERE lock_key = $1 AND holder = $2",
+                None,
+                &[lock_key.into(), holder.into(), lease_ms.into()],
+            )
+            .map_err(|e| PgTrickleError::SpiError(format!("pgt_st_locks extend: {e}")))?;
+        Ok::<bool, PgTrickleError>(rows.len() > 0)
+    })?;
+    Ok(renewed)
+}
+
+// ── Per-worker WAL CDC helpers ────────────────────────────────────────────────
+
+/// Build a `dblink`-compatible connection string for a Citus worker node.
+///
+/// Reads the current database name from `current_database()` and combines it
+/// with the node's hostname and port.  The resulting string is suitable for
+/// passing to `dblink(connstr, query)`.
+///
+/// # Security
+/// Connection strings are constructed from catalog values (`pg_dist_node`)
+/// plus the current database name, never from user-supplied input.
+pub fn worker_conn_string(worker: &NodeAddr, dbname: &str) -> String {
+    format!(
+        "host={} port={} dbname={} options='-c enable_seqscan=on'",
+        worker.node_name.replace('\'', "''"),
+        worker.node_port,
+        dbname.replace('\'', "''"),
+    )
+}
+
+/// Poll a logical replication slot on a remote Citus worker via `dblink`.
+///
+/// Calls `pg_logical_slot_get_changes(slot_name, NULL, $max_changes, …)` on
+/// the remote worker and writes decoded changes into the local change buffer
+/// via the standard WAL decoder pipeline (same `test_decoding` text format
+/// as local slots).
+///
+/// # Prerequisites
+/// - `dblink` extension must be installed on the coordinator.
+/// - The coordinator's PostgreSQL role must have login privileges on the worker.
+/// - The replication slot must already exist on the worker (see `ensure_worker_slot`).
+///
+/// Returns the number of change rows written to the local buffer.
+pub fn poll_worker_slot_changes(
+    worker: &NodeAddr,
+    slot_name: &str,
+    change_schema: &str,
+    source_qualified_table: &str,
+    source_oid: pg_sys::Oid,
+    max_changes: i64,
+    pk_columns: &[String],
+    columns: &[(String, String)],
+) -> Result<i64, PgTrickleError> {
+    // Get current database name.
+    let dbname = Spi::get_one::<String>("SELECT current_database()")
+        .map_err(|e| PgTrickleError::SpiError(format!("current_database: {e}")))?
+        .unwrap_or_else(|| "postgres".into());
+
+    let connstr = worker_conn_string(worker, &dbname);
+    let connstr_esc = connstr.replace('\'', "''");
+    let slot_esc = slot_name.replace('\'', "''");
+
+    // Build the remote query that drains the slot.
+    let remote_sql = format!(
+        "SELECT lsn::text, xid::text, data \
+         FROM pg_logical_slot_get_changes('{}', NULL, {}, 'include-timestamp', 'on')",
+        slot_esc, max_changes,
+    );
+    let remote_sql_esc = remote_sql.replace('\'', "''");
+
+    // Materialize dblink results into a temp table for batch processing.
+    let temp_name = format!("__pgt_worker_changes_{}", source_oid.to_u32());
+    let _ = Spi::run(&format!("DROP TABLE IF EXISTS {temp_name}"));
+    let create_sql = format!(
+        "CREATE TEMP TABLE {temp_name} ON COMMIT DROP AS \
+         SELECT lsn, xid, data \
+         FROM dblink('{connstr_esc}', '{remote_sql_esc}') \
+         AS t(lsn text, xid text, data text)"
+    );
+    Spi::run(&create_sql).map_err(|e| {
+        PgTrickleError::SpiError(format!(
+            "dblink poll worker {}:{} slot '{}': {e}",
+            worker.node_name, worker.node_port, slot_name
+        ))
+    })?;
+
+    // Delegate parsing and buffer-write to the WAL decoder.
+    crate::wal_decoder::write_worker_changes_to_buffer(
+        &temp_name,
+        source_qualified_table,
+        change_schema,
+        source_oid,
+        pk_columns,
+        columns,
+    )
+}
+
+/// Ensure a logical replication slot exists on a remote Citus worker via `dblink`.
+///
+/// Creates the slot only if it does not already exist, making this safe to
+/// call on every scheduler tick.  The remote slot uses the `test_decoding`
+/// plugin (same as local slots).
+///
+/// Returns `Ok(())` on success or if the slot already exists.
+pub fn ensure_worker_slot(
+    worker: &NodeAddr,
+    slot_name: &str,
+) -> Result<(), PgTrickleError> {
+    let dbname = Spi::get_one::<String>("SELECT current_database()")
+        .map_err(|e| PgTrickleError::SpiError(format!("current_database: {e}")))?
+        .unwrap_or_else(|| "postgres".into());
+
+    let connstr = worker_conn_string(worker, &dbname);
+    let connstr_esc = connstr.replace('\'', "''");
+    let slot_esc = slot_name.replace('\'', "''");
+
+    // Check if slot exists on the remote worker.
+    let remote_check = format!(
+        "SELECT count(*) FROM pg_replication_slots WHERE slot_name = '{slot_esc}'"
+    );
+    let remote_check_esc = remote_check.replace('\'', "''");
+
+    let exists_count = Spi::get_one::<i64>(&format!(
+        "SELECT val::bigint FROM dblink('{connstr_esc}', '{remote_check_esc}') AS t(val text)"
+    ))
+    .map_err(|e| {
+        PgTrickleError::SpiError(format!(
+            "dblink check slot on {}:{}: {e}",
+            worker.node_name, worker.node_port
+        ))
+    })?
+    .unwrap_or(0);
+
+    if exists_count > 0 {
+        return Ok(());
+    }
+
+    // Create the slot on the remote worker.
+    let remote_create = format!(
+        "SELECT pg_create_logical_replication_slot('{slot_esc}', 'test_decoding')"
+    );
+    let remote_create_esc = remote_create.replace('\'', "''");
+
+    Spi::run(&format!(
+        "SELECT * FROM dblink('{connstr_esc}', '{remote_create_esc}') AS t(slot_name text, lsn text)"
+    ))
+    .map_err(|e| {
+        PgTrickleError::SpiError(format!(
+            "dblink create slot '{}' on {}:{}: {e}",
+            slot_name, worker.node_name, worker.node_port
+        ))
+    })?;
+
+    pgrx::info!(
+        "[pg_trickle] created WAL slot '{}' on Citus worker {}:{}",
+        slot_name,
+        worker.node_name,
+        worker.node_port,
+    );
+
+    Ok(())
+}
+
 // ── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]

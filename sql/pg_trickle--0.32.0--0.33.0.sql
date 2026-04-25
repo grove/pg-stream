@@ -1,7 +1,7 @@
 -- pg_trickle 0.32.0 → 0.33.0 upgrade migration
 -- ============================================
 --
--- v0.33.0 — CITUS-7: output_distribution_column parameter
+-- v0.33.0 — CITUS distributed stream table support
 --
 -- Changes in this version:
 --   - CITUS-7: Add `output_distribution_column TEXT DEFAULT NULL` parameter to
@@ -10,13 +10,71 @@
 --              and Citus is loaded, the output storage table is converted to a
 --              Citus distributed table on that column immediately after creation.
 --              Pass 's' to co-locate stream table output with pg_ripple VP shards.
+--   - CIT-1:  Distributed stream tables now use DELETE+INSERT instead of MERGE
+--             during differential refresh (Citus blocks cross-shard MERGE).
+--   - CIT-2:  New pgtrickle.pgt_st_locks table for cross-node refresh coordination.
+--   - CIT-3:  New pgtrickle.pgt_worker_slots table for per-worker WAL slot tracking.
+--   - CIT-4:  New pgtrickle.citus_status view for per-worker CDC observability.
 --
--- Migration is safe to run on a live system.  The function replacements below
--- add a trailing DEFAULT NULL parameter to each function, so existing call
--- sites continue to work unchanged.
+-- Migration is safe to run on a live system.
 
 -- ─────────────────────────────────────────────────────────────────────────
--- STEP 1: Replace create_stream_table with new signature
+-- STEP 1: Cross-node advisory lock table
+-- ─────────────────────────────────────────────────────────────────────────
+
+CREATE TABLE IF NOT EXISTS pgtrickle.pgt_st_locks (
+    lock_key    TEXT        NOT NULL,
+    holder      TEXT        NOT NULL,
+    acquired_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    expires_at  TIMESTAMPTZ NOT NULL,
+    CONSTRAINT pgt_st_locks_pkey PRIMARY KEY (lock_key)
+);
+SELECT pg_catalog.pg_extension_config_dump('pgtrickle.pgt_st_locks', '');
+
+-- ─────────────────────────────────────────────────────────────────────────
+-- STEP 2: Per-worker WAL slot tracking table
+-- ─────────────────────────────────────────────────────────────────────────
+
+CREATE TABLE IF NOT EXISTS pgtrickle.pgt_worker_slots (
+    pgt_id       BIGINT NOT NULL
+                 REFERENCES pgtrickle.pgt_stream_tables(pgt_id) ON DELETE CASCADE,
+    source_relid OID    NOT NULL,
+    worker_name  TEXT   NOT NULL,
+    worker_port  INT    NOT NULL DEFAULT 5432,
+    slot_name    TEXT   NOT NULL,
+    last_frontier TEXT,
+    CONSTRAINT pgt_worker_slots_pkey
+        PRIMARY KEY (pgt_id, source_relid, worker_name, worker_port)
+);
+SELECT pg_catalog.pg_extension_config_dump('pgtrickle.pgt_worker_slots', '');
+
+-- ─────────────────────────────────────────────────────────────────────────
+-- STEP 3: Citus status observability view
+-- ─────────────────────────────────────────────────────────────────────────
+
+CREATE OR REPLACE VIEW pgtrickle.citus_status AS
+SELECT
+    ct.pgt_id,
+    st.pgt_schema,
+    st.pgt_name,
+    ct.source_relid,
+    ct.source_stable_name,
+    ct.slot_name           AS coordinator_slot,
+    ct.source_placement,
+    ct.frontier_per_node,
+    ws.worker_name,
+    ws.worker_port,
+    ws.slot_name           AS worker_slot,
+    ws.last_frontier       AS worker_frontier
+FROM pgtrickle.pgt_change_tracking ct
+JOIN pgtrickle.pgt_stream_tables   st ON st.pgt_id = ct.pgt_id
+LEFT JOIN pgtrickle.pgt_worker_slots ws
+       ON ws.pgt_id       = ct.pgt_id
+      AND ws.source_relid = ct.source_relid
+WHERE ct.source_placement = 'distributed';
+
+-- ─────────────────────────────────────────────────────────────────────────
+-- STEP 4: Replace create_stream_table with new signature (output_distribution_column)
 -- ─────────────────────────────────────────────────────────────────────────
 
 CREATE OR REPLACE FUNCTION pgtrickle."create_stream_table"(
@@ -39,7 +97,7 @@ LANGUAGE c
 AS 'MODULE_PATHNAME', 'create_stream_table_wrapper';
 
 -- ─────────────────────────────────────────────────────────────────────────
--- STEP 2: Replace create_stream_table_if_not_exists with new signature
+-- STEP 5: Replace create_stream_table_if_not_exists with new signature
 -- ─────────────────────────────────────────────────────────────────────────
 
 CREATE OR REPLACE FUNCTION pgtrickle."create_stream_table_if_not_exists"(
@@ -62,7 +120,7 @@ LANGUAGE c
 AS 'MODULE_PATHNAME', 'create_stream_table_if_not_exists_wrapper';
 
 -- ─────────────────────────────────────────────────────────────────────────
--- STEP 3: Replace create_or_replace_stream_table with new signature
+-- STEP 6: Replace create_or_replace_stream_table with new signature
 -- ─────────────────────────────────────────────────────────────────────────
 
 CREATE OR REPLACE FUNCTION pgtrickle."create_or_replace_stream_table"(

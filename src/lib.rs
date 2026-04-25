@@ -442,6 +442,34 @@ SELECT pg_catalog.pg_extension_config_dump('pgtrickle.pgt_source_gates', '');
 SELECT pg_catalog.pg_extension_config_dump('pgtrickle.pgt_watermarks', '');
 SELECT pg_catalog.pg_extension_config_dump('pgtrickle.pgt_watermark_groups', '');
 
+-- CIT-2: Cross-node advisory lock table for distributed stream table refresh.
+-- Uses INSERT … ON CONFLICT DO NOTHING for atomic acquisition; timestamp-based
+-- lease expiry handles crashed holders without requiring heartbeats.
+CREATE TABLE IF NOT EXISTS pgtrickle.pgt_st_locks (
+    lock_key    TEXT        NOT NULL,
+    holder      TEXT        NOT NULL,
+    acquired_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    expires_at  TIMESTAMPTZ NOT NULL,
+    CONSTRAINT pgt_st_locks_pkey PRIMARY KEY (lock_key)
+);
+SELECT pg_catalog.pg_extension_config_dump('pgtrickle.pgt_st_locks', '');
+
+-- CIT-3: Per-worker logical replication slot tracking for distributed sources.
+-- Each row represents a WAL slot on one Citus worker node that feeds changes
+-- for a given (stream_table, source) pair into the coordinator's change buffer.
+CREATE TABLE IF NOT EXISTS pgtrickle.pgt_worker_slots (
+    pgt_id       BIGINT      NOT NULL
+                 REFERENCES pgtrickle.pgt_stream_tables(pgt_id) ON DELETE CASCADE,
+    source_relid OID         NOT NULL,
+    worker_name  TEXT        NOT NULL,
+    worker_port  INT         NOT NULL DEFAULT 5432,
+    slot_name    TEXT        NOT NULL,
+    last_frontier TEXT,
+    CONSTRAINT pgt_worker_slots_pkey
+        PRIMARY KEY (pgt_id, source_relid, worker_name, worker_port)
+);
+SELECT pg_catalog.pg_extension_config_dump('pgtrickle.pgt_worker_slots', '');
+
 -- G14-SHC: Shared template cache (catalog-backed, UNLOGGED)
 CREATE UNLOGGED TABLE IF NOT EXISTS pgtrickle.pgt_template_cache (
     pgt_id       BIGINT PRIMARY KEY
@@ -482,6 +510,39 @@ FROM pgtrickle.pgt_stream_tables st;
 "#,
     name = "pg_trickle_info_view",
     requires = [parse_duration_seconds],
+);
+
+// ── Citus observability view ───────────────────────────────────────────
+
+extension_sql!(
+    r#"
+-- CIT-4: Per-worker replication slot tracking view.
+-- Safe to query on non-Citus deployments (pgt_change_tracking and
+-- pgt_worker_slots are local catalog tables; no pg_dist_node reference).
+-- Returns one row per (stream_table, source, worker) combination.
+CREATE OR REPLACE VIEW pgtrickle.citus_status AS
+SELECT
+    ct.pgt_id,
+    st.pgt_schema,
+    st.pgt_name,
+    ct.source_relid,
+    ct.source_stable_name,
+    ct.slot_name           AS coordinator_slot,
+    ct.source_placement,
+    ct.frontier_per_node,
+    ws.worker_name,
+    ws.worker_port,
+    ws.slot_name           AS worker_slot,
+    ws.last_frontier       AS worker_frontier
+FROM pgtrickle.pgt_change_tracking ct
+JOIN pgtrickle.pgt_stream_tables   st ON st.pgt_id = ct.pgt_id
+LEFT JOIN pgtrickle.pgt_worker_slots ws
+       ON ws.pgt_id       = ct.pgt_id
+      AND ws.source_relid = ct.source_relid
+WHERE ct.source_placement = 'distributed';
+"#,
+    name = "pg_trickle_citus_status_view",
+    requires = ["pg_trickle_catalog"],
 );
 
 // ── DDL event triggers (Phase 7) ──────────────────────────────────────

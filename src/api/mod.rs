@@ -5672,6 +5672,7 @@ mod tests {
             last_error_at: None,
             downstream_publication_name: None,
             freshness_deadline_ms: None,
+            st_placement: "local".to_string(),
         }
     }
 
