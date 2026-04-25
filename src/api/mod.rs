@@ -635,6 +635,11 @@ fn raise_error_with_context(e: PgTrickleError) -> ! {
 /// - `initialize`: Whether to populate the table immediately.
 /// - `diamond_consistency`: `'atomic'` (default) or `'none'`.
 /// - `diamond_schedule_policy`: `'fastest'` (default) or `'slowest'`.
+/// - `output_distribution_column`: When non-NULL and Citus is loaded, the storage
+///   table is converted to a Citus distributed table using this column as the
+///   distribution key after creation. Use `'s'` when the stream table materializes
+///   a view over pg_ripple VP tables and you want co-location with VP shards.
+///   Has no effect when Citus is not installed.
 #[allow(clippy::too_many_arguments)]
 #[pg_extern(schema = "pgtrickle")]
 fn create_stream_table(
@@ -651,6 +656,8 @@ fn create_stream_table(
     partition_by: default!(Option<&str>, "NULL"),
     max_differential_joins: default!(Option<i32>, "NULL"),
     max_delta_fraction: default!(Option<f64>, "NULL"),
+    // CITUS-7: Distribution column for the output (stream table storage) table.
+    output_distribution_column: default!(Option<&str>, "NULL"),
 ) {
     let result = create_stream_table_impl(
         name,
@@ -666,6 +673,7 @@ fn create_stream_table(
         partition_by,
         max_differential_joins,
         max_delta_fraction,
+        output_distribution_column,
     );
     if let Err(e) = result {
         raise_error_with_context(e);
@@ -694,6 +702,8 @@ fn create_stream_table_if_not_exists(
     partition_by: default!(Option<&str>, "NULL"),
     max_differential_joins: default!(Option<i32>, "NULL"),
     max_delta_fraction: default!(Option<f64>, "NULL"),
+    // CITUS-7: Distribution column for the output (stream table storage) table.
+    output_distribution_column: default!(Option<&str>, "NULL"),
 ) {
     let result = create_stream_table_if_not_exists_impl(
         name,
@@ -709,6 +719,7 @@ fn create_stream_table_if_not_exists(
         partition_by,
         max_differential_joins,
         max_delta_fraction,
+        output_distribution_column,
     );
     if let Err(e) = result {
         raise_error_with_context(e);
@@ -730,6 +741,8 @@ fn create_stream_table_if_not_exists_impl(
     partition_by: Option<&str>,
     max_differential_joins: Option<i32>,
     max_delta_fraction: Option<f64>,
+    // CITUS-7: Distribution column for the output (stream table storage) table.
+    output_distribution_column: Option<&str>,
 ) -> Result<(), PgTrickleError> {
     let (schema, table_name) = parse_qualified_name(name)?;
 
@@ -756,6 +769,7 @@ fn create_stream_table_if_not_exists_impl(
             partition_by,
             max_differential_joins,
             max_delta_fraction,
+            output_distribution_column,
         ),
         Err(e) => Err(e),
     }
@@ -849,6 +863,10 @@ fn bulk_create_impl(definitions: serde_json::Value) -> Result<serde_json::Value,
             .and_then(|v| v.as_i64())
             .map(|v| v as i32);
         let max_delta_fraction = obj.get("max_delta_fraction").and_then(|v| v.as_f64());
+        // CITUS-7: optional distribution column for the output table
+        let output_distribution_column = obj
+            .get("output_distribution_column")
+            .and_then(|v| v.as_str());
 
         match create_stream_table_impl(
             name,
@@ -864,6 +882,7 @@ fn bulk_create_impl(definitions: serde_json::Value) -> Result<serde_json::Value,
             partition_by,
             max_differential_joins,
             max_delta_fraction,
+            output_distribution_column,
         ) {
             Ok(()) => {
                 // Look up pgt_id for the result
@@ -927,6 +946,8 @@ fn create_or_replace_stream_table(
     partition_by: default!(Option<&str>, "NULL"),
     max_differential_joins: default!(Option<i32>, "NULL"),
     max_delta_fraction: default!(Option<f64>, "NULL"),
+    // CITUS-7: Distribution column for the output (stream table storage) table.
+    output_distribution_column: default!(Option<&str>, "NULL"),
 ) {
     let result = create_or_replace_stream_table_impl(
         name,
@@ -942,6 +963,7 @@ fn create_or_replace_stream_table(
         partition_by,
         max_differential_joins,
         max_delta_fraction,
+        output_distribution_column,
     );
     if let Err(e) = result {
         raise_error_with_context(e);
@@ -1076,6 +1098,8 @@ fn create_or_replace_stream_table_impl(
     partition_by: Option<&str>,
     max_differential_joins: Option<i32>,
     max_delta_fraction: Option<f64>,
+    // CITUS-7: Distribution column for the output table (used only on first creation).
+    output_distribution_column: Option<&str>,
 ) -> Result<(), PgTrickleError> {
     let (schema, table_name) = parse_qualified_name(name)?;
 
@@ -1167,6 +1191,7 @@ fn create_or_replace_stream_table_impl(
                 partition_by,
                 max_differential_joins,
                 max_delta_fraction,
+                output_distribution_column,
             )
         }
         Err(e) => Err(e),
@@ -3068,6 +3093,9 @@ fn create_stream_table_impl(
     partition_by: Option<&str>,
     max_differential_joins: Option<i32>,
     max_delta_fraction: Option<f64>,
+    // CITUS-7: If set and Citus is loaded, convert the storage table to a
+    // Citus distributed table using this column as the distribution key.
+    output_distribution_column: Option<&str>,
 ) -> Result<(), PgTrickleError> {
     let is_auto = RefreshMode::is_auto_str(refresh_mode_str);
     let mut refresh_mode = RefreshMode::from_str(refresh_mode_str)?;
@@ -3252,6 +3280,37 @@ fn create_stream_table_impl(
         &vq.nonnull_aux_columns,
         partition_by,
     )?;
+
+    // CITUS-7: Distribute the output storage table when requested and Citus is available.
+    if let Some(dist_col) = output_distribution_column {
+        if crate::citus::is_citus_loaded() {
+            let qualified = format!(
+                "{}.{}",
+                quote_identifier(&schema),
+                quote_identifier(&table_name),
+            );
+            Spi::run_with_args(
+                "SELECT create_distributed_table($1, $2)",
+                &[qualified.as_str().into(), dist_col.into()],
+            )
+            .map_err(|e| {
+                PgTrickleError::SpiError(format!(
+                    "create_distributed_table for {} on column '{}': {}",
+                    qualified, dist_col, e
+                ))
+            })?;
+            pgrx::info!(
+                "pg_trickle: distributed stream table {} on column '{}'",
+                qualified,
+                dist_col,
+            );
+        } else {
+            return Err(PgTrickleError::InvalidArgument(
+                "output_distribution_column requires Citus to be installed and loaded"
+                    .to_string(),
+            ));
+        }
+    }
 
     // Insert catalog entry + dependency edges
     // For TopK, store the base query (ORDER BY/LIMIT stripped) as defining_query.
