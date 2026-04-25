@@ -3253,7 +3253,6 @@ fn create_stream_table_impl(
         partition_by,
     )?;
 
-
     // Insert catalog entry + dependency edges
     // For TopK, store the base query (ORDER BY/LIMIT stripped) as defining_query.
     // The ORDER BY, LIMIT, and OFFSET are stored separately as topk_order_by,
