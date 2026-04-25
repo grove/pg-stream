@@ -40,13 +40,19 @@ async fn test_logged_buffer_when_guc_off() {
     )
     .await;
 
-    // Find the change buffer table for this ST
+    // Find the change buffer table for this ST (v0.32.0+: stable name)
     let oid: i32 = db.table_oid("unlog_src1").await;
+    let stable_name: String = db
+        .query_scalar(&format!(
+            "SELECT pgtrickle.source_stable_name({}::oid)",
+            oid
+        ))
+        .await;
     let persistence: String = db
         .query_scalar(&format!(
             "SELECT relpersistence::text FROM pg_class \
              WHERE relnamespace = (SELECT oid FROM pg_namespace WHERE nspname = 'pgtrickle_changes') \
-             AND relname = 'changes_{oid}'"
+             AND relname = 'changes_{stable_name}'"
         ))
         .await;
     assert_eq!(
@@ -77,11 +83,17 @@ async fn test_unlogged_buffer_when_guc_on() {
     .await;
 
     let oid: i32 = db.table_oid("unlog_src2").await;
+    let stable_name: String = db
+        .query_scalar(&format!(
+            "SELECT pgtrickle.source_stable_name({}::oid)",
+            oid
+        ))
+        .await;
     let persistence: String = db
         .query_scalar(&format!(
             "SELECT relpersistence::text FROM pg_class \
              WHERE relnamespace = (SELECT oid FROM pg_namespace WHERE nspname = 'pgtrickle_changes') \
-             AND relname = 'changes_{oid}'"
+             AND relname = 'changes_{stable_name}'"
         ))
         .await;
     assert_eq!(
