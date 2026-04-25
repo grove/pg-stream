@@ -107,7 +107,7 @@ async fn test_drop_removes_cdc_trigger() {
         .await;
 
     let source_oid = db.table_oid("dr_trig").await;
-    let trigger_name = format!("pg_trickle_cdc_ins_{}", source_oid);
+    let trigger_name = db.cdc_trigger_name(source_oid as i64).await;
 
     assert!(
         db.trigger_exists(&trigger_name, "dr_trig").await,
@@ -148,7 +148,7 @@ async fn test_drop_preserves_trigger_for_other_st() {
     .await;
 
     let source_oid = db.table_oid("dr_shared").await;
-    let trigger_name = format!("pg_trickle_cdc_ins_{}", source_oid);
+    let trigger_name = db.cdc_trigger_name(source_oid as i64).await;
 
     // Drop one ST
     db.drop_st("st_shared_1").await;

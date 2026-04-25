@@ -81,9 +81,16 @@ async fn test_stmt_cdc_default_trigger_is_statement_level() {
     .await;
 
     let source_oid = db.table_oid("stmt_type_src").await;
-    let ins_trigger = format!("pg_trickle_cdc_ins_{}", source_oid);
-    let upd_trigger = format!("pg_trickle_cdc_upd_{}", source_oid);
-    let del_trigger = format!("pg_trickle_cdc_del_{}", source_oid);
+    let stable_name: String = db
+        .query_scalar(&format!(
+            "SELECT source_stable_name FROM pgtrickle.pgt_change_tracking \
+             WHERE source_relid = {}",
+            source_oid
+        ))
+        .await;
+    let ins_trigger = format!("pg_trickle_cdc_ins_{}", stable_name);
+    let upd_trigger = format!("pg_trickle_cdc_upd_{}", stable_name);
+    let del_trigger = format!("pg_trickle_cdc_del_{}", stable_name);
 
     // All three per-event triggers must be statement-level (tgtype & 1 = 0).
     assert_eq!(
@@ -371,7 +378,15 @@ async fn test_stmt_cdc_row_mode_guc_creates_row_level_trigger() {
     .await;
 
     let source_oid = db.table_oid("row_mode_src").await;
-    let trigger_name = format!("pg_trickle_cdc_{}", source_oid);
+    // v0.32.0+: trigger names use stable hash. Row-level trigger has no ins/upd/del suffix.
+    let stable_name: String = db
+        .query_scalar(&format!(
+            "SELECT source_stable_name FROM pgtrickle.pgt_change_tracking \
+             WHERE source_relid = {}",
+            source_oid
+        ))
+        .await;
+    let trigger_name = format!("pg_trickle_cdc_{}", stable_name);
 
     // tgtype bit 0 = 1 → FOR EACH ROW
     assert_eq!(
@@ -426,9 +441,16 @@ async fn test_stmt_cdc_rebuild_cdc_triggers_migrates_to_statement() {
     .await;
 
     let source_oid = db.table_oid("rebuild_src").await;
-    let row_trigger = format!("pg_trickle_cdc_{}", source_oid);
-    let ins_trigger = format!("pg_trickle_cdc_ins_{}", source_oid);
-    let upd_trigger = format!("pg_trickle_cdc_upd_{}", source_oid);
+    let stable_name: String = db
+        .query_scalar(&format!(
+            "SELECT source_stable_name FROM pgtrickle.pgt_change_tracking \
+             WHERE source_relid = {}",
+            source_oid
+        ))
+        .await;
+    let row_trigger = format!("pg_trickle_cdc_{}", stable_name);
+    let ins_trigger = format!("pg_trickle_cdc_ins_{}", stable_name);
+    let upd_trigger = format!("pg_trickle_cdc_upd_{}", stable_name);
 
     // Confirm row-level trigger before migration.
     assert_eq!(

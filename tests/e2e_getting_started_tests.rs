@@ -751,8 +751,21 @@ async fn test_getting_started_step7_drop_in_order() {
     );
 
     // CDC triggers removed from base tables
-    let dept_trigger = format!("pg_trickle_cdc_{}", dept_oid);
-    let empl_trigger = format!("pg_trickle_cdc_{}", empl_oid);
+    // v0.32.0+: trigger names use stable hash suffix
+    let dept_stable: String = db
+        .query_scalar(&format!(
+            "SELECT source_stable_name FROM pgtrickle.pgt_change_tracking WHERE source_relid = {}",
+            dept_oid
+        ))
+        .await;
+    let empl_stable: String = db
+        .query_scalar(&format!(
+            "SELECT source_stable_name FROM pgtrickle.pgt_change_tracking WHERE source_relid = {}",
+            empl_oid
+        ))
+        .await;
+    let dept_trigger = format!("pg_trickle_cdc_{}", dept_stable);
+    let empl_trigger = format!("pg_trickle_cdc_{}", empl_stable);
     assert!(
         !db.trigger_exists(&dept_trigger, "departments").await,
         "CDC trigger on departments should be removed"

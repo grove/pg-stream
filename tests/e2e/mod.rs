@@ -1012,6 +1012,22 @@ impl E2eDb {
         format!("pgtrickle_changes.changes_{}", stable_name)
     }
 
+    /// Return the CDC INSERT trigger name for a source OID.
+    ///
+    /// v0.32.0+: triggers are named `pg_trickle_cdc_ins_{stable_name}`
+    /// (stable 16-char xxhash64 hex) rather than `pg_trickle_cdc_ins_{oid}`.
+    pub async fn cdc_trigger_name(&self, source_oid: i64) -> String {
+        let stable_name: String = self
+            .query_scalar(&format!(
+                "SELECT source_stable_name \
+                 FROM pgtrickle.pgt_change_tracking \
+                 WHERE source_relid = {}",
+                source_oid
+            ))
+            .await;
+        format!("pg_trickle_cdc_ins_{}", stable_name)
+    }
+
     /// Execute a query and return all result rows as a single text string.
     ///
     /// Useful for capturing EXPLAIN output where each row is a text line.
