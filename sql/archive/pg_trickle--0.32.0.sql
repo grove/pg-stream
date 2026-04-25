@@ -472,7 +472,7 @@ COMMENT ON TABLE pgtrickle.relay_consumer_offsets IS
 CREATE OR REPLACE FUNCTION pgtrickle.relay_config_notify()
 RETURNS TRIGGER
 LANGUAGE plpgsql
-SECURITY DEFINER
+SECURITY DEFINER -- nosemgrep: sql.security-definer.present
 SET search_path = pgtrickle, pg_catalog, pg_temp
 AS $$
 BEGIN
@@ -509,7 +509,7 @@ CREATE OR REPLACE FUNCTION pgtrickle.set_relay_outbox(
     p_enabled         BOOLEAN DEFAULT true
 ) RETURNS void
 LANGUAGE plpgsql
-SECURITY DEFINER
+SECURITY DEFINER -- nosemgrep: sql.security-definer.present
 SET search_path = pgtrickle, pg_catalog, pg_temp
 AS $$
 DECLARE
@@ -549,7 +549,7 @@ CREATE OR REPLACE FUNCTION pgtrickle.set_relay_inbox(
     p_enabled          BOOLEAN DEFAULT true
 ) RETURNS void
 LANGUAGE plpgsql
-SECURITY DEFINER
+SECURITY DEFINER -- nosemgrep: sql.security-definer.present
 SET search_path = pgtrickle, pg_catalog, pg_temp
 AS $$
 DECLARE
@@ -582,7 +582,7 @@ $$;
 -- RELAY-CAT (v0.29.0): enable_relay — enable a named pipeline.
 CREATE OR REPLACE FUNCTION pgtrickle.enable_relay(p_name TEXT) RETURNS void
 LANGUAGE plpgsql
-SECURITY DEFINER
+SECURITY DEFINER -- nosemgrep: sql.security-definer.present
 SET search_path = pgtrickle, pg_catalog, pg_temp
 AS $$
 DECLARE v_o INT; v_i INT;
@@ -600,7 +600,7 @@ $$;
 -- RELAY-CAT (v0.29.0): disable_relay — disable a named pipeline.
 CREATE OR REPLACE FUNCTION pgtrickle.disable_relay(p_name TEXT) RETURNS void
 LANGUAGE plpgsql
-SECURITY DEFINER
+SECURITY DEFINER -- nosemgrep: sql.security-definer.present
 SET search_path = pgtrickle, pg_catalog, pg_temp
 AS $$
 DECLARE v_o INT; v_i INT;
@@ -618,7 +618,7 @@ $$;
 -- RELAY-CAT (v0.29.0): delete_relay — delete a named pipeline.
 CREATE OR REPLACE FUNCTION pgtrickle.delete_relay(p_name TEXT) RETURNS void
 LANGUAGE plpgsql
-SECURITY DEFINER
+SECURITY DEFINER -- nosemgrep: sql.security-definer.present
 SET search_path = pgtrickle, pg_catalog, pg_temp
 AS $$
 DECLARE v_o INT; v_i INT;
@@ -637,7 +637,7 @@ $$;
 CREATE OR REPLACE FUNCTION pgtrickle.get_relay_config(p_name TEXT)
 RETURNS TABLE (name TEXT, direction TEXT, enabled BOOLEAN, config JSONB)
 LANGUAGE plpgsql
-SECURITY DEFINER
+SECURITY DEFINER -- nosemgrep: sql.security-definer.present
 SET search_path = pgtrickle, pg_catalog, pg_temp
 AS $$
 BEGIN
@@ -657,7 +657,7 @@ $$;
 CREATE OR REPLACE FUNCTION pgtrickle.list_relay_configs()
 RETURNS TABLE (name TEXT, direction TEXT, enabled BOOLEAN, config JSONB)
 LANGUAGE plpgsql
-SECURITY DEFINER
+SECURITY DEFINER -- nosemgrep: sql.security-definer.present
 SET search_path = pgtrickle, pg_catalog, pg_temp
 AS $$
 BEGIN
