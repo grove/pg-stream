@@ -164,3 +164,15 @@ CREATE OR REPLACE FUNCTION pgtrickle."create_or_replace_stream_table"(
 ) RETURNS void
 LANGUAGE c
 AS 'MODULE_PATHNAME', 'create_or_replace_stream_table_wrapper';
+
+-- ─────────────────────────────────────────────────────────────────────────
+-- New function: pgtrickle.handle_vp_promoted
+-- ─────────────────────────────────────────────────────────────────────────
+-- src/citus.rs:752
+-- pg_trickle::citus::handle_vp_promoted
+CREATE OR REPLACE FUNCTION pgtrickle."handle_vp_promoted"(
+    "payload" TEXT /* &str */
+) RETURNS bool /* bool */
+STRICT
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'sql_handle_vp_promoted_wrapper';

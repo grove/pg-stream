@@ -1204,9 +1204,9 @@ pub static PGS_INBOX_DRAIN_INTERVAL_SECONDS: GucSetting<i32> = GucSetting::<i32>
 /// INBOX-7 (v0.28.0): Maximum DLQ alerts raised per refresh cycle (0 = disabled).
 pub static PGS_INBOX_DLQ_ALERT_MAX_PER_REFRESH: GucSetting<i32> = GucSetting::<i32>::new(10);
 
-// ── v0.33.1: Citus / pg_ripple co-ordination GUCs ────────────────────────────
+// ── v0.33.0: Citus / pg_ripple co-ordination GUCs ────────────────────────────
 
-/// COORD-2 (v0.33.1): Duration in milliseconds for `pgt_st_locks` lease entries
+/// COORD-2 (v0.33.0): Duration in milliseconds for `pgt_st_locks` lease entries
 /// acquired by the scheduler before coordinating a distributed stream table refresh.
 ///
 /// Must be ≥ `pg_ripple.merge_fence_timeout_ms` (default 30 000) so that a
@@ -2616,7 +2616,7 @@ pub fn register_gucs() {
         GucFlags::default(),
     );
 
-    // COORD-2 (v0.33.1): Citus pgt_st_locks lease duration.
+    // COORD-2 (v0.33.0): Citus pgt_st_locks lease duration.
     pgrx::GucRegistry::define_int_guc(
         c"pg_trickle.citus_st_lock_lease_ms",
         c"COORD-2: Duration (ms) of pgt_st_locks lease for distributed refresh coordination. \
