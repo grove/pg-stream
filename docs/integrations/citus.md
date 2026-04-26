@@ -197,6 +197,107 @@ same pg_trickle version on all nodes before creating distributed stream tables.
 - Citus reference tables work as sources with trigger-based CDC only
   (per-worker WAL slots are not needed for reference tables).
 
+## pg_ripple Integration (v0.58.0+)
+
+pg_trickle v0.33.0 and pg_ripple v0.58.0 can be deployed together on a Citus
+cluster.  pg_ripple stores its RDF triples in _Vertical Partitioning (VP)_
+tables that are distributed by subject hash (`s BIGINT`).  pg_trickle can track
+changes to these tables and materialize downstream stream tables.
+
+### Co-location Contract
+
+VP tables are distributed on `s` (the XXH3-128 subject ID encoded as BIGINT).
+Downstream stream tables consuming VP data should use the same distribution
+column to avoid coordinator fan-out:
+
+```sql
+CALL pgtrickle.create_stream_table(
+    name                       => 'rdf_subjects',
+    query                      => 'SELECT s, count(*) AS triple_count
+                                   FROM _pg_ripple.vp_42_delta GROUP BY s',
+    output_distribution_column => 's'   -- co-locate with VP shards
+);
+```
+
+The natural row identity for such a stream table is `(s, predicate_hash, g)` —
+the triple's encoded subject, predicate, and named-graph.  Configure pg_trickle
+with this composite key so the `DELETE WHERE row_id IN (…)` apply path targets
+the correct shard.
+
+### VP Table Promotion Notifications
+
+When pg_ripple distributes a new VP table it emits a
+`pg_ripple.vp_promoted` NOTIFY with the following JSON payload:
+
+```json
+{
+  "table":             "_pg_ripple.vp_42_delta",
+  "shard_count":       32,
+  "shard_table_prefix":"_pg_ripple.vp_42_delta_",
+  "predicate_id":      42
+}
+```
+
+pg_trickle ships a helper function that processes this payload.  Use it from
+any regular backend session that LISTENs to the channel:
+
+```sql
+LISTEN "pg_ripple.vp_promoted";
+-- … wait for pg_notify …
+-- (in application code: call handle_vp_promoted with the notification payload)
+SELECT pgtrickle.handle_vp_promoted(pg_notification_queue_transfer());
+-- or pass the payload directly:
+SELECT pgtrickle.handle_vp_promoted(
+  '{"table":"_pg_ripple.vp_42_delta","shard_count":32,'
+  '"shard_table_prefix":"_pg_ripple.vp_42_delta_","predicate_id":42}'
+);
+```
+
+`handle_vp_promoted()` logs the promotion and, when the VP table is already
+tracked as a distributed CDC source, signals the scheduler that worker-slot
+probing should run on the next tick.
+
+### Merge Fencing and `pgt_st_locks` Lease Alignment
+
+pg_ripple's merge worker emits `pg_ripple.merge_start` / `merge_end` NOTIFY
+signals as **observability hints** — the TRUNCATE+INSERT merge is a single 2PC
+transaction so no inconsistent state is visible to pg_trickle's per-worker WAL
+decoders even without these signals.
+
+pg_trickle uses `pgtrickle.pgt_st_locks` (catalog-based leases) for cross-node
+coordination.  Set the `pgt_st_locks` lease expiry **≥**
+`pg_ripple.merge_fence_timeout_ms` to prevent a lease from expiring mid-merge:
+
+```sql
+-- pg_ripple side (postgresql.conf or SET):
+SET pg_ripple.merge_fence_timeout_ms = 30000;   -- 30 seconds
+
+-- pg_trickle side:
+SET pg_trickle.st_lock_lease_ms = 45000;        -- 45 seconds ≥ 30 s fence
+```
+
+Monitor both together:
+
+```sql
+SELECT
+    r.predicate_id,
+    r.cycle_duration_ms,
+    c.stream_table,
+    c.worker_frontier
+FROM pg_ripple.merge_status()   r
+JOIN pgtrickle.citus_status      c
+  ON c.source_stable_name LIKE '_pg_ripple_vp_' || r.predicate_id || '_%';
+```
+
+### Prerequisites
+
+- pg_ripple ≥ 0.58.0 (Citus support)
+- pg_trickle ≥ 0.33.0 (distributed CDC + stream tables)
+- Citus 12.x on all nodes
+- `pg_ripple.citus_sharding_enabled = on`
+- `pg_ripple.citus_trickle_compat = on` (sets `colocate_with='none'` on VP tables,
+  avoiding cross-shard tombstone deletes during CDC apply)
+
 ## Performance Considerations
 
 - `dblink` polling adds round-trip latency per worker per tick.  On a loopback

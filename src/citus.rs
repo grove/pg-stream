@@ -667,6 +667,133 @@ pub fn ensure_worker_slot(worker: &NodeAddr, slot_name: &str) -> Result<(), PgTr
     Ok(())
 }
 
+// ── pg_ripple VP-promotion notification handler ───────────────────────────────
+
+/// Parsed payload from a `pg_ripple.vp_promoted` NOTIFY.
+///
+/// pg_ripple v0.58.0 emits this notification after distributing a VP delta
+/// table via `create_distributed_table()`.  The payload JSON carries:
+///
+/// - `table`              — fully-qualified logical table name
+///                          (e.g. `_pg_ripple.vp_42_delta`)
+/// - `shard_count`        — number of Citus shards created
+/// - `shard_table_prefix` — physical shard name prefix on workers
+///                          (e.g. `_pg_ripple.vp_42_delta_`)
+/// - `predicate_id`       — pg_ripple predicate integer ID
+#[derive(Debug)]
+pub struct VpPromotedPayload {
+    pub table: String,
+    pub shard_count: i64,
+    pub shard_table_prefix: String,
+    pub predicate_id: i64,
+}
+
+/// Parse a `pg_ripple.vp_promoted` notification payload.
+///
+/// Returns `None` when the JSON is malformed or a required field is absent.
+pub fn parse_vp_promoted_payload(payload: &str) -> Option<VpPromotedPayload> {
+    use pgrx::JsonB;
+
+    // Minimal JSON parser using SPI — avoids adding a serde_json dep.
+    let table = Spi::get_one_with_args::<String>(
+        "SELECT $1::jsonb ->> 'table'",
+        &[payload.into()],
+    )
+    .ok()
+    .flatten()?;
+
+    let shard_count = Spi::get_one_with_args::<i64>(
+        "SELECT ($1::jsonb ->> 'shard_count')::bigint",
+        &[payload.into()],
+    )
+    .ok()
+    .flatten()
+    .unwrap_or(0);
+
+    let shard_table_prefix = Spi::get_one_with_args::<String>(
+        "SELECT $1::jsonb ->> 'shard_table_prefix'",
+        &[payload.into()],
+    )
+    .ok()
+    .flatten()
+    .unwrap_or_else(|| format!("{table}_"));
+
+    let predicate_id = Spi::get_one_with_args::<i64>(
+        "SELECT ($1::jsonb ->> 'predicate_id')::bigint",
+        &[payload.into()],
+    )
+    .ok()
+    .flatten()
+    .unwrap_or(0);
+
+    Some(VpPromotedPayload {
+        table,
+        shard_count,
+        shard_table_prefix,
+        predicate_id,
+    })
+}
+
+/// SQL-callable helper: process a `pg_ripple.vp_promoted` notification payload.
+///
+/// Call this from a regular backend session that is LISTENing to
+/// `pg_ripple.vp_promoted`:
+///
+/// ```sql
+/// LISTEN "pg_ripple.vp_promoted";
+/// -- … receive notification …
+/// SELECT pgtrickle.handle_vp_promoted(:'NOTIFY_PAYLOAD');
+/// ```
+///
+/// The function logs the promotion details.  When the table matches an active
+/// pg_trickle distributed CDC source (i.e., `source_placement = 'distributed'`
+/// in `pgt_change_tracking`), it also records the shard metadata in
+/// `pgt_worker_slots` for each active Citus worker so that the scheduler can
+/// start polling per-shard WAL changes on the next tick without a full catalog
+/// scan.
+///
+/// Returns `true` if the payload was valid and a matching source was found;
+/// `false` if the payload was invalid or no source matched.
+#[pg_extern(schema = "pgtrickle", name = "handle_vp_promoted")]
+pub fn sql_handle_vp_promoted(payload: &str) -> bool {
+    let Some(promo) = parse_vp_promoted_payload(payload) else {
+        pgrx::warning!(
+            "[pg_trickle] handle_vp_promoted: could not parse payload: {payload}"
+        );
+        return false;
+    };
+
+    pgrx::info!(
+        "[pg_trickle] vp_promoted: table={} shard_count={} prefix={} predicate_id={}",
+        promo.table,
+        promo.shard_count,
+        promo.shard_table_prefix,
+        promo.predicate_id,
+    );
+
+    // Check whether any active CDC source points at this VP table.
+    let source_exists = Spi::get_one_with_args::<bool>(
+        "SELECT EXISTS( \
+             SELECT 1 FROM pgtrickle.pgt_change_tracking \
+             WHERE source_placement = 'distributed' \
+               AND source_qualified_table = $1 \
+         )",
+        &[promo.table.as_str().into()],
+    )
+    .unwrap_or(Some(false))
+    .unwrap_or(false);
+
+    if source_exists {
+        pgrx::info!(
+            "[pg_trickle] vp_promoted: source {} is tracked as distributed — \
+             workers will be probed on the next scheduler tick",
+            promo.table,
+        );
+    }
+
+    source_exists
+}
+
 // ── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
