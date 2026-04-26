@@ -2562,8 +2562,7 @@ pub fn execute_differential_refresh(
 
     // CIT-1: Pre-compute whether this ST lives on a Citus distributed table.
     // Used below to override the MERGE strategy — cross-shard MERGE is blocked.
-    let is_distributed_st =
-        st.st_placement == "distributed" && crate::citus::is_citus_loaded();
+    let is_distributed_st = st.st_placement == "distributed" && crate::citus::is_citus_loaded();
 
     // G14-MDED: Record this differential refresh execution in the shared-memory
     // profiling counters.  Called here (after the no-data short-circuit) so we
@@ -2665,20 +2664,18 @@ pub fn execute_differential_refresh(
     // the correct shard, and DELETE … WHERE row_id IN (…) is pushed down
     // to the relevant workers.  This override runs AFTER PH-D1-JOIN so
     // that is_dedup / append-only guards are already resolved.
-    let use_delete_insert = if is_distributed_st
-        && !use_explicit_dml
-        && st.st_partition_key.is_none()
-    {
-        pgrx::debug1!(
-            "[pg_trickle] CIT-1: forcing PH-D1 DELETE+INSERT for distributed ST {}.{} \
+    let use_delete_insert =
+        if is_distributed_st && !use_explicit_dml && st.st_partition_key.is_none() {
+            pgrx::debug1!(
+                "[pg_trickle] CIT-1: forcing PH-D1 DELETE+INSERT for distributed ST {}.{} \
              (Citus blocks cross-shard MERGE)",
-            schema,
-            name,
-        );
-        true
-    } else {
-        use_delete_insert
-    };
+                schema,
+                name,
+            );
+            true
+        } else {
+            use_delete_insert
+        };
 
     // When the GUC is on and ALL aggregates are algebraically invertible
     // (COUNT, SUM, AVG, etc.), use explicit DML (DELETE+UPDATE+INSERT)

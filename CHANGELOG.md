@@ -8,6 +8,7 @@ For future plans and upcoming features, see [ROADMAP.md](ROADMAP.md).
 
 <!-- TOC start -->
 - [Unreleased](#unreleased)
+- [0.33.0 — Citus: Distributed Source CDC & Stream Tables](#0330--citus-distributed-source-cdc--stream-tables)
 - [0.32.0 — Citus: Stable Naming & Per-Source Frontier Foundation](#0320--citus-stable-naming--per-source-frontier-foundation)
 - [0.31.0 — Performance & Scheduler Intelligence](#0310--performance--scheduler-intelligence)
 - [0.30.0 — Pre-GA Correctness & Stability Sprint](#0300--pre-ga-correctness--stability-sprint)
@@ -51,6 +52,105 @@ For future plans and upcoming features, see [ROADMAP.md](ROADMAP.md).
 ---
 
 ## [Unreleased]
+
+---
+
+## [0.33.0] — Citus: Distributed Source CDC & Stream Tables
+
+This release delivers world-class incremental view maintenance over Citus
+distributed tables. pg_trickle can now track changes on distributed source
+tables and write results to distributed output tables, while leaving all
+non-Citus code paths completely unchanged.
+
+### Distributed stream table output
+
+`create_stream_table()` gains a new optional parameter
+`output_distribution_column`. When provided, and Citus is installed, the
+output storage table is converted to a Citus distributed table on that column
+immediately after creation. Existing call sites without the parameter are
+unaffected.
+
+```sql
+-- Co-locate the stream table with the source shards
+CALL pgtrickle.create_stream_table(
+    name                       => 'orders_summary',
+    query                      => 'SELECT customer_id, count(*) FROM orders GROUP BY 1',
+    output_distribution_column => 'customer_id'
+);
+```
+
+### Per-worker WAL slot tracking (`pgt_worker_slots`)
+
+A new catalog table `pgtrickle.pgt_worker_slots` records the logical
+replication slot name and last-consumed frontier for each Citus worker node
+per source table. This enables per-worker CDC polling and accurate lag
+monitoring across all nodes in the cluster.
+
+### Cross-node refresh coordination (`pgt_st_locks`)
+
+A new catalog table `pgtrickle.pgt_st_locks` provides lightweight distributed
+mutex semantics using `INSERT … ON CONFLICT DO NOTHING`. This replaces
+advisory locks for distributed stream table refreshes, ensuring that only one
+coordinator node applies changes at a time across a multi-coordinator Citus
+setup.
+
+### Citus observability view (`citus_status`)
+
+`SELECT * FROM pgtrickle.citus_status` returns one row per
+(stream table, source, worker) combination, showing the coordinator slot,
+worker slot name, last consumed LSN, and source placement type. Use this view
+to monitor replication lag and detect unreachable workers.
+
+```sql
+SELECT pgt_name, worker_name, worker_port, worker_slot, worker_frontier
+FROM pgtrickle.citus_status;
+```
+
+### Correct apply path for distributed stream tables
+
+Citus blocks cross-shard `MERGE` statements. pg_trickle now automatically
+detects distributed output stream tables and switches to a
+`DELETE + INSERT … ON CONFLICT DO UPDATE` apply path, which Citus supports
+natively. Single-node and reference-table stream tables continue to use the
+existing `MERGE` path.
+
+### Pre-flight checks for Citus clusters
+
+Two new pre-flight check functions are available via the Rust API:
+
+- `check_citus_version_compat()` — verifies that all worker nodes are running
+  the same pg_trickle version as the coordinator. Returns an error listing any
+  mismatched workers.
+- `check_worker_wal_levels()` — verifies that `wal_level = logical` is
+  configured on all worker nodes. Returns an error if any worker has a lower
+  WAL level, preventing silent slot-creation failures.
+
+### Per-worker CDC helpers
+
+The `poll_worker_slot_changes()` function drains a logical replication slot on
+a remote Citus worker via `dblink` and writes the decoded changes into the
+coordinator's local change buffer. The `ensure_worker_slot()` function creates
+the slot if it does not already exist, making the setup idempotent on every
+scheduler tick.
+
+### Citus integration guide
+
+A new documentation page at `docs/integrations/citus.md` covers prerequisites,
+installation, placement options, the observability view, known failure modes
+(unreachable workers, recycled WAL slots, shard rebalancing), and performance
+considerations.
+
+### Upgrade
+
+Run the standard extension upgrade. The migration script adds the three new
+catalog objects (`pgt_st_locks`, `pgt_worker_slots`, `citus_status`) and
+replaces the three `create_stream_table` function signatures with versions that
+include the new `output_distribution_column` parameter. Existing call sites
+without the new parameter continue to work without change.
+
+```sql
+ALTER EXTENSION pg_trickle UPDATE TO '0.33.0';
+```
 
 ---
 

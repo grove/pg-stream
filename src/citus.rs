@@ -324,6 +324,114 @@ pub fn shard_placements(table_oid: pg_sys::Oid) -> Vec<NodeAddr> {
     })
 }
 
+// ── Pre-flight checks (COORD-7, COORD-8) ─────────────────────────────────────
+
+/// COORD-7: Check that all active Citus worker nodes are running the same
+/// pg_trickle version as the coordinator.
+///
+/// When `is_citus_loaded()` is false, returns `Ok(())` immediately.
+/// On version mismatch, returns an error listing the offending workers.
+///
+/// # Note
+/// Requires the `dblink` extension installed on the coordinator and that
+/// `pg_trickle` is also installed (with identical schema) on every worker.
+pub fn check_citus_version_compat() -> Result<(), PgTrickleError> {
+    if !is_citus_loaded() {
+        return Ok(());
+    }
+
+    let local_version =
+        Spi::get_one::<String>("SELECT extversion FROM pg_extension WHERE extname = 'pg_trickle'")
+            .map_err(|e| PgTrickleError::SpiError(format!("local pg_trickle version: {e}")))?
+            .unwrap_or_else(|| "unknown".into());
+
+    let dbname = Spi::get_one::<String>("SELECT current_database()")
+        .map_err(|e| PgTrickleError::SpiError(format!("current_database: {e}")))?
+        .unwrap_or_else(|| "postgres".into());
+
+    let workers = worker_nodes();
+    let mut mismatches: Vec<String> = Vec::new();
+
+    for w in &workers {
+        let connstr = worker_conn_string(w, &dbname);
+        let connstr_esc = connstr.replace('\'', "''");
+
+        let remote_query = "SELECT extversion FROM pg_extension WHERE extname = 'pg_trickle'";
+        let remote_query_esc = remote_query.replace('\'', "''");
+
+        let remote_version = Spi::get_one::<String>(&format!(
+            "SELECT val FROM dblink('{connstr_esc}', '{remote_query_esc}') AS t(val text)"
+        ))
+        .unwrap_or(None)
+        .unwrap_or_else(|| "not_installed".into());
+
+        if remote_version != local_version {
+            mismatches.push(format!(
+                "{}:{} has pg_trickle {} (coordinator has {})",
+                w.node_name, w.node_port, remote_version, local_version
+            ));
+        }
+    }
+
+    if !mismatches.is_empty() {
+        return Err(PgTrickleError::InvalidArgument(format!(
+            "pg_trickle version mismatch across Citus nodes: {}",
+            mismatches.join("; ")
+        )));
+    }
+
+    Ok(())
+}
+
+/// COORD-8: Verify that `wal_level = logical` is set on each active Citus
+/// worker node.
+///
+/// When `is_citus_loaded()` is false, returns `Ok(())` immediately.
+/// Returns an error listing any workers with insufficient `wal_level`.
+pub fn check_worker_wal_levels() -> Result<(), PgTrickleError> {
+    if !is_citus_loaded() {
+        return Ok(());
+    }
+
+    let dbname = Spi::get_one::<String>("SELECT current_database()")
+        .map_err(|e| PgTrickleError::SpiError(format!("current_database: {e}")))?
+        .unwrap_or_else(|| "postgres".into());
+
+    let workers = worker_nodes();
+    let mut failures: Vec<String> = Vec::new();
+
+    for w in &workers {
+        let connstr = worker_conn_string(w, &dbname);
+        let connstr_esc = connstr.replace('\'', "''");
+
+        let remote_query = "SELECT current_setting('wal_level')";
+        let remote_query_esc = remote_query.replace('\'', "''");
+
+        let wal_level = Spi::get_one::<String>(&format!(
+            "SELECT val FROM dblink('{connstr_esc}', '{remote_query_esc}') AS t(val text)"
+        ))
+        .unwrap_or(None)
+        .unwrap_or_else(|| "unknown".into());
+
+        if wal_level != "logical" {
+            failures.push(format!(
+                "{}:{} has wal_level='{}' (need 'logical')",
+                w.node_name, w.node_port, wal_level
+            ));
+        }
+    }
+
+    if !failures.is_empty() {
+        return Err(PgTrickleError::InvalidArgument(format!(
+            "Citus worker(s) do not have wal_level=logical: {}. \
+             Set wal_level=logical on each worker and restart PostgreSQL.",
+            failures.join("; ")
+        )));
+    }
+
+    Ok(())
+}
+
 // ── Cross-node coordination: pgt_st_locks ────────────────────────────────────
 
 /// Attempt to acquire a named advisory lock in `pgtrickle.pgt_st_locks`.
@@ -361,14 +469,10 @@ pub fn try_acquire_st_lock(
                  VALUES ($1, $2, now(), now() + ($3 * interval '1 ms')) \
                  ON CONFLICT (lock_key) DO NOTHING",
                 None,
-                &[
-                    lock_key.into(),
-                    holder.into(),
-                    lease_ms.into(),
-                ],
+                &[lock_key.into(), holder.into(), lease_ms.into()],
             )
             .map_err(|e| PgTrickleError::SpiError(format!("pgt_st_locks insert: {e}")))?;
-        Ok::<bool, PgTrickleError>(rows.len() > 0)
+        Ok::<bool, PgTrickleError>(!rows.is_empty())
     })?;
 
     Ok(acquired)
@@ -388,11 +492,7 @@ pub fn release_st_lock(lock_key: &str, holder: &str) -> Result<(), PgTrickleErro
 /// Extend the expiry of an existing lock.
 ///
 /// Returns `true` if the lock was found (and renewed), `false` otherwise.
-pub fn extend_st_lock(
-    lock_key: &str,
-    holder: &str,
-    lease_ms: i64,
-) -> Result<bool, PgTrickleError> {
+pub fn extend_st_lock(lock_key: &str, holder: &str, lease_ms: i64) -> Result<bool, PgTrickleError> {
     let renewed = Spi::connect_mut(|client| {
         let rows = client
             .update(
@@ -403,7 +503,7 @@ pub fn extend_st_lock(
                 &[lock_key.into(), holder.into(), lease_ms.into()],
             )
             .map_err(|e| PgTrickleError::SpiError(format!("pgt_st_locks extend: {e}")))?;
-        Ok::<bool, PgTrickleError>(rows.len() > 0)
+        Ok::<bool, PgTrickleError>(!rows.is_empty())
     })?;
     Ok(renewed)
 }
@@ -440,17 +540,27 @@ pub fn worker_conn_string(worker: &NodeAddr, dbname: &str) -> String {
 /// - The coordinator's PostgreSQL role must have login privileges on the worker.
 /// - The replication slot must already exist on the worker (see `ensure_worker_slot`).
 ///
+/// Source descriptor for [`poll_worker_slot_changes`].
+pub struct WorkerPollSource<'a> {
+    pub change_schema: &'a str,
+    pub source_qualified_table: &'a str,
+    pub source_oid: pg_sys::Oid,
+    pub pk_columns: &'a [String],
+    pub columns: &'a [(String, String)],
+}
+
 /// Returns the number of change rows written to the local buffer.
 pub fn poll_worker_slot_changes(
     worker: &NodeAddr,
     slot_name: &str,
-    change_schema: &str,
-    source_qualified_table: &str,
-    source_oid: pg_sys::Oid,
     max_changes: i64,
-    pk_columns: &[String],
-    columns: &[(String, String)],
+    src: &WorkerPollSource<'_>,
 ) -> Result<i64, PgTrickleError> {
+    let change_schema = src.change_schema;
+    let source_qualified_table = src.source_qualified_table;
+    let source_oid = src.source_oid;
+    let pk_columns = src.pk_columns;
+    let columns = src.columns;
     // Get current database name.
     let dbname = Spi::get_one::<String>("SELECT current_database()")
         .map_err(|e| PgTrickleError::SpiError(format!("current_database: {e}")))?
@@ -502,10 +612,7 @@ pub fn poll_worker_slot_changes(
 /// plugin (same as local slots).
 ///
 /// Returns `Ok(())` on success or if the slot already exists.
-pub fn ensure_worker_slot(
-    worker: &NodeAddr,
-    slot_name: &str,
-) -> Result<(), PgTrickleError> {
+pub fn ensure_worker_slot(worker: &NodeAddr, slot_name: &str) -> Result<(), PgTrickleError> {
     let dbname = Spi::get_one::<String>("SELECT current_database()")
         .map_err(|e| PgTrickleError::SpiError(format!("current_database: {e}")))?
         .unwrap_or_else(|| "postgres".into());
@@ -515,9 +622,8 @@ pub fn ensure_worker_slot(
     let slot_esc = slot_name.replace('\'', "''");
 
     // Check if slot exists on the remote worker.
-    let remote_check = format!(
-        "SELECT count(*) FROM pg_replication_slots WHERE slot_name = '{slot_esc}'"
-    );
+    let remote_check =
+        format!("SELECT count(*) FROM pg_replication_slots WHERE slot_name = '{slot_esc}'");
     let remote_check_esc = remote_check.replace('\'', "''");
 
     let exists_count = Spi::get_one::<i64>(&format!(
@@ -536,9 +642,8 @@ pub fn ensure_worker_slot(
     }
 
     // Create the slot on the remote worker.
-    let remote_create = format!(
-        "SELECT pg_create_logical_replication_slot('{slot_esc}', 'test_decoding')"
-    );
+    let remote_create =
+        format!("SELECT pg_create_logical_replication_slot('{slot_esc}', 'test_decoding')");
     let remote_create_esc = remote_create.replace('\'', "''");
 
     Spi::run(&format!(

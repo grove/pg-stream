@@ -3306,8 +3306,7 @@ fn create_stream_table_impl(
             );
         } else {
             return Err(PgTrickleError::InvalidArgument(
-                "output_distribution_column requires Citus to be installed and loaded"
-                    .to_string(),
+                "output_distribution_column requires Citus to be installed and loaded".to_string(),
             ));
         }
     }
