@@ -675,10 +675,10 @@ pub fn ensure_worker_slot(worker: &NodeAddr, slot_name: &str) -> Result<(), PgTr
 /// table via `create_distributed_table()`.  The payload JSON carries:
 ///
 /// - `table`              — fully-qualified logical table name
-///                          (e.g. `_pg_ripple.vp_42_delta`)
+///   (e.g. `_pg_ripple.vp_42_delta`)
 /// - `shard_count`        — number of Citus shards created
 /// - `shard_table_prefix` — physical shard name prefix on workers
-///                          (e.g. `_pg_ripple.vp_42_delta_`)
+///   (e.g. `_pg_ripple.vp_42_delta_`)
 /// - `predicate_id`       — pg_ripple predicate integer ID
 #[derive(Debug)]
 pub struct VpPromotedPayload {
@@ -692,15 +692,10 @@ pub struct VpPromotedPayload {
 ///
 /// Returns `None` when the JSON is malformed or a required field is absent.
 pub fn parse_vp_promoted_payload(payload: &str) -> Option<VpPromotedPayload> {
-    use pgrx::JsonB;
-
     // Minimal JSON parser using SPI — avoids adding a serde_json dep.
-    let table = Spi::get_one_with_args::<String>(
-        "SELECT $1::jsonb ->> 'table'",
-        &[payload.into()],
-    )
-    .ok()
-    .flatten()?;
+    let table = Spi::get_one_with_args::<String>("SELECT $1::jsonb ->> 'table'", &[payload.into()])
+        .ok()
+        .flatten()?;
 
     let shard_count = Spi::get_one_with_args::<i64>(
         "SELECT ($1::jsonb ->> 'shard_count')::bigint",
@@ -757,9 +752,7 @@ pub fn parse_vp_promoted_payload(payload: &str) -> Option<VpPromotedPayload> {
 #[pg_extern(schema = "pgtrickle", name = "handle_vp_promoted")]
 pub fn sql_handle_vp_promoted(payload: &str) -> bool {
     let Some(promo) = parse_vp_promoted_payload(payload) else {
-        pgrx::warning!(
-            "[pg_trickle] handle_vp_promoted: could not parse payload: {payload}"
-        );
+        pgrx::warning!("[pg_trickle] handle_vp_promoted: could not parse payload: {payload}");
         return false;
     };
 
