@@ -360,6 +360,7 @@ pub fn check_citus_version_compat() -> Result<(), PgTrickleError> {
         let remote_query_esc = remote_query.replace('\'', "''");
 
         let remote_version = Spi::get_one::<String>(&format!(
+            // nosemgrep: rust.spi.query.dynamic-format — dblink call cannot be parameterized; connstr_esc/remote_query_esc use SQL single-quote escaping on internal Citus catalog values only
             "SELECT val FROM dblink('{connstr_esc}', '{remote_query_esc}') AS t(val text)"
         ))
         .unwrap_or(None)
@@ -408,6 +409,7 @@ pub fn check_worker_wal_levels() -> Result<(), PgTrickleError> {
         let remote_query_esc = remote_query.replace('\'', "''");
 
         let wal_level = Spi::get_one::<String>(&format!(
+            // nosemgrep: rust.spi.query.dynamic-format — dblink call cannot be parameterized; connstr_esc/remote_query_esc use SQL single-quote escaping on internal Citus catalog values only
             "SELECT val FROM dblink('{connstr_esc}', '{remote_query_esc}') AS t(val text)"
         ))
         .unwrap_or(None)
@@ -580,7 +582,7 @@ pub fn poll_worker_slot_changes(
 
     // Materialize dblink results into a temp table for batch processing.
     let temp_name = format!("__pgt_worker_changes_{}", source_oid.to_u32());
-    let _ = Spi::run(&format!("DROP TABLE IF EXISTS {temp_name}"));
+    let _ = Spi::run(&format!("DROP TABLE IF EXISTS {temp_name}")); // nosemgrep: rust.spi.run.dynamic-format — temp_name is derived from a numeric OID, not user input
     let create_sql = format!(
         "CREATE TEMP TABLE {temp_name} ON COMMIT DROP AS \
          SELECT lsn, xid, data \
@@ -627,6 +629,7 @@ pub fn ensure_worker_slot(worker: &NodeAddr, slot_name: &str) -> Result<(), PgTr
     let remote_check_esc = remote_check.replace('\'', "''");
 
     let exists_count = Spi::get_one::<i64>(&format!(
+        // nosemgrep: rust.spi.query.dynamic-format — dblink call cannot be parameterized; connstr_esc/remote_check_esc use SQL single-quote escaping on internal Citus catalog values only
         "SELECT val::bigint FROM dblink('{connstr_esc}', '{remote_check_esc}') AS t(val text)"
     ))
     .map_err(|e| {
@@ -646,7 +649,7 @@ pub fn ensure_worker_slot(worker: &NodeAddr, slot_name: &str) -> Result<(), PgTr
         format!("SELECT pg_create_logical_replication_slot('{slot_esc}', 'test_decoding')");
     let remote_create_esc = remote_create.replace('\'', "''");
 
-    Spi::run(&format!(
+    Spi::run(&format!( // nosemgrep: rust.spi.run.dynamic-format — dblink call cannot be parameterized; connstr_esc/remote_create_esc use SQL single-quote escaping on internal Citus catalog values only
         "SELECT * FROM dblink('{connstr_esc}', '{remote_create_esc}') AS t(slot_name text, lsn text)"
     ))
     .map_err(|e| {
