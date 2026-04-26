@@ -7,6 +7,7 @@ For future plans and upcoming features, see [ROADMAP.md](ROADMAP.md).
 ## Table of Contents
 
 <!-- TOC start -->
+- [0.34.0 — Citus: Automated Distributed CDC Scheduler & Shard Recovery](#0340--citus-automated-distributed-cdc-scheduler--shard-recovery)
 - [0.33.0 — Citus: Distributed Source CDC & Stream Tables](#0330--citus-distributed-source-cdc--stream-tables)
 - [0.32.0 — Citus: Stable Naming & Per-Source Frontier Foundation](#0320--citus-stable-naming--per-source-frontier-foundation)
 - [0.31.0 — Performance & Scheduler Intelligence](#0310--performance--scheduler-intelligence)
@@ -47,6 +48,59 @@ For future plans and upcoming features, see [ROADMAP.md](ROADMAP.md).
 - [0.1.1 — CloudNativePG Image & Test Hardening](#011--cloudnativepg-image--test-hardening)
 - [0.1.0 — Initial Release](#010--initial-release)
 <!-- TOC end -->
+
+---
+
+## [0.34.0] — Citus: Automated Distributed CDC Scheduler & Shard Recovery
+
+v0.33.0 shipped all the Citus distributed CDC infrastructure — per-worker WAL
+slots, `pgt_st_locks` coordination, `poll_worker_slot_changes`, and
+`handle_vp_promoted`. v0.34.0 closes the final gap: the scheduler is now fully
+aware of distributed sources and drives the per-worker slot lifecycle
+automatically, making distributed stream tables completely hands-off.
+
+### What's new
+
+- **Automated scheduler integration** (COORD-10, COORD-11, COORD-12):
+  When a stream table source has `source_placement = 'distributed'`, the
+  scheduler now calls `ensure_worker_slot()` on the first tick (and after
+  rebalances), calls `poll_worker_slot_changes()` to drain per-worker WAL
+  changes into the local buffer, and acquires/extends/releases a
+  `pgt_st_locks` lease around the entire operation.
+
+- **Shard rebalance auto-recovery** (COORD-13):
+  The scheduler detects `pg_dist_node` topology changes by comparing active
+  primaries against `pgt_worker_slots`. When a change is detected, stale
+  slot entries are dropped, new worker slots are inserted, and the stream
+  table is marked for a full refresh — no operator intervention needed.
+
+- **Worker failure handling** (COORD-14):
+  If `poll_worker_slot_changes()` fails for a worker, the error is logged
+  and the worker is skipped for that tick. After
+  `pg_trickle.citus_worker_retry_ticks` consecutive failures, a WARNING
+  is emitted in the PostgreSQL log for operator attention. Refreshes
+  against healthy workers continue uninterrupted.
+
+- **New GUC** (COORD-15):
+  `pg_trickle.citus_worker_retry_ticks` (default 5) — consecutive
+  worker-poll failures before flagging in `citus_status`. Set to 0 to
+  disable the alert.
+
+- **Extended `citus_status` view** (COORD-16):
+  The view now includes `last_polled_at` (timestamp of the last successful
+  poll for each worker slot), `lease_holder`, `lease_acquired_at`,
+  `lease_expires_at`, and `lease_health` (`'unlocked'` / `'locked'` /
+  `'expired'`) columns for full operational visibility.
+
+### Migration
+
+No application-level changes required. The new scheduler behaviour activates
+automatically for stream tables with `source_placement = 'distributed'`.
+Operators using manual `LISTEN + handle_vp_promoted()` wiring can remove that
+code — it is now redundant (though harmless to leave in place).
+
+Run `ALTER EXTENSION pg_trickle UPDATE TO '0.34.0'` to pick up the new
+`last_polled_at` column and extended `citus_status` view.
 
 ---
 

@@ -787,6 +787,239 @@ pub fn sql_handle_vp_promoted(payload: &str) -> bool {
     source_exists
 }
 
+// ── COORD-10/11/12/13 (v0.34.0): Scheduler distributed CDC integration ────────
+
+/// A worker slot descriptor loaded from `pgt_worker_slots`.
+///
+/// Used by the scheduler to drive per-worker `ensure_worker_slot` and
+/// `poll_worker_slot_changes` calls on each refresh tick.
+#[derive(Debug, Clone)]
+pub struct WorkerSlotEntry {
+    pub pgt_id: i64,
+    pub source_relid: pg_sys::Oid,
+    pub worker_name: String,
+    pub worker_port: i32,
+    pub slot_name: String,
+}
+
+impl WorkerSlotEntry {
+    /// Return the `NodeAddr` for this worker entry.
+    pub fn node_addr(&self) -> NodeAddr {
+        NodeAddr {
+            node_name: self.worker_name.clone(),
+            node_port: self.worker_port,
+        }
+    }
+}
+
+/// COORD-13: Detect whether the active Citus primary worker set has diverged
+/// from what is recorded in `pgt_worker_slots` for `pgt_id`.
+///
+/// Compares the set of `(nodename, nodeport)` pairs from `pg_dist_node`
+/// (active primaries) against the set stored in `pgt_worker_slots`.
+///
+/// Returns `true` when the sets differ (topology change detected), `false`
+/// when they are identical or when Citus is not loaded.
+pub fn detect_topology_change(pgt_id: i64) -> bool {
+    if !is_citus_loaded() {
+        return false;
+    }
+
+    // Current active primaries from pg_dist_node.
+    let live_workers = worker_nodes();
+    let live_set: std::collections::HashSet<(String, i32)> = live_workers
+        .iter()
+        .map(|w| (w.node_name.clone(), w.node_port))
+        .collect();
+
+    // Workers recorded in pgt_worker_slots for this ST.
+    let recorded_set: std::collections::HashSet<(String, i32)> = Spi::connect(|client| {
+        let result = match client.select(
+            "SELECT DISTINCT worker_name::text, worker_port \
+             FROM pgtrickle.pgt_worker_slots \
+             WHERE pgt_id = $1",
+            None,
+            &[pgt_id.into()],
+        ) {
+            Ok(r) => r,
+            Err(_) => return std::collections::HashSet::new(),
+        };
+
+        result
+            .into_iter()
+            .map(|row| {
+                let name: String = row.get(1).ok().flatten().unwrap_or_default();
+                let port: i32 = row.get(2).ok().flatten().unwrap_or(5432);
+                (name, port)
+            })
+            .collect()
+    });
+
+    // If pgt_worker_slots is empty (first tick), only report a change when
+    // there are actually live workers to register.
+    if recorded_set.is_empty() {
+        return !live_set.is_empty();
+    }
+
+    live_set != recorded_set
+}
+
+/// COORD-13: Drop `pgt_worker_slots` rows that are no longer in `active_workers`
+/// and insert rows for newly-seen workers (with slot name derived from the
+/// source's stable name).
+///
+/// Also drops `pgt_worker_slots` rows for workers that have disappeared.
+/// Called by the scheduler after a topology change is detected.
+///
+/// Returns the number of rows deleted (stale) + inserted (new).
+pub fn reconcile_worker_slots(pgt_id: i64) -> Result<i64, PgTrickleError> {
+    if !is_citus_loaded() {
+        return Ok(0);
+    }
+
+    let live_workers = worker_nodes();
+
+    // Build the set of live (name, port) pairs as SQL-safe text arrays.
+    // Delete stale entries first.
+    let deleted = Spi::connect_mut(|client| {
+        // We delete any slot entry whose (worker_name, worker_port) pair is not
+        // in the current live worker list.
+        let rows = client
+            .update(
+                "DELETE FROM pgtrickle.pgt_worker_slots \
+                 WHERE pgt_id = $1 \
+                   AND NOT EXISTS ( \
+                       SELECT 1 FROM pg_dist_node \
+                       WHERE isactive AND noderole = 'primary' \
+                         AND nodename::text = pgt_worker_slots.worker_name \
+                         AND nodeport       = pgt_worker_slots.worker_port \
+                   ) \
+                 RETURNING 1",
+                None,
+                &[pgt_id.into()],
+            )
+            .map_err(|e| PgTrickleError::SpiError(format!("reconcile_worker_slots delete: {e}")))?;
+        Ok::<i64, PgTrickleError>(rows.len() as i64)
+    })?;
+
+    // Insert rows for new workers (for each distributed source tracked for this ST).
+    let inserted: i64 = Spi::connect_mut(|client| {
+        let mut count = 0i64;
+        for worker in &live_workers {
+            // For each source tracked by this ST with source_placement = 'distributed',
+            // insert a worker slot row if one does not already exist.
+            let rows = client
+                .update(
+                    "INSERT INTO pgtrickle.pgt_worker_slots \
+                         (pgt_id, source_relid, worker_name, worker_port, slot_name) \
+                     SELECT d.pgt_id, \
+                            d.source_relid, \
+                            $2, \
+                            $3, \
+                            'pgtrickle_' || coalesce(d.source_stable_name, d.source_relid::text) \
+                     FROM pgtrickle.pgt_dependencies d \
+                     WHERE d.pgt_id = $1 \
+                       AND COALESCE(d.source_placement, 'local') = 'distributed' \
+                     ON CONFLICT (pgt_id, source_relid, worker_name, worker_port) DO NOTHING",
+                    None,
+                    &[
+                        pgt_id.into(),
+                        worker.node_name.as_str().into(),
+                        worker.node_port.into(),
+                    ],
+                )
+                .map_err(|e| {
+                    PgTrickleError::SpiError(format!("reconcile_worker_slots insert: {e}"))
+                })?;
+            count += rows.len() as i64;
+        }
+        Ok::<i64, PgTrickleError>(count)
+    })?;
+
+    Ok(deleted + inserted)
+}
+
+/// COORD-10/11: Load all `pgt_worker_slots` entries for a given stream table.
+///
+/// The scheduler iterates over these to call `ensure_worker_slot` and
+/// `poll_worker_slot_changes` on each refresh tick.
+///
+/// Returns an empty Vec when Citus is not loaded or no slots are registered.
+pub fn get_worker_slots_for_st(pgt_id: i64) -> Vec<WorkerSlotEntry> {
+    if !is_citus_loaded() {
+        return Vec::new();
+    }
+
+    Spi::connect(|client| {
+        let result = match client.select(
+            "SELECT pgt_id, source_relid, worker_name::text, worker_port, slot_name::text \
+             FROM pgtrickle.pgt_worker_slots \
+             WHERE pgt_id = $1",
+            None,
+            &[pgt_id.into()],
+        ) {
+            Ok(r) => r,
+            Err(_) => return Vec::new(),
+        };
+
+        result
+            .into_iter()
+            .map(|row| WorkerSlotEntry {
+                pgt_id: row.get(1).ok().flatten().unwrap_or(0),
+                source_relid: row.get(2).ok().flatten().unwrap_or(pg_sys::InvalidOid),
+                worker_name: row.get(3).ok().flatten().unwrap_or_default(),
+                worker_port: row.get(4).ok().flatten().unwrap_or(5432),
+                slot_name: row.get(5).ok().flatten().unwrap_or_default(),
+            })
+            .collect()
+    })
+}
+
+/// COORD-14: Update the `last_frontier` and `last_polled_at` columns for a
+/// worker slot after a successful poll.  This lets operators observe per-worker
+/// CDC progress via `citus_status`.
+pub fn update_worker_slot_frontier(
+    pgt_id: i64,
+    source_relid: pg_sys::Oid,
+    worker_name: &str,
+    worker_port: i32,
+    frontier: &str,
+) -> Result<(), PgTrickleError> {
+    Spi::run_with_args(
+        "UPDATE pgtrickle.pgt_worker_slots \
+         SET last_frontier = $5, last_polled_at = now() \
+         WHERE pgt_id = $1 \
+           AND source_relid = $2 \
+           AND worker_name  = $3 \
+           AND worker_port  = $4",
+        &[
+            pgt_id.into(),
+            source_relid.into(),
+            worker_name.into(),
+            worker_port.into(),
+            frontier.into(),
+        ],
+    )
+    .map_err(|e| PgTrickleError::SpiError(format!("update_worker_slot_frontier: {e}")))
+}
+
+// ── COORD-16 (v0.34.0): Topology change unit-testing helpers ─────────────────
+
+/// COORD-13 (unit-test helper): Compare two worker sets without any SPI calls.
+///
+/// Returns `true` when `live` and `recorded` differ (topology change detected).
+/// This pure function can be exercised in unit tests without a PostgreSQL backend.
+#[allow(dead_code)]
+pub fn topology_sets_differ(live: &[(String, i32)], recorded: &[(String, i32)]) -> bool {
+    let live_set: std::collections::HashSet<_> = live.iter().cloned().collect();
+    let rec_set: std::collections::HashSet<_> = recorded.iter().cloned().collect();
+
+    if rec_set.is_empty() {
+        return !live_set.is_empty();
+    }
+    live_set != rec_set
+}
+
 // ── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -862,6 +1095,80 @@ mod tests {
         assert_eq!(
             id1.stable_name, id2.stable_name,
             "stable_name must not depend on OID"
+        );
+    }
+
+    // ── COORD-17/18 unit tests: topology change detection ──────────────────
+
+    /// COORD-13: Identical live and recorded sets → no topology change.
+    #[test]
+    fn test_topology_no_change() {
+        let live = vec![("worker1".to_string(), 5432), ("worker2".to_string(), 5432)];
+        let recorded = live.clone();
+        assert!(
+            !topology_sets_differ(&live, &recorded),
+            "identical sets must not trigger topology change"
+        );
+    }
+
+    /// COORD-13: A worker is added → topology change detected.
+    #[test]
+    fn test_topology_worker_added() {
+        let live = vec![
+            ("worker1".to_string(), 5432),
+            ("worker2".to_string(), 5432),
+            ("worker3".to_string(), 5432),
+        ];
+        let recorded = vec![("worker1".to_string(), 5432), ("worker2".to_string(), 5432)];
+        assert!(
+            topology_sets_differ(&live, &recorded),
+            "added worker must trigger topology change"
+        );
+    }
+
+    /// COORD-13: A worker is removed → topology change detected.
+    #[test]
+    fn test_topology_worker_removed() {
+        let live = vec![("worker1".to_string(), 5432)];
+        let recorded = vec![("worker1".to_string(), 5432), ("worker2".to_string(), 5432)];
+        assert!(
+            topology_sets_differ(&live, &recorded),
+            "removed worker must trigger topology change"
+        );
+    }
+
+    /// COORD-13: Empty recorded set and non-empty live set → topology change
+    /// (initial-tick case where no slots are registered yet).
+    #[test]
+    fn test_topology_empty_recorded_live_workers() {
+        let live = vec![("worker1".to_string(), 5432)];
+        let recorded: Vec<(String, i32)> = vec![];
+        assert!(
+            topology_sets_differ(&live, &recorded),
+            "empty recorded + live workers must signal first-tick change"
+        );
+    }
+
+    /// COORD-13: Empty recorded set and empty live set → no change
+    /// (no Citus workers exist; non-Citus deployment).
+    #[test]
+    fn test_topology_both_empty() {
+        let live: Vec<(String, i32)> = vec![];
+        let recorded: Vec<(String, i32)> = vec![];
+        assert!(
+            !topology_sets_differ(&live, &recorded),
+            "both empty sets must not trigger topology change"
+        );
+    }
+
+    /// COORD-13: Port change for same hostname → topology change.
+    #[test]
+    fn test_topology_port_change() {
+        let live = vec![("worker1".to_string(), 5433)];
+        let recorded = vec![("worker1".to_string(), 5432)];
+        assert!(
+            topology_sets_differ(&live, &recorded),
+            "port change must trigger topology change"
         );
     }
 }
