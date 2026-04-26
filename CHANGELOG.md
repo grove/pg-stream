@@ -8,7 +8,6 @@ For future plans and upcoming features, see [ROADMAP.md](ROADMAP.md).
 
 <!-- TOC start -->
 - [Unreleased](#unreleased)
-- [0.33.1 — pg_ripple Citus Co-location Helper](#0331--pg_ripple-citus-co-location-helper)
 - [0.33.0 — Citus: Distributed Source CDC & Stream Tables](#0330--citus-distributed-source-cdc--stream-tables)
 - [0.32.0 — Citus: Stable Naming & Per-Source Frontier Foundation](#0320--citus-stable-naming--per-source-frontier-foundation)
 - [0.31.0 — Performance & Scheduler Intelligence](#0310--performance--scheduler-intelligence)
@@ -54,13 +53,11 @@ For future plans and upcoming features, see [ROADMAP.md](ROADMAP.md).
 
 ## [Unreleased]
 
----
-
-## [0.33.1] — pg_ripple Citus Co-location Helper
+### pg_ripple Citus Co-location Helper
 
 Patch release aligning pg_trickle with pg_ripple v0.58.0 Citus sharding support.
 
-### New: `pgtrickle.handle_vp_promoted(payload TEXT) → BOOLEAN`
+#### New: `pgtrickle.handle_vp_promoted(payload TEXT) → BOOLEAN`
 
 Processes a `pg_ripple.vp_promoted` NOTIFY payload emitted by pg_ripple
 v0.58.0 when a VP table is distributed via Citus.  Call this from any
@@ -81,16 +78,12 @@ The function:
   next tick without a full catalog scan.
 - Returns `true` if a matching source was found, `false` otherwise.
 
-### Documentation
+#### Documentation
 
 - `docs/integrations/citus.md` gains a new **pg_ripple Integration** section
   covering co-location DDL, the `vp_promoted` notification contract, and
   guidance on aligning `pgt_st_locks` lease expiry with
   `pg_ripple.merge_fence_timeout_ms`.
-
-### Migration
-
-`ALTER EXTENSION pg_trickle UPDATE TO '0.33.1';`
 
 ---
 
