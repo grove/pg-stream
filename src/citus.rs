@@ -359,12 +359,11 @@ pub fn check_citus_version_compat() -> Result<(), PgTrickleError> {
         let remote_query = "SELECT extversion FROM pg_extension WHERE extname = 'pg_trickle'";
         let remote_query_esc = remote_query.replace('\'', "''");
 
-        let remote_version = Spi::get_one::<String>(&format!(
-            // nosemgrep: rust.spi.query.dynamic-format — dblink call cannot be parameterized; connstr_esc/remote_query_esc use SQL single-quote escaping on internal Citus catalog values only
-            "SELECT val FROM dblink('{connstr_esc}', '{remote_query_esc}') AS t(val text)"
-        ))
-        .unwrap_or(None)
-        .unwrap_or_else(|| "not_installed".into());
+        let sql =
+            format!("SELECT val FROM dblink('{connstr_esc}', '{remote_query_esc}') AS t(val text)");
+        let remote_version = Spi::get_one::<String>(&sql) // nosemgrep: rust.spi.query.dynamic-format — dblink() call cannot be parameterized; connstr_esc/remote_query_esc are SQL-escaped server-controlled Citus catalog values
+            .unwrap_or(None)
+            .unwrap_or_else(|| "not_installed".into());
 
         if remote_version != local_version {
             mismatches.push(format!(
@@ -408,12 +407,11 @@ pub fn check_worker_wal_levels() -> Result<(), PgTrickleError> {
         let remote_query = "SELECT current_setting('wal_level')";
         let remote_query_esc = remote_query.replace('\'', "''");
 
-        let wal_level = Spi::get_one::<String>(&format!(
-            // nosemgrep: rust.spi.query.dynamic-format — dblink call cannot be parameterized; connstr_esc/remote_query_esc use SQL single-quote escaping on internal Citus catalog values only
-            "SELECT val FROM dblink('{connstr_esc}', '{remote_query_esc}') AS t(val text)"
-        ))
-        .unwrap_or(None)
-        .unwrap_or_else(|| "unknown".into());
+        let sql =
+            format!("SELECT val FROM dblink('{connstr_esc}', '{remote_query_esc}') AS t(val text)");
+        let wal_level = Spi::get_one::<String>(&sql) // nosemgrep: rust.spi.query.dynamic-format — dblink() call cannot be parameterized; connstr_esc/remote_query_esc are SQL-escaped server-controlled Citus catalog values
+            .unwrap_or(None)
+            .unwrap_or_else(|| "unknown".into());
 
         if wal_level != "logical" {
             failures.push(format!(
@@ -628,17 +626,17 @@ pub fn ensure_worker_slot(worker: &NodeAddr, slot_name: &str) -> Result<(), PgTr
         format!("SELECT count(*) FROM pg_replication_slots WHERE slot_name = '{slot_esc}'");
     let remote_check_esc = remote_check.replace('\'', "''");
 
-    let exists_count = Spi::get_one::<i64>(&format!(
-        // nosemgrep: rust.spi.query.dynamic-format — dblink call cannot be parameterized; connstr_esc/remote_check_esc use SQL single-quote escaping on internal Citus catalog values only
+    let slot_check_sql = format!(
         "SELECT val::bigint FROM dblink('{connstr_esc}', '{remote_check_esc}') AS t(val text)"
-    ))
-    .map_err(|e| {
-        PgTrickleError::SpiError(format!(
-            "dblink check slot on {}:{}: {e}",
-            worker.node_name, worker.node_port
-        ))
-    })?
-    .unwrap_or(0);
+    );
+    let exists_count = Spi::get_one::<i64>(&slot_check_sql) // nosemgrep: rust.spi.query.dynamic-format — dblink() call cannot be parameterized; connstr_esc/remote_check_esc are SQL-escaped server-controlled Citus catalog values
+        .map_err(|e| {
+            PgTrickleError::SpiError(format!(
+                "dblink check slot on {}:{}: {e}",
+                worker.node_name, worker.node_port
+            ))
+        })?
+        .unwrap_or(0);
 
     if exists_count > 0 {
         return Ok(());
