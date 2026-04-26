@@ -310,6 +310,38 @@ CREATE EVENT TRIGGER pg_trickle_drop_tracker
 /* </end connected objects> */
 
 /* <begin connected objects> */
+-- src/lib.rs:517
+-- requires:
+--   pg_trickle_catalog
+
+
+-- CIT-4: Per-worker replication slot tracking view.
+-- Safe to query on non-Citus deployments (pgt_change_tracking and
+-- pgt_worker_slots are local catalog tables; no pg_dist_node reference).
+-- Returns one row per (stream_table, source, worker) combination.
+CREATE OR REPLACE VIEW pgtrickle.citus_status AS
+SELECT
+    st.pgt_id,
+    st.pgt_schema,
+    st.pgt_name,
+    ct.source_relid,
+    ct.source_stable_name,
+    ct.slot_name           AS coordinator_slot,
+    ct.source_placement,
+    ct.frontier_per_node,
+    ws.worker_name,
+    ws.worker_port,
+    ws.slot_name           AS worker_slot,
+    ws.last_frontier       AS worker_frontier
+FROM pgtrickle.pgt_change_tracking ct
+JOIN pgtrickle.pgt_stream_tables   st ON st.pgt_id = ANY(ct.tracked_by_pgt_ids)
+LEFT JOIN pgtrickle.pgt_worker_slots ws
+       ON ws.pgt_id       = st.pgt_id
+      AND ws.source_relid = ct.source_relid
+WHERE ct.source_placement = 'distributed';
+/* </end connected objects> */
+
+/* <begin connected objects> */
 -- src/lib.rs:707
 
 CREATE OR REPLACE FUNCTION pgtrickle."pause_all"()
@@ -697,107 +729,198 @@ $$;
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/lib.rs:517
--- requires:
---   pg_trickle_catalog
-
-
--- CIT-4: Per-worker replication slot tracking view.
--- Safe to query on non-Citus deployments (pgt_change_tracking and
--- pgt_worker_slots are local catalog tables; no pg_dist_node reference).
--- Returns one row per (stream_table, source, worker) combination.
-CREATE OR REPLACE VIEW pgtrickle.citus_status AS
-SELECT
-    ct.pgt_id,
-    st.pgt_schema,
-    st.pgt_name,
-    ct.source_relid,
-    ct.source_stable_name,
-    ct.slot_name           AS coordinator_slot,
-    ct.source_placement,
-    ct.frontier_per_node,
-    ws.worker_name,
-    ws.worker_port,
-    ws.slot_name           AS worker_slot,
-    ws.last_frontier       AS worker_frontier
-FROM pgtrickle.pgt_change_tracking ct
-JOIN pgtrickle.pgt_stream_tables   st ON st.pgt_id = ct.pgt_id
-LEFT JOIN pgtrickle.pgt_worker_slots ws
-       ON ws.pgt_id       = ct.pgt_id
-      AND ws.source_relid = ct.source_relid
-WHERE ct.source_placement = 'distributed';
-/* </end connected objects> */
-
-/* <begin connected objects> */
 -- src/lib.rs:51
 CREATE SCHEMA IF NOT EXISTS pgtrickle; /* pg_trickle::pgtrickle */
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/api/mod.rs:644
--- pg_trickle::api::create_stream_table
-CREATE  FUNCTION pgtrickle."create_stream_table"(
-	"name" TEXT, /* & str */
-	"query" TEXT, /* & str */
-	"schedule" TEXT DEFAULT 'calculated', /* Option < & str > */
-	"refresh_mode" TEXT DEFAULT 'AUTO', /* & str */
-	"initialize" bool DEFAULT true, /* bool */
-	"diamond_consistency" TEXT DEFAULT NULL, /* Option < & str > */
-	"diamond_schedule_policy" TEXT DEFAULT NULL, /* Option < & str > */
-	"cdc_mode" TEXT DEFAULT NULL, /* Option < & str > */
-	"append_only" bool DEFAULT false, /* bool */
-	"pooler_compatibility_mode" bool DEFAULT false, /* bool */
-	"partition_by" TEXT DEFAULT NULL, /* Option < & str > */
-	"max_differential_joins" INT DEFAULT NULL, /* Option < i32 > */
-	"max_delta_fraction" double precision DEFAULT NULL, /* Option < f64 > */
-	"output_distribution_column" TEXT DEFAULT NULL /* Option < & str > */
+-- src/ivm.rs:1066
+-- pg_trickle::ivm::pgt_ivm_handle_truncate
+CREATE  FUNCTION pgtrickle."pgt_ivm_handle_truncate"(
+	"pgt_id" bigint /* i64 */
+) RETURNS VOID /* Result < (), PgTrickleError > */
+STRICT 
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'pgt_ivm_handle_truncate_wrapper';
+/* </end connected objects> */
+
+/* <begin connected objects> */
+-- src/monitor.rs:1366
+-- pg_trickle::monitor::explain_diff_sql
+CREATE  FUNCTION pgtrickle."explain_diff_sql"(
+	"name" TEXT /* & str */
+) RETURNS TEXT /* Option < String > */
+STRICT  
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'explain_diff_sql_wrapper';
+/* </end connected objects> */
+
+/* <begin connected objects> */
+-- src/hooks.rs:51
+-- pg_trickle::hooks::pg_trickle_on_ddl_end
+-- Skipped due to `#[pgrx(sql = false)]`
+/* </end connected objects> */
+
+/* <begin connected objects> */
+-- src/api/self_monitoring.rs:358
+-- pg_trickle::api::self_monitoring::self_monitoring_status
+CREATE  FUNCTION pgtrickle."self_monitoring_status"() RETURNS TABLE (
+	"st_name" TEXT,  /* String */
+	"exists" bool,  /* bool */
+	"status" TEXT,  /* Option < String > */
+	"refresh_mode" TEXT,  /* Option < String > */
+	"last_refresh_at" TEXT,  /* Option < String > */
+	"total_refreshes" bigint  /* Option < i64 > */
+)
+STRICT 
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'self_monitoring_status_wrapper';
+/* </end connected objects> */
+
+/* <begin connected objects> */
+-- src/diagnostics.rs:570
+-- pg_trickle::diagnostics::list_auxiliary_columns
+CREATE  FUNCTION pgtrickle."list_auxiliary_columns"(
+	"name" TEXT /* & str */
+) RETURNS TABLE (
+	"column_name" TEXT,  /* String */
+	"data_type" TEXT,  /* String */
+	"purpose" TEXT  /* String */
+)
+STRICT 
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'list_auxiliary_columns_wrapper';
+/* </end connected objects> */
+
+/* <begin connected objects> */
+-- src/api/outbox.rs:387
+-- pg_trickle::api::outbox::outbox_rows_consumed
+CREATE  FUNCTION pgtrickle."outbox_rows_consumed"(
+	"p_stream_table" TEXT, /* & str */
+	"p_outbox_id" bigint /* i64 */
 ) RETURNS void
-
-LANGUAGE c /* Rust */
-AS 'MODULE_PATHNAME', 'create_stream_table_wrapper';
-/* </end connected objects> */
-
-/* <begin connected objects> */
--- src/api/outbox.rs:748
--- pg_trickle::api::outbox::extend_lease
-CREATE  FUNCTION pgtrickle."extend_lease"(
-	"p_group" TEXT, /* & str */
-	"p_consumer" TEXT, /* & str */
-	"p_extension_seconds" INT DEFAULT 30 /* i32 */
-) RETURNS timestamp with time zone /* Option < TimestampWithTimeZone > */
 STRICT 
 LANGUAGE c /* Rust */
-AS 'MODULE_PATHNAME', 'extend_lease_wrapper';
+AS 'MODULE_PATHNAME', 'outbox_rows_consumed_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/api/mod.rs:794
--- pg_trickle::api::bulk_create
-CREATE  FUNCTION pgtrickle."bulk_create"(
-	"definitions" jsonb /* pgrx :: JsonB */
-) RETURNS jsonb /* pgrx :: JsonB */
-STRICT 
-LANGUAGE c /* Rust */
-AS 'MODULE_PATHNAME', 'bulk_create_wrapper';
-/* </end connected objects> */
-
-/* <begin connected objects> */
--- src/monitor.rs:2848
--- pg_trickle::monitor::health_summary
-CREATE  FUNCTION pgtrickle."health_summary"() RETURNS TABLE (
-	"total_stream_tables" INT,  /* i32 */
-	"active_count" INT,  /* i32 */
-	"error_count" INT,  /* i32 */
-	"suspended_count" INT,  /* i32 */
-	"stale_count" INT,  /* i32 */
-	"reinit_pending" INT,  /* i32 */
-	"max_staleness_seconds" double precision,  /* Option < f64 > */
-	"scheduler_status" TEXT,  /* String */
-	"cache_hit_rate" double precision  /* Option < f64 > */
+-- src/monitor.rs:3172
+-- pg_trickle::monitor::worker_pool_status
+CREATE  FUNCTION pgtrickle."worker_pool_status"() RETURNS TABLE (
+	"active_workers" INT,  /* i32 */
+	"max_workers" INT,  /* i32 */
+	"per_db_cap" INT,  /* i32 */
+	"parallel_mode" TEXT  /* String */
 )
 STRICT  
 LANGUAGE c /* Rust */
-AS 'MODULE_PATHNAME', 'health_summary_wrapper';
+AS 'MODULE_PATHNAME', 'worker_pool_status_wrapper';
+/* </end connected objects> */
+
+/* <begin connected objects> */
+-- src/api/diagnostics.rs:109
+-- pg_trickle::api::diagnostics::rebuild_cdc_triggers
+CREATE  FUNCTION pgtrickle."rebuild_cdc_triggers"() RETURNS TEXT /* & '_ str */
+STRICT 
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'rebuild_cdc_triggers_wrapper';
+/* </end connected objects> */
+
+/* <begin connected objects> */
+-- src/monitor.rs:2204
+-- pg_trickle::monitor::list_sources
+CREATE  FUNCTION pgtrickle."list_sources"(
+	"name" TEXT /* & str */
+) RETURNS TABLE (
+	"source_table" TEXT,  /* String */
+	"source_oid" bigint,  /* i64 */
+	"source_type" TEXT,  /* String */
+	"cdc_mode" TEXT,  /* String */
+	"columns_used" TEXT  /* Option < String > */
+)
+STRICT  
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'list_sources_wrapper';
+/* </end connected objects> */
+
+/* <begin connected objects> */
+-- src/api/self_monitoring.rs:305
+-- pg_trickle::api::self_monitoring::teardown_self_monitoring
+CREATE  FUNCTION pgtrickle."teardown_self_monitoring"() RETURNS void
+STRICT 
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'teardown_self_monitoring_wrapper';
+/* </end connected objects> */
+
+/* <begin connected objects> */
+-- src/api/inbox.rs:788
+-- pg_trickle::api::inbox::disable_inbox_ordering
+CREATE  FUNCTION pgtrickle."disable_inbox_ordering"(
+	"p_inbox" TEXT, /* & str */
+	"p_if_exists" bool DEFAULT false /* bool */
+) RETURNS void
+STRICT 
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'disable_inbox_ordering_wrapper';
+/* </end connected objects> */
+
+/* <begin connected objects> */
+-- src/api/inbox.rs:121
+-- pg_trickle::api::inbox::create_inbox
+CREATE  FUNCTION pgtrickle."create_inbox"(
+	"p_name" TEXT, /* & str */
+	"p_schema" TEXT DEFAULT 'pgtrickle', /* & str */
+	"p_max_retries" INT DEFAULT 3, /* i32 */
+	"p_schedule" TEXT DEFAULT '1s', /* & str */
+	"with_dead_letter" bool DEFAULT true, /* bool */
+	"with_stats" bool DEFAULT true, /* bool */
+	"p_retention_hours" INT DEFAULT 72 /* i32 */
+) RETURNS void
+STRICT 
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'create_inbox_wrapper';
+/* </end connected objects> */
+
+/* <begin connected objects> */
+-- src/api/outbox.rs:718
+-- pg_trickle::api::outbox::commit_offset
+CREATE  FUNCTION pgtrickle."commit_offset"(
+	"p_group" TEXT, /* & str */
+	"p_consumer" TEXT, /* & str */
+	"p_last_offset" bigint /* i64 */
+) RETURNS void
+STRICT 
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'commit_offset_wrapper';
+/* </end connected objects> */
+
+/* <begin connected objects> */
+-- src/api/outbox.rs:781
+-- pg_trickle::api::outbox::seek_offset
+CREATE  FUNCTION pgtrickle."seek_offset"(
+	"p_group" TEXT, /* & str */
+	"p_consumer" TEXT, /* & str */
+	"p_new_offset" bigint /* i64 */
+) RETURNS void
+STRICT 
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'seek_offset_wrapper';
+/* </end connected objects> */
+
+/* <begin connected objects> */
+-- src/api/diagnostics.rs:296
+-- pg_trickle::api::diagnostics::explain_refresh_mode
+CREATE  FUNCTION pgtrickle."explain_refresh_mode"(
+	"name" TEXT /* & str */
+) RETURNS TABLE (
+	"configured_mode" TEXT,  /* String */
+	"effective_mode" TEXT,  /* Option < String > */
+	"downgrade_reason" TEXT  /* Option < String > */
+)
+STRICT 
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'explain_refresh_mode_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
@@ -816,14 +939,223 @@ AS 'MODULE_PATHNAME', 'slot_health_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/api/publication.rs:73
--- pg_trickle::api::publication::drop_stream_table_publication
-CREATE  FUNCTION pgtrickle."drop_stream_table_publication"(
-	"name" TEXT /* & str */
+-- src/api/diagnostics.rs:1455
+-- pg_trickle::api::diagnostics::refresh_groups
+CREATE  FUNCTION pgtrickle."refresh_groups"() RETURNS TABLE (
+	"group_id" INT,  /* i32 */
+	"group_name" TEXT,  /* String */
+	"member_count" INT,  /* i32 */
+	"isolation" TEXT,  /* String */
+	"created_at" timestamp with time zone  /* TimestampWithTimeZone */
+)
+STRICT  
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'refresh_groups_fn_wrapper';
+/* </end connected objects> */
+
+/* <begin connected objects> */
+-- src/monitor.rs:491
+-- pg_trickle::monitor::st_refresh_stats
+CREATE  FUNCTION pgtrickle."st_refresh_stats"() RETURNS TABLE (
+	"pgt_name" TEXT,  /* String */
+	"pgt_schema" TEXT,  /* String */
+	"status" TEXT,  /* String */
+	"refresh_mode" TEXT,  /* String */
+	"is_populated" bool,  /* bool */
+	"total_refreshes" bigint,  /* i64 */
+	"successful_refreshes" bigint,  /* i64 */
+	"failed_refreshes" bigint,  /* i64 */
+	"total_rows_inserted" bigint,  /* i64 */
+	"total_rows_deleted" bigint,  /* i64 */
+	"avg_duration_ms" double precision,  /* f64 */
+	"last_refresh_action" TEXT,  /* Option < String > */
+	"last_refresh_status" TEXT,  /* Option < String > */
+	"last_refresh_at" timestamp with time zone,  /* Option < TimestampWithTimeZone > */
+	"staleness_secs" double precision,  /* Option < f64 > */
+	"stale" bool,  /* bool */
+	"consecutive_errors" INT,  /* i32 */
+	"schedule" TEXT,  /* Option < String > */
+	"refresh_tier" TEXT,  /* String */
+	"last_error_message" TEXT,  /* Option < String > */
+	"downstream_publication" TEXT  /* Option < String > */
+)
+STRICT  
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'st_refresh_stats_wrapper';
+/* </end connected objects> */
+
+/* <begin connected objects> */
+-- src/api/mod.rs:4046
+-- pg_trickle::api::drop_stream_table
+CREATE  FUNCTION pgtrickle."drop_stream_table"(
+	"name" TEXT, /* & str */
+	"cascade" bool DEFAULT false /* bool */
 ) RETURNS void
 STRICT 
 LANGUAGE c /* Rust */
-AS 'MODULE_PATHNAME', 'drop_stream_table_publication_wrapper';
+AS 'MODULE_PATHNAME', 'drop_stream_table_wrapper';
+/* </end connected objects> */
+
+/* <begin connected objects> */
+-- src/api/outbox.rs:448
+-- pg_trickle::api::outbox::create_consumer_group
+CREATE  FUNCTION pgtrickle."create_consumer_group"(
+	"p_name" TEXT, /* & str */
+	"p_outbox" TEXT, /* & str */
+	"p_auto_offset_reset" TEXT DEFAULT 'latest' /* & str */
+) RETURNS void
+STRICT 
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'create_consumer_group_wrapper';
+/* </end connected objects> */
+
+/* <begin connected objects> */
+-- src/api/outbox.rs:748
+-- pg_trickle::api::outbox::extend_lease
+CREATE  FUNCTION pgtrickle."extend_lease"(
+	"p_group" TEXT, /* & str */
+	"p_consumer" TEXT, /* & str */
+	"p_extension_seconds" INT DEFAULT 30 /* i32 */
+) RETURNS timestamp with time zone /* Option < TimestampWithTimeZone > */
+STRICT 
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'extend_lease_wrapper';
+/* </end connected objects> */
+
+/* <begin connected objects> */
+-- src/diagnostics.rs:767
+-- pg_trickle::diagnostics::validate_query
+CREATE  FUNCTION pgtrickle."validate_query"(
+	"query" TEXT /* & str */
+) RETURNS TABLE (
+	"check_name" TEXT,  /* String */
+	"result" TEXT,  /* String */
+	"severity" TEXT  /* String */
+)
+STRICT 
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'validate_query_wrapper';
+/* </end connected objects> */
+
+/* <begin connected objects> */
+-- src/api/helpers.rs:2279
+-- pg_trickle::api::helpers::convert_buffers_to_unlogged
+CREATE  FUNCTION pgtrickle."convert_buffers_to_unlogged"() RETURNS bigint /* Result < i64, PgTrickleError > */
+STRICT 
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'convert_buffers_to_unlogged_wrapper';
+/* </end connected objects> */
+
+/* <begin connected objects> */
+-- src/api/inbox.rs:555
+-- pg_trickle::api::inbox::inbox_status
+CREATE  FUNCTION pgtrickle."inbox_status"(
+	"p_name" TEXT DEFAULT NULL /* Option < & str > */
+) RETURNS TABLE (
+	"inbox_name" TEXT,  /* String */
+	"inbox_schema" TEXT,  /* String */
+	"max_retries" INT,  /* i32 */
+	"schedule" TEXT,  /* String */
+	"with_dead_letter" bool,  /* bool */
+	"with_stats" bool,  /* bool */
+	"created_at" timestamp with time zone  /* Option < TimestampWithTimeZone > */
+)
+
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'inbox_status_wrapper';
+/* </end connected objects> */
+
+/* <begin connected objects> */
+-- src/api/diagnostics.rs:1156
+-- pg_trickle::api::diagnostics::drop_watermark_group
+CREATE  FUNCTION pgtrickle."drop_watermark_group"(
+	"group_name" TEXT /* & str */
+) RETURNS VOID /* Result < (), PgTrickleError > */
+STRICT 
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'drop_watermark_group_wrapper';
+/* </end connected objects> */
+
+/* <begin connected objects> */
+-- src/monitor.rs:785
+-- pg_trickle::monitor::get_refresh_history
+CREATE  FUNCTION pgtrickle."get_refresh_history"(
+	"name" TEXT, /* & str */
+	"max_rows" INT DEFAULT 20 /* i32 */
+) RETURNS TABLE (
+	"refresh_id" bigint,  /* i64 */
+	"data_timestamp" timestamp with time zone,  /* TimestampWithTimeZone */
+	"start_time" timestamp with time zone,  /* TimestampWithTimeZone */
+	"end_time" timestamp with time zone,  /* Option < TimestampWithTimeZone > */
+	"action" TEXT,  /* String */
+	"status" TEXT,  /* String */
+	"rows_inserted" bigint,  /* i64 */
+	"rows_deleted" bigint,  /* i64 */
+	"duration_ms" double precision,  /* Option < f64 > */
+	"error_message" TEXT  /* Option < String > */
+)
+STRICT  
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'get_refresh_history_wrapper';
+/* </end connected objects> */
+
+/* <begin connected objects> */
+-- src/ivm.rs:746
+-- pg_trickle::ivm::pgt_ivm_apply_delta_enr
+CREATE  FUNCTION pgtrickle."pgt_ivm_apply_delta_enr"(
+	"pgt_id" bigint, /* i64 */
+	"source_oid" INT, /* i32 */
+	"has_new" bool, /* bool */
+	"has_old" bool /* bool */
+) RETURNS VOID /* Result < (), PgTrickleError > */
+STRICT 
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'pgt_ivm_apply_delta_enr_wrapper';
+/* </end connected objects> */
+
+/* <begin connected objects> */
+-- src/hooks.rs:1028
+-- pg_trickle::hooks::pg_trickle_on_sql_drop
+-- Skipped due to `#[pgrx(sql = false)]`
+/* </end connected objects> */
+
+/* <begin connected objects> */
+-- src/api/diagnostics.rs:407
+-- pg_trickle::api::diagnostics::explain_delta
+CREATE  FUNCTION pgtrickle."explain_delta"(
+	"name" TEXT, /* & str */
+	"format" TEXT DEFAULT 'text' /* & str */
+) RETURNS SETOF TEXT /* String */
+STRICT  
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'explain_delta_text_wrapper';
+/* </end connected objects> */
+
+/* <begin connected objects> */
+-- src/api/diagnostics.rs:545
+-- pg_trickle::api::diagnostics::shared_buffer_stats
+CREATE  FUNCTION pgtrickle."shared_buffer_stats"() RETURNS TABLE (
+	"source_oid" bigint,  /* i64 */
+	"source_table" TEXT,  /* String */
+	"consumer_count" INT,  /* i32 */
+	"consumers" TEXT,  /* String */
+	"columns_tracked" INT,  /* i32 */
+	"safe_frontier_lsn" TEXT,  /* Option < String > */
+	"buffer_rows" bigint,  /* i64 */
+	"is_partitioned" bool  /* bool */
+)
+STRICT  
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'shared_buffer_stats_fn_wrapper';
+/* </end connected objects> */
+
+/* <begin connected objects> */
+-- src/api/diagnostics.rs:8
+-- pg_trickle::api::diagnostics::version
+CREATE  FUNCTION pgtrickle."version"() RETURNS TEXT /* & '_ str */
+IMMUTABLE STRICT PARALLEL SAFE 
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'version_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
@@ -837,79 +1169,6 @@ CREATE  FUNCTION pgtrickle."dedup_stats"() RETURNS TABLE (
 STRICT  
 LANGUAGE c /* Rust */
 AS 'MODULE_PATHNAME', 'dedup_stats_fn_wrapper';
-/* </end connected objects> */
-
-/* <begin connected objects> */
--- src/api/outbox.rs:781
--- pg_trickle::api::outbox::seek_offset
-CREATE  FUNCTION pgtrickle."seek_offset"(
-	"p_group" TEXT, /* & str */
-	"p_consumer" TEXT, /* & str */
-	"p_new_offset" bigint /* i64 */
-) RETURNS void
-STRICT 
-LANGUAGE c /* Rust */
-AS 'MODULE_PATHNAME', 'seek_offset_wrapper';
-/* </end connected objects> */
-
-/* <begin connected objects> */
--- src/api/diagnostics.rs:1015
--- pg_trickle::api::diagnostics::bootstrap_gate_status
-CREATE  FUNCTION pgtrickle."bootstrap_gate_status"() RETURNS TABLE (
-	"source_table" TEXT,  /* String */
-	"schema_name" TEXT,  /* String */
-	"gated" bool,  /* bool */
-	"gated_at" timestamp with time zone,  /* Option < TimestampWithTimeZone > */
-	"ungated_at" timestamp with time zone,  /* Option < TimestampWithTimeZone > */
-	"gated_by" TEXT,  /* Option < String > */
-	"gate_duration" interval,  /* Option < pgrx :: datum :: Interval > */
-	"affected_stream_tables" TEXT  /* Option < String > */
-)
-STRICT  
-LANGUAGE c /* Rust */
-AS 'MODULE_PATHNAME', 'bootstrap_gate_status_fn_wrapper';
-/* </end connected objects> */
-
-/* <begin connected objects> */
--- src/api/outbox.rs:498
--- pg_trickle::api::outbox::drop_consumer_group
-CREATE  FUNCTION pgtrickle."drop_consumer_group"(
-	"p_name" TEXT, /* & str */
-	"p_if_exists" bool DEFAULT false /* bool */
-) RETURNS void
-STRICT 
-LANGUAGE c /* Rust */
-AS 'MODULE_PATHNAME', 'drop_consumer_group_wrapper';
-/* </end connected objects> */
-
-/* <begin connected objects> */
--- src/api/cluster.rs:18
--- pg_trickle::api::cluster::cluster_worker_summary
-CREATE  FUNCTION pgtrickle."cluster_worker_summary"() RETURNS TABLE (
-	"db_oid" bigint,  /* Option < i64 > */
-	"db_name" TEXT,  /* Option < String > */
-	"active_workers" INT,  /* Option < i32 > */
-	"scheduler_pid" INT,  /* Option < i32 > */
-	"scheduler_running" bool,  /* Option < bool > */
-	"total_active_workers" INT  /* Option < i32 > */
-)
-STRICT 
-LANGUAGE c /* Rust */
-AS 'MODULE_PATHNAME', 'cluster_worker_summary_wrapper';
-/* </end connected objects> */
-
-/* <begin connected objects> */
--- src/ivm.rs:633
--- pg_trickle::ivm::pgt_ivm_apply_delta
-CREATE  FUNCTION pgtrickle."pgt_ivm_apply_delta"(
-	"pgt_id" bigint, /* i64 */
-	"source_oid" INT, /* i32 */
-	"has_new" bool, /* bool */
-	"has_old" bool /* bool */
-) RETURNS VOID /* Result < (), PgTrickleError > */
-STRICT 
-LANGUAGE c /* Rust */
-AS 'MODULE_PATHNAME', 'pgt_ivm_apply_delta_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
@@ -931,19 +1190,200 @@ AS 'MODULE_PATHNAME', 'check_cdc_health_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/monitor.rs:2286
--- pg_trickle::monitor::dependency_tree
-CREATE  FUNCTION pgtrickle."dependency_tree"() RETURNS TABLE (
-	"tree_line" TEXT,  /* String */
-	"node" TEXT,  /* String */
-	"node_type" TEXT,  /* String */
-	"depth" INT,  /* i32 */
-	"status" TEXT,  /* Option < String > */
-	"refresh_mode" TEXT  /* Option < String > */
+-- src/api/snapshot.rs:471
+-- pg_trickle::api::snapshot::list_snapshots
+CREATE  FUNCTION pgtrickle."list_snapshots"(
+	"p_name" TEXT /* & str */
+) RETURNS TABLE (
+	"snapshot_table" TEXT,  /* Option < String > */
+	"created_at" timestamp with time zone,  /* Option < TimestampWithTimeZone > */
+	"row_count" bigint,  /* Option < i64 > */
+	"frontier" jsonb,  /* Option < pgrx :: JsonB > */
+	"size_bytes" bigint  /* Option < i64 > */
+)
+STRICT 
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'list_snapshots_wrapper';
+/* </end connected objects> */
+
+/* <begin connected objects> */
+-- src/api/planner.rs:186
+-- pg_trickle::api::planner::schedule_recommendations
+CREATE  FUNCTION pgtrickle."schedule_recommendations"() RETURNS TABLE (
+	"name" TEXT,  /* Option < String > */
+	"current_interval_seconds" double precision,  /* Option < f64 > */
+	"recommended_interval_seconds" double precision,  /* Option < f64 > */
+	"delta_pct" double precision,  /* Option < f64 > */
+	"confidence" double precision,  /* Option < f64 > */
+	"reasoning" TEXT  /* Option < String > */
+)
+STRICT 
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'schedule_recommendations_wrapper';
+/* </end connected objects> */
+
+/* <begin connected objects> */
+-- src/api/cluster.rs:18
+-- pg_trickle::api::cluster::cluster_worker_summary
+CREATE  FUNCTION pgtrickle."cluster_worker_summary"() RETURNS TABLE (
+	"db_oid" bigint,  /* Option < i64 > */
+	"db_name" TEXT,  /* Option < String > */
+	"active_workers" INT,  /* Option < i32 > */
+	"scheduler_pid" INT,  /* Option < i32 > */
+	"scheduler_running" bool,  /* Option < bool > */
+	"total_active_workers" INT  /* Option < i32 > */
+)
+STRICT 
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'cluster_worker_summary_wrapper';
+/* </end connected objects> */
+
+/* <begin connected objects> */
+-- src/api/outbox.rs:529
+-- pg_trickle::api::outbox::poll_outbox
+CREATE  FUNCTION pgtrickle."poll_outbox"(
+	"p_group" TEXT, /* & str */
+	"p_consumer" TEXT, /* & str */
+	"p_batch_size" INT DEFAULT 100, /* i32 */
+	"p_visibility_seconds" INT DEFAULT 30 /* i32 */
+) RETURNS TABLE (
+	"outbox_id" bigint,  /* i64 */
+	"pgt_id" uuid,  /* pgrx :: Uuid */
+	"created_at" timestamp with time zone,  /* TimestampWithTimeZone */
+	"inserted_count" bigint,  /* i64 */
+	"deleted_count" bigint,  /* i64 */
+	"is_claim_check" bool,  /* bool */
+	"payload" jsonb  /* Option < pgrx :: JsonB > */
+)
+STRICT 
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'poll_outbox_wrapper';
+/* </end connected objects> */
+
+/* <begin connected objects> */
+-- src/api/diagnostics.rs:19
+-- pg_trickle::api::diagnostics::version_check
+CREATE  FUNCTION pgtrickle."version_check"() RETURNS TEXT /* String */
+STRICT 
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'version_check_wrapper';
+/* </end connected objects> */
+
+/* <begin connected objects> */
+-- src/monitor.rs:2980
+-- pg_trickle::monitor::refresh_timeline
+CREATE  FUNCTION pgtrickle."refresh_timeline"(
+	"max_rows" INT DEFAULT 50 /* i32 */
+) RETURNS TABLE (
+	"start_time" timestamp with time zone,  /* TimestampWithTimeZone */
+	"stream_table" TEXT,  /* String */
+	"action" TEXT,  /* String */
+	"status" TEXT,  /* String */
+	"rows_inserted" bigint,  /* i64 */
+	"rows_deleted" bigint,  /* i64 */
+	"duration_ms" double precision,  /* Option < f64 > */
+	"error_message" TEXT  /* Option < String > */
 )
 STRICT  
 LANGUAGE c /* Rust */
-AS 'MODULE_PATHNAME', 'dependency_tree_wrapper';
+AS 'MODULE_PATHNAME', 'refresh_timeline_wrapper';
+/* </end connected objects> */
+
+/* <begin connected objects> */
+-- src/hash.rs:54
+-- pg_trickle::hash::pg_trickle_hash_multi
+CREATE  FUNCTION pgtrickle."pg_trickle_hash_multi"(
+	"inputs" TEXT[] /* Vec < Option < String > > */
+) RETURNS bigint /* i64 */
+IMMUTABLE STRICT PARALLEL SAFE 
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'pg_trickle_hash_multi_wrapper';
+/* </end connected objects> */
+
+/* <begin connected objects> */
+-- src/api/inbox.rs:1022
+-- pg_trickle::api::inbox::inbox_is_my_partition
+CREATE  FUNCTION pgtrickle."inbox_is_my_partition"(
+	"p_aggregate_id" TEXT, /* & str */
+	"p_worker_id" INT, /* i32 */
+	"p_total_workers" INT /* i32 */
+) RETURNS bool /* bool */
+IMMUTABLE STRICT 
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'inbox_is_my_partition_wrapper';
+/* </end connected objects> */
+
+/* <begin connected objects> */
+-- src/api/diagnostics.rs:1597
+-- pg_trickle::api::diagnostics::clear_caches
+CREATE  FUNCTION pgtrickle."clear_caches"() RETURNS bigint /* i64 */
+STRICT 
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'clear_caches_wrapper';
+/* </end connected objects> */
+
+/* <begin connected objects> */
+-- src/api/helpers.rs:2523
+-- pg_trickle::api::helpers::export_definition
+CREATE  FUNCTION pgtrickle."export_definition"(
+	"st_name" TEXT /* & str */
+) RETURNS TEXT /* Result < String, PgTrickleError > */
+STRICT  
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'export_definition_wrapper';
+/* </end connected objects> */
+
+/* <begin connected objects> */
+-- src/lib.rs:785
+-- requires:
+--   export_definition
+
+
+CREATE OR REPLACE FUNCTION pgtrickle."stream_table_definition"(
+    p_name text
+)
+RETURNS text
+LANGUAGE sql
+STABLE
+AS $$
+    SELECT pgtrickle.export_definition(p_name);
+$$;
+
+COMMENT ON FUNCTION pgtrickle."stream_table_definition"(text) IS
+    'Return the CREATE STREAM TABLE DDL for the named stream table. '
+    'Equivalent to pgtrickle.export_definition(name) — provided as a '
+    'more discoverable alias.';
+/* </end connected objects> */
+
+/* <begin connected objects> */
+-- src/api/outbox.rs:308
+-- pg_trickle::api::outbox::outbox_status
+CREATE  FUNCTION pgtrickle."outbox_status"(
+	"p_name" TEXT /* & str */
+) RETURNS jsonb /* pgrx :: JsonB */
+STRICT 
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'outbox_status_wrapper';
+/* </end connected objects> */
+
+/* <begin connected objects> */
+-- src/api/inbox.rs:360
+-- pg_trickle::api::inbox::enable_inbox_tracking
+CREATE  FUNCTION pgtrickle."enable_inbox_tracking"(
+	"p_name" TEXT, /* & str */
+	"p_table_ref" TEXT, /* & str */
+	"p_id_column" TEXT DEFAULT 'event_id', /* & str */
+	"p_processed_at_column" TEXT DEFAULT 'processed_at', /* & str */
+	"p_retry_count_column" TEXT DEFAULT 'retry_count', /* & str */
+	"p_error_column" TEXT DEFAULT 'error', /* & str */
+	"p_received_at_column" TEXT DEFAULT 'received_at', /* & str */
+	"p_event_type_column" TEXT DEFAULT 'event_type', /* & str */
+	"p_max_retries" INT DEFAULT 3, /* i32 */
+	"p_schedule" TEXT DEFAULT '1s' /* & str */
+) RETURNS void
+STRICT 
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'enable_inbox_tracking_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
@@ -955,44 +1395,6 @@ CREATE  FUNCTION pgtrickle."parse_duration_seconds"(
 IMMUTABLE STRICT PARALLEL SAFE 
 LANGUAGE c /* Rust */
 AS 'MODULE_PATHNAME', 'parse_duration_seconds_wrapper';
-/* </end connected objects> */
-
-/* <begin connected objects> */
--- src/lib.rs:668
--- requires:
---   parse_duration_seconds
-
-
--- ERG-E: One-row health summary for dashboards and alerting.
-CREATE OR REPLACE VIEW pgtrickle.quick_health AS
-SELECT
-    (SELECT count(*) FROM pgtrickle.pgt_stream_tables)::bigint
-        AS total_stream_tables,
-    (SELECT count(*) FROM pgtrickle.pgt_stream_tables
-     WHERE status = 'ERROR' OR consecutive_errors > 0)::bigint
-        AS error_tables,
-    (SELECT count(*) FROM pgtrickle.pgt_stream_tables
-     WHERE schedule IS NOT NULL
-       AND schedule !~ '[\s@]'
-       AND last_refresh_at IS NOT NULL
-       AND EXTRACT(EPOCH FROM (now() - last_refresh_at)) >
-           pgtrickle.parse_duration_seconds(schedule))::bigint
-        AS stale_tables,
-    (SELECT count(*) > 0 FROM pg_stat_activity
-     WHERE backend_type = 'pg_trickle scheduler')
-        AS scheduler_running,
-    CASE
-        WHEN (SELECT count(*) FROM pgtrickle.pgt_stream_tables) = 0 THEN 'EMPTY'
-        WHEN (SELECT count(*) FROM pgtrickle.pgt_stream_tables WHERE status = 'SUSPENDED') > 0 THEN 'CRITICAL'
-        WHEN (SELECT count(*) FROM pgtrickle.pgt_stream_tables WHERE status = 'ERROR' OR consecutive_errors > 0) > 0 THEN 'WARNING'
-        WHEN (SELECT count(*) FROM pgtrickle.pgt_stream_tables
-              WHERE schedule IS NOT NULL
-                AND schedule !~ '[\s@]'
-                AND last_refresh_at IS NOT NULL
-                AND EXTRACT(EPOCH FROM (now() - last_refresh_at)) >
-                    pgtrickle.parse_duration_seconds(schedule)) > 0 THEN 'WARNING'
-        ELSE 'OK'
-    END AS status;
 /* </end connected objects> */
 
 /* <begin connected objects> */
@@ -1083,6 +1485,44 @@ WHERE d.source_type = 'TABLE';
 /* </end connected objects> */
 
 /* <begin connected objects> */
+-- src/lib.rs:668
+-- requires:
+--   parse_duration_seconds
+
+
+-- ERG-E: One-row health summary for dashboards and alerting.
+CREATE OR REPLACE VIEW pgtrickle.quick_health AS
+SELECT
+    (SELECT count(*) FROM pgtrickle.pgt_stream_tables)::bigint
+        AS total_stream_tables,
+    (SELECT count(*) FROM pgtrickle.pgt_stream_tables
+     WHERE status = 'ERROR' OR consecutive_errors > 0)::bigint
+        AS error_tables,
+    (SELECT count(*) FROM pgtrickle.pgt_stream_tables
+     WHERE schedule IS NOT NULL
+       AND schedule !~ '[\s@]'
+       AND last_refresh_at IS NOT NULL
+       AND EXTRACT(EPOCH FROM (now() - last_refresh_at)) >
+           pgtrickle.parse_duration_seconds(schedule))::bigint
+        AS stale_tables,
+    (SELECT count(*) > 0 FROM pg_stat_activity
+     WHERE backend_type = 'pg_trickle scheduler')
+        AS scheduler_running,
+    CASE
+        WHEN (SELECT count(*) FROM pgtrickle.pgt_stream_tables) = 0 THEN 'EMPTY'
+        WHEN (SELECT count(*) FROM pgtrickle.pgt_stream_tables WHERE status = 'SUSPENDED') > 0 THEN 'CRITICAL'
+        WHEN (SELECT count(*) FROM pgtrickle.pgt_stream_tables WHERE status = 'ERROR' OR consecutive_errors > 0) > 0 THEN 'WARNING'
+        WHEN (SELECT count(*) FROM pgtrickle.pgt_stream_tables
+              WHERE schedule IS NOT NULL
+                AND schedule !~ '[\s@]'
+                AND last_refresh_at IS NOT NULL
+                AND EXTRACT(EPOCH FROM (now() - last_refresh_at)) >
+                    pgtrickle.parse_duration_seconds(schedule)) > 0 THEN 'WARNING'
+        ELSE 'OK'
+    END AS status;
+/* </end connected objects> */
+
+/* <begin connected objects> */
 -- src/lib.rs:495
 -- requires:
 --   parse_duration_seconds
@@ -1104,26 +1544,130 @@ FROM pgtrickle.pgt_stream_tables st;
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/citus.rs:103
--- pg_trickle::citus::source_stable_name
-CREATE  FUNCTION pgtrickle."source_stable_name"(
-	"source_oid" oid /* pg_sys :: Oid */
-) RETURNS TEXT /* Option < String > */
-STRICT  
+-- src/api/metrics_ext.rs:25
+-- pg_trickle::api::metrics_ext::metrics_summary
+CREATE  FUNCTION pgtrickle."metrics_summary"() RETURNS TABLE (
+	"db_name" TEXT,  /* Option < String > */
+	"total_stream_tables" bigint,  /* Option < i64 > */
+	"active_stream_tables" bigint,  /* Option < i64 > */
+	"suspended_stream_tables" bigint,  /* Option < i64 > */
+	"total_refreshes" bigint,  /* Option < i64 > */
+	"successful_refreshes" bigint,  /* Option < i64 > */
+	"failed_refreshes" bigint,  /* Option < i64 > */
+	"total_rows_processed" bigint,  /* Option < i64 > */
+	"active_workers" INT,  /* Option < i32 > */
+	"ivm_lock_parse_error_count" bigint  /* Option < i64 > */
+)
+STRICT 
 LANGUAGE c /* Rust */
-AS 'MODULE_PATHNAME', 'sql_stable_name_for_oid_wrapper';
+AS 'MODULE_PATHNAME', 'metrics_summary_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/api/inbox.rs:901
--- pg_trickle::api::inbox::disable_inbox_priority
-CREATE  FUNCTION pgtrickle."disable_inbox_priority"(
-	"p_inbox" TEXT, /* & str */
-	"p_if_exists" bool DEFAULT false /* bool */
+-- src/api/diagnostics.rs:1015
+-- pg_trickle::api::diagnostics::bootstrap_gate_status
+CREATE  FUNCTION pgtrickle."bootstrap_gate_status"() RETURNS TABLE (
+	"source_table" TEXT,  /* String */
+	"schema_name" TEXT,  /* String */
+	"gated" bool,  /* bool */
+	"gated_at" timestamp with time zone,  /* Option < TimestampWithTimeZone > */
+	"ungated_at" timestamp with time zone,  /* Option < TimestampWithTimeZone > */
+	"gated_by" TEXT,  /* Option < String > */
+	"gate_duration" interval,  /* Option < pgrx :: datum :: Interval > */
+	"affected_stream_tables" TEXT  /* Option < String > */
+)
+STRICT  
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'bootstrap_gate_status_fn_wrapper';
+/* </end connected objects> */
+
+/* <begin connected objects> */
+-- src/api/diagnostics.rs:931
+-- pg_trickle::api::diagnostics::ungate_source
+CREATE  FUNCTION pgtrickle."ungate_source"(
+	"source" TEXT /* & str */
+) RETURNS VOID /* Result < (), PgTrickleError > */
+STRICT 
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'ungate_source_wrapper';
+/* </end connected objects> */
+
+/* <begin connected objects> */
+-- src/api/diagnostics.rs:1443
+-- pg_trickle::api::diagnostics::drop_refresh_group
+CREATE  FUNCTION pgtrickle."drop_refresh_group"(
+	"group_name" TEXT /* & str */
+) RETURNS VOID /* Result < (), PgTrickleError > */
+STRICT 
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'drop_refresh_group_wrapper';
+/* </end connected objects> */
+
+/* <begin connected objects> */
+-- src/api/self_monitoring.rs:240
+-- pg_trickle::api::self_monitoring::setup_self_monitoring
+CREATE  FUNCTION pgtrickle."setup_self_monitoring"() RETURNS void
+STRICT 
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'setup_self_monitoring_wrapper';
+/* </end connected objects> */
+
+/* <begin connected objects> */
+-- src/api/snapshot.rs:321
+-- pg_trickle::api::snapshot::restore_from_snapshot
+CREATE  FUNCTION pgtrickle."restore_from_snapshot"(
+	"p_name" TEXT, /* & str */
+	"p_source" TEXT /* & str */
 ) RETURNS void
 STRICT 
 LANGUAGE c /* Rust */
-AS 'MODULE_PATHNAME', 'disable_inbox_priority_wrapper';
+AS 'MODULE_PATHNAME', 'restore_from_snapshot_wrapper';
+/* </end connected objects> */
+
+/* <begin connected objects> */
+-- src/api/diagnostics.rs:1504
+-- pg_trickle::api::diagnostics::worker_allocation_status
+CREATE  FUNCTION pgtrickle."worker_allocation_status"() RETURNS TABLE (
+	"db_name" TEXT,  /* String */
+	"workers_used" bigint,  /* i64 */
+	"workers_quota" bigint,  /* i64 */
+	"workers_queued" bigint,  /* i64 */
+	"cluster_active" bigint,  /* i64 */
+	"cluster_max" bigint  /* i64 */
+)
+STRICT  
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'worker_allocation_status_fn_wrapper';
+/* </end connected objects> */
+
+/* <begin connected objects> */
+-- src/api/diagnostics.rs:1087
+-- pg_trickle::api::diagnostics::advance_watermark
+CREATE  FUNCTION pgtrickle."advance_watermark"(
+	"source" TEXT, /* & str */
+	"watermark" timestamp with time zone /* TimestampWithTimeZone */
+) RETURNS VOID /* Result < (), PgTrickleError > */
+STRICT 
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'advance_watermark_wrapper';
+/* </end connected objects> */
+
+/* <begin connected objects> */
+-- src/api/outbox.rs:827
+-- pg_trickle::api::outbox::consumer_lag
+CREATE  FUNCTION pgtrickle."consumer_lag"(
+	"p_group" TEXT /* & str */
+) RETURNS TABLE (
+	"consumer_id" TEXT,  /* String */
+	"committed_offset" bigint,  /* i64 */
+	"max_outbox_id" bigint,  /* i64 */
+	"lag" bigint,  /* i64 */
+	"last_heartbeat_at" timestamp with time zone,  /* Option < TimestampWithTimeZone > */
+	"is_alive" bool  /* bool */
+)
+STRICT 
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'consumer_lag_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
@@ -1151,110 +1695,76 @@ AS 'MODULE_PATHNAME', 'create_or_replace_stream_table_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/monitor.rs:2980
--- pg_trickle::monitor::refresh_timeline
-CREATE  FUNCTION pgtrickle."refresh_timeline"(
-	"max_rows" INT DEFAULT 50 /* i32 */
-) RETURNS TABLE (
-	"start_time" timestamp with time zone,  /* TimestampWithTimeZone */
-	"stream_table" TEXT,  /* String */
-	"action" TEXT,  /* String */
+-- src/api/diagnostics.rs:163
+-- pg_trickle::api::diagnostics::pgt_status
+CREATE  FUNCTION pgtrickle."pgt_status"() RETURNS TABLE (
+	"name" TEXT,  /* String */
 	"status" TEXT,  /* String */
-	"rows_inserted" bigint,  /* i64 */
-	"rows_deleted" bigint,  /* i64 */
-	"duration_ms" double precision,  /* Option < f64 > */
-	"error_message" TEXT  /* Option < String > */
+	"refresh_mode" TEXT,  /* String */
+	"is_populated" bool,  /* bool */
+	"consecutive_errors" INT,  /* i32 */
+	"schedule" TEXT,  /* Option < String > */
+	"data_timestamp" timestamp with time zone,  /* Option < TimestampWithTimeZone > */
+	"staleness" interval,  /* Option < pgrx :: datum :: Interval > */
+	"scc_id" INT  /* Option < i32 > */
 )
 STRICT  
 LANGUAGE c /* Rust */
-AS 'MODULE_PATHNAME', 'refresh_timeline_wrapper';
+AS 'MODULE_PATHNAME', 'pgt_status_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/ivm.rs:746
--- pg_trickle::ivm::pgt_ivm_apply_delta_enr
-CREATE  FUNCTION pgtrickle."pgt_ivm_apply_delta_enr"(
-	"pgt_id" bigint, /* i64 */
-	"source_oid" INT, /* i32 */
-	"has_new" bool, /* bool */
-	"has_old" bool /* bool */
-) RETURNS VOID /* Result < (), PgTrickleError > */
-STRICT 
-LANGUAGE c /* Rust */
-AS 'MODULE_PATHNAME', 'pgt_ivm_apply_delta_enr_wrapper';
-/* </end connected objects> */
-
-/* <begin connected objects> */
--- src/api/mod.rs:3496
--- pg_trickle::api::alter_stream_table
-CREATE  FUNCTION pgtrickle."alter_stream_table"(
-	"name" TEXT, /* & str */
-	"query" TEXT DEFAULT NULL, /* Option < & str > */
-	"schedule" TEXT DEFAULT NULL, /* Option < & str > */
-	"refresh_mode" TEXT DEFAULT NULL, /* Option < & str > */
-	"status" TEXT DEFAULT NULL, /* Option < & str > */
-	"diamond_consistency" TEXT DEFAULT NULL, /* Option < & str > */
-	"diamond_schedule_policy" TEXT DEFAULT NULL, /* Option < & str > */
-	"cdc_mode" TEXT DEFAULT NULL, /* Option < & str > */
-	"append_only" bool DEFAULT NULL, /* Option < bool > */
-	"pooler_compatibility_mode" bool DEFAULT NULL, /* Option < bool > */
-	"tier" TEXT DEFAULT NULL, /* Option < & str > */
-	"fuse" TEXT DEFAULT NULL, /* Option < & str > */
-	"fuse_ceiling" bigint DEFAULT NULL, /* Option < i64 > */
-	"fuse_sensitivity" INT DEFAULT NULL, /* Option < i32 > */
-	"partition_by" TEXT DEFAULT NULL, /* Option < & str > */
-	"max_differential_joins" INT DEFAULT NULL, /* Option < i32 > */
-	"max_delta_fraction" double precision DEFAULT NULL /* Option < f64 > */
-) RETURNS void
-
-LANGUAGE c /* Rust */
-AS 'MODULE_PATHNAME', 'alter_stream_table_wrapper';
-/* </end connected objects> */
-
-/* <begin connected objects> */
--- src/api/outbox.rs:827
--- pg_trickle::api::outbox::consumer_lag
-CREATE  FUNCTION pgtrickle."consumer_lag"(
-	"p_group" TEXT /* & str */
-) RETURNS TABLE (
-	"consumer_id" TEXT,  /* String */
-	"committed_offset" bigint,  /* i64 */
-	"max_outbox_id" bigint,  /* i64 */
-	"lag" bigint,  /* i64 */
-	"last_heartbeat_at" timestamp with time zone,  /* Option < TimestampWithTimeZone > */
-	"is_alive" bool  /* bool */
-)
-STRICT 
-LANGUAGE c /* Rust */
-AS 'MODULE_PATHNAME', 'consumer_lag_wrapper';
-/* </end connected objects> */
-
-/* <begin connected objects> */
--- src/api/inbox.rs:121
--- pg_trickle::api::inbox::create_inbox
-CREATE  FUNCTION pgtrickle."create_inbox"(
+-- src/api/outbox.rs:238
+-- pg_trickle::api::outbox::disable_outbox
+CREATE  FUNCTION pgtrickle."disable_outbox"(
 	"p_name" TEXT, /* & str */
-	"p_schema" TEXT DEFAULT 'pgtrickle', /* & str */
-	"p_max_retries" INT DEFAULT 3, /* i32 */
-	"p_schedule" TEXT DEFAULT '1s', /* & str */
-	"with_dead_letter" bool DEFAULT true, /* bool */
-	"with_stats" bool DEFAULT true, /* bool */
-	"p_retention_hours" INT DEFAULT 72 /* i32 */
+	"p_if_exists" bool DEFAULT false /* bool */
 ) RETURNS void
 STRICT 
 LANGUAGE c /* Rust */
-AS 'MODULE_PATHNAME', 'create_inbox_wrapper';
+AS 'MODULE_PATHNAME', 'disable_outbox_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/api/inbox.rs:485
--- pg_trickle::api::inbox::inbox_health
-CREATE  FUNCTION pgtrickle."inbox_health"(
-	"p_name" TEXT /* & str */
-) RETURNS jsonb /* pgrx :: JsonB */
+-- src/monitor.rs:958
+-- pg_trickle::monitor::cache_stats
+CREATE  FUNCTION pgtrickle."cache_stats"() RETURNS TABLE (
+	"l1_hits" bigint,  /* i64 */
+	"l2_hits" bigint,  /* i64 */
+	"misses" bigint,  /* i64 */
+	"evictions" bigint,  /* i64 */
+	"l1_size" INT  /* i32 */
+)
+STRICT  
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'cache_stats_wrapper';
+/* </end connected objects> */
+
+/* <begin connected objects> */
+-- src/api/outbox.rs:498
+-- pg_trickle::api::outbox::drop_consumer_group
+CREATE  FUNCTION pgtrickle."drop_consumer_group"(
+	"p_name" TEXT, /* & str */
+	"p_if_exists" bool DEFAULT false /* bool */
+) RETURNS void
 STRICT 
 LANGUAGE c /* Rust */
-AS 'MODULE_PATHNAME', 'inbox_health_wrapper';
+AS 'MODULE_PATHNAME', 'drop_consumer_group_wrapper';
+/* </end connected objects> */
+
+/* <begin connected objects> */
+-- src/monitor.rs:1077
+-- pg_trickle::monitor::explain_st
+CREATE  FUNCTION pgtrickle."explain_st"(
+	"name" TEXT, /* & str */
+	"with_analyze" bool DEFAULT false /* bool */
+) RETURNS TABLE (
+	"property" TEXT,  /* String */
+	"value" TEXT  /* String */
+)
+STRICT  
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'explain_st_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
@@ -1282,112 +1792,6 @@ AS 'MODULE_PATHNAME', 'parallel_job_status_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/hooks.rs:1028
--- pg_trickle::hooks::pg_trickle_on_sql_drop
--- Skipped due to `#[pgrx(sql = false)]`
-/* </end connected objects> */
-
-/* <begin connected objects> */
--- src/api/diagnostics.rs:163
--- pg_trickle::api::diagnostics::pgt_status
-CREATE  FUNCTION pgtrickle."pgt_status"() RETURNS TABLE (
-	"name" TEXT,  /* String */
-	"status" TEXT,  /* String */
-	"refresh_mode" TEXT,  /* String */
-	"is_populated" bool,  /* bool */
-	"consecutive_errors" INT,  /* i32 */
-	"schedule" TEXT,  /* Option < String > */
-	"data_timestamp" timestamp with time zone,  /* Option < TimestampWithTimeZone > */
-	"staleness" interval,  /* Option < pgrx :: datum :: Interval > */
-	"scc_id" INT  /* Option < i32 > */
-)
-STRICT  
-LANGUAGE c /* Rust */
-AS 'MODULE_PATHNAME', 'pgt_status_wrapper';
-/* </end connected objects> */
-
-/* <begin connected objects> */
--- src/diagnostics.rs:395
--- pg_trickle::diagnostics::diagnose_errors
-CREATE  FUNCTION pgtrickle."diagnose_errors"(
-	"name" TEXT /* & str */
-) RETURNS TABLE (
-	"event_time" timestamp with time zone,  /* Option < TimestampWithTimeZone > */
-	"error_type" TEXT,  /* String */
-	"error_message" TEXT,  /* String */
-	"remediation" TEXT  /* String */
-)
-STRICT 
-LANGUAGE c /* Rust */
-AS 'MODULE_PATHNAME', 'diagnose_errors_wrapper';
-/* </end connected objects> */
-
-/* <begin connected objects> */
--- src/api/outbox.rs:387
--- pg_trickle::api::outbox::outbox_rows_consumed
-CREATE  FUNCTION pgtrickle."outbox_rows_consumed"(
-	"p_stream_table" TEXT, /* & str */
-	"p_outbox_id" bigint /* i64 */
-) RETURNS void
-STRICT 
-LANGUAGE c /* Rust */
-AS 'MODULE_PATHNAME', 'outbox_rows_consumed_wrapper';
-/* </end connected objects> */
-
-/* <begin connected objects> */
--- src/api/diagnostics.rs:1455
--- pg_trickle::api::diagnostics::refresh_groups
-CREATE  FUNCTION pgtrickle."refresh_groups"() RETURNS TABLE (
-	"group_id" INT,  /* i32 */
-	"group_name" TEXT,  /* String */
-	"member_count" INT,  /* i32 */
-	"isolation" TEXT,  /* String */
-	"created_at" timestamp with time zone  /* TimestampWithTimeZone */
-)
-STRICT  
-LANGUAGE c /* Rust */
-AS 'MODULE_PATHNAME', 'refresh_groups_fn_wrapper';
-/* </end connected objects> */
-
-/* <begin connected objects> */
--- src/api/outbox.rs:448
--- pg_trickle::api::outbox::create_consumer_group
-CREATE  FUNCTION pgtrickle."create_consumer_group"(
-	"p_name" TEXT, /* & str */
-	"p_outbox" TEXT, /* & str */
-	"p_auto_offset_reset" TEXT DEFAULT 'latest' /* & str */
-) RETURNS void
-STRICT 
-LANGUAGE c /* Rust */
-AS 'MODULE_PATHNAME', 'create_consumer_group_wrapper';
-/* </end connected objects> */
-
-/* <begin connected objects> */
--- src/api/helpers.rs:2279
--- pg_trickle::api::helpers::convert_buffers_to_unlogged
-CREATE  FUNCTION pgtrickle."convert_buffers_to_unlogged"() RETURNS bigint /* Result < i64, PgTrickleError > */
-STRICT 
-LANGUAGE c /* Rust */
-AS 'MODULE_PATHNAME', 'convert_buffers_to_unlogged_wrapper';
-/* </end connected objects> */
-
-/* <begin connected objects> */
--- src/api/diagnostics.rs:954
--- pg_trickle::api::diagnostics::source_gates
-CREATE  FUNCTION pgtrickle."source_gates"() RETURNS TABLE (
-	"source_table" TEXT,  /* String */
-	"schema_name" TEXT,  /* String */
-	"gated" bool,  /* bool */
-	"gated_at" timestamp with time zone,  /* Option < TimestampWithTimeZone > */
-	"ungated_at" timestamp with time zone,  /* Option < TimestampWithTimeZone > */
-	"gated_by" TEXT  /* Option < String > */
-)
-STRICT  
-LANGUAGE c /* Rust */
-AS 'MODULE_PATHNAME', 'source_gates_fn_wrapper';
-/* </end connected objects> */
-
-/* <begin connected objects> */
 -- src/api/helpers.rs:2464
 -- pg_trickle::api::helpers::refresh_efficiency
 CREATE  FUNCTION pgtrickle."refresh_efficiency"() RETURNS TABLE (
@@ -1409,39 +1813,62 @@ AS 'MODULE_PATHNAME', 'refresh_efficiency_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/api/diagnostics.rs:1156
--- pg_trickle::api::diagnostics::drop_watermark_group
-CREATE  FUNCTION pgtrickle."drop_watermark_group"(
-	"group_name" TEXT /* & str */
-) RETURNS VOID /* Result < (), PgTrickleError > */
+-- src/api/diagnostics.rs:744
+-- pg_trickle::api::diagnostics::fuse_status
+CREATE  FUNCTION pgtrickle."fuse_status"() RETURNS TABLE (
+	"stream_table" TEXT,  /* String */
+	"fuse_mode" TEXT,  /* String */
+	"fuse_state" TEXT,  /* String */
+	"fuse_ceiling" bigint,  /* Option < i64 > */
+	"effective_ceiling" bigint,  /* Option < i64 > */
+	"fuse_sensitivity" INT,  /* Option < i32 > */
+	"blown_at" timestamp with time zone,  /* Option < TimestampWithTimeZone > */
+	"blow_reason" TEXT  /* Option < String > */
+)
 STRICT 
 LANGUAGE c /* Rust */
-AS 'MODULE_PATHNAME', 'drop_watermark_group_wrapper';
+AS 'MODULE_PATHNAME', 'fuse_status_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/api/snapshot.rs:212
--- pg_trickle::api::snapshot::snapshot_stream_table
-CREATE  FUNCTION pgtrickle."snapshot_stream_table"(
-	"p_name" TEXT, /* & str */
-	"p_target" TEXT DEFAULT NULL /* Option < & str > */
-) RETURNS TEXT /* String */
-
+-- src/api/inbox.rs:937
+-- pg_trickle::api::inbox::inbox_ordering_gaps
+CREATE  FUNCTION pgtrickle."inbox_ordering_gaps"(
+	"p_inbox_name" TEXT /* & str */
+) RETURNS TABLE (
+	"aggregate_id" TEXT,  /* String */
+	"expected_seq" bigint,  /* i64 */
+	"found_seq" bigint  /* i64 */
+)
+STRICT 
 LANGUAGE c /* Rust */
-AS 'MODULE_PATHNAME', 'snapshot_stream_table_wrapper';
+AS 'MODULE_PATHNAME', 'inbox_ordering_gaps_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/api/inbox.rs:1022
--- pg_trickle::api::inbox::inbox_is_my_partition
-CREATE  FUNCTION pgtrickle."inbox_is_my_partition"(
-	"p_aggregate_id" TEXT, /* & str */
-	"p_worker_id" INT, /* i32 */
-	"p_total_workers" INT /* i32 */
-) RETURNS bool /* bool */
-IMMUTABLE STRICT 
+-- src/api/diagnostics.rs:61
+-- pg_trickle::api::diagnostics::migrate
+CREATE  FUNCTION pgtrickle."migrate"() RETURNS TEXT /* String */
+STRICT 
 LANGUAGE c /* Rust */
-AS 'MODULE_PATHNAME', 'inbox_is_my_partition_wrapper';
+AS 'MODULE_PATHNAME', 'migrate_wrapper';
+/* </end connected objects> */
+
+/* <begin connected objects> */
+-- src/api/self_monitoring.rs:453
+-- pg_trickle::api::self_monitoring::scheduler_overhead
+CREATE  FUNCTION pgtrickle."scheduler_overhead"() RETURNS TABLE (
+	"total_refreshes_1h" bigint,  /* i64 */
+	"df_refreshes_1h" bigint,  /* i64 */
+	"df_refresh_fraction" double precision,  /* Option < f64 > */
+	"avg_refresh_ms" double precision,  /* Option < f64 > */
+	"avg_df_refresh_ms" double precision,  /* Option < f64 > */
+	"total_refresh_time_s" double precision,  /* Option < f64 > */
+	"df_refresh_time_s" double precision  /* Option < f64 > */
+)
+STRICT 
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'scheduler_overhead_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
@@ -1461,219 +1888,42 @@ AS 'MODULE_PATHNAME', 'diamond_groups_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/api/outbox.rs:718
--- pg_trickle::api::outbox::commit_offset
-CREATE  FUNCTION pgtrickle."commit_offset"(
-	"p_group" TEXT, /* & str */
-	"p_consumer" TEXT, /* & str */
-	"p_last_offset" bigint /* i64 */
-) RETURNS void
-STRICT 
-LANGUAGE c /* Rust */
-AS 'MODULE_PATHNAME', 'commit_offset_wrapper';
-/* </end connected objects> */
-
-/* <begin connected objects> */
--- src/api/diagnostics.rs:1443
--- pg_trickle::api::diagnostics::drop_refresh_group
-CREATE  FUNCTION pgtrickle."drop_refresh_group"(
-	"group_name" TEXT /* & str */
-) RETURNS VOID /* Result < (), PgTrickleError > */
-STRICT 
-LANGUAGE c /* Rust */
-AS 'MODULE_PATHNAME', 'drop_refresh_group_wrapper';
-/* </end connected objects> */
-
-/* <begin connected objects> */
--- src/api/diagnostics.rs:223
--- pg_trickle::api::diagnostics::pgt_scc_status
-CREATE  FUNCTION pgtrickle."pgt_scc_status"() RETURNS TABLE (
-	"scc_id" INT,  /* i32 */
-	"member_count" INT,  /* i32 */
-	"members" TEXT[],  /* Vec < String > */
-	"last_iterations" INT,  /* Option < i32 > */
-	"last_converged_at" timestamp with time zone  /* Option < TimestampWithTimeZone > */
-)
-STRICT  
-LANGUAGE c /* Rust */
-AS 'MODULE_PATHNAME', 'pgt_scc_status_wrapper';
-/* </end connected objects> */
-
-/* <begin connected objects> */
--- src/api/outbox.rs:91
--- pg_trickle::api::outbox::enable_outbox
-CREATE  FUNCTION pgtrickle."enable_outbox"(
+-- src/api/snapshot.rs:212
+-- pg_trickle::api::snapshot::snapshot_stream_table
+CREATE  FUNCTION pgtrickle."snapshot_stream_table"(
 	"p_name" TEXT, /* & str */
-	"p_retention_hours" INT DEFAULT 24 /* i32 */
+	"p_target" TEXT DEFAULT NULL /* Option < & str > */
+) RETURNS TEXT /* String */
+
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'snapshot_stream_table_wrapper';
+/* </end connected objects> */
+
+/* <begin connected objects> */
+-- src/api/mod.rs:4229
+-- pg_trickle::api::resume_stream_table
+CREATE  FUNCTION pgtrickle."resume_stream_table"(
+	"name" TEXT /* & str */
 ) RETURNS void
 STRICT 
 LANGUAGE c /* Rust */
-AS 'MODULE_PATHNAME', 'enable_outbox_wrapper';
+AS 'MODULE_PATHNAME', 'resume_stream_table_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/diagnostics.rs:570
--- pg_trickle::diagnostics::list_auxiliary_columns
-CREATE  FUNCTION pgtrickle."list_auxiliary_columns"(
-	"name" TEXT /* & str */
-) RETURNS TABLE (
-	"column_name" TEXT,  /* String */
-	"data_type" TEXT,  /* String */
-	"purpose" TEXT  /* String */
-)
-STRICT 
-LANGUAGE c /* Rust */
-AS 'MODULE_PATHNAME', 'list_auxiliary_columns_wrapper';
-/* </end connected objects> */
-
-/* <begin connected objects> */
--- src/api/diagnostics.rs:1252
--- pg_trickle::api::diagnostics::watermark_status
-CREATE  FUNCTION pgtrickle."watermark_status"() RETURNS TABLE (
-	"group_name" TEXT,  /* String */
-	"min_watermark" timestamp with time zone,  /* Option < TimestampWithTimeZone > */
-	"max_watermark" timestamp with time zone,  /* Option < TimestampWithTimeZone > */
-	"lag_secs" double precision,  /* Option < f64 > */
-	"aligned" bool,  /* bool */
-	"sources_with_watermark" INT,  /* i32 */
-	"sources_total" INT  /* i32 */
+-- src/api/diagnostics.rs:954
+-- pg_trickle::api::diagnostics::source_gates
+CREATE  FUNCTION pgtrickle."source_gates"() RETURNS TABLE (
+	"source_table" TEXT,  /* String */
+	"schema_name" TEXT,  /* String */
+	"gated" bool,  /* bool */
+	"gated_at" timestamp with time zone,  /* Option < TimestampWithTimeZone > */
+	"ungated_at" timestamp with time zone,  /* Option < TimestampWithTimeZone > */
+	"gated_by" TEXT  /* Option < String > */
 )
 STRICT  
 LANGUAGE c /* Rust */
-AS 'MODULE_PATHNAME', 'watermark_status_fn_wrapper';
-/* </end connected objects> */
-
-/* <begin connected objects> */
--- src/monitor.rs:3172
--- pg_trickle::monitor::worker_pool_status
-CREATE  FUNCTION pgtrickle."worker_pool_status"() RETURNS TABLE (
-	"active_workers" INT,  /* i32 */
-	"max_workers" INT,  /* i32 */
-	"per_db_cap" INT,  /* i32 */
-	"parallel_mode" TEXT  /* String */
-)
-STRICT  
-LANGUAGE c /* Rust */
-AS 'MODULE_PATHNAME', 'worker_pool_status_wrapper';
-/* </end connected objects> */
-
-/* <begin connected objects> */
--- src/monitor.rs:2555
--- pg_trickle::monitor::health_check
-CREATE  FUNCTION pgtrickle."health_check"() RETURNS TABLE (
-	"check_name" TEXT,  /* String */
-	"severity" TEXT,  /* String */
-	"detail" TEXT  /* String */
-)
-STRICT  
-LANGUAGE c /* Rust */
-AS 'MODULE_PATHNAME', 'health_check_wrapper';
-/* </end connected objects> */
-
-/* <begin connected objects> */
--- src/api/metrics_ext.rs:25
--- pg_trickle::api::metrics_ext::metrics_summary
-CREATE  FUNCTION pgtrickle."metrics_summary"() RETURNS TABLE (
-	"db_name" TEXT,  /* Option < String > */
-	"total_stream_tables" bigint,  /* Option < i64 > */
-	"active_stream_tables" bigint,  /* Option < i64 > */
-	"suspended_stream_tables" bigint,  /* Option < i64 > */
-	"total_refreshes" bigint,  /* Option < i64 > */
-	"successful_refreshes" bigint,  /* Option < i64 > */
-	"failed_refreshes" bigint,  /* Option < i64 > */
-	"total_rows_processed" bigint,  /* Option < i64 > */
-	"active_workers" INT,  /* Option < i32 > */
-	"ivm_lock_parse_error_count" bigint  /* Option < i64 > */
-)
-STRICT 
-LANGUAGE c /* Rust */
-AS 'MODULE_PATHNAME', 'metrics_summary_wrapper';
-/* </end connected objects> */
-
-/* <begin connected objects> */
--- src/api/diagnostics.rs:407
--- pg_trickle::api::diagnostics::explain_delta
-CREATE  FUNCTION pgtrickle."explain_delta"(
-	"name" TEXT, /* & str */
-	"format" TEXT DEFAULT 'text' /* & str */
-) RETURNS SETOF TEXT /* String */
-STRICT  
-LANGUAGE c /* Rust */
-AS 'MODULE_PATHNAME', 'explain_delta_text_wrapper';
-/* </end connected objects> */
-
-/* <begin connected objects> */
--- src/monitor.rs:893
--- pg_trickle::monitor::st_auto_threshold
-CREATE  FUNCTION pgtrickle."st_auto_threshold"(
-	"name" TEXT /* & str */
-) RETURNS double precision /* Option < f64 > */
-STRICT  
-LANGUAGE c /* Rust */
-AS 'MODULE_PATHNAME', 'st_auto_threshold_wrapper';
-/* </end connected objects> */
-
-/* <begin connected objects> */
--- src/hash.rs:33
--- pg_trickle::hash::pg_trickle_hash
-CREATE  FUNCTION pgtrickle."pg_trickle_hash"(
-	"input" TEXT /* Option < & str > */
-) RETURNS bigint /* i64 */
-IMMUTABLE PARALLEL SAFE 
-LANGUAGE c /* Rust */
-AS 'MODULE_PATHNAME', 'pg_trickle_hash_wrapper';
-/* </end connected objects> */
-
-/* <begin connected objects> */
--- src/monitor.rs:1000
--- pg_trickle::monitor::pgtrickle_refresh_stats
-CREATE  FUNCTION pgtrickle."pgtrickle_refresh_stats"() RETURNS TABLE (
-	"stream_table" TEXT,  /* String */
-	"mode" TEXT,  /* String */
-	"avg_ms" double precision,  /* f64 */
-	"p95_ms" double precision,  /* f64 */
-	"p99_ms" double precision,  /* f64 */
-	"refresh_count" bigint,  /* i64 */
-	"last_refresh_at" timestamp with time zone  /* Option < TimestampWithTimeZone > */
-)
-STRICT  
-LANGUAGE c /* Rust */
-AS 'MODULE_PATHNAME', 'pgtrickle_refresh_stats_wrapper';
-/* </end connected objects> */
-
-/* <begin connected objects> */
--- src/diagnostics.rs:767
--- pg_trickle::diagnostics::validate_query
-CREATE  FUNCTION pgtrickle."validate_query"(
-	"query" TEXT /* & str */
-) RETURNS TABLE (
-	"check_name" TEXT,  /* String */
-	"result" TEXT,  /* String */
-	"severity" TEXT  /* String */
-)
-STRICT 
-LANGUAGE c /* Rust */
-AS 'MODULE_PATHNAME', 'validate_query_wrapper';
-/* </end connected objects> */
-
-/* <begin connected objects> */
--- src/api/diagnostics.rs:8
--- pg_trickle::api::diagnostics::version
-CREATE  FUNCTION pgtrickle."version"() RETURNS TEXT /* & '_ str */
-IMMUTABLE STRICT PARALLEL SAFE 
-LANGUAGE c /* Rust */
-AS 'MODULE_PATHNAME', 'version_wrapper';
-/* </end connected objects> */
-
-/* <begin connected objects> */
--- src/api/snapshot.rs:549
--- pg_trickle::api::snapshot::drop_snapshot
-CREATE  FUNCTION pgtrickle."drop_snapshot"(
-	"p_snapshot_table" TEXT /* & str */
-) RETURNS void
-STRICT 
-LANGUAGE c /* Rust */
-AS 'MODULE_PATHNAME', 'drop_snapshot_wrapper';
+AS 'MODULE_PATHNAME', 'source_gates_fn_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
@@ -1687,177 +1937,6 @@ CREATE  FUNCTION pgtrickle."enable_inbox_priority"(
 
 LANGUAGE c /* Rust */
 AS 'MODULE_PATHNAME', 'enable_inbox_priority_wrapper';
-/* </end connected objects> */
-
-/* <begin connected objects> */
--- src/api/mod.rs:4271
--- pg_trickle::api::refresh_stream_table
-CREATE  FUNCTION pgtrickle."refresh_stream_table"(
-	"name" TEXT /* & str */
-) RETURNS void
-STRICT 
-LANGUAGE c /* Rust */
-AS 'MODULE_PATHNAME', 'refresh_stream_table_wrapper';
-/* </end connected objects> */
-
-/* <begin connected objects> */
--- src/lib.rs:745
--- requires:
---   refresh_stream_table
-
-
-CREATE OR REPLACE FUNCTION pgtrickle."refresh_if_stale"(
-    p_name   text,
-    p_max_age interval DEFAULT '5 minutes'::interval
-)
-RETURNS boolean
-LANGUAGE plpgsql
-AS $$
-DECLARE
-    v_last_end timestamp with time zone;
-    v_refreshed boolean := false;
-BEGIN
-    SELECT MAX(end_time)
-      INTO v_last_end
-      FROM pgtrickle.pgt_refresh_history h
-      JOIN pgtrickle.pgt_stream_tables   s USING (pgt_id)
-     WHERE s.pgt_name = p_name
-       AND h.status = 'COMPLETED';
-
-    IF v_last_end IS NULL OR (now() - v_last_end) > p_max_age THEN
-        PERFORM pgtrickle.refresh_stream_table(p_name);
-        v_refreshed := true;
-    END IF;
-
-    RETURN v_refreshed;
-END;
-$$;
-
-COMMENT ON FUNCTION pgtrickle."refresh_if_stale"(text, interval) IS
-    'Refresh the named stream table only when the most recent completed '
-    'refresh is older than max_age.  Returns TRUE when a refresh was '
-    'triggered, FALSE when the table was fresh enough.';
-/* </end connected objects> */
-
-/* <begin connected objects> */
--- src/monitor.rs:1077
--- pg_trickle::monitor::explain_st
-CREATE  FUNCTION pgtrickle."explain_st"(
-	"name" TEXT, /* & str */
-	"with_analyze" bool DEFAULT false /* bool */
-) RETURNS TABLE (
-	"property" TEXT,  /* String */
-	"value" TEXT  /* String */
-)
-STRICT  
-LANGUAGE c /* Rust */
-AS 'MODULE_PATHNAME', 'explain_st_wrapper';
-/* </end connected objects> */
-
-/* <begin connected objects> */
--- src/api/diagnostics.rs:1217
--- pg_trickle::api::diagnostics::watermark_groups
-CREATE  FUNCTION pgtrickle."watermark_groups"() RETURNS TABLE (
-	"group_name" TEXT,  /* String */
-	"source_count" INT,  /* i32 */
-	"tolerance_secs" double precision,  /* f64 */
-	"created_at" timestamp with time zone  /* TimestampWithTimeZone */
-)
-STRICT  
-LANGUAGE c /* Rust */
-AS 'MODULE_PATHNAME', 'watermark_groups_fn_wrapper';
-/* </end connected objects> */
-
-/* <begin connected objects> */
--- src/monitor.rs:785
--- pg_trickle::monitor::get_refresh_history
-CREATE  FUNCTION pgtrickle."get_refresh_history"(
-	"name" TEXT, /* & str */
-	"max_rows" INT DEFAULT 20 /* i32 */
-) RETURNS TABLE (
-	"refresh_id" bigint,  /* i64 */
-	"data_timestamp" timestamp with time zone,  /* TimestampWithTimeZone */
-	"start_time" timestamp with time zone,  /* TimestampWithTimeZone */
-	"end_time" timestamp with time zone,  /* Option < TimestampWithTimeZone > */
-	"action" TEXT,  /* String */
-	"status" TEXT,  /* String */
-	"rows_inserted" bigint,  /* i64 */
-	"rows_deleted" bigint,  /* i64 */
-	"duration_ms" double precision,  /* Option < f64 > */
-	"error_message" TEXT  /* Option < String > */
-)
-STRICT  
-LANGUAGE c /* Rust */
-AS 'MODULE_PATHNAME', 'get_refresh_history_wrapper';
-/* </end connected objects> */
-
-/* <begin connected objects> */
--- src/api/outbox.rs:238
--- pg_trickle::api::outbox::disable_outbox
-CREATE  FUNCTION pgtrickle."disable_outbox"(
-	"p_name" TEXT, /* & str */
-	"p_if_exists" bool DEFAULT false /* bool */
-) RETURNS void
-STRICT 
-LANGUAGE c /* Rust */
-AS 'MODULE_PATHNAME', 'disable_outbox_wrapper';
-/* </end connected objects> */
-
-/* <begin connected objects> */
--- src/api/helpers.rs:2523
--- pg_trickle::api::helpers::export_definition
-CREATE  FUNCTION pgtrickle."export_definition"(
-	"st_name" TEXT /* & str */
-) RETURNS TEXT /* Result < String, PgTrickleError > */
-STRICT  
-LANGUAGE c /* Rust */
-AS 'MODULE_PATHNAME', 'export_definition_wrapper';
-/* </end connected objects> */
-
-/* <begin connected objects> */
--- src/lib.rs:785
--- requires:
---   export_definition
-
-
-CREATE OR REPLACE FUNCTION pgtrickle."stream_table_definition"(
-    p_name text
-)
-RETURNS text
-LANGUAGE sql
-STABLE
-AS $$
-    SELECT pgtrickle.export_definition(p_name);
-$$;
-
-COMMENT ON FUNCTION pgtrickle."stream_table_definition"(text) IS
-    'Return the CREATE STREAM TABLE DDL for the named stream table. '
-    'Equivalent to pgtrickle.export_definition(name) — provided as a '
-    'more discoverable alias.';
-/* </end connected objects> */
-
-/* <begin connected objects> */
--- src/hash.rs:54
--- pg_trickle::hash::pg_trickle_hash_multi
-CREATE  FUNCTION pgtrickle."pg_trickle_hash_multi"(
-	"inputs" TEXT[] /* Vec < Option < String > > */
-) RETURNS bigint /* i64 */
-IMMUTABLE STRICT PARALLEL SAFE 
-LANGUAGE c /* Rust */
-AS 'MODULE_PATHNAME', 'pg_trickle_hash_multi_wrapper';
-/* </end connected objects> */
-
-/* <begin connected objects> */
--- src/api/diagnostics.rs:1373
--- pg_trickle::api::diagnostics::create_refresh_group
-CREATE  FUNCTION pgtrickle."create_refresh_group"(
-	"group_name" TEXT, /* & str */
-	"members" TEXT[], /* Vec < String > */
-	"isolation" TEXT DEFAULT 'read_committed' /* & str */
-) RETURNS INT /* Result < i32, PgTrickleError > */
-STRICT 
-LANGUAGE c /* Rust */
-AS 'MODULE_PATHNAME', 'create_refresh_group_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
@@ -1877,85 +1956,25 @@ AS 'MODULE_PATHNAME', 'change_buffer_sizes_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/monitor.rs:2204
--- pg_trickle::monitor::list_sources
-CREATE  FUNCTION pgtrickle."list_sources"(
-	"name" TEXT /* & str */
-) RETURNS TABLE (
-	"source_table" TEXT,  /* String */
-	"source_oid" bigint,  /* i64 */
-	"source_type" TEXT,  /* String */
-	"cdc_mode" TEXT,  /* String */
-	"columns_used" TEXT  /* Option < String > */
-)
-STRICT  
-LANGUAGE c /* Rust */
-AS 'MODULE_PATHNAME', 'list_sources_wrapper';
-/* </end connected objects> */
-
-/* <begin connected objects> */
--- src/monitor.rs:1366
--- pg_trickle::monitor::explain_diff_sql
-CREATE  FUNCTION pgtrickle."explain_diff_sql"(
-	"name" TEXT /* & str */
+-- src/citus.rs:103
+-- pg_trickle::citus::source_stable_name
+CREATE  FUNCTION pgtrickle."source_stable_name"(
+	"source_oid" oid /* pg_sys :: Oid */
 ) RETURNS TEXT /* Option < String > */
 STRICT  
 LANGUAGE c /* Rust */
-AS 'MODULE_PATHNAME', 'explain_diff_sql_wrapper';
+AS 'MODULE_PATHNAME', 'sql_stable_name_for_oid_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/api/snapshot.rs:471
--- pg_trickle::api::snapshot::list_snapshots
-CREATE  FUNCTION pgtrickle."list_snapshots"(
-	"p_name" TEXT /* & str */
-) RETURNS TABLE (
-	"snapshot_table" TEXT,  /* Option < String > */
-	"created_at" timestamp with time zone,  /* Option < TimestampWithTimeZone > */
-	"row_count" bigint,  /* Option < i64 > */
-	"frontier" jsonb,  /* Option < pgrx :: JsonB > */
-	"size_bytes" bigint  /* Option < i64 > */
-)
-STRICT 
-LANGUAGE c /* Rust */
-AS 'MODULE_PATHNAME', 'list_snapshots_wrapper';
-/* </end connected objects> */
-
-/* <begin connected objects> */
--- src/api/diagnostics.rs:1164
--- pg_trickle::api::diagnostics::watermarks
-CREATE  FUNCTION pgtrickle."watermarks"() RETURNS TABLE (
-	"source_table" TEXT,  /* String */
-	"schema_name" TEXT,  /* String */
-	"watermark" timestamp with time zone,  /* TimestampWithTimeZone */
-	"updated_at" timestamp with time zone,  /* TimestampWithTimeZone */
-	"advanced_by" TEXT,  /* Option < String > */
-	"wal_lsn" TEXT  /* Option < String > */
-)
+-- src/monitor.rs:893
+-- pg_trickle::monitor::st_auto_threshold
+CREATE  FUNCTION pgtrickle."st_auto_threshold"(
+	"name" TEXT /* & str */
+) RETURNS double precision /* Option < f64 > */
 STRICT  
 LANGUAGE c /* Rust */
-AS 'MODULE_PATHNAME', 'watermarks_fn_wrapper';
-/* </end connected objects> */
-
-/* <begin connected objects> */
--- src/api/self_monitoring.rs:305
--- pg_trickle::api::self_monitoring::teardown_self_monitoring
-CREATE  FUNCTION pgtrickle."teardown_self_monitoring"() RETURNS void
-STRICT 
-LANGUAGE c /* Rust */
-AS 'MODULE_PATHNAME', 'teardown_self_monitoring_wrapper';
-/* </end connected objects> */
-
-/* <begin connected objects> */
--- src/api/inbox.rs:632
--- pg_trickle::api::inbox::replay_inbox_messages
-CREATE  FUNCTION pgtrickle."replay_inbox_messages"(
-	"p_name" TEXT, /* & str */
-	"p_event_ids" TEXT[] /* Vec < String > */
-) RETURNS bigint /* i64 */
-STRICT 
-LANGUAGE c /* Rust */
-AS 'MODULE_PATHNAME', 'replay_inbox_messages_wrapper';
+AS 'MODULE_PATHNAME', 'st_auto_threshold_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
@@ -1972,128 +1991,15 @@ AS 'MODULE_PATHNAME', 'enable_inbox_ordering_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/api/diagnostics.rs:931
--- pg_trickle::api::diagnostics::ungate_source
-CREATE  FUNCTION pgtrickle."ungate_source"(
-	"source" TEXT /* & str */
-) RETURNS VOID /* Result < (), PgTrickleError > */
-STRICT 
-LANGUAGE c /* Rust */
-AS 'MODULE_PATHNAME', 'ungate_source_wrapper';
-/* </end connected objects> */
-
-/* <begin connected objects> */
--- src/hooks.rs:51
--- pg_trickle::hooks::pg_trickle_on_ddl_end
--- Skipped due to `#[pgrx(sql = false)]`
-/* </end connected objects> */
-
-/* <begin connected objects> */
--- src/api/diagnostics.rs:19
--- pg_trickle::api::diagnostics::version_check
-CREATE  FUNCTION pgtrickle."version_check"() RETURNS TEXT /* String */
-STRICT 
-LANGUAGE c /* Rust */
-AS 'MODULE_PATHNAME', 'version_check_wrapper';
-/* </end connected objects> */
-
-/* <begin connected objects> */
--- src/monitor.rs:912
--- pg_trickle::monitor::get_staleness
-CREATE  FUNCTION pgtrickle."get_staleness"(
-	"name" TEXT /* & str */
-) RETURNS double precision /* Option < f64 > */
-STRICT  
-LANGUAGE c /* Rust */
-AS 'MODULE_PATHNAME', 'get_staleness_wrapper';
-/* </end connected objects> */
-
-/* <begin connected objects> */
--- src/api/diagnostics.rs:1119
--- pg_trickle::api::diagnostics::create_watermark_group
-CREATE  FUNCTION pgtrickle."create_watermark_group"(
-	"group_name" TEXT, /* & str */
-	"sources" TEXT[], /* Vec < String > */
-	"tolerance_secs" double precision DEFAULT 0.0 /* f64 */
-) RETURNS INT /* Result < i32, PgTrickleError > */
-STRICT 
-LANGUAGE c /* Rust */
-AS 'MODULE_PATHNAME', 'create_watermark_group_wrapper';
-/* </end connected objects> */
-
-/* <begin connected objects> */
--- src/api/diagnostics.rs:744
--- pg_trickle::api::diagnostics::fuse_status
-CREATE  FUNCTION pgtrickle."fuse_status"() RETURNS TABLE (
-	"stream_table" TEXT,  /* String */
-	"fuse_mode" TEXT,  /* String */
-	"fuse_state" TEXT,  /* String */
-	"fuse_ceiling" bigint,  /* Option < i64 > */
-	"effective_ceiling" bigint,  /* Option < i64 > */
-	"fuse_sensitivity" INT,  /* Option < i32 > */
-	"blown_at" timestamp with time zone,  /* Option < TimestampWithTimeZone > */
-	"blow_reason" TEXT  /* Option < String > */
-)
-STRICT 
-LANGUAGE c /* Rust */
-AS 'MODULE_PATHNAME', 'fuse_status_wrapper';
-/* </end connected objects> */
-
-/* <begin connected objects> */
--- src/api/helpers.rs:2640
--- pg_trickle::api::helpers::restore_stream_tables
-CREATE  FUNCTION pgtrickle."restore_stream_tables"() RETURNS VOID /* Result < (), crate :: error :: PgTrickleError > */
-STRICT 
-LANGUAGE c /* Rust */
-AS 'MODULE_PATHNAME', 'restore_stream_tables_wrapper';
-/* </end connected objects> */
-
-/* <begin connected objects> */
--- src/api/inbox.rs:555
--- pg_trickle::api::inbox::inbox_status
-CREATE  FUNCTION pgtrickle."inbox_status"(
-	"p_name" TEXT DEFAULT NULL /* Option < & str > */
-) RETURNS TABLE (
-	"inbox_name" TEXT,  /* String */
-	"inbox_schema" TEXT,  /* String */
-	"max_retries" INT,  /* i32 */
-	"schedule" TEXT,  /* String */
-	"with_dead_letter" bool,  /* bool */
-	"with_stats" bool,  /* bool */
-	"created_at" timestamp with time zone  /* Option < TimestampWithTimeZone > */
-)
-
-LANGUAGE c /* Rust */
-AS 'MODULE_PATHNAME', 'inbox_status_wrapper';
-/* </end connected objects> */
-
-/* <begin connected objects> */
--- src/api/inbox.rs:360
--- pg_trickle::api::inbox::enable_inbox_tracking
-CREATE  FUNCTION pgtrickle."enable_inbox_tracking"(
+-- src/api/outbox.rs:91
+-- pg_trickle::api::outbox::enable_outbox
+CREATE  FUNCTION pgtrickle."enable_outbox"(
 	"p_name" TEXT, /* & str */
-	"p_table_ref" TEXT, /* & str */
-	"p_id_column" TEXT DEFAULT 'event_id', /* & str */
-	"p_processed_at_column" TEXT DEFAULT 'processed_at', /* & str */
-	"p_retry_count_column" TEXT DEFAULT 'retry_count', /* & str */
-	"p_error_column" TEXT DEFAULT 'error', /* & str */
-	"p_received_at_column" TEXT DEFAULT 'received_at', /* & str */
-	"p_event_type_column" TEXT DEFAULT 'event_type', /* & str */
-	"p_max_retries" INT DEFAULT 3, /* i32 */
-	"p_schedule" TEXT DEFAULT '1s' /* & str */
+	"p_retention_hours" INT DEFAULT 24 /* i32 */
 ) RETURNS void
 STRICT 
 LANGUAGE c /* Rust */
-AS 'MODULE_PATHNAME', 'enable_inbox_tracking_wrapper';
-/* </end connected objects> */
-
-/* <begin connected objects> */
--- src/api/diagnostics.rs:61
--- pg_trickle::api::diagnostics::migrate
-CREATE  FUNCTION pgtrickle."migrate"() RETURNS TEXT /* String */
-STRICT 
-LANGUAGE c /* Rust */
-AS 'MODULE_PATHNAME', 'migrate_wrapper';
+AS 'MODULE_PATHNAME', 'enable_outbox_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
@@ -2130,42 +2036,205 @@ AS 'MODULE_PATHNAME', 'recommend_refresh_mode_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/monitor.rs:958
--- pg_trickle::monitor::cache_stats
-CREATE  FUNCTION pgtrickle."cache_stats"() RETURNS TABLE (
-	"l1_hits" bigint,  /* i64 */
-	"l2_hits" bigint,  /* i64 */
-	"misses" bigint,  /* i64 */
-	"evictions" bigint,  /* i64 */
-	"l1_size" INT  /* i32 */
+-- src/monitor.rs:2286
+-- pg_trickle::monitor::dependency_tree
+CREATE  FUNCTION pgtrickle."dependency_tree"() RETURNS TABLE (
+	"tree_line" TEXT,  /* String */
+	"node" TEXT,  /* String */
+	"node_type" TEXT,  /* String */
+	"depth" INT,  /* i32 */
+	"status" TEXT,  /* Option < String > */
+	"refresh_mode" TEXT  /* Option < String > */
 )
 STRICT  
 LANGUAGE c /* Rust */
-AS 'MODULE_PATHNAME', 'cache_stats_wrapper';
+AS 'MODULE_PATHNAME', 'dependency_tree_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/api/diagnostics.rs:1087
--- pg_trickle::api::diagnostics::advance_watermark
-CREATE  FUNCTION pgtrickle."advance_watermark"(
-	"source" TEXT, /* & str */
-	"watermark" timestamp with time zone /* TimestampWithTimeZone */
-) RETURNS VOID /* Result < (), PgTrickleError > */
+-- src/api/inbox.rs:632
+-- pg_trickle::api::inbox::replay_inbox_messages
+CREATE  FUNCTION pgtrickle."replay_inbox_messages"(
+	"p_name" TEXT, /* & str */
+	"p_event_ids" TEXT[] /* Vec < String > */
+) RETURNS bigint /* i64 */
 STRICT 
 LANGUAGE c /* Rust */
-AS 'MODULE_PATHNAME', 'advance_watermark_wrapper';
+AS 'MODULE_PATHNAME', 'replay_inbox_messages_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/api/snapshot.rs:321
--- pg_trickle::api::snapshot::restore_from_snapshot
-CREATE  FUNCTION pgtrickle."restore_from_snapshot"(
-	"p_name" TEXT, /* & str */
-	"p_source" TEXT /* & str */
+-- src/api/publication.rs:126
+-- pg_trickle::api::publication::set_stream_table_sla
+CREATE  FUNCTION pgtrickle."set_stream_table_sla"(
+	"name" TEXT, /* & str */
+	"sla" interval /* Interval */
 ) RETURNS void
 STRICT 
 LANGUAGE c /* Rust */
-AS 'MODULE_PATHNAME', 'restore_from_snapshot_wrapper';
+AS 'MODULE_PATHNAME', 'set_stream_table_sla_wrapper';
+/* </end connected objects> */
+
+/* <begin connected objects> */
+-- src/api/self_monitoring.rs:566
+-- pg_trickle::api::self_monitoring::explain_dag
+CREATE  FUNCTION pgtrickle."explain_dag"(
+	"format" TEXT DEFAULT 'mermaid' /* Option < & str > */
+) RETURNS TEXT /* Option < String > */
+
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'explain_dag_wrapper';
+/* </end connected objects> */
+
+/* <begin connected objects> */
+-- src/monitor.rs:2848
+-- pg_trickle::monitor::health_summary
+CREATE  FUNCTION pgtrickle."health_summary"() RETURNS TABLE (
+	"total_stream_tables" INT,  /* i32 */
+	"active_count" INT,  /* i32 */
+	"error_count" INT,  /* i32 */
+	"suspended_count" INT,  /* i32 */
+	"stale_count" INT,  /* i32 */
+	"reinit_pending" INT,  /* i32 */
+	"max_staleness_seconds" double precision,  /* Option < f64 > */
+	"scheduler_status" TEXT,  /* String */
+	"cache_hit_rate" double precision  /* Option < f64 > */
+)
+STRICT  
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'health_summary_wrapper';
+/* </end connected objects> */
+
+/* <begin connected objects> */
+-- src/monitor.rs:912
+-- pg_trickle::monitor::get_staleness
+CREATE  FUNCTION pgtrickle."get_staleness"(
+	"name" TEXT /* & str */
+) RETURNS double precision /* Option < f64 > */
+STRICT  
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'get_staleness_wrapper';
+/* </end connected objects> */
+
+/* <begin connected objects> */
+-- src/api/outbox.rs:804
+-- pg_trickle::api::outbox::consumer_heartbeat
+CREATE  FUNCTION pgtrickle."consumer_heartbeat"(
+	"p_group" TEXT, /* & str */
+	"p_consumer" TEXT /* & str */
+) RETURNS void
+STRICT 
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'consumer_heartbeat_wrapper';
+/* </end connected objects> */
+
+/* <begin connected objects> */
+-- src/ivm.rs:633
+-- pg_trickle::ivm::pgt_ivm_apply_delta
+CREATE  FUNCTION pgtrickle."pgt_ivm_apply_delta"(
+	"pgt_id" bigint, /* i64 */
+	"source_oid" INT, /* i32 */
+	"has_new" bool, /* bool */
+	"has_old" bool /* bool */
+) RETURNS VOID /* Result < (), PgTrickleError > */
+STRICT 
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'pgt_ivm_apply_delta_wrapper';
+/* </end connected objects> */
+
+/* <begin connected objects> */
+-- src/api/diagnostics.rs:1217
+-- pg_trickle::api::diagnostics::watermark_groups
+CREATE  FUNCTION pgtrickle."watermark_groups"() RETURNS TABLE (
+	"group_name" TEXT,  /* String */
+	"source_count" INT,  /* i32 */
+	"tolerance_secs" double precision,  /* f64 */
+	"created_at" timestamp with time zone  /* TimestampWithTimeZone */
+)
+STRICT  
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'watermark_groups_fn_wrapper';
+/* </end connected objects> */
+
+/* <begin connected objects> */
+-- src/monitor.rs:1000
+-- pg_trickle::monitor::pgtrickle_refresh_stats
+CREATE  FUNCTION pgtrickle."pgtrickle_refresh_stats"() RETURNS TABLE (
+	"stream_table" TEXT,  /* String */
+	"mode" TEXT,  /* String */
+	"avg_ms" double precision,  /* f64 */
+	"p95_ms" double precision,  /* f64 */
+	"p99_ms" double precision,  /* f64 */
+	"refresh_count" bigint,  /* i64 */
+	"last_refresh_at" timestamp with time zone  /* Option < TimestampWithTimeZone > */
+)
+STRICT  
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'pgtrickle_refresh_stats_wrapper';
+/* </end connected objects> */
+
+/* <begin connected objects> */
+-- src/api/mod.rs:644
+-- pg_trickle::api::create_stream_table
+CREATE  FUNCTION pgtrickle."create_stream_table"(
+	"name" TEXT, /* & str */
+	"query" TEXT, /* & str */
+	"schedule" TEXT DEFAULT 'calculated', /* Option < & str > */
+	"refresh_mode" TEXT DEFAULT 'AUTO', /* & str */
+	"initialize" bool DEFAULT true, /* bool */
+	"diamond_consistency" TEXT DEFAULT NULL, /* Option < & str > */
+	"diamond_schedule_policy" TEXT DEFAULT NULL, /* Option < & str > */
+	"cdc_mode" TEXT DEFAULT NULL, /* Option < & str > */
+	"append_only" bool DEFAULT false, /* bool */
+	"pooler_compatibility_mode" bool DEFAULT false, /* bool */
+	"partition_by" TEXT DEFAULT NULL, /* Option < & str > */
+	"max_differential_joins" INT DEFAULT NULL, /* Option < i32 > */
+	"max_delta_fraction" double precision DEFAULT NULL, /* Option < f64 > */
+	"output_distribution_column" TEXT DEFAULT NULL /* Option < & str > */
+) RETURNS void
+
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'create_stream_table_wrapper';
+/* </end connected objects> */
+
+/* <begin connected objects> */
+-- src/diagnostics.rs:49
+-- pg_trickle::diagnostics::explain_query_rewrite
+CREATE  FUNCTION pgtrickle."explain_query_rewrite"(
+	"query" TEXT /* & str */
+) RETURNS TABLE (
+	"pass_name" TEXT,  /* String */
+	"changed" bool,  /* bool */
+	"sql_after" TEXT  /* Option < String > */
+)
+STRICT 
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'explain_query_rewrite_wrapper';
+/* </end connected objects> */
+
+/* <begin connected objects> */
+-- src/api/diagnostics.rs:1119
+-- pg_trickle::api::diagnostics::create_watermark_group
+CREATE  FUNCTION pgtrickle."create_watermark_group"(
+	"group_name" TEXT, /* & str */
+	"sources" TEXT[], /* Vec < String > */
+	"tolerance_secs" double precision DEFAULT 0.0 /* f64 */
+) RETURNS INT /* Result < i32, PgTrickleError > */
+STRICT 
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'create_watermark_group_wrapper';
+/* </end connected objects> */
+
+/* <begin connected objects> */
+-- src/api/mod.rs:4299
+-- pg_trickle::api::write_and_refresh
+CREATE  FUNCTION pgtrickle."write_and_refresh"(
+	"sql" TEXT, /* & str */
+	"stream_table_name" TEXT /* & str */
+) RETURNS void
+STRICT 
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'write_and_refresh_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
@@ -2180,55 +2249,30 @@ AS 'MODULE_PATHNAME', 'recommend_schedule_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/api/diagnostics.rs:109
--- pg_trickle::api::diagnostics::rebuild_cdc_triggers
-CREATE  FUNCTION pgtrickle."rebuild_cdc_triggers"() RETURNS TEXT /* & '_ str */
-STRICT 
-LANGUAGE c /* Rust */
-AS 'MODULE_PATHNAME', 'rebuild_cdc_triggers_wrapper';
-/* </end connected objects> */
-
-/* <begin connected objects> */
--- src/api/diagnostics.rs:1597
--- pg_trickle::api::diagnostics::clear_caches
-CREATE  FUNCTION pgtrickle."clear_caches"() RETURNS bigint /* i64 */
-STRICT 
-LANGUAGE c /* Rust */
-AS 'MODULE_PATHNAME', 'clear_caches_wrapper';
-/* </end connected objects> */
-
-/* <begin connected objects> */
--- src/api/outbox.rs:308
--- pg_trickle::api::outbox::outbox_status
-CREATE  FUNCTION pgtrickle."outbox_status"(
-	"p_name" TEXT /* & str */
-) RETURNS jsonb /* pgrx :: JsonB */
-STRICT 
-LANGUAGE c /* Rust */
-AS 'MODULE_PATHNAME', 'outbox_status_wrapper';
-/* </end connected objects> */
-
-/* <begin connected objects> */
--- src/ivm.rs:1066
--- pg_trickle::ivm::pgt_ivm_handle_truncate
-CREATE  FUNCTION pgtrickle."pgt_ivm_handle_truncate"(
-	"pgt_id" bigint /* i64 */
-) RETURNS VOID /* Result < (), PgTrickleError > */
-STRICT 
-LANGUAGE c /* Rust */
-AS 'MODULE_PATHNAME', 'pgt_ivm_handle_truncate_wrapper';
-/* </end connected objects> */
-
-/* <begin connected objects> */
--- src/api/mod.rs:4046
--- pg_trickle::api::drop_stream_table
-CREATE  FUNCTION pgtrickle."drop_stream_table"(
+-- src/api/mod.rs:3496
+-- pg_trickle::api::alter_stream_table
+CREATE  FUNCTION pgtrickle."alter_stream_table"(
 	"name" TEXT, /* & str */
-	"cascade" bool DEFAULT false /* bool */
+	"query" TEXT DEFAULT NULL, /* Option < & str > */
+	"schedule" TEXT DEFAULT NULL, /* Option < & str > */
+	"refresh_mode" TEXT DEFAULT NULL, /* Option < & str > */
+	"status" TEXT DEFAULT NULL, /* Option < & str > */
+	"diamond_consistency" TEXT DEFAULT NULL, /* Option < & str > */
+	"diamond_schedule_policy" TEXT DEFAULT NULL, /* Option < & str > */
+	"cdc_mode" TEXT DEFAULT NULL, /* Option < & str > */
+	"append_only" bool DEFAULT NULL, /* Option < bool > */
+	"pooler_compatibility_mode" bool DEFAULT NULL, /* Option < bool > */
+	"tier" TEXT DEFAULT NULL, /* Option < & str > */
+	"fuse" TEXT DEFAULT NULL, /* Option < & str > */
+	"fuse_ceiling" bigint DEFAULT NULL, /* Option < i64 > */
+	"fuse_sensitivity" INT DEFAULT NULL, /* Option < i32 > */
+	"partition_by" TEXT DEFAULT NULL, /* Option < & str > */
+	"max_differential_joins" INT DEFAULT NULL, /* Option < i32 > */
+	"max_delta_fraction" double precision DEFAULT NULL /* Option < f64 > */
 ) RETURNS void
-STRICT 
+
 LANGUAGE c /* Rust */
-AS 'MODULE_PATHNAME', 'drop_stream_table_wrapper';
+AS 'MODULE_PATHNAME', 'alter_stream_table_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
@@ -2395,94 +2439,58 @@ COMMENT ON FUNCTION pgtrickle."canary_promote"(text) IS
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/api/diagnostics.rs:545
--- pg_trickle::api::diagnostics::shared_buffer_stats
-CREATE  FUNCTION pgtrickle."shared_buffer_stats"() RETURNS TABLE (
-	"source_oid" bigint,  /* i64 */
-	"source_table" TEXT,  /* String */
-	"consumer_count" INT,  /* i32 */
-	"consumers" TEXT,  /* String */
-	"columns_tracked" INT,  /* i32 */
-	"safe_frontier_lsn" TEXT,  /* Option < String > */
-	"buffer_rows" bigint,  /* i64 */
-	"is_partitioned" bool  /* bool */
-)
-STRICT  
-LANGUAGE c /* Rust */
-AS 'MODULE_PATHNAME', 'shared_buffer_stats_fn_wrapper';
-/* </end connected objects> */
-
-/* <begin connected objects> */
--- src/monitor.rs:491
--- pg_trickle::monitor::st_refresh_stats
-CREATE  FUNCTION pgtrickle."st_refresh_stats"() RETURNS TABLE (
-	"pgt_name" TEXT,  /* String */
-	"pgt_schema" TEXT,  /* String */
-	"status" TEXT,  /* String */
-	"refresh_mode" TEXT,  /* String */
-	"is_populated" bool,  /* bool */
-	"total_refreshes" bigint,  /* i64 */
-	"successful_refreshes" bigint,  /* i64 */
-	"failed_refreshes" bigint,  /* i64 */
-	"total_rows_inserted" bigint,  /* i64 */
-	"total_rows_deleted" bigint,  /* i64 */
-	"avg_duration_ms" double precision,  /* f64 */
-	"last_refresh_action" TEXT,  /* Option < String > */
-	"last_refresh_status" TEXT,  /* Option < String > */
-	"last_refresh_at" timestamp with time zone,  /* Option < TimestampWithTimeZone > */
-	"staleness_secs" double precision,  /* Option < f64 > */
-	"stale" bool,  /* bool */
-	"consecutive_errors" INT,  /* i32 */
-	"schedule" TEXT,  /* Option < String > */
-	"refresh_tier" TEXT,  /* String */
-	"last_error_message" TEXT,  /* Option < String > */
-	"downstream_publication" TEXT  /* Option < String > */
-)
-STRICT  
-LANGUAGE c /* Rust */
-AS 'MODULE_PATHNAME', 'st_refresh_stats_wrapper';
-/* </end connected objects> */
-
-/* <begin connected objects> */
--- src/monitor.rs:3066
--- pg_trickle::monitor::trigger_inventory
-CREATE  FUNCTION pgtrickle."trigger_inventory"() RETURNS TABLE (
-	"source_table" TEXT,  /* String */
-	"source_oid" bigint,  /* i64 */
-	"trigger_name" TEXT,  /* String */
-	"trigger_type" TEXT,  /* String */
-	"present" bool,  /* bool */
-	"enabled" bool  /* bool */
-)
-STRICT  
-LANGUAGE c /* Rust */
-AS 'MODULE_PATHNAME', 'trigger_inventory_wrapper';
-/* </end connected objects> */
-
-/* <begin connected objects> */
--- src/diagnostics.rs:49
--- pg_trickle::diagnostics::explain_query_rewrite
-CREATE  FUNCTION pgtrickle."explain_query_rewrite"(
-	"query" TEXT /* & str */
+-- src/diagnostics.rs:395
+-- pg_trickle::diagnostics::diagnose_errors
+CREATE  FUNCTION pgtrickle."diagnose_errors"(
+	"name" TEXT /* & str */
 ) RETURNS TABLE (
-	"pass_name" TEXT,  /* String */
-	"changed" bool,  /* bool */
-	"sql_after" TEXT  /* Option < String > */
+	"event_time" timestamp with time zone,  /* Option < TimestampWithTimeZone > */
+	"error_type" TEXT,  /* String */
+	"error_message" TEXT,  /* String */
+	"remediation" TEXT  /* String */
 )
 STRICT 
 LANGUAGE c /* Rust */
-AS 'MODULE_PATHNAME', 'explain_query_rewrite_wrapper';
+AS 'MODULE_PATHNAME', 'diagnose_errors_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/api/self_monitoring.rs:566
--- pg_trickle::api::self_monitoring::explain_dag
-CREATE  FUNCTION pgtrickle."explain_dag"(
-	"format" TEXT DEFAULT 'mermaid' /* Option < & str > */
-) RETURNS TEXT /* Option < String > */
-
+-- src/api/inbox.rs:485
+-- pg_trickle::api::inbox::inbox_health
+CREATE  FUNCTION pgtrickle."inbox_health"(
+	"p_name" TEXT /* & str */
+) RETURNS jsonb /* pgrx :: JsonB */
+STRICT 
 LANGUAGE c /* Rust */
-AS 'MODULE_PATHNAME', 'explain_dag_wrapper';
+AS 'MODULE_PATHNAME', 'inbox_health_wrapper';
+/* </end connected objects> */
+
+/* <begin connected objects> */
+-- src/api/diagnostics.rs:1373
+-- pg_trickle::api::diagnostics::create_refresh_group
+CREATE  FUNCTION pgtrickle."create_refresh_group"(
+	"group_name" TEXT, /* & str */
+	"members" TEXT[], /* Vec < String > */
+	"isolation" TEXT DEFAULT 'read_committed' /* & str */
+) RETURNS INT /* Result < i32, PgTrickleError > */
+STRICT 
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'create_refresh_group_wrapper';
+/* </end connected objects> */
+
+/* <begin connected objects> */
+-- src/api/diagnostics.rs:223
+-- pg_trickle::api::diagnostics::pgt_scc_status
+CREATE  FUNCTION pgtrickle."pgt_scc_status"() RETURNS TABLE (
+	"scc_id" INT,  /* i32 */
+	"member_count" INT,  /* i32 */
+	"members" TEXT[],  /* Vec < String > */
+	"last_iterations" INT,  /* Option < i32 > */
+	"last_converged_at" timestamp with time zone  /* Option < TimestampWithTimeZone > */
+)
+STRICT  
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'pgt_scc_status_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
@@ -2497,12 +2505,19 @@ AS 'MODULE_PATHNAME', 'gate_source_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/api/self_monitoring.rs:240
--- pg_trickle::api::self_monitoring::setup_self_monitoring
-CREATE  FUNCTION pgtrickle."setup_self_monitoring"() RETURNS void
-STRICT 
+-- src/api/diagnostics.rs:1164
+-- pg_trickle::api::diagnostics::watermarks
+CREATE  FUNCTION pgtrickle."watermarks"() RETURNS TABLE (
+	"source_table" TEXT,  /* String */
+	"schema_name" TEXT,  /* String */
+	"watermark" timestamp with time zone,  /* TimestampWithTimeZone */
+	"updated_at" timestamp with time zone,  /* TimestampWithTimeZone */
+	"advanced_by" TEXT,  /* Option < String > */
+	"wal_lsn" TEXT  /* Option < String > */
+)
+STRICT  
 LANGUAGE c /* Rust */
-AS 'MODULE_PATHNAME', 'setup_self_monitoring_wrapper';
+AS 'MODULE_PATHNAME', 'watermarks_fn_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
@@ -2518,26 +2533,15 @@ AS 'MODULE_PATHNAME', 'reset_fuse_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/api/mod.rs:4229
--- pg_trickle::api::resume_stream_table
-CREATE  FUNCTION pgtrickle."resume_stream_table"(
-	"name" TEXT /* & str */
-) RETURNS void
-STRICT 
-LANGUAGE c /* Rust */
-AS 'MODULE_PATHNAME', 'resume_stream_table_wrapper';
-/* </end connected objects> */
-
-/* <begin connected objects> */
--- src/api/inbox.rs:788
--- pg_trickle::api::inbox::disable_inbox_ordering
-CREATE  FUNCTION pgtrickle."disable_inbox_ordering"(
+-- src/api/inbox.rs:901
+-- pg_trickle::api::inbox::disable_inbox_priority
+CREATE  FUNCTION pgtrickle."disable_inbox_priority"(
 	"p_inbox" TEXT, /* & str */
 	"p_if_exists" bool DEFAULT false /* bool */
 ) RETURNS void
 STRICT 
 LANGUAGE c /* Rust */
-AS 'MODULE_PATHNAME', 'disable_inbox_ordering_wrapper';
+AS 'MODULE_PATHNAME', 'disable_inbox_priority_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
@@ -2565,85 +2569,136 @@ AS 'MODULE_PATHNAME', 'create_stream_table_if_not_exists_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/api/inbox.rs:937
--- pg_trickle::api::inbox::inbox_ordering_gaps
-CREATE  FUNCTION pgtrickle."inbox_ordering_gaps"(
-	"p_inbox_name" TEXT /* & str */
-) RETURNS TABLE (
-	"aggregate_id" TEXT,  /* String */
-	"expected_seq" bigint,  /* i64 */
-	"found_seq" bigint  /* i64 */
-)
-STRICT 
-LANGUAGE c /* Rust */
-AS 'MODULE_PATHNAME', 'inbox_ordering_gaps_wrapper';
-/* </end connected objects> */
-
-/* <begin connected objects> */
--- src/api/self_monitoring.rs:453
--- pg_trickle::api::self_monitoring::scheduler_overhead
-CREATE  FUNCTION pgtrickle."scheduler_overhead"() RETURNS TABLE (
-	"total_refreshes_1h" bigint,  /* i64 */
-	"df_refreshes_1h" bigint,  /* i64 */
-	"df_refresh_fraction" double precision,  /* Option < f64 > */
-	"avg_refresh_ms" double precision,  /* Option < f64 > */
-	"avg_df_refresh_ms" double precision,  /* Option < f64 > */
-	"total_refresh_time_s" double precision,  /* Option < f64 > */
-	"df_refresh_time_s" double precision  /* Option < f64 > */
-)
-STRICT 
-LANGUAGE c /* Rust */
-AS 'MODULE_PATHNAME', 'scheduler_overhead_wrapper';
-/* </end connected objects> */
-
-/* <begin connected objects> */
--- src/api/planner.rs:186
--- pg_trickle::api::planner::schedule_recommendations
-CREATE  FUNCTION pgtrickle."schedule_recommendations"() RETURNS TABLE (
-	"name" TEXT,  /* Option < String > */
-	"current_interval_seconds" double precision,  /* Option < f64 > */
-	"recommended_interval_seconds" double precision,  /* Option < f64 > */
-	"delta_pct" double precision,  /* Option < f64 > */
-	"confidence" double precision,  /* Option < f64 > */
-	"reasoning" TEXT  /* Option < String > */
-)
-STRICT 
-LANGUAGE c /* Rust */
-AS 'MODULE_PATHNAME', 'schedule_recommendations_wrapper';
-/* </end connected objects> */
-
-/* <begin connected objects> */
--- src/api/outbox.rs:529
--- pg_trickle::api::outbox::poll_outbox
-CREATE  FUNCTION pgtrickle."poll_outbox"(
-	"p_group" TEXT, /* & str */
-	"p_consumer" TEXT, /* & str */
-	"p_batch_size" INT DEFAULT 100, /* i32 */
-	"p_visibility_seconds" INT DEFAULT 30 /* i32 */
-) RETURNS TABLE (
-	"outbox_id" bigint,  /* i64 */
-	"pgt_id" uuid,  /* pgrx :: Uuid */
-	"created_at" timestamp with time zone,  /* TimestampWithTimeZone */
-	"inserted_count" bigint,  /* i64 */
-	"deleted_count" bigint,  /* i64 */
-	"is_claim_check" bool,  /* bool */
-	"payload" jsonb  /* Option < pgrx :: JsonB > */
-)
-STRICT 
-LANGUAGE c /* Rust */
-AS 'MODULE_PATHNAME', 'poll_outbox_wrapper';
-/* </end connected objects> */
-
-/* <begin connected objects> */
--- src/api/outbox.rs:804
--- pg_trickle::api::outbox::consumer_heartbeat
-CREATE  FUNCTION pgtrickle."consumer_heartbeat"(
-	"p_group" TEXT, /* & str */
-	"p_consumer" TEXT /* & str */
+-- src/api/publication.rs:73
+-- pg_trickle::api::publication::drop_stream_table_publication
+CREATE  FUNCTION pgtrickle."drop_stream_table_publication"(
+	"name" TEXT /* & str */
 ) RETURNS void
 STRICT 
 LANGUAGE c /* Rust */
-AS 'MODULE_PATHNAME', 'consumer_heartbeat_wrapper';
+AS 'MODULE_PATHNAME', 'drop_stream_table_publication_wrapper';
+/* </end connected objects> */
+
+/* <begin connected objects> */
+-- src/monitor.rs:2555
+-- pg_trickle::monitor::health_check
+CREATE  FUNCTION pgtrickle."health_check"() RETURNS TABLE (
+	"check_name" TEXT,  /* String */
+	"severity" TEXT,  /* String */
+	"detail" TEXT  /* String */
+)
+STRICT  
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'health_check_wrapper';
+/* </end connected objects> */
+
+/* <begin connected objects> */
+-- src/api/snapshot.rs:549
+-- pg_trickle::api::snapshot::drop_snapshot
+CREATE  FUNCTION pgtrickle."drop_snapshot"(
+	"p_snapshot_table" TEXT /* & str */
+) RETURNS void
+STRICT 
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'drop_snapshot_wrapper';
+/* </end connected objects> */
+
+/* <begin connected objects> */
+-- src/api/diagnostics.rs:1252
+-- pg_trickle::api::diagnostics::watermark_status
+CREATE  FUNCTION pgtrickle."watermark_status"() RETURNS TABLE (
+	"group_name" TEXT,  /* String */
+	"min_watermark" timestamp with time zone,  /* Option < TimestampWithTimeZone > */
+	"max_watermark" timestamp with time zone,  /* Option < TimestampWithTimeZone > */
+	"lag_secs" double precision,  /* Option < f64 > */
+	"aligned" bool,  /* bool */
+	"sources_with_watermark" INT,  /* i32 */
+	"sources_total" INT  /* i32 */
+)
+STRICT  
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'watermark_status_fn_wrapper';
+/* </end connected objects> */
+
+/* <begin connected objects> */
+-- src/hash.rs:33
+-- pg_trickle::hash::pg_trickle_hash
+CREATE  FUNCTION pgtrickle."pg_trickle_hash"(
+	"input" TEXT /* Option < & str > */
+) RETURNS bigint /* i64 */
+IMMUTABLE PARALLEL SAFE 
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'pg_trickle_hash_wrapper';
+/* </end connected objects> */
+
+/* <begin connected objects> */
+-- src/api/mod.rs:4271
+-- pg_trickle::api::refresh_stream_table
+CREATE  FUNCTION pgtrickle."refresh_stream_table"(
+	"name" TEXT /* & str */
+) RETURNS void
+STRICT 
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'refresh_stream_table_wrapper';
+/* </end connected objects> */
+
+/* <begin connected objects> */
+-- src/lib.rs:745
+-- requires:
+--   refresh_stream_table
+
+
+CREATE OR REPLACE FUNCTION pgtrickle."refresh_if_stale"(
+    p_name   text,
+    p_max_age interval DEFAULT '5 minutes'::interval
+)
+RETURNS boolean
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    v_last_end timestamp with time zone;
+    v_refreshed boolean := false;
+BEGIN
+    SELECT MAX(end_time)
+      INTO v_last_end
+      FROM pgtrickle.pgt_refresh_history h
+      JOIN pgtrickle.pgt_stream_tables   s USING (pgt_id)
+     WHERE s.pgt_name = p_name
+       AND h.status = 'COMPLETED';
+
+    IF v_last_end IS NULL OR (now() - v_last_end) > p_max_age THEN
+        PERFORM pgtrickle.refresh_stream_table(p_name);
+        v_refreshed := true;
+    END IF;
+
+    RETURN v_refreshed;
+END;
+$$;
+
+COMMENT ON FUNCTION pgtrickle."refresh_if_stale"(text, interval) IS
+    'Refresh the named stream table only when the most recent completed '
+    'refresh is older than max_age.  Returns TRUE when a refresh was '
+    'triggered, FALSE when the table was fresh enough.';
+/* </end connected objects> */
+
+/* <begin connected objects> */
+-- src/api/diagnostics.rs:95
+-- pg_trickle::api::diagnostics::_signal_launcher_rescan
+CREATE  FUNCTION pgtrickle."_signal_launcher_rescan"() RETURNS void
+STRICT 
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', '_signal_launcher_rescan_wrapper';
+/* </end connected objects> */
+
+/* <begin connected objects> */
+-- src/api/mod.rs:794
+-- pg_trickle::api::bulk_create
+CREATE  FUNCTION pgtrickle."bulk_create"(
+	"definitions" jsonb /* pgrx :: JsonB */
+) RETURNS jsonb /* pgrx :: JsonB */
+STRICT 
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'bulk_create_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
@@ -2658,83 +2713,28 @@ AS 'MODULE_PATHNAME', 'stream_table_to_publication_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/api/diagnostics.rs:296
--- pg_trickle::api::diagnostics::explain_refresh_mode
-CREATE  FUNCTION pgtrickle."explain_refresh_mode"(
-	"name" TEXT /* & str */
-) RETURNS TABLE (
-	"configured_mode" TEXT,  /* String */
-	"effective_mode" TEXT,  /* Option < String > */
-	"downgrade_reason" TEXT  /* Option < String > */
-)
+-- src/api/helpers.rs:2640
+-- pg_trickle::api::helpers::restore_stream_tables
+CREATE  FUNCTION pgtrickle."restore_stream_tables"() RETURNS VOID /* Result < (), crate :: error :: PgTrickleError > */
 STRICT 
 LANGUAGE c /* Rust */
-AS 'MODULE_PATHNAME', 'explain_refresh_mode_wrapper';
+AS 'MODULE_PATHNAME', 'restore_stream_tables_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/api/mod.rs:4299
--- pg_trickle::api::write_and_refresh
-CREATE  FUNCTION pgtrickle."write_and_refresh"(
-	"sql" TEXT, /* & str */
-	"stream_table_name" TEXT /* & str */
-) RETURNS void
-STRICT 
-LANGUAGE c /* Rust */
-AS 'MODULE_PATHNAME', 'write_and_refresh_wrapper';
-/* </end connected objects> */
-
-/* <begin connected objects> */
--- src/api/diagnostics.rs:95
--- pg_trickle::api::diagnostics::_signal_launcher_rescan
-CREATE  FUNCTION pgtrickle."_signal_launcher_rescan"() RETURNS void
-STRICT 
-LANGUAGE c /* Rust */
-AS 'MODULE_PATHNAME', '_signal_launcher_rescan_wrapper';
-/* </end connected objects> */
-
-/* <begin connected objects> */
--- src/api/self_monitoring.rs:358
--- pg_trickle::api::self_monitoring::self_monitoring_status
-CREATE  FUNCTION pgtrickle."self_monitoring_status"() RETURNS TABLE (
-	"st_name" TEXT,  /* String */
-	"exists" bool,  /* bool */
-	"status" TEXT,  /* Option < String > */
-	"refresh_mode" TEXT,  /* Option < String > */
-	"last_refresh_at" TEXT,  /* Option < String > */
-	"total_refreshes" bigint  /* Option < i64 > */
-)
-STRICT 
-LANGUAGE c /* Rust */
-AS 'MODULE_PATHNAME', 'self_monitoring_status_wrapper';
-/* </end connected objects> */
-
-/* <begin connected objects> */
--- src/api/diagnostics.rs:1504
--- pg_trickle::api::diagnostics::worker_allocation_status
-CREATE  FUNCTION pgtrickle."worker_allocation_status"() RETURNS TABLE (
-	"db_name" TEXT,  /* String */
-	"workers_used" bigint,  /* i64 */
-	"workers_quota" bigint,  /* i64 */
-	"workers_queued" bigint,  /* i64 */
-	"cluster_active" bigint,  /* i64 */
-	"cluster_max" bigint  /* i64 */
+-- src/monitor.rs:3066
+-- pg_trickle::monitor::trigger_inventory
+CREATE  FUNCTION pgtrickle."trigger_inventory"() RETURNS TABLE (
+	"source_table" TEXT,  /* String */
+	"source_oid" bigint,  /* i64 */
+	"trigger_name" TEXT,  /* String */
+	"trigger_type" TEXT,  /* String */
+	"present" bool,  /* bool */
+	"enabled" bool  /* bool */
 )
 STRICT  
 LANGUAGE c /* Rust */
-AS 'MODULE_PATHNAME', 'worker_allocation_status_fn_wrapper';
-/* </end connected objects> */
-
-/* <begin connected objects> */
--- src/api/publication.rs:126
--- pg_trickle::api::publication::set_stream_table_sla
-CREATE  FUNCTION pgtrickle."set_stream_table_sla"(
-	"name" TEXT, /* & str */
-	"sla" interval /* Interval */
-) RETURNS void
-STRICT 
-LANGUAGE c /* Rust */
-AS 'MODULE_PATHNAME', 'set_stream_table_sla_wrapper';
+AS 'MODULE_PATHNAME', 'trigger_inventory_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */

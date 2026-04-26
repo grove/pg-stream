@@ -54,7 +54,7 @@ SELECT pg_catalog.pg_extension_config_dump('pgtrickle.pgt_worker_slots', '');
 
 CREATE OR REPLACE VIEW pgtrickle.citus_status AS
 SELECT
-    ct.pgt_id,
+    st.pgt_id,
     st.pgt_schema,
     st.pgt_name,
     ct.source_relid,
@@ -67,9 +67,9 @@ SELECT
     ws.slot_name           AS worker_slot,
     ws.last_frontier       AS worker_frontier
 FROM pgtrickle.pgt_change_tracking ct
-JOIN pgtrickle.pgt_stream_tables   st ON st.pgt_id = ct.pgt_id
+JOIN pgtrickle.pgt_stream_tables   st ON st.pgt_id = ANY(ct.tracked_by_pgt_ids)
 LEFT JOIN pgtrickle.pgt_worker_slots ws
-       ON ws.pgt_id       = ct.pgt_id
+       ON ws.pgt_id       = st.pgt_id
       AND ws.source_relid = ct.source_relid
 WHERE ct.source_placement = 'distributed';
 
