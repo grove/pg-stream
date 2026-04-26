@@ -187,13 +187,24 @@ same pg_trickle version on all nodes before creating distributed stream tables.
 
 ## Known Limitations
 
+- **Scheduler integration not yet automated** (v0.33.0): The infrastructure for
+  per-worker WAL slot polling is complete (`poll_worker_slot_changes`,
+  `ensure_worker_slot`, `handle_vp_promoted`, `pgt_st_locks` coordination),
+  but the scheduler's main loop does not yet automatically call it. Manual
+  polling via `LISTEN "pg_ripple.vp_promoted" + handle_vp_promoted()` or custom
+  application logic is required.  Full end-to-end automation is planned for a
+  future release.
+
 - **Shard rebalancing** (Citus `citus_rebalance_start`) invalidates per-worker
   WAL slots. Manual recovery is required (see above).
+
 - **MERGE** is not supported for distributed stream tables. pg_trickle
   automatically uses the `DELETE + INSERT … ON CONFLICT DO UPDATE` path for
   distributed output tables.
+
 - **Cross-shard JOINs** in the stream table query follow normal Citus pushdown
   rules. If the plan is not pushable, the query runs on the coordinator.
+
 - Citus reference tables work as sources with trigger-based CDC only
   (per-worker WAL slots are not needed for reference tables).
 
