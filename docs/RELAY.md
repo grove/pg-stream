@@ -1,5 +1,34 @@
 # pgtrickle-relay — Architecture & Operations Guide
 
+## What is the relay? Do I need it?
+
+`pgtrickle-relay` is an optional standalone binary that bridges
+pg_trickle's outbox and inbox tables to external messaging systems:
+NATS JetStream, Kafka, HTTP webhooks, Redis Streams, SQS, and
+RabbitMQ.
+
+**You need the relay when:**
+- You want stream table deltas to flow automatically to a message queue
+  or event bus (Kafka, NATS, …) without application-level polling code.
+- You receive events from an external system and need them in PostgreSQL
+  reliably and idempotently.
+- You want high-availability message delivery with automatic failover
+  (the relay uses advisory locks to elect one active instance per
+  pipeline group).
+
+**You do NOT need the relay when:**
+- Your consumers read directly from PostgreSQL (they can call
+  `pgtrickle.poll_outbox()` themselves).
+- You only need PostgreSQL-to-PostgreSQL replication (use logical
+  replication or publications instead).
+- You are still evaluating pg_trickle — start with the outbox/inbox
+  pattern first; add the relay binary later if you need external delivery.
+
+> The relay is a separate workspace member in `pgtrickle-relay/`.
+> For the user-facing pattern guide see [Pattern 9: Relay](PATTERNS.md#pattern-9-bidirectional-event-pipeline-with-relay-v0290).
+
+---
+
 `pgtrickle-relay` is a standalone Rust CLI binary that bridges pg-trickle
 outbox/inbox tables with external messaging systems.
 

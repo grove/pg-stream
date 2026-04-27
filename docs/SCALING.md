@@ -357,3 +357,13 @@ dashboards can filter by database without requiring separate scrape targets:
 ```promql
 rate(pg_trickle_refreshes_total{db_name="tenant_a"}[5m])
 ```
+
+---
+
+**See also:**
+[Capacity Planning](CAPACITY_PLANNING.md) ·
+[Configuration](CONFIGURATION.md) ·
+[Multi-Database Deployments](MULTI_DATABASE.md) ·
+[Performance Cookbook](PERFORMANCE_COOKBOOK.md) ·
+[Cost Model](COST_MODEL.md) ·
+[Pre-Deployment Checklist](PRE_DEPLOYMENT.md)

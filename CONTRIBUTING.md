@@ -161,6 +161,20 @@ docs: document JOIN key change limitation in SQL_REFERENCE
 test: add E2E test for keyless table duplicate-row behaviour
 ```
 
+## Documentation Policy
+
+**Every new feature ships with documentation.** This is a hard requirement,
+not a nice-to-have.
+
+- New SQL functions → entry in `docs/SQL_REFERENCE.md`.
+- New GUC variable → entry in `docs/CONFIGURATION.md`.
+- New user-facing capability → at minimum a paragraph in the relevant
+  chapter; for headline features, a dedicated page.
+- New page → add it to `docs/SUMMARY.md` in the correct chapter.
+
+PRs that introduce a `#[pg_extern]` function or a new GUC without
+documentation will be asked to add it before merge.
+
 ## License
 
 By contributing you agree that your contributions will be licensed under the

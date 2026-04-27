@@ -4,6 +4,22 @@ This guide shows how to incrementally migrate existing PostgreSQL
 `MATERIALIZED VIEW` + manual `REFRESH` workflows to pg_trickle stream
 tables.
 
+## Coming from a different background?
+
+The step-by-step guide below covers the PostgreSQL materialized view path.
+If you are migrating from a different system, start here:
+
+| You are migrating from | Jump to |
+|---|---|
+| PostgreSQL `MATERIALIZED VIEW` + `REFRESH` | This guide |
+| `pg_ivm` | [Migrating from pg_ivm](MIGRATING_FROM_PG_IVM.md) |
+| Cron-based `REFRESH` (`pg_cron`, OS cron) | [Step 6 — Remove external refresh jobs](#6-remove-external-refresh-jobs) |
+| Application-level refresh (manual SQL in code) | [Step 2 — Create the stream table](#2-create-the-stream-table) |
+| Debezium + Materialize / RisingWave | Port your queries to PostgreSQL SQL, then follow this guide. See [Comparisons](../COMPARISONS.md) for feature mapping. |
+| Looker PDTs (Persistent Derived Tables) | PDTs map closely to stream tables. Translate the PDT SQL to a `create_stream_table()` call; the schedule replaces the PDT caching strategy. |
+| Snowflake Dynamic Tables | The concepts are nearly identical. Map `TARGET_LAG` to a pg_trickle `schedule`; `DOWNSTREAM` is `schedule => 'calculated'`. See [Comparisons](../COMPARISONS.md). |
+| Homemade ETL pipeline (INSERT ... SELECT) | Replace the periodic ETL job with a stream table using the same SELECT query. |
+
 ## Why Migrate?
 
 | | Materialized View | Stream Table |

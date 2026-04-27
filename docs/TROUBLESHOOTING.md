@@ -762,3 +762,13 @@ When investigating any issue, follow this sequence:
 | `pg_trickle.auto_backoff` | `on` | Stretches intervals up to 8x under load |
 | `pg_trickle.frontier_holdback_mode` | `xmin` | `none` disables holdback (unsafe); `xmin` = safe default |
 | `pg_trickle.frontier_holdback_warn_seconds` | `60` | Warn after holding back for this many seconds |
+
+---
+
+**See also:**
+[Error Reference](ERRORS.md) ·
+[Configuration](CONFIGURATION.md) ·
+[FAQ](FAQ.md) ·
+[Pre-Deployment Checklist](PRE_DEPLOYMENT.md) ·
+[Capacity Planning](CAPACITY_PLANNING.md) ·
+[CDC Modes](CDC_MODES.md)

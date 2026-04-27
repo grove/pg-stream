@@ -98,6 +98,14 @@ SELECT pgtrickle.create_stream_table(
 - **Don't use IMMEDIATE mode for Gold.** Aggregate maintenance on every
   DML row is expensive — batched DIFFERENTIAL is more efficient.
 
+### When NOT to use this pattern
+
+- Your data never changes after insert — a single stream table is simpler.
+- The Bronze source is external (foreign table, `dblink`) — CDC triggers
+  cannot be attached to foreign tables; use WAL CDC mode or FULL refresh.
+- You have fewer than ~10,000 rows in Silver — the overhead of three layers
+  is not justified; use one or two tables instead.
+
 ---
 
 ## Pattern 2: Event Sourcing with Stream Tables
@@ -160,6 +168,15 @@ SELECT pgtrickle.create_stream_table(
 - **Don't use `append_only => true` with UPDATE/DELETE patterns.** The
   `append_only` flag skips DELETE tracking in the change buffer — only
   use it when the source truly never updates or deletes.
+
+### When NOT to use this pattern
+
+- Your event log is consumed and processed in real time by application
+  code — a stream table adds latency without benefit.
+- You need strict per-event ordering guarantees within a transaction —
+  use `IMMEDIATE` mode with a single-row projection instead.
+- Your events are multi-gigabyte payloads — stream tables replicate the
+  whole row; store only metadata in the event log, not the payload.
 
 ---
 
@@ -232,6 +249,16 @@ SELECT pgtrickle.create_stream_table(
 - **Don't forget to index `valid_to IS NULL` for SCD-2 sources.** Without
   it, the delta scan touches all historical rows.
 
+### When NOT to use this pattern
+
+- You already have a purpose-built slowly-changing-dimension ETL tool
+  (e.g. dbt snapshots) — pg_trickle's SCD support is complementary,
+  not a replacement, and duplicate ownership creates confusion.
+- Your dimension table changes every row on every load — DIFFERENTIAL
+  offers no benefit; use FULL refresh or rethink the source update pattern.
+- You need Type 3 (add-a-column) or Type 6 SCD — those require schema
+  evolution that pg_trickle does not automate today.
+
 ---
 
 ## Pattern 4: High-Fan-Out Topology
@@ -298,6 +325,15 @@ SELECT pgtrickle.create_stream_table('top_customers',
   If `daily_totals` and `by_region` must agree, give them the same
   schedule or use `diamond_consistency => 'atomic'`.
 
+### When NOT to use this pattern
+
+- You only have one or two downstream stream tables — the fan-out
+  pattern adds planning overhead that isn't justified below ~4 targets.
+- Downstream queries have incompatible refresh modes (e.g. one needs
+  IMMEDIATE, another needs FULL) — prefer separate source tables.
+- All downstream STs will always be queried together — a single
+  wider stream table may be simpler and faster.
+
 ---
 
 ## Pattern 5: Real-Time Dashboards
@@ -350,6 +386,17 @@ SELECT pgtrickle.create_stream_table(
   pooling drops temp tables between transactions; enable this flag to
   avoid stale PREPARE statements.
 
+### When NOT to use this pattern
+
+- The data source itself is the bottleneck (slow sensors, infrequent
+  API polling) — a sub-second schedule on a stream table that changes
+  once a minute burns CPU for nothing.
+- You need consistency across several related tiles — schedule them
+  together or use a single wider query rather than sub-second individual
+  refreshes that can transiently disagree.
+- Write throughput exceeds ~5,000 rows/s — IMMEDIATE mode adds latency
+  to every write; profile with `pg_trickle.latency_percentiles()` first.
+
 ---
 
 ## Pattern 6: Tiered Refresh Strategy
@@ -383,6 +430,16 @@ SELECT pgtrickle.alter_stream_table('audit_log_summary', tier => 'frozen');
 | warm   | 2x                 | Hourly reports, batch pipelines    |
 | cold   | 10x                | Daily analytics, low-priority STs  |
 | frozen | skip               | Paused/archived, manual refresh    |
+
+### When NOT to use this pattern
+
+- All your stream tables are equally critical — don't introduce
+  tier complexity just to have tiers; use a flat schedule instead.
+- Your scheduler runs with a single worker — tiering helps multi-worker
+  scheduling; it has no effect when `max_workers = 1`.
+- Tier multipliers change too frequently — tier is a static property;
+  if freshness requirements change continuously, use SLA scheduling
+  (`pg_trickle.sla_scheduling`) instead.
 
 ---
 
@@ -621,6 +678,16 @@ pg_trickle.consumer_cleanup_enabled = true
 - **Long processing without heartbeats:** Call `consumer_heartbeat()` every 10–15
   seconds for long-running processing to avoid being marked dead.
 
+### When NOT to use this pattern
+
+- You only need to expose stream table changes to a single application that
+  reads directly from PostgreSQL — a NOTIFY/LISTEN trigger or change table
+  is simpler than a full outbox.
+- Delivery guarantees are not required (analytics, dashboards) — the overhead
+  of consumer groups and offset tracking is not justified.
+- Your stream table refreshes every few seconds and consumers can tolerate
+  a few seconds of lag — just poll the stream table directly.
+
 ---
 
 ## Pattern 8: Transactional Inbox (v0.28.0)
@@ -731,6 +798,17 @@ pg_trickle.inbox_dlq_alert_max_per_refresh = 10   # alert on DLQ growth
   Producers must supply stable, unique `event_id` values — typically a UUID
   derived from the source event.
 
+### When NOT to use this pattern
+
+- Message volume is very high (>10,000/s) — the inbox table becomes a hot
+  bottleneck; consider a dedicated message queue (Kafka, NATS) fronting
+  a batch INSERT into the inbox.
+- Processing is purely stateless and idempotency is guaranteed by the
+  producer — writing to an inbox and querying `_pending` adds latency
+  without benefit over direct INSERT + trigger.
+- The event source already provides at-least-once with dedup — a second
+  layer of dedup in the inbox wastes storage.
+
 ---
 
 ## Pattern 9: Bidirectional Event Pipeline with Relay (v0.29.0)
@@ -836,3 +914,25 @@ at `:9090/health`.
 | `pgtrickle_relay_pipelines_owned` | Pipelines owned by this instance |
 
 See [RELAY.md](RELAY.md) for the full deployment guide.
+
+### When NOT to use this pattern
+
+- Your consumers run inside the same PostgreSQL database — use the outbox
+  pattern (Pattern 7) directly instead of adding a relay binary.
+- You only have one external system to integrate — a simple application
+  polling `poll_outbox()` is easier to operate than a standalone relay
+  process.
+- Your team does not want to operate an additional binary — the relay is
+  a Rust process with its own monitoring requirements; if that's a
+  burden, consider a managed connector (e.g. Debezium + publications).
+
+---
+
+**See also:**
+[Use Cases](USE_CASES.md) ·
+[Performance Cookbook](PERFORMANCE_COOKBOOK.md) ·
+[SQL Reference](SQL_REFERENCE.md) ·
+[Tutorials: What Happens on INSERT](tutorials/WHAT_HAPPENS_ON_INSERT.md) ·
+[Outbox Pattern](OUTBOX.md) ·
+[Inbox Pattern](INBOX.md) ·
+[Relay Guide](RELAY_GUIDE.md)

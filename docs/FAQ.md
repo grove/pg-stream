@@ -3154,3 +3154,12 @@ pg_trickle uses the following PostgreSQL connections:
 **`max_worker_processes`**: pg_trickle registers 1 background worker per database during `_PG_init()`. Ensure `max_worker_processes` (default 8) has room for the pg_trickle worker plus any other extensions.
 
 **Advisory locks**: The scheduler holds a session-level advisory lock per actively-refreshing ST. These are released immediately after each refresh completes.
+
+---
+
+**See also:**
+[Troubleshooting](TROUBLESHOOTING.md) ·
+[Error Reference](ERRORS.md) ·
+[Configuration](CONFIGURATION.md) ·
+[SQL Reference](SQL_REFERENCE.md) ·
+[Glossary](GLOSSARY.md)
