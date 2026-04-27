@@ -502,6 +502,137 @@ async fn test_consumer_lag_returns_metrics() {
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
+// Regression tests: outbox written by the refresh path (issue #660)
+// ══════════════════════════════════════════════════════════════════════════════
+
+/// Issue #660a: A manual differential refresh that produces rows must write at
+/// least one header row to `pgtrickle.outbox_<st>`.
+///
+/// Before the fix, `write_outbox_row` was never called from
+/// `execute_manual_differential_refresh`, so the outbox table stayed empty
+/// even after a successful refresh.
+#[tokio::test]
+async fn test_outbox_written_after_manual_refresh() {
+    let db = E2eDb::new().await.with_extension().await;
+    make_outbox_st(&db, "reg660a_src", "reg660a_st").await;
+
+    db.execute("SELECT pgtrickle.enable_outbox('reg660a_st')")
+        .await;
+
+    let outbox_name: String = db
+        .query_scalar(
+            "SELECT outbox_table_name FROM pgtrickle.pgt_outbox_config \
+             WHERE stream_table_name = 'reg660a_st'",
+        )
+        .await;
+
+    // Drive a source change after the initial refresh established the frontier.
+    db.execute("INSERT INTO reg660a_src VALUES (4, 'd')").await;
+
+    // Manual refresh — this is the path that was broken.
+    db.refresh_st("reg660a_st").await;
+
+    let outbox_row_count: i64 = db
+        .query_scalar(&format!("SELECT count(*) FROM pgtrickle.\"{outbox_name}\""))
+        .await;
+    assert!(
+        outbox_row_count >= 1,
+        "pgtrickle.{outbox_name} must contain at least one row after a \
+         non-empty differential refresh (regression test for issue #660)"
+    );
+}
+
+/// Issue #660b: The outbox header row written after a manual refresh must have
+/// accurate `inserted_count` and a non-NULL inline `payload` (when the delta
+/// is below the claim-check threshold).
+#[tokio::test]
+async fn test_outbox_header_row_has_correct_counts_and_payload() {
+    let db = E2eDb::new().await.with_extension().await;
+    make_outbox_st(&db, "reg660b_src", "reg660b_st").await;
+
+    db.execute("SELECT pgtrickle.enable_outbox('reg660b_st')")
+        .await;
+
+    let outbox_name: String = db
+        .query_scalar(
+            "SELECT outbox_table_name FROM pgtrickle.pgt_outbox_config \
+             WHERE stream_table_name = 'reg660b_st'",
+        )
+        .await;
+
+    // Two new rows — initial data (id 1,2,3) was loaded at create_st time.
+    db.execute("INSERT INTO reg660b_src VALUES (4, 'd'), (5, 'e')")
+        .await;
+    db.refresh_st("reg660b_st").await;
+
+    // Fetch individual columns from the most recent outbox header row.
+    let inserted: i64 = db
+        .query_scalar(&format!(
+            "SELECT inserted_count FROM pgtrickle.\"{outbox_name}\" ORDER BY id DESC LIMIT 1"
+        ))
+        .await;
+    let is_claim_check: bool = db
+        .query_scalar(&format!(
+            "SELECT is_claim_check FROM pgtrickle.\"{outbox_name}\" ORDER BY id DESC LIMIT 1"
+        ))
+        .await;
+    let payload_is_null: bool = db
+        .query_scalar(&format!(
+            "SELECT payload IS NULL FROM pgtrickle.\"{outbox_name}\" ORDER BY id DESC LIMIT 1"
+        ))
+        .await;
+
+    assert_eq!(
+        inserted, 2,
+        "inserted_count should be 2 (regression test for issue #660)"
+    );
+    assert!(
+        !is_claim_check,
+        "is_claim_check should be false for a small delta (regression test for issue #660)"
+    );
+    assert!(
+        !payload_is_null,
+        "payload should not be NULL for an inline delta (regression test for issue #660)"
+    );
+}
+
+/// Issue #660c: `poll_outbox` must return rows after a real refresh cycle,
+/// confirming the end-to-end path: source change → refresh → outbox → poll.
+#[tokio::test]
+async fn test_poll_outbox_returns_rows_after_real_refresh() {
+    let db = E2eDb::new().await.with_extension().await;
+    make_outbox_st(&db, "reg660c_src", "reg660c_st").await;
+
+    db.execute("SELECT pgtrickle.enable_outbox('reg660c_st')")
+        .await;
+
+    let outbox_name: String = db
+        .query_scalar(
+            "SELECT outbox_table_name FROM pgtrickle.pgt_outbox_config \
+             WHERE stream_table_name = 'reg660c_st'",
+        )
+        .await;
+
+    db.execute(&format!(
+        "SELECT pgtrickle.create_consumer_group('grp_reg660c', '{outbox_name}', 'earliest')"
+    ))
+    .await;
+
+    // Drive a change and refresh.
+    db.execute("INSERT INTO reg660c_src VALUES (4, 'd')").await;
+    db.refresh_st("reg660c_st").await;
+
+    let polled_count: i64 = db
+        .query_scalar("SELECT count(*) FROM pgtrickle.poll_outbox('grp_reg660c', 'w1', 100)")
+        .await;
+    assert!(
+        polled_count >= 1,
+        "poll_outbox must return at least one row after a real refresh cycle \
+         (regression test for issue #660)"
+    );
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
 // New catalog tables — existence checks
 // ══════════════════════════════════════════════════════════════════════════════
 
