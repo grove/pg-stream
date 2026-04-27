@@ -7,6 +7,7 @@ For future plans and upcoming features, see [ROADMAP.md](ROADMAP.md).
 ## Table of Contents
 
 <!-- TOC start -->
+- [0.37.0 — pgVector Incremental Aggregates & Distributed Trace Propagation](#0370--pgvector-incremental-aggregates--distributed-trace-propagation)
 - [0.36.0 — Structural Hardening, Performance & Temporal IVM](#0360--structural-hardening-performance--temporal-ivm)
 - [0.35.0 — Hardening, Reactive Subscriptions & Relay Resilience](#0350--hardening-reactive-subscriptions--relay-resilience)
 - [0.34.0 — Citus: Automated Distributed CDC Scheduler & Shard Recovery](#0340--citus-automated-distributed-cdc-scheduler--shard-recovery)
@@ -50,6 +51,88 @@ For future plans and upcoming features, see [ROADMAP.md](ROADMAP.md).
 - [0.1.1 — CloudNativePG Image & Test Hardening](#011--cloudnativepg-image--test-hardening)
 - [0.1.0 — Initial Release](#010--initial-release)
 <!-- TOC end -->
+
+---
+
+## [0.37.0] — pgVector Incremental Aggregates & Distributed Trace Propagation
+
+v0.37.0 adds two independent capability pillars: incremental vector aggregates
+for pgvector workloads, and W3C Trace Context propagation through the CDC →
+DVM → MERGE pipeline.
+
+### F4 — pgVector Incremental Aggregates
+
+Stream tables can now maintain `avg(embedding)` and `sum(embedding)` over
+`vector`, `halfvec`, and `sparsevec` columns incrementally. The DVM planner
+detects vector-typed aggregate arguments at plan time and reclassifies them to
+use pgvector-native differential operators (`VectorAvg`, `VectorSum`) that
+maintain a running `(count, sum_vector)` auxiliary state instead of a full
+table scan on every change.
+
+**SQL usage:**
+
+```sql
+CREATE EXTENSION pgvector;
+
+CREATE TABLE products (
+    id SERIAL PRIMARY KEY,
+    category TEXT,
+    embedding vector(3)
+);
+
+-- This stream table is maintained incrementally — no full scan on INSERT.
+SELECT pgtrickle.create_stream_table(
+    'category_centroids',
+    'SELECT category, avg(embedding)::vector AS centroid
+     FROM products GROUP BY category',
+    schedule => '5s'
+);
+```
+
+**GUC:** `SET pg_trickle.enable_vector_agg = on;` (session-level opt-in).
+
+**Distance operator fallback:** `<=>`, `<->`, `<#>` operators in WHERE clauses
+trigger automatic full-refresh fallback because they are non-monotone. The
+planner emits a `WARNING` so operators know the mode downgrade occurred.
+
+**Criterion benchmarks** are provided for vector_avg, vector_sum, and mixed
+workloads in `benches/diff_operators.rs`.
+
+**Documentation:** `docs/tutorials/PGVECTOR_EMBEDDING_PIPELINES.md`.
+
+### F10 — W3C Trace Context Propagation
+
+Every CDC change buffer table now contains a `__pgt_trace_context TEXT` column.
+When an application sets the `pg_trickle.trace_id` GUC before executing DML,
+the row-level and statement-level CDC triggers capture the W3C `traceparent`
+string into that column.
+
+After each differential refresh, if `pg_trickle.enable_trace_propagation = on`,
+the extension reads the trace context from the change buffer and either:
+
+- exports an OTLP/JSON span to `pg_trickle.otel_endpoint` (Jaeger, Zipkin,
+  OTEL Collector), or
+- logs the span at `INFO` level when no endpoint is configured.
+
+The span covers the full CDC-drain → DVM-plan → merge-apply cycle, linking
+PostgreSQL refresh latency directly to application request traces.
+
+**GUCs added:**
+
+| GUC | Type | Default | Description |
+|-----|------|---------|-------------|
+| `pg_trickle.enable_trace_propagation` | BOOL | `false` | Enable W3C trace propagation |
+| `pg_trickle.otel_endpoint` | STRING | `''` | OTLP HTTP endpoint (e.g. `http://localhost:4318`) |
+| `pg_trickle.trace_id` | STRING | `''` | W3C traceparent set by the application session |
+| `pg_trickle.enable_vector_agg` | BOOL | `false` | Enable incremental pgvector aggregates |
+
+**Upgrade:** The `0.36.0 → 0.37.0` migration script adds `__pgt_trace_context`
+to all existing change buffer tables automatically.
+
+### Internal improvements
+
+- **A15/A16:** `src/scheduler` and `src/refresh/merge` each split into focused
+  sub-modules (completed in v0.37.0 development cycle).
 
 ---
 
