@@ -124,4 +124,4 @@ To add a new rewrite pass:
 
 - [docs/DVM_OPERATORS.md](DVM_OPERATORS.md) — Per-operator differentiation rules
 - [docs/PERFORMANCE_COOKBOOK.md](PERFORMANCE_COOKBOOK.md) — Performance tuning
-- [src/dvm/parser/rewrites.rs](../src/dvm/parser/rewrites.rs) — Implementation
+- [src/dvm/parser/rewrites.rs](https://github.com/grove/pg-trickle/blob/main/src/dvm/parser/rewrites.rs) — Implementation

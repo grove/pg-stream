@@ -199,7 +199,7 @@ WHERE status IN ('ERROR', 'SUSPENDED');
 
 ### Grafana / Prometheus
 
-See the [monitoring/](../monitoring/) directory for ready-to-use
+See the [monitoring/](https://github.com/grove/pg-trickle/blob/main/monitoring/) directory for ready-to-use
 Grafana dashboards and Prometheus configuration.
 
 - [ ] Monitoring configured for stream table health

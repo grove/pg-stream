@@ -35,6 +35,11 @@ jobs:
             "https://github.com/rust-lang/mdBook/releases/download/v${MDBOOK_VERSION}/mdbook-v${MDBOOK_VERSION}-x86_64-unknown-linux-gnu.tar.gz" \
             | tar -xz -C ~/.cargo/bin
 
+      - name: Stage files outside docs/ into docs/ for mdBook
+        run: |
+          cp ESSENCE.md docs/ESSENCE.md
+          cp -r blog docs/blog
+
       - name: Build documentation
         run: mdbook build
 

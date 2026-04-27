@@ -3,6 +3,6 @@
 >
 > This page contains the project's vulnerability-reporting policy. The rendered
 > version is served by the [pg_trickle docs site](https://grove.github.io/pg-trickle/);
-> on GitHub the source is [SECURITY.md](../SECURITY.md).
+> on GitHub the source is [SECURITY.md](https://github.com/grove/pg-trickle/blob/main/SECURITY.md).
 
 {{#include ../SECURITY.md}}

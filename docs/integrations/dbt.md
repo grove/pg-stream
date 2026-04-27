@@ -42,7 +42,7 @@ Requires dbt-postgres 1.7+ and pg_trickle v0.30+.
 
 > The full configuration reference, supported materializations, macros,
 > testing guide, and CI setup are in the
-> [dbt-pgtrickle README](../../dbt-pgtrickle/README.md).
+> [dbt-pgtrickle README](https://github.com/grove/pg-trickle/blob/main/dbt-pgtrickle/README.md).
 
 ---
 

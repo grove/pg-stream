@@ -107,7 +107,7 @@ column on the dashboard.
 ## The DAG of Stream Tables (fraud)
 
 All nine stream tables are defined in
-[demo/postgres/fraud/02_stream_tables.sql](../demo/postgres/fraud/02_stream_tables.sql).
+[demo/postgres/fraud/02_stream_tables.sql](https://github.com/grove/pg-trickle/blob/main/demo/postgres/fraud/02_stream_tables.sql).
 
 ```
   Base tables             Layer 1 — Silver           Layer 2 — Gold              Layer 3 — Platinum
@@ -563,7 +563,7 @@ a visible revenue spike in the Category Revenue panel.
 ### The DAG of Stream Tables (ecommerce)
 
 All six stream tables are defined in
-[demo/postgres/ecommerce/02_stream_tables.sql](../demo/postgres/ecommerce/02_stream_tables.sql).
+[demo/postgres/ecommerce/02_stream_tables.sql](https://github.com/grove/pg-trickle/blob/main/demo/postgres/ecommerce/02_stream_tables.sql).
 
 ```
   Base tables          Layer 1 — Silver           Layer 2 — Gold         Layer 3 — Platinum
@@ -692,7 +692,7 @@ differential calculation pipeline.
 ### The DAG of Stream Tables (finance)
 
 All 10 stream tables are defined in
-[demo/postgres/finance/02_stream_tables.sql](../demo/postgres/finance/02_stream_tables.sql).
+[demo/postgres/finance/02_stream_tables.sql](https://github.com/grove/pg-trickle/blob/main/demo/postgres/finance/02_stream_tables.sql).
 
 This is the **deepest DAG in all three scenarios** — a 10-level cascade where each
 level reads only from the previous level (plus static reference data), creating

@@ -155,7 +155,7 @@ For very large DAGs:
 | 1000+ | Consider splitting across databases |
 
 The scheduler's zero-change overhead is documented in
-[README – Zero-Change Latency](../README.md#zero-change-latency)
+[README – Zero-Change Latency](https://github.com/grove/pg-trickle/blob/main/README.md#zero-change-latency)
 (target < 10 ms).
 
 ---

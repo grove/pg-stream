@@ -1,7 +1,7 @@
 # Architecture
 
 This document describes the internal architecture of pg_trickle — a PostgreSQL 18 extension that implements stream tables with differential view maintenance.
-For a high-level description of what pg_trickle does and why, read [ESSENCE.md](../ESSENCE.md). For release milestones and future plans, see [ROADMAP.md](../ROADMAP.md).
+For a high-level description of what pg_trickle does and why, read [ESSENCE.md](ESSENCE.md). For release milestones and future plans, see [Roadmap](roadmap.md).
 
 ---
 
@@ -181,7 +181,7 @@ When `pg_trickle.cdc_mode` is set to `'auto'` or `'wal'` and `wal_level = logica
 3. **Transition Orchestration** — The transition is a three-step process: (a) create a replication slot, (b) wait for the decoder to catch up to the trigger's last confirmed LSN, (c) drop the trigger and switch the dependency to WAL mode. If the decoder doesn't catch up within `pg_trickle.wal_transition_timeout` (default 300s), the system falls back to triggers.
 4. **CDC Mode Tracking** — Each source dependency in `pgt_dependencies` carries a `cdc_mode` column (TRIGGER / TRANSITIONING / WAL) and WAL-specific metadata (`slot_name`, `decoder_confirmed_lsn`, `transition_started_at`).
 
-See ADR-001 and ADR-002 in [plans/adrs/PLAN_ADRS.md](../plans/adrs/PLAN_ADRS.md) for the original design rationale and [plans/sql/PLAN_HYBRID_CDC.md](../plans/sql/PLAN_HYBRID_CDC.md) for the full implementation plan.
+See ADR-001 and ADR-002 in [plans/adrs/PLAN_ADRS.md](https://github.com/grove/pg-trickle/blob/main/plans/adrs/PLAN_ADRS.md) for the original design rationale and [plans/sql/PLAN_HYBRID_CDC.md](https://github.com/grove/pg-trickle/blob/main/plans/sql/PLAN_HYBRID_CDC.md) for the full implementation plan.
 
 #### Immediate Mode / Transactional IVM (`src/ivm.rs`)
 
@@ -193,7 +193,7 @@ When `refresh_mode = 'IMMEDIATE'`, pg_trickle uses **statement-level AFTER trigg
 4. **Delta Application** — The computed delta is applied via explicit DML (DELETE + INSERT ON CONFLICT) to the stream table.
 5. **TRUNCATE** — A separate AFTER TRUNCATE trigger calls `pgt_ivm_handle_truncate()`, which truncates the stream table and re-populates from the defining query.
 
-No change buffer tables, no scheduler involvement, and no WAL infrastructure is needed for IMMEDIATE mode. See [plans/sql/PLAN_TRANSACTIONAL_IVM.md](../plans/sql/PLAN_TRANSACTIONAL_IVM.md) for the design plan.
+No change buffer tables, no scheduler involvement, and no WAL infrastructure is needed for IMMEDIATE mode. See [plans/sql/PLAN_TRANSACTIONAL_IVM.md](https://github.com/grove/pg-trickle/blob/main/plans/sql/PLAN_TRANSACTIONAL_IVM.md) for the design plan.
 
 #### ST-to-ST Change Capture (v0.11.0+)
 
@@ -480,7 +480,7 @@ sequential path — downstream units only become ready after all upstream
 units succeed. The worker-budget caps ensure pg_trickle does not exhaust
 `max_worker_processes`.
 
-See [PLAN_PARALLELISM.md](../plans/sql/PLAN_PARALLELISM.md) for the full
+See [PLAN_PARALLELISM.md](https://github.com/grove/pg-trickle/blob/main/plans/sql/PLAN_PARALLELISM.md) for the full
 design and [CONFIGURATION.md](CONFIGURATION.md#parallel-refresh) for
 tuning guidance.
 

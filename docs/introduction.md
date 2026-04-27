@@ -17,7 +17,7 @@ INSERT INTO orders (id, status) VALUES (42, 'active');
 SELECT count(*) FROM active_orders;  -- 1, automatically
 ```
 
-> **New here?** Read **[What is pg_trickle?](../ESSENCE.md)** for the
+> **New here?** Read **[What is pg_trickle?](ESSENCE.md)** for the
 > plain-language overview, or jump to the
 > **[5-Minute Quickstart](QUICKSTART_5MIN.md)** to try it.
 
@@ -27,7 +27,7 @@ SELECT count(*) FROM active_orders;  -- 1, automatically
 
 | Persona | Start here |
 |---|---|
-| **Curious / evaluator** | [What is pg_trickle?](../ESSENCE.md) → [Use Cases](USE_CASES.md) → [Comparisons](COMPARISONS.md) → [Playground](PLAYGROUND.md) |
+| **Curious / evaluator** | [What is pg_trickle?](ESSENCE.md) → [Use Cases](USE_CASES.md) → [Comparisons](COMPARISONS.md) → [Playground](PLAYGROUND.md) |
 | **Application developer** | [5-Minute Quickstart](QUICKSTART_5MIN.md) → [Getting Started tutorial](GETTING_STARTED.md) → [Patterns](PATTERNS.md) → [SQL Reference](SQL_REFERENCE.md) |
 | **DBA / SRE** | [Pre-Deployment Checklist](PRE_DEPLOYMENT.md) → [Configuration](CONFIGURATION.md) → [Troubleshooting](TROUBLESHOOTING.md) → [Capacity Planning](CAPACITY_PLANNING.md) |
 | **Data / analytics engineer** | [Use Cases](USE_CASES.md) → [dbt integration](integrations/dbt.md) → [Migrating from materialized views](tutorials/MIGRATING_FROM_MATERIALIZED_VIEWS.md) |

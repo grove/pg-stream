@@ -195,6 +195,6 @@ Decrease `poll_interval_ms` in the pipeline config, or increase batch size.
 
 ## See also
 
-- [pgtrickle-relay README](../pgtrickle-relay/README.md) — quickstart and config reference
-- [PLAN_RELAY_CLI.md](../plans/relay/PLAN_RELAY_CLI.md) — full design document
+- [pgtrickle-relay README](https://github.com/grove/pg-trickle/blob/main/pgtrickle-relay/README.md) — quickstart and config reference
+- [PLAN_RELAY_CLI.md](https://github.com/grove/pg-trickle/blob/main/plans/relay/PLAN_RELAY_CLI.md) — full design document
 - [SQL_REFERENCE.md](SQL_REFERENCE.md) — complete SQL API reference

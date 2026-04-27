@@ -4,7 +4,7 @@ This guide walks through migrating existing `pg_ivm` IMMVs (Incrementally
 Maintained Materialized Views) to pg_trickle stream tables. It covers API
 mapping, behavioral differences, and a step-by-step migration checklist.
 
-> **See also:** [plans/ecosystem/GAP_PG_IVM_COMPARISON.md](../../plans/ecosystem/GAP_PG_IVM_COMPARISON.md)
+> **See also:** [plans/ecosystem/GAP_PG_IVM_COMPARISON.md](https://github.com/grove/pg-trickle/blob/main/plans/ecosystem/GAP_PG_IVM_COMPARISON.md)
 > for the full feature comparison and gap analysis between the two extensions.
 
 ---

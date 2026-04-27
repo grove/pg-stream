@@ -240,7 +240,7 @@ The `bench_no_data_refresh_latency` test measures the overhead of a refresh when
 |--------|---------|
 | **Avg** | Average wall-clock time across 10 no-op refreshes |
 | **Max** | Worst-case single iteration |
-| **Target** | The [PLAN.md](../plans/PLAN.md) goal: < 10 ms per no-op refresh |
+| **Target** | The [PLAN.md](https://github.com/grove/pg-trickle/blob/main/plans/PLAN.md) goal: < 10 ms per no-op refresh |
 | **Status** | PASS if avg < 10 ms, SLOW otherwise |
 
 A passing result confirms the scheduler's per-cycle overhead is negligible. Values > 10 ms in containerized environments may be acceptable due to Docker overhead; bare-metal PostgreSQL should comfortably meet the target.
@@ -384,7 +384,7 @@ cargo test --test e2e_dag_bench_tests --features pg18 -- --ignored bench_through
 
 ### Theoretical Comparison
 
-Each latency benchmark computes the theoretical prediction from [PLAN_DAG_PERFORMANCE.md](../plans/performance/PLAN_DAG_PERFORMANCE.md) and reports the delta:
+Each latency benchmark computes the theoretical prediction from [PLAN_DAG_PERFORMANCE.md](https://github.com/grove/pg-trickle/blob/main/plans/performance/PLAN_DAG_PERFORMANCE.md) and reports the delta:
 
 | Mode | Formula |
 |------|---------|

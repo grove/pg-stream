@@ -1477,7 +1477,7 @@ SET pg_trickle.ivm_recursive_max_depth = 500;
 These settings control whether and how the scheduler dispatches refresh
 work to multiple dynamic background workers instead of processing
 stream tables sequentially. See
-[PLAN_PARALLELISM.md](../plans/sql/PLAN_PARALLELISM.md) for the design.
+[PLAN_PARALLELISM.md](https://github.com/grove/pg-trickle/blob/main/plans/sql/PLAN_PARALLELISM.md) for the design.
 
 > **Note:** Parallel refresh is new in v0.4.0 and defaults to `off`. Enable
 > it via `pg_trickle.parallel_refresh_mode` after validating your workload.
@@ -2919,6 +2919,6 @@ SELECT pg_reload_conf();
 
 ## Further Reading
 
-- [INSTALL.md](../INSTALL.md) — Installation and initial configuration
+- [Installation](installation.md) — Installation and initial configuration
 - [ARCHITECTURE.md](ARCHITECTURE.md) — System architecture overview
 - [SQL_REFERENCE.md](SQL_REFERENCE.md) — Complete function reference

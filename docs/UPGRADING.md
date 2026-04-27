@@ -929,7 +929,7 @@ done
 
 ## CloudNativePG (CNPG)
 
-For CNPG deployments, see [cnpg/README.md](../cnpg/) for upgrade
+For CNPG deployments, see [cnpg/README.md](https://github.com/grove/pg-trickle/blob/main/cnpg/) for upgrade
 instructions specific to the Kubernetes operator.
 
 ---

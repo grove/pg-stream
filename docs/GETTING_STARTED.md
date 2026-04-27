@@ -49,9 +49,9 @@ This tutorial walks through a concrete org-chart example so you can see this flo
 
 ## Prerequisites
 
-- PostgreSQL 18.x with pg_trickle installed (see [INSTALL.md](../INSTALL.md))
+- PostgreSQL 18.x with pg_trickle installed (see [Installation](installation.md))
 - `shared_preload_libraries = 'pg_trickle'` in `postgresql.conf`
-- `max_worker_processes` raised to at least 32 (see [INSTALL.md](../INSTALL.md#postgresql-configuration)); the PostgreSQL default of 8 is often exhausted if you have several databases, causing stream tables to silently stop refreshing
+- `max_worker_processes` raised to at least 32 (see [Installation](installation.md#postgresql-configuration)); the PostgreSQL default of 8 is often exhausted if you have several databases, causing stream tables to silently stop refreshing
 - `psql` or any SQL client
 
 > **Deploying to production?** See the [Pre-Deployment Checklist](PRE_DEPLOYMENT.md)
@@ -63,7 +63,7 @@ This tutorial walks through a concrete org-chart example so you can see this flo
 > ```bash
 > docker run --rm -e POSTGRES_PASSWORD=secret -p 5432:5432 ghcr.io/grove/pg_trickle:latest
 > ```
-> All GUC defaults (`wal_level`, `shared_preload_libraries`, scheduler settings) are pre-configured. See [INSTALL.md](../INSTALL.md#4-ghcr-docker-image-recommended-for-local-dev) for tag details and volume mounting.
+> All GUC defaults (`wal_level`, `shared_preload_libraries`, scheduler settings) are pre-configured. See [Installation](installation.md#4-ghcr-docker-image-recommended-for-local-dev) for tag details and volume mounting.
 
 Connect to the database you want to use and enable the extension:
 
@@ -222,7 +222,7 @@ By the end you will have:
 > ```bash
 > ./examples/dbt_getting_started/scripts/run_example.sh
 > ```
-> See [examples/dbt_getting_started/](../examples/dbt_getting_started/) for full details.
+> See [examples/dbt_getting_started/](https://github.com/grove/pg-trickle/tree/main/examples/dbt_getting_started/) for full details.
 
 ---
 
@@ -1124,7 +1124,7 @@ cd monitoring && docker compose up
 
 This starts PostgreSQL + postgres_exporter + Prometheus + Grafana with
 pre-configured dashboards and alerting rules. Grafana is available at
-`http://localhost:3000` (admin/admin). See [monitoring/README.md](../monitoring/README.md)
+`http://localhost:3000` (admin/admin). See the [monitoring README](https://github.com/grove/pg-trickle/blob/main/monitoring/README.md)
 for the full list of exported metrics and alert conditions.
 
 **Key Prometheus metrics:**
@@ -1487,4 +1487,4 @@ The control plane continues operating identically without self-monitoring.
 - **[What Happens on UPDATE](tutorials/WHAT_HAPPENS_ON_UPDATE.md)** — How UPDATEs are split into D+I, group key changes, and net-effect computation
 - **[What Happens on DELETE](tutorials/WHAT_HAPPENS_ON_DELETE.md)** — Reference counting, group deletion, and INSERT+DELETE cancellation
 - **[What Happens on TRUNCATE](tutorials/WHAT_HAPPENS_ON_TRUNCATE.md)** — Why TRUNCATE bypasses triggers and how to recover
-- **[dbt Getting Started example](../examples/dbt_getting_started/)** — Everything above, expressed as dbt models and seeds with a one-command Docker runner
+- **[dbt Getting Started example](https://github.com/grove/pg-trickle/tree/main/examples/dbt_getting_started/)** — Everything above, expressed as dbt models and seeds with a one-command Docker runner

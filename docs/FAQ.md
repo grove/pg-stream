@@ -309,7 +309,7 @@ That said, as with any new extension, you should evaluate it against your specif
    CREATE EXTENSION pg_trickle;
    ```
 
-See [INSTALL.md](../INSTALL.md) for platform-specific instructions and pre-built release artifacts.
+See [Installation](installation.md) for platform-specific instructions and pre-built release artifacts.
 
 ### What are the minimum configuration requirements?
 
@@ -2287,8 +2287,8 @@ However, stream tables replicated from the primary are **readable** on the stand
 
 pg_trickle is compatible with CloudNativePG. The `cnpg/` directory in the repository contains example manifests:
 
-- [Dockerfile.ext](../cnpg/Dockerfile.ext) — builds a PostgreSQL image with pg_trickle pre-installed
-- [cluster-example.yaml](../cnpg/cluster-example.yaml) — CloudNativePG Cluster manifest with `shared_preload_libraries = 'pg_trickle'`
+- [Dockerfile.ext](https://github.com/grove/pg-trickle/blob/main/cnpg/Dockerfile.ext) — builds a PostgreSQL image with pg_trickle pre-installed
+- [cluster-example.yaml](https://github.com/grove/pg-trickle/blob/main/cnpg/cluster-example.yaml) — CloudNativePG Cluster manifest with `shared_preload_libraries = 'pg_trickle'`
 
 Key considerations:
 - Include `pg_trickle` in `shared_preload_libraries` in the Cluster's `postgresql` configuration.
@@ -2695,7 +2695,7 @@ called during unit tests (pure Rust logic only).
 This does **not** affect integration tests, E2E tests, `just lint`,
 `just build`, or the extension running inside PostgreSQL.
 
-See the [Installation Guide](../INSTALL.md#unit-tests-crash-on-macos-26-symbol-not-found-in-flat-namespace) for details and manual usage.
+See the [Installation Guide](installation.md#unit-tests-crash-on-macos-26-symbol-not-found-in-flat-namespace) for details and manual usage.
 
 ### My stream table is stuck in INITIALIZING status
 
