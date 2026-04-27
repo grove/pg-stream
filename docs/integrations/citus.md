@@ -128,7 +128,9 @@ SELECT
     worker_name,
     worker_port,
     worker_slot,
-    worker_frontier
+    worker_frontier,
+    last_polled_at,     -- v0.34.0+
+    lease_health        -- v0.34.0+: 'unlocked' | 'locked' | 'expired'
 FROM pgtrickle.citus_status
 ORDER BY pgt_name, worker_name;
 ```
@@ -141,6 +143,18 @@ ORDER BY pgt_name, worker_name;
 | `worker_port` | Port of the Citus worker |
 | `worker_slot` | WAL slot name on the worker |
 | `worker_frontier` | Last consumed LSN on the worker |
+| `last_polled_at` | Timestamp of the last successful poll for each worker slot (v0.34.0+) |
+| `lease_holder` | Session that currently holds the `pgt_st_locks` lease, if any (v0.34.0+) |
+| `lease_acquired_at` | When the current lease was acquired (v0.34.0+) |
+| `lease_expires_at` | When the current lease expires (v0.34.0+) |
+| `lease_health` | `'unlocked'`, `'locked'`, or `'expired'` (v0.34.0+) |
+
+### Worker-failure alerting GUC (v0.34.0)
+
+| GUC | Default | Description |
+|-----|---------|-------------|
+| `pg_trickle.citus_worker_retry_ticks` | `5` | Consecutive per-worker poll failures before raising a WARNING in the PostgreSQL log. Set to `0` to disable. |
+| `pg_trickle.citus_st_lock_lease_ms` | `60000` | Duration (ms) of the `pgt_st_locks` distributed-refresh lease. Must be ≥ `pg_ripple.merge_fence_timeout_ms` when pg_ripple is in use. |
 
 ## Failure Modes
 
@@ -171,13 +185,16 @@ SELECT pg_drop_replication_slot('pgtrickle_<stable_name>');
 
 ### Shard rebalance
 
-Citus shard rebalancing changes which worker holds which shards. pg_trickle
-detects a topology change (by comparing `pg_dist_node` node sets) and raises
-an error rather than silently producing incorrect results.
+Citus shard rebalancing changes which worker holds which shards. Since v0.34.0,
+pg_trickle detects a topology change automatically (by comparing `pg_dist_node`
+active primaries against `pgt_worker_slots`) and recovers without operator
+intervention:
 
-**Recovery**: After a rebalance, drop and recreate the affected stream tables.
-Tracking automatic slot migration post-rebalance is planned for a future
-release.
+1. Stale slot entries for removed workers are dropped.
+2. New `pgt_worker_slots` rows are inserted for the incoming workers.
+3. The affected stream table is marked for a full refresh on the next tick.
+
+No manual `DROP + CREATE` of stream tables is required after a rebalance.
 
 ### Version mismatch across nodes
 
@@ -186,17 +203,6 @@ If pg_trickle versions differ between the coordinator and workers,
 same pg_trickle version on all nodes before creating distributed stream tables.
 
 ## Known Limitations
-
-- **Scheduler integration not yet automated** (v0.33.0): The infrastructure for
-  per-worker WAL slot polling is complete (`poll_worker_slot_changes`,
-  `ensure_worker_slot`, `handle_vp_promoted`, `pgt_st_locks` coordination),
-  but the scheduler's main loop does not yet automatically call it. Manual
-  polling via `LISTEN "pg_ripple.vp_promoted" + handle_vp_promoted()` or custom
-  application logic is required.  Full end-to-end automation is planned for a
-  future release.
-
-- **Shard rebalancing** (Citus `citus_rebalance_start`) invalidates per-worker
-  WAL slots. Manual recovery is required (see above).
 
 - **MERGE** is not supported for distributed stream tables. pg_trickle
   automatically uses the `DELETE + INSERT … ON CONFLICT DO UPDATE` path for
@@ -207,6 +213,10 @@ same pg_trickle version on all nodes before creating distributed stream tables.
 
 - Citus reference tables work as sources with trigger-based CDC only
   (per-worker WAL slots are not needed for reference tables).
+
+- **Worker failure alerting** — configure `pg_trickle.citus_worker_retry_ticks`
+  (default 5) to control how many consecutive poll failures trigger a WARNING.
+  Set to `0` to disable the alert entirely.
 
 ## pg_ripple Integration (v0.58.0+)
 
@@ -323,6 +333,6 @@ JOIN pgtrickle.citus_status      c
 - [SQL Reference — `create_stream_table`](../SQL_REFERENCE.md)
 - [Architecture — Citus distributed CDC](../ARCHITECTURE.md)
 - [Monitoring — `citus_status` view](../CONFIGURATION.md)
-- [CHANGELOG — v0.32.0](../../CHANGELOG.md) (stable naming and frontier
-  foundations)
+- [CHANGELOG — v0.32.0](../../CHANGELOG.md) (stable naming and frontier foundations)
 - [CHANGELOG — v0.33.0](../../CHANGELOG.md) (distributed CDC and stream tables)
+- [CHANGELOG — v0.34.0](../../CHANGELOG.md) (automated distributed CDC scheduler & shard rebalance auto-recovery)

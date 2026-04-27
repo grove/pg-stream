@@ -692,6 +692,107 @@ No breaking changes.
 
 ---
 
+### 0.30.0 → 0.31.0
+
+**No schema changes.** All improvements are confined to the Rust extension binary and scheduler logic.
+
+**New GUC variables:**
+
+| GUC | Default | Purpose |
+|-----|---------|---------|
+| `pg_trickle.cost_model_miss_penalty` | `2.0` | Weight applied to the estimated cost when the planner's row count estimate is inaccurate |
+| `pg_trickle.scheduler_hot_tier_interval_ms` | `500` | Effective polling interval (ms) for Hot-tier stream tables |
+
+**Behavioral changes:**
+
+- Scheduler now uses a predictive cost model to decide DIFFERENTIAL vs. FULL refresh per cycle; the model activates after `pg_trickle.prediction_min_samples` samples.
+- Event-driven wake now debounces duplicate NOTIFY payloads within a single tick to avoid redundant wakeups on bulk writes.
+
+No breaking changes.
+
+---
+
+### 0.31.0 → 0.32.0
+
+**No schema changes.** Citus stable naming infrastructure is added without altering the public catalog schema.
+
+**Behavioral changes:**
+
+- `pgtrickle.source_stable_name(rel_oid)` introduced as a deterministic, version-stable WAL slot name for Citus distributed sources.
+- Per-source `last_frontier` column added to `pgtrickle.pgt_stream_tables` via `ADD COLUMN IF NOT EXISTS` — existing rows receive `NULL`.
+
+No breaking changes.
+
+---
+
+### 0.32.0 → 0.33.0
+
+**Schema additions** — new catalog tables for Citus distributed CDC:
+
+| Object | Type | Purpose |
+|--------|------|---------|
+| `pgtrickle.pgt_worker_slots` | Table | Tracks per-worker WAL slot name and last-consumed frontier for each Citus worker / source combination |
+| `pgtrickle.pgt_st_locks` | Table | Lightweight distributed mutex for cross-coordinator refresh serialisation |
+| `pgtrickle.citus_status` | View | Per-(stream table, source, worker) CDC health view |
+
+**New SQL functions:**
+
+- `pgtrickle.ensure_worker_slot(st_name, worker_host, worker_port)` — creates the WAL slot on a Citus worker if it does not exist.
+- `pgtrickle.poll_worker_slot_changes(st_name, worker_host, worker_port)` — drains pending WAL changes from a worker slot into the coordinator change buffer.
+- `pgtrickle.handle_vp_promoted(payload TEXT)` — processes a `pg_ripple.vp_promoted` NOTIFY payload and signals the scheduler.
+- `pgtrickle.check_citus_version_compat()` — verifies that all worker nodes run the same pg_trickle version.
+- `pgtrickle.check_worker_wal_level()` — verifies that `wal_level = logical` on every worker.
+
+**New `create_stream_table()` parameter:**
+
+- `output_distribution_column TEXT` — when provided (and Citus is installed), converts the output storage table to a Citus distributed table on that column immediately after creation.
+
+**New GUC:**
+
+| GUC | Default | Purpose |
+|-----|---------|---------|
+| `pg_trickle.citus_st_lock_lease_ms` | `60000` | Duration (ms) of the `pgt_st_locks` lease for cross-node coordination |
+
+No application-level breaking changes.  Existing stream tables on non-Citus deployments are completely unaffected.
+
+---
+
+### 0.33.0 → 0.34.0
+
+**Schema additions** — the `pgtrickle.citus_status` view gains five new columns:
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `last_polled_at` | `timestamptz` | Timestamp of the last successful per-worker poll |
+| `lease_holder` | `text` | Session holding the `pgt_st_locks` lease (NULL when unlocked) |
+| `lease_acquired_at` | `timestamptz` | When the current lease was acquired |
+| `lease_expires_at` | `timestamptz` | When the current lease expires |
+| `lease_health` | `text` | `'unlocked'` / `'locked'` / `'expired'` |
+
+**Behavioral changes:**
+
+- The scheduler now drives the full per-worker slot lifecycle automatically for stream tables with `source_placement = 'distributed'`: `ensure_worker_slot()` on first tick (and after topology changes), `poll_worker_slot_changes()` on every tick, and `pgt_st_locks` lease acquire/extend/release.  Manual wiring via `LISTEN "pg_ripple.vp_promoted" + handle_vp_promoted()` is no longer required (though harmless if left in place).
+- Shard rebalance auto-recovery: the scheduler detects `pg_dist_node` topology changes, prunes stale `pgt_worker_slots` rows, inserts new ones, and marks the stream table for a full refresh — no operator intervention required.
+- Worker failure isolation: per-worker `poll_worker_slot_changes()` failures are caught, logged, and skipped for that tick; healthy workers continue uninterrupted.
+
+**New GUC:**
+
+| GUC | Default | Purpose |
+|-----|---------|---------|
+| `pg_trickle.citus_worker_retry_ticks` | `5` | Consecutive per-worker poll failures before emitting a WARNING and flagging in `citus_status`. Set to `0` to disable. |
+
+**Migration note:**
+
+```sql
+ALTER EXTENSION pg_trickle UPDATE TO '0.34.0';
+```
+
+The migration script adds the five new columns to `citus_status` via `CREATE OR REPLACE VIEW`.  No data loss.
+
+No breaking changes.  Non-Citus deployments are completely unaffected.
+
+---
+
 ## Supported Upgrade Paths
 
 The following migration hops are available. PostgreSQL chains them
@@ -715,10 +816,30 @@ automatically when you run `ALTER EXTENSION pg_trickle UPDATE`.
 | 0.11.0 | 0.12.0 | `pg_trickle--0.11.0--0.12.0.sql` |
 | 0.12.0 | 0.13.0 | `pg_trickle--0.12.0--0.13.0.sql` |
 | 0.13.0 | 0.14.0 | `pg_trickle--0.13.0--0.14.0.sql` |
+| 0.14.0 | 0.15.0 | `pg_trickle--0.14.0--0.15.0.sql` |
+| 0.15.0 | 0.16.0 | `pg_trickle--0.15.0--0.16.0.sql` |
+| 0.16.0 | 0.17.0 | `pg_trickle--0.16.0--0.17.0.sql` |
+| 0.17.0 | 0.18.0 | `pg_trickle--0.17.0--0.18.0.sql` |
+| 0.18.0 | 0.19.0 | `pg_trickle--0.18.0--0.19.0.sql` |
+| 0.19.0 | 0.20.0 | `pg_trickle--0.19.0--0.20.0.sql` |
+| 0.20.0 | 0.21.0 | `pg_trickle--0.20.0--0.21.0.sql` |
+| 0.21.0 | 0.22.0 | `pg_trickle--0.21.0--0.22.0.sql` |
+| 0.22.0 | 0.23.0 | `pg_trickle--0.22.0--0.23.0.sql` |
+| 0.23.0 | 0.24.0 | `pg_trickle--0.23.0--0.24.0.sql` |
+| 0.24.0 | 0.25.0 | `pg_trickle--0.24.0--0.25.0.sql` |
+| 0.25.0 | 0.26.0 | `pg_trickle--0.25.0--0.26.0.sql` |
+| 0.26.0 | 0.27.0 | `pg_trickle--0.26.0--0.27.0.sql` |
+| 0.27.0 | 0.28.0 | `pg_trickle--0.27.0--0.28.0.sql` |
+| 0.28.0 | 0.29.0 | `pg_trickle--0.28.0--0.29.0.sql` |
+| 0.29.0 | 0.30.0 | `pg_trickle--0.29.0--0.30.0.sql` |
+| 0.30.0 | 0.31.0 | `pg_trickle--0.30.0--0.31.0.sql` |
+| 0.31.0 | 0.32.0 | `pg_trickle--0.31.0--0.32.0.sql` |
+| 0.32.0 | 0.33.0 | `pg_trickle--0.32.0--0.33.0.sql` |
+| 0.33.0 | 0.34.0 | `pg_trickle--0.33.0--0.34.0.sql` |
 
-That means any installation currently on 0.1.3 through 0.13.0 can upgrade to
-0.14.0 in one step after the new binaries are installed and PostgreSQL has been
-restarted.
+Any installation from 0.1.3 onward can be upgraded to 0.34.0 in a single
+`ALTER EXTENSION pg_trickle UPDATE` — PostgreSQL chains the hops automatically
+after the new binaries are installed and the server has been restarted.
 
 ---
 

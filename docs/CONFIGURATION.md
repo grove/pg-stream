@@ -112,6 +112,9 @@ Complete reference for all pg_trickle GUC (Grand Unified Configuration) variable
   - [pg\_trickle.use\_sqlstate\_classification](#pg_trickleuse_sqlstate_classification)
   - [pg\_trickle.template\_cache\_max\_age\_hours](#pg_trickletemplate_cache_max_age_hours)
   - [pg\_trickle.max\_parse\_nodes](#pg_tricklemax_parse_nodes)
+- [Citus Distributed Tables (v0.32.0+)](#citus-distributed-tables-v0320)
+  - [pg\_trickle.citus\_st\_lock\_lease\_ms](#pg_tricklecitus_st_lock_lease_ms)
+  - [pg\_trickle.citus\_worker\_retry\_ticks](#pg_tricklecitus_worker_retry_ticks)
 - [GUC Interaction Matrix](#guc-interaction-matrix)
 - [Tuning Profiles](#tuning-profiles)
   - [Low-Latency Profile](#low-latency-profile)
@@ -2581,6 +2584,71 @@ recommended for production deployments.
 
 ---
 
+## Citus Distributed Tables (v0.32.0+)
+
+Configuration for Citus distributed-table CDC and stream table support.
+See [docs/integrations/citus.md](integrations/citus.md) for the full setup guide.
+
+---
+
+### pg_trickle.citus_st_lock_lease_ms
+
+Duration in milliseconds of the `pgtrickle.pgt_st_locks` lease used for
+cross-node refresh coordination in Citus clusters.
+
+The lease prevents two coordinator nodes from applying changes to the same
+distributed stream table simultaneously.  When pg_ripple is deployed alongside
+pg_trickle, set this value to be **≥ `pg_ripple.merge_fence_timeout_ms`** to
+prevent the lease from expiring mid-merge.
+
+| Property | Value |
+|---|---|
+| Type | `integer` |
+| Default | `60000` (60 seconds) |
+| Range | 0 (disabled) – 600,000 ms (10 minutes) |
+| Context | `SUSET` (superuser) |
+| Restart required | No |
+| Added in | v0.33.0 (COORD-2) |
+
+```sql
+-- Align with a 30-second pg_ripple merge fence
+ALTER SYSTEM SET pg_trickle.citus_st_lock_lease_ms = 45000;
+SELECT pg_reload_conf();
+```
+
+---
+
+### pg_trickle.citus_worker_retry_ticks
+
+Number of consecutive per-worker poll failures before the scheduler emits a
+`WARNING` in the PostgreSQL log and flags the worker in `pgtrickle.citus_status`.
+The warning is for operator attention — healthy workers continue refreshing
+uninterrupted while a failed worker is skipped.
+
+Set to `0` to disable the alerting entirely (failures are still logged at
+`LOG` level per tick).
+
+| Property | Value |
+|---|---|
+| Type | `integer` |
+| Default | `5` |
+| Range | 0 (disabled) – 100 |
+| Context | `SUSET` (superuser) |
+| Restart required | No |
+| Added in | v0.34.0 (COORD-15) |
+
+```sql
+-- Alert after 3 consecutive failures instead of 5
+ALTER SYSTEM SET pg_trickle.citus_worker_retry_ticks = 3;
+SELECT pg_reload_conf();
+
+-- Disable alerting (failures logged at LOG level only)
+ALTER SYSTEM SET pg_trickle.citus_worker_retry_ticks = 0;
+SELECT pg_reload_conf();
+```
+
+---
+
 ## GUC Interaction Matrix
 
 Some GUC variables interact with or depend on each other. The table below
@@ -2798,6 +2866,10 @@ pg_trickle.inbox_enabled = true
 pg_trickle.inbox_processed_retention_hours = 72
 pg_trickle.inbox_dlq_retention_hours = 0       # 0 = keep forever
 pg_trickle.inbox_dlq_alert_max_per_refresh = 10
+
+# Citus distributed tables (v0.32.0+)
+pg_trickle.citus_st_lock_lease_ms = 60000      # lease duration for cross-node coordination
+pg_trickle.citus_worker_retry_ticks = 5        # failures before WARNING in citus_status
 
 # Advanced / internal
 pg_trickle.change_buffer_schema = 'pgtrickle_changes'

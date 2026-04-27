@@ -127,6 +127,14 @@ We also do not think the use of AI should lower the standard for trust. If anyth
 - **Tiered scheduling** — Hot / Warm / Cold / Frozen tiers control effective refresh rates in large deployments; Frozen tables are skipped until manually thawed.
 - **Multi-database** — a single launcher worker auto-discovers every database with the extension installed and spawns a scheduler for each.
 
+### Citus distributed tables (v0.32.0+)
+
+- **Distributed sources** — stream tables can be defined over Citus distributed source tables; the scheduler polls per-worker WAL slots via `dblink` and merges changes on the coordinator.
+- **Distributed output** — pass `output_distribution_column` to `create_stream_table()` to co-locate the result table with the source shards.
+- **Automated scheduler** — since v0.34.0 the scheduler drives the full per-worker slot lifecycle automatically (no manual wiring required): `ensure_worker_slot`, `poll_worker_slot_changes`, and `pgt_st_locks` lease management.
+- **Shard rebalance auto-recovery** — topology changes are detected by comparing `pg_dist_node` against `pgt_worker_slots`; stale slots are pruned and new ones inserted without operator intervention.
+- **Worker failure isolation** — per-worker poll failures are logged and skipped; after `pg_trickle.citus_worker_retry_ticks` (default 5) consecutive failures a WARNING is raised while healthy workers continue uninterrupted.
+
 ### Production & operations
 
 - **PgBouncer / connection-pool compatible** — works behind PgBouncer in transaction-pool mode (Supabase, Railway, Neon, etc.); row-level locking replaces session locks; per-table `pooler_compatibility_mode` available.
@@ -355,7 +363,7 @@ CREATE EXTENSION pg_trickle;
 pg_trickle is distributed as a minimal OCI extension image for [CloudNativePG Image Volume Extensions](https://cloudnative-pg.io/docs/1.28/imagevolume_extensions/). The image is `scratch`-based (< 10 MB) and contains only the extension files — no PostgreSQL server, no OS.
 
 ```bash
-docker pull ghcr.io/grove/pg_trickle-ext:0.20.0
+docker pull ghcr.io/grove/pg_trickle-ext:0.34.0
 ```
 
 Deploy with the official CNPG PostgreSQL 18 operand image:
@@ -369,7 +377,7 @@ spec:
     extensions:
       - name: pg-trickle
         image:
-          reference: ghcr.io/grove/pg_trickle-ext:0.20.0
+          reference: ghcr.io/grove/pg_trickle-ext:0.34.0
 ```
 
 See [cnpg/cluster-example.yaml](cnpg/cluster-example.yaml) and [cnpg/database-example.yaml](cnpg/database-example.yaml) for complete examples. Requires Kubernetes 1.33+ and CNPG 1.28+.
@@ -479,7 +487,7 @@ The `dbt-pgtrickle` package provides a custom `stream_table` materialization for
 # packages.yml
 packages:
   - git: "https://github.com/grove/pg-trickle.git"
-    revision: v0.20.0
+    revision: v0.34.0
     subdirectory: "dbt-pgtrickle"
 ```
 
