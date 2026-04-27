@@ -81,6 +81,67 @@ struct DdlCommand {
     schema_name: Option<String>,
     /// Object identity string (e.g. "public.orders").
     object_identity: Option<String>,
+    /// A17 (v0.36.0): Typed classification derived from object_type + command_tag
+    /// at collection time. Avoids repeated string matching after construction.
+    kind: DdlCommandKind,
+}
+
+/// A17 (v0.36.0): Typed DDL command classification.
+///
+/// Populated from `pg_event_trigger_ddl_commands()` introspection data at
+/// collection time, replacing ad-hoc string matching at usage sites. This
+/// makes the classification explicit and avoids silent breakage if PostgreSQL
+/// ever adjusts a command-tag wording in a future minor release.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DdlCommandKind {
+    /// ALTER TABLE command on a heap table.
+    AlterTable,
+    /// CREATE TABLE command.
+    CreateTable,
+    /// Any CREATE/ALTER VIEW command.
+    ViewChange,
+    /// CREATE TRIGGER command.
+    CreateTrigger,
+    /// CREATE OR REPLACE FUNCTION / ALTER FUNCTION.
+    FunctionChange,
+    /// ALTER TYPE command.
+    TypeChange,
+    /// ALTER DOMAIN / CREATE DOMAIN.
+    DomainChange,
+    /// CREATE/ALTER/DROP POLICY.
+    PolicyChange,
+    /// CREATE EXTENSION.
+    ExtensionChange,
+    /// Any other DDL that pg_trickle does not need to react to.
+    Ignored,
+}
+
+impl DdlCommandKind {
+    /// Classify a DDL event from its PostgreSQL-provided object_type and
+    /// command_tag strings.
+    ///
+    /// This function encapsulates all string matching in one place so that
+    /// future PostgreSQL naming changes require only this function to be updated.
+    pub(crate) fn from_event(object_type: &str, command_tag: &str) -> Self {
+        match (object_type, command_tag) {
+            ("table", "ALTER TABLE") => Self::AlterTable,
+            ("table", "CREATE TABLE") => Self::CreateTable,
+            ("view", "CREATE VIEW")
+            | ("view", "CREATE OR REPLACE VIEW")
+            | ("view", "ALTER VIEW") => Self::ViewChange,
+            ("trigger", "CREATE TRIGGER") => Self::CreateTrigger,
+            ("function", "CREATE FUNCTION")
+            | ("function", "CREATE OR REPLACE FUNCTION")
+            | ("function", "ALTER FUNCTION") => Self::FunctionChange,
+            ("type", "ALTER TYPE") => Self::TypeChange,
+            ("domain", "ALTER DOMAIN") | ("domain", "CREATE DOMAIN") => Self::DomainChange,
+            ("policy", "CREATE POLICY")
+            | ("policy", "ALTER POLICY")
+            | ("policy", "DROP POLICY") => Self::PolicyChange,
+            ("extension", "CREATE EXTENSION") => Self::ExtensionChange,
+            _ => Self::Ignored,
+        }
+    }
 }
 
 /// Collect DDL commands from the event trigger context.
@@ -108,12 +169,16 @@ fn collect_ddl_commands() -> Result<Vec<DdlCommand>, PgTrickleError> {
             let schema_name = row.get::<String>(4).map_err(map_spi)?;
             let object_identity = row.get::<String>(5).map_err(map_spi)?;
 
+            // A17 (v0.36.0): Classify at collection time via typed enum.
+            let kind = DdlCommandKind::from_event(&object_type, &command_tag);
+
             commands.push(DdlCommand {
                 objid,
                 object_type,
                 command_tag,
                 schema_name,
                 object_identity,
+                kind,
             });
         }
         Ok(commands)
@@ -121,7 +186,10 @@ fn collect_ddl_commands() -> Result<Vec<DdlCommand>, PgTrickleError> {
 }
 
 /// Classification of a DDL event based on object type and command tag.
+/// Kept for internal use by unit tests; at runtime, `DdlCommandKind::from_event`
+/// is called at collection time and stored on `DdlCommand::kind`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)] // retained for test compatibility
 enum DdlEventKind {
     AlterTable,
     CreateTable,
@@ -135,57 +203,38 @@ enum DdlEventKind {
     Ignored,
 }
 
-/// Classify a DDL event purely from its object type and command tag strings.
-fn classify_ddl_event(object_type: &str, command_tag: &str) -> DdlEventKind {
-    match (object_type, command_tag) {
-        ("table", "ALTER TABLE") => DdlEventKind::AlterTable,
-        ("table", "CREATE TABLE") => DdlEventKind::CreateTable,
-        ("view", "CREATE VIEW") | ("view", "CREATE OR REPLACE VIEW") | ("view", "ALTER VIEW") => {
-            DdlEventKind::ViewChange
-        }
-        ("trigger", "CREATE TRIGGER") => DdlEventKind::CreateTrigger,
-        ("function", "CREATE FUNCTION") | ("function", "ALTER FUNCTION") => {
-            DdlEventKind::FunctionChange
-        }
-        ("type", "ALTER TYPE") => DdlEventKind::TypeChange,
-        ("domain", "ALTER DOMAIN") | ("domain", "CREATE DOMAIN") => DdlEventKind::DomainChange,
-        ("policy", "CREATE POLICY") | ("policy", "ALTER POLICY") | ("policy", "DROP POLICY") => {
-            DdlEventKind::PolicyChange
-        }
-        ("extension", "CREATE EXTENSION") => DdlEventKind::ExtensionChange,
-        _ => DdlEventKind::Ignored,
-    }
-}
-
 /// Process a single DDL command: check for upstream/ST impact and react.
+///
+/// A17 (v0.36.0): dispatches on `cmd.kind` (pre-classified typed enum) rather
+/// than calling `classify_ddl_event()` at dispatch time.
 fn handle_ddl_command(cmd: &DdlCommand) {
-    match classify_ddl_event(&cmd.object_type, &cmd.command_tag) {
-        DdlEventKind::AlterTable => {
+    match cmd.kind {
+        DdlCommandKind::AlterTable => {
             let identity = cmd.object_identity.as_deref().unwrap_or("unknown");
             handle_alter_table(cmd.objid, identity);
         }
-        DdlEventKind::CreateTable => {
+        DdlCommandKind::CreateTable => {
             // New tables can't be upstream of any existing ST yet.
         }
-        DdlEventKind::ViewChange => {
+        DdlCommandKind::ViewChange => {
             handle_view_change(cmd);
         }
-        DdlEventKind::CreateTrigger => {
+        DdlCommandKind::CreateTrigger => {
             handle_create_trigger(cmd);
         }
-        DdlEventKind::FunctionChange => {
+        DdlCommandKind::FunctionChange => {
             handle_function_change(cmd);
         }
-        DdlEventKind::TypeChange => {
+        DdlCommandKind::TypeChange => {
             handle_type_change(cmd);
         }
-        DdlEventKind::DomainChange => {
+        DdlCommandKind::DomainChange => {
             handle_domain_change(cmd);
         }
-        DdlEventKind::PolicyChange => {
+        DdlCommandKind::PolicyChange => {
             handle_policy_change(cmd);
         }
-        DdlEventKind::ExtensionChange => {
+        DdlCommandKind::ExtensionChange => {
             if let Some(ref ident) = cmd.object_identity
                 && ident == "pg_trickle"
             {
@@ -197,7 +246,7 @@ fn handle_ddl_command(cmd: &DdlCommand) {
                 }
             }
         }
-        DdlEventKind::Ignored => {}
+        DdlCommandKind::Ignored => {}
     }
 }
 
@@ -1722,6 +1771,7 @@ mod tests {
             command_tag: "ALTER TABLE".to_string(),
             schema_name: Some("public".to_string()),
             object_identity: Some("public.orders".to_string()),
+            kind: DdlCommandKind::AlterTable,
         };
         let debug = format!("{:?}", cmd);
         assert!(debug.contains("ALTER TABLE"));
@@ -1772,113 +1822,118 @@ mod tests {
         );
     }
 
-    // ── classify_ddl_event tests ────────────────────────────────────
+    // ── classify_ddl_event tests (A17: now tests DdlCommandKind::from_event) ──
 
     #[test]
     fn test_classify_alter_table() {
         assert_eq!(
-            classify_ddl_event("table", "ALTER TABLE"),
-            DdlEventKind::AlterTable,
+            DdlCommandKind::from_event("table", "ALTER TABLE"),
+            DdlCommandKind::AlterTable,
         );
     }
 
     #[test]
     fn test_classify_create_table() {
         assert_eq!(
-            classify_ddl_event("table", "CREATE TABLE"),
-            DdlEventKind::CreateTable,
+            DdlCommandKind::from_event("table", "CREATE TABLE"),
+            DdlCommandKind::CreateTable,
         );
     }
 
     #[test]
     fn test_classify_create_view() {
         assert_eq!(
-            classify_ddl_event("view", "CREATE VIEW"),
-            DdlEventKind::ViewChange,
+            DdlCommandKind::from_event("view", "CREATE VIEW"),
+            DdlCommandKind::ViewChange,
         );
     }
 
     #[test]
     fn test_classify_create_or_replace_view() {
         assert_eq!(
-            classify_ddl_event("view", "CREATE OR REPLACE VIEW"),
-            DdlEventKind::ViewChange,
+            DdlCommandKind::from_event("view", "CREATE OR REPLACE VIEW"),
+            DdlCommandKind::ViewChange,
         );
     }
 
     #[test]
     fn test_classify_alter_view() {
         assert_eq!(
-            classify_ddl_event("view", "ALTER VIEW"),
-            DdlEventKind::ViewChange,
+            DdlCommandKind::from_event("view", "ALTER VIEW"),
+            DdlCommandKind::ViewChange,
         );
     }
 
     #[test]
     fn test_classify_create_trigger() {
         assert_eq!(
-            classify_ddl_event("trigger", "CREATE TRIGGER"),
-            DdlEventKind::CreateTrigger,
+            DdlCommandKind::from_event("trigger", "CREATE TRIGGER"),
+            DdlCommandKind::CreateTrigger,
         );
     }
 
     #[test]
     fn test_classify_function_change() {
         assert_eq!(
-            classify_ddl_event("function", "CREATE FUNCTION"),
-            DdlEventKind::FunctionChange,
+            DdlCommandKind::from_event("function", "CREATE FUNCTION"),
+            DdlCommandKind::FunctionChange,
         );
         assert_eq!(
-            classify_ddl_event("function", "ALTER FUNCTION"),
-            DdlEventKind::FunctionChange,
+            DdlCommandKind::from_event("function", "ALTER FUNCTION"),
+            DdlCommandKind::FunctionChange,
+        );
+        // A17: Also handle CREATE OR REPLACE FUNCTION (v0.36.0 addition)
+        assert_eq!(
+            DdlCommandKind::from_event("function", "CREATE OR REPLACE FUNCTION"),
+            DdlCommandKind::FunctionChange,
         );
     }
 
     #[test]
     fn test_classify_type_change() {
         assert_eq!(
-            classify_ddl_event("type", "ALTER TYPE"),
-            DdlEventKind::TypeChange,
+            DdlCommandKind::from_event("type", "ALTER TYPE"),
+            DdlCommandKind::TypeChange,
         );
     }
 
     #[test]
     fn test_classify_domain_change() {
         assert_eq!(
-            classify_ddl_event("domain", "ALTER DOMAIN"),
-            DdlEventKind::DomainChange,
+            DdlCommandKind::from_event("domain", "ALTER DOMAIN"),
+            DdlCommandKind::DomainChange,
         );
         assert_eq!(
-            classify_ddl_event("domain", "CREATE DOMAIN"),
-            DdlEventKind::DomainChange,
+            DdlCommandKind::from_event("domain", "CREATE DOMAIN"),
+            DdlCommandKind::DomainChange,
         );
     }
 
     #[test]
     fn test_classify_policy_change() {
         assert_eq!(
-            classify_ddl_event("policy", "CREATE POLICY"),
-            DdlEventKind::PolicyChange,
+            DdlCommandKind::from_event("policy", "CREATE POLICY"),
+            DdlCommandKind::PolicyChange,
         );
         assert_eq!(
-            classify_ddl_event("policy", "ALTER POLICY"),
-            DdlEventKind::PolicyChange,
+            DdlCommandKind::from_event("policy", "ALTER POLICY"),
+            DdlCommandKind::PolicyChange,
         );
         assert_eq!(
-            classify_ddl_event("policy", "DROP POLICY"),
-            DdlEventKind::PolicyChange,
+            DdlCommandKind::from_event("policy", "DROP POLICY"),
+            DdlCommandKind::PolicyChange,
         );
     }
 
     #[test]
     fn test_classify_unknown_is_ignored() {
         assert_eq!(
-            classify_ddl_event("index", "CREATE INDEX"),
-            DdlEventKind::Ignored,
+            DdlCommandKind::from_event("index", "CREATE INDEX"),
+            DdlCommandKind::Ignored,
         );
         assert_eq!(
-            classify_ddl_event("table", "DROP TABLE"),
-            DdlEventKind::Ignored,
+            DdlCommandKind::from_event("table", "DROP TABLE"),
+            DdlCommandKind::Ignored,
         );
     }
 

@@ -35,6 +35,7 @@ pub mod error;
 mod hash;
 mod hooks;
 mod ivm;
+pub mod logging;
 pub(crate) mod metrics_server;
 mod monitor;
 mod refresh;
@@ -288,6 +289,12 @@ CREATE TABLE IF NOT EXISTS pgtrickle.pgt_stream_tables (
     st_partition_key TEXT,
     -- CITUS-3: Placement of this stream table's storage in a Citus cluster.
     st_placement    TEXT NOT NULL DEFAULT 'local',
+    -- v0.36.0: temporal IVM flag (CORR-1/UX-1)
+    temporal_mode   BOOLEAN NOT NULL DEFAULT FALSE,
+    -- v0.36.0: columnar storage backend (CORR-2/UX-3)
+    storage_backend TEXT NOT NULL DEFAULT 'heap',
+    -- v0.36.0: column lineage metadata (F12)
+    column_lineage  JSONB,
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at      TIMESTAMPTZ NOT NULL DEFAULT now()
 );

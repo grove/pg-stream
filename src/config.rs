@@ -1318,6 +1318,126 @@ pub fn normalize_frontier_holdback_mode(value: Option<String>) -> FrontierHoldba
     }
 }
 
+// ── v0.36.0 GUCs ──────────────────────────────────────────────────────────
+
+/// A12 (v0.36.0): Enforce WAL backpressure when slot lag exceeds the critical threshold.
+///
+/// When `true`, CDC trigger writes are paused when the WAL slot lag exceeds
+/// `pg_trickle.slot_lag_critical_threshold_mb`. Writes resume when lag drops
+/// below 50% of the threshold. This prevents disk exhaustion at the cost of
+/// temporary change-buffer growth.
+///
+/// Default: `false` (alerts only, no throttling).
+pub static PGS_ENFORCE_BACKPRESSURE: GucSetting<bool> = GucSetting::<bool>::new(false);
+
+/// A20 (v0.36.0): Log format for pg_trickle structured log events.
+///
+/// - `"text"` (default): Unstructured human-readable messages via `pgrx::log!()`.
+/// - `"json"`: Structured JSON with fields `event`, `pgt_id`, `cycle_id`,
+///   `duration_ms`, `refresh_reason`, `error_code`. Targets OpenTelemetry/Loki.
+pub static PGS_LOG_FORMAT: GucSetting<Option<std::ffi::CString>> =
+    GucSetting::<Option<std::ffi::CString>>::new(Some(c"text"));
+
+/// A35 (v0.36.0): Drain timeout in seconds for `pgtrickle.drain()`.
+///
+/// Maximum seconds to wait for in-flight refreshes to complete during a drain
+/// operation. When the timeout is exceeded, `drain()` returns `false` to
+/// indicate that not all refreshes completed before the deadline.
+///
+/// Default: 60 seconds.
+pub static PGS_DRAIN_TIMEOUT: GucSetting<i32> = GucSetting::<i32>::new(60);
+
+/// F5 (v0.36.0): Enable online schema evolution for `ALTER STREAM TABLE EVOLVE`.
+///
+/// When `true`, type-compatible column additions detected during `ALTER QUERY`
+/// are handled by emitting `ALTER TABLE … ADD COLUMN` on the storage table,
+/// then re-preparing templates — without a full data flush. Falls back to the
+/// standard full reinit path when the evolution is not type-compatible.
+///
+/// Default: `false` (standard ALTER QUERY reinit behaviour).
+pub static PGS_ONLINE_SCHEMA_EVOLUTION: GucSetting<bool> = GucSetting::<bool>::new(false);
+
+/// CORR-2 / UX-3 (v0.36.0): Columnar storage backend for stream tables.
+///
+/// - `"none"` (default): Heap storage (standard PostgreSQL tables).
+/// - `"citus"`: Citus columnar via `CREATE TABLE … USING columnar`.
+/// - `"pg_mooncake"`: pg_mooncake columnar tables.
+///
+/// When set, `create_stream_table()` uses the specified columnar backend and
+/// routes differential refresh to the `delete_insert` strategy (columnar
+/// backends are append-only).
+pub static PGS_COLUMNAR_BACKEND: GucSetting<Option<std::ffi::CString>> =
+    GucSetting::<Option<std::ffi::CString>>::new(Some(c"none"));
+
+/// CORR-1 / UX-1 (v0.36.0): Enable temporal IVM (SCD Type 2) for stream tables.
+///
+/// When `true`, stream tables created with `temporal := true` maintain a
+/// two-dimensional frontier `(frontier_lsn, valid_from_ts)`. Each row carries
+/// `__pgt_valid_from TIMESTAMPTZ` and `__pgt_valid_to TIMESTAMPTZ`. Rows are
+/// never physically deleted; a "close" delta sets `valid_to`.
+///
+/// Default: `false` (standard non-temporal storage).
+pub static PGS_TEMPORAL_STREAM_TABLES: GucSetting<bool> = GucSetting::<bool>::new(false);
+
+/// A20 (v0.36.0): Log format enum.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LogFormat {
+    /// Standard unstructured text messages.
+    Text,
+    /// Structured JSON with named fields.
+    Json,
+}
+
+impl LogFormat {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            LogFormat::Text => "text",
+            LogFormat::Json => "json",
+        }
+    }
+}
+
+pub fn normalize_log_format(value: Option<String>) -> LogFormat {
+    match value.as_deref().map(str::to_ascii_lowercase).as_deref() {
+        Some("json") => LogFormat::Json,
+        _ => LogFormat::Text,
+    }
+}
+
+/// CORR-2 (v0.36.0): Columnar backend enum.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ColumnarBackend {
+    /// Standard heap storage (default).
+    None,
+    /// Citus columnar extension.
+    Citus,
+    /// pg_mooncake columnar tables.
+    PgMooncake,
+}
+
+impl ColumnarBackend {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ColumnarBackend::None => "none",
+            ColumnarBackend::Citus => "citus",
+            ColumnarBackend::PgMooncake => "pg_mooncake",
+        }
+    }
+
+    /// Returns `true` if this backend is append-only (requires `delete_insert` strategy).
+    pub fn is_append_only(self) -> bool {
+        matches!(self, ColumnarBackend::Citus | ColumnarBackend::PgMooncake)
+    }
+}
+
+pub fn normalize_columnar_backend(value: Option<String>) -> ColumnarBackend {
+    match value.as_deref().map(str::to_ascii_lowercase).as_deref() {
+        Some("citus") => ColumnarBackend::Citus,
+        Some("pg_mooncake") => ColumnarBackend::PgMooncake,
+        _ => ColumnarBackend::None,
+    }
+}
+
 /// Register all GUC variables. Called from `_PG_init()`.
 pub fn register_gucs() {
     GucRegistry::define_bool_guc(
@@ -2764,6 +2884,85 @@ pub fn register_gucs() {
         GucContext::Suset,
         GucFlags::default(),
     );
+
+    // ── v0.36.0 GUCs ─────────────────────────────────────────────────────────
+
+    // A12: WAL backpressure enforcement.
+    GucRegistry::define_bool_guc(
+        c"pg_trickle.enforce_backpressure",
+        c"A12: Pause CDC writes when WAL slot lag exceeds the critical threshold.",
+        c"When true, CDC trigger writes pause when the WAL slot lag exceeds \
+          pg_trickle.slot_lag_critical_threshold_mb. Resumes when lag drops below 50% \
+          of the threshold. Default false (alerts only, no throttling).",
+        &PGS_ENFORCE_BACKPRESSURE,
+        GucContext::Suset,
+        GucFlags::default(),
+    );
+
+    // A20: Structured JSON logging.
+    GucRegistry::define_string_guc(
+        c"pg_trickle.log_format",
+        c"A20: Log format for pg_trickle events: text (default) or json.",
+        c"'text' emits standard human-readable log messages. \
+          'json' emits structured JSON with fields event, pgt_id, cycle_id, \
+          duration_ms, refresh_reason, error_code for OpenTelemetry/Loki integration.",
+        &PGS_LOG_FORMAT,
+        GucContext::Suset,
+        GucFlags::default(),
+    );
+
+    // A35: Drain timeout.
+    GucRegistry::define_int_guc(
+        c"pg_trickle.drain_timeout",
+        c"A35: Maximum seconds to wait for in-flight refreshes during drain().",
+        c"When pgtrickle.drain() is called, the scheduler stops accepting new cycles \
+          and waits up to this many seconds for all in-flight refreshes to complete. \
+          Returns false if not all refreshes complete before the deadline.",
+        &PGS_DRAIN_TIMEOUT,
+        1,     // min
+        3_600, // max (1 hour)
+        GucContext::Suset,
+        GucFlags::default(),
+    );
+
+    // F5: Online schema evolution.
+    GucRegistry::define_bool_guc(
+        c"pg_trickle.online_schema_evolution",
+        c"F5: Enable online schema evolution for ALTER STREAM TABLE EVOLVE.",
+        c"When true, type-compatible column additions during ALTER QUERY are handled \
+          by ALTER TABLE ADD COLUMN + template re-prepare instead of full reinit. \
+          Falls back to full reinit when changes are not type-compatible. \
+          Default false (opt-in).",
+        &PGS_ONLINE_SCHEMA_EVOLUTION,
+        GucContext::Suset,
+        GucFlags::default(),
+    );
+
+    // CORR-2 / UX-3: Columnar storage backend.
+    GucRegistry::define_string_guc(
+        c"pg_trickle.columnar_backend",
+        c"CORR-2: Columnar storage backend: none (default), citus, or pg_mooncake.",
+        c"'none' (default) uses standard heap tables. \
+          'citus' uses Citus columnar (CREATE TABLE ... USING columnar). \
+          'pg_mooncake' uses pg_mooncake columnar tables. \
+          Columnar backends use the delete_insert refresh strategy (append-only).",
+        &PGS_COLUMNAR_BACKEND,
+        GucContext::Suset,
+        GucFlags::default(),
+    );
+
+    // CORR-1 / UX-1: Temporal IVM.
+    GucRegistry::define_bool_guc(
+        c"pg_trickle.temporal_stream_tables",
+        c"CORR-1: Enable temporal IVM (SCD Type 2) support for stream tables.",
+        c"When true, stream tables created with temporal := true maintain a \
+          two-dimensional frontier (frontier_lsn, valid_from_ts). Each row carries \
+          __pgt_valid_from TIMESTAMPTZ and __pgt_valid_to TIMESTAMPTZ. Rows are never \
+          physically deleted; close deltas set valid_to. Default false.",
+        &PGS_TEMPORAL_STREAM_TABLES,
+        GucContext::Suset,
+        GucFlags::default(),
+    );
 }
 
 // ── Convenience accessors ──────────────────────────────────────────────────
@@ -3350,16 +3549,57 @@ pub fn pg_trickle_backpressure_consecutive_limit() -> i32 {
     PGS_BACKPRESSURE_CONSECUTIVE_LIMIT.get()
 }
 
+// ── v0.36.0 accessor functions ─────────────────────────────────────────────
+
+/// A12 (v0.36.0): Returns whether WAL backpressure enforcement is enabled.
+pub fn pg_trickle_enforce_backpressure() -> bool {
+    PGS_ENFORCE_BACKPRESSURE.get()
+}
+
+/// A20 (v0.36.0): Returns the current log format.
+pub fn pg_trickle_log_format() -> LogFormat {
+    normalize_log_format(
+        PGS_LOG_FORMAT
+            .get()
+            .and_then(|cs| cs.to_str().ok().map(str::to_owned)),
+    )
+}
+
+/// A35 (v0.36.0): Returns the drain timeout in seconds.
+pub fn pg_trickle_drain_timeout() -> i32 {
+    PGS_DRAIN_TIMEOUT.get()
+}
+
+/// F5 (v0.36.0): Returns whether online schema evolution is enabled.
+pub fn pg_trickle_online_schema_evolution() -> bool {
+    PGS_ONLINE_SCHEMA_EVOLUTION.get()
+}
+
+/// CORR-2 / UX-3 (v0.36.0): Returns the columnar storage backend.
+pub fn pg_trickle_columnar_backend() -> ColumnarBackend {
+    normalize_columnar_backend(
+        PGS_COLUMNAR_BACKEND
+            .get()
+            .and_then(|cs| cs.to_str().ok().map(str::to_owned)),
+    )
+}
+
+/// CORR-1 / UX-1 (v0.36.0): Returns whether temporal IVM is globally enabled.
+pub fn pg_trickle_temporal_stream_tables() -> bool {
+    PGS_TEMPORAL_STREAM_TABLES.get()
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        CdcTriggerMode, DiffOutputFormat, FrontierHoldbackMode, MergeJoinStrategy, MergeStrategy,
-        ParallelRefreshMode, RefreshStrategy, SelfMonitoringAutoApply, UserTriggersMode,
-        VolatileFunctionPolicy, normalize_cdc_trigger_mode, normalize_diff_output_format,
-        normalize_frontier_holdback_mode, normalize_merge_join_strategy, normalize_merge_strategy,
-        normalize_parallel_refresh_mode, normalize_recursive_max_depth, normalize_refresh_strategy,
-        normalize_self_monitoring_auto_apply, normalize_user_triggers_mode,
-        normalize_volatile_function_policy, threshold_mb_to_bytes,
+        CdcTriggerMode, ColumnarBackend, DiffOutputFormat, FrontierHoldbackMode, LogFormat,
+        MergeJoinStrategy, MergeStrategy, ParallelRefreshMode, RefreshStrategy,
+        SelfMonitoringAutoApply, UserTriggersMode, VolatileFunctionPolicy,
+        normalize_cdc_trigger_mode, normalize_columnar_backend, normalize_diff_output_format,
+        normalize_frontier_holdback_mode, normalize_log_format, normalize_merge_join_strategy,
+        normalize_merge_strategy, normalize_parallel_refresh_mode, normalize_recursive_max_depth,
+        normalize_refresh_strategy, normalize_self_monitoring_auto_apply,
+        normalize_user_triggers_mode, normalize_volatile_function_policy, threshold_mb_to_bytes,
     };
 
     #[test]
@@ -3922,5 +4162,87 @@ mod tests {
             normalize_frontier_holdback_mode(Some("lsn:notanumber".to_string())),
             FrontierHoldbackMode::InvalidLsn
         );
+    }
+
+    // ── v0.36.0: LogFormat normalizer tests ───────────────────────────────
+
+    #[test]
+    fn test_normalize_log_format_defaults_to_text() {
+        assert_eq!(normalize_log_format(None), LogFormat::Text);
+        assert_eq!(
+            normalize_log_format(Some("text".to_string())),
+            LogFormat::Text
+        );
+        assert_eq!(
+            normalize_log_format(Some("unexpected".to_string())),
+            LogFormat::Text
+        );
+    }
+
+    #[test]
+    fn test_normalize_log_format_accepts_json() {
+        assert_eq!(
+            normalize_log_format(Some("json".to_string())),
+            LogFormat::Json
+        );
+        assert_eq!(
+            normalize_log_format(Some("JSON".to_string())),
+            LogFormat::Json
+        );
+    }
+
+    #[test]
+    fn test_log_format_as_str() {
+        assert_eq!(LogFormat::Text.as_str(), "text");
+        assert_eq!(LogFormat::Json.as_str(), "json");
+    }
+
+    // ── v0.36.0: ColumnarBackend normalizer tests ─────────────────────────
+
+    #[test]
+    fn test_normalize_columnar_backend_defaults_to_none() {
+        assert_eq!(normalize_columnar_backend(None), ColumnarBackend::None);
+        assert_eq!(
+            normalize_columnar_backend(Some("none".to_string())),
+            ColumnarBackend::None
+        );
+        assert_eq!(
+            normalize_columnar_backend(Some("unexpected".to_string())),
+            ColumnarBackend::None
+        );
+    }
+
+    #[test]
+    fn test_normalize_columnar_backend_all_variants() {
+        assert_eq!(
+            normalize_columnar_backend(Some("citus".to_string())),
+            ColumnarBackend::Citus
+        );
+        assert_eq!(
+            normalize_columnar_backend(Some("CITUS".to_string())),
+            ColumnarBackend::Citus
+        );
+        assert_eq!(
+            normalize_columnar_backend(Some("pg_mooncake".to_string())),
+            ColumnarBackend::PgMooncake
+        );
+        assert_eq!(
+            normalize_columnar_backend(Some("PG_MOONCAKE".to_string())),
+            ColumnarBackend::PgMooncake
+        );
+    }
+
+    #[test]
+    fn test_columnar_backend_is_append_only() {
+        assert!(!ColumnarBackend::None.is_append_only());
+        assert!(ColumnarBackend::Citus.is_append_only());
+        assert!(ColumnarBackend::PgMooncake.is_append_only());
+    }
+
+    #[test]
+    fn test_columnar_backend_as_str() {
+        assert_eq!(ColumnarBackend::None.as_str(), "none");
+        assert_eq!(ColumnarBackend::Citus.as_str(), "citus");
+        assert_eq!(ColumnarBackend::PgMooncake.as_str(), "pg_mooncake");
     }
 }

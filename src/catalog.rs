@@ -124,6 +124,15 @@ pub struct StreamTableMeta {
     /// 'local' = coordinator-local (default), 'distributed' = Citus distributed table,
     /// 'reference' = Citus reference table.
     pub st_placement: String,
+    /// CORR-1 (v0.36.0): Whether this stream table uses temporal IVM (SCD Type 2).
+    /// When true, the storage table has `__pgt_valid_from` and `__pgt_valid_to`
+    /// columns, and the frontier model is two-dimensional `(frontier_lsn, valid_from_ts)`.
+    pub temporal_mode: bool,
+    /// CORR-2 (v0.36.0): Storage backend for the stream table output.
+    /// 'heap' = standard PostgreSQL heap (default).
+    /// 'citus' = Citus columnar extension.
+    /// 'pg_mooncake' = pg_mooncake columnar tables.
+    pub storage_backend: String,
 }
 
 /// CDC mode for a source dependency — tracks whether change capture uses
@@ -240,6 +249,10 @@ impl StreamTableMeta {
         st_partition_key: Option<&str>,
         max_differential_joins: Option<i32>,
         max_delta_fraction: Option<f64>,
+        // CORR-1/UX-1 (v0.36.0): temporal IVM mode
+        temporal_mode: bool,
+        // CORR-2/UX-3 (v0.36.0): columnar storage backend ("heap", "citus", "pg_mooncake")
+        storage_backend: &str,
     ) -> Result<i64, PgTrickleError> {
         Spi::connect_mut(|client| {
             let row = client
@@ -249,9 +262,10 @@ impl StreamTableMeta {
                       refresh_mode, functions_used, topk_limit, topk_order_by, topk_offset, \
                       diamond_consistency, diamond_schedule_policy, has_keyless_source, \
                       requested_cdc_mode, is_append_only, pooler_compatibility_mode, \
-                      st_partition_key, max_differential_joins, max_delta_fraction) \
+                      st_partition_key, max_differential_joins, max_delta_fraction, \
+                      temporal_mode, storage_backend) \
                      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, \
-                             $15, $16, $17, $18, $19, $20) \
+                             $15, $16, $17, $18, $19, $20, $21, $22) \
                      RETURNING pgt_id",
                     None,
                     &[
@@ -275,6 +289,8 @@ impl StreamTableMeta {
                         st_partition_key.into(),
                         max_differential_joins.into(),
                         max_delta_fraction.into(),
+                        temporal_mode.into(),
+                        storage_backend.into(),
                     ],
                 )
                 .map_err(|e: pgrx::spi::SpiError| PgTrickleError::SpiError(e.to_string()))?
@@ -304,7 +320,9 @@ impl StreamTableMeta {
                      fuse_ceiling, fuse_sensitivity, blown_at, blow_reason, \
                      st_partition_key, max_differential_joins, max_delta_fraction, \
                      last_error_message, last_error_at, downstream_publication_name, freshness_deadline_ms, \
-                     COALESCE(st_placement, 'local') AS st_placement \
+                     COALESCE(st_placement, 'local') AS st_placement, \
+                     COALESCE(temporal_mode, FALSE) AS temporal_mode, \
+                     COALESCE(storage_backend, 'heap') AS storage_backend \
                      FROM pgtrickle.pgt_stream_tables \
                      WHERE pgt_schema = $1 AND pgt_name = $2",
                     None,
@@ -338,7 +356,9 @@ impl StreamTableMeta {
                      fuse_ceiling, fuse_sensitivity, blown_at, blow_reason, \
                      st_partition_key, max_differential_joins, max_delta_fraction, \
                      last_error_message, last_error_at, downstream_publication_name, freshness_deadline_ms, \
-                     COALESCE(st_placement, 'local') AS st_placement \
+                     COALESCE(st_placement, 'local') AS st_placement, \
+                     COALESCE(temporal_mode, FALSE) AS temporal_mode, \
+                     COALESCE(storage_backend, 'heap') AS storage_backend \
                      FROM pgtrickle.pgt_stream_tables \
                      WHERE pgt_relid = $1",
                     None,
@@ -377,7 +397,9 @@ impl StreamTableMeta {
                      fuse_ceiling, fuse_sensitivity, blown_at, blow_reason, \
                      st_partition_key, max_differential_joins, max_delta_fraction, \
                      last_error_message, last_error_at, downstream_publication_name, freshness_deadline_ms, \
-                     COALESCE(st_placement, 'local') AS st_placement \
+                     COALESCE(st_placement, 'local') AS st_placement, \
+                     COALESCE(temporal_mode, FALSE) AS temporal_mode, \
+                     COALESCE(storage_backend, 'heap') AS storage_backend \
                      FROM pgtrickle.pgt_stream_tables \
                      WHERE pgt_id = $1",
                     None,
@@ -411,7 +433,9 @@ impl StreamTableMeta {
                      fuse_ceiling, fuse_sensitivity, blown_at, blow_reason, \
                      st_partition_key, max_differential_joins, max_delta_fraction, \
                      last_error_message, last_error_at, downstream_publication_name, freshness_deadline_ms, \
-                     COALESCE(st_placement, 'local') AS st_placement \
+                     COALESCE(st_placement, 'local') AS st_placement, \
+                     COALESCE(temporal_mode, FALSE) AS temporal_mode, \
+                     COALESCE(storage_backend, 'heap') AS storage_backend \
                      FROM pgtrickle.pgt_stream_tables",
                     None,
                     &[],
@@ -449,7 +473,9 @@ impl StreamTableMeta {
                      fuse_ceiling, fuse_sensitivity, blown_at, blow_reason, \
                      st_partition_key, max_differential_joins, max_delta_fraction, \
                      last_error_message, last_error_at, downstream_publication_name, freshness_deadline_ms, \
-                     COALESCE(st_placement, 'local') AS st_placement \
+                     COALESCE(st_placement, 'local') AS st_placement, \
+                     COALESCE(temporal_mode, FALSE) AS temporal_mode, \
+                     COALESCE(storage_backend, 'heap') AS storage_backend \
                      FROM pgtrickle.pgt_stream_tables \
                      WHERE status = 'ACTIVE'",
                     None,
@@ -1180,6 +1206,11 @@ impl StreamTableMeta {
             .get::<String>(44)
             .map_err(map_spi)?
             .unwrap_or_else(|| "local".into());
+        let temporal_mode = table.get::<bool>(45).map_err(map_spi)?.unwrap_or(false);
+        let storage_backend = table
+            .get::<String>(46)
+            .map_err(map_spi)?
+            .unwrap_or_else(|| "heap".into());
 
         Ok(StreamTableMeta {
             pgt_id,
@@ -1226,6 +1257,8 @@ impl StreamTableMeta {
             downstream_publication_name,
             freshness_deadline_ms,
             st_placement,
+            temporal_mode,
+            storage_backend,
         })
     }
 
@@ -1339,6 +1372,11 @@ impl StreamTableMeta {
             .get::<String>(44)
             .map_err(map_spi)?
             .unwrap_or_else(|| "local".into());
+        let temporal_mode = row.get::<bool>(45).map_err(map_spi)?.unwrap_or(false);
+        let storage_backend = row
+            .get::<String>(46)
+            .map_err(map_spi)?
+            .unwrap_or_else(|| "heap".into());
 
         Ok(StreamTableMeta {
             pgt_id,
@@ -1385,6 +1423,8 @@ impl StreamTableMeta {
             downstream_publication_name,
             freshness_deadline_ms,
             st_placement,
+            temporal_mode,
+            storage_backend,
         })
     }
 }

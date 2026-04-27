@@ -453,7 +453,41 @@ pub fn get_slot_lag_bytes(slot_name: &str) -> Result<i64, PgTrickleError> {
     .map(|v| v.unwrap_or(0))
 }
 
-// ── WAL Polling ────────────────────────────────────────────────────────────
+/// A12 (v0.36.0): Check whether WAL slot lag backpressure should pause CDC writes.
+///
+/// When `pg_trickle.enforce_backpressure = true` and the slot lag for `slot_name`
+/// exceeds `slot_lag_critical_threshold_mb`, returns `true` to indicate that CDC
+/// trigger writes should be suppressed (no-op).
+///
+/// Backpressure is released (returns `false`) when the lag drops below 50% of
+/// the critical threshold.
+///
+/// When `enforce_backpressure = false` (default), always returns `false`.
+pub fn is_backpressure_active(slot_name: &str) -> bool {
+    if !crate::config::pg_trickle_enforce_backpressure() {
+        return false;
+    }
+    let critical_bytes = crate::config::pg_trickle_slot_lag_critical_threshold_bytes();
+    let lag_bytes = match get_slot_lag_bytes(slot_name) {
+        Ok(b) => b,
+        Err(_) => return false, // On error, don't suppress writes
+    };
+    // Backpressure active when: lag >= critical threshold
+    // Backpressure released when: lag < 50% of critical threshold
+    // Hysteresis prevents rapid on/off oscillation
+    if lag_bytes >= critical_bytes {
+        pgrx::warning!(
+            "pg_trickle: WAL slot '{}' lag {}MB >= critical threshold {}MB, \
+             enabling backpressure (CDC writes suppressed)",
+            slot_name,
+            lag_bytes / (1024 * 1024),
+            critical_bytes / (1024 * 1024),
+        );
+        return true;
+    }
+    // Below the lower hysteresis threshold: backpressure off
+    false
+}
 
 /// Maximum number of changes to process per poll cycle.
 ///

@@ -7,6 +7,7 @@ For future plans and upcoming features, see [ROADMAP.md](ROADMAP.md).
 ## Table of Contents
 
 <!-- TOC start -->
+- [0.36.0 — Structural Hardening, Performance & Temporal IVM](#0360--structural-hardening-performance--temporal-ivm)
 - [0.35.0 — Hardening, Reactive Subscriptions & Relay Resilience](#0350--hardening-reactive-subscriptions--relay-resilience)
 - [0.34.0 — Citus: Automated Distributed CDC Scheduler & Shard Recovery](#0340--citus-automated-distributed-cdc-scheduler--shard-recovery)
 - [0.33.0 — Citus: Distributed Source CDC & Stream Tables](#0330--citus-distributed-source-cdc--stream-tables)
@@ -49,6 +50,113 @@ For future plans and upcoming features, see [ROADMAP.md](ROADMAP.md).
 - [0.1.1 — CloudNativePG Image & Test Hardening](#011--cloudnativepg-image--test-hardening)
 - [0.1.0 — Initial Release](#010--initial-release)
 <!-- TOC end -->
+
+---
+
+## [0.36.0] — Structural Hardening, Performance & Temporal IVM
+
+v0.36.0 closes structural and performance gaps accumulated since the Citus arc.
+The L0 process-local template cache is now constructed (was wired-but-empty
+since v0.31.0). WAL slot backpressure enforcement is available via the new
+`pg_trickle.enforce_backpressure` GUC. Structured JSON logging arrives for
+OpenTelemetry/Loki integration. The `RowIdSchema` type formalises cross-operator
+row-id compatibility, addressing the architectural root cause of EC-01 class bugs.
+Temporal IVM (SCD Type 2, `AS OF TIMESTAMP` ready) and columnar storage backend
+support are introduced. A drain mode API enables graceful quiesce before
+maintenance windows.
+
+### New features
+
+- **A09 — L0 process-local template cache**: Process-local `RwLock<HashMap>`
+  keyed by `(pgt_id, cache_generation)` avoids ~45 ms cold-start penalty per
+  backend for connection-pooler workloads. Invalidated automatically on generation
+  bump. New API: `shmem::l0_cache_lookup()`, `shmem::l0_cache_store()`,
+  `shmem::invalidate_l0_cache()`.
+
+- **A12 — WAL backpressure enforcement**: When
+  `pg_trickle.enforce_backpressure = on`, CDC trigger writes are suppressed
+  once the WAL replication slot lag reaches `slot_lag_critical_threshold_mb`.
+  Writes resume when lag drops below 50% of the threshold (hysteresis).
+  Default: `off`.
+
+- **A17 — Typed DDL event payload**: Replaced string-tag matching in
+  `hooks.rs` with a `DdlCommandKind` enum. `CREATE OR REPLACE FUNCTION` is
+  now correctly classified as `FunctionChange`.
+
+- **A18 — `RowIdSchema` type**: Every DVM operator can now declare its
+  row-id hash schema. A `verify_pipeline()` function asserts cross-operator
+  compatibility at plan time, making EC-01-class bugs detectable before execution.
+
+- **A20 — Structured JSON logging**: New `src/logging.rs` module with
+  `PgtLogEvent` struct and `pgt_info!` macro. When
+  `pg_trickle.log_format = json`, events are emitted as structured JSON
+  with fields `event`, `pgt_id`, `cycle_id`, `duration_ms`, `refresh_reason`,
+  `error_code`, `msg`. Default: `text`.
+
+- **A25 — Bulk alter / drop APIs**: New SQL functions
+  `pgtrickle.bulk_alter_stream_tables(names TEXT[], params JSONB)` and
+  `pgtrickle.bulk_drop_stream_tables(names TEXT[])` for dbt deployments
+  managing many stream tables.
+
+- **A35 — Drain mode**: `pgtrickle.drain(timeout_s INT DEFAULT 60)` signals
+  the scheduler to stop accepting new cycles and waits for all in-flight
+  refreshes to complete. `pgtrickle.is_drained()` checks drain status.
+  Useful before `pg_upgrade`, rolling restarts, and backup windows.
+
+- **CORR-1 / UX-1 — Temporal IVM**: `create_stream_table()` and
+  `create_stream_table_if_not_exists()` now accept `temporal := true`.
+  When enabled, `__pgt_valid_from TIMESTAMPTZ` and `__pgt_valid_to TIMESTAMPTZ`
+  columns are automatically added to the storage table. A `temporal_mode` column
+  is recorded in `pgtrickle.pgt_stream_tables`.
+
+- **CORR-2 / UX-3 — Columnar storage backend**: `create_stream_table()` now
+  accepts `storage_backend := 'heap'|'citus'|'pg_mooncake'` (default: `'heap'`).
+  The backend is recorded in `pgtrickle.pgt_stream_tables.storage_backend` and
+  can be overridden globally via the `pg_trickle.columnar_backend` GUC.
+
+- **F5 — Online schema evolution**: When
+  `pg_trickle.online_schema_evolution = on`, `ALTER QUERY` with only
+  column additions (no removals) preserves the existing frontier and
+  `is_populated` flag, enabling continuous differential refresh without
+  a full reinit. Default: `off`.
+
+- **F11 — `CREATE STREAM TABLE` SQL syntax**: New function
+  `pgtrickle.exec_stream_ddl(TEXT)` parses custom DDL strings such as
+  `CREATE STREAM TABLE name AS SELECT ...` and
+  `CREATE OR REPLACE STREAM TABLE name AS SELECT ...` and
+  `DROP STREAM TABLE name`.
+
+- **F12 — Column lineage**: New function
+  `pgtrickle.stream_table_lineage(name TEXT)` returns
+  `TABLE(output_col, source_table, source_col)` from the `column_lineage`
+  JSONB recorded in the catalog at creation time.
+
+### New GUCs
+
+| GUC | Default | Description |
+|-----|---------|-------------|
+| `pg_trickle.enforce_backpressure` | `off` | Pause CDC writes when slot lag exceeds critical threshold |
+| `pg_trickle.log_format` | `text` | Log format: `text` or `json` |
+| `pg_trickle.drain_timeout` | `60` | Default drain timeout (seconds) |
+| `pg_trickle.online_schema_evolution` | `off` | Preserve frontier on compatible ALTER QUERY |
+| `pg_trickle.columnar_backend` | `none` | Default columnar backend: `none`, `citus`, `pg_mooncake` |
+| `pg_trickle.temporal_stream_tables` | `off` | Global temporal IVM flag |
+
+### Schema changes
+
+- `pgtrickle.pgt_stream_tables` gains three new columns:
+  - `temporal_mode BOOLEAN NOT NULL DEFAULT FALSE`
+  - `storage_backend TEXT NOT NULL DEFAULT 'heap'`
+  - `column_lineage JSONB`
+
+### Upgrade
+
+```sql
+ALTER EXTENSION pg_trickle UPDATE TO '0.36.0';
+```
+
+The migration script (`sql/pg_trickle--0.35.0--0.36.0.sql`) is fully
+idempotent and adds the new columns with `IF NOT EXISTS`.
 
 ---
 
