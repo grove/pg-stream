@@ -83,6 +83,8 @@
 | [v0.35.0](roadmap/v0.35.0.md) | EC-01 correctness closeout, Citus chaos hardening, reactive subscriptions, zero-downtime schema changes | Released | Large | [Full details](roadmap/v0.35.0.md-full.md) |
 | [v0.36.0](roadmap/v0.36.0.md) | Structural hardening, L0 cache, WAL backpressure, temporal IVM, columnar storage | Planned | Large | [Full details](roadmap/v0.36.0.md-full.md) |
 | [v0.37.0](roadmap/v0.37.0.md) | Scheduler modularisation, pgVectorMV, OpenTelemetry trace propagation | Planned | Medium | [Full details](roadmap/v0.37.0.md-full.md) |
+| [v0.38.0](roadmap/v0.38.0.md) | Relay Phase 2a+2b — GCP Pub/Sub, Kinesis, Azure Service Bus, Elasticsearch, MQTT, Event Hubs, S3/GCS/Blob, ClickHouse | Planned | Large | [Full details](roadmap/v0.38.0.md-full.md) |
+| [v0.39.0](roadmap/v0.39.0.md) | Relay Phase 2c — DLQ, schema registry, JMESPath transforms, routing, rate limiting, circuit breaker, OTel, webhook sig | Planned | Large | [Full details](roadmap/v0.39.0.md-full.md) |
 
 ### Beyond v1.0
 
@@ -129,6 +131,10 @@ v0.36    ─── L0 cache, WAL backpressure, api split, temporal IVM, columnar
     │
 v0.37    ─── Scheduler split, pgVectorMV, OpenTelemetry, pg_partman compat
     │
+v0.38    ─── Relay Phase 2a+2b: GCP, Kinesis, Azure, Elasticsearch, MQTT, S3, ClickHouse
+    │
+v0.39    ─── Relay Phase 2c: DLQ, schema registry, transforms, routing, rate limit, OTel
+    │
 v1.0.0   ─── Stable release, PostgreSQL 19, package registries
 ```
 
@@ -150,4 +156,11 @@ performance hardening (L0 cache, WAL backpressure), structural refactoring
 (`src/api/mod.rs` split, `RowIdSchema` type), and temporal IVM / columnar
 storage. v0.37.0 completes the modularisation arc (scheduler and merge splits),
 adds pgVectorMV for AI/RAG workloads, and threads OpenTelemetry traces through
-the refresh pipeline.
+the refresh pipeline. v0.38.0 broadens the relay backend catalogue with eight
+new sinks and sources: GCP Pub/Sub, Amazon Kinesis, Azure Service Bus,
+Elasticsearch/OpenSearch, MQTT v5, Azure Event Hubs, object storage
+(S3/GCS/Azure Blob), and ClickHouse. v0.39.0 completes the relay Phase 2 plan
+with ten production-grade operational features: dead-letter queues, schema
+registry, JMESPath transforms, content-based routing, rate limiting, circuit
+breakers, SIGHUP reload, dry-run/replay, OpenTelemetry tracing, and webhook
+signature verification.
