@@ -891,12 +891,22 @@ fn consumer_lag_impl(
 /// This function is designed for the hot path — it should be called only when
 /// `is_outbox_enabled()` returns true, avoiding the SPI lookup overhead for
 /// the common (outbox disabled) case.
+///
+/// For the **inline** path (total delta ≤ `inline_threshold_rows`) the current
+/// rows of the stream table are serialised as a JSONB array in `payload`.
+/// For the **claim-check** path (total delta > threshold) the rows are written
+/// to `pgtrickle.outbox_delta_rows_<st>` with `row_op = 'INSERT'`, reflecting
+/// the post-refresh snapshot. A true row-level delta (distinguishing inserts
+/// from deletes during the MERGE) would require capturing rows inside the MERGE
+/// execution and is deferred to a future enhancement.
 pub(crate) fn write_outbox_row(
     pgt_id: i64,
     refresh_id: Option<&str>,
     inserted_count: i64,
     deleted_count: i64,
     inline_threshold_rows: i32,
+    st_schema: &str,
+    st_table: &str,
 ) -> Result<(), PgTrickleError> {
     use crate::config::PGS_OUTBOX_SKIP_EMPTY_DELTA;
 
@@ -910,27 +920,78 @@ pub(crate) fn write_outbox_row(
         None => return Ok(()), // outbox was disabled between the hot-path check and here
     };
 
-    let is_claim_check = (inserted_count + deleted_count) > inline_threshold_rows as i64;
+    let total_delta = inserted_count + deleted_count;
+    let is_claim_check = total_delta > inline_threshold_rows as i64;
 
+    // For the inline path: build a JSONB array of the stream table's current
+    // rows (up to the threshold). Pass NULL for the claim-check path — the
+    // rows will be written to the delta table below.
+    let quoted_schema = crate::api::helpers::quote_identifier(st_schema);
+    let quoted_table = crate::api::helpers::quote_identifier(st_table);
+    let payload: Option<pgrx::JsonB> = if !is_claim_check && total_delta > 0 {
+        let sql = format!(
+            "SELECT COALESCE(json_agg(row_to_json(t))::jsonb, '[]'::jsonb) \
+             FROM {quoted_schema}.{quoted_table} AS t \
+             LIMIT $1"
+        );
+        Spi::get_one_with_args::<pgrx::JsonB>(&sql, &[(inline_threshold_rows as i64).into()])
+            .unwrap_or(None)
+    } else {
+        None
+    };
+
+    // Insert the outbox header row. The refresh_id column is UUID; pass NULL
+    // when no UUID is provided rather than an empty string (which would fail
+    // the ::uuid cast).
     let insert_sql = format!(
         r#"INSERT INTO pgtrickle."{outbox}"
            (refresh_id, inserted_count, deleted_count, is_claim_check, payload)
-           VALUES ($1::uuid, $2, $3, $4, NULL)
+           VALUES ($1::uuid, $2, $3, $4, $5)
            RETURNING id"#,
         outbox = outbox_name.replace('"', "\\\"")
     );
 
-    let _outbox_row_id = Spi::get_one_with_args::<i64>(
+    let outbox_row_id: i64 = Spi::get_one_with_args::<i64>(
         &insert_sql,
         &[
-            refresh_id.unwrap_or("").into(),
+            // Pass NULL when refresh_id is None so that ::uuid receives a typed
+            // NULL rather than an empty-string coercion (which would error).
+            match refresh_id {
+                Some(s) => s.into(),
+                None => Option::<&str>::None.into(),
+            },
             inserted_count.into(),
             deleted_count.into(),
             is_claim_check.into(),
+            payload.into(),
         ],
     )
     .unwrap_or(None)
     .unwrap_or(0);
+
+    // For the claim-check path: populate the delta rows table with the
+    // stream table's current rows. Each row is recorded with row_op='INSERT'
+    // representing the post-refresh state. Bug #660 (true delta capture during
+    // MERGE) is tracked as a future enhancement.
+    if is_claim_check && outbox_row_id > 0 {
+        let st_name_part: String = st_table.chars().take(48).collect();
+        let delta_table = format!("outbox_delta_rows_{}", st_name_part);
+        let insert_delta_sql = format!(
+            r#"INSERT INTO pgtrickle."{delta}"
+               (outbox_id, row_op, row_data, row_num)
+               SELECT $1, 'INSERT', row_to_json(t)::jsonb, row_number() OVER ()
+               FROM {quoted_schema}.{quoted_table} AS t"#,
+            delta = delta_table.replace('"', "\\\""),
+        );
+        if let Err(e) = Spi::run_with_args(&insert_delta_sql, &[outbox_row_id.into()]) {
+            pgrx::warning!(
+                "[pg_trickle] OUTBOX-3: failed to write claim-check delta rows \
+                 for outbox '{}': {}",
+                outbox_name,
+                e
+            );
+        }
+    }
 
     // Notify any listeners
     let _ = Spi::run_with_args(

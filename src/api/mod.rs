@@ -5037,6 +5037,27 @@ fn execute_manual_differential_refresh(
             &new_frontier,
             rows_inserted,
         )?;
+
+        // Bug #660 fix: write outbox notification row when outbox is enabled.
+        if crate::api::outbox::is_outbox_enabled(st.pgt_id) {
+            let threshold = crate::config::PGS_OUTBOX_INLINE_THRESHOLD_ROWS.get();
+            if let Err(e) = crate::api::outbox::write_outbox_row(
+                st.pgt_id,
+                None, // manual refresh has no UUID refresh_id
+                rows_inserted,
+                rows_deleted,
+                threshold,
+                schema,
+                table_name,
+            ) {
+                pgrx::warning!(
+                    "[pg_trickle] OUTBOX: failed to write outbox row for {}.{}: {}",
+                    schema,
+                    table_name,
+                    e
+                );
+            }
+        }
     } else {
         // No rows changed — store frontier to advance past processed WAL range,
         // but preserve data_timestamp to avoid spurious downstream wakeups.
