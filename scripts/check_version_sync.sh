@@ -66,6 +66,24 @@ else
     PASS=false
 fi
 
+# 7. META.json top-level and provides version must match
+META_VERSION=$(jq -r '.version' META.json 2>/dev/null || true)
+META_PROVIDES=$(jq -r '.provides["pg_trickle"].version' META.json 2>/dev/null || true)
+if [[ "$META_VERSION" == "$VERSION" ]]; then
+    echo "  OK  META.json .version = $META_VERSION"
+else
+    echo "  FAIL META.json .version ($META_VERSION) != Cargo.toml ($VERSION)"
+    echo "       Run: just bump-version $VERSION   (or: just check-meta-version)"
+    PASS=false
+fi
+if [[ "$META_PROVIDES" == "$VERSION" ]]; then
+    echo "  OK  META.json .provides.pg_trickle.version = $META_PROVIDES"
+else
+    echo "  FAIL META.json .provides.pg_trickle.version ($META_PROVIDES) != Cargo.toml ($VERSION)"
+    echo "       Run: just bump-version $VERSION   (or: just check-meta-version)"
+    PASS=false
+fi
+
 if $PASS; then
     echo ""
     echo "All version checks passed for v${VERSION}."
