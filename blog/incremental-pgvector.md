@@ -345,6 +345,28 @@ LIMIT  20;
 
 Vector similarity, full-text ranking, ACL filter — on one table, one query, with correct fresh data.
 
+### The Before and After
+
+Let's count what changed.
+
+**Before:**
+- Three codebases to deploy and maintain: app, embedding worker, index rebuild job.
+- Average search freshness: up to 24 hours stale (nightly REINDEX).
+- Permission filtering happens *after* ANN retrieval: for a user with access to 5% of projects, you over-fetch 20× candidates, discard 95% of them, and return 10 results.
+- Index quality: unknown until someone notices results feel off.
+- On-call surface: three failure modes — worker stopped, index diverged, outbox grew unbounded.
+
+**After:**
+- One SQL statement to create the stream table. The rest is PostgreSQL.
+- Average search freshness: 10 seconds from edit to searchable.
+- Permission filtering is a native indexed array lookup (`$3 = ANY(allowed_users)`) on the flat table — zero over-fetching, no candidate waste.
+- Index quality: tracked as `drift_pct` in `pgtrickle.vector_status()`. Auto-rebuilt when it crosses 15%.
+- On-call surface: one alert if the refresh lag exceeds your SLA. The system self-heals on restart.
+
+The 50 edits per minute figure is worth unpacking. Over a 24-hour period, that's 72,000 page changes. Under the nightly-batch model, every one of those changes is invisible to search until the next morning's rebuild. Under pg_trickle, each change is propagated within 10 seconds. The HNSW and GIN indexes are updated by PostgreSQL's normal index maintenance — the same mechanism that would update any other btree or gin index when you run an INSERT or UPDATE. There is no special path.
+
+The drift-aware reindex matters here too. At 50 edits per minute, roughly 72,000 out of 500,000 pages change each day — about 14% daily churn. With a 15% threshold, the HNSW index will be rebuilt roughly every day. Since it uses `REINDEX CONCURRENTLY`, the rebuild happens in the background, the old index serves queries throughout, and the swap is atomic. Your on-call engineer never needs to know it happened.
+
 ---
 
 ## The Architecture in Plain English
@@ -364,6 +386,88 @@ Here's how pg_trickle actually connects the pieces:
 **Step 6 — Monitoring.** `pgtrickle.vector_status()` shows lag, drift, index age, and aggregate counts in real time.
 
 Every step is within PostgreSQL. Every step is ACID-safe. No external processes, no message queues, no separate services.
+
+---
+
+## Monitoring Your Embedding Pipeline
+
+The most dangerous failure mode in any embedding pipeline is the one you can't see. The batch job fell behind three days ago. The worker is running but throwing errors it's swallowing. The HNSW recall degraded over six months and nobody noticed.
+
+pg_trickle's v0.38.0 monitoring view — `pgtrickle.vector_status()` — is designed to make the invisible visible.
+
+```sql
+SELECT * FROM pgtrickle.vector_status();
+```
+
+```
+ stream_table      | embedding_col | index_type | total_rows | rows_changed | drift_pct | last_refresh        | refresh_lag_ms | last_reindex        | index_age_hours
+-------------------+---------------+------------+------------+--------------+-----------+---------------------+----------------+---------------------+-----------------
+ doc_search_corpus | embedding     | hnsw       |    498,231 |       11,443 |      2.30 | 2026-04-27 14:32:01 |          2,847 | 2026-04-27 03:00:00 |           11.53
+ user_taste        | taste_vec     | hnsw       |  1,204,891 |       81,020 |      6.73 | 2026-04-27 14:32:05 |          3,102 | 2026-04-26 20:00:00 |           18.53
+```
+
+Each row tells you:
+
+- **`total_rows`** — how large the corpus is right now.
+- **`rows_changed`** — how many rows have been inserted, updated, or deleted since the last REINDEX. Divide by `total_rows` to get `drift_pct`.
+- **`refresh_lag_ms`** — milliseconds since the last successful refresh. For a 10-second schedule, this should stay below ~12,000ms under normal load. If it climbs, your refresh is taking longer than the cycle.
+- **`last_reindex`** and **`index_age_hours`** — when the HNSW index was last rebuilt, and how old it is.
+
+For the documentation platform example, `doc_search_corpus` is 2.3% drifted after ~11 hours. At the current edit rate, it will cross the 15% threshold in about two more days. When it does, `REINDEX CONCURRENTLY` runs automatically overnight without waking anyone up.
+
+### Prometheus and Grafana
+
+The same numbers are exported as Prometheus metrics (shipped alongside the monitoring view in v0.38.0):
+
+```
+# HELP pgtrickle_vector_drift_ratio Fraction of rows changed since last reindex
+# TYPE pgtrickle_vector_drift_ratio gauge
+pgtrickle_vector_drift_ratio{stream_table="doc_search_corpus"} 0.023
+pgtrickle_vector_drift_ratio{stream_table="user_taste"} 0.067
+
+# HELP pgtrickle_vector_refresh_lag_ms Milliseconds since last successful refresh
+# TYPE pgtrickle_vector_refresh_lag_ms gauge
+pgtrickle_vector_refresh_lag_ms{stream_table="doc_search_corpus"} 2847
+pgtrickle_vector_refresh_lag_ms{stream_table="user_taste"} 3102
+
+# HELP pgtrickle_vector_index_age_seconds Seconds since last REINDEX
+# TYPE pgtrickle_vector_index_age_seconds gauge
+pgtrickle_vector_index_age_seconds{stream_table="doc_search_corpus"} 41508
+pgtrickle_vector_index_age_seconds{stream_table="user_taste"} 66708
+```
+
+Two Grafana alerts are enough to cover the production failure surface:
+
+```yaml
+- alert: EmbeddingCorpusStale
+  expr: pgtrickle_vector_refresh_lag_ms > 30000
+  for: 3m
+  annotations:
+    summary: "{{ $labels.stream_table }} hasn't refreshed in >30s"
+    description: "Check background worker health and source-table CDC triggers."
+
+- alert: VectorIndexDriftHigh
+  expr: pgtrickle_vector_drift_ratio > 0.20
+  for: 10m
+  annotations:
+    summary: "{{ $labels.stream_table }} index drift >20%"
+    description: "Automatic reindex may not be keeping up. Review reindex_drift_threshold."
+```
+
+The first alert catches the case where something is broken (worker dead, schema changed, CDC trigger dropped). The second catches the case where your reindex threshold is too conservative for your write rate. Neither requires the on-call engineer to understand IVFFlat centroids. They just need to know "this dashboard is green when the system is working."
+
+### What You Won't Have to Monitor
+
+The things that break in a typical batch-based embedding pipeline and require monitoring:
+- Is the embedding worker running?
+- Is the outbox queue draining?
+- Is the last batch run date recent?
+- Is the HNSW index from this year or last year?
+- Did the nightly rebuild complete successfully?
+
+With pg_trickle, none of these exist as failure modes. There's no embedding worker (your app writes vectors, pg_trickle maintains the corpus). There's no outbox queue (CDC buffers are written in-transaction and drained automatically). There's no batch run date (refresh is continuous). There's no "when was the index last rebuilt" anxiety (the scheduler handles it, and `vector_status()` confirms it).
+
+The monitoring surface collapses to two metrics. That's the right outcome.
 
 ---
 
