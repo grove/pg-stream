@@ -58,6 +58,8 @@ fn test_st(refresh_mode: RefreshMode, needs_reinit: bool) -> StreamTableMeta {
         downstream_publication_name: None,
         freshness_deadline_ms: None,
         st_placement: "local".to_string(),
+        temporal_mode: false,
+        storage_backend: "heap".to_string(),
     }
 }
 

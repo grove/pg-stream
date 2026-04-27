@@ -658,6 +658,10 @@ fn create_stream_table(
     max_delta_fraction: default!(Option<f64>, "NULL"),
     // CITUS-7: Distribution column for the output (stream table storage) table.
     output_distribution_column: default!(Option<&str>, "NULL"),
+    // CORR-1/UX-1 (v0.36.0): temporal IVM mode
+    temporal: default!(bool, false),
+    // CORR-2/UX-3 (v0.36.0): columnar storage backend
+    storage_backend: default!(Option<&str>, "NULL"),
 ) {
     let result = create_stream_table_impl(
         name,
@@ -674,6 +678,8 @@ fn create_stream_table(
         max_differential_joins,
         max_delta_fraction,
         output_distribution_column,
+        temporal,
+        storage_backend,
     );
     if let Err(e) = result {
         raise_error_with_context(e);
@@ -704,6 +710,10 @@ fn create_stream_table_if_not_exists(
     max_delta_fraction: default!(Option<f64>, "NULL"),
     // CITUS-7: Distribution column for the output (stream table storage) table.
     output_distribution_column: default!(Option<&str>, "NULL"),
+    // CORR-1/UX-1 (v0.36.0): temporal IVM mode
+    temporal: default!(bool, false),
+    // CORR-2/UX-3 (v0.36.0): columnar storage backend
+    storage_backend: default!(Option<&str>, "NULL"),
 ) {
     let result = create_stream_table_if_not_exists_impl(
         name,
@@ -720,6 +730,8 @@ fn create_stream_table_if_not_exists(
         max_differential_joins,
         max_delta_fraction,
         output_distribution_column,
+        temporal,
+        storage_backend,
     );
     if let Err(e) = result {
         raise_error_with_context(e);
@@ -743,6 +755,10 @@ fn create_stream_table_if_not_exists_impl(
     max_delta_fraction: Option<f64>,
     // CITUS-7: Distribution column for the output (stream table storage) table.
     output_distribution_column: Option<&str>,
+    // CORR-1/UX-1 (v0.36.0)
+    temporal: bool,
+    // CORR-2/UX-3 (v0.36.0)
+    storage_backend: Option<&str>,
 ) -> Result<(), PgTrickleError> {
     let (schema, table_name) = parse_qualified_name(name)?;
 
@@ -770,6 +786,8 @@ fn create_stream_table_if_not_exists_impl(
             max_differential_joins,
             max_delta_fraction,
             output_distribution_column,
+            temporal,
+            storage_backend,
         ),
         Err(e) => Err(e),
     }
@@ -867,6 +885,13 @@ fn bulk_create_impl(definitions: serde_json::Value) -> Result<serde_json::Value,
         let output_distribution_column = obj
             .get("output_distribution_column")
             .and_then(|v| v.as_str());
+        // CORR-1/UX-1 (v0.36.0): temporal IVM mode
+        let temporal = obj
+            .get("temporal")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        // CORR-2/UX-3 (v0.36.0): columnar storage backend
+        let storage_backend = obj.get("storage_backend").and_then(|v| v.as_str());
 
         match create_stream_table_impl(
             name,
@@ -883,6 +908,8 @@ fn bulk_create_impl(definitions: serde_json::Value) -> Result<serde_json::Value,
             max_differential_joins,
             max_delta_fraction,
             output_distribution_column,
+            temporal,
+            storage_backend,
         ) {
             Ok(()) => {
                 // Look up pgt_id for the result
@@ -1192,6 +1219,8 @@ fn create_or_replace_stream_table_impl(
                 max_differential_joins,
                 max_delta_fraction,
                 output_distribution_column,
+                false, // temporal: default off for create_or_replace
+                None,  // storage_backend: default
             )
         }
         Err(e) => Err(e),
@@ -1962,6 +1991,10 @@ fn insert_catalog_and_deps(
     partition_by: Option<&str>,
     max_differential_joins: Option<i32>,
     max_delta_fraction: Option<f64>,
+    // CORR-1/UX-1 (v0.36.0): temporal IVM mode
+    temporal_mode: bool,
+    // CORR-2/UX-3 (v0.36.0): columnar storage backend
+    storage_backend: &str,
 ) -> Result<i64, PgTrickleError> {
     let pgt_id = StreamTableMeta::insert(
         pgt_relid,
@@ -1986,6 +2019,8 @@ fn insert_catalog_and_deps(
         partition_by,
         max_differential_joins,
         max_delta_fraction,
+        temporal_mode,
+        storage_backend,
     )?;
 
     // Build per-source column usage map
@@ -2754,21 +2789,46 @@ fn alter_stream_table_query(
         .as_ref()
         .and_then(|i| i.offset_value.map(|v| v as i32));
 
+    // F5 (v0.36.0): Online schema evolution — when the GUC is enabled and the
+    // schema change only adds columns (no removals, no incompatible changes),
+    // preserve the existing frontier and is_populated flag so that the next
+    // refresh continues incrementally rather than performing a full reinit.
+    let preserve_frontier = config::pg_trickle_online_schema_evolution()
+        && matches!(
+            &schema_change,
+            SchemaChange::Compatible { added, removed } if !added.is_empty() && removed.is_empty()
+        );
+
+    let (frontier_clause, populated_clause) = if preserve_frontier {
+        // Keep existing frontier and is_populated — differential refresh continues
+        pgrx::log!(
+            "pg_trickle: online schema evolution enabled; preserving frontier for {}.{}",
+            schema,
+            table_name,
+        );
+        ("", "")
+    } else {
+        ("frontier = NULL,", "is_populated = false,")
+    };
+
     Spi::run_with_args(
-        "UPDATE pgtrickle.pgt_stream_tables SET \
-         pgt_relid = $1, \
-         defining_query = $2, \
-         original_query = $3, \
-         functions_used = $4, \
-         topk_limit = $5, \
-         topk_order_by = $6, \
-         topk_offset = $7, \
-         needs_reinit = false, \
-         frontier = NULL, \
-         is_populated = false, \
-         has_keyless_source = $8, \
-         updated_at = now() \
-         WHERE pgt_id = $9",
+        &format!(
+            "UPDATE pgtrickle.pgt_stream_tables SET \
+             pgt_relid = $1, \
+             defining_query = $2, \
+             original_query = $3, \
+             functions_used = $4, \
+             topk_limit = $5, \
+             topk_order_by = $6, \
+             topk_offset = $7, \
+             needs_reinit = false, \
+             {} \
+             {} \
+             has_keyless_source = $8, \
+             updated_at = now() \
+             WHERE pgt_id = $9",
+            frontier_clause, populated_clause,
+        ),
         &[
             new_pgt_relid.into(),
             defining_query.into(),
@@ -3096,6 +3156,10 @@ fn create_stream_table_impl(
     // CITUS-7: If set and Citus is loaded, convert the storage table to a
     // Citus distributed table using this column as the distribution key.
     output_distribution_column: Option<&str>,
+    // CORR-1/UX-1 (v0.36.0): temporal IVM mode
+    temporal_mode: bool,
+    // CORR-2/UX-3 (v0.36.0): columnar storage backend ("heap", "citus", "pg_mooncake", or "none")
+    storage_backend: Option<&str>,
 ) -> Result<(), PgTrickleError> {
     let is_auto = RefreshMode::is_auto_str(refresh_mode_str);
     let mut refresh_mode = RefreshMode::from_str(refresh_mode_str)?;
@@ -3325,6 +3389,49 @@ fn create_stream_table_impl(
     } else {
         None
     };
+
+    // CORR-1/UX-1 (v0.36.0): Add __pgt_valid_from / __pgt_valid_to columns for temporal mode.
+    if temporal_mode {
+        let temporal_sql = format!(
+            "ALTER TABLE {}.{} \
+             ADD COLUMN IF NOT EXISTS __pgt_valid_from TIMESTAMPTZ NOT NULL DEFAULT now(), \
+             ADD COLUMN IF NOT EXISTS __pgt_valid_to TIMESTAMPTZ",
+            quote_identifier(&schema),
+            quote_identifier(&table_name),
+        );
+        Spi::run(&temporal_sql).map_err(|e| {
+            PgTrickleError::SpiError(format!(
+                "Failed to add temporal columns to storage table: {}",
+                e
+            ))
+        })?;
+    }
+
+    // CORR-2/UX-3 (v0.36.0): Normalize storage_backend value for catalog storage.
+    let storage_backend_str = match storage_backend {
+        Some(b) => {
+            let b = b.to_lowercase();
+            match b.as_str() {
+                "heap" | "citus" | "pg_mooncake" | "none" => b,
+                other => {
+                    return Err(PgTrickleError::InvalidArgument(format!(
+                        "invalid storage_backend '{}': expected 'heap', 'citus', 'pg_mooncake', or 'none'",
+                        other
+                    )));
+                }
+            }
+        }
+        None => {
+            // Use GUC-configured columnar backend if set, otherwise heap
+            use crate::config::{ColumnarBackend, pg_trickle_columnar_backend};
+            match pg_trickle_columnar_backend() {
+                ColumnarBackend::None => "heap".to_string(),
+                ColumnarBackend::Citus => "citus".to_string(),
+                ColumnarBackend::PgMooncake => "pg_mooncake".to_string(),
+            }
+        }
+    };
+
     // Capture before schedule_str is moved into insert_catalog_and_deps.
     let is_calculated = schedule_str.is_none();
     let pgt_id = insert_catalog_and_deps(
@@ -3344,6 +3451,8 @@ fn create_stream_table_impl(
         partition_by,
         max_differential_joins,
         max_delta_fraction,
+        temporal_mode,
+        &storage_backend_str,
     )?;
 
     // ── Phase 2: CDC / IVM trigger setup ──
@@ -5182,6 +5291,354 @@ fn view_evolution_status() -> TableIterator<
     TableIterator::new(rows)
 }
 
+// ── v0.36.0: Drain mode (A35) ─────────────────────────────────────────────
+
+/// A35 (v0.36.0): Signal the scheduler to gracefully quiesce and wait for all
+/// in-flight refreshes to complete before returning.
+///
+/// The function signals a drain by incrementing the shared `DRAIN_REQUESTED`
+/// epoch counter, then polls `DRAIN_COMPLETED` at 100 ms intervals until it
+/// matches the requested epoch or the `timeout_s` deadline expires.
+///
+/// Returns `true` if the scheduler completed the drain within the timeout,
+/// `false` if the deadline was reached with refreshes still in flight.
+///
+/// # Example
+/// ```sql
+/// -- Quiesce before pg_upgrade or rolling restart:
+/// SELECT pgtrickle.drain();
+/// -- Confirm drained:
+/// SELECT pgtrickle.is_drained();
+/// -- Resume normal operation after maintenance:
+/// UPDATE pgtrickle.pgt_stream_tables SET status = status; -- noop, scheduler picks up
+/// ```
+#[pg_extern(schema = "pgtrickle")]
+fn drain(timeout_s: default!(i32, 60)) -> bool {
+    let effective_timeout = if timeout_s < 1 {
+        crate::config::pg_trickle_drain_timeout()
+    } else {
+        timeout_s
+    };
+
+    let epoch = match crate::shmem::signal_drain() {
+        Some(e) => e,
+        None => {
+            // Shared memory not available — trivially drained
+            return true;
+        }
+    };
+
+    let deadline =
+        std::time::Instant::now() + std::time::Duration::from_secs(effective_timeout as u64);
+
+    loop {
+        if crate::shmem::check_drain_completed(epoch) {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            // Timed out — cancel the drain request so the scheduler resumes
+            crate::shmem::cancel_drain();
+            return false;
+        }
+        // Poll at 100 ms intervals to avoid busy-wait
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+}
+
+/// A35 (v0.36.0): Returns `true` when the scheduler is drained (all in-flight
+/// refreshes have completed and no new cycles are being dispatched).
+///
+/// A scheduler is considered drained when `DRAIN_COMPLETED >= DRAIN_REQUESTED`
+/// in shared memory. This state is reset the next time the scheduler begins a
+/// new tick.
+#[pg_extern(schema = "pgtrickle")]
+fn is_drained() -> bool {
+    crate::shmem::is_drained()
+}
+
+// ── v0.36.0: Bulk operations (A25) ────────────────────────────────────────
+
+/// A25 (v0.36.0): Alter multiple stream tables in a single call.
+///
+/// Applies the same parameter set to each stream table in `names`. The
+/// `params` JSONB object accepts the same keys as `alter_stream_table()`:
+/// `schedule`, `refresh_mode`, `tier`, `fuse_mode`, `fuse_ceiling`, etc.
+///
+/// Returns the number of stream tables successfully altered.
+///
+/// # Example
+/// ```sql
+/// SELECT pgtrickle.bulk_alter_stream_tables(
+///     ARRAY['public.orders_summary', 'public.daily_revenue'],
+///     '{"schedule": "5m", "tier": "warm"}'::jsonb
+/// );
+/// ```
+#[pg_extern(schema = "pgtrickle")]
+fn bulk_alter_stream_tables(names: Vec<Option<String>>, params: pgrx::Json) -> i32 {
+    let mut count = 0i32;
+    let param_map: serde_json::Map<String, serde_json::Value> =
+        match serde_json::from_value(params.0) {
+            Ok(m) => m,
+            Err(e) => {
+                pgrx::error!("bulk_alter_stream_tables: invalid params JSON: {}", e);
+            }
+        };
+
+    for name_opt in names.iter().flatten() {
+        let name = name_opt.as_str();
+        // Parse schema.name from the provided name
+        let (schema, tbl) = if let Some((s, t)) = name.split_once('.') {
+            (s.to_string(), t.to_string())
+        } else {
+            ("public".to_string(), name.to_string())
+        };
+
+        // Build ALTER STREAM TABLE command by calling the existing alter function
+        // for each key/value pair in params.
+        let mut altered = false;
+        for (key, value) in &param_map {
+            let val_str = match value {
+                serde_json::Value::String(s) => s.clone(),
+                serde_json::Value::Number(n) => n.to_string(),
+                serde_json::Value::Bool(b) => b.to_string(),
+                _ => value.to_string(),
+            };
+            let alter_sql = format!(
+                "ALTER STREAM TABLE {}.{} SET ({} = '{}')",
+                schema, tbl, key, val_str
+            );
+            match Spi::run(&alter_sql) {
+                Ok(_) => {
+                    altered = true;
+                }
+                Err(e) => {
+                    pgrx::warning!("bulk_alter_stream_tables: failed to alter {}: {}", name, e);
+                }
+            }
+        }
+        if altered {
+            count += 1;
+        }
+    }
+    count
+}
+
+/// A25 (v0.36.0): Drop multiple stream tables in a single call.
+///
+/// Drops each stream table in `names`, stopping CDC and removing the storage
+/// table. On failure for any table, logs a WARNING and continues to the next.
+///
+/// Returns the number of stream tables successfully dropped.
+///
+/// # Example
+/// ```sql
+/// SELECT pgtrickle.bulk_drop_stream_tables(
+///     ARRAY['public.orders_summary', 'public.stale_view']
+/// );
+/// ```
+#[pg_extern(schema = "pgtrickle")]
+fn bulk_drop_stream_tables(names: Vec<Option<String>>) -> i32 {
+    let mut count = 0i32;
+    for name_opt in names.iter().flatten() {
+        let name = name_opt.as_str();
+        let (schema, tbl) = if let Some((s, t)) = name.split_once('.') {
+            (s.to_string(), t.to_string())
+        } else {
+            ("public".to_string(), name.to_string())
+        };
+        let drop_sql = format!(
+            "SELECT pgtrickle.drop_stream_table('{}', '{}')",
+            tbl, schema
+        );
+        match Spi::run(&drop_sql) {
+            Ok(_) => {
+                count += 1;
+            }
+            Err(e) => {
+                pgrx::warning!(
+                    "bulk_drop_stream_tables: failed to drop {}.{}: {}",
+                    schema,
+                    tbl,
+                    e
+                );
+            }
+        }
+    }
+    count
+}
+
+// ── v0.36.0: CREATE STREAM TABLE SQL syntax (F11) ─────────────────────────
+
+/// F11 (v0.36.0): Execute a `CREATE [OR REPLACE] STREAM TABLE` SQL statement.
+///
+/// Parses the custom `CREATE STREAM TABLE name AS SELECT ...` syntax (which
+/// PostgreSQL's parser does not understand natively) and translates it to a
+/// `pgtrickle.create_stream_table()` call.
+///
+/// Supported syntax variants:
+/// ```sql
+/// CREATE STREAM TABLE my_st AS SELECT ...;
+/// CREATE OR REPLACE STREAM TABLE my_st AS SELECT ...;
+/// DROP STREAM TABLE my_st;
+/// ```
+///
+/// All `create_stream_table()` options default to their standard defaults.
+/// For full control, call `pgtrickle.create_stream_table()` directly.
+///
+/// # Example
+/// ```sql
+/// SELECT pgtrickle.exec_stream_ddl(
+///   'CREATE STREAM TABLE revenue AS SELECT SUM(amount) FROM orders'
+/// );
+/// ```
+#[pg_extern(schema = "pgtrickle")]
+fn exec_stream_ddl(cmd: &str) -> bool {
+    let cmd = cmd.trim();
+    let upper = cmd.to_uppercase();
+
+    // ── DROP STREAM TABLE ──
+    if upper.starts_with("DROP STREAM TABLE") {
+        let rest = cmd[17..].trim(); // after "DROP STREAM TABLE"
+        let name = rest.trim_end_matches(';').trim();
+        if name.is_empty() {
+            pgrx::error!("exec_stream_ddl: missing table name in DROP STREAM TABLE");
+        }
+        // Use $1 parameterized call to avoid SQL injection.
+        Spi::run_with_args("SELECT pgtrickle.drop_stream_table($1)", &[name.into()])
+            .unwrap_or_else(|e| pgrx::error!("exec_stream_ddl DROP: {}", e));
+        return true;
+    }
+
+    // ── CREATE [OR REPLACE] STREAM TABLE ──
+    let (or_replace, rest) = if upper.starts_with("CREATE OR REPLACE STREAM TABLE ") {
+        (true, &cmd[31..]) // after "CREATE OR REPLACE STREAM TABLE "
+    } else if upper.starts_with("CREATE STREAM TABLE ") {
+        (false, &cmd[20..]) // after "CREATE STREAM TABLE "
+    } else {
+        pgrx::error!(
+            "exec_stream_ddl: unrecognised syntax. Expected \
+             'CREATE [OR REPLACE] STREAM TABLE name AS SELECT ...' \
+             or 'DROP STREAM TABLE name'."
+        );
+    };
+
+    // Split name from "AS SELECT ..."
+    let upper_rest = rest.to_uppercase();
+    let as_idx = upper_rest.find(" AS ").unwrap_or_else(|| {
+        pgrx::error!(
+            "exec_stream_ddl: missing AS keyword. Syntax: CREATE STREAM TABLE name AS SELECT ..."
+        )
+    });
+    let name = rest[..as_idx].trim();
+    let query = rest[as_idx + 4..].trim().trim_end_matches(';').trim();
+
+    if name.is_empty() {
+        pgrx::error!("exec_stream_ddl: missing table name");
+    }
+    if query.is_empty() {
+        pgrx::error!("exec_stream_ddl: missing query after AS");
+    }
+
+    if or_replace {
+        Spi::run_with_args(
+            "SELECT pgtrickle.create_or_replace_stream_table($1, $2)",
+            &[name.into(), query.into()],
+        )
+        .unwrap_or_else(|e| pgrx::error!("exec_stream_ddl CREATE OR REPLACE: {}", e));
+    } else {
+        Spi::run_with_args(
+            "SELECT pgtrickle.create_stream_table($1, $2)",
+            &[name.into(), query.into()],
+        )
+        .unwrap_or_else(|e| pgrx::error!("exec_stream_ddl CREATE: {}", e));
+    }
+
+    true
+}
+
+// ── v0.36.0: Column lineage (F12) ─────────────────────────────────────────
+
+/// F12 (v0.36.0): Return the column lineage for a stream table.
+///
+/// Reports the `column_lineage` JSON recorded in `pgt_stream_tables` at
+/// creation time, mapping each output column to its source table and column.
+/// When no lineage information is available (e.g., complex expressions),
+/// `source_table` and `source_col` are `NULL`.
+///
+/// # Example
+/// ```sql
+/// SELECT * FROM pgtrickle.stream_table_lineage('public.revenue_summary');
+/// ```
+#[pg_extern(schema = "pgtrickle")]
+fn stream_table_lineage(
+    name: &str,
+) -> TableIterator<
+    'static,
+    (
+        name!(output_col, Option<String>),
+        name!(source_table, Option<String>),
+        name!(source_col, Option<String>),
+    ),
+> {
+    let (schema, tbl) = if let Some((s, t)) = name.split_once('.') {
+        (s.to_string(), t.to_string())
+    } else {
+        ("public".to_string(), name.to_string())
+    };
+
+    let rows: Vec<(Option<String>, Option<String>, Option<String>)> = Spi::connect(|client| {
+        // Retrieve the column_lineage JSON from the catalog.
+        let result = client.select(
+            "SELECT column_lineage FROM pgtrickle.pgt_stream_tables \
+             WHERE pgt_schema = $1 AND pgt_name = $2",
+            None,
+            &[schema.clone().into(), tbl.clone().into()],
+        )?;
+
+        if result.is_empty() {
+            return Ok::<Vec<(Option<String>, Option<String>, Option<String>)>, pgrx::spi::SpiError>(
+                Vec::new(),
+            );
+        }
+
+        let first = result.first();
+        let lineage_json: Option<pgrx::Json> = first.get::<pgrx::Json>(1)?;
+
+        let lineage = match lineage_json {
+            Some(j) => j.0,
+            None => {
+                return Ok::<
+                    Vec<(Option<String>, Option<String>, Option<String>)>,
+                    pgrx::spi::SpiError,
+                >(Vec::new());
+            }
+        };
+
+        // Expected JSON format:
+        // [{"output_col": "revenue", "source_table": "orders", "source_col": "amount"}, ...]
+        let mut rows = Vec::new();
+        if let serde_json::Value::Array(entries) = lineage {
+            for entry in entries {
+                let output_col = entry["output_col"].as_str().map(str::to_owned);
+                let source_table = entry["source_table"].as_str().map(str::to_owned);
+                let source_col = entry["source_col"].as_str().map(str::to_owned);
+                rows.push((output_col, source_table, source_col));
+            }
+        } else if let serde_json::Value::Object(obj) = lineage {
+            // Also support {"col": {"source_table": ..., "source_col": ...}} format
+            for (col, info) in obj {
+                let source_table = info["source_table"].as_str().map(str::to_owned);
+                let source_col = info["source_col"].as_str().map(str::to_owned);
+                rows.push((Some(col), source_table, source_col));
+            }
+        }
+        Ok(rows)
+    })
+    .unwrap_or_default();
+
+    TableIterator::new(rows)
+}
+
 /// Return the pg_trickle extension version (from `Cargo.toml`).
 ///
 /// This matches the version reported by `pg_extension.extversion`.
@@ -5889,6 +6346,8 @@ mod tests {
             downstream_publication_name: None,
             freshness_deadline_ms: None,
             st_placement: "local".to_string(),
+            temporal_mode: false,
+            storage_backend: "heap".to_string(),
         }
     }
 
