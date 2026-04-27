@@ -10,21 +10,52 @@
 
 ## Posts
 
-### Core Concepts
+### Core Concepts & Theory
 
 | Post | Summary |
 |------|---------|
 | [Why Your Materialized Views Are Always Stale](stale-materialized-views.md) | Explains why `REFRESH MATERIALIZED VIEW` fails at scale — locking, cost, and the full-scan ceiling — and how switching to a stream table with `DIFFERENTIAL` mode fixes staleness in 5 lines of SQL. |
 | [Differential Dataflow for the Rest of Us](differential-dataflow-explained.md) | A plain-language walkthrough of the mathematics behind incremental view maintenance: delta rules for filters, joins, aggregates, the MERGE application step, and why some aggregates (MEDIAN, RANK) can't be made incremental. |
 | [Incremental Aggregates in PostgreSQL: No ETL Required](incremental-aggregates-no-etl.md) | How `SUM`, `COUNT`, `AVG`, and (in v0.37) `vector_avg` are maintained as running algebraic state rather than full scans. Covers multi-table aggregates, conditional aggregates, and the non-differentiable cases. |
+| [The Z-Set: The Data Structure That Makes IVM Correct](z-set-data-structure.md) | A concrete tour of the integer-weighted multiset that underlies pg_trickle's differential engine — how inserts are +1, deletes are -1, updates are both, and why commutativity eliminates an entire class of ordering bugs. |
+| [The Cost Model: How pg_trickle Decides Whether to Refresh Differentially](cost-model-auto-mode.md) | Inside AUTO mode: the decision inputs (delta ratio, query complexity, historical timings), the learned cost model, and when the engine switches between DIFFERENTIAL and FULL refresh mid-flight. |
 
-### Operational Deep Dives
+### Refresh Modes & Scheduling
 
 | Post | Summary |
 |------|---------|
+| [IMMEDIATE Mode: When "Good Enough Freshness" Isn't Good Enough](immediate-mode-zero-lag.md) | Synchronous IVM inside the source transaction — zero lag, no background worker. Account balances, inventory tracking, and the trade-offs vs. DIFFERENTIAL mode. |
+| [How pg_trickle Handles Diamond Dependencies](diamond-dependencies.md) | When two branches of a DAG share a source and converge downstream, naively refreshing can cause double-counting. How the frontier tracker and diamond-group scheduling ensure correctness. |
+| [Temporal Stream Tables: Time-Windowed Views That Update Themselves](temporal-stream-tables.md) | The "last 7 days" problem — results that change because time passes, not because data changed. Sliding-window eviction, the `temporal_mode` parameter, and when fixed windows don't need it. |
+
+### Architecture & Data Patterns
+
+| Post | Summary |
+|------|---------|
+| [The Medallion Architecture Lives Inside PostgreSQL](medallion-architecture-postgresql.md) | Bronze/Silver/Gold without Spark or Airflow. Chained stream tables propagate from raw ingest to business aggregates in under 5 seconds, with DAG-aware scheduling and transactional consistency. |
+| [CQRS Without a Second Database](cqrs-without-second-database.md) | Command Query Responsibility Segregation using stream tables as the read model — same PostgreSQL instance, no CDC pipeline, read-your-writes with IMMEDIATE mode. |
+| [Slowly Changing Dimensions in Real Time](slowly-changing-dimensions.md) | SCD Type 2 (historical attribute tracking with `valid_from`/`valid_to`) maintained continuously by a stream table — no nightly ETL, no Airflow DAG. |
+| [The Append-Only Fast Path](append-only-fast-path.md) | Why insert-only tables (event logs, sensor data, clickstreams) get a 2–3× faster refresh: no delete-side delta, no inverse computation, no before-image lookups. |
+
+### Use Cases & Migration
+
+| Post | Summary |
+|------|---------|
+| [Real-Time Leaderboards That Don't Lie](real-time-leaderboards.md) | Top-N stream tables for games, sales dashboards, and coding challenges — tied scores, multi-category boards, the pagination problem, and why you might not need Redis. |
 | [The Hidden Cost of Trigger-Based Denormalization](trigger-denormalization-cost.md) | Four failure modes of hand-rolled trigger sync — blind UPDATE divergence, statement vs. row trigger semantics, invisible deletes, and multi-row races — and how declarative IVM avoids all of them. |
 | [How We Replaced a Celery Pipeline with 3 SQL Statements](replaced-celery-with-sql.md) | A before/after case study of a Celery + Elasticsearch product search pipeline across three generations of growing complexity, and the pg_trickle stream table that replaced it. Includes benchmark numbers. |
-| [Stop Rebuilding Your Search Index at 3am](stop-rebuilding-search-index.md) | How pg_trickle's scheduler, SLA tiers (`critical` / `standard` / `background`), backpressure, and parallel workers let you tune refresh behaviour per workload — and why the 3am maintenance window disappears with continuous incremental refresh. |
+| [Migrating from pg_ivm to pg_trickle](migrating-from-pg-ivm.md) | Feature gap table, SQL syntax differences, step-by-step migration procedure, and when staying on pg_ivm is the right call. |
+
+### Integrations & Ecosystem
+
+| Post | Summary |
+|------|---------|
+| [Streaming to Kafka Without Kafka Expertise](streaming-to-kafka-without-kafka.md) | pgtrickle-relay bridges stream table deltas to Kafka, NATS, SQS, and webhooks — a single binary with TOML config, advisory-lock HA, subject routing, and Prometheus metrics. |
+| [The Inbox Pattern: Receiving Events from Kafka into PostgreSQL](inbox-pattern-kafka.md) | Idempotent, ordered event ingestion via the inbox table — deduplication by event ID, dead-letter queue, and stream tables that aggregate incoming events incrementally. |
+| [dbt + pg_trickle: The Analytics Engineer's Stack](dbt-analytics-stack.md) | The `pgtrickle` dbt materialization: continuously-fresh models that are also version-controlled, tested, and documented. DAG alignment, freshness checks, and mixing materializations. |
+| [Distributed IVM with Citus](distributed-ivm-citus.md) | Incremental view maintenance across sharded PostgreSQL: per-worker CDC, shard-aware delta routing, co-located join push-down, and automatic recovery after shard rebalances. |
+| [pg_trickle on CloudNativePG](pg-trickle-cloudnativepg-kubernetes.md) | Production Kubernetes deployment using the CloudNativePG operator: Dockerfile, Cluster manifest, GUC configuration, HA failover behaviour, Prometheus metrics ConfigMap, alerting rules, upgrade procedure, and sizing guidance. |
+| [Making pg_trickle Work Through PgBouncer](pgbouncer-compatibility.md) | Connection pooling modes, the background-worker bypass, LISTEN/NOTIFY caveats in transaction mode, and a configuration checklist for PgBouncer + pg_trickle. |
 
 ### pgvector Integration
 
@@ -33,21 +64,26 @@
 | [Your pgvector Index Is Lying to You](incremental-pgvector.md) | Four silent failure modes of unmanaged pgvector deployments: stale embedding corpora, drifting aggregates, IVFFlat recall loss, and over-fetching. How pg_trickle's differential IVM and drift-aware reindexing closes each gap. |
 | [HNSW Recall Is a Lie: Distribution Drift Explained](hnsw-recall-distribution-drift.md) | Deep dive on IVFFlat centroid staleness and HNSW tombstone accumulation — how to measure drift, what the right threshold is, and how `post_refresh_action => 'reindex_if_drift'` (v0.38) automates the fix. |
 | [The pgvector Tooling Landscape in 2026](pgvector-tooling-landscape.md) | Honest comparison of pg_trickle against pgai (archived Feb 2026), pg_vectorize, DIY batch pipelines, and Debezium. Introduces the two-layer model: Layer 1 = embedding generation, Layer 2 = derived-state maintenance. |
+| [Multi-Tenant Vector Search with Row-Level Security](multi-tenant-vector-search-rls.md) | Zero cross-tenant data leakage using RLS policies on stream tables, tiered tenancy (large / medium / small tenant strategies), per-tenant partial HNSW indexes, and drift-aware reindexing per partition. |
 
-### Advanced Patterns
+### Operations & Observability
 
 | Post | Summary |
 |------|---------|
-| [Reactive Alerts Without Polling](reactive-alerts-without-polling.md) | How pg_trickle's reactive subscriptions (v0.39) replace polling loops: SLA breach detection, inventory alerts, fraud velocity checks, and vector distance subscriptions. Covers `OLD.*`/`NEW.*` transition semantics and PostgreSQL `LISTEN`. |
-| [Multi-Tenant Vector Search with Row-Level Security](multi-tenant-vector-search-rls.md) | Zero cross-tenant data leakage using RLS policies on stream tables, tiered tenancy (large / medium / small tenant strategies), per-tenant partial HNSW indexes, and drift-aware reindexing per partition. |
-| [The Outbox Pattern, Turbocharged](outbox-pattern-turbocharged.md) | Using stream tables as transactionally consistent event sources for the outbox pattern — derived aggregate events, fat payloads, transition-based routing, and why stream tables naturally debounce high-frequency changes into fewer events. |
+| [Stop Rebuilding Your Search Index at 3am](stop-rebuilding-search-index.md) | How pg_trickle's scheduler, SLA tiers (`critical` / `standard` / `background`), backpressure, and parallel workers let you tune refresh behaviour per workload — and why the 3am maintenance window disappears with continuous incremental refresh. |
+| [pg_trickle Monitors Itself](self-monitoring.md) | Since v0.20, the extension's own health metrics are maintained as stream tables. How self-monitoring works, what it tracks, and the recursion question ("who monitors the monitor?"). |
+| [How to Change a Stream Table Query Without Taking It Offline](online-schema-evolution.md) | `ALTER STREAM TABLE ... QUERY` performs online schema evolution — the stream table stays queryable during migration, with atomic swap and cascade-safe dependency checking. |
+| [Backup and Restore for Stream Tables](backup-and-restore.md) | pg_dump, PITR, selective restore, and the `repair_stream_table` procedure. What to do (and what breaks) when you restore a database with active stream tables. |
+| [Testing Stream Tables: Shadow Mode and Correctness Fuzzing](shadow-mode-correctness-fuzzing.md) | Shadow mode runs DIFFERENTIAL and FULL refresh in parallel and compares. SQLancer fuzzing generates random schemas and DML to find delta engine bugs. The multiset invariant and what it caught. |
 
-### Benchmarks & Infrastructure
+### Benchmarks & Advanced Patterns
 
 | Post | Summary |
 |------|---------|
 | [TPC-H at 1GB in 40ms](tpch-benchmarking-ivm.md) | Reproducible benchmark of differential vs. full refresh across five TPC-H queries (Q1, Q3, Q5, Q6, Q12). Results: 13–22× faster per refresh cycle, with differential lag under 2.5 seconds vs. 186 seconds at 5,000 rows/second sustained write load. |
-| [pg_trickle on CloudNativePG](pg-trickle-cloudnativepg-kubernetes.md) | Production Kubernetes deployment using the CloudNativePG operator: Dockerfile, Cluster manifest, GUC configuration, HA failover behaviour, Prometheus metrics ConfigMap, alerting rules, upgrade procedure, and sizing guidance. |
+| [From Nexmark to Production: Benchmarking Stream Processing in PostgreSQL](nexmark-benchmark.md) | pg_trickle on the Nexmark streaming benchmark: per-query throughput, latency percentiles, and how the numbers compare to Flink, Materialize, and a cron job. |
+| [Reactive Alerts Without Polling](reactive-alerts-without-polling.md) | How pg_trickle's reactive subscriptions (v0.39) replace polling loops: SLA breach detection, inventory alerts, fraud velocity checks, and vector distance subscriptions. Covers `OLD.*`/`NEW.*` transition semantics and PostgreSQL `LISTEN`. |
+| [The Outbox Pattern, Turbocharged](outbox-pattern-turbocharged.md) | Using stream tables as transactionally consistent event sources for the outbox pattern — derived aggregate events, fat payloads, transition-based routing, and why stream tables naturally debounce high-frequency changes into fewer events. |
 
 ---
 
