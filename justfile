@@ -529,6 +529,28 @@ package:
 
 # ── Release ───────────────────────────────────────────────────────────────
 
+# Verify META.json version matches Cargo.toml (run before tagging a release)
+[group: "release"]
+check-meta-version:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    CARGO_VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
+    META_VERSION=$(jq -r '.version' META.json)
+    META_PROVIDES=$(jq -r '.provides["pg_trickle"].version' META.json)
+    FAILED=0
+    if [ "$META_VERSION" != "$CARGO_VERSION" ]; then
+        echo "Error: META.json .version ($META_VERSION) != Cargo.toml ($CARGO_VERSION)"
+        FAILED=1
+    fi
+    if [ "$META_PROVIDES" != "$CARGO_VERSION" ]; then
+        echo "Error: META.json .provides.pg_trickle.version ($META_PROVIDES) != Cargo.toml ($CARGO_VERSION)"
+        FAILED=1
+    fi
+    if [ "$FAILED" -eq 0 ]; then
+        echo "META.json version check passed: $META_VERSION"
+    fi
+    exit $FAILED
+
 # Package the extension into a zip archive and upload it to PGXN
 [group: "release"]
 pgxn-publish:
