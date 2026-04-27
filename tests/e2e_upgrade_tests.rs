@@ -36,6 +36,7 @@ async fn test_upgrade_catalog_schema_stability() {
         ("auto_threshold", "double precision"),
         ("blow_reason", "text"),
         ("blown_at", "timestamp with time zone"),
+        ("column_lineage", "jsonb"),
         ("consecutive_errors", "integer"),
         ("created_at", "timestamp with time zone"),
         ("data_timestamp", "timestamp with time zone"),
@@ -77,6 +78,8 @@ async fn test_upgrade_catalog_schema_stability() {
         ("st_partition_key", "text"),
         ("st_placement", "text"), // CITUS-3: v0.32.0
         ("status", "text"),
+        ("storage_backend", "text"), // v0.36.0: CORR-2/UX-3
+        ("temporal_mode", "boolean"), // v0.36.0: CORR-1/UX-1
         ("topk_limit", "integer"),
         ("topk_offset", "integer"),
         ("topk_order_by", "text"),
