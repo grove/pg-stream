@@ -13,9 +13,6 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Install just
-        uses: extractions/setup-just@v4
-        
       - name: Setup Python
         uses: actions/setup-python@v6
         with:
@@ -37,7 +34,48 @@ jobs:
           fi
 
       - name: Package and upload to PGXN
-        run: just pgxn-publish
+        run: |
+          set -euo pipefail
+
+          VERSION=$(jq -r '.version' META.json)
+          if [ -z "$VERSION" ] || [ "$VERSION" = "null" ]; then
+            echo "Error: Could not read version from META.json"
+            exit 1
+          fi
+
+          ARCHIVE="pg_trickle-${VERSION}.zip"
+          echo "Creating PGXN archive: $ARCHIVE"
+          git archive --format zip --prefix="pg_trickle-${VERSION}/" -o "$ARCHIVE" HEAD
+
+          echo "Verifying archive contents..."
+          python3 scripts/verify_pgxn_archive.py "$ARCHIVE"
+
+          if [ -z "${PGXN_USERNAME:-}" ] || [ -z "${PGXN_PASSWORD:-}" ]; then
+            echo "Error: missing PGXN credentials."
+            exit 1
+          fi
+
+          echo "Uploading to PGXN as '${PGXN_USERNAME}'..."
+          HTTP_STATUS=$(curl --silent --show-error \
+            --output /tmp/pgxn_response.txt --write-out "%{http_code}" \
+            -F "archive=@${ARCHIVE};type=application/zip" \
+            -u "${PGXN_USERNAME}:${PGXN_PASSWORD}" \
+            "https://manager.pgxn.org/upload")
+
+          echo "PGXN responded with HTTP $HTTP_STATUS"
+          cat /tmp/pgxn_response.txt
+
+          if [ "$HTTP_STATUS" -ge 200 ] && [ "$HTTP_STATUS" -lt 400 ]; then
+            echo "Successfully uploaded pg_trickle-$VERSION to PGXN!"
+          elif [ "$HTTP_STATUS" = "409" ] && grep -q "already exists" /tmp/pgxn_response.txt; then
+            echo "pg_trickle-$VERSION already exists on PGXN — nothing to do."
+          else
+            echo "Error: PGXN upload failed with HTTP $HTTP_STATUS"
+            if [ "$HTTP_STATUS" = "401" ]; then
+              echo "Hint: HTTP 401 means authentication failed."
+            fi
+            exit 1
+          fi
         env:
           PGXN_USERNAME: ${{ secrets.PGXN_USERNAME }}
           PGXN_PASSWORD: ${{ secrets.PGXN_PASSWORD }}
