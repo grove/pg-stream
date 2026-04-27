@@ -6357,6 +6357,30 @@ fn execute_scheduled_refresh(
                 }
             }
 
+            // Bug #660 fix: write outbox notification row when outbox is enabled
+            // and the refresh produced at least one changed row.
+            if (rows_inserted > 0 || rows_deleted > 0)
+                && crate::api::outbox::is_outbox_enabled(st.pgt_id)
+            {
+                let threshold = crate::config::PGS_OUTBOX_INLINE_THRESHOLD_ROWS.get();
+                if let Err(e) = crate::api::outbox::write_outbox_row(
+                    st.pgt_id,
+                    None, // refresh_id is a BIGINT in pgt_refresh_history; outbox uses UUID
+                    rows_inserted,
+                    rows_deleted,
+                    threshold,
+                    &st.pgt_schema,
+                    &st.pgt_name,
+                ) {
+                    log!(
+                        "pg_trickle: outbox write failed for {}.{}: {}",
+                        st.pgt_schema,
+                        st.pgt_name,
+                        e
+                    );
+                }
+            }
+
             RefreshOutcome::Success
         }
         Err(e) => {
