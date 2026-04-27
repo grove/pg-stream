@@ -1217,6 +1217,18 @@ pub static PGS_INBOX_DLQ_ALERT_MAX_PER_REFRESH: GucSetting<i32> = GucSetting::<i
 /// Default: 60 000 ms (60 seconds).
 pub static PGS_CITUS_ST_LOCK_LEASE_MS: GucSetting<i32> = GucSetting::<i32>::new(60_000);
 
+/// COORD-15 (v0.34.0): Number of consecutive per-worker poll failures before
+/// the stream table is flagged in `citus_status` for operator attention.
+///
+/// When `poll_worker_slot_changes()` fails for a worker on this many consecutive
+/// scheduler ticks, the failure is surfaced as an alert in the `citus_status`
+/// view.  Refreshes against healthy workers continue uninterrupted.
+///
+/// Set to 0 to disable the alert (not recommended for production).
+///
+/// Default: 5 ticks.
+pub static PGS_CITUS_WORKER_RETRY_TICKS: GucSetting<i32> = GucSetting::<i32>::new(5);
+
 /// #536: Frontier holdback mode enum.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FrontierHoldbackMode {
@@ -2628,6 +2640,19 @@ pub fn register_gucs() {
         GucContext::Suset,
         GucFlags::default(),
     );
+
+    // COORD-15 (v0.34.0): Consecutive worker-poll failures before alerting in citus_status.
+    pgrx::GucRegistry::define_int_guc(
+        c"pg_trickle.citus_worker_retry_ticks",
+        c"COORD-15: Consecutive worker-poll failures before flagging in citus_status. \
+          0 = disabled.",
+        c"",
+        &PGS_CITUS_WORKER_RETRY_TICKS,
+        0,   // min (0 = disabled)
+        100, // max
+        GucContext::Suset,
+        GucFlags::default(),
+    );
 }
 
 // ── Convenience accessors ──────────────────────────────────────────────────
@@ -2655,6 +2680,12 @@ pub fn pg_trickle_enabled() -> bool {
 /// Returns the `pgt_st_locks` lease duration in milliseconds for Citus coordination.
 pub fn pg_trickle_citus_st_lock_lease_ms() -> i64 {
     PGS_CITUS_ST_LOCK_LEASE_MS.get() as i64
+}
+
+/// COORD-15: Returns the number of consecutive worker-poll failures before
+/// flagging in `citus_status`.  Returns 0 when alerting is disabled.
+pub fn pg_trickle_citus_worker_retry_ticks() -> i32 {
+    PGS_CITUS_WORKER_RETRY_TICKS.get()
 }
 
 /// Returns the scheduler interval in milliseconds.
