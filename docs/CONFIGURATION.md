@@ -4,6 +4,26 @@ Complete reference for all pg_trickle GUC (Grand Unified Configuration) variable
 
 ---
 
+## Quick-tuning by goal
+
+Not sure which GUC to change? Start here.
+
+| Goal | GUCs to adjust |
+|---|---|
+| **Lower refresh latency** | `scheduler_interval_ms`, `event_driven_wake`, `wake_debounce_ms`, `min_schedule_seconds` |
+| **Reduce write overhead on busy tables** | `compact_threshold`, `max_buffer_rows`, `cleanup_use_truncate`, `user_triggers` |
+| **Handle larger DAGs without timeouts** | `max_workers`, `max_dynamic_refresh_workers`, `scheduler_interval_ms` |
+| **Connection-pooler compatibility (PgBouncer)** | `pooler_compatibility_mode`, `use_prepared_statements` |
+| **Lower memory usage during refresh** | `merge_work_mem_mb`, `max_delta_estimate_rows` |
+| **Improve cost-model accuracy** | `cost_model_safety_margin`, `planner_aggressive`, `differential_max_change_ratio` |
+| **Enable WAL-based CDC** | `cdc_mode`, `wal_transition_timeout`, `slot_lag_warning_threshold_mb` |
+| **Prevent a runaway stream table** | `max_consecutive_errors`, `fuse_threshold`, `buffer_alert_threshold` |
+
+See the full reference below for each variable's defaults, valid values, and
+notes. Use `pgtrickle.recommend_refresh_mode()` for per-table advice.
+
+---
+
 ## Table of Contents
 
 - [Overview](#overview)

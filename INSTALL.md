@@ -1,5 +1,17 @@
 # Installation Guide
 
+## Choose your installation path
+
+| Environment | Recommended approach |
+|---|---|
+| **Local development / quick evaluation** | [Docker sandbox](playground/) — `docker compose up -d` in `playground/` gets you a running pg_trickle instance in ~60 seconds with no build step. |
+| **Self-hosted Linux server** | [Pre-built release](#installing-from-a-pre-built-release) — download the `.tar.gz`, copy two directories, `CREATE EXTENSION`. |
+| **macOS development** | [Build from source](#building-from-source) using `cargo pgrx install`, or use the Docker sandbox above. |
+| **Kubernetes / CNPG** | [CloudNativePG](docs/integrations/cloudnativepg.md) — use the `Dockerfile.ghcr` image or the CNPG extension manifest. |
+| **Managed PostgreSQL** | Check your provider's extension list. If pg_trickle is not available, the Docker or Kubernetes path is your best option. |
+
+---
+
 ## Prerequisites
 
 | Requirement | Version |

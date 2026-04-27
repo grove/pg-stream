@@ -4893,5 +4893,15 @@ running relay instances hot-reload their pipelines without restart.
 - **Minor releases** (0.X.0): New features. Stable API preserved; unstable surfaces may change. Breaking changes to stable API only with a deprecation cycle (WARNING for one release, removal in the next).
 - **Major release** (1.0.0): Stable API locked. Breaking changes require a major version bump.
 
+---
+
+**See also:**
+[Configuration](CONFIGURATION.md) ·
+[Patterns](PATTERNS.md) ·
+[Performance Cookbook](PERFORMANCE_COOKBOOK.md) ·
+[Error Reference](ERRORS.md) ·
+[Glossary](GLOSSARY.md) ·
+[FAQ](FAQ.md)
+
 
 

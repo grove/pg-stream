@@ -702,7 +702,9 @@ just test-all            # All of the above + pgrx tests
 just bench               # Criterion benchmarks
 ```
 
-**Test counts:** ~1,670 unit tests + integration tests + ~1,340 E2E tests + ~140 TUI tests.
+**Test counts:** Current test counts are reported by CI on every push to `main`.
+Run `just test-all` locally or check the latest
+[GitHub Actions run](../../actions/workflows/ci.yml) for the live numbers.
 
 ## Contributors
 
