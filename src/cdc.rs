@@ -269,9 +269,8 @@ pub fn create_change_trigger(
          SECURITY DEFINER
          SET search_path = pg_catalog, pgtrickle, pgtrickle_changes, public AS $$
          BEGIN
-             -- A07: CDC kill-switch guard.
-             IF (current_setting('pg_trickle.enabled', true) = 'off') OR
-                (current_setting('pg_trickle.cdc_paused', true) = 'on') THEN
+             -- A07: CDC cdc_paused guard (A07).
+             IF (current_setting('pg_trickle.cdc_paused', true) = 'on') THEN
                  RETURN NULL;
              END IF;
              INSERT INTO {change_schema}.changes_{name}
@@ -1734,9 +1733,8 @@ fn build_row_trigger_fn_sql(
          SECURITY DEFINER
          SET search_path = pg_catalog, pgtrickle, pgtrickle_changes, public AS $$
          BEGIN
-             -- A07: CDC kill-switch guard.
-             IF (current_setting('pg_trickle.enabled', true) = 'off') OR
-                (current_setting('pg_trickle.cdc_paused', true) = 'on') THEN
+             -- A07: CDC cdc_paused guard (A07).
+             IF (current_setting('pg_trickle.cdc_paused', true) = 'on') THEN
                  RETURN NULL;
              END IF;
              IF TG_OP = 'INSERT' THEN
@@ -1826,9 +1824,8 @@ fn build_stmt_trigger_fn_sql(
          SECURITY DEFINER
          SET search_path = pg_catalog, pgtrickle, pgtrickle_changes, public AS $$
          BEGIN
-             -- A07: CDC kill-switch guard.
-             IF (current_setting('pg_trickle.enabled', true) = 'off') OR
-                (current_setting('pg_trickle.cdc_paused', true) = 'on') THEN
+             -- A07: CDC cdc_paused guard (A07).
+             IF (current_setting('pg_trickle.cdc_paused', true) = 'on') THEN
                  RETURN NULL;
              END IF;
              INSERT INTO {cs}.changes_{name}
@@ -1853,9 +1850,8 @@ fn build_stmt_trigger_fn_sql(
          SECURITY DEFINER
          SET search_path = pg_catalog, pgtrickle, pgtrickle_changes, public AS $$
          BEGIN
-             -- A07: CDC kill-switch guard.
-             IF (current_setting('pg_trickle.enabled', true) = 'off') OR
-                (current_setting('pg_trickle.cdc_paused', true) = 'on') THEN
+             -- A07: CDC cdc_paused guard (A07).
+             IF (current_setting('pg_trickle.cdc_paused', true) = 'on') THEN
                  RETURN NULL;
              END IF;
              INSERT INTO {cs}.changes_{name}
@@ -1896,9 +1892,8 @@ fn build_stmt_trigger_fn_sql(
          SECURITY DEFINER
          SET search_path = pg_catalog, pgtrickle, pgtrickle_changes, public AS $$
          BEGIN
-             -- A07: CDC kill-switch guard.
-             IF (current_setting('pg_trickle.enabled', true) = 'off') OR
-                (current_setting('pg_trickle.cdc_paused', true) = 'on') THEN
+             -- A07: CDC cdc_paused guard (A07).
+             IF (current_setting('pg_trickle.cdc_paused', true) = 'on') THEN
                  RETURN NULL;
              END IF;
              INSERT INTO {cs}.changes_{name}
@@ -1932,9 +1927,8 @@ fn build_stmt_trigger_fn_sql(
          SECURITY DEFINER
          SET search_path = pg_catalog, pgtrickle, pgtrickle_changes, public AS $$
          BEGIN
-             -- A07: CDC kill-switch guard.
-             IF (current_setting('pg_trickle.enabled', true) = 'off') OR
-                (current_setting('pg_trickle.cdc_paused', true) = 'on') THEN
+             -- A07: CDC cdc_paused guard (A07).
+             IF (current_setting('pg_trickle.cdc_paused', true) = 'on') THEN
                  RETURN NULL;
              END IF;
              INSERT INTO {cs}.changes_{name}
