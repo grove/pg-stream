@@ -79,17 +79,18 @@ tables, pre-loaded data, and five stream tables demonstrating key pg_trickle pat
 aggregates, window functions, multi-table joins, time-series, and EXISTS subqueries. See
 [`playground/README.md`](playground/README.md) or the [Playground docs page](docs/PLAYGROUND.md).
 
-## History and Motivation
+## Choose your path
 
-This project started with a practical goal. We were inspired by existing data platforms built around pipelines that keep themselves incrementally up to date, and we wanted to bring that same style of self-maintaining data flow directly into PostgreSQL. In particular, we needed support for recursive CTEs, which were essential to the kinds of pipelines we had in mind. We could not find an open-source incremental view maintenance system that matched that requirement, so pg_trickle began as an attempt to close that gap.
+| Persona | Start here |
+|---|---|
+| **Curious / evaluator** | [What is pg_trickle?](ESSENCE.md) → [Use Cases](docs/USE_CASES.md) → [Comparisons](docs/COMPARISONS.md) → [Playground](playground/) |
+| **Application developer** | [5-Minute Quickstart](docs/QUICKSTART_5MIN.md) → [Getting Started tutorial](docs/GETTING_STARTED.md) → [Patterns](docs/PATTERNS.md) → [SQL Reference](docs/SQL_REFERENCE.md) |
+| **DBA / SRE** | [Pre-Deployment Checklist](docs/PRE_DEPLOYMENT.md) → [Configuration](docs/CONFIGURATION.md) → [Troubleshooting](docs/TROUBLESHOOTING.md) → [Capacity Planning](docs/CAPACITY_PLANNING.md) |
+| **Data / analytics engineer** | [Use Cases](docs/USE_CASES.md) → [dbt integration](docs/integrations/dbt.md) → [Migrating from materialized views](docs/tutorials/MIGRATING_FROM_MATERIALIZED_VIEWS.md) |
+| **Confused by jargon** | [Glossary](docs/GLOSSARY.md) |
 
-It also became an experiment in what coding agents could realistically help build. We set out to develop pg_trickle without editing code by hand, while still holding it to the same bar we would expect from any other systems project: broad feature coverage, strong code quality, extensive tests, and thorough documentation. Skepticism toward AI-written software is reasonable; the right way to evaluate pg_trickle is by the codebase, the tests, and the docs.
-
-That constraint changed how we worked. Agents can produce a lot of surface area quickly, but database systems are unforgiving of vague assumptions and hidden edge cases. To make the project hold together, we had to be unusually explicit about architecture, operator semantics, failure handling, and test coverage. In practice, that pushed us toward more written design, more reviewable behavior, and more verification than a quick prototype would normally get.
-
-The result is a **spec-driven** development process, not vibe-coding. Every feature starts as a written plan — an architecture decision record, a gap analysis, or a phased implementation spec — before any code is generated. The [`plans/`](plans/) directory contains over 110 documents (~72,500 lines) covering operator semantics, CDC tradeoffs, performance strategies, ecosystem comparisons, and edge case catalogues. Agents work from these specs; the specs are reviewed and revised by humans. This is what makes it possible to maintain coherence across a large codebase without manually editing every line: the design is explicit, the invariants are written down, and the tests verify both.
-
-We also do not think the use of AI should lower the standard for trust. If anything, it raises it. The point of the experiment was not to ask people to trust the toolchain; it was to see whether disciplined use of coding agents could help produce a serious, inspectable PostgreSQL extension. Whether that worked is for readers and users to judge, but the intent is simple: make the code, the tests, the documentation, and the tradeoffs visible enough that the project can stand on its own merits.
+> **Curious about how pg_trickle came to be — and the role coding agents played in its development?**
+> See [Project History](docs/PROJECT_HISTORY.md).
 
 ## Key Features
 
@@ -502,20 +503,95 @@ reference, operations, and testing guide.
 
 ## Documentation
 
+The documentation is organised into reading paths so you can find what you
+need without scrolling. Start with **[ESSENCE.md](ESSENCE.md)** if you want
+the plain-language overview, or jump straight to a topic below.
+
+### Discover
+
 | Document | Description |
 |---|---|
-| [GETTING_STARTED.md](docs/GETTING_STARTED.md) | Hands-on tutorial building an org-chart with stream tables |
+| [What is pg_trickle?](ESSENCE.md) | Plain-language overview |
+| [Use Cases](docs/USE_CASES.md) | What people build with stream tables |
+| [Comparisons](docs/COMPARISONS.md) | vs. pg_ivm, Materialize, Flink, Debezium, … |
+| [Glossary](docs/GLOSSARY.md) | Decoder for every term used in the docs |
+
+### Get started
+
+| Document | Description |
+|---|---|
+| [5-Minute Quickstart](docs/QUICKSTART_5MIN.md) | Shortest possible introduction |
+| [Getting Started Tutorial](docs/GETTING_STARTED.md) | Hands-on tutorial building an org-chart with stream tables |
 | [INSTALL.md](INSTALL.md) | Detailed installation and configuration guide |
-| [docs/TUI.md](docs/TUI.md) | Terminal UI & CLI user guide — building, connecting, views, commands |
-| [docs/SQL_REFERENCE.md](docs/SQL_REFERENCE.md) | Complete SQL function reference |
-| [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | System architecture and data flow |
-| [docs/DVM_OPERATORS.md](docs/DVM_OPERATORS.md) | Supported operators and differentiation rules |
-| [docs/CONFIGURATION.md](docs/CONFIGURATION.md) | GUC variables and tuning guide |
-| [ROADMAP.md](ROADMAP.md) | Release milestones and future plans |
-| [What Happens on INSERT](docs/tutorials/WHAT_HAPPENS_ON_INSERT.md) | Full 7-phase lifecycle of a single INSERT through the pipeline |
-| [What Happens on UPDATE](docs/tutorials/WHAT_HAPPENS_ON_UPDATE.md) | D+I split, group key changes, net-effect for multiple UPDATEs |
-| [What Happens on DELETE](docs/tutorials/WHAT_HAPPENS_ON_DELETE.md) | Reference counting, group deletion, INSERT+DELETE cancellation |
-| [What Happens on TRUNCATE](docs/tutorials/WHAT_HAPPENS_ON_TRUNCATE.md) | Why TRUNCATE bypasses triggers and recovery strategies |
+
+### Build with stream tables
+
+| Document | Description |
+|---|---|
+| [Patterns](docs/PATTERNS.md) | Bronze/Silver/Gold, SCDs, dashboards, outbox/inbox |
+| [Performance Cookbook](docs/PERFORMANCE_COOKBOOK.md) | Tuning recipes |
+| [SQL Reference](docs/SQL_REFERENCE.md) | Every function, view, and option |
+| [Configuration](docs/CONFIGURATION.md) | All GUC variables |
+| [Predictive Cost Model](docs/COST_MODEL.md) | How AUTO mode chooses |
+
+### Operate
+
+| Document | Description |
+|---|---|
+| [Pre-Deployment Checklist](docs/PRE_DEPLOYMENT.md) | Before you go live |
+| [Scaling Guide](docs/SCALING.md) | Worker pool sizing, tiered scheduling |
+| [Capacity Planning](docs/CAPACITY_PLANNING.md) | Disk, memory, connections |
+| [Multi-Database Deployments](docs/MULTI_DATABASE.md) | One server, many databases |
+| [Backup and Restore](docs/BACKUP_AND_RESTORE.md) | pg_dump, pgBackRest, PITR |
+| [Snapshots](docs/SNAPSHOTS.md) | Point-in-time copies of stream tables |
+| [HA & Replication](docs/HA_AND_REPLICATION.md) | Failover, logical replicas, CNPG |
+| [Upgrading](docs/UPGRADING.md) | Version-to-version upgrade procedure |
+| [Security Guide](docs/SECURITY_GUIDE.md) | Roles, grants, RLS, auditing |
+| [Troubleshooting](docs/TROUBLESHOOTING.md) | Symptoms → diagnosis → fix |
+| [Error Reference](docs/ERRORS.md) | Every PgTrickleError variant with SQLSTATE |
+| [TUI Tool](docs/TUI.md) | Interactive terminal dashboard |
+| [CLI Reference](docs/CLI_REFERENCE.md) | Every `pgtrickle` subcommand |
+
+### Distributed & streaming
+
+| Document | Description |
+|---|---|
+| [Citus](docs/CITUS.md) | Distributed sources and outputs |
+| [CDC Modes](docs/CDC_MODES.md) | Trigger, WAL, hybrid |
+| [SLA-based Smart Scheduling](docs/SLA_SCHEDULING.md) | Set freshness goals, not intervals |
+| [Downstream Publications](docs/PUBLICATIONS.md) | Replicate stream tables to Debezium, Kafka, … |
+| [Transactional Outbox](docs/OUTBOX.md) | Reliable event emission |
+| [Transactional Inbox](docs/INBOX.md) | Idempotent event consumption |
+| [Relay Service](docs/RELAY_GUIDE.md) | Standalone bridge to NATS, Kafka, Redis, SQS, RabbitMQ, webhooks |
+
+### Tutorials & deep dives
+
+[What Happens on INSERT](docs/tutorials/WHAT_HAPPENS_ON_INSERT.md) ·
+[UPDATE](docs/tutorials/WHAT_HAPPENS_ON_UPDATE.md) ·
+[DELETE](docs/tutorials/WHAT_HAPPENS_ON_DELETE.md) ·
+[TRUNCATE](docs/tutorials/WHAT_HAPPENS_ON_TRUNCATE.md) ·
+[Tiered Scheduling](docs/tutorials/TIERED_SCHEDULING.md) ·
+[Fuse Circuit Breaker](docs/tutorials/FUSE_CIRCUIT_BREAKER.md) ·
+[Circular Dependencies](docs/tutorials/CIRCULAR_DEPENDENCIES.md) ·
+[Migrating from Materialized Views](docs/tutorials/MIGRATING_FROM_MATERIALIZED_VIEWS.md) ·
+[Migrating from pg_ivm](docs/tutorials/MIGRATING_FROM_PG_IVM.md) ·
+[Row-Level Security](docs/tutorials/ROW_LEVEL_SECURITY.md) ·
+[Partitioned Tables](docs/tutorials/PARTITIONED_TABLES.md) ·
+[Foreign Table Sources](docs/tutorials/FOREIGN_TABLE_SOURCES.md) ·
+[Tuning Refresh Mode](docs/tutorials/tuning-refresh-mode.md) ·
+[Monitoring & Alerting](docs/tutorials/MONITORING_AND_ALERTING.md) ·
+[ETL & Bulk Load](docs/tutorials/ETL_BULK_LOAD.md)
+
+### Reference
+
+[FAQ](docs/FAQ.md) ·
+[What's New](docs/WHATS_NEW.md) ·
+[Changelog](CHANGELOG.md) ·
+[Roadmap](ROADMAP.md) ·
+[Project History](docs/PROJECT_HISTORY.md) ·
+[Architecture](docs/ARCHITECTURE.md) ·
+[DVM Operators](docs/DVM_OPERATORS.md) ·
+[Benchmarks](docs/BENCHMARK.md)
 
 ## Known Limitations
 

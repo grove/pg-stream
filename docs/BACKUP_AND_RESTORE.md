@@ -1,83 +1,172 @@
 # Backup and Restore
 
-Like any standard PostgreSQL extension, `pg_trickle` supports logical backups via `pg_dump` and physical backups (via tools like pgBackRest or `pg_basebackup`).
+pg_trickle plays nicely with every standard PostgreSQL backup
+mechanism — `pg_dump`, `pg_basebackup`, pgBackRest, WAL archiving,
+PITR, and pre-built tools like CloudNativePG and Crunchy Operator.
+The catalog, change buffers, and stream-table contents are all
+ordinary PostgreSQL relations, so they get backed up like anything
+else.
 
-Because `pg_trickle` maintains automated states (like Change Data Capture buffers and DDL Event Triggers), specific workflows should be followed to ensure a smooth recovery.
+This page walks through the recommended workflows, the gotchas, and
+how the v0.27 [Snapshots](SNAPSHOTS.md) API fits in.
 
-## Physical Backups (pgBackRest / pg_basebackup)
-
-Physical backups copy the underlying data blocks. These are the most robust backups.
-
-**No special steps are needed** during restore. When the database comes online, `pg_trickle`'s catalogs, CDC buffers, and internal dependencies exist precisely as they did at the moment the snapshot was taken.
-
-*Note for WAL-Mode Users: Physical backups do not export replication slot data by default. If your CDC pipeline was in `wal` mode, logical slots might not survive the recreation. The pg_trickle scheduler handles missing slots gracefully by temporarily re-enabling table triggers.*
-
-## Logical Backups (pg_dump / pg_restore)
-
-Logical backups dump your database schema as generic cross-compatible SQL (`CREATE TABLE`, `INSERT`, `CREATE INDEX`).
-
-`pg_trickle` integrates with `pg_dump` natively. When restoring these backups (which typically involves sequentially recreating schemas, inserting data into those tables, and lastly applying indexes and triggers), you must restore into a database precisely, to allow the extension to rewrite its own internal triggers correctly without conflicting with plain PostgreSQL commands.
-
-### The Recommended Multi-Stage pg_restore Strategy
-
-The most reliable approach is to use the `--section` arguments of `pg_restore`. By breaking the restore up into pieces, we guarantee that when the schema, data, and constraints are created, all variables and configurations are actively in the database, and our custom hook `DdlEventKind::ExtensionChange` intercepts the query and automatically dials `pgtrickle.restore_stream_tables()` internally.
+> **TL;DR.** Physical backups (pgBackRest, `pg_basebackup`) just
+> work. `pg_dump` works too, with one small ordering rule. Snapshots
+> are an *application-level* tool for derived state, not a backup
+> replacement.
 
 ---
 
-## Stream Table Snapshots (v0.27.0)
+## Choosing the right tool
 
-In addition to traditional backup methods, pg_trickle v0.27.0 introduces a
-native **snapshot API** for stream tables. Snapshots are useful for:
+| Tool | Best for | Notes |
+|---|---|---|
+| **pgBackRest / WAL-G / pg_basebackup** | Production backup & PITR | Full-fidelity; no special pg_trickle steps |
+| **`pg_dump` / `pg_restore`** | Logical copies, dev environments, schema migration | Works; restore order matters slightly |
+| **Stream-table [snapshots](SNAPSHOTS.md)** | Replica bootstrap, archival of derived state, fast rollback of one stream table | Not a substitute for a real backup |
 
-- **Replica bootstrap**: Quickly populate a new replica without a full refresh
-- **PITR alignment**: Export a stream table's state at a known frontier
-- **Offline analysis**: Create an archival copy without impact to live queries
+---
 
-### Creating a snapshot
+## Physical backups (pgBackRest, pg_basebackup, WAL-G)
 
-```sql
--- Creates pgtrickle.snapshot_orders_agg_<epoch_ms> (auto-named)
-SELECT pgtrickle.snapshot_stream_table('public.orders_agg');
+Physical backups copy the data directory at the file-system level.
+Everything is captured: source tables, stream-table storage, the
+`pgtrickle.*` catalog, the `pgtrickle_changes.*` change buffers,
+and (in WAL CDC mode) the replication slots' on-disk state.
 
--- Or specify the target table name explicitly
-SELECT pgtrickle.snapshot_stream_table('public.orders_agg',
-       'pgtrickle.orders_agg_backup_2025');
+**Restore procedure:**
+
+1. Restore the data directory exactly as you would for any
+   PostgreSQL database.
+2. Start PostgreSQL.
+3. The pg_trickle launcher discovers each database on the next
+   tick (~10 s) and resumes the per-database scheduler.
+
+There is nothing pg_trickle-specific to do.
+
+**Point-in-time recovery (PITR).** PITR works as expected. If you
+recover to a point in the middle of a refresh, that refresh is
+marked failed in `pgtrickle.pgt_refresh_history` on first start;
+the next scheduler tick re-runs it. No data loss.
+
+**WAL CDC slots after restore.** If you were running in
+`pg_trickle.cdc_mode = 'wal'` and the restored cluster came up
+without the original slots (e.g. a logical-decoding replica that
+did not inherit slots), pg_trickle's scheduler detects the absence
+and re-bootstraps trigger CDC for the affected sources. You will
+see one `WARNING` per source; the system continues to work.
+
+---
+
+## Logical backups (`pg_dump` / `pg_restore`)
+
+`pg_dump` produces a portable SQL script (or directory archive)
+that can be replayed into a fresh database. pg_trickle objects are
+included automatically because they are normal extension objects.
+
+**The one ordering rule:** restore must follow the standard
+PostgreSQL "schema, then data, then constraints/indexes" order.
+`pg_restore --section=pre-data --section=data --section=post-data`
+does this for you. Avoid hand-editing the dump to interleave
+sections.
+
+### Recommended workflow
+
+```bash
+# Create the dump (custom or directory format)
+pg_dump --format=custom --file=mydb.dump mydb
+
+# Restore into a fresh database
+createdb mydb_restored
+pg_restore --dbname=mydb_restored --jobs=4 mydb.dump
 ```
 
-The snapshot table contains all rows from the stream table plus three
-metadata columns: `__pgt_snapshot_version`, `__pgt_frontier`, and
-`__pgt_snapshotted_at`.
-
-### Listing available snapshots
+Then, if you want to verify everything came back:
 
 ```sql
-SELECT snapshot_table, created_at, row_count, size_bytes
-FROM pgtrickle.list_snapshots('public.orders_agg')
-ORDER BY created_at DESC;
+-- Should list every stream table
+SELECT * FROM pgtrickle.pgt_status();
+
+-- Force a refresh on each one to confirm CDC is wired
+SELECT pgtrickle.refresh_stream_table(pgt_name)
+FROM pgtrickle.stream_tables_info;
 ```
 
-### Restoring from a snapshot
+### What `pg_dump` does and does not capture
 
-```sql
--- Truncate and restore from a named snapshot
-SELECT pgtrickle.restore_from_snapshot(
-    'public.orders_agg',
-    'pgtrickle.snapshot_orders_agg_1735000000000'
-);
-```
+| Object | Captured by `pg_dump`? |
+|---|---|
+| Source tables (your data) | ✅ |
+| Stream-table storage (your derived data) | ✅ |
+| `pgtrickle.*` catalog rows | ✅ |
+| CDC trigger definitions | ✅ (recreated when the extension reapplies them) |
+| `pgtrickle_changes.*` change buffers | ✅ — but typically empty after a clean dump |
+| WAL replication slots (WAL CDC mode) | ✕ (slots are not dumpable; the scheduler recreates them) |
+| Refresh history | ✅ |
 
-After restore, the stream table's frontier is set to the snapshot's frontier
-so the next refresh cycle is **DIFFERENTIAL** (not FULL). This avoids an
-expensive re-scan for the restored rows.
+If you do not need the audit history, you can shrink the dump with
+`pg_dump --exclude-table='pgtrickle.pgt_refresh_history'`.
 
-### Dropping a snapshot
+---
 
-```sql
-SELECT pgtrickle.drop_snapshot('pgtrickle.snapshot_orders_agg_1735000000000');
-```
+## Stream-table snapshots vs. backups
 
-This removes both the archival table and its metadata catalog row.
+[Snapshots](SNAPSHOTS.md) (v0.27+) are an **application-level**
+mechanism for capturing the contents of *one* stream table at a
+*chosen* point. They are great for:
 
-> **Note**: Snapshots are ordinary PostgreSQL tables; they are included in
-> `pg_dump` / `pg_basebackup` automatically. No special restore procedure is
-> needed — the snapshot table persists as a regular table until explicitly dropped.
+- Bootstrapping a replica without re-running a slow full refresh.
+- Archiving a slowly-changing dimension daily.
+- Rolling one stream table back after a defining-query mistake.
+
+They are **not** a backup of your database. Use them in addition to,
+not instead of, pgBackRest / `pg_dump`.
+
+A reasonable production posture:
+
+- Daily pgBackRest backup.
+- Snapshots of your most important stream tables on the cadence
+  that matches your business RPO.
+- WAL retention sized to PITR window.
+
+---
+
+## Backup and restore on Kubernetes (CNPG)
+
+CloudNativePG handles backup orchestration via Barman / object
+storage. pg_trickle is fully compatible:
+
+- Use `Cluster.spec.backup` exactly as you would for any other
+  PG cluster.
+- After a `Cluster.spec.bootstrap.recovery` operation, the
+  pg_trickle launcher resumes automatically.
+- For very large stream tables, consider taking pre-backup
+  snapshots and restoring them on the new cluster to skip an
+  initial full refresh.
+
+See [CloudNativePG integration](integrations/cloudnativepg.md).
+
+---
+
+## Disaster-recovery checklist
+
+- [ ] Backup tool of choice configured (pgBackRest / WAL-G / CNPG /
+      managed service).
+- [ ] WAL retention window ≥ your PITR target.
+- [ ] If using WAL CDC: alerting on
+      `pg_trickle.slot_lag_critical_threshold_mb`.
+- [ ] Periodic snapshot of business-critical stream tables.
+- [ ] Documented restore procedure tested at least once
+      (snapshot → fresh database → `pg_trickle.health_check()`).
+- [ ] Off-site copy of backups (managed service, S3 with
+      cross-region replication, etc.).
+- [ ] Monitoring on `pg_trickle.pgt_refresh_history` for restore
+      drift.
+
+---
+
+**See also:**
+[Snapshots](SNAPSHOTS.md) ·
+[High Availability and Replication](HA_AND_REPLICATION.md) ·
+[CloudNativePG integration](integrations/cloudnativepg.md) ·
+[Capacity Planning](CAPACITY_PLANNING.md)

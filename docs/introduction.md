@@ -1,106 +1,54 @@
 # pg_trickle
 
-**pg_trickle** is a PostgreSQL 18 extension that turns ordinary SQL views into
-self-maintaining stream tables — no external processes, no sidecars, no
-bespoke refresh pipelines. Just `CREATE EXTENSION pg_trickle` and your views
-stay fresh.
+**pg_trickle** is a PostgreSQL 18 extension that adds *self-maintaining*
+materialized views — **stream tables** — and keeps them up to date
+incrementally as the underlying data changes. No external streaming
+engine, no sidecars, no bespoke refresh pipeline. Just install the
+extension and write SQL.
 
 ```sql
--- Declare a stream table — a view that maintains itself
 SELECT pgtrickle.create_stream_table(
     name     => 'active_orders',
     query    => 'SELECT * FROM orders WHERE status = ''active''',
     schedule => '30s'
 );
 
--- Insert a row — the stream table updates automatically on the next refresh
 INSERT INTO orders (id, status) VALUES (42, 'active');
-SELECT count(*) FROM active_orders;  -- 1
+SELECT count(*) FROM active_orders;  -- 1, automatically
 ```
 
-## The problem with materialized views
-
-PostgreSQL's materialized views are powerful but frustrating.
-`REFRESH MATERIALIZED VIEW` re-runs the entire query from scratch, even if
-only one row changed in a million-row table. Your choices are: burn CPU on
-full recomputation, or accept stale data. Most teams end up building bespoke
-refresh pipelines just to keep summary tables current.
-
-## What pg_trickle does differently
-
-pg_trickle captures changes to your source tables and — on each refresh cycle
-— derives a *delta query* that processes only the changed rows and merges the
-result into the materialized table. One insert into a million-row source table?
-pg_trickle touches exactly one row's worth of computation.
-
-The approach is grounded in the [DBSP differential dataflow framework](https://arxiv.org/abs/2203.16684)
-(Budiu et al., 2022). Delta queries are derived automatically from your SQL's
-operator tree: joins produce the classic bilinear expansion, aggregates
-maintain auxiliary counters, and linear operators like filters pass deltas
-through unchanged.
-
-## Key capabilities
-
-| Feature | Description |
-|---------|-------------|
-| **Incremental refresh** | Only changed rows are recomputed — never a full table scan |
-| **Cascading DAG** | Stream tables that depend on stream tables propagate deltas downstream automatically |
-| **Demand-driven scheduling** | Set a freshness interval on the views your app queries; upstream layers inherit the tightest schedule automatically |
-| **Hybrid CDC** | Starts with lightweight row-level triggers; seamlessly transitions to WAL-based logical replication once available |
-| **Broad SQL support** | JOINs, GROUP BY, DISTINCT, UNION/INTERSECT/EXCEPT, subqueries, CTEs (including WITH RECURSIVE), window functions, LATERAL, and more |
-| **Built-in observability** | Monitoring views, refresh history, NOTIFY-based alerting |
-| **CloudNativePG-ready** | Ships as an Image Volume extension image for Kubernetes deployments |
-
-## Demand-driven scheduling
-
-With the default `CALCULATED` schedule mode, you only set an explicit refresh
-interval on the stream tables your application actually queries. The system
-propagates that cadence upward through the dependency graph: each upstream
-stream table inherits the tightest schedule among its downstream dependents.
-You declare freshness requirements where they matter — at the consumer — and
-the entire pipeline adjusts without manual coordination.
-
-## Hybrid change capture
-
-pg_trickle bootstraps with lightweight row-level triggers — no configuration
-needed, works out of the box. Once the first refresh succeeds and
-`wal_level = logical` is available, the system automatically transitions to
-WAL-based logical replication for lower write-side overhead. The transition
-is seamless: `trigger → transitioning → WAL-only`. If anything goes wrong, it
-falls back to triggers.
+> **New here?** Read **[What is pg_trickle?](../ESSENCE.md)** for the
+> plain-language overview, or jump to the
+> **[5-Minute Quickstart](QUICKSTART_5MIN.md)** to try it.
 
 ---
 
-## Explore this documentation
+## Choose your path
 
-- **[Getting Started](GETTING_STARTED.md)** — build a three-layer DAG from scratch in minutes
-- **[SQL Reference](SQL_REFERENCE.md)** — every function and option
-- **[Architecture](ARCHITECTURE.md)** — how the engine works internally
-- **[Configuration](CONFIGURATION.md)** — GUC variables and tuning
-
-### Tutorials
-
-- **[Fuse Circuit Breaker](tutorials/FUSE_CIRCUIT_BREAKER.md)** — protect stream tables from bulk-change storms
-- **[Tiered Scheduling](tutorials/TIERED_SCHEDULING.md)** — configure multi-tier refresh cadences
-- **[Migrating from Materialized Views](tutorials/MIGRATING_FROM_MATERIALIZED_VIEWS.md)** — step-by-step migration guide
-- **[Circular Dependencies](tutorials/CIRCULAR_DEPENDENCIES.md)** — handle SCCs in your DAG
-- **[Monitoring & Alerting](tutorials/MONITORING_AND_ALERTING.md)** — set up observability for stream tables
-- **[ETL Bulk Load Patterns](tutorials/ETL_BULK_LOAD.md)** — safely load large batches without overwhelming CDC
-
-### Integrations
-
-- **[CloudNativePG](integrations/cloudnativepg.md)** — deploy pg_trickle on Kubernetes
-- **[Prometheus & Grafana](integrations/prometheus.md)** — metrics and dashboards
-- **[PgBouncer](integrations/pgbouncer.md)** — connection pooling configuration
+| Persona | Start here |
+|---|---|
+| **Curious / evaluator** | [What is pg_trickle?](../ESSENCE.md) → [Use Cases](USE_CASES.md) → [Comparisons](COMPARISONS.md) → [Playground](PLAYGROUND.md) |
+| **Application developer** | [5-Minute Quickstart](QUICKSTART_5MIN.md) → [Getting Started tutorial](GETTING_STARTED.md) → [Patterns](PATTERNS.md) → [SQL Reference](SQL_REFERENCE.md) |
+| **DBA / SRE** | [Pre-Deployment Checklist](PRE_DEPLOYMENT.md) → [Configuration](CONFIGURATION.md) → [Troubleshooting](TROUBLESHOOTING.md) → [Capacity Planning](CAPACITY_PLANNING.md) |
+| **Data / analytics engineer** | [Use Cases](USE_CASES.md) → [dbt integration](integrations/dbt.md) → [Migrating from materialized views](tutorials/MIGRATING_FROM_MATERIALIZED_VIEWS.md) |
+| **Confused by jargon** | [Glossary](GLOSSARY.md) |
 
 ---
 
-## Source & releases
+## What's new
 
-Written in Rust using [pgrx](https://github.com/pgcentralfoundation/pgrx).
-Targets PostgreSQL 18. Apache 2.0 licensed.
+See [What's New](WHATS_NEW.md) for a curated summary of recent
+releases, or the [Changelog](changelog.md) for the full history.
 
-- Repository: [github.com/grove/pg-trickle](https://github.com/grove/pg-trickle)
-- Install instructions: [Installation](installation.md)
-- Changelog: [Changelog](changelog.md)
-- Roadmap: [Roadmap](roadmap.md)
+---
+
+## Project & licensing
+
+- Written in Rust using [pgrx](https://github.com/pgcentralfoundation/pgrx).
+- Targets PostgreSQL 18.
+- Apache 2.0 licensed.
+- Repository: <https://github.com/grove/pg-trickle>
+- [Project history](PROJECT_HISTORY.md) ·
+  [Roadmap](roadmap.md) ·
+  [Contributing](contributing.md) ·
+  [Security policy](security.md)
