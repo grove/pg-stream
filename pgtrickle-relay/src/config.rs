@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 #[serde(default)]
 pub struct RelayConfig {
     /// PostgreSQL connection URL (required).
+    /// Supports `${ENV:VAR_NAME}` substitution at load time (A30).
     pub postgres_url: String,
 
     /// Prometheus metrics + health endpoint address.
@@ -27,6 +28,10 @@ pub struct RelayConfig {
 
     /// Relay group ID for advisory locks and offset namespacing.
     pub relay_group_id: String,
+
+    /// A39: Maximum number of in-flight messages to the downstream sink
+    /// before upstream polling is paused.  0 = unlimited (legacy behaviour).
+    pub sink_max_inflight: usize,
 }
 
 impl Default for RelayConfig {
@@ -39,7 +44,50 @@ impl Default for RelayConfig {
             discovery_interval_secs: 30,
             default_batch_size: 100,
             relay_group_id: "default".to_string(),
+            sink_max_inflight: 1_000,
         }
+    }
+}
+
+impl RelayConfig {
+    /// A30: Expand `${ENV:VAR_NAME}` placeholders in a connection string using
+    /// the current process environment.  Unknown variables are left as-is so
+    /// callers can detect mis-configuration.
+    ///
+    /// # Security
+    /// Only reads from the process environment — no eval or shell expansion.
+    pub fn expand_env_vars(s: &str) -> String {
+        let mut result = String::with_capacity(s.len());
+        let mut rest = s;
+        while let Some(start) = rest.find("${ENV:") {
+            result.push_str(&rest[..start]);
+            let after = &rest[start + 6..];
+            if let Some(end) = after.find('}') {
+                let var_name = &after[..end];
+                match std::env::var(var_name) {
+                    Ok(val) => result.push_str(&val),
+                    Err(_) => {
+                        // Leave the placeholder intact so the caller can detect the error.
+                        result.push_str("${ENV:");
+                        result.push_str(var_name);
+                        result.push('}');
+                    }
+                }
+                rest = &after[end + 1..];
+            } else {
+                // Malformed placeholder — pass through verbatim.
+                result.push_str("${ENV:");
+                rest = after;
+            }
+        }
+        result.push_str(rest);
+        result
+    }
+
+    /// Expand all connection string fields.
+    pub fn resolve_env_vars(mut self) -> Self {
+        self.postgres_url = Self::expand_env_vars(&self.postgres_url);
+        self
     }
 }
 
@@ -177,10 +225,67 @@ mod tests {
             discovery_interval_secs: 60,
             default_batch_size: 200,
             relay_group_id: "prod-cluster-1".to_string(),
+            sink_max_inflight: 500,
         };
         let toml_str = toml::to_string(&cfg).unwrap();
         let decoded: RelayConfig = toml::from_str(&toml_str).unwrap();
         assert_eq!(decoded.postgres_url, cfg.postgres_url);
         assert_eq!(decoded.relay_group_id, cfg.relay_group_id);
+        assert_eq!(decoded.sink_max_inflight, 500);
+    }
+
+    // ── A30: ENV variable expansion ───────────────────────────────────────
+
+    #[test]
+    fn test_expand_env_vars_no_placeholders() {
+        let s = "postgres://localhost/mydb";
+        assert_eq!(RelayConfig::expand_env_vars(s), s);
+    }
+
+    #[test]
+    fn test_expand_env_vars_known_var() {
+        // SAFETY: test-only; single-threaded cargo test with no parallel access.
+        unsafe { std::env::set_var("PGTRICKLE_TEST_CONN_VAR", "secret_password") };
+        let s = "postgres://user:${ENV:PGTRICKLE_TEST_CONN_VAR}@localhost/db";
+        let result = RelayConfig::expand_env_vars(s);
+        assert_eq!(result, "postgres://user:secret_password@localhost/db");
+        // SAFETY: same as above.
+        unsafe { std::env::remove_var("PGTRICKLE_TEST_CONN_VAR") };
+    }
+
+    #[test]
+    fn test_expand_env_vars_unknown_var_preserved() {
+        // Unknown variable placeholder must be left intact so callers can detect
+        // mis-configuration rather than silently passing an empty password.
+        // SAFETY: test-only; single-threaded cargo test.
+        unsafe { std::env::remove_var("PGTRICKLE_DEFINITELY_NOT_SET_9XQ") };
+        let s = "postgres://${ENV:PGTRICKLE_DEFINITELY_NOT_SET_9XQ}@host/db";
+        let result = RelayConfig::expand_env_vars(s);
+        assert_eq!(result, s, "unknown var placeholder should be preserved");
+    }
+
+    #[test]
+    fn test_expand_env_vars_multiple_vars() {
+        // SAFETY: test-only; single-threaded cargo test.
+        unsafe {
+            std::env::set_var("PGTRICKLE_TEST_USER", "alice");
+            std::env::set_var("PGTRICKLE_TEST_DB", "analytics");
+        }
+        let s = "postgres://${ENV:PGTRICKLE_TEST_USER}@host/${ENV:PGTRICKLE_TEST_DB}";
+        let result = RelayConfig::expand_env_vars(s);
+        assert_eq!(result, "postgres://alice@host/analytics");
+        // SAFETY: test-only; single-threaded cargo test.
+        unsafe {
+            std::env::remove_var("PGTRICKLE_TEST_USER");
+            std::env::remove_var("PGTRICKLE_TEST_DB");
+        }
+    }
+
+    #[test]
+    fn test_expand_env_vars_malformed_unclosed() {
+        // Malformed placeholder (no closing brace) is passed through verbatim.
+        let s = "postgres://${ENV:UNCLOSED";
+        let result = RelayConfig::expand_env_vars(s);
+        assert_eq!(result, s);
     }
 }

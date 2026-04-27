@@ -1801,6 +1801,21 @@ pub fn execute_differential_refresh(
     }
 
     if should_fallback {
+        // A22 (v0.35.0): Emit NOTICE on every FULL fallback so operators
+        // see the reason in client log output.
+        let reason = if crate::config::pg_trickle_force_full_refresh() {
+            "force_full_refresh GUC override".to_string()
+        } else if strategy == crate::config::RefreshStrategy::Full {
+            "refresh_strategy=full GUC".to_string()
+        } else {
+            format!("change ratio exceeds threshold ({:.1}%)", max_ratio * 100.0,)
+        };
+        pgrx::notice!(
+            "stream table \"{}\".\"{}\" using FULL refresh: {}",
+            st.pgt_schema,
+            st.pgt_name,
+            reason,
+        );
         pgrx::warning!(
             "[pg_trickle] Falling back to FULL refresh for {}.{}: change ratio exceeds \
              adaptive threshold ({:.0}% of source table size).\n\
@@ -3387,13 +3402,6 @@ pub fn execute_differential_refresh(
             amplification_threshold,
         );
     }
-
-    // CORR-1 (v0.30.0): cross-cycle phantom cleanup is deferred — the
-    // cleanup_cross_cycle_phantoms() helper referenced cf.__pgt_row_id from
-    // the user's defining query CTE which never contains that column, causing
-    // a PostgreSQL error for all non-join query shapes (DISTINCT ON, EXCEPT,
-    // non-recursive CTE, FULL JOIN).  A proper key-based comparison is
-    // required; this will be addressed in a follow-up.
 
     // G12-ERM-1: Record the effective mode for this execution path.
     set_effective_mode("DIFFERENTIAL");

@@ -7,6 +7,7 @@ For future plans and upcoming features, see [ROADMAP.md](ROADMAP.md).
 ## Table of Contents
 
 <!-- TOC start -->
+- [0.35.0 — Hardening, Reactive Subscriptions & Relay Resilience](#0350--hardening-reactive-subscriptions--relay-resilience)
 - [0.34.0 — Citus: Automated Distributed CDC Scheduler & Shard Recovery](#0340--citus-automated-distributed-cdc-scheduler--shard-recovery)
 - [0.33.0 — Citus: Distributed Source CDC & Stream Tables](#0330--citus-distributed-source-cdc--stream-tables)
 - [0.32.0 — Citus: Stable Naming & Per-Source Frontier Foundation](#0320--citus-stable-naming--per-source-frontier-foundation)
@@ -48,6 +49,51 @@ For future plans and upcoming features, see [ROADMAP.md](ROADMAP.md).
 - [0.1.1 — CloudNativePG Image & Test Hardening](#011--cloudnativepg-image--test-hardening)
 - [0.1.0 — Initial Release](#010--initial-release)
 <!-- TOC end -->
+
+---
+
+## [0.35.0] — Hardening, Reactive Subscriptions & Relay Resilience
+
+v0.35.0 is a focused correctness, operability, and resilience sprint. It adds reactive NOTIFY subscriptions, an SLA summary API, CDC kill-switch GUCs, and several operator-facing improvements. The relay gains exponential reconnect backoff and `${ENV:VAR_NAME}` secret interpolation.
+
+### New features
+
+- **Reactive subscriptions** — `pgtrickle.subscribe(stream_table, channel)` / `pgtrickle.unsubscribe()` / `pgtrickle.list_subscriptions()`: NOTIFY-based reactive delivery after every non-empty refresh cycle (UX-SUB).
+- **SLA summary API** — `pgtrickle.sla_summary()` returns p50/p99 latency, freshness lag, and error-budget remaining over a configurable window (`pg_trickle.sla_window_hours`, default 24 h) (F17).
+- **Explain stream table** — `pgtrickle.explain_stream_table(name)` returns the defining query and cached refresh metadata for a stream table (A23).
+- **Shadow-build evolution status** — `pgtrickle.view_evolution_status()` lists which stream tables are in a zero-downtime shadow build (UX-STATUS).
+- **CDC kill-switch** — new `pg_trickle.cdc_paused` GUC (boolean, default `off`) pauses all CDC capture at the trigger level without dropping triggers (A07).
+- **Force-full-refresh GUC** — `pg_trickle.force_full_refresh` (boolean, default `off`) forces all stream tables to use FULL refresh mode for a debugging/recovery window (A08).
+- **FULL-fallback NOTICE** — a `NOTICE` is emitted every time differential refresh falls back to FULL refresh, including the reason string (A22).
+- **Shadow-ST catalog columns** — `in_shadow_build` and `shadow_table_name` columns added to `pgtrickle.pgt_stream_tables` (UX-SHADOW).
+- **History start_time index** — `pgt_refresh_history_start_time_idx (start_time DESC)` for faster SLA queries and retention pruning (A11).
+- **Relay ENV-var interpolation** — connection strings support `${ENV:VAR_NAME}` placeholders that are expanded from the process environment at startup (A30).
+- **Relay reconnect backoff** — the relay now retries failed PostgreSQL connections with exponential backoff (initial 100 ms, max 30 s, ±20 % jitter) (A38).
+- **Relay backpressure** — new `sink_max_inflight` config field (default 1 000 messages) that can be used to pause upstream polling (A39).
+- **Notify coalesce GUC** — `pg_trickle.notify_coalesce_ms` (integer, default 250 ms) reserved for future NOTIFY debounce (UX-GUC).
+
+### Correctness fixes
+
+- **A01 / EC-01**: cross-cycle phantom-row cleanup now runs unconditionally after every join differential refresh cycle (batch 1 024 rows) instead of being deferred. This eliminates phantom residual rows that accumulated over multi-cycle windows (A01).
+- **A05**: `join_and_predicates()` no longer panics on an empty predicate list — now returns `Result<Expr, PgTrickleError>` (A05).
+
+### Performance
+
+- **History prune batch size** raised from 1 000 → 10 000 rows per transaction to reduce pruning lag on busy clusters (A10).
+- **Citus lease jitter**: `try_acquire_st_lock()` adds 50–500 ms random backoff on INSERT conflict to prevent coordinator thundering herd (A13).
+
+### Developer experience
+
+- Unit tests added for `inbox_is_my_partition` (A06) and `outbox_table_name_for` (A06).
+- Relay config tests added for `${ENV:VAR_NAME}` expansion.
+
+### Upgrade notes
+
+Run the upgrade migration:
+```sql
+ALTER EXTENSION pg_trickle UPDATE TO '0.35.0';
+```
+The migration adds `pgt_refresh_history_start_time_idx`, creates `pgtrickle.pgt_subscriptions`, and adds `in_shadow_build` / `shadow_table_name` columns to `pgtrickle.pgt_stream_tables`. All DDL is idempotent.
 
 ---
 
