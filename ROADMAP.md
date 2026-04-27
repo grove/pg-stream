@@ -82,10 +82,10 @@
 | [v0.34.0](roadmap/v0.34.0.md) | Citus: automated distributed CDC scheduler wiring and shard rebalance auto-recovery | ✅ Released | Medium | [Full details](roadmap/v0.34.0.md-full.md) |
 | [v0.35.0](roadmap/v0.35.0.md) | EC-01 correctness closeout, Citus chaos hardening, reactive subscriptions, zero-downtime schema changes | Released | Large | [Full details](roadmap/v0.35.0.md-full.md) |
 | [v0.36.0](roadmap/v0.36.0.md) | Structural hardening, L0 cache, WAL backpressure, temporal IVM, columnar storage | ✅ Released | Large | [Full details](roadmap/v0.36.0.md-full.md) |
-| [v0.37.0](roadmap/v0.37.0.md) | Scheduler modularisation, pgVectorMV, OpenTelemetry trace propagation | Planned | Medium | [Full details](roadmap/v0.37.0.md-full.md) |
-| [v0.38.0](roadmap/v0.38.0.md) | Embedding pipeline infrastructure: post-refresh hooks, drift-based reindex, vector_status() monitoring | Planned | Medium | [Full details](roadmap/v0.38.0.md-full.md) |
-| [v0.39.0](roadmap/v0.39.0.md) | Hybrid search & sparse vector aggregates: sparsevec_avg, halfvec_avg, reactive distance subscriptions | Planned | Medium | [Full details](roadmap/v0.39.0.md-full.md) |
-| [v0.40.0](roadmap/v0.40.0.md) | Embedding API & advanced RAG patterns: embedding_stream_table(), k-NN graph research, per-tenant ANN | Planned | Large | [Full details](roadmap/v0.40.0.md-full.md) |
+| [v0.37.0](roadmap/v0.37.0.md) | Scheduler & merge modularisation, pgVectorMV (vector_avg/sum), OpenTelemetry trace propagation | Planned | Medium | [Full details](roadmap/v0.37.0.md-full.md) |
+| [v0.38.0](roadmap/v0.38.0.md) | Embedding pipeline operations: post-refresh hooks, drift-based reindex, vector_status() monitoring, GUC docs overhaul | Planned | Medium | [Full details](roadmap/v0.38.0.md-full.md) |
+| [v0.39.0](roadmap/v0.39.0.md) | Sparse & half-precision vector aggregates, reactive distance subscriptions, hybrid-search benchmarks | Planned | Medium | [Full details](roadmap/v0.39.0.md-full.md) |
+| [v0.40.0](roadmap/v0.40.0.md) | embedding_stream_table() ergonomic API, per-tenant ANN patterns, outbox embedding events, co-marketing | Planned | Large | [Full details](roadmap/v0.40.0.md-full.md) |
 
 ### Beyond v1.0
 
