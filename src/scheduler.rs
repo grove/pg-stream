@@ -2712,6 +2712,14 @@ pub extern "C-unwind" fn pg_trickle_scheduler_main(_arg: pg_sys::Datum) {
     let mut last_history_cleanup_ms: u64 = 0;
     const HISTORY_CLEANUP_INTERVAL_MS: u64 = 24 * 60 * 60 * 1000; // 24 hours
 
+    // OUTBOX-1: Timestamp for periodic outbox retention cleanup.
+    // Interval is driven by pg_trickle.outbox_drain_interval_seconds.
+    let mut last_outbox_cleanup_ms: u64 = 0;
+
+    // INBOX-1: Timestamp for periodic inbox retention cleanup.
+    // Interval is driven by pg_trickle.inbox_drain_interval_seconds.
+    let mut last_inbox_cleanup_ms: u64 = 0;
+
     // DF-G2: Dog-feeding auto-apply — timestamp-gated, rate-limited.
     let mut last_auto_apply_ms: u64 = 0;
     const AUTO_APPLY_INTERVAL_MS: u64 = 10 * 60 * 1000; // 10 minutes
@@ -3108,6 +3116,317 @@ pub extern "C-unwind" fn pg_trickle_scheduler_main(_arg: pg_sys::Datum) {
                     }
                 }
                 last_history_cleanup_ms = now_for_cleanup;
+            }
+        }
+
+        // OUTBOX-1: Periodic outbox retention cleanup.
+        //
+        // Iterates all outbox tables registered in pgt_outbox_config and deletes
+        // rows older than their per-ST retention_hours (falling back to the global
+        // outbox_retention_hours GUC).  Also emits a WARNING when any outbox table
+        // exceeds outbox_storage_critical_mb.  Skips deletion entirely when
+        // outbox_force_retention = true (consumers may not have caught up yet).
+        {
+            let outbox_interval_ms =
+                config::pg_trickle_outbox_drain_interval_seconds().saturating_mul(1_000);
+            if outbox_interval_ms > 0 {
+                let now_for_outbox = current_epoch_ms();
+                if now_for_outbox.saturating_sub(last_outbox_cleanup_ms) >= outbox_interval_ms {
+                    if config::pg_trickle_outbox_enabled() {
+                        let global_retention_hours = config::pg_trickle_outbox_retention_hours();
+                        let force_retention = config::pg_trickle_outbox_force_retention();
+                        let storage_critical_bytes =
+                            config::pg_trickle_outbox_storage_critical_bytes();
+                        let batch_size = config::pg_trickle_outbox_drain_batch_size();
+
+                        // Fetch all outbox tables with their per-ST retention_hours.
+                        let outbox_entries: Vec<(String, i32)> =
+                            BackgroundWorker::transaction(AssertUnwindSafe(|| {
+                                let mut entries: Vec<(String, i32)> = Vec::new();
+                                let _ = Spi::connect(|client| {
+                                    let tup_table = client.select(
+                                        "SELECT outbox_table_name, retention_hours \
+                                         FROM pgtrickle.pgt_outbox_config",
+                                        None,
+                                        &[],
+                                    )?;
+                                    for row in tup_table {
+                                        let table_name: Option<String> = row.get(1)?;
+                                        let ret_hours: Option<i32> = row.get(2)?;
+                                        if let Some(name) = table_name {
+                                            entries.push((
+                                                name,
+                                                ret_hours.unwrap_or(global_retention_hours),
+                                            ));
+                                        }
+                                    }
+                                    Ok::<_, pgrx::spi::SpiError>(())
+                                });
+                                entries
+                            }));
+
+                        for (outbox_table, retention_hours) in outbox_entries {
+                            // Storage alert check.
+                            if storage_critical_bytes > 0 {
+                                let table_bytes: i64 =
+                                    BackgroundWorker::transaction(AssertUnwindSafe(|| {
+                                        Spi::get_one_with_args::<i64>(
+                                            "SELECT pg_total_relation_size(\
+                                                 ('pgtrickle.' || quote_ident($1))::regclass)",
+                                            &[outbox_table.as_str().into()],
+                                        )
+                                        .unwrap_or(None)
+                                        .unwrap_or(0)
+                                    }));
+                                if table_bytes >= storage_critical_bytes {
+                                    warning!(
+                                        "pg_trickle: outbox table 'pgtrickle.{}' size {}MB \
+                                         exceeds outbox_storage_critical_mb threshold \
+                                         ({}MB). Consider increasing consumer throughput \
+                                         or reducing outbox_retention_hours.",
+                                        outbox_table,
+                                        table_bytes / (1024 * 1024),
+                                        storage_critical_bytes / (1024 * 1024),
+                                    );
+                                }
+                            }
+
+                            // Retention cleanup — skip when force_retention is on.
+                            if !force_retention && retention_hours > 0 {
+                                let mut total_deleted: i64 = 0;
+                                loop {
+                                    let deleted: i64 =
+                                        BackgroundWorker::transaction(AssertUnwindSafe(|| {
+                                            let sql = format!(
+                                                "WITH batch AS (\
+                                                     SELECT id \
+                                                     FROM pgtrickle.\"{}\" \
+                                                     WHERE created_at \
+                                                           < now() - make_interval(hours => $1) \
+                                                     LIMIT $2 \
+                                                 ), del AS (\
+                                                     DELETE FROM pgtrickle.\"{}\" \
+                                                     WHERE id IN (SELECT id FROM batch) \
+                                                     RETURNING 1\
+                                                 ) SELECT count(*) FROM del",
+                                                outbox_table.replace('"', "\"\""),
+                                                outbox_table.replace('"', "\"\""),
+                                            );
+                                            Spi::get_one_with_args::<i64>(
+                                                &sql,
+                                                &[retention_hours.into(), batch_size.into()],
+                                            )
+                                            .unwrap_or(None)
+                                            .unwrap_or(0)
+                                        }));
+                                    total_deleted += deleted;
+                                    if deleted < batch_size {
+                                        break;
+                                    }
+                                }
+                                if total_deleted > 0 {
+                                    log!(
+                                        "pg_trickle: outbox cleanup — deleted {} rows \
+                                         from 'pgtrickle.{}' older than {} hours (batched)",
+                                        total_deleted,
+                                        outbox_table,
+                                        retention_hours,
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    last_outbox_cleanup_ms = current_epoch_ms();
+                }
+            }
+        }
+
+        // INBOX-1: Periodic inbox retention cleanup.
+        //
+        // Iterates all inbox configs and deletes:
+        //   - Processed rows (processed_at IS NOT NULL) older than
+        //     inbox_processed_retention_hours from the base inbox table.
+        //   - DLQ rows (retry_count >= max_retries AND processed_at IS NULL) older
+        //     than inbox_dlq_retention_hours (when > 0) from the base inbox table.
+        //
+        // INBOX-7: After cleanup, checks the current DLQ count per inbox and
+        // emits a WARNING when it exceeds inbox_dlq_alert_max_per_refresh.
+        {
+            let inbox_interval_ms =
+                config::pg_trickle_inbox_drain_interval_seconds().saturating_mul(1_000);
+            if inbox_interval_ms > 0 {
+                let now_for_inbox = current_epoch_ms();
+                if now_for_inbox.saturating_sub(last_inbox_cleanup_ms) >= inbox_interval_ms {
+                    if config::pg_trickle_inbox_enabled() {
+                        let processed_retention_hours =
+                            config::pg_trickle_inbox_processed_retention_hours();
+                        let dlq_retention_hours = config::pg_trickle_inbox_dlq_retention_hours();
+                        let batch_size = config::pg_trickle_inbox_drain_batch_size();
+                        let dlq_alert_threshold =
+                            config::pg_trickle_inbox_dlq_alert_max_per_refresh();
+
+                        // Fetch all inbox configs: (schema, name, max_retries).
+                        let inbox_entries: Vec<(String, String, i32)> =
+                            BackgroundWorker::transaction(AssertUnwindSafe(|| {
+                                let mut entries: Vec<(String, String, i32)> = Vec::new();
+                                let _ = Spi::connect(|client| {
+                                    let tup_table = client.select(
+                                        "SELECT inbox_schema, inbox_name, max_retries \
+                                         FROM pgtrickle.pgt_inbox_config",
+                                        None,
+                                        &[],
+                                    )?;
+                                    for row in tup_table {
+                                        let schema: Option<String> = row.get(1)?;
+                                        let name: Option<String> = row.get(2)?;
+                                        let max_retries: Option<i32> = row.get(3)?;
+                                        if let (Some(s), Some(n)) = (schema, name) {
+                                            entries.push((s, n, max_retries.unwrap_or(3)));
+                                        }
+                                    }
+                                    Ok::<_, pgrx::spi::SpiError>(())
+                                });
+                                entries
+                            }));
+
+                        for (inbox_schema, inbox_name, max_retries) in inbox_entries {
+                            // Delete processed rows older than processed_retention_hours.
+                            if processed_retention_hours > 0 {
+                                let mut total_deleted: i64 = 0;
+                                loop {
+                                    let deleted: i64 =
+                                        BackgroundWorker::transaction(AssertUnwindSafe(|| {
+                                            let sql = format!(
+                                                "WITH batch AS (\
+                                                     SELECT ctid \
+                                                     FROM \"{}\".\"{}\" \
+                                                     WHERE processed_at IS NOT NULL \
+                                                       AND processed_at \
+                                                           < now() - make_interval(hours => $1) \
+                                                     LIMIT $2 \
+                                                 ), del AS (\
+                                                     DELETE FROM \"{}\".\"{}\" \
+                                                     WHERE ctid IN (SELECT ctid FROM batch) \
+                                                     RETURNING 1\
+                                                 ) SELECT count(*) FROM del",
+                                                inbox_schema.replace('"', "\"\""),
+                                                inbox_name.replace('"', "\"\""),
+                                                inbox_schema.replace('"', "\"\""),
+                                                inbox_name.replace('"', "\"\""),
+                                            );
+                                            Spi::get_one_with_args::<i64>(
+                                                &sql,
+                                                &[
+                                                    processed_retention_hours.into(),
+                                                    batch_size.into(),
+                                                ],
+                                            )
+                                            .unwrap_or(None)
+                                            .unwrap_or(0)
+                                        }));
+                                    total_deleted += deleted;
+                                    if deleted < batch_size {
+                                        break;
+                                    }
+                                }
+                                if total_deleted > 0 {
+                                    log!(
+                                        "pg_trickle: inbox processed cleanup — deleted {} rows \
+                                         from '\"{}\".\"{}\"' older than {} hours (batched)",
+                                        total_deleted,
+                                        inbox_schema,
+                                        inbox_name,
+                                        processed_retention_hours,
+                                    );
+                                }
+                            }
+
+                            // Delete DLQ rows older than dlq_retention_hours.
+                            if dlq_retention_hours > 0 {
+                                let mut total_deleted: i64 = 0;
+                                loop {
+                                    let deleted: i64 =
+                                        BackgroundWorker::transaction(AssertUnwindSafe(|| {
+                                            let sql = format!(
+                                                "WITH batch AS (\
+                                                     SELECT ctid \
+                                                     FROM \"{}\".\"{}\" \
+                                                     WHERE processed_at IS NULL \
+                                                       AND retry_count >= $1 \
+                                                       AND received_at \
+                                                           < now() - make_interval(hours => $2) \
+                                                     LIMIT $3 \
+                                                 ), del AS (\
+                                                     DELETE FROM \"{}\".\"{}\" \
+                                                     WHERE ctid IN (SELECT ctid FROM batch) \
+                                                     RETURNING 1\
+                                                 ) SELECT count(*) FROM del",
+                                                inbox_schema.replace('"', "\"\""),
+                                                inbox_name.replace('"', "\"\""),
+                                                inbox_schema.replace('"', "\"\""),
+                                                inbox_name.replace('"', "\"\""),
+                                            );
+                                            Spi::get_one_with_args::<i64>(
+                                                &sql,
+                                                &[
+                                                    max_retries.into(),
+                                                    dlq_retention_hours.into(),
+                                                    batch_size.into(),
+                                                ],
+                                            )
+                                            .unwrap_or(None)
+                                            .unwrap_or(0)
+                                        }));
+                                    total_deleted += deleted;
+                                    if deleted < batch_size {
+                                        break;
+                                    }
+                                }
+                                if total_deleted > 0 {
+                                    log!(
+                                        "pg_trickle: inbox DLQ cleanup — deleted {} rows \
+                                         from '\"{}\".\"{}\"' older than {} hours (batched)",
+                                        total_deleted,
+                                        inbox_schema,
+                                        inbox_name,
+                                        dlq_retention_hours,
+                                    );
+                                }
+                            }
+
+                            // INBOX-7: DLQ threshold alert.
+                            if dlq_alert_threshold > 0 {
+                                let dlq_count: i64 =
+                                    BackgroundWorker::transaction(AssertUnwindSafe(|| {
+                                        let sql = format!(
+                                            "SELECT count(*) \
+                                             FROM \"{}\".\"{}\" \
+                                             WHERE processed_at IS NULL \
+                                               AND retry_count >= $1",
+                                            inbox_schema.replace('"', "\"\""),
+                                            inbox_name.replace('"', "\"\""),
+                                        );
+                                        Spi::get_one_with_args::<i64>(&sql, &[max_retries.into()])
+                                            .unwrap_or(None)
+                                            .unwrap_or(0)
+                                    }));
+                                if dlq_count >= dlq_alert_threshold as i64 {
+                                    warning!(
+                                        "pg_trickle: inbox '\"{}\".\"{}\"' DLQ has {} \
+                                         unprocessed messages (threshold: {}). \
+                                         Check for processing errors or increase \
+                                         pg_trickle.inbox_dlq_alert_max_per_refresh.",
+                                        inbox_schema,
+                                        inbox_name,
+                                        dlq_count,
+                                        dlq_alert_threshold,
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    last_inbox_cleanup_ms = current_epoch_ms();
+                }
             }
         }
 

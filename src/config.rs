@@ -3589,6 +3589,72 @@ pub fn pg_trickle_temporal_stream_tables() -> bool {
     PGS_TEMPORAL_STREAM_TABLES.get()
 }
 
+// ── v0.28.0 outbox/inbox accessor functions ────────────────────────────────
+
+/// OUTBOX-1: Returns whether the outbox feature is globally enabled.
+pub fn pg_trickle_outbox_enabled() -> bool {
+    PGS_OUTBOX_ENABLED.get()
+}
+
+/// OUTBOX-1: Returns the global outbox retention period in hours (0 = keep forever).
+pub fn pg_trickle_outbox_retention_hours() -> i32 {
+    PGS_OUTBOX_RETENTION_HOURS.get()
+}
+
+/// OUTBOX-1: Returns the outbox drain batch size.
+pub fn pg_trickle_outbox_drain_batch_size() -> i64 {
+    PGS_OUTBOX_DRAIN_BATCH_SIZE.get() as i64
+}
+
+/// OUTBOX-1: Returns the outbox drain interval in seconds (0 = disabled).
+pub fn pg_trickle_outbox_drain_interval_seconds() -> u64 {
+    PGS_OUTBOX_DRAIN_INTERVAL_SECONDS.get() as u64
+}
+
+/// OUTBOX-5: Returns the storage threshold in bytes at which outbox is critical.
+pub fn pg_trickle_outbox_storage_critical_bytes() -> i64 {
+    threshold_mb_to_bytes(PGS_OUTBOX_STORAGE_CRITICAL_MB.get())
+}
+
+/// OUTBOX-1: Returns whether outbox force-retention is enabled (skip delete if
+/// any consumer has not yet consumed the row).
+pub fn pg_trickle_outbox_force_retention() -> bool {
+    PGS_OUTBOX_FORCE_RETENTION.get()
+}
+
+/// INBOX-1: Returns whether the inbox feature is globally enabled.
+pub fn pg_trickle_inbox_enabled() -> bool {
+    PGS_INBOX_ENABLED.get()
+}
+
+/// INBOX-1: Returns the retention period (hours) for successfully processed
+/// inbox messages (0 = keep forever).
+pub fn pg_trickle_inbox_processed_retention_hours() -> i32 {
+    PGS_INBOX_PROCESSED_RETENTION_HOURS.get()
+}
+
+/// INBOX-1: Returns the retention period (hours) for dead-letter queue rows
+/// (0 = keep forever).
+pub fn pg_trickle_inbox_dlq_retention_hours() -> i32 {
+    PGS_INBOX_DLQ_RETENTION_HOURS.get()
+}
+
+/// INBOX-1: Returns the inbox drain batch size.
+pub fn pg_trickle_inbox_drain_batch_size() -> i64 {
+    PGS_INBOX_DRAIN_BATCH_SIZE.get() as i64
+}
+
+/// INBOX-1: Returns the inbox drain interval in seconds (0 = disabled).
+pub fn pg_trickle_inbox_drain_interval_seconds() -> u64 {
+    PGS_INBOX_DRAIN_INTERVAL_SECONDS.get() as u64
+}
+
+/// INBOX-7: Returns the maximum DLQ count per inbox before an alert fires
+/// (0 = disabled).
+pub fn pg_trickle_inbox_dlq_alert_max_per_refresh() -> i32 {
+    PGS_INBOX_DLQ_ALERT_MAX_PER_REFRESH.get()
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
