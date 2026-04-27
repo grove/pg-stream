@@ -4619,7 +4619,8 @@ fn execute_manual_refresh(
             st.clone()
         };
 
-        execute_manual_full_refresh(&refresh_st, schema, table_name, source_oids)?;
+        let full_result =
+            execute_manual_full_refresh(&refresh_st, schema, table_name, source_oids)?;
 
         // After the FULL refresh has committed the correct data, re-run
         // the rewrite pipeline to store the updated inlined query.
@@ -4632,21 +4633,18 @@ fn execute_manual_refresh(
         );
         Spi::run(&sql).map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
 
-        Ok((0i64, 0i64))
+        Ok(full_result)
     } else {
         match st.refresh_mode {
-            RefreshMode::Full => execute_manual_full_refresh(st, schema, table_name, source_oids)
-                .map(|_| (0i64, 0i64)),
+            RefreshMode::Full => execute_manual_full_refresh(st, schema, table_name, source_oids),
             RefreshMode::Differential => {
                 execute_manual_differential_refresh(st, schema, table_name, source_oids)
-                    .map(|_| (0i64, 0i64))
             }
             RefreshMode::Immediate => {
                 // For IMMEDIATE mode, manual refresh does a FULL refresh
                 // (re-populate from the defining query), same as pg_ivm's
                 // refresh_immv(name, true).
                 execute_manual_full_refresh(st, schema, table_name, source_oids)
-                    .map(|_| (0i64, 0i64))
             }
         }
     };
@@ -4671,6 +4669,31 @@ fn execute_manual_refresh(
             let eff_mode = crate::refresh::take_effective_mode();
             if !eff_mode.is_empty() {
                 let _ = StreamTableMeta::update_effective_refresh_mode(st.pgt_id, eff_mode);
+            }
+            // Gap-1 fix: write outbox notification for ALL manual refresh modes.
+            // Centralized here so FULL, Immediate, needs_reinit, TopK, and
+            // Differential (including its fallback-to-full paths) all trigger
+            // the outbox write with the actual row counts.
+            if (*rows_inserted > 0 || *rows_deleted > 0)
+                && crate::api::outbox::is_outbox_enabled(st.pgt_id)
+            {
+                let threshold = crate::config::PGS_OUTBOX_INLINE_THRESHOLD_ROWS.get();
+                if let Err(e) = crate::api::outbox::write_outbox_row(
+                    st.pgt_id,
+                    None, // manual refresh has no UUID refresh_id
+                    *rows_inserted,
+                    *rows_deleted,
+                    threshold,
+                    schema,
+                    table_name,
+                ) {
+                    pgrx::warning!(
+                        "[pg_trickle] OUTBOX: failed to write outbox row for {}.{}: {}",
+                        schema,
+                        table_name,
+                        e
+                    );
+                }
             }
         }
         Err(e) => {
@@ -4738,7 +4761,7 @@ fn execute_manual_full_refresh(
     schema: &str,
     table_name: &str,
     source_oids: &[pg_sys::Oid],
-) -> Result<(), PgTrickleError> {
+) -> Result<(i64, i64), PgTrickleError> {
     // EC-25/EC-26: Ensure the internal_refresh flag is set so DML guard
     // triggers allow the refresh executor to modify the storage table.
     // This is needed when called directly (e.g., from alter_stream_table)
@@ -4870,7 +4893,12 @@ fn execute_manual_full_refresh(
     };
 
     let insert_sql = format!("INSERT INTO {quoted_table} {insert_body}");
-    Spi::run(&insert_sql).map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
+    let rows_inserted = Spi::connect_mut(|client| {
+        let result = client
+            .update(&insert_sql, None, &[])
+            .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
+        Ok::<usize, PgTrickleError>(result.len())
+    })?;
 
     // Re-enable user triggers and emit NOTIFY so listeners know a FULL
     // refresh occurred.
@@ -4967,7 +4995,7 @@ fn execute_manual_full_refresh(
         );
     }
 
-    Ok(())
+    Ok((rows_inserted as i64, 0i64))
 }
 
 /// Execute a DIFFERENTIAL manual refresh using the DVM engine.
@@ -4978,7 +5006,7 @@ fn execute_manual_differential_refresh(
     schema: &str,
     table_name: &str,
     source_oids: &[pg_sys::Oid],
-) -> Result<(), PgTrickleError> {
+) -> Result<(i64, i64), PgTrickleError> {
     // If the ST has never been refreshed (frontier is None), fall back to
     // a FULL refresh to establish the baseline frontier.
     if st.frontier.is_none() {
@@ -5037,27 +5065,6 @@ fn execute_manual_differential_refresh(
             &new_frontier,
             rows_inserted,
         )?;
-
-        // Bug #660 fix: write outbox notification row when outbox is enabled.
-        if crate::api::outbox::is_outbox_enabled(st.pgt_id) {
-            let threshold = crate::config::PGS_OUTBOX_INLINE_THRESHOLD_ROWS.get();
-            if let Err(e) = crate::api::outbox::write_outbox_row(
-                st.pgt_id,
-                None, // manual refresh has no UUID refresh_id
-                rows_inserted,
-                rows_deleted,
-                threshold,
-                schema,
-                table_name,
-            ) {
-                pgrx::warning!(
-                    "[pg_trickle] OUTBOX: failed to write outbox row for {}.{}: {}",
-                    schema,
-                    table_name,
-                    e
-                );
-            }
-        }
     } else {
         // No rows changed — store frontier to advance past processed WAL range,
         // but preserve data_timestamp to avoid spurious downstream wakeups.
@@ -5072,7 +5079,7 @@ fn execute_manual_differential_refresh(
         rows_inserted,
         rows_deleted,
     );
-    Ok(())
+    Ok((rows_inserted, rows_deleted))
 }
 
 /// Get source table OIDs for a stream table (used by manual refresh path).

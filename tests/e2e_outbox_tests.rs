@@ -632,6 +632,140 @@ async fn test_poll_outbox_returns_rows_after_real_refresh() {
     );
 }
 
+/// Gap-1 regression: outbox must be written after a manual FULL-mode refresh.
+/// Prior to the fix, `execute_manual_full_refresh` returned `(0, 0)` so the
+/// outer arm's `rows_inserted > 0` guard was never satisfied.
+#[tokio::test]
+async fn test_outbox_written_after_manual_full_refresh() {
+    let db = E2eDb::new().await.with_extension().await;
+
+    db.execute("CREATE TABLE gap1_full_src (id INT PRIMARY KEY, val TEXT)")
+        .await;
+    db.execute("INSERT INTO gap1_full_src VALUES (1, 'a'), (2, 'b')")
+        .await;
+    db.create_st(
+        "gap1_full_st",
+        "SELECT id, val FROM gap1_full_src",
+        "1m",
+        "FULL",
+    )
+    .await;
+    db.execute("SELECT pgtrickle.enable_outbox('gap1_full_st')")
+        .await;
+
+    let outbox_name: String = db
+        .query_scalar(
+            "SELECT outbox_table_name FROM pgtrickle.pgt_outbox_config \
+             WHERE stream_table_name = 'gap1_full_st'",
+        )
+        .await;
+
+    // Insert a new row and do a manual refresh — this previously wrote 0 rows
+    // to the outbox because the count was always zeroed.
+    db.execute("INSERT INTO gap1_full_src VALUES (3, 'c')")
+        .await;
+    db.refresh_st("gap1_full_st").await;
+
+    let count: i64 = db
+        .query_scalar(&format!("SELECT count(*) FROM pgtrickle.\"{outbox_name}\""))
+        .await;
+    assert!(
+        count >= 1,
+        "outbox must contain at least one row after a manual FULL refresh \
+         (Gap-1 regression test)"
+    );
+}
+
+/// Gap-1 regression: outbox must be written after a manual IMMEDIATE-mode refresh.
+/// IMMEDIATE mode delegates to `execute_manual_full_refresh`, so the same fix
+/// must reach it.
+#[tokio::test]
+async fn test_outbox_written_after_manual_immediate_refresh() {
+    let db = E2eDb::new().await.with_extension().await;
+
+    db.execute("CREATE TABLE gap1_imm_src (id INT PRIMARY KEY, val TEXT)")
+        .await;
+    db.execute("INSERT INTO gap1_imm_src VALUES (1, 'x'), (2, 'y')")
+        .await;
+    db.create_st(
+        "gap1_imm_st",
+        "SELECT id, val FROM gap1_imm_src",
+        "1m",
+        "IMMEDIATE",
+    )
+    .await;
+    db.execute("SELECT pgtrickle.enable_outbox('gap1_imm_st')")
+        .await;
+
+    let outbox_name: String = db
+        .query_scalar(
+            "SELECT outbox_table_name FROM pgtrickle.pgt_outbox_config \
+             WHERE stream_table_name = 'gap1_imm_st'",
+        )
+        .await;
+
+    db.execute("INSERT INTO gap1_imm_src VALUES (3, 'z')").await;
+    db.refresh_st("gap1_imm_st").await;
+
+    let count: i64 = db
+        .query_scalar(&format!("SELECT count(*) FROM pgtrickle.\"{outbox_name}\""))
+        .await;
+    assert!(
+        count >= 1,
+        "outbox must contain at least one row after a manual IMMEDIATE refresh \
+         (Gap-1 regression test)"
+    );
+}
+
+/// Gap-1 regression: outbox must be written when needs_reinit forces a FULL
+/// refresh.  We force the flag directly to reproduce the reinit path without
+/// needing a DDL hook.
+#[tokio::test]
+async fn test_outbox_written_after_reinit_refresh() {
+    let db = E2eDb::new().await.with_extension().await;
+
+    db.execute("CREATE TABLE gap1_reinit_src (id INT PRIMARY KEY, val TEXT)")
+        .await;
+    db.execute("INSERT INTO gap1_reinit_src VALUES (1, 'a'), (2, 'b')")
+        .await;
+    db.create_st(
+        "gap1_reinit_st",
+        "SELECT id, val FROM gap1_reinit_src",
+        "1m",
+        "DIFFERENTIAL",
+    )
+    .await;
+    db.execute("SELECT pgtrickle.enable_outbox('gap1_reinit_st')")
+        .await;
+
+    let outbox_name: String = db
+        .query_scalar(
+            "SELECT outbox_table_name FROM pgtrickle.pgt_outbox_config \
+             WHERE stream_table_name = 'gap1_reinit_st'",
+        )
+        .await;
+
+    // Force the reinit flag so the next manual refresh takes the reinit path.
+    db.execute(
+        "UPDATE pgtrickle.pgt_stream_tables \
+         SET needs_reinit = true WHERE pgt_name = 'gap1_reinit_st'",
+    )
+    .await;
+
+    db.execute("INSERT INTO gap1_reinit_src VALUES (3, 'c')")
+        .await;
+    db.refresh_st("gap1_reinit_st").await;
+
+    let count: i64 = db
+        .query_scalar(&format!("SELECT count(*) FROM pgtrickle.\"{outbox_name}\""))
+        .await;
+    assert!(
+        count >= 1,
+        "outbox must contain at least one row after a needs_reinit FULL refresh \
+         (Gap-1 regression test)"
+    );
+}
+
 // ══════════════════════════════════════════════════════════════════════════════
 // New catalog tables — existence checks
 // ══════════════════════════════════════════════════════════════════════════════
