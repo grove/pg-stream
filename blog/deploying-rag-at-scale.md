@@ -255,7 +255,7 @@ CREATE POLICY tenant_isolation ON search_corpus_shared
 CREATE INDEX ON search_corpus_shared USING hnsw (embedding vector_cosine_ops);
 ```
 
-For small tenants, the over-fetching problem is less severe (they have fewer rows in the index to skip). RLS guarantees data isolation regardless of application bugs. The shared index means less infrastructure per tenant.
+For small tenants, over-fetching is a real trade-off: a tenant with 500 rows in a 50,000-row shared index is 1% of the data, so HNSW may need to visit many non-matching nodes before returning 10 results. In practice this is acceptable because the total shared index is small (small tenants have little data by definition), so even with over-fetching, absolute query latency stays low. RLS guarantees data isolation regardless of application bugs. The shared index means less infrastructure per tenant.
 
 ### Monitoring Per Tenant
 
@@ -478,7 +478,7 @@ SELECT pgtrickle.alter_stream_table(
 ### Monitoring Checklist
 
 1. **Embedding lag** (`pgtrickle_vector_refresh_lag_ms`): Should be below 2× your schedule interval. If consistently above, your refresh is too expensive for the cycle time.
-2. **Drift ratio** (`pgtrickle_vector_drift_ratio`): Steady state should stay below your threshold. If it keeps hitting the threshold, your write rate is high enough to warrant a lower schedule interval.
+2. **Drift ratio** (`pgtrickle_vector_drift_ratio`): Steady state should stay below your threshold. If it keeps hitting the threshold, your write rate is high enough to warrant a shorter schedule interval (more frequent refreshes) to reduce the delta size per cycle.
 3. **Reindex frequency**: Check `last_reindex` in `vector_status()`. If reindexing every day, consider whether the drift threshold is too low or the write volume is genuinely high.
 4. **Refresh duration trend**: If refresh time is trending up, check whether the delta size is growing (more changes per cycle) or the stream table is getting larger (more rows to merge into).
 
@@ -488,7 +488,7 @@ SELECT pgtrickle.alter_stream_table(
 
 **Drift never decreases after reindex.** The write rate is so high that by the time the reindex finishes, enough new changes have accumulated to exceed the threshold again. Solution: increase the threshold, or accept that for very high-write-rate tables, the index will always have some drift.
 
-**REINDEX CONCURRENTLY fails.** PostgreSQL can fail concurrent reindex under certain conditions (e.g., unique constraint violations from concurrent writes to the underlying table). pg_trickle retries once; on second failure, it logs a warning and skips until the next threshold crossing. The old index continues to serve queries — the failure is not catastrophic.
+**REINDEX CONCURRENTLY fails.** PostgreSQL can fail concurrent reindex under certain conditions (e.g., deadlocks with concurrent sessions, or if a conflicting DDL operation runs during the build). pg_trickle retries once; on second failure, it logs a warning and skips until the next threshold crossing. The old index continues to serve queries — the failure is not catastrophic.
 
 ---
 

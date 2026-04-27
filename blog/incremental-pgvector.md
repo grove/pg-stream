@@ -147,7 +147,7 @@ SELECT pgtrickle.create_stream_table(
   name         => 'docs_embedded',
   query        => $$
     SELECT d.id, d.title, d.body,
-           pgai.embed('text-embedding-3-small', d.body) AS embedding,
+           d.embedding,  -- pre-computed by your app or pgai
            d.project_id, d.updated_at
     FROM documents d
     WHERE d.status = 'active'
@@ -159,9 +159,11 @@ SELECT pgtrickle.create_stream_table(
 CREATE INDEX ON docs_embedded USING hnsw (embedding vector_cosine_ops);
 ```
 
-Now when a document body changes, pg_trickle's CDC trigger captures the change. Within the next refresh cycle (10 seconds by default), only the changed document's row is updated in `docs_embedded`. The HNSW index receives a precise insert+delete pair. No batch job. No queue. No worker. No drift.
+Now when a document body changes (and your application writes the new embedding to the source table), pg_trickle's CDC trigger captures the change. Within the next refresh cycle (10 seconds by default), only the changed document's row is updated in `docs_embedded`. The HNSW index receives a precise insert+delete pair. No batch job. No queue. No worker. No drift.
 
 The important word here is **DIFFERENTIAL**. The engine doesn't recompute the entire corpus. It processes only the rows that changed since the last cycle. If 1 document changes out of 1 million, it touches 1 row's worth of work.
+
+> **Note on embedding generation:** The example above assumes your application (or a `pgai` vectorizer worker) writes the embedding to the source `documents` table before commit. pg_trickle's differential refresh reads the already-computed embedding — it doesn't call an embedding API during refresh. Calling a volatile function like `pgai.embed()` inside the stream table query would force a FULL refresh on every cycle, defeating the purpose. Keep embedding generation in your write path; keep corpus maintenance in the stream table.
 
 ### Denormalized Corpora as First-Class Citizens
 
@@ -325,7 +327,7 @@ CREATE INDEX ON doc_search_corpus (project_id);
 CREATE INDEX ON doc_search_corpus USING gin (allowed_users);
 ```
 
-That's it. Two SQL statements (one stream table, two indexes). From now on:
+That's it. Five SQL statements (one stream table, four indexes). From now on:
 - Every page edit propagates to the corpus within 10 seconds.
 - Every permission change propagates within 10 seconds.
 - The HNSW index stays current automatically.

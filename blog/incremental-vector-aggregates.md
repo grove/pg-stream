@@ -176,16 +176,13 @@ SELECT pgtrickle.create_stream_table(
     SELECT
       dc.cluster_id,
       vector_avg(d.embedding) AS centroid,
-      count(*)                AS doc_count,
-      array_agg(d.id ORDER BY d.created_at DESC)
-        FILTER (WHERE row_number() OVER (
-          PARTITION BY dc.cluster_id ORDER BY d.created_at DESC
-        ) <= 5)               AS recent_doc_ids
+      count(*)                AS doc_count
     FROM document_clusters dc
     JOIN documents d ON d.id = dc.doc_id
     GROUP BY dc.cluster_id
   $$,
-  schedule     => '15 seconds'
+  schedule     => '15 seconds',
+  refresh_mode => 'DIFFERENTIAL'
 );
 ```
 
@@ -216,7 +213,7 @@ SELECT pgtrickle.create_stream_table(
 -- taste_vec = weighted_sum / total_weight
 ```
 
-The weight can be anything: a recency decay, an action-type multiplier (purchase = 3, like = 2, view = 1), or a learned user-specific weight. The DVM engine doesn't care — it maintains `vector_sum` and `scalar_sum` as independent algebraic aggregates.
+The weight can be anything: a recency decay, an action-type multiplier (purchase = 3, like = 2, view = 1), or a learned user-specific weight. The DVM engine doesn't care — it maintains `vector_sum` and `sum` as independent algebraic aggregates.
 
 ---
 
@@ -276,18 +273,15 @@ The real power of maintaining taste vectors as a stream table is that you can in
 
 ```sql
 -- Find users with similar taste to user 42
-SELECT user_id, taste_vec <=> (
-  SELECT taste_vec FROM user_taste WHERE user_id = 42
-) AS similarity
+SELECT user_id,
+       taste_vec <=> (SELECT taste_vec FROM user_taste WHERE user_id = 42) AS distance
 FROM user_taste
 WHERE user_id != 42
-ORDER BY taste_vec <=> (
-  SELECT taste_vec FROM user_taste WHERE user_id = 42
-)
+ORDER BY distance
 LIMIT 20;
 ```
 
-This returns the 20 users whose taste vectors are closest to user 42's — a user similarity search over HNSW. The index makes it fast. The stream table makes it fresh.
+This returns the 20 users whose taste vectors are closest to user 42's (lowest cosine distance) — a user-similarity search over HNSW. The index makes it fast. The stream table makes it fresh.
 
 **"Items for me" queries:**
 
