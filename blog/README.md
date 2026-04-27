@@ -20,6 +20,19 @@
 | [The Z-Set: The Data Structure That Makes IVM Correct](z-set-data-structure.md) | A concrete tour of the integer-weighted multiset that underlies pg_trickle's differential engine — how inserts are +1, deletes are -1, updates are both, and why commutativity eliminates an entire class of ordering bugs. |
 | [The Cost Model: How pg_trickle Decides Whether to Refresh Differentially](cost-model-auto-mode.md) | Inside AUTO mode: the decision inputs (delta ratio, query complexity, historical timings), the learned cost model, and when the engine switches between DIFFERENTIAL and FULL refresh mid-flight. |
 
+### SQL Operator Deep Dives
+
+| Post | Summary |
+|------|---------|
+| [Recursive CTEs That Update Themselves](recursive-ctes-that-update-themselves.md) | Semi-naive evaluation for insert-only tables and Delete-and-Rederive for mixed DML — how pg_trickle maintains `WITH RECURSIVE` queries incrementally for org charts, BOMs, and graph reachability. |
+| [Window Functions Without the Full Recompute](window-functions-without-full-recompute.md) | Partition-scoped recomputation for `ROW_NUMBER`, `RANK`, `LAG`, `LEAD`, and all standard window functions. Change one partition, leave the rest untouched. |
+| [GROUPING SETS, ROLLUP, and CUBE — Incrementally](grouping-sets-rollup-cube.md) | Multi-dimensional aggregation decomposed into UNION ALL branches, each maintained with algebraic delta rules. Drill-down dashboards that refresh in milliseconds. |
+| [EXISTS and NOT EXISTS: The Delta Rules Nobody Talks About](exists-not-exists-delta-rules.md) | Semi-joins and anti-joins maintained via reference counting on the join key. Delta-key pre-filtering, inverted semantics for NOT EXISTS, SubLink extraction from WHERE clauses. |
+| [DISTINCT That Doesn't Recount](distinct-reference-counting.md) | Reference counting (`__pgt_dup_count`) for incremental deduplication. Insert increments, delete decrements, row removed when count hits zero. DISTINCT ON with tie-breaking. |
+| [Scalar Subqueries in the SELECT List — Incrementally](scalar-subqueries.md) | Pre/post snapshot diff for correlated subqueries. Only groups affected by the delta are re-evaluated — O(affected groups), not O(all rows). |
+| [LATERAL Joins in a Stream Table](lateral-joins.md) | Row-scoped re-execution for `JSON_TABLE`, `unnest()`, `generate_series()`, and correlated set-returning functions. Cost proportional to changed left-side rows. |
+| [Set Operations Done Right: UNION, INTERSECT, EXCEPT](set-operations.md) | Dual-count multiplicity tracking for all set operations. UNION uses reference counting, INTERSECT requires both-side presence, EXCEPT removes when the right side gains a match. |
+
 ### Refresh Modes & Scheduling
 
 | Post | Summary |
@@ -27,6 +40,17 @@
 | [IMMEDIATE Mode: When "Good Enough Freshness" Isn't Good Enough](immediate-mode-zero-lag.md) | Synchronous IVM inside the source transaction — zero lag, no background worker. Account balances, inventory tracking, and the trade-offs vs. DIFFERENTIAL mode. |
 | [How pg_trickle Handles Diamond Dependencies](diamond-dependencies.md) | When two branches of a DAG share a source and converge downstream, naively refreshing can cause double-counting. How the frontier tracker and diamond-group scheduling ensure correctness. |
 | [Temporal Stream Tables: Time-Windowed Views That Update Themselves](temporal-stream-tables.md) | The "last 7 days" problem — results that change because time passes, not because data changed. Sliding-window eviction, the `temporal_mode` parameter, and when fixed windows don't need it. |
+| [Declare Freshness Once: CALCULATED Scheduling](calculated-scheduling.md) | Upstream tables derive their refresh cadence from downstream consumers. Set the SLA on the dashboard; the pipeline adjusts automatically. |
+| [Cycles in Your Dependency Graph? That's Fine.](circular-dependencies.md) | Fixed-point iteration for monotone queries. `allow_circular = on`, SCC detection, convergence guarantees, the iteration limit, and when cycles are a legitimate design choice. |
+| [Hot, Warm, Cold, Frozen: Tiered Scheduling at Scale](tiered-scheduling.md) | Automatic tier classification by change frequency. The scheduler checks hot tables every cycle, frozen tables every ~60 cycles — 80%+ overhead reduction at 500+ stream tables. |
+
+### CDC & Change Tracking
+
+| Post | Summary |
+|------|---------|
+| [The CDC Mode You Never Have to Choose](hybrid-cdc-mode.md) | Hybrid CDC starts with triggers, silently graduates to WAL. Three-step transition orchestration, automatic fallback on failure, WAL backpressure, and why AUTO is the right default. |
+| [IVM Without Primary Keys](ivm-without-primary-keys.md) | Content-based hashing (`xxHash64`) generates synthetic row identity for keyless tables. Multiplicity counting for duplicates, collision probability, and when to add a PK anyway. |
+| [Foreign Tables as Stream Table Sources](foreign-table-sources.md) | IVM over `postgres_fdw`, `file_fdw`, and `parquet_fdw` sources using polling-based change detection. Mixed local/foreign source queries, performance trade-offs, and the materialize-first optimization. |
 
 ### Architecture & Data Patterns
 
@@ -51,11 +75,15 @@
 | Post | Summary |
 |------|---------|
 | [Streaming to Kafka Without Kafka Expertise](streaming-to-kafka-without-kafka.md) | pgtrickle-relay bridges stream table deltas to Kafka, NATS, SQS, and webhooks — a single binary with TOML config, advisory-lock HA, subject routing, and Prometheus metrics. |
+| [The Relay Deep Dive: NATS, Redis Streams, and RabbitMQ](relay-deep-dive.md) | Beyond Kafka: per-backend architecture for NATS JetStream, Redis Streams, RabbitMQ, SQS, and HTTP webhooks. Subject templates, consumer groups, multi-sink pipelines, and a decision tree for choosing a backend. |
 | [The Inbox Pattern: Receiving Events from Kafka into PostgreSQL](inbox-pattern-kafka.md) | Idempotent, ordered event ingestion via the inbox table — deduplication by event ID, dead-letter queue, and stream tables that aggregate incoming events incrementally. |
+| [The Outbox You Don't Have to Build](built-in-outbox.md) | pg_trickle's built-in outbox API: `enable_outbox()`, consumer groups, `poll_outbox()`, offset tracking, exactly-once delivery, consumer lag monitoring, and cleanup. |
 | [dbt + pg_trickle: The Analytics Engineer's Stack](dbt-analytics-stack.md) | The `pgtrickle` dbt materialization: continuously-fresh models that are also version-controlled, tested, and documented. DAG alignment, freshness checks, and mixing materializations. |
 | [Distributed IVM with Citus](distributed-ivm-citus.md) | Incremental view maintenance across sharded PostgreSQL: per-worker CDC, shard-aware delta routing, co-located join push-down, and automatic recovery after shard rebalances. |
 | [pg_trickle on CloudNativePG](pg-trickle-cloudnativepg-kubernetes.md) | Production Kubernetes deployment using the CloudNativePG operator: Dockerfile, Cluster manifest, GUC configuration, HA failover behaviour, Prometheus metrics ConfigMap, alerting rules, upgrade procedure, and sizing guidance. |
 | [Making pg_trickle Work Through PgBouncer](pgbouncer-compatibility.md) | Connection pooling modes, the background-worker bypass, LISTEN/NOTIFY caveats in transaction mode, and a configuration checklist for PgBouncer + pg_trickle. |
+| [Publishing Stream Tables via Logical Replication](logical-replication-publishing.md) | Stream tables as standard publication sources for downstream PostgreSQL instances. Replication identity, multi-region distribution, and feeding Debezium/Kafka with clean aggregated events. |
+| [One PostgreSQL, Five Databases, One Worker Pool](multi-database.md) | Multi-database architecture: one launcher per server, one scheduler per database, shared worker pool with per-database quotas. Failure isolation and the database-per-tenant SaaS pattern. |
 
 ### pgvector Integration
 
@@ -75,6 +103,18 @@
 | [How to Change a Stream Table Query Without Taking It Offline](online-schema-evolution.md) | `ALTER STREAM TABLE ... QUERY` performs online schema evolution — the stream table stays queryable during migration, with atomic swap and cascade-safe dependency checking. |
 | [Backup and Restore for Stream Tables](backup-and-restore.md) | pg_dump, PITR, selective restore, and the `repair_stream_table` procedure. What to do (and what breaks) when you restore a database with active stream tables. |
 | [Testing Stream Tables: Shadow Mode and Correctness Fuzzing](shadow-mode-correctness-fuzzing.md) | Shadow mode runs DIFFERENTIAL and FULL refresh in parallel and compares. SQLancer fuzzing generates random schemas and DML to find delta engine bugs. The multiset invariant and what it caught. |
+| [Snapshots: Time Travel for Stream Tables](snapshots-time-travel.md) | `snapshot_stream_table()` captures point-in-time copies for pre-migration safety, replica bootstrap, forensic comparison, and test fixtures. Restore, list, and clean up with one function call each. |
+| [Drain Mode: Zero-Downtime Upgrades for Stream Tables](drain-mode.md) | `pgtrickle.drain()` quiesces in-flight refreshes before maintenance. Safe upgrade workflow, CloudNativePG integration, HA failover, and the resume path. |
+| [Column-Level Lineage in One Function Call](column-level-lineage.md) | `stream_table_lineage()` maps output columns to source columns. Impact analysis before ALTER TABLE, GDPR column-deletion audit, documentation generation, and recursive DAG tracing. |
+| [Error Budgets for Stream Tables](error-budgets.md) | SRE-style freshness monitoring: `sla_summary()` with p50/p99 latency, staleness tracking, error budget consumption, alerting thresholds, and Prometheus integration. |
+| [Structured Logging and OpenTelemetry for Stream Tables](structured-logging.md) | `log_format = json` emits structured events with `cycle_id` correlation. Event taxonomy, log aggregator integration (Loki, Datadog, Elasticsearch), and OpenTelemetry compatibility. |
+
+### Performance Internals
+
+| Post | Summary |
+|------|---------|
+| [The 45ms Cold-Start Tax and How L0 Cache Eliminates It](l0-cache-cold-start.md) | Connection poolers recycle backends, paying a template-parse penalty. The L0 process-local `RwLock<HashMap>` cache keyed by `(pgt_id, cache_generation)` drops p99 from 48ms to 6ms. |
+| [Spill-to-Disk and the Auto-Fallback Safety Net](spill-to-disk-fallback.md) | When delta queries exceed `work_mem`, pg_trickle detects consecutive spills and auto-switches to FULL refresh. Tuning `merge_work_mem_mb`, `spill_threshold_blocks`, and the self-healing recovery path. |
 
 ### Benchmarks & Advanced Patterns
 
