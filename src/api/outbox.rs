@@ -940,3 +940,57 @@ pub(crate) fn write_outbox_row(
 
     Ok(())
 }
+
+// ── A06 (v0.35.0): Unit tests ────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── outbox_table_name_for ─────────────────────────────────────────────
+
+    #[test]
+    fn test_outbox_table_name_for_simple() {
+        assert_eq!(outbox_table_name_for("orders"), "outbox_orders");
+    }
+
+    #[test]
+    fn test_outbox_table_name_for_truncated_at_63_chars() {
+        // Input that would produce a name longer than 63 characters.
+        let long_name = "a".repeat(60);
+        let result = outbox_table_name_for(&long_name);
+        assert!(
+            result.len() <= 63,
+            "outbox table name must be <= 63 chars, got {}",
+            result.len()
+        );
+    }
+
+    #[test]
+    fn test_outbox_table_name_for_empty() {
+        // Empty stream table name produces "outbox_" (7 chars, well under limit).
+        let result = outbox_table_name_for("");
+        assert_eq!(result, "outbox_");
+    }
+
+    #[test]
+    fn test_outbox_table_name_for_exactly_56_char_input() {
+        // 7 prefix chars + 56 input chars = 63 total (at the PostgreSQL limit).
+        let name = "b".repeat(56);
+        let result = outbox_table_name_for(&name);
+        assert_eq!(result.len(), 63);
+        assert!(result.starts_with("outbox_b"));
+    }
+
+    #[test]
+    fn test_outbox_table_name_for_unicode_chars() {
+        // Multibyte UTF-8: truncation uses char count, not byte count.
+        let name = "ÄÖÜ_table";
+        let result = outbox_table_name_for(name);
+        assert!(
+            result.chars().count() <= 63,
+            "char count must be <= 63, got {}",
+            result.chars().count()
+        );
+    }
+}

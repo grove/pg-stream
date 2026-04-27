@@ -5348,14 +5348,14 @@ fn check_where_for_unsupported_sublinks(node: *mut pg_sys::Node) -> Result<(), P
 //   d) Any predicate that can't be promoted stays in the Filter.
 
 /// Push filter predicates down into cross-join ON clauses.
-pub(crate) fn push_filter_into_cross_joins(tree: OpTree) -> OpTree {
+pub(crate) fn push_filter_into_cross_joins(tree: OpTree) -> Result<OpTree, PgTrickleError> {
     let OpTree::Filter { predicate, child } = tree else {
-        return tree;
+        return Ok(tree);
     };
 
     // Quick check: does the child contain any cross join?
     if !has_cross_join(&child) {
-        return OpTree::Filter { predicate, child };
+        return Ok(OpTree::Filter { predicate, child });
     }
 
     // Split predicate into AND-connected parts
@@ -5391,10 +5391,10 @@ pub(crate) fn push_filter_into_cross_joins(tree: OpTree) -> OpTree {
 
     if to_promote.is_empty() {
         // Nothing to promote — rebuild the original Filter
-        return OpTree::Filter {
-            predicate: join_and_predicates(remaining),
+        return Ok(OpTree::Filter {
+            predicate: join_and_predicates(remaining)?,
             child,
-        };
+        });
     }
 
     // Promote each predicate into the join chain
@@ -5405,12 +5405,12 @@ pub(crate) fn push_filter_into_cross_joins(tree: OpTree) -> OpTree {
 
     // Wrap remaining predicates (if any)
     if remaining.is_empty() {
-        new_tree
+        Ok(new_tree)
     } else {
-        OpTree::Filter {
-            predicate: join_and_predicates(remaining),
+        Ok(OpTree::Filter {
+            predicate: join_and_predicates(remaining)?,
             child: Box::new(new_tree),
-        }
+        })
     }
 }
 
@@ -5465,10 +5465,17 @@ pub(crate) fn split_and_predicates(expr: Expr) -> Vec<Expr> {
     }
 }
 
-/// Join predicates with AND. Panics if the slice is empty.
-pub(crate) fn join_and_predicates(parts: Vec<Expr>) -> Expr {
+/// Join predicates with AND.
+///
+/// Returns `Err(PgTrickleError::InvalidArgument)` if `parts` is empty.
+/// All call sites guarantee at least one predicate, but this function
+/// avoids a production `expect()` panic to comply with the AGENTS.md
+/// no-unwrap convention.
+pub(crate) fn join_and_predicates(parts: Vec<Expr>) -> Result<Expr, PgTrickleError> {
     let mut iter = parts.into_iter();
-    let mut result = iter.next().expect("at least one predicate required");
+    let mut result = iter
+        .next()
+        .ok_or_else(|| PgTrickleError::InvalidArgument("empty predicate set".into()))?;
     for part in iter {
         result = Expr::BinaryOp {
             op: "AND".to_string(),
@@ -5476,7 +5483,7 @@ pub(crate) fn join_and_predicates(parts: Vec<Expr>) -> Expr {
             right: Box::new(part),
         };
     }
-    result
+    Ok(result)
 }
 
 /// Collect all source-table aliases referenced by column refs in an expression.

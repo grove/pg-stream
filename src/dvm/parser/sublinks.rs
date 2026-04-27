@@ -1881,7 +1881,7 @@ unsafe fn parse_select_stmt_inner(
         // Note: Q07 previously showed revenue drift with pushdown
         // enabled — if it recurs, investigate the aggregate diff or
         // MERGE pipeline; the root cause is not in pushdown itself.
-        tree = push_filter_into_cross_joins(tree);
+        tree = push_filter_into_cross_joins(tree)?;
     }
 
     // ── Step 3: Parse GROUP BY + aggregates ─────────────────────────────

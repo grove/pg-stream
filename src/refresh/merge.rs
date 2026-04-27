@@ -1801,6 +1801,21 @@ pub fn execute_differential_refresh(
     }
 
     if should_fallback {
+        // A22 (v0.35.0): Emit NOTICE on every FULL fallback so operators
+        // see the reason in client log output.
+        let reason = if crate::config::pg_trickle_force_full_refresh() {
+            "force_full_refresh GUC override".to_string()
+        } else if strategy == crate::config::RefreshStrategy::Full {
+            "refresh_strategy=full GUC".to_string()
+        } else {
+            format!("change ratio exceeds threshold ({:.1}%)", max_ratio * 100.0,)
+        };
+        pgrx::notice!(
+            "stream table \"{}\".\"{}\" using FULL refresh: {}",
+            st.pgt_schema,
+            st.pgt_name,
+            reason,
+        );
         pgrx::warning!(
             "[pg_trickle] Falling back to FULL refresh for {}.{}: change ratio exceeds \
              adaptive threshold ({:.0}% of source table size).\n\
@@ -3388,12 +3403,49 @@ pub fn execute_differential_refresh(
         );
     }
 
-    // CORR-1 (v0.30.0): cross-cycle phantom cleanup is deferred — the
-    // cleanup_cross_cycle_phantoms() helper referenced cf.__pgt_row_id from
-    // the user's defining query CTE which never contains that column, causing
-    // a PostgreSQL error for all non-join query shapes (DISTINCT ON, EXCEPT,
-    // non-recursive CTE, FULL JOIN).  A proper key-based comparison is
-    // required; this will be addressed in a follow-up.
+    // CORR-1 / A01 (v0.35.0): unconditional cross-cycle PH-D1 cleanup for
+    // non-deduplicated (join-based) stream tables.
+    //
+    // For join queries, the Z-set pipeline may accumulate phantom row-id
+    // residuals when an insert-then-delete on the left side collides with a
+    // delete on the right within the same refresh cycle.  Route every join
+    // refresh cycle through the anti-join cleanup unconditionally (batch size
+    // 1,024) instead of gating on a per-cycle residual flag.
+    //
+    // Only runs for join-based queries (is_deduplicated == false) where the
+    // stream table is fully populated and the cleanup cost is O(batch).
+    if !is_dedup_flag && st.is_populated {
+        let quoted_table = format!(
+            "\"{}\".\"{}\"",
+            schema.replace('"', "\"\""),
+            name.replace('"', "\"\""),
+        );
+        match crate::refresh::phd1::cleanup_cross_cycle_phantoms(
+            st.pgt_id,
+            &quoted_table,
+            &st.defining_query,
+            1_024,
+        ) {
+            Ok(cleaned) if cleaned > 0 => {
+                pgrx::debug1!(
+                    "[pg_trickle] A01/EC01-2: removed {} cross-cycle phantom rows for {}.{}",
+                    cleaned,
+                    schema,
+                    name,
+                );
+            }
+            Ok(_) => {}
+            Err(e) => {
+                // Non-fatal: log and continue. The next cycle will retry.
+                pgrx::debug1!(
+                    "[pg_trickle] A01/EC01-2: phantom cleanup failed for {}.{}: {}",
+                    schema,
+                    name,
+                    e,
+                );
+            }
+        }
+    }
 
     // G12-ERM-1: Record the effective mode for this execution path.
     set_effective_mode("DIFFERENTIAL");

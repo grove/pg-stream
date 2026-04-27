@@ -4965,6 +4965,223 @@ fn get_data_timestamp_str() -> String {
 }
 
 pub(crate) mod cluster;
+
+// ── v0.35.0 reactive-subscription API (UX-SUB) ──────────────────────────────
+
+/// UX-SUB: Subscribe a named NOTIFY channel to a stream table.
+///
+/// After a non-empty differential or full refresh for `stream_table`, the
+/// background worker will call `PERFORM pg_notify(channel, ...)` so clients
+/// blocked on `LISTEN <channel>` wake up immediately.
+///
+/// The subscription is stored in `pgtrickle.pgt_subscriptions` and survives
+/// restarts.
+#[pg_extern(schema = "pgtrickle")]
+fn subscribe(stream_table: &str, channel: &str) -> Result<(), PgTrickleError> {
+    Spi::run_with_args(
+        "INSERT INTO pgtrickle.pgt_subscriptions (stream_table, channel) \
+         VALUES ($1, $2) ON CONFLICT DO NOTHING",
+        &[stream_table.into(), channel.into()],
+    )
+    .map_err(|e| PgTrickleError::SpiError(e.to_string()))
+}
+
+/// UX-SUB: Remove a NOTIFY subscription for a stream table / channel pair.
+#[pg_extern(schema = "pgtrickle")]
+fn unsubscribe(stream_table: &str, channel: &str) -> Result<(), PgTrickleError> {
+    Spi::run_with_args(
+        "DELETE FROM pgtrickle.pgt_subscriptions \
+         WHERE stream_table = $1 AND channel = $2",
+        &[stream_table.into(), channel.into()],
+    )
+    .map_err(|e| PgTrickleError::SpiError(e.to_string()))
+}
+
+/// UX-SUB: List all active NOTIFY subscriptions.
+///
+/// Returns a table with columns (stream_table TEXT, channel TEXT,
+/// created_at TIMESTAMPTZ).
+#[allow(clippy::type_complexity)]
+#[pg_extern(schema = "pgtrickle")]
+fn list_subscriptions() -> TableIterator<
+    'static,
+    (
+        name!(stream_table, Option<String>),
+        name!(channel, Option<String>),
+        name!(created_at, Option<pgrx::datum::TimestampWithTimeZone>),
+    ),
+> {
+    let rows = Spi::connect(|client| {
+        let tup_table = client.select(
+            "SELECT stream_table, channel, created_at \
+             FROM pgtrickle.pgt_subscriptions \
+             ORDER BY stream_table, channel",
+            None,
+            &[],
+        )?;
+        let mut result: Vec<(
+            Option<String>,
+            Option<String>,
+            Option<pgrx::datum::TimestampWithTimeZone>,
+        )> = Vec::new();
+        for row in tup_table {
+            result.push((
+                row["stream_table"].value::<String>()?,
+                row["channel"].value::<String>()?,
+                row["created_at"].value::<pgrx::datum::TimestampWithTimeZone>()?,
+            ));
+        }
+        Ok::<_, pgrx::spi::Error>(result)
+    })
+    .unwrap_or_default();
+    TableIterator::new(rows)
+}
+
+// ── v0.35.0 SLA summary API (F17) ───────────────────────────────────────────
+
+/// F17: SLA summary for stream tables over the configured SLA window.
+///
+/// Returns per-stream-table statistics: p50/p99 refresh latency, freshness
+/// lag, error rate, and remaining error budget.
+#[allow(clippy::type_complexity)]
+#[pg_extern(schema = "pgtrickle")]
+fn sla_summary() -> TableIterator<
+    'static,
+    (
+        name!(stream_table, Option<String>),
+        name!(p50_ms, Option<f64>),
+        name!(p99_ms, Option<f64>),
+        name!(freshness_lag_s, Option<f64>),
+        name!(error_rate, Option<f64>),
+        name!(error_budget_remaining, Option<f64>),
+    ),
+> {
+    let window_hours = crate::config::pg_trickle_sla_window_hours();
+    let rows = Spi::connect(|client| {
+        let tup_table = client.select(
+            "SELECT
+                 COALESCE(schema_name || '.' || stream_table_name, stream_table_name) AS stream_table,
+                 PERCENTILE_CONT(0.50) WITHIN GROUP (ORDER BY duration_ms) AS p50_ms,
+                 PERCENTILE_CONT(0.99) WITHIN GROUP (ORDER BY duration_ms) AS p99_ms,
+                 EXTRACT(EPOCH FROM (now() - MAX(finished_at))) AS freshness_lag_s,
+                 ROUND(COUNT(*) FILTER (WHERE status = 'error')::numeric /
+                       NULLIF(COUNT(*), 0), 4)::float8 AS error_rate,
+                 GREATEST(0.0,
+                     1.0 - ROUND(COUNT(*) FILTER (WHERE status = 'error')::numeric /
+                                 NULLIF(COUNT(*), 0), 4))::float8 AS error_budget_remaining
+             FROM pgtrickle.pgt_refresh_history
+             WHERE start_time >= now() - ($1 || ' hours')::interval
+             GROUP BY 1
+             ORDER BY 1",
+            None,
+            &[window_hours.into()],
+        )?;
+        let mut result: Vec<(
+            Option<String>,
+            Option<f64>,
+            Option<f64>,
+            Option<f64>,
+            Option<f64>,
+            Option<f64>,
+        )> = Vec::new();
+        for row in tup_table {
+            result.push((
+                row["stream_table"].value::<String>()?,
+                row["p50_ms"].value::<f64>()?,
+                row["p99_ms"].value::<f64>()?,
+                row["freshness_lag_s"].value::<f64>()?,
+                row["error_rate"].value::<f64>()?,
+                row["error_budget_remaining"].value::<f64>()?,
+            ));
+        }
+        Ok::<_, pgrx::spi::Error>(result)
+    })
+    .unwrap_or_default();
+    TableIterator::new(rows)
+}
+
+// ── v0.35.0 stream table introspection API (A23) ────────────────────────────
+
+/// A23: Explain the DVM operator tree for a stream table.
+///
+/// Returns a text representation of the cached operator tree that the
+/// differential maintenance engine uses to evaluate incremental updates.
+/// Useful for diagnosing unexpected fallback behaviour or understanding
+/// which joins and filters pg_trickle resolves at each hop.
+#[pg_extern(schema = "pgtrickle")]
+fn explain_stream_table(name: &str) -> Result<String, PgTrickleError> {
+    let (schema, table_name) = parse_qualified_name(name)?;
+    let st = StreamTableMeta::get_by_name(&schema, &table_name)?;
+    // Return the normalised defining query plus key metadata as a
+    // human-readable explanation.  Full DVM OpTree rendering is deferred
+    // to a follow-up that exposes the cached parse tree via shared memory.
+    let explanation = format!(
+        "Stream table: {schema}.{table_name}\n\
+         Status:       {status:?}\n\
+         Refresh mode: {mode}\n\
+         Populated:    {populated}\n\
+         Defining query:\n\
+         {query}",
+        schema = schema,
+        table_name = table_name,
+        status = st.status,
+        mode = if crate::config::pg_trickle_force_full_refresh() {
+            "FULL (force_full_refresh GUC override)"
+        } else {
+            "DIFFERENTIAL (adaptive)"
+        },
+        populated = st.is_populated,
+        query = st.defining_query,
+    );
+    Ok(explanation)
+}
+
+// ── v0.35.0 shadow-ST evolution status API (UX-STATUS) ──────────────────────
+
+/// UX-STATUS: Return the shadow build status for all stream tables.
+///
+/// During a zero-downtime schema evolution (ALTER STREAM TABLE), pg_trickle
+/// builds the new definition in a shadow table.  This function reports which
+/// stream tables are currently in a shadow build and how far along they are.
+#[allow(clippy::type_complexity)]
+#[pg_extern(schema = "pgtrickle")]
+fn view_evolution_status() -> TableIterator<
+    'static,
+    (
+        name!(stream_table, Option<String>),
+        name!(in_shadow_build, Option<bool>),
+        name!(shadow_table_name, Option<String>),
+        name!(status, Option<String>),
+    ),
+> {
+    let rows = Spi::connect(|client| {
+        let tup_table = client.select(
+            "SELECT
+                 COALESCE(pgt_schema || '.' || pgt_name, pgt_name) AS stream_table,
+                 in_shadow_build,
+                 shadow_table_name,
+                 status::text
+             FROM pgtrickle.pgt_stream_tables
+             ORDER BY 1",
+            None,
+            &[],
+        )?;
+        let mut result: Vec<(Option<String>, Option<bool>, Option<String>, Option<String>)> =
+            Vec::new();
+        for row in tup_table {
+            result.push((
+                row["stream_table"].value::<String>()?,
+                row["in_shadow_build"].value::<bool>()?,
+                row["shadow_table_name"].value::<String>()?,
+                row["status"].value::<String>()?,
+            ));
+        }
+        Ok::<_, pgrx::spi::Error>(result)
+    })
+    .unwrap_or_default();
+    TableIterator::new(rows)
+}
+
 /// Return the pg_trickle extension version (from `Cargo.toml`).
 ///
 /// This matches the version reported by `pg_extension.extversion`.

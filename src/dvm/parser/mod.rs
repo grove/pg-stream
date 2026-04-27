@@ -4222,7 +4222,7 @@ mod tests {
             },
             child: Box::new(cross),
         };
-        let result = push_filter_into_cross_joins(filter);
+        let result = push_filter_into_cross_joins(filter).unwrap();
         // Should become InnerJoin with the condition promoted
         match &result {
             OpTree::InnerJoin { condition, .. } => {
@@ -4267,7 +4267,7 @@ mod tests {
             predicate: pred,
             child: Box::new(outer),
         };
-        let result = push_filter_into_cross_joins(filter);
+        let result = push_filter_into_cross_joins(filter).unwrap();
         // Outer join should have b.y = c.y (c is right child)
         // Inner join should have a.x = b.x (b is right child)
         // No filter should remain
@@ -4327,7 +4327,7 @@ mod tests {
             predicate: pred,
             child: Box::new(cross),
         };
-        let result = push_filter_into_cross_joins(filter);
+        let result = push_filter_into_cross_joins(filter).unwrap();
         // The join predicate should be promoted; single-table pred stays as Filter
         match &result {
             OpTree::Filter {
@@ -4369,7 +4369,7 @@ mod tests {
             },
             child: Box::new(join),
         };
-        let result = push_filter_into_cross_joins(filter);
+        let result = push_filter_into_cross_joins(filter).unwrap();
         assert!(matches!(result, OpTree::Filter { .. }));
     }
 
@@ -4391,7 +4391,7 @@ mod tests {
             },
             child: Box::new(cross),
         };
-        let result = push_filter_into_cross_joins(filter);
+        let result = push_filter_into_cross_joins(filter).unwrap();
         // Should promote the predicate (both sides resolve to different scans)
         match &result {
             OpTree::InnerJoin { condition, .. } => {
@@ -4971,7 +4971,7 @@ mod tests {
     fn test_join_and_predicates_single() {
         let parts = vec![Expr::Literal("a".to_string())];
         let result = join_and_predicates(parts);
-        assert_eq!(result.to_sql(), "a");
+        assert_eq!(result.unwrap().to_sql(), "a");
     }
 
     #[test]
@@ -4983,7 +4983,7 @@ mod tests {
         ];
         let result = join_and_predicates(parts);
         // Should produce ((a AND b) AND c)
-        assert_eq!(result.to_sql(), "((a AND b) AND c)");
+        assert_eq!(result.unwrap().to_sql(), "((a AND b) AND c)");
     }
 
     #[test]
@@ -4997,7 +4997,7 @@ mod tests {
         let parts = split_and_predicates(expr);
         assert_eq!(parts.len(), 2);
         let rejoined = join_and_predicates(parts);
-        assert_eq!(rejoined.to_sql(), "(x > 0 AND y < 10)");
+        assert_eq!(rejoined.unwrap().to_sql(), "(x > 0 AND y < 10)");
     }
 
     // ── AggFunc::is_group_rescan tests ──────────────────────────────

@@ -441,6 +441,10 @@ pub fn check_worker_wal_levels() -> Result<(), PgTrickleError> {
 /// `now() + lease_ms * interval '1 ms'`; stale entries from crashed holders
 /// are purged before each acquisition attempt.
 ///
+/// A13: On conflict (another holder owns the lock), sleeps for a randomised
+/// 50–500 ms jitter before returning `false`. This prevents O(N²) SPI
+/// attempts/second when multiple Citus coordinators race for the same lock.
+///
 /// Returns `true` if the lock was acquired, `false` if another holder owns it.
 pub fn try_acquire_st_lock(
     lock_key: &str,
@@ -474,6 +478,33 @@ pub fn try_acquire_st_lock(
             .map_err(|e| PgTrickleError::SpiError(format!("pgt_st_locks insert: {e}")))?;
         Ok::<bool, PgTrickleError>(!rows.is_empty())
     })?;
+
+    // A13: On conflict, apply randomised jitter (50–500 ms) to prevent
+    // thundering-herd from multiple coordinators polling at the same rate.
+    if !acquired {
+        // Simple xorshift64 seeded from lock_key hash + holder hash + timestamp
+        // to produce deterministic-yet-varied jitter without an external crate.
+        let seed: u64 = {
+            let mut h: u64 = 0x517cc1b727220a95u64;
+            for b in lock_key.bytes().chain(holder.bytes()) {
+                h ^= b as u64;
+                h = h
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+            }
+            // Mix in current nanos for time-based variance.
+            h ^= std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.subsec_nanos() as u64)
+                .unwrap_or(42);
+            h
+        };
+        // xorshift64 step
+        let jitter_seed = seed ^ (seed << 13) ^ (seed >> 7) ^ (seed << 17);
+        // Map to 50–500 ms range
+        let jitter_ms = 50 + (jitter_seed % 451);
+        std::thread::sleep(std::time::Duration::from_millis(jitter_ms));
+    }
 
     Ok(acquired)
 }

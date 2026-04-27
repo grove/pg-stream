@@ -80,7 +80,7 @@
 | [v0.32.0](roadmap/v0.32.0.md) | Citus: stable object naming and per-source frontier foundation | ✅ Released | Medium | [Full details](roadmap/v0.32.0.md-full.md) |
 | [v0.33.0](roadmap/v0.33.0.md) | Citus: world-class distributed source CDC and stream table support | ✅ Released | Large | [Full details](roadmap/v0.33.0.md-full.md) |
 | [v0.34.0](roadmap/v0.34.0.md) | Citus: automated distributed CDC scheduler wiring and shard rebalance auto-recovery | ✅ Released | Medium | [Full details](roadmap/v0.34.0.md-full.md) |
-| [v0.35.0](roadmap/v0.35.0.md) | EC-01 correctness closeout, Citus chaos hardening, reactive subscriptions, zero-downtime schema changes | Planned | Large | [Full details](roadmap/v0.35.0.md-full.md) |
+| [v0.35.0](roadmap/v0.35.0.md) | EC-01 correctness closeout, Citus chaos hardening, reactive subscriptions, zero-downtime schema changes | Released | Large | [Full details](roadmap/v0.35.0.md-full.md) |
 | [v0.36.0](roadmap/v0.36.0.md) | Structural hardening, L0 cache, WAL backpressure, temporal IVM, columnar storage | Planned | Large | [Full details](roadmap/v0.36.0.md-full.md) |
 | [v0.37.0](roadmap/v0.37.0.md) | Scheduler modularisation, pgVectorMV, OpenTelemetry trace propagation | Planned | Medium | [Full details](roadmap/v0.37.0.md-full.md) |
 

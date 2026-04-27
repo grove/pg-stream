@@ -3072,10 +3072,10 @@ pub extern "C-unwind" fn pg_trickle_scheduler_main(_arg: pg_sys::Datum) {
             {
                 let retention_days = config::pg_trickle_history_retention_days();
                 if retention_days > 0 {
-                    // PERF-5: Batched DELETEs — delete up to 1000 rows per
+                    // A10 (v0.35.0): Batched DELETEs — delete up to 10,000 rows per
                     // transaction to limit lock contention on pgt_refresh_history.
                     // Repeat until fewer than the batch size are deleted.
-                    let batch_size: i64 = 1000;
+                    let batch_size: i64 = 10_000;
                     let mut total_deleted: i64 = 0;
                     loop {
                         let deleted: i64 = BackgroundWorker::transaction(AssertUnwindSafe(|| {
@@ -5684,6 +5684,18 @@ fn refresh_single_st(
 
     let action = {
         let mut base_action = refresh::determine_refresh_action(&st, has_changes);
+
+        // A08 (v0.35.0): Force-full-refresh GUC override.
+        // When `pg_trickle.force_full_refresh = true`, override any DIFFERENTIAL
+        // action to FULL regardless of per-ST refresh_mode.
+        if base_action == RefreshAction::Differential && config::pg_trickle_force_full_refresh() {
+            log!(
+                "pg_trickle: A08 force_full_refresh override for {}.{}",
+                st.pgt_schema,
+                st.pgt_name,
+            );
+            base_action = RefreshAction::Full;
+        }
 
         // PRED-2: Predictive cost model — pre-emptive FULL switch.
         // If the predicted DIFFERENTIAL cost exceeds the FULL cost by the

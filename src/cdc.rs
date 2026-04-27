@@ -269,6 +269,11 @@ pub fn create_change_trigger(
          SECURITY DEFINER
          SET search_path = pg_catalog, pgtrickle, pgtrickle_changes, public AS $$
          BEGIN
+             -- A07: CDC kill-switch guard.
+             IF (current_setting('pg_trickle.enabled', true) = 'off') OR
+                (current_setting('pg_trickle.cdc_paused', true) = 'on') THEN
+                 RETURN NULL;
+             END IF;
              INSERT INTO {change_schema}.changes_{name}
                  (lsn, action)
              VALUES (pg_current_wal_lsn(), 'T');
@@ -1729,6 +1734,11 @@ fn build_row_trigger_fn_sql(
          SECURITY DEFINER
          SET search_path = pg_catalog, pgtrickle, pgtrickle_changes, public AS $$
          BEGIN
+             -- A07: CDC kill-switch guard.
+             IF (current_setting('pg_trickle.enabled', true) = 'off') OR
+                (current_setting('pg_trickle.cdc_paused', true) = 'on') THEN
+                 RETURN NULL;
+             END IF;
              IF TG_OP = 'INSERT' THEN
                  INSERT INTO {cs}.changes_{name}
                      (lsn, action, pk_hash{ncn})
@@ -1816,6 +1826,11 @@ fn build_stmt_trigger_fn_sql(
          SECURITY DEFINER
          SET search_path = pg_catalog, pgtrickle, pgtrickle_changes, public AS $$
          BEGIN
+             -- A07: CDC kill-switch guard.
+             IF (current_setting('pg_trickle.enabled', true) = 'off') OR
+                (current_setting('pg_trickle.cdc_paused', true) = 'on') THEN
+                 RETURN NULL;
+             END IF;
              INSERT INTO {cs}.changes_{name}
                  (lsn, action, pk_hash{ncn})
              SELECT pg_current_wal_insert_lsn(), 'I', {pkn}{ncr}
@@ -1838,6 +1853,11 @@ fn build_stmt_trigger_fn_sql(
          SECURITY DEFINER
          SET search_path = pg_catalog, pgtrickle, pgtrickle_changes, public AS $$
          BEGIN
+             -- A07: CDC kill-switch guard.
+             IF (current_setting('pg_trickle.enabled', true) = 'off') OR
+                (current_setting('pg_trickle.cdc_paused', true) = 'on') THEN
+                 RETURN NULL;
+             END IF;
              INSERT INTO {cs}.changes_{name}
                  (lsn, action, pk_hash{ocn})
              SELECT pg_current_wal_insert_lsn(), 'D', {pko}{ocr}
@@ -1876,6 +1896,11 @@ fn build_stmt_trigger_fn_sql(
          SECURITY DEFINER
          SET search_path = pg_catalog, pgtrickle, pgtrickle_changes, public AS $$
          BEGIN
+             -- A07: CDC kill-switch guard.
+             IF (current_setting('pg_trickle.enabled', true) = 'off') OR
+                (current_setting('pg_trickle.cdc_paused', true) = 'on') THEN
+                 RETURN NULL;
+             END IF;
              INSERT INTO {cs}.changes_{name}
                  (lsn, action, pk_hash{uccd}{ncn}{ocn})
              SELECT pg_current_wal_insert_lsn(), 'U', {pkn}{ucv}{ncr}{ocr}
@@ -1907,6 +1932,11 @@ fn build_stmt_trigger_fn_sql(
          SECURITY DEFINER
          SET search_path = pg_catalog, pgtrickle, pgtrickle_changes, public AS $$
          BEGIN
+             -- A07: CDC kill-switch guard.
+             IF (current_setting('pg_trickle.enabled', true) = 'off') OR
+                (current_setting('pg_trickle.cdc_paused', true) = 'on') THEN
+                 RETURN NULL;
+             END IF;
              INSERT INTO {cs}.changes_{name}
                  (lsn, action, pk_hash{ocn})
              SELECT pg_current_wal_insert_lsn(), 'D', {pko}{ocr}

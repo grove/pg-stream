@@ -15,6 +15,7 @@ mod transforms;
 
 use clap::Parser;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::signal;
 use tokio::sync::RwLock;
 use tracing_subscriber::EnvFilter;
@@ -47,6 +48,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         _ => LogFormat::Text,
     };
 
+    // A30: Expand ${ENV:VAR_NAME} placeholders in connection strings.
+    cfg = cfg.resolve_env_vars();
+
     // Initialise tracing.
     init_tracing(&cfg);
 
@@ -61,9 +65,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "pgtrickle-relay starting"
     );
 
-    // Connect to PostgreSQL.
-    let (db_client, db_conn) =
-        tokio_postgres::connect(&cfg.postgres_url, tokio_postgres::NoTls).await?;
+    // A38: Connect to PostgreSQL with exponential backoff.
+    let (db_client, db_conn) = connect_with_backoff(&cfg.postgres_url).await?;
     let db = Arc::new(db_client);
 
     // Spawn the connection driver.
@@ -149,5 +152,53 @@ async fn wait_for_shutdown() {
     tokio::select! {
         _ = ctrl_c => { tracing::info!("received Ctrl+C") }
         _ = terminate => { tracing::info!("received SIGTERM") }
+    }
+}
+
+/// A38: Connect to PostgreSQL with exponential backoff.
+///
+/// Retries with initial delay 100 ms, doubling each attempt up to 30 s,
+/// with ±20 % jitter to avoid thundering-herd reconnects.
+async fn connect_with_backoff(
+    url: &str,
+) -> Result<
+    (
+        tokio_postgres::Client,
+        tokio_postgres::Connection<tokio_postgres::Socket, tokio_postgres::tls::NoTlsStream>,
+    ),
+    Box<dyn std::error::Error>,
+> {
+    const INITIAL_DELAY_MS: u64 = 100;
+    const MAX_DELAY_MS: u64 = 30_000;
+    const JITTER_PCT: f64 = 0.20;
+
+    let mut delay_ms = INITIAL_DELAY_MS;
+    let mut attempt = 0u32;
+
+    loop {
+        match tokio_postgres::connect(url, tokio_postgres::NoTls).await {
+            Ok(pair) => return Ok(pair),
+            Err(e) => {
+                attempt += 1;
+                // Apply ±20% jitter: seed from attempt number for determinism in tests.
+                let jitter_range = (delay_ms as f64 * JITTER_PCT) as u64;
+                let jitter = if jitter_range > 0 {
+                    // Simple deterministic jitter: (attempt * 6364136223846793005) % range
+                    let pseudo = attempt as u64 * 6_364_136_223_846_793_005_u64;
+                    (pseudo % (jitter_range * 2)).saturating_sub(jitter_range)
+                } else {
+                    0
+                };
+                let sleep_ms = delay_ms.saturating_add(jitter);
+                tracing::warn!(
+                    attempt,
+                    sleep_ms,
+                    error = %e,
+                    "PostgreSQL connection failed, retrying"
+                );
+                tokio::time::sleep(Duration::from_millis(sleep_ms)).await;
+                delay_ms = (delay_ms * 2).min(MAX_DELAY_MS);
+            }
+        }
     }
 }

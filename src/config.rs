@@ -1229,6 +1229,53 @@ pub static PGS_CITUS_ST_LOCK_LEASE_MS: GucSetting<i32> = GucSetting::<i32>::new(
 /// Default: 5 ticks.
 pub static PGS_CITUS_WORKER_RETRY_TICKS: GucSetting<i32> = GucSetting::<i32>::new(5);
 
+// ── v0.35.0 GUCs ──────────────────────────────────────────────────────────
+
+/// A08 (v0.35.0): When `true`, overrides per-ST `refresh_mode` and forces
+/// every stream table to use FULL refresh for the duration the GUC is set.
+///
+/// Useful for SRE diagnosis when a cluster-wide `refresh_strategy = 'full'`
+/// still has DIFFERENTIAL STs due to explicit per-ST row values. Set to
+/// `false` (default) to restore normal per-ST scheduling.
+pub static PGS_FORCE_FULL_REFRESH: GucSetting<bool> = GucSetting::<bool>::new(false);
+
+/// A07 (v0.35.0): When `true`, CDC trigger bodies return `NULL` (no-op) and
+/// the change buffer is not written. Provides a durable hold that survives
+/// session reconnects, unlike `pg_trickle.enabled = false` which only stops
+/// the scheduler.
+///
+/// Default: `false` (CDC writes are enabled).
+pub static PGS_CDC_PAUSED: GucSetting<bool> = GucSetting::<bool>::new(false);
+
+/// UX-GUC / CORR-SUB (v0.35.0): Debounce interval in milliseconds for NOTIFY
+/// coalescing in the reactive subscription API.
+///
+/// When `pgtrickle.subscribe()` is active and the refresh interval is shorter
+/// than the LISTEN client's poll loop, successive NOTIFY calls for the same
+/// stream table within this window are coalesced into a single emission.
+/// Set to 0 to disable coalescing (emit on every non-empty refresh).
+///
+/// Default: 250 ms.
+pub static PGS_NOTIFY_COALESCE_MS: GucSetting<i32> = GucSetting::<i32>::new(250);
+
+/// F17 (v0.35.0): SLA reporting window in hours for `pgtrickle.sla_summary()`.
+///
+/// `sla_summary()` computes p50/p99 refresh latency, freshness lag, error rate,
+/// and error-budget remaining over this many hours of `pgt_refresh_history`.
+///
+/// Default: 24 hours.
+pub static PGS_SLA_WINDOW_HOURS: GucSetting<i32> = GucSetting::<i32>::new(24);
+
+/// A10 (v0.35.0): Interval in seconds between history pruner sweeps.
+///
+/// The history pruner deletes rows from `pgtrickle.pgt_refresh_history`
+/// older than `history_retention_days` in batches of 10,000 rows to
+/// limit lock contention. Set to 0 to use the legacy behaviour (prune
+/// once per `HISTORY_CLEANUP_INTERVAL_MS`).
+///
+/// Default: 60 seconds.
+pub static PGS_HISTORY_PRUNE_INTERVAL_SECONDS: GucSetting<i32> = GucSetting::<i32>::new(60);
+
 /// #536: Frontier holdback mode enum.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FrontierHoldbackMode {
@@ -2653,6 +2700,70 @@ pub fn register_gucs() {
         GucContext::Suset,
         GucFlags::default(),
     );
+
+    // ── v0.35.0 GUCs ────────────────────────────────────────────────────
+
+    // A08: Force-full-refresh override.
+    GucRegistry::define_bool_guc(
+        c"pg_trickle.force_full_refresh",
+        c"A08: Force all stream tables to FULL refresh regardless of per-ST mode.",
+        c"When true, overrides per-ST refresh_mode and forces every differential ST \
+          to use FULL refresh. Useful for SRE diagnosis. Default false.",
+        &PGS_FORCE_FULL_REFRESH,
+        GucContext::Suset,
+        GucFlags::default(),
+    );
+
+    // A07: CDC kill switch (durable pause).
+    GucRegistry::define_bool_guc(
+        c"pg_trickle.cdc_paused",
+        c"A07: Pause CDC trigger writes cluster-wide (durable hold).",
+        c"When true, CDC trigger bodies return NULL immediately without writing to \
+          the change buffer. Survives session reconnects unlike pg_trickle.enabled. \
+          Default false (CDC writes enabled).",
+        &PGS_CDC_PAUSED,
+        GucContext::Suset,
+        GucFlags::default(),
+    );
+
+    // UX-GUC / CORR-SUB: Notify coalescing debounce interval.
+    GucRegistry::define_int_guc(
+        c"pg_trickle.notify_coalesce_ms",
+        c"UX-GUC: Debounce window (ms) for NOTIFY coalescing in subscribe() API.",
+        c"Successive NOTIFY emissions for the same stream table within this window \
+          are coalesced into a single emission. 0 disables coalescing. Default 250.",
+        &PGS_NOTIFY_COALESCE_MS,
+        0,      // min (0 = disabled)
+        60_000, // max (1 minute)
+        GucContext::Suset,
+        GucFlags::default(),
+    );
+
+    // F17: SLA reporting window.
+    GucRegistry::define_int_guc(
+        c"pg_trickle.sla_window_hours",
+        c"F17: History window in hours for pgtrickle.sla_summary() computations.",
+        c"sla_summary() aggregates pgt_refresh_history over this many hours to compute \
+          p50/p99 latency, freshness lag, error rate, and error-budget remaining.",
+        &PGS_SLA_WINDOW_HOURS,
+        1,     // min
+        8_760, // max (1 year)
+        GucContext::Suset,
+        GucFlags::default(),
+    );
+
+    // A10: History pruner interval.
+    GucRegistry::define_int_guc(
+        c"pg_trickle.history_prune_interval_seconds",
+        c"A10: Seconds between history pruner sweeps (0 = legacy mode).",
+        c"The pruner deletes pgt_refresh_history rows older than history_retention_days \
+          in batches of 10,000. 0 uses the legacy single-pass pruner.",
+        &PGS_HISTORY_PRUNE_INTERVAL_SECONDS,
+        0,      // min (0 = legacy)
+        86_400, // max (1 day)
+        GucContext::Suset,
+        GucFlags::default(),
+    );
 }
 
 // ── Convenience accessors ──────────────────────────────────────────────────
@@ -2686,6 +2797,32 @@ pub fn pg_trickle_citus_st_lock_lease_ms() -> i64 {
 /// flagging in `citus_status`.  Returns 0 when alerting is disabled.
 pub fn pg_trickle_citus_worker_retry_ticks() -> i32 {
     PGS_CITUS_WORKER_RETRY_TICKS.get()
+}
+
+/// A08 (v0.35.0): Returns whether force-full-refresh override is active.
+pub fn pg_trickle_force_full_refresh() -> bool {
+    PGS_FORCE_FULL_REFRESH.get()
+}
+
+/// A07 (v0.35.0): Returns whether CDC writes are paused cluster-wide.
+pub fn pg_trickle_cdc_paused() -> bool {
+    PGS_CDC_PAUSED.get()
+}
+
+/// UX-GUC (v0.35.0): Returns the NOTIFY coalescing debounce interval in ms.
+/// Returns 0 when coalescing is disabled.
+pub fn pg_trickle_notify_coalesce_ms() -> i32 {
+    PGS_NOTIFY_COALESCE_MS.get()
+}
+
+/// F17 (v0.35.0): Returns the SLA reporting window in hours.
+pub fn pg_trickle_sla_window_hours() -> i32 {
+    PGS_SLA_WINDOW_HOURS.get()
+}
+
+/// A10 (v0.35.0): Returns the history pruner interval in seconds (0 = legacy).
+pub fn pg_trickle_history_prune_interval_seconds() -> i32 {
+    PGS_HISTORY_PRUNE_INTERVAL_SECONDS.get()
 }
 
 /// Returns the scheduler interval in milliseconds.

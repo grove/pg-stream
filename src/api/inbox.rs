@@ -1032,3 +1032,74 @@ pub fn inbox_is_my_partition(p_aggregate_id: &str, p_worker_id: i32, p_total_wor
     }
     (hash % p_total_workers as u64) == p_worker_id as u64
 }
+
+// ── A06 (v0.35.0): Unit tests ────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── inbox_is_my_partition ─────────────────────────────────────────────
+
+    #[test]
+    fn test_is_my_partition_degenerate_zero_workers() {
+        // With total_workers == 0 every aggregate_id belongs to "all" workers.
+        assert!(inbox_is_my_partition("any-id", 0, 0));
+        assert!(inbox_is_my_partition("other", 99, 0));
+    }
+
+    #[test]
+    fn test_is_my_partition_single_worker() {
+        // With 1 worker, worker 0 owns all messages.
+        assert!(inbox_is_my_partition("order-1", 0, 1));
+        assert!(inbox_is_my_partition("user-42", 0, 1));
+    }
+
+    #[test]
+    fn test_is_my_partition_two_workers_exclusive() {
+        // Each message belongs to exactly one of the two workers.
+        let ids = ["a", "b", "c", "d", "e", "hello", "world"];
+        for id in ids {
+            let w0 = inbox_is_my_partition(id, 0, 2);
+            let w1 = inbox_is_my_partition(id, 1, 2);
+            assert!(w0 ^ w1, "id '{}' should belong to exactly one worker", id);
+        }
+    }
+
+    #[test]
+    fn test_is_my_partition_stability() {
+        // Same input must always map to the same worker (hash is deterministic).
+        for _ in 0..10 {
+            assert_eq!(
+                inbox_is_my_partition("stable-id-42", 0, 4),
+                inbox_is_my_partition("stable-id-42", 0, 4)
+            );
+        }
+    }
+
+    #[test]
+    fn test_is_my_partition_consistent_hashing() {
+        // With 4 workers, the four calls with worker_id 0..3 sum to exactly 1 true.
+        let id = "partition-test-id";
+        let owned: Vec<bool> = (0..4).map(|w| inbox_is_my_partition(id, w, 4)).collect();
+        assert_eq!(
+            owned.iter().filter(|&&v| v).count(),
+            1,
+            "exactly one worker should own the id, got {:?}",
+            owned
+        );
+    }
+
+    #[test]
+    fn test_is_my_partition_empty_id() {
+        // Empty aggregate_id should not panic and should assign to a deterministic worker.
+        let w0 = inbox_is_my_partition("", 0, 3);
+        let w1 = inbox_is_my_partition("", 1, 3);
+        let w2 = inbox_is_my_partition("", 2, 3);
+        assert_eq!(
+            [w0, w1, w2].iter().filter(|&&v| v).count(),
+            1,
+            "empty id should still map to exactly one worker"
+        );
+    }
+}
