@@ -80,8 +80,9 @@
 | [v0.32.0](roadmap/v0.32.0.md) | Citus: stable object naming and per-source frontier foundation | ✅ Released | Medium | [Full details](roadmap/v0.32.0.md-full.md) |
 | [v0.33.0](roadmap/v0.33.0.md) | Citus: world-class distributed source CDC and stream table support | ✅ Released | Large | [Full details](roadmap/v0.33.0.md-full.md) |
 | [v0.34.0](roadmap/v0.34.0.md) | Citus: automated distributed CDC scheduler wiring and shard rebalance auto-recovery | ✅ Released | Medium | [Full details](roadmap/v0.34.0.md-full.md) |
-| [v0.35.0](roadmap/v0.35.0.md) | Live push notifications and safe live schema changes | Planned | Medium | [Full details](roadmap/v0.35.0.md-full.md) |
-| [v0.36.0](roadmap/v0.36.0.md) | Time-travel queries and analytic storage | Planned | Medium | [Full details](roadmap/v0.36.0.md-full.md) |
+| [v0.35.0](roadmap/v0.35.0.md) | EC-01 correctness closeout, Citus chaos hardening, reactive subscriptions, zero-downtime schema changes | Planned | Large | [Full details](roadmap/v0.35.0.md-full.md) |
+| [v0.36.0](roadmap/v0.36.0.md) | Structural hardening, L0 cache, WAL backpressure, temporal IVM, columnar storage | Planned | Large | [Full details](roadmap/v0.36.0.md-full.md) |
+| [v0.37.0](roadmap/v0.37.0.md) | Scheduler modularisation, pgVectorMV, OpenTelemetry trace propagation | Planned | Medium | [Full details](roadmap/v0.37.0.md-full.md) |
 
 ### Beyond v1.0
 
@@ -122,7 +123,11 @@ v0.32    ─── Citus: stable naming foundation (additive, safe for all users
     │
 v0.33    ─── Citus: distributed CDC and stream table support
     │
-v0.34–35 ─── Push notifications, zero-downtime schema changes, time-travel
+v0.35    ─── EC-01 fix, Citus chaos rig, reactive subscriptions, shadow-ST, relay hardening
+    │
+v0.36    ─── L0 cache, WAL backpressure, api split, temporal IVM, columnar, RowIdSchema
+    │
+v0.37    ─── Scheduler split, pgVectorMV, OpenTelemetry, pg_partman compat
     │
 v1.0.0   ─── Stable release, PostgreSQL 19, package registries
 ```
@@ -137,5 +142,12 @@ delivers the full Citus integration immediately after — per-worker slot CDC,
 distributed ST placement, cross-node coordination, and the Citus test suite.
 Pulling v0.33.0 forward means users with Citus topologies (including
 billion-row all-distributed deployments) are unblocked two releases earlier.
-v0.34.0 and v0.35.0 add push notifications and time-travel/columnar storage;
-both are independent of the Citus work and ship in their own right.
+v0.35.0 is the single most important release before v1.0: it closes the EC-01
+phantom-row correctness bug (flagged in three consecutive overall assessments)
+and adds the Citus chaos test rig, on top of reactive subscriptions and
+zero-downtime schema changes. v0.36.0 builds on that foundation with
+performance hardening (L0 cache, WAL backpressure), structural refactoring
+(`src/api/mod.rs` split, `RowIdSchema` type), and temporal IVM / columnar
+storage. v0.37.0 completes the modularisation arc (scheduler and merge splits),
+adds pgVectorMV for AI/RAG workloads, and threads OpenTelemetry traces through
+the refresh pipeline.
