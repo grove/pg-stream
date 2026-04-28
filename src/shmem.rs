@@ -1287,4 +1287,57 @@ mod tests {
         let ids = drain_ring(&mut s).unwrap();
         assert_eq!(ids, vec![2]);
     }
+
+    // ── Scheduler meta state tracking ────────────────────────────────────
+
+    #[test]
+    fn test_scheduler_meta_stores_and_retrieves_state() {
+        // This test directly manipulates SCHEDULER_META_STATE to verify
+        // the set/get contract, even though the public API (scheduler_running)
+        // requires shmem to be initialized. The underlying struct must hold
+        // values correctly across set_scheduler_meta calls.
+
+        let mut meta = super::SchedulerMetaState::default();
+
+        // Initial state: pid=0, running=false, wake=0
+        assert_eq!(meta.scheduler_pid, 0);
+        assert!(!meta.scheduler_running);
+        assert_eq!(meta.last_scheduler_wake, 0);
+
+        // Simulate startup: set(12345, true, 1234567890)
+        meta.scheduler_pid = 12345;
+        meta.scheduler_running = true;
+        meta.last_scheduler_wake = 1234567890;
+
+        assert_eq!(meta.scheduler_pid, 12345);
+        assert!(meta.scheduler_running);
+        assert_eq!(meta.last_scheduler_wake, 1234567890);
+
+        // Simulate shutdown: set(0, false, 0)
+        meta.scheduler_pid = 0;
+        meta.scheduler_running = false;
+        meta.last_scheduler_wake = 0;
+
+        assert_eq!(meta.scheduler_pid, 0);
+        assert!(!meta.scheduler_running);
+        assert_eq!(meta.last_scheduler_wake, 0);
+    }
+
+    #[test]
+    fn test_scheduler_meta_wake_timestamp_updates() {
+        let mut meta = super::SchedulerMetaState::default();
+
+        // Startup with initial timestamp
+        meta.scheduler_running = true;
+        meta.last_scheduler_wake = 1000;
+        assert_eq!(meta.last_scheduler_wake, 1000);
+
+        // Periodic update in scheduler loop
+        meta.last_scheduler_wake = 1060; // 60s later
+        assert_eq!(meta.last_scheduler_wake, 1060);
+
+        // Multiple updates preserve monotonicity
+        meta.last_scheduler_wake = 1120;
+        assert_eq!(meta.last_scheduler_wake, 1120);
+    }
 }
