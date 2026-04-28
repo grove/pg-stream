@@ -508,6 +508,32 @@ impl E2eDb {
         }
     }
 
+    /// Run `config` statements on a dedicated connection (all must succeed),
+    /// then run `sql` on the same connection and return Ok/Err.
+    ///
+    /// Use this when `sql` depends on session-local GUC values set by
+    /// `config` — for example in the Light-E2E environment (no
+    /// `shared_preload_libraries`) where `ALTER SYSTEM SET` + reload does
+    /// not propagate to lazily-loaded extension GUCs.
+    pub async fn try_execute_with_config(
+        &self,
+        config: &[&str],
+        sql: &str,
+    ) -> Result<(), sqlx::Error> {
+        let mut conn = self
+            .pool
+            .acquire()
+            .await
+            .expect("Failed to acquire DB connection for try_execute_with_config");
+        for stmt in config {
+            sqlx::query(stmt)
+                .execute(&mut *conn)
+                .await
+                .unwrap_or_else(|e| panic!("Config SQL failed: {}\nSQL: {}", e, stmt));
+        }
+        sqlx::query(sql).execute(&mut *conn).await.map(|_| ())
+    }
+
     /// Reload PostgreSQL configuration and wait briefly for SIGHUP settings to apply.
     pub async fn reload_config_and_wait(&self) {
         self.execute("SELECT pg_reload_conf()").await;
