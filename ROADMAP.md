@@ -83,15 +83,18 @@
 | [v0.35.0](roadmap/v0.35.0.md) | EC-01 correctness closeout, Citus chaos hardening, reactive subscriptions, zero-downtime schema changes | Released | Large | [Full details](roadmap/v0.35.0.md-full.md) |
 | [v0.36.0](roadmap/v0.36.0.md) | Structural hardening, L0 cache, WAL backpressure, temporal IVM, columnar storage | ✅ Released | Large | [Full details](roadmap/v0.36.0.md-full.md) |
 | [v0.37.0](roadmap/v0.37.0.md) | Scheduler & merge modularisation, pgVectorMV (vector_avg/sum), OpenTelemetry trace propagation | Released | Medium | [Full details](roadmap/v0.37.0.md-full.md) |
-| [v0.38.0](roadmap/v0.38.0.md) | Embedding pipeline operations: post-refresh hooks, drift-based reindex, vector_status() monitoring, GUC docs overhaul | Planned | Medium | [Full details](roadmap/v0.38.0.md-full.md) |
-| [v0.39.0](roadmap/v0.39.0.md) | Sparse & half-precision vector aggregates, reactive distance subscriptions, hybrid-search benchmarks | Planned | Medium | [Full details](roadmap/v0.39.0.md-full.md) |
-| [v0.40.0](roadmap/v0.40.0.md) | embedding_stream_table() ergonomic API, per-tenant ANN patterns, outbox embedding events, co-marketing | Planned | Large | [Full details](roadmap/v0.40.0.md-full.md) |
+| [v0.38.0](roadmap/v0.38.0.md) | Correctness closeout and operational truthfulness: EC-01, RowIdSchema planning, backpressure wiring, wake/docs fixes | Planned | Large | [Full details](roadmap/v0.38.0.md-full.md) |
+| [v0.39.0](roadmap/v0.39.0.md) | Distributed hardening and performance diagnostics: Citus chaos rig, durable CDC hold, TPC-H explain artifacts, fuzzing | Planned | Large | [Full details](roadmap/v0.39.0.md-full.md) |
+| [v0.40.0](roadmap/v0.40.0.md) | Operator trust and maintainability: generated references, alerting, drain-mode proof, secret hygiene, unsafe gating | Planned | Large | [Full details](roadmap/v0.40.0.md-full.md) |
+| [v0.41.0](roadmap/v0.41.0.md) | Embedding pipeline infrastructure: post-refresh hooks, drift-based reindex, vector monitoring | Planned | Medium | [Full details](roadmap/v0.41.0.md-full.md) |
+| [v0.42.0](roadmap/v0.42.0.md) | Sparse & half-precision vector aggregates, reactive distance subscriptions, hybrid-search benchmarks | Planned | Medium | [Full details](roadmap/v0.42.0.md-full.md) |
+| [v0.43.0](roadmap/v0.43.0.md) | embedding_stream_table() ergonomic API, per-tenant ANN patterns, outbox embedding events | Planned | Large | [Full details](roadmap/v0.43.0.md-full.md) |
 
 ### Beyond v1.0
 
 | Version | Theme | Status | Scope | Full details |
 |---------|-------|--------|------- |---------- |
-| [v1.0.0](roadmap/v1.0.0.md-full.md) | Stable release — PostgreSQL 19, package registries, zero breaking changes | Planned | Large | [Full details](roadmap/v1.0.0.md-full.md) |
+| [v1.0.0](roadmap/v1.0.0.md-full.md) | Stable release — PostgreSQL 19, package registries, signed artifacts, SBOMs, zero breaking changes | Planned | Large | [Full details](roadmap/v1.0.0.md-full.md) |
 | [v1.1.0](roadmap/v1.1.0.md-full.md) | PostgreSQL 17 support | Planned | Medium | [Full details](roadmap/v1.1.0.md-full.md) |
 | [v1.2.0](roadmap/v1.2.0.md-full.md) | PGlite proof of concept | Planned | Medium | [Full details](roadmap/v1.2.0.md-full.md) |
 | [v1.3.0](roadmap/v1.3.0.md-full.md) | Core extraction (`pg_trickle_core`) | Planned | Large | [Full details](roadmap/v1.3.0.md-full.md) |
@@ -132,13 +135,19 @@ v0.36    ─── L0 cache, WAL backpressure, api split, temporal IVM, columnar
     │
 v0.37    ─── Scheduler split, pgVectorMV, OpenTelemetry, pg_partman compat
     │
-v0.38    ─── Embedding pipeline infrastructure: post-refresh actions, drift-based reindex, vector monitoring
+v0.38    ─── Correctness closeout and truthfulness: EC-01, RowIdSchema planning, backpressure, wake/docs repair
     │
-v0.39    ─── Hybrid search & sparse vectors: sparsevec_avg, halfvec_avg, reactive distance alerts
+v0.39    ─── Distributed hardening and diagnostics: Citus chaos, durable CDC hold, TPC-H explain artifacts, fuzzing
     │
-v0.40    ─── Embedding API & advanced RAG: embedding_stream_table(), k-NN graphs, per-tenant ANN
+v0.40    ─── Operator trust and maintainability: generated docs, alerting, drain proof, secret hygiene, unsafe gating
     │
-v1.0.0   ─── Stable release, PostgreSQL 19, package registries
+v0.41    ─── Embedding infrastructure: post-refresh actions, drift-based reindex, vector monitoring
+    │
+v0.42    ─── Hybrid search & sparse vectors: sparsevec_avg, halfvec_avg, reactive distance alerts
+    │
+v0.43    ─── Embedding API & advanced RAG: embedding_stream_table(), per-tenant ANN, embedding outbox
+    │
+v1.0.0   ─── Stable release, PostgreSQL 19, package registries, signed artifacts, SBOMs
 ```
 
 v0.1.0 through v0.27.0 build the complete core engine and harden it for
@@ -151,17 +160,23 @@ delivers the full Citus integration immediately after — per-worker slot CDC,
 distributed ST placement, cross-node coordination, and the Citus test suite.
 Pulling v0.33.0 forward means users with Citus topologies (including
 billion-row all-distributed deployments) are unblocked two releases earlier.
-v0.35.0 is the single most important release before v1.0: it closes the EC-01
-phantom-row correctness bug (flagged in three consecutive overall assessments)
-and adds the Citus chaos test rig, on top of reactive subscriptions and
-zero-downtime schema changes. v0.36.0 builds on that foundation with
-performance hardening (L0 cache, WAL backpressure), structural refactoring
-(`src/api/mod.rs` split, `RowIdSchema` type), and temporal IVM / columnar
-storage. v0.37.0 completes the modularisation arc (scheduler and merge splits),
-adds pgVectorMV for AI/RAG workloads, and threads OpenTelemetry traces through
-the refresh pipeline. v0.38–v0.40 form a three-release programme for
-production embedding pipelines: infrastructure (post-refresh hooks, reindex
-scheduling), feature completeness (sparse / half-precision aggregates, reactive
-alerts), and ergonomic API (`embedding_stream_table()`, per-tenant patterns).
-This positions pg_trickle as the default incremental-maintenance layer for
-AI/RAG on PostgreSQL.
+v0.35.0 was intended to be the single most important release before v1.0, but
+the v0.37.0 overall assessment shows several of those closeout items remain
+partially open or insufficiently proven. v0.36.0 and v0.37.0 still delivered
+substantial structural gains: L0 cache construction, temporal IVM,
+`RowIdSchema`, scheduler and merge splits, pgVectorMV, and OpenTelemetry trace
+capture. The next three releases now form a hardening programme rather than an
+immediate feature expansion. v0.38.0 closes the highest-risk correctness and
+truthfulness gaps (EC-01 mitigation, planner-enforced row-id compatibility,
+backpressure wiring or deprecation, wake/docs repair, SQLSTATE rollout, trace
+integration proof, and generated configuration docs). v0.39.0 extends that
+with distributed and diagnostic coverage: Citus chaos testing, durable CDC hold
+semantics, per-query TPC-H explain artifacts, SQLancer light PR mode, targeted
+fuzzing, and inbox/outbox reliability tests. v0.40.0 then focuses on operator
+trust and maintainability: generated SQL/GUC references, drain-mode proof,
+monitoring/alert rules, security-model and secret-handling docs, upgrade-gate
+coverage, unsafe-inventory PR gating, and continued decomposition of the
+largest files. Only after that hardening arc does the roadmap resume the
+embedding programme in v0.41.0-v0.43.0, preserving the pgvector work while
+aligning the release order with the assessment's conclusion that closing
+correctness and operational gaps matters more than adding new surface area.
