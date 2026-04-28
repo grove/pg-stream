@@ -68,9 +68,8 @@ Three files must have their version bumped together:
 #    Rename ## [Unreleased] → ## [0.8.0] — YYYY-MM-DD
 #    Add a new empty ## [Unreleased] section at the top
 ```
-> and a mismatch causes `cargo install --path pgtrickle-tui` to report the wrong
-> version. The `just check-version-sync` script does **not** currently enforce
-> this, so it must be checked manually.
+
+The `just check-version-sync` script enforces version consistency across the workspace.
 
 The extension control file (`pg_trickle.control`) uses
 `default_version = '@CARGO_VERSION@'`, which pgrx substitutes automatically at
