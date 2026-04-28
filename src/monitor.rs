@@ -3777,7 +3777,10 @@ mod tests {
                 "launcher running but no per-database scheduler yet".to_string(),
             )
         } else {
-            ("ERROR", "neither launcher nor scheduler present".to_string())
+            (
+                "ERROR",
+                "neither launcher nor scheduler present".to_string(),
+            )
         };
 
         assert_eq!(severity, "OK");
@@ -3796,7 +3799,10 @@ mod tests {
         let (severity, _detail) = if scheduler_count > 0 {
             ("OK", format!("{} worker(s) running", scheduler_count))
         } else if launcher_count > 0 {
-            ("WARN", "launcher running but no per-database scheduler yet".to_string())
+            (
+                "WARN",
+                "launcher running but no per-database scheduler yet".to_string(),
+            )
         } else {
             (
                 "ERROR",
@@ -3826,8 +3832,7 @@ mod tests {
         } else {
             (
                 "ERROR",
-                "neither launcher nor scheduler present — configuration issue"
-                    .to_string(),
+                "neither launcher nor scheduler present — configuration issue".to_string(),
             )
         };
 

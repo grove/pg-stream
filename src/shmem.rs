@@ -1325,11 +1325,11 @@ mod tests {
 
     #[test]
     fn test_scheduler_meta_wake_timestamp_updates() {
-        let mut meta = super::SchedulerMetaState::default();
-
-        // Startup with initial timestamp
-        meta.scheduler_running = true;
-        meta.last_scheduler_wake = 1000;
+        let mut meta = super::SchedulerMetaState {
+            scheduler_running: true,
+            last_scheduler_wake: 1000,
+            ..Default::default()
+        };
         assert_eq!(meta.last_scheduler_wake, 1000);
 
         // Periodic update in scheduler loop
