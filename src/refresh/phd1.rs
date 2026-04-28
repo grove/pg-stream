@@ -26,60 +26,40 @@ use pgrx::Spi;
 /// The cleanup runs in batches of `batch_size` rows to avoid holding long
 /// locks. Returns the total number of orphaned rows removed.
 ///
-/// Called conditionally when:
-/// - The stream table uses a join-based defining query (non-deduplicated delta)
-/// - The prior refresh reported non-zero phantom residuals
-/// - The stream table has completed at least 2 refresh cycles
+/// Called after each non-deduplicated, keyed, non-partitioned differential
+/// apply so stale row IDs converge even when the current delta no longer
+/// contains the matching DELETE.
 pub fn cleanup_cross_cycle_phantoms(
     pgt_id: i64,
     stream_table_name: &str,
     defining_query: &str,
     batch_size: i64,
 ) -> Result<i64, PgTrickleError> {
-    // Step 1: Find orphaned __pgt_row_id values that exist in the stream
-    // table but NOT in the full-refresh result set.
-    //
-    // We use an anti-join (NOT EXISTS) against the full query to identify
-    // rows whose __pgt_row_id has no corresponding row in the correct
-    // result set. These are phantoms from prior cycles.
-    let orphan_count = Spi::get_one_with_args::<i64>(
-        &format!(
-            "WITH current_full AS ({defining_query}), \
-             orphans AS ( \
-                 SELECT st.__pgt_row_id \
-                 FROM {stream_table_name} st \
-                 WHERE NOT EXISTS ( \
-                     SELECT 1 FROM current_full cf \
-                     WHERE cf.__pgt_row_id = st.__pgt_row_id \
-                 ) \
-                 LIMIT $1 \
-             ) \
-             SELECT count(*) FROM orphans"
-        ),
-        &[batch_size.into()],
-    )
-    .map_err(|e| PgTrickleError::SpiError(e.to_string()))?
-    .unwrap_or(0);
+    let row_id_expr = crate::dvm::row_id_expr_for_query(defining_query);
+    let full_with_row_id = format!(
+        "SELECT {row_id_expr} AS __pgt_row_id \
+         FROM ({defining_query}) sub"
+    );
 
-    if orphan_count == 0 {
-        return Ok(0);
-    }
-
-    // Step 2: Delete orphaned rows in batches.
     let deleted = Spi::get_one_with_args::<i64>(
         &format!(
-            "WITH current_full AS ({defining_query}), \
+            "WITH current_full AS MATERIALIZED ({full_with_row_id}), \
              orphans AS ( \
-                 SELECT st.__pgt_row_id \
+                 SELECT DISTINCT st.__pgt_row_id \
                  FROM {stream_table_name} st \
                  WHERE NOT EXISTS ( \
                      SELECT 1 FROM current_full cf \
                      WHERE cf.__pgt_row_id = st.__pgt_row_id \
                  ) \
                  LIMIT $1 \
+             ), \
+             deleted AS ( \
+                 DELETE FROM {stream_table_name} st \
+                 USING orphans o \
+                 WHERE st.__pgt_row_id = o.__pgt_row_id \
+                 RETURNING 1 \
              ) \
-             DELETE FROM {stream_table_name} \
-             WHERE __pgt_row_id IN (SELECT __pgt_row_id FROM orphans)"
+             SELECT count(*)::bigint FROM deleted"
         ),
         &[batch_size.into()],
     )

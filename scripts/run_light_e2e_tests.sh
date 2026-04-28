@@ -122,6 +122,7 @@ LIGHT_E2E_TESTS=(
     e2e_immediate_concurrency_tests
     e2e_merge_template_tests
     e2e_rls_tests
+    e2e_ec01_property_tests
 )
 
 usage() {
@@ -131,6 +132,7 @@ Usage: scripts/run_light_e2e_tests.sh [options]
 Options:
   --package                 Run cargo pgrx package before tests
   --package-only            Run cargo pgrx package and exit
+    --test <name>             Run only the named light-E2E test target
   --list                    Print selected test targets and exit
   --shard-index <n>         1-based shard index
   --shard-count <n>         Total shard count
@@ -188,33 +190,38 @@ ensure_builder_image() {
     echo "  Building it now for Light E2E packaging …"
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     docker build \
+        --platform "${DOCKER_PLATFORM}" \
         -t "${BUILDER_IMAGE}" \
         -f "${PROJECT_DIR}/tests/Dockerfile.builder" \
         "${PROJECT_DIR}"
 }
 
 package_extension_in_builder() {
-    local package_parent archive_path
+    local package_parent host_uid host_gid
     package_parent="$(dirname "${LIGHT_E2E_PACKAGE_DIR}")"
-    archive_path="${package_parent}/pg_trickle-pg18.tar"
+    host_uid="$(id -u)"
+    host_gid="$(id -g)"
 
     ensure_builder_image
 
     mkdir -p "$package_parent"
-    rm -rf "$LIGHT_E2E_PACKAGE_DIR" "$archive_path"
+    rm -rf "$LIGHT_E2E_PACKAGE_DIR"
 
     echo "Packaging Linux extension artifacts in builder image: ${BUILDER_IMAGE}"
     docker run --rm \
+        --platform "${DOCKER_PLATFORM}" \
+        -e HOST_UID="${host_uid}" \
+        -e HOST_GID="${host_gid}" \
         -v "${PROJECT_DIR}:/build" \
         -w /build \
         "${BUILDER_IMAGE}" \
         bash -lc 'set -euo pipefail
             export CARGO_TARGET_DIR=/tmp/pgt-light-target
             cargo pgrx package --pg-config /usr/bin/pg_config >/tmp/pgt-light-e2e-package.log
-            tar -C /tmp/pgt-light-target/release -cf - pg_trickle-pg18' > "$archive_path"
+            rm -rf /build/target/light-e2e/pg_trickle-pg18
+            cp -a /tmp/pgt-light-target/release/pg_trickle-pg18 /build/target/light-e2e/pg_trickle-pg18
+            chown -R "${HOST_UID}:${HOST_GID}" /build/target/light-e2e/pg_trickle-pg18'
 
-    tar -xf "$archive_path" -C "$package_parent"
-    rm -f "$archive_path"
     export PGT_EXTENSION_DIR="$LIGHT_E2E_PACKAGE_DIR"
 }
 
@@ -262,6 +269,7 @@ package_only=false
 list_only=false
 shard_index=1
 shard_count=1
+requested_tests=()
 
 while (($# > 0)); do
     case "$1" in
@@ -271,6 +279,10 @@ while (($# > 0)); do
         --package-only)
             package_before_run=true
             package_only=true
+            ;;
+        --test)
+            shift
+            requested_tests+=("${1:-}")
             ;;
         --list)
             list_only=true
@@ -307,14 +319,25 @@ fi
 selected_tests=()
 selected_count=0
 
-# Distribute tests round-robin across shards so adjacent entries do not end up
-# in the same shard when new tests are appended to the allowlist.
-for index in "${!LIGHT_E2E_TESTS[@]}"; do
-    if (( index % shard_count == shard_index - 1 )); then
-        selected_tests+=("${LIGHT_E2E_TESTS[$index]}")
+if (( ${#requested_tests[@]} > 0 )); then
+    for test_name in "${requested_tests[@]}"; do
+        if [[ -z "$test_name" ]]; then
+            echo "ERROR: --test requires a test target name" >&2
+            exit 1
+        fi
+        selected_tests+=("$test_name")
         selected_count=$((selected_count + 1))
-    fi
-done
+    done
+else
+    # Distribute tests round-robin across shards so adjacent entries do not end
+    # up in the same shard when new tests are appended to the allowlist.
+    for index in "${!LIGHT_E2E_TESTS[@]}"; do
+        if (( index % shard_count == shard_index - 1 )); then
+            selected_tests+=("${LIGHT_E2E_TESTS[$index]}")
+            selected_count=$((selected_count + 1))
+        fi
+    done
+fi
 
 if (( selected_count == 0 )); then
     echo "ERROR: No tests selected for shard ${shard_index}/${shard_count}" >&2
@@ -361,6 +384,7 @@ start_shared_light_e2e_container() {
     echo "Starting shared light-E2E PostgreSQL container..."
     local cid
     cid=$(docker run -d \
+        --platform "${DOCKER_PLATFORM}" \
         -e POSTGRES_PASSWORD=postgres \
         -e POSTGRES_DB=postgres \
         -p 5432 \

@@ -123,22 +123,12 @@ const IMMEDIATE_SKIP_ALLOWLIST: &[&str] = &[
     // q05: multi-table joins produce DVM SQL that exceeds
     // the Docker container's temp_file_limit (4 GB).
     "q05",
-    // q07: 5-table join (nation×2, supplier, customer, orders, lineitem)
-    // IVM trigger generates intermediate results that exceed the Docker
-    // container's temp_file_limit (4 GB).
-    "q07",
     // q08: 7-table join (region, nation×2, supplier, part, customer, orders,
     // lineitem) — largest join in TPC-H; exceeds temp_file_limit (4 GB).
     "q08",
     // q09: 6-table join (nation, supplier, part, partsupp, orders, lineitem)
     // exceeds temp_file_limit (4 GB) — same root cause as q05/q07/q08.
     "q09",
-    // q15: scalar subquery over a window aggregate (max revenue via CTE)
-    // still produces an extra row in IMMEDIATE mode after EC01-1/2 fixes.
-    // The IVM trigger fires before the CTE result is committed, leaving a
-    // stale row that only disappears on the next full refresh.
-    // Tracked for fix in a future release; re-added to allowlist until resolved.
-    "q15",
 ];
 
 // ── P3.15: TPCH_STRICT mode ───────────────────────────────────────────

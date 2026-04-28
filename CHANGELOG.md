@@ -7,6 +7,7 @@ For future plans and upcoming features, see [ROADMAP.md](ROADMAP.md).
 ## Table of Contents
 
 <!-- TOC start -->
+- [0.38.0 — EC-01 Join Correctness Sprint](#0380--ec-01-join-correctness-sprint)
 - [0.37.0 — pgVector Incremental Aggregates & Distributed Trace Propagation](#0370--pgvector-incremental-aggregates--distributed-trace-propagation)
 - [0.36.0 — Structural Hardening, Performance & Temporal IVM](#0360--structural-hardening-performance--temporal-ivm)
 - [0.35.0 — Hardening, Reactive Subscriptions & Relay Resilience](#0350--hardening-reactive-subscriptions--relay-resilience)
@@ -61,6 +62,45 @@ For future plans and upcoming features, see [ROADMAP.md](ROADMAP.md).
 - **`pgtrickle-tui`** — The terminal dashboard binary has been removed from
   this repository. All SQL-level monitoring functions (`pgtrickle.health_check()`,
   `pgtrickle.list_stream_tables()`, etc.) remain fully available in the extension.
+
+---
+
+## [0.38.0] — EC-01 Join Correctness Sprint
+
+v0.38.0 is a focused correctness release for EC-01, the join phantom-row class
+where non-deduplicated join deltas could leave stale row IDs behind across
+refresh cycles.
+
+### EC-01 — Unconditional PH-D1 Cleanup
+
+Non-deduplicated keyed join deltas now run PH-D1 cross-cycle cleanup after every
+differential apply. The cleanup computes the current FULL-refresh row-id set and
+deletes stream-table row IDs that no longer exist in the correct result. This
+removes historical phantoms that are not present in the current delta and keeps
+DIFFERENTIAL output convergent with FULL output.
+
+### RowIdSchema Planner Guard
+
+The dormant `RowIdSchema` model is now exercised during DVM planning. The
+planner infers row-id schemas for scans, transparent operators, joins,
+aggregates, set operations, CTEs, recursive plans, lateral plans, and scalar
+subqueries before generating delta SQL. If a row-id pipeline is internally
+inconsistent, planning fails with a clear `RowIdSchema verification failed`
+message rather than allowing silent refresh drift.
+
+### EC-01 Property Release Gate
+
+Added `e2e_ec01_property_tests`, a DIFF-vs-FULL property test that runs a
+deterministic three-table join aggregate through 100 mixed-DML cycles by
+default. Each cycle includes inserts, updates, deletes on both sides of joins,
+and co-delete cases, then compares DIFFERENTIAL and FULL stream tables with
+multiset equality and row-id diagnostics.
+
+Q07 and Q15 are no longer allowed in `IMMEDIATE_SKIP_ALLOWLIST`, so CI must
+prove those query shapes instead of accepting silent skips.
+
+**Upgrade:** The `0.37.0 -> 0.38.0` migration has no SQL-object changes; the
+release changes Rust DVM/refresh behavior and test coverage only.
 
 ---
 

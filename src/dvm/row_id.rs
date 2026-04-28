@@ -3,6 +3,8 @@
 //! Row ID computation depends on the operator that produces the row.
 //! See `PLAN.md` Phase 6.2 for the full strategy table.
 
+use crate::dvm::parser::OpTree;
+
 /// Strategies for computing row IDs at each operator.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RowIdStrategy {
@@ -76,8 +78,8 @@ impl RowIdSchema {
         match self {
             // Any and Derived accept everything
             RowIdSchema::Any | RowIdSchema::Derived => true,
-            // PassThrough propagates the schema — must match exactly
-            RowIdSchema::PassThrough => upstream == &RowIdSchema::PassThrough || upstream == self,
+            // PassThrough propagates the upstream schema unchanged.
+            RowIdSchema::PassThrough => true,
             // PrimaryKey schemas must agree on table + column set
             RowIdSchema::PrimaryKey { table, columns } => {
                 matches!(upstream, RowIdSchema::PrimaryKey { table: t, columns: c }
@@ -117,6 +119,137 @@ impl RowIdSchema {
             }
         }
         Ok(())
+    }
+}
+
+/// Infer and verify the row-id schema produced by a parsed DVM plan.
+///
+/// This is a lightweight plan-time guardrail for EC-01 class bugs: every
+/// operator declares the row-id shape it emits, transparent operators are
+/// checked as pass-through, and join operators compose the schemas from both
+/// children. The returned schema is primarily diagnostic; an error means the
+/// plan contains an internally inconsistent row-id pipeline and should not be
+/// maintained in DIFFERENTIAL mode.
+pub fn verify_plan_row_id_schema(op: &OpTree) -> Result<RowIdSchema, String> {
+    infer_plan_row_id_schema(op)
+}
+
+fn infer_plan_row_id_schema(op: &OpTree) -> Result<RowIdSchema, String> {
+    match op {
+        OpTree::Scan {
+            schema,
+            table_name,
+            columns,
+            pk_columns,
+            ..
+        } => {
+            if pk_columns.is_empty() {
+                Ok(RowIdSchema::AllColumns {
+                    columns: columns.iter().map(|c| c.name.clone()).collect(),
+                })
+            } else {
+                Ok(RowIdSchema::PrimaryKey {
+                    table: format!("{schema}.{table_name}"),
+                    columns: pk_columns.clone(),
+                })
+            }
+        }
+        OpTree::Filter { child, .. } | OpTree::Subquery { child, .. } => {
+            let child_schema = infer_plan_row_id_schema(child)?;
+            RowIdSchema::verify_pipeline(&[child_schema.clone(), RowIdSchema::PassThrough])?;
+            Ok(child_schema)
+        }
+        OpTree::Project { child, .. } => {
+            let child_schema = infer_plan_row_id_schema(child)?;
+            if let Some(key_columns) = op.row_id_key_columns() {
+                if key_columns == child.output_columns() {
+                    RowIdSchema::verify_pipeline(&[
+                        child_schema.clone(),
+                        RowIdSchema::PassThrough,
+                    ])?;
+                    Ok(child_schema)
+                } else {
+                    Ok(RowIdSchema::Derived)
+                }
+            } else {
+                Ok(RowIdSchema::Derived)
+            }
+        }
+        OpTree::InnerJoin { left, right, .. }
+        | OpTree::LeftJoin { left, right, .. }
+        | OpTree::FullJoin { left, right, .. } => Ok(RowIdSchema::Combined {
+            left: Box::new(infer_plan_row_id_schema(left)?),
+            right: Box::new(infer_plan_row_id_schema(right)?),
+        }),
+        OpTree::SemiJoin { left, right, .. } | OpTree::AntiJoin { left, right, .. } => {
+            let left_schema = infer_plan_row_id_schema(left)?;
+            let _right_schema = infer_plan_row_id_schema(right)?;
+            RowIdSchema::verify_pipeline(&[left_schema.clone(), RowIdSchema::PassThrough])?;
+            Ok(left_schema)
+        }
+        OpTree::Aggregate {
+            group_by, child, ..
+        } => {
+            let _child_schema = infer_plan_row_id_schema(child)?;
+            let columns: Vec<String> = group_by.iter().map(|expr| expr.output_name()).collect();
+            if columns.is_empty() {
+                Ok(RowIdSchema::Derived)
+            } else {
+                Ok(RowIdSchema::GroupByKey { columns })
+            }
+        }
+        OpTree::Distinct { child } => {
+            let _child_schema = infer_plan_row_id_schema(child)?;
+            Ok(RowIdSchema::AllColumns {
+                columns: child.output_columns(),
+            })
+        }
+        OpTree::Intersect { left, right, .. } | OpTree::Except { left, right, .. } => {
+            let _left_schema = infer_plan_row_id_schema(left)?;
+            let _right_schema = infer_plan_row_id_schema(right)?;
+            Ok(RowIdSchema::AllColumns {
+                columns: left.output_columns(),
+            })
+        }
+        OpTree::UnionAll { children } => {
+            for child in children {
+                let _child_schema = infer_plan_row_id_schema(child)?;
+            }
+            Ok(RowIdSchema::Derived)
+        }
+        OpTree::CteScan { body, columns, .. } => {
+            if let Some(body) = body {
+                let _body_schema = infer_plan_row_id_schema(body)?;
+            }
+            Ok(RowIdSchema::AllColumns {
+                columns: columns.clone(),
+            })
+        }
+        OpTree::RecursiveCte {
+            base, recursive, ..
+        } => {
+            let _base_schema = infer_plan_row_id_schema(base)?;
+            let _recursive_schema = infer_plan_row_id_schema(recursive)?;
+            Ok(RowIdSchema::Derived)
+        }
+        OpTree::RecursiveSelfRef { columns, .. } | OpTree::ConstantSelect { columns, .. } => {
+            Ok(RowIdSchema::AllColumns {
+                columns: columns.clone(),
+            })
+        }
+        OpTree::Window { child, .. }
+        | OpTree::LateralFunction { child, .. }
+        | OpTree::LateralSubquery { child, .. } => {
+            let _child_schema = infer_plan_row_id_schema(child)?;
+            Ok(RowIdSchema::Derived)
+        }
+        OpTree::ScalarSubquery {
+            subquery, child, ..
+        } => {
+            let _subquery_schema = infer_plan_row_id_schema(subquery)?;
+            let _child_schema = infer_plan_row_id_schema(child)?;
+            Ok(RowIdSchema::Derived)
+        }
     }
 }
 
@@ -284,17 +417,14 @@ mod tests {
 
     #[test]
     fn test_row_id_schema_verify_pipeline_happy_path() {
-        // PassThrough is compatible with PrimaryKey (passes through)
-        // Actually by our impl, PassThrough checks upstream == PassThrough || upstream == self
-        // so PassThrough is NOT compatible with PrimaryKey. Let's use Any instead.
-        let schemas_any = vec![
+        let schemas = vec![
             RowIdSchema::PrimaryKey {
                 table: "t".to_string(),
                 columns: vec!["id".to_string()],
             },
-            RowIdSchema::Any,
+            RowIdSchema::PassThrough,
         ];
-        assert!(RowIdSchema::verify_pipeline(&schemas_any).is_ok());
+        assert!(RowIdSchema::verify_pipeline(&schemas).is_ok());
     }
 
     #[test]

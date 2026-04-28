@@ -363,6 +363,9 @@ pub fn generate_delta_query(
 
     // Step 2: Check DVM support (validates CTE bodies + main tree)
     check_ivm_support_with_registry(&result)?;
+    row_id::verify_plan_row_id_schema(&result.tree).map_err(|e| {
+        PgTrickleError::InvalidArgument(format!("RowIdSchema verification failed: {e}"))
+    })?;
 
     // Step 3: Generate the delta query.
     // Use differentiate_with_columns() to get the diff result's column list,
@@ -578,6 +581,9 @@ pub fn generate_delta_query_cached(
     }
 
     check_ivm_support_with_registry(&result)?;
+    row_id::verify_plan_row_id_schema(&result.tree).map_err(|e| {
+        PgTrickleError::InvalidArgument(format!("RowIdSchema verification failed: {e}"))
+    })?;
 
     // Generate template with placeholder tokens instead of literal LSNs.
     // Use dummy frontiers — the actual LSN values come from placeholders.

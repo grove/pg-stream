@@ -2538,6 +2538,44 @@ pub fn execute_differential_refresh(
         (n, "merge")
     };
 
+    // EC-01 / v0.38.0: non-deduplicated join deltas can leave stale row_ids
+    // from earlier refresh cycles that are not present in the current delta.
+    // After every such differential apply, reconcile the stream table against
+    // the full-query row_id set. This is intentionally unconditional for
+    // keyed, non-partitioned STs: correctness beats the extra anti-join cost.
+    let phantom_cleanup_count =
+        if !resolved.is_deduplicated && !st.has_keyless_source && st.st_partition_key.is_none() {
+            let quoted_table = format!(
+                "\"{}\".\"{}\"",
+                schema.replace('"', "\"\""),
+                name.replace('"', "\"\""),
+            );
+            super::phd1::cleanup_cross_cycle_phantoms(
+                st.pgt_id,
+                &quoted_table,
+                &st.defining_query,
+                10_000,
+            )?
+        } else {
+            0
+        };
+
+    if phantom_cleanup_count > 0
+        && has_downstream_st_consumers(st.pgt_id)
+        && let Ok(downstream_ids) =
+            crate::catalog::StDependency::get_downstream_pgt_ids(st.pgt_relid)
+    {
+        for ds_id in &downstream_ids {
+            if let Err(e) = StreamTableMeta::mark_for_reinitialize(*ds_id) {
+                pgrx::warning!(
+                    "[pg_trickle] EC01-2: failed to mark downstream ST {} for reinit after phantom cleanup: {}",
+                    ds_id,
+                    e,
+                );
+            }
+        }
+    }
+
     // Re-enable user triggers if they were suppressed (GUC = 'off').
     if suppress_triggers {
         let quoted_table = format!(
@@ -2605,13 +2643,14 @@ pub fn execute_differential_refresh(
 
     // Emit timing breakdown for profiling
     pgrx::info!(
-        "[PGS_PROFILE] decision={:.2}ms generate+build={:.2}ms merge_exec={:.2}ms cleanup_enqueue={:.2}ms total={:.2}ms affected={} delta_est={} mode=INCR path={} hints={} strategy={}",
+        "[PGS_PROFILE] decision={:.2}ms generate+build={:.2}ms merge_exec={:.2}ms cleanup_enqueue={:.2}ms total={:.2}ms affected={} phantom_cleanup={} delta_est={} mode=INCR path={} hints={} strategy={}",
         t_decision.as_secs_f64() * 1000.0,
         t1.duration_since(t0).as_secs_f64() * 1000.0,
         t2.duration_since(t1).as_secs_f64() * 1000.0,
         t3.duration_since(t2).as_secs_f64() * 1000.0,
         (t_decision.as_secs_f64() + t3.duration_since(t0).as_secs_f64()) * 1000.0,
         merge_count,
+        phantom_cleanup_count,
         total_change_count,
         cache_path,
         hint_tier,

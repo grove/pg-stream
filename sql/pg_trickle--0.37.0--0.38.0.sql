@@ -1,0 +1,4 @@
+-- pg_trickle 0.37.0 -> 0.38.0 upgrade migration
+--
+-- v0.38.0 is an EC-01 correctness release. It changes Rust DVM/refresh
+-- behavior only; no SQL objects or catalog tables changed.
