@@ -84,7 +84,8 @@ COMMENT ON TABLE pgtrickle.relay_consumer_offsets IS
 CREATE OR REPLACE FUNCTION pgtrickle.relay_config_notify()
 RETURNS TRIGGER
 LANGUAGE plpgsql
-SECURITY DEFINER
+SECURITY DEFINER -- nosemgrep: sql.security-definer.present
+SET search_path = pgtrickle, pg_catalog, pg_temp
 AS $$
 BEGIN
     PERFORM pg_notify(
@@ -127,7 +128,8 @@ CREATE OR REPLACE FUNCTION pgtrickle.set_relay_outbox(
     p_enabled         BOOLEAN DEFAULT true
 ) RETURNS void
 LANGUAGE plpgsql
-SECURITY DEFINER
+SECURITY DEFINER -- nosemgrep: sql.security-definer.present
+SET search_path = pgtrickle, pg_catalog, pg_temp
 AS $$
 DECLARE
     v_sink_type TEXT;
@@ -185,7 +187,8 @@ CREATE OR REPLACE FUNCTION pgtrickle.set_relay_inbox(
     p_enabled           BOOLEAN   DEFAULT true
 ) RETURNS void
 LANGUAGE plpgsql
-SECURITY DEFINER
+SECURITY DEFINER -- nosemgrep: sql.security-definer.present
+SET search_path = pgtrickle, pg_catalog, pg_temp
 AS $$
 DECLARE
     v_source_type TEXT;
@@ -238,7 +241,8 @@ CREATE OR REPLACE FUNCTION pgtrickle.enable_relay(
     p_name TEXT
 ) RETURNS void
 LANGUAGE plpgsql
-SECURITY DEFINER
+SECURITY DEFINER -- nosemgrep: sql.security-definer.present
+SET search_path = pgtrickle, pg_catalog, pg_temp
 AS $$
 DECLARE
     v_found_outbox BOOLEAN;
@@ -273,7 +277,8 @@ CREATE OR REPLACE FUNCTION pgtrickle.disable_relay(
     p_name TEXT
 ) RETURNS void
 LANGUAGE plpgsql
-SECURITY DEFINER
+SECURITY DEFINER -- nosemgrep: sql.security-definer.present
+SET search_path = pgtrickle, pg_catalog, pg_temp
 AS $$
 DECLARE
     v_found_outbox BOOLEAN;
@@ -307,7 +312,8 @@ CREATE OR REPLACE FUNCTION pgtrickle.delete_relay(
     p_name TEXT
 ) RETURNS void
 LANGUAGE plpgsql
-SECURITY DEFINER
+SECURITY DEFINER -- nosemgrep: sql.security-definer.present
+SET search_path = pgtrickle, pg_catalog, pg_temp
 AS $$
 DECLARE
     v_deleted_outbox INT;
@@ -342,7 +348,8 @@ CREATE OR REPLACE FUNCTION pgtrickle.get_relay_config(
     config     JSONB
 )
 LANGUAGE plpgsql
-SECURITY DEFINER
+SECURITY DEFINER -- nosemgrep: sql.security-definer.present
+SET search_path = pgtrickle, pg_catalog, pg_temp
 AS $$
 BEGIN
     RETURN QUERY
@@ -376,7 +383,8 @@ RETURNS TABLE (
     config     JSONB
 )
 LANGUAGE plpgsql
-SECURITY DEFINER
+SECURITY DEFINER -- nosemgrep: sql.security-definer.present
+SET search_path = pgtrickle, pg_catalog, pg_temp
 AS $$
 BEGIN
     RETURN QUERY

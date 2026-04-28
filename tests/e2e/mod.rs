@@ -856,6 +856,29 @@ impl E2eDb {
         }
     }
 
+    /// Run `config` statements on a dedicated connection (all must succeed),
+    /// then run `sql` on the same connection and return Ok/Err.
+    ///
+    /// Use this when `sql` depends on session-local GUC values set by `config`.
+    pub async fn try_execute_with_config(
+        &self,
+        config: &[&str],
+        sql: &str,
+    ) -> Result<(), sqlx::Error> {
+        let mut conn = self
+            .pool
+            .acquire()
+            .await
+            .expect("Failed to acquire DB connection for try_execute_with_config");
+        for stmt in config {
+            sqlx::query(stmt)
+                .execute(&mut *conn)
+                .await
+                .unwrap_or_else(|e| panic!("Config SQL failed: {}\nSQL: {}", e, stmt));
+        }
+        sqlx::query(sql).execute(&mut *conn).await.map(|_| ())
+    }
+
     /// Execute `setup_sql` on a connection, then try `target_sql` and return its
     /// result, then run `teardown_sql` unconditionally.  All three statements use
     /// the **same** connection so session state (e.g. `SET ROLE`) is preserved.

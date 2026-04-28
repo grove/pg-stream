@@ -508,10 +508,36 @@ impl E2eDb {
         }
     }
 
+    /// Run `config` statements on a dedicated connection (all must succeed),
+    /// then run `sql` on the same connection and return Ok/Err.
+    ///
+    /// Use this when `sql` depends on session-local GUC values set by
+    /// `config` — for example in the Light-E2E environment (no
+    /// `shared_preload_libraries`) where `ALTER SYSTEM SET` + reload does
+    /// not propagate to lazily-loaded extension GUCs.
+    pub async fn try_execute_with_config(
+        &self,
+        config: &[&str],
+        sql: &str,
+    ) -> Result<(), sqlx::Error> {
+        let mut conn = self
+            .pool
+            .acquire()
+            .await
+            .expect("Failed to acquire DB connection for try_execute_with_config");
+        for stmt in config {
+            sqlx::query(stmt)
+                .execute(&mut *conn)
+                .await
+                .unwrap_or_else(|e| panic!("Config SQL failed: {}\nSQL: {}", e, stmt));
+        }
+        sqlx::query(sql).execute(&mut *conn).await.map(|_| ())
+    }
+
     /// Reload PostgreSQL configuration and wait briefly for SIGHUP settings to apply.
     pub async fn reload_config_and_wait(&self) {
         self.execute("SELECT pg_reload_conf()").await;
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     }
 
     /// Read a GUC value after forcing the extension to load on the same backend.
@@ -537,12 +563,12 @@ impl E2eDb {
 
     /// Wait until `SHOW <setting>` reports the expected value.
     pub async fn wait_for_setting(&self, setting: &str, expected: &str) {
-        for _ in 0..10 {
+        for _ in 0..30 {
             let current = self.show_setting(setting).await;
             if current == expected {
                 return;
             }
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         }
 
         let current = self.show_setting(setting).await;

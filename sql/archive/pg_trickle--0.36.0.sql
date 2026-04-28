@@ -503,7 +503,8 @@ COMMENT ON TABLE pgtrickle.relay_consumer_offsets IS
 CREATE OR REPLACE FUNCTION pgtrickle.relay_config_notify()
 RETURNS TRIGGER
 LANGUAGE plpgsql
-SECURITY DEFINER
+SECURITY DEFINER -- nosemgrep: sql.security-definer.present
+SET search_path = pgtrickle, pg_catalog, pg_temp
 AS $$
 BEGIN
     PERFORM pg_notify(
@@ -539,7 +540,8 @@ CREATE OR REPLACE FUNCTION pgtrickle.set_relay_outbox(
     p_enabled         BOOLEAN DEFAULT true
 ) RETURNS void
 LANGUAGE plpgsql
-SECURITY DEFINER
+SECURITY DEFINER -- nosemgrep: sql.security-definer.present
+SET search_path = pgtrickle, pg_catalog, pg_temp
 AS $$
 DECLARE
     v_sink_type TEXT;
@@ -578,7 +580,8 @@ CREATE OR REPLACE FUNCTION pgtrickle.set_relay_inbox(
     p_enabled          BOOLEAN DEFAULT true
 ) RETURNS void
 LANGUAGE plpgsql
-SECURITY DEFINER
+SECURITY DEFINER -- nosemgrep: sql.security-definer.present
+SET search_path = pgtrickle, pg_catalog, pg_temp
 AS $$
 DECLARE
     v_source_type TEXT;
@@ -609,7 +612,10 @@ $$;
 
 -- RELAY-CAT (v0.29.0): enable_relay — enable a named pipeline.
 CREATE OR REPLACE FUNCTION pgtrickle.enable_relay(p_name TEXT) RETURNS void
-LANGUAGE plpgsql SECURITY DEFINER AS $$
+LANGUAGE plpgsql
+SECURITY DEFINER -- nosemgrep: sql.security-definer.present
+SET search_path = pgtrickle, pg_catalog, pg_temp
+AS $$
 DECLARE v_o INT; v_i INT;
 BEGIN
     UPDATE pgtrickle.relay_outbox_config SET enabled = true WHERE name = p_name;
@@ -624,7 +630,10 @@ $$;
 
 -- RELAY-CAT (v0.29.0): disable_relay — disable a named pipeline.
 CREATE OR REPLACE FUNCTION pgtrickle.disable_relay(p_name TEXT) RETURNS void
-LANGUAGE plpgsql SECURITY DEFINER AS $$
+LANGUAGE plpgsql
+SECURITY DEFINER -- nosemgrep: sql.security-definer.present
+SET search_path = pgtrickle, pg_catalog, pg_temp
+AS $$
 DECLARE v_o INT; v_i INT;
 BEGIN
     UPDATE pgtrickle.relay_outbox_config SET enabled = false WHERE name = p_name;
@@ -639,7 +648,10 @@ $$;
 
 -- RELAY-CAT (v0.29.0): delete_relay — delete a named pipeline.
 CREATE OR REPLACE FUNCTION pgtrickle.delete_relay(p_name TEXT) RETURNS void
-LANGUAGE plpgsql SECURITY DEFINER AS $$
+LANGUAGE plpgsql
+SECURITY DEFINER -- nosemgrep: sql.security-definer.present
+SET search_path = pgtrickle, pg_catalog, pg_temp
+AS $$
 DECLARE v_o INT; v_i INT;
 BEGIN
     DELETE FROM pgtrickle.relay_outbox_config WHERE name = p_name;
@@ -655,7 +667,10 @@ $$;
 -- RELAY-CAT (v0.29.0): get_relay_config — fetch config for a single pipeline.
 CREATE OR REPLACE FUNCTION pgtrickle.get_relay_config(p_name TEXT)
 RETURNS TABLE (name TEXT, direction TEXT, enabled BOOLEAN, config JSONB)
-LANGUAGE plpgsql SECURITY DEFINER AS $$
+LANGUAGE plpgsql
+SECURITY DEFINER -- nosemgrep: sql.security-definer.present
+SET search_path = pgtrickle, pg_catalog, pg_temp
+AS $$
 BEGIN
     RETURN QUERY
         SELECT r.name, 'forward'::TEXT, r.enabled, r.config
@@ -672,7 +687,10 @@ $$;
 -- RELAY-CAT (v0.29.0): list_relay_configs — list all pipelines.
 CREATE OR REPLACE FUNCTION pgtrickle.list_relay_configs()
 RETURNS TABLE (name TEXT, direction TEXT, enabled BOOLEAN, config JSONB)
-LANGUAGE plpgsql SECURITY DEFINER AS $$
+LANGUAGE plpgsql
+SECURITY DEFINER -- nosemgrep: sql.security-definer.present
+SET search_path = pgtrickle, pg_catalog, pg_temp
+AS $$
 BEGIN
     RETURN QUERY
         SELECT r.name, 'forward'::TEXT, r.enabled, r.config

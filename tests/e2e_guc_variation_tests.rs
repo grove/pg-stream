@@ -186,14 +186,15 @@ async fn test_guc_max_grouping_set_branches_rejects_over_limit() {
     // should cause creation to fail with a clear error.
     let _gs_lock = GROUPING_SET_BRANCHES_LOCK.lock().await;
     let db = E2eDb::new().await.with_extension().await;
-    // Use ALTER SYSTEM SET so the value is visible across all pool connections.
-    db.alter_system_set_and_wait("pg_trickle.max_grouping_set_branches", "4", "4")
-        .await;
     db.execute("CREATE TABLE gs_limit_src (a TEXT, b TEXT, c TEXT, val INT)")
         .await;
 
+    // Use session-level SET on the same connection as create_stream_table so
+    // the GUC is visible even in the Light-E2E environment (no
+    // shared_preload_libraries — ALTER SYSTEM + reload is unreliable there).
     let result = db
-        .try_execute(
+        .try_execute_with_config(
+            &["SET pg_trickle.max_grouping_set_branches = 4"],
             "SELECT pgtrickle.create_stream_table('gs_limit_st', \
              $$ SELECT a, b, c, SUM(val) FROM gs_limit_src GROUP BY CUBE (a, b, c) $$, \
              '1m', 'FULL')",
@@ -208,10 +209,6 @@ async fn test_guc_max_grouping_set_branches_rejects_over_limit() {
         err_msg.contains("exceeds the limit"),
         "Error should mention branch limit, got: {err_msg}"
     );
-
-    // Reset to default so other tests are not affected.
-    db.alter_system_reset_and_wait("pg_trickle.max_grouping_set_branches", "64")
-        .await;
 }
 
 #[tokio::test]
@@ -219,13 +216,12 @@ async fn test_guc_max_grouping_set_branches_allows_within_limit() {
     // CUBE(a, b) produces 2^2 = 4 branches.  Limit of 4 should pass.
     let _gs_lock = GROUPING_SET_BRANCHES_LOCK.lock().await;
     let db = E2eDb::new().await.with_extension().await;
-    db.alter_system_set_and_wait("pg_trickle.max_grouping_set_branches", "4", "4")
-        .await;
     db.execute("CREATE TABLE gs_ok_src (id SERIAL PRIMARY KEY, a TEXT, b TEXT, val INT)")
         .await;
 
     let result = db
-        .try_execute(
+        .try_execute_with_config(
+            &["SET pg_trickle.max_grouping_set_branches = 4"],
             "SELECT pgtrickle.create_stream_table('gs_ok_st', \
              $$ SELECT a, b, SUM(val) FROM gs_ok_src GROUP BY CUBE (a, b) $$, \
              '1m', 'FULL')",
@@ -236,9 +232,6 @@ async fn test_guc_max_grouping_set_branches_allows_within_limit() {
         "CUBE(2) = 4 branches should be within limit of 4, got: {:?}",
         result.err()
     );
-
-    db.alter_system_reset_and_wait("pg_trickle.max_grouping_set_branches", "64")
-        .await;
 }
 
 #[tokio::test]
@@ -246,13 +239,12 @@ async fn test_guc_max_grouping_set_branches_raised_allows_large_cube() {
     // Raise the limit to 128 so CUBE(a, b, c, d, e) = 32 branches passes.
     let _gs_lock = GROUPING_SET_BRANCHES_LOCK.lock().await;
     let db = E2eDb::new().await.with_extension().await;
-    db.alter_system_set_and_wait("pg_trickle.max_grouping_set_branches", "128", "128")
-        .await;
     db.execute("CREATE TABLE gs_big_src (id SERIAL PRIMARY KEY, a TEXT, b TEXT, c TEXT, d TEXT, e TEXT, val INT)")
         .await;
 
     let result = db
-        .try_execute(
+        .try_execute_with_config(
+            &["SET pg_trickle.max_grouping_set_branches = 128"],
             "SELECT pgtrickle.create_stream_table('gs_big_st', \
              $$ SELECT a, b, c, d, e, SUM(val) FROM gs_big_src \
              GROUP BY CUBE (a, b, c, d, e) $$, '1m', 'FULL')",
@@ -263,9 +255,6 @@ async fn test_guc_max_grouping_set_branches_raised_allows_large_cube() {
         "CUBE(5) = 32 branches should be within limit of 128, got: {:?}",
         result.err()
     );
-
-    db.alter_system_reset_and_wait("pg_trickle.max_grouping_set_branches", "64")
-        .await;
 }
 
 // ═══════════════════════════════════════════════════════════════════════

@@ -317,8 +317,8 @@ pub fn setup_ivm_triggers(
     let create_fn_sql = format!(
         "CREATE OR REPLACE FUNCTION {before_fn}()
          RETURNS trigger LANGUAGE plpgsql
-         SECURITY DEFINER
-         SET search_path = pg_catalog, pgtrickle, pgtrickle_changes, public
+         SECURITY DEFINER -- nosemgrep: sql.security-definer.present — public needed for user-table access in delta SQL; extension schemas take precedence
+         SET search_path = pgtrickle_changes, pgtrickle, pg_catalog, pg_temp, public
          AS $$
          BEGIN
              -- Lock stream table for IVM ({lock_mode:?} mode).
@@ -380,8 +380,8 @@ pub fn setup_ivm_triggers(
         format!(
             "CREATE OR REPLACE FUNCTION {fn}()
          RETURNS trigger LANGUAGE plpgsql
-         SECURITY DEFINER
-         SET search_path = pg_catalog, pgtrickle, pgtrickle_changes, public
+         SECURITY DEFINER -- nosemgrep: sql.security-definer.present — public needed for user-table access in delta SQL; extension schemas take precedence
+         SET search_path = pgtrickle_changes, pgtrickle, pg_catalog, pg_temp, public
          AS $$
          BEGIN
              PERFORM pgtrickle.pgt_ivm_apply_delta_enr({pgt_id}, {oid_u32}, true, false);
@@ -394,8 +394,8 @@ pub fn setup_ivm_triggers(
         format!(
             "CREATE OR REPLACE FUNCTION {fn}()
          RETURNS trigger LANGUAGE plpgsql
-         SECURITY DEFINER
-         SET search_path = pg_catalog, pgtrickle, pgtrickle_changes, public
+         SECURITY DEFINER -- nosemgrep: sql.security-definer.present — public needed for user-table access in delta SQL; extension schemas take precedence
+         SET search_path = pgtrickle_changes, pgtrickle, pg_catalog, pg_temp, public
          AS $$
          BEGIN
              CREATE TEMP TABLE __pgt_newtable_{oid_u32} ON COMMIT DROP AS
@@ -433,8 +433,8 @@ pub fn setup_ivm_triggers(
         format!(
             "CREATE OR REPLACE FUNCTION {fn}()
          RETURNS trigger LANGUAGE plpgsql
-         SECURITY DEFINER -- nosemgrep: semgrep.sql.security-definer.present
-         SET search_path = pg_catalog, pgtrickle, pgtrickle_changes, public
+         SECURITY DEFINER -- nosemgrep: sql.security-definer.present — public needed for user-table access in delta SQL; extension schemas take precedence
+         SET search_path = pgtrickle_changes, pgtrickle, pg_catalog, pg_temp, public
          AS $$
          BEGIN
              PERFORM pgtrickle.pgt_ivm_apply_delta_enr({pgt_id}, {oid_u32}, true, true);
@@ -447,8 +447,8 @@ pub fn setup_ivm_triggers(
         format!(
             "CREATE OR REPLACE FUNCTION {fn}()
          RETURNS trigger LANGUAGE plpgsql
-         SECURITY DEFINER
-         SET search_path = pg_catalog, pgtrickle, pgtrickle_changes, public
+         SECURITY DEFINER -- nosemgrep: sql.security-definer.present — public needed for user-table access in delta SQL; extension schemas take precedence
+         SET search_path = pgtrickle_changes, pgtrickle, pg_catalog, pg_temp, public
          AS $$
          BEGIN
              CREATE TEMP TABLE __pgt_newtable_{oid_u32} ON COMMIT DROP AS
@@ -489,8 +489,8 @@ pub fn setup_ivm_triggers(
         format!(
             "CREATE OR REPLACE FUNCTION {fn}()
          RETURNS trigger LANGUAGE plpgsql
-         SECURITY DEFINER -- nosemgrep: semgrep.sql.security-definer.present
-         SET search_path = pg_catalog, pgtrickle, pgtrickle_changes, public
+         SECURITY DEFINER -- nosemgrep: sql.security-definer.present — public needed for user-table access in delta SQL; extension schemas take precedence
+         SET search_path = pgtrickle_changes, pgtrickle, pg_catalog, pg_temp, public
          AS $$
          BEGIN
              PERFORM pgtrickle.pgt_ivm_apply_delta_enr({pgt_id}, {oid_u32}, false, true);
@@ -503,8 +503,8 @@ pub fn setup_ivm_triggers(
         format!(
             "CREATE OR REPLACE FUNCTION {fn}()
          RETURNS trigger LANGUAGE plpgsql
-         SECURITY DEFINER
-         SET search_path = pg_catalog, pgtrickle, pgtrickle_changes, public
+         SECURITY DEFINER -- nosemgrep: sql.security-definer.present — public needed for user-table access in delta SQL; extension schemas take precedence
+         SET search_path = pgtrickle_changes, pgtrickle, pg_catalog, pg_temp, public
          AS $$
          BEGIN
              CREATE TEMP TABLE __pgt_oldtable_{oid_u32} ON COMMIT DROP AS
@@ -541,8 +541,8 @@ pub fn setup_ivm_triggers(
     let create_after_trunc_fn = format!(
         "CREATE OR REPLACE FUNCTION {fn}()
          RETURNS trigger LANGUAGE plpgsql
-         SECURITY DEFINER
-         SET search_path = pg_catalog, pgtrickle, pgtrickle_changes, public
+         SECURITY DEFINER -- nosemgrep: sql.security-definer.present — public needed for user-table access in delta SQL; extension schemas take precedence
+         SET search_path = pgtrickle_changes, pgtrickle, pg_catalog, pg_temp, public
          AS $$
          BEGIN
              PERFORM pgtrickle.pgt_ivm_handle_truncate({pgt_id});

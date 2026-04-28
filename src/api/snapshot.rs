@@ -383,9 +383,10 @@ fn restore_from_snapshot_impl(name: &str, source: &str) -> Result<(), PgTrickleE
     let subtxn = SnapSubTransaction::begin();
 
     let lock_result = Spi::run(&format!(
+        // nosemgrep: rust.spi.run.dynamic-format — DDL cannot be parameterized; storage_fqn is a double-quoted and escaped catalog identifier.
         "LOCK TABLE {} IN ACCESS EXCLUSIVE MODE",
         storage_fqn
-    )) // nosemgrep: rust.spi.run.dynamic-format — DDL cannot be parameterized; storage_fqn is a double-quoted and escaped catalog identifier.
+    ))
     .map_err(|e| PgTrickleError::SpiError(format!("restore lock failed: {e}")));
 
     if let Err(e) = lock_result {

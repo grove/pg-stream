@@ -322,13 +322,17 @@ async fn test_ivm_trigger_functions_security_definer() {
                 SELECT 1 FROM pg_proc \
                 WHERE proname LIKE 'pgt_ivm_%' \
                 AND prosecdef = true \
-                AND proconfig @> ARRAY['search_path=pg_catalog, pgtrickle, pgtrickle_changes, public'] \
+                AND EXISTS ( \
+                    SELECT 1 FROM unnest(proconfig) AS cfg \
+                    WHERE cfg LIKE 'search_path=pgtrickle_changes, pgtrickle, pg_catalog%' \
+                ) \
              )",
         )
         .await;
     assert!(
         has_search_path,
-        "IVM SECURITY DEFINER functions should have a locked search_path"
+        "IVM SECURITY DEFINER functions should have a locked search_path \
+         starting with pgtrickle_changes, pgtrickle, pg_catalog"
     );
 }
 
@@ -370,12 +374,16 @@ async fn test_cdc_trigger_functions_security_definer() {
             "SELECT count(*) FROM pg_proc \
              WHERE proname LIKE 'pg_trickle_cdc_%' \
              AND prosecdef = true \
-             AND NOT (proconfig @> ARRAY['search_path=pg_catalog, pgtrickle, pgtrickle_changes, public'])",
+             AND NOT EXISTS ( \
+                 SELECT 1 FROM unnest(COALESCE(proconfig, ARRAY[]::text[])) AS cfg \
+                 WHERE cfg LIKE 'search_path=pgtrickle_changes, pgtrickle, pg_catalog%' \
+             )",
         )
         .await;
     assert_eq!(
         without_search_path, 0,
-        "all CDC SECURITY DEFINER functions must have a locked search_path, \
+        "all CDC SECURITY DEFINER functions must have a locked search_path \
+         (starting with pgtrickle_changes, pgtrickle, pg_catalog), \
          found {without_search_path} without it"
     );
 }
