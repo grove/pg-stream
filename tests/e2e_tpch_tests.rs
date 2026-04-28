@@ -121,29 +121,6 @@ const LARGE_SCALE_DIFFERENTIAL_SKIP: &[&str] = &[
 /// this list is skipped, catching silent regressions as the DVM evolves.
 #[rustfmt::skip]
 const IMMEDIATE_SKIP_ALLOWLIST: &[&str] = &[
-    // q05: multi-table joins produce DVM SQL that exceeds
-    // the Docker container's temp_file_limit (4 GB).
-    "q05",
-    // q07: 6-table comma-join with OR predicate. The IMMEDIATE-mode delta
-    // engine leaves a phantom aggregation group after multi-cycle RF3
-    // UPDATE. EC-01b cross-cycle phantom cleanup (wired into IMMEDIATE in
-    // this commit) handles many cases but does not fully reconcile this
-    // shape — the row_id formula used by the IMMEDIATE delta path
-    // (`row_to_json(sub) || row_number()`) does not match what
-    // `row_id_expr_for_query` produces during full-query reconciliation
-    // for queries whose join PKs do not appear in the output projection.
-    // Tracked separately; the cleanup hook is in place so a future fix
-    // to the row_id formula or delta engine will close the gap.
-    "q07",
-    // q08: 7-table join — largest in TPC-H; exceeds temp_file_limit (4 GB).
-    "q08",
-    // q09: 6-table join exceeds temp_file_limit (4 GB) — same root cause as q05/q08.
-    "q09",
-    // q15: derived-table join filtered by `total_revenue = (SELECT MAX(...))`.
-    // Same row_id-formula mismatch as q07: the IMMEDIATE EC-01b cleanup
-    // hook is now in place but does not yet reconcile this query's
-    // multi-cycle RF3 UPDATE shape. Tracked separately.
-    "q15",
 ];
 
 // ── P3.15: TPCH_STRICT mode ───────────────────────────────────────────

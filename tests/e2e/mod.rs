@@ -717,7 +717,13 @@ impl E2eDb {
         // override this per-transaction for 5+ table join delta queries,
         // but the system-wide cap protects against unlimited growth from
         // other queries (initial full refresh, IMMEDIATE IVM triggers).
-        db.execute("ALTER SYSTEM SET temp_file_limit = '4GB'").await;
+        //
+        // 16 GB rather than 4 GB so the initial full population of
+        // 6/7-table TPC-H joins (q05/q07/q08/q09) — which runs before
+        // DI-11 planner hints can apply since there is no incremental
+        // delta yet — completes without spilling past the cap.
+        db.execute("ALTER SYSTEM SET temp_file_limit = '16GB'")
+            .await;
         // Aggressive autovacuum: change-buffer tables and stream tables
         // accumulate dead tuples rapidly during differential refreshes.
         // Without aggressive settings the default autovacuum can't keep
