@@ -60,7 +60,7 @@ rdkafka = { version = "0.37", optional = true }
 redis = { version = "1.2", features = ["tokio-comp", "streams"], optional = true }
 aws-sdk-sqs = { version = "1.98", optional = true }
 aws-config = { version = "1.8", optional = true }
-lapin = { version = "2", optional = true }
+lapin = { version = "4", optional = true }
 
 [dev-dependencies]
 testcontainers = "0.27"
