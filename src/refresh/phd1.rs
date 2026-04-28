@@ -26,9 +26,9 @@ use pgrx::Spi;
 /// The cleanup runs in batches of `batch_size` rows to avoid holding long
 /// locks. Returns the total number of orphaned rows removed.
 ///
-/// Called after each non-deduplicated, keyed, non-partitioned differential
-/// apply so stale row IDs converge even when the current delta no longer
-/// contains the matching DELETE.
+/// Called after each non-deduplicated, keyed, non-partitioned, join-bearing
+/// differential apply so stale row IDs converge even when the current delta
+/// no longer contains the matching DELETE.
 pub fn cleanup_cross_cycle_phantoms(
     pgt_id: i64,
     stream_table_name: &str,

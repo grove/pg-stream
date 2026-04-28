@@ -2541,24 +2541,36 @@ pub fn execute_differential_refresh(
     // EC-01 / v0.38.0: non-deduplicated join deltas can leave stale row_ids
     // from earlier refresh cycles that are not present in the current delta.
     // After every such differential apply, reconcile the stream table against
-    // the full-query row_id set. This is intentionally unconditional for
-    // keyed, non-partitioned STs: correctness beats the extra anti-join cost.
-    let phantom_cleanup_count =
-        if !resolved.is_deduplicated && !st.has_keyless_source && st.st_partition_key.is_none() {
-            let quoted_table = format!(
-                "\"{}\".\"{}\"",
-                schema.replace('"', "\"\""),
-                name.replace('"', "\"\""),
-            );
-            super::phd1::cleanup_cross_cycle_phantoms(
-                st.pgt_id,
-                &quoted_table,
-                &st.defining_query,
-                10_000,
-            )?
-        } else {
-            0
-        };
+    // the full-query row_id set. Only for join-bearing queries where cross-cycle
+    // phantom rows can materialize from partial delta application.
+    let query_has_join = {
+        let upper = st.defining_query.to_ascii_uppercase();
+        upper.contains(" JOIN ")
+            || upper.contains(" INNER JOIN ")
+            || upper.contains(" LEFT JOIN ")
+            || upper.contains(" RIGHT JOIN ")
+            || upper.contains(" FULL JOIN ")
+            || upper.contains(" CROSS JOIN ")
+    };
+    let phantom_cleanup_count = if query_has_join
+        && !resolved.is_deduplicated
+        && !st.has_keyless_source
+        && st.st_partition_key.is_none()
+    {
+        let quoted_table = format!(
+            "\"{}\".\"{}\"",
+            schema.replace('"', "\"\""),
+            name.replace('"', "\"\""),
+        );
+        super::phd1::cleanup_cross_cycle_phantoms(
+            st.pgt_id,
+            &quoted_table,
+            &st.defining_query,
+            10_000,
+        )?
+    } else {
+        0
+    };
 
     if phantom_cleanup_count > 0
         && has_downstream_st_consumers(st.pgt_id)
