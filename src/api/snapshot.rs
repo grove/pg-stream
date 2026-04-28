@@ -382,8 +382,8 @@ fn restore_from_snapshot_impl(name: &str, source: &str) -> Result<(), PgTrickleE
     // storage table is left on crash and concurrent refreshes are blocked.
     let subtxn = SnapSubTransaction::begin();
 
+    // nosemgrep: rust.spi.run.dynamic-format — DDL cannot be parameterized; storage_fqn is a double-quoted and escaped catalog identifier.
     let lock_result = Spi::run(&format!(
-        // nosemgrep: rust.spi.run.dynamic-format — DDL cannot be parameterized; storage_fqn is a double-quoted and escaped catalog identifier.
         "LOCK TABLE {} IN ACCESS EXCLUSIVE MODE",
         storage_fqn
     ))

@@ -417,7 +417,7 @@ END;
 $$;
 
 -- Revoke direct table access from the relay role; all mutations go through
--- the SECURITY DEFINER API functions.
+-- the SECURITY DEFINER API functions. -- nosemgrep: sql.security-definer.present
 REVOKE ALL ON pgtrickle.relay_outbox_config    FROM pgtrickle_relay;
 REVOKE ALL ON pgtrickle.relay_inbox_config     FROM pgtrickle_relay;
 REVOKE ALL ON pgtrickle.relay_consumer_offsets FROM pgtrickle_relay;
