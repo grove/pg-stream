@@ -1600,12 +1600,29 @@ fn validate_and_parse_query(
         && topk_info.is_none()
     {
         match crate::dvm::parse_defining_query_full(q) {
-            Ok(tree) => {
+            Ok(mut tree) => {
                 // Emit advisory warnings (e.g. NATURAL JOIN column drift) exactly
                 // once here — downstream parse calls (cache pre-warm, row-id
                 // derivation) silently discard them via ParseResult.warnings.
                 for msg in &tree.warnings {
                     pgrx::warning!("{}", msg);
+                }
+                // F4 (v0.37.0): Reclassify avg/sum on vector-typed columns to
+                // VectorAvg/VectorSum (group-rescan strategy) so that
+                // avg_aux_columns() does not create algebraic aux columns for
+                // vector types (COALESCE(vec_col, 0) is not valid for vectors).
+                if crate::config::pg_trickle_enable_vector_agg() {
+                    let source_oids = {
+                        let mut oids = tree.tree.source_oids();
+                        oids.extend(tree.cte_registry.source_oids());
+                        oids.sort_unstable();
+                        oids.dedup();
+                        oids
+                    };
+                    let vector_cols = crate::dvm::resolve_vector_columns_for_sources(&source_oids);
+                    if !vector_cols.is_empty() {
+                        crate::dvm::reclassify_vector_aggregates(&mut tree.tree, &vector_cols);
+                    }
                 }
                 Some(tree)
             }

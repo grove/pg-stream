@@ -676,15 +676,16 @@ async fn test_outbox_written_after_manual_full_refresh() {
     );
 }
 
-/// OUTBOX-1e: `enable_outbox()` on an IMMEDIATE-mode stream table must return
-/// `OutboxRequiresNotImmediateMode`.  IMMEDIATE refreshes fire inside every
-/// source transaction; the design explicitly rejects the outbox for this mode
-/// to avoid adding an INSERT on every application write.
+/// Gap-1 regression: outbox must be written after a manual IMMEDIATE-mode refresh.
+/// IMMEDIATE mode routes to `execute_manual_full_refresh`; the centralized
+/// outbox write introduced in #682 runs for all refresh modes including IMMEDIATE.
 #[tokio::test]
-async fn test_enable_outbox_rejected_for_immediate_mode() {
+async fn test_outbox_written_after_manual_immediate_refresh() {
     let db = E2eDb::new().await.with_extension().await;
 
     db.execute("CREATE TABLE gap1_imm_src (id INT PRIMARY KEY, val TEXT)")
+        .await;
+    db.execute("INSERT INTO gap1_imm_src VALUES (1, 'x'), (2, 'y')")
         .await;
     db.create_st(
         "gap1_imm_st",
@@ -693,19 +694,26 @@ async fn test_enable_outbox_rejected_for_immediate_mode() {
         "IMMEDIATE",
     )
     .await;
+    db.execute("SELECT pgtrickle.enable_outbox('gap1_imm_st')")
+        .await;
 
-    let result = db
-        .try_execute("SELECT pgtrickle.enable_outbox('gap1_imm_st')")
+    let outbox_name: String = db
+        .query_scalar(
+            "SELECT outbox_table_name FROM pgtrickle.pgt_outbox_config \
+             WHERE stream_table_name = 'gap1_imm_st'",
+        )
+        .await;
+
+    db.execute("INSERT INTO gap1_imm_src VALUES (3, 'z')").await;
+    db.refresh_st("gap1_imm_st").await;
+
+    let count: i64 = db
+        .query_scalar(&format!("SELECT count(*) FROM pgtrickle.\"{outbox_name}\""))
         .await;
     assert!(
-        result.is_err(),
-        "enable_outbox on an IMMEDIATE-mode stream table should fail"
-    );
-    let err = result.unwrap_err().to_string();
-    assert!(
-        err.contains("outbox requires deferred refresh mode"),
-        "expected OutboxRequiresNotImmediateMode error, got: {}",
-        err
+        count >= 1,
+        "outbox must contain at least one row after a manual IMMEDIATE refresh \
+         (Gap-1 regression test)"
     );
 }
 

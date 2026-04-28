@@ -19,9 +19,6 @@ use e2e::E2eDb;
 
 async fn setup_pgvector(db: &E2eDb) {
     db.execute("CREATE EXTENSION IF NOT EXISTS vector").await;
-    db.execute("ALTER SYSTEM SET pg_trickle.enable_vector_agg = on")
-        .await;
-    db.reload_config_and_wait().await;
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -50,7 +47,11 @@ async fn test_pgvector_avg_centroid_insert() {
     .await;
 
     let q = "SELECT user_id, avg(embedding) AS centroid FROM embeddings GROUP BY user_id";
-    db.create_st("centroid_st", q, "1m", "DIFFERENTIAL").await;
+    let create_sql = format!(
+        "SELECT pgtrickle.create_stream_table('centroid_st', $${q}$$, '1m', 'DIFFERENTIAL')"
+    );
+    db.execute_seq(&["SET pg_trickle.enable_vector_agg = on", &create_sql])
+        .await;
     db.assert_st_matches_query("centroid_st", q).await;
 
     // INSERT new embedding for user 1
@@ -88,7 +89,10 @@ async fn test_pgvector_avg_centroid_update() {
     .await;
 
     let q = "SELECT user_id, avg(embedding) AS centroid FROM emb_upd GROUP BY user_id";
-    db.create_st("centroid_upd_st", q, "1m", "DIFFERENTIAL")
+    let create_sql = format!(
+        "SELECT pgtrickle.create_stream_table('centroid_upd_st', $${q}$$, '1m', 'DIFFERENTIAL')"
+    );
+    db.execute_seq(&["SET pg_trickle.enable_vector_agg = on", &create_sql])
         .await;
     db.assert_st_matches_query("centroid_upd_st", q).await;
 
@@ -121,7 +125,10 @@ async fn test_pgvector_avg_centroid_delete() {
     .await;
 
     let q = "SELECT user_id, avg(embedding) AS centroid FROM emb_del GROUP BY user_id";
-    db.create_st("centroid_del_st", q, "1m", "DIFFERENTIAL")
+    let create_sql = format!(
+        "SELECT pgtrickle.create_stream_table('centroid_del_st', $${q}$$, '1m', 'DIFFERENTIAL')"
+    );
+    db.execute_seq(&["SET pg_trickle.enable_vector_agg = on", &create_sql])
         .await;
     db.assert_st_matches_query("centroid_del_st", q).await;
 
@@ -163,7 +170,11 @@ async fn test_pgvector_sum_differential() {
     .await;
 
     let q = "SELECT grp, sum(embedding) AS total_vec FROM emb_sum_src GROUP BY grp";
-    db.create_st("vec_sum_st", q, "1m", "DIFFERENTIAL").await;
+    let create_sql = format!(
+        "SELECT pgtrickle.create_stream_table('vec_sum_st', $${q}$$, '1m', 'DIFFERENTIAL')"
+    );
+    db.execute_seq(&["SET pg_trickle.enable_vector_agg = on", &create_sql])
+        .await;
     db.assert_st_matches_query("vec_sum_st", q).await;
 
     // INSERT
@@ -243,7 +254,10 @@ async fn test_pgvector_hnsw_index_on_stream_table() {
     .await;
 
     let q = "SELECT user_id, avg(embedding) AS centroid FROM emb_hnsw_src GROUP BY user_id";
-    db.create_st("centroid_hnsw_st", q, "1m", "DIFFERENTIAL")
+    let create_sql = format!(
+        "SELECT pgtrickle.create_stream_table('centroid_hnsw_st', $${q}$$, '1m', 'DIFFERENTIAL')"
+    );
+    db.execute_seq(&["SET pg_trickle.enable_vector_agg = on", &create_sql])
         .await;
     db.assert_st_matches_query("centroid_hnsw_st", q).await;
 

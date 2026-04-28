@@ -717,7 +717,7 @@ fn resolve_buffer_names_for_sources(source_oids: &[u32]) -> HashMap<u32, String>
 /// Called from `generate_delta_query` when `enable_vector_agg` is on.
 /// Non-fatal: if SPI is unavailable (e.g. unit-test context), returns empty map.
 #[cfg(feature = "pg18")]
-fn resolve_vector_columns_for_sources(
+pub(crate) fn resolve_vector_columns_for_sources(
     source_oids: &[u32],
 ) -> HashMap<u32, std::collections::HashSet<String>> {
     use pgrx::prelude::*;
@@ -760,7 +760,7 @@ fn resolve_vector_columns_for_sources(
 }
 
 #[cfg(not(feature = "pg18"))]
-fn resolve_vector_columns_for_sources(
+pub(crate) fn resolve_vector_columns_for_sources(
     _source_oids: &[u32],
 ) -> HashMap<u32, std::collections::HashSet<String>> {
     HashMap::new()
@@ -773,7 +773,7 @@ fn resolve_vector_columns_for_sources(
 /// For vector-typed argument columns, the DVM must use the group-rescan strategy
 /// (re-aggregating affected groups) instead of the algebraic auxiliary-column
 /// strategy (which generates `COALESCE(st.col, 0) + delta` — invalid for vectors).
-fn reclassify_vector_aggregates(
+pub(crate) fn reclassify_vector_aggregates(
     tree: &mut parser::OpTree,
     vector_cols: &HashMap<u32, std::collections::HashSet<String>>,
 ) {
