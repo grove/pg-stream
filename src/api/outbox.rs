@@ -87,7 +87,6 @@ pub(crate) fn get_outbox_table_name(pgt_id: i64) -> Option<String> {
 ///
 /// # Errors
 /// - `OutboxAlreadyEnabled` if outbox is already active for this ST.
-/// - `OutboxRequiresNotImmediateMode` if the ST uses IMMEDIATE refresh mode.
 #[pg_extern(schema = "pgtrickle")]
 pub fn enable_outbox(p_name: &str, p_retention_hours: default!(i32, 24)) {
     enable_outbox_impl(p_name, p_retention_hours).unwrap_or_else(|e| pgrx::error!("{}", e))
@@ -100,14 +99,6 @@ fn enable_outbox_impl(name: &str, retention_hours: i32) -> Result<(), PgTrickleE
     // Check not already enabled
     if is_outbox_enabled(meta.pgt_id) {
         return Err(PgTrickleError::OutboxAlreadyEnabled(format!(
-            "{}.{}",
-            schema, st_name
-        )));
-    }
-
-    // Check refresh mode is not IMMEDIATE
-    if meta.refresh_mode.is_immediate() {
-        return Err(PgTrickleError::OutboxRequiresNotImmediateMode(format!(
             "{}.{}",
             schema, st_name
         )));
