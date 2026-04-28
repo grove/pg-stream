@@ -111,6 +111,33 @@
 | [Error Budgets for Stream Tables](error-budgets.md) | SRE-style freshness monitoring: `sla_summary()` with p50/p99 latency, staleness tracking, error budget consumption, alerting thresholds, and Prometheus integration. |
 | [Structured Logging and OpenTelemetry for Stream Tables](structured-logging.md) | `log_format = json` emits structured events with `cycle_id` correlation. Event taxonomy, log aggregator integration (Loki, Datadog, Elasticsearch), and OpenTelemetry compatibility. |
 
+### Analytics & Feature Engineering
+
+| Post | Summary |
+|------|---------|
+| [Funnel Analysis and Cohort Retention at Scale](funnel-analysis-cohort-retention.md) | Computing conversion funnels, retention matrices, and session aggregates incrementally — keeping product analytics live without billion-row scans. |
+| [Incremental ML Feature Engineering in PostgreSQL](incremental-ml-feature-engineering.md) | Replace nightly feature store batch jobs with continuously fresh features: rolling windows, lag features, cross-entity comparisons, all maintained as stream tables. |
+| [Time-Series Downsampling Without TimescaleDB](time-series-downsampling.md) | Hourly, daily, and monthly rollups maintained incrementally from raw sensor data — cascading stream tables as a lightweight alternative to a dedicated TSDB. |
+| [Incremental Statistical Aggregates: stddev, Percentiles, and Histograms](incremental-statistical-aggregates.md) | Which higher-order statistics (variance, correlation, histograms) can be maintained exactly, which need approximations, and the space-accuracy trade-offs. |
+
+### Data Patterns & Domain Applications
+
+| Post | Summary |
+|------|---------|
+| [Event Sourcing Read Models Without Replay](event-sourcing-read-models.md) | Project live read-optimized views from an append-only event store without replaying history — order status, revenue analytics, and inventory projections as stream tables. |
+| [Soft Deletes and Tombstone Management in Differential IVM](soft-deletes-tombstone-management.md) | How `deleted_at` patterns interact with delta propagation, ghost row pitfalls, cascading visibility, and best practices for correct stream tables over soft-deletable data. |
+| [Compliance and Audit Trails with Append-Only Stream Tables](compliance-audit-trails.md) | GDPR-compliant, tamper-evident audit logs: right-to-erasure reconciliation, hash chains, access pattern monitoring, and retention policies — all incrementally maintained. |
+| [Incremental Full-Text Search with tsvector](incremental-fulltext-search.md) | Maintain ranked search results incrementally as documents change — tracked queries, faceted counts, and top-K ranking without re-indexing the corpus. |
+| [Incremental PageRank and Graph Analytics in SQL](incremental-pagerank-graph-analytics.md) | Live PageRank, connected components, and shortest-path metrics maintained inside PostgreSQL as stream tables — no graph database required. |
+| [PostGIS + pg_trickle: Incremental Geospatial Aggregates](postgis-incremental-geospatial.md) | Heatmaps, geofencing, spatial clustering, and distance-based aggregation that update in milliseconds as new points arrive. |
+
+### Deployment & Multi-Tenancy
+
+| Post | Summary |
+|------|---------|
+| [High Availability Failover with pg_trickle and Patroni](ha-failover-patroni.md) | How stream table state survives primary switchover, WAL replay semantics for change buffers, split-brain prevention, and zero-data-loss configuration. |
+| [Parameterized Stream Tables: Building a SQL View Library](parameterized-stream-tables.md) | Patterns for reusable, tenant-scoped, and versionable stream table definitions: single-table multi-tenant, template functions, schema isolation, and composable building blocks. |
+
 ### Performance Internals
 
 | Post | Summary |
