@@ -37,6 +37,20 @@ path = "fuzz_targets/cdc_fuzz.rs"
 test = false
 doc = false
 
+# FUZZ-4 (v0.39.0): WAL/SQLSTATE error classifier fuzz target (O39-12).
+[[bin]]
+name = "wal_fuzz"
+path = "fuzz_targets/wal_fuzz.rs"
+test = false
+doc = false
+
+# FUZZ-5 (v0.39.0): DAG/merge SQL / snapshot column-list fuzz target (O39-12).
+[[bin]]
+name = "dag_fuzz"
+path = "fuzz_targets/dag_fuzz.rs"
+test = false
+doc = false
+
 [dependencies]
 libfuzzer-sys = "0.4"
 pg_trickle = { path = "..", features = [] }

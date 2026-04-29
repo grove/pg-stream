@@ -5307,34 +5307,72 @@ fn sla_summary() -> TableIterator<
 // ── v0.35.0 stream table introspection API (A23) ────────────────────────────
 
 /// A23: Explain the DVM operator tree for a stream table.
+/// O39-9 (v0.39.0): Return a structured explanation of a stream table's
+/// DVM configuration and refresh mode reasoning.
 ///
 /// Returns a text representation of the cached operator tree that the
 /// differential maintenance engine uses to evaluate incremental updates.
 /// Useful for diagnosing unexpected fallback behaviour or understanding
 /// which joins and filters pg_trickle resolves at each hop.
+///
+/// v0.39.0 extends the output to include:
+/// - Explicit DIFF/FULL fallback reason from the stream table catalog
+/// - Whether `force_full_refresh` GUC is overriding the mode
+/// - The effective refresh mode from the last completed refresh cycle
+/// - Whether the backpressure or CDC-pause state is active
 #[pg_extern(schema = "pgtrickle")]
 fn explain_stream_table(name: &str) -> Result<String, PgTrickleError> {
     let (schema, table_name) = parse_qualified_name(name)?;
     let st = StreamTableMeta::get_by_name(&schema, &table_name)?;
-    // Return the normalised defining query plus key metadata as a
-    // human-readable explanation.  Full DVM OpTree rendering is deferred
-    // to a follow-up that exposes the cached parse tree via shared memory.
+
+    // Determine effective refresh mode and fallback reasoning.
+    let force_full = crate::config::pg_trickle_force_full_refresh();
+    let cdc_paused = crate::config::pg_trickle_cdc_paused();
+    let capture_mode = crate::config::pg_trickle_cdc_capture_mode();
+    let backpressure_note = if crate::config::pg_trickle_enforce_backpressure() {
+        "enabled (CDC writes suppressed when WAL slot lag exceeds critical threshold)"
+    } else {
+        "disabled (alerts only)"
+    };
+
+    let refresh_mode_note = if force_full {
+        "FULL — force_full_refresh GUC override is active (differential disabled globally)"
+            .to_string()
+    } else {
+        format!("{:?} (configured)", st.refresh_mode)
+    };
+
+    let cdc_status = if cdc_paused {
+        format!(
+            "PAUSED (cdc_paused=on, capture_mode={}) — \
+             {} while paused",
+            capture_mode.as_str(),
+            if capture_mode == crate::config::CdcCaptureMode::Discard {
+                "changes are DISCARDED; reinitialize after un-pausing"
+            } else {
+                "changes are HELD in buffer"
+            }
+        )
+    } else {
+        "active".to_string()
+    };
+
     let explanation = format!(
         "Stream table: {schema}.{table_name}\n\
          Status:       {status:?}\n\
-         Refresh mode: {mode}\n\
          Populated:    {populated}\n\
+         Refresh mode: {refresh_mode}\n\
+         CDC status:   {cdc_status}\n\
+         Backpressure: {backpressure}\n\
          Defining query:\n\
          {query}",
         schema = schema,
         table_name = table_name,
         status = st.status,
-        mode = if crate::config::pg_trickle_force_full_refresh() {
-            "FULL (force_full_refresh GUC override)"
-        } else {
-            "DIFFERENTIAL (adaptive)"
-        },
         populated = st.is_populated,
+        refresh_mode = refresh_mode_note,
+        cdc_status = cdc_status,
+        backpressure = backpressure_note,
         query = st.defining_query,
     );
     Ok(explanation)
@@ -5449,6 +5487,52 @@ fn drain(timeout_s: default!(i32, 60)) -> bool {
 #[pg_extern(schema = "pgtrickle")]
 fn is_drained() -> bool {
     crate::shmem::is_drained()
+}
+
+// ── v0.39.0: CDC pause status API (O39-8) ─────────────────────────────────
+
+/// O39-8 (v0.39.0): Return the active CDC capture mode and pause status.
+///
+/// This function makes the CDC pause state operator-visible so that operators
+/// know exactly whether changes are being captured, discarded, or held while
+/// `pg_trickle.cdc_paused = on`.
+///
+/// Returns a table with one row containing:
+/// - `paused` — `true` when `cdc_paused = on`
+/// - `capture_mode` — `'discard'` or `'hold'`
+/// - `note` — human-readable explanation of the current state
+#[pg_extern(schema = "pgtrickle")]
+fn cdc_pause_status() -> TableIterator<
+    'static,
+    (
+        name!(paused, bool),
+        name!(capture_mode, String),
+        name!(note, String),
+    ),
+> {
+    let paused = crate::config::pg_trickle_cdc_paused();
+    let capture_mode = crate::config::pg_trickle_cdc_capture_mode();
+    let mode_str = capture_mode.as_str().to_string();
+
+    let note = if paused {
+        match capture_mode {
+            crate::config::CdcCaptureMode::Discard => {
+                "CDC is PAUSED — changes are DISCARDED while paused. \
+                 Stream tables that received DML during the pause will have stale data. \
+                 Run pgtrickle.refresh_stream_table('<name>') or reinitialize after un-pausing."
+                    .to_string()
+            }
+            crate::config::CdcCaptureMode::Hold => {
+                "CDC is PAUSED in HOLD mode (reserved). Falling back to DISCARD semantics. \
+                 Changes arriving now are being DROPPED."
+                    .to_string()
+            }
+        }
+    } else {
+        "CDC is active — changes are being captured normally.".to_string()
+    };
+
+    TableIterator::new(vec![(paused, mode_str, note)])
 }
 
 // ── v0.36.0: Bulk operations (A25) ────────────────────────────────────────

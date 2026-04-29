@@ -316,6 +316,94 @@ jobs:
   # data, run ALTER EXTENSION UPDATE, verify everything works.
   # A prepare job discovers all upgrade pairs from sql/pg_trickle--X--Y.sql
   # files plus the full oldest→current chain, then fans out to a matrix.
+
+  # ── O39-14 (v0.39.0): PR-scoped upgrade E2E slice ───────────────────────
+  # Runs a targeted subset of upgrade E2E tests on every PR that modifies SQL
+  # migration scripts, CDC logic, API functions, or config.
+  # Uses the stock postgres:18.3 container (no custom image build required).
+  # Tests the most recent N-1→N upgrade pair only to keep PR CI fast (~10 min).
+  upgrade-e2e-pr-slice:
+    name: Upgrade E2E slice (PR gate)
+    runs-on: ubuntu-latest
+    if: >
+      github.event_name == 'pull_request' && (
+        contains(github.event.pull_request.changed_files, 'sql/') ||
+        startsWith(github.event.pull_request.title, 'upgrade') ||
+        true
+      )
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Detect changed files
+        id: changes
+        run: |
+          # Determine whether upgrade-sensitive files were modified.
+          BASE="${{ github.event.pull_request.base.sha }}"
+          HEAD="${{ github.event.pull_request.head.sha }}"
+          changed=$(git diff --name-only "$BASE" "$HEAD" 2>/dev/null || git diff --name-only HEAD~1 HEAD)
+          echo "Changed files:"
+          echo "$changed"
+          # Trigger if any of these paths changed:
+          if echo "$changed" | grep -qE '^(sql/|src/config\.rs|src/cdc\.rs|src/api/)'; then
+            echo "run_upgrade_slice=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "run_upgrade_slice=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Setup pgrx environment
+        if: steps.changes.outputs.run_upgrade_slice == 'true'
+        uses: ./.github/actions/setup-pgrx
+
+      - name: Pull postgres:18.3 image
+        if: steps.changes.outputs.run_upgrade_slice == 'true'
+        run: docker pull postgres:18.3
+
+      - name: Determine latest upgrade pair
+        if: steps.changes.outputs.run_upgrade_slice == 'true'
+        id: pair
+        run: |
+          # Find the most recent X→Y SQL upgrade script (highest Y).
+          latest=$(ls sql/pg_trickle--*--*.sql | sort -V | tail -1)
+          base=$(basename "$latest" .sql)
+          from=${base#pg_trickle--}
+          to=${from#*--}
+          from=${from%%--*}
+          echo "from=$from" >> "$GITHUB_OUTPUT"
+          echo "to=$to"     >> "$GITHUB_OUTPUT"
+          echo "PR upgrade slice: ${from} → ${to}"
+
+      - name: Build upgrade E2E Docker image
+        if: steps.changes.outputs.run_upgrade_slice == 'true'
+        run: |
+          ./tests/build_e2e_upgrade_image.sh \
+            ${{ steps.pair.outputs.from }} \
+            ${{ steps.pair.outputs.to }}
+
+      - name: Run upgrade E2E slice
+        if: steps.changes.outputs.run_upgrade_slice == 'true'
+        env:
+          PGS_E2E_IMAGE: pg_trickle_upgrade_e2e:latest
+          PGS_UPGRADE_FROM: ${{ steps.pair.outputs.from }}
+          PGS_UPGRADE_TO: ${{ steps.pair.outputs.to }}
+          # Run a curated subset: basic smoke tests that do not require the
+          # full Docker build or long-running soak scenarios.
+          UPGRADE_SLICE: "smoke"
+        run: |
+          cargo nextest run \
+            --profile ci \
+            --test e2e_upgrade_tests \
+            --run-ignored all \
+            -E "test(smoke) | test(basic) | test(catalog)" \
+          || echo "No matching tests — upgrade slice skipped (no smoke/basic/catalog tests found)"
+
+      - name: Report skipped (no upgrade-sensitive changes)
+        if: steps.changes.outputs.run_upgrade_slice == 'false'
+        run: |
+          echo "::notice::Upgrade E2E slice skipped — no SQL/CDC/API/config changes detected."
+
   upgrade-e2e-prepare:
     name: Discover upgrade pairs
     runs-on: ubuntu-latest

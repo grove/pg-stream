@@ -791,6 +791,245 @@ No breaking changes.  Non-Citus deployments are completely unaffected.
 
 ---
 
+### 0.34.0 → 0.35.0
+
+**New catalog columns** added to `pgtrickle.pgt_stream_tables`:
+
+| Column | Type | Default | Purpose |
+|--------|------|---------|---------|
+| `in_shadow_build` | `BOOLEAN NOT NULL` | `FALSE` | Whether this stream table is currently undergoing zero-downtime schema evolution |
+| `shadow_table_name` | `TEXT` | `NULL` | Name of the shadow table being built during schema evolution |
+
+**New catalog table:**
+
+| Table | Purpose |
+|-------|---------|
+| `pgtrickle.pgt_subscriptions` | Stores reactive subscription registrations (NOTIFY channel → stream table mappings) |
+
+**New SQL functions:**
+
+| Function | Purpose |
+|----------|---------|
+| `pgtrickle.subscribe(stream_table TEXT, channel TEXT)` | Register a NOTIFY channel to fire after each refresh cycle |
+| `pgtrickle.unsubscribe(stream_table TEXT, channel TEXT)` | Remove a subscription |
+| `pgtrickle.list_subscriptions()` | List all active subscriptions |
+| `pgtrickle.sla_summary()` | Return p50/p99 latency, freshness lag, error rate, and budget over the SLA window |
+| `pgtrickle.explain_stream_table(name TEXT)` | Human-readable DVM configuration and refresh mode explanation |
+| `pgtrickle.view_evolution_status()` | Status of in-progress shadow table builds |
+
+**Behavioral notes:**
+
+- Zero-downtime schema evolution (`ALTER STREAM TABLE`) now builds a shadow table
+  in the background and cuts over atomically. The `in_shadow_build` column tracks
+  progress; check `pgtrickle.view_evolution_status()` to monitor.
+- `pgtrickle.sla_summary()` queries `pgt_refresh_history` using the
+  `pg_trickle.sla_window_hours` GUC (default 24 h).
+- Reactive subscriptions emit `pg_notify(channel, '')` after each non-empty
+  refresh cycle. Debounce interval is controlled by `pg_trickle.notify_coalesce_ms`.
+
+**New GUCs:**
+
+| GUC | Default | Description |
+|-----|---------|-------------|
+| `pg_trickle.cdc_paused` | `false` | Pause CDC trigger writes (discard mode — see CONFIGURATION.md) |
+| `pg_trickle.notify_coalesce_ms` | `250` | Debounce window (ms) for reactive subscription NOTIFY calls |
+| `pg_trickle.sla_window_hours` | `24` | Reporting window (h) for `sla_summary()` |
+| `pg_trickle.history_prune_interval_seconds` | `60` | Interval between `pgt_refresh_history` cleanup sweeps |
+
+**Migration note:**
+
+```sql
+ALTER EXTENSION pg_trickle UPDATE TO '0.35.0';
+```
+
+No breaking changes. All v0.34.0 functions continue to work.
+
+---
+
+### 0.35.0 → 0.36.0
+
+**New catalog columns** added to `pgtrickle.pgt_stream_tables`:
+
+| Column | Type | Default | Purpose |
+|--------|------|---------|---------|
+| `temporal_mode` | `BOOLEAN NOT NULL` | `FALSE` | Enable temporal IVM (SCD Type 2) tracking |
+| `storage_backend` | `TEXT NOT NULL` | `'heap'` | Storage backend: `'heap'`, `'citus'`, or `'pg_mooncake'` |
+| `column_lineage` | `JSONB` | `NULL` | Column-level lineage mapping output columns to source tables/columns |
+
+**New SQL functions:**
+
+| Function | Purpose |
+|----------|---------|
+| `pgtrickle.drain(timeout_s INT)` | Gracefully quiesce all in-flight refreshes |
+| `pgtrickle.is_drained()` | Check whether the scheduler is fully drained |
+| `pgtrickle.bulk_alter_stream_tables(names TEXT[], params JSONB)` | Alter multiple stream tables in one call |
+| `pgtrickle.bulk_drop_stream_tables(names TEXT[])` | Drop multiple stream tables in one call |
+| `pgtrickle.stream_table_lineage(name TEXT)` | Return column-level lineage for a stream table |
+| `pgtrickle.exec_stream_ddl(cmd TEXT)` | Execute DDL in the stream-table DDL sandbox |
+
+**Updated function signatures:**
+
+- `pgtrickle.create_stream_table(...)` gains `temporal BOOLEAN DEFAULT FALSE` and `storage_backend TEXT DEFAULT 'heap'` parameters.
+
+**Behavioral notes:**
+
+- **Temporal IVM (CORR-1):** Stream tables created with `temporal := true` maintain SCD Type 2 history. Each row carries `__pgt_valid_from TIMESTAMPTZ` and `__pgt_valid_to TIMESTAMPTZ`. Existing tables are unaffected.
+- **Alternative storage backends:** `storage_backend = 'citus'` creates the stream table storage as a Citus distributed table; `'pg_mooncake'` uses columnar storage. Both require the respective extensions to be installed.
+- **Drain mode (A35):** `pgtrickle.drain()` is a safety mechanism for maintenance windows. The scheduler completes all in-flight refreshes, then stops dispatching new ones until the drain is cancelled or the server restarts.
+- **WAL slot backpressure (A12):** The `pg_trickle.enforce_backpressure` GUC is now wired — when slot lag exceeds `slot_lag_critical_threshold_mb`, CDC writes are suppressed. See `CONFIGURATION.md` for details and the **discard semantics** of `cdc_paused`.
+
+**New GUCs:**
+
+| GUC | Default | Description |
+|-----|---------|-------------|
+| `pg_trickle.enforce_backpressure` | `false` | Suppress CDC writes when WAL slot lag exceeds critical threshold |
+| `pg_trickle.log_format` | `'text'` | Structured log format: `'text'` or `'json'` |
+| `pg_trickle.temporal_stream_tables` | `false` | Master switch for temporal IVM support |
+
+**TRUNCATE and CDC semantics:** When `pg_trickle.cdc_paused = on`, CDC trigger
+bodies return `NULL` — changes are **discarded**. This is the discard mode.
+After un-pausing, stream tables must be reinitialized (FULL refresh) to
+recover from the gap. A future `cdc_capture_mode = 'hold'` option is planned.
+
+**Migration note:**
+
+```sql
+ALTER EXTENSION pg_trickle UPDATE TO '0.36.0';
+```
+
+No breaking changes. The `column_lineage` column is additive. The
+`temporal_mode` and `storage_backend` columns have safe defaults.
+
+---
+
+### 0.36.0 → 0.37.0
+
+**Schema change:** All existing change buffer tables in
+`pgtrickle_changes.*` gain a `__pgt_trace_context TEXT` column via dynamic
+`ALTER TABLE`. This is applied automatically by the upgrade script.
+
+**Behavioral notes:**
+
+- **W3C Trace Context (F10):** When `pg_trickle.enable_trace_propagation = true`,
+  CDC triggers capture the session `pg_trickle.trace_id` GUC into the
+  `__pgt_trace_context` column. At refresh time, the stored trace context is
+  propagated to any OTLP span exported to `pg_trickle.otel_endpoint`.
+- **pgVectorMV (F4):** `avg(vector_col)` and `sum(vector_col)` in defining
+  queries are now handled incrementally when `pg_trickle.enable_vector_agg =
+  true`. Requires pgvector ≥ 0.7.0.
+
+**New GUCs:**
+
+| GUC | Default | Description |
+|-----|---------|-------------|
+| `pg_trickle.enable_vector_agg` | `false` | Enable incremental vector aggregate operators |
+| `pg_trickle.enable_trace_propagation` | `false` | Enable W3C Trace Context propagation |
+| `pg_trickle.otel_endpoint` | `''` | OTLP/gRPC endpoint for span export (empty = off) |
+| `pg_trickle.trace_id` | `''` | Session-level W3C traceparent header |
+
+**Migration note:**
+
+```sql
+ALTER EXTENSION pg_trickle UPDATE TO '0.37.0';
+```
+
+The upgrade script applies `ALTER TABLE ... ADD COLUMN IF NOT EXISTS
+__pgt_trace_context TEXT` to each existing change buffer table. This is
+idempotent and safe for large installations. Expect a brief metadata lock
+on each buffer table during the upgrade.
+
+No breaking changes. The `__pgt_trace_context` column is `NULL` unless
+`enable_trace_propagation = true` and a session trace_id is set.
+
+---
+
+### 0.37.0 → 0.38.0
+
+**No schema changes.** This is a correctness and diagnostic release.
+
+**Behavioral notes:**
+
+- **EC-01 correctness closeout:** Join phantom row elimination is complete.
+  Property tests now prove convergence across join patterns including three-way
+  joins with simultaneous multi-side deletes.
+- **Fuzz regression fixes:** All known fuzz corpus failures are resolved.
+
+**Migration note:**
+
+```sql
+ALTER EXTENSION pg_trickle UPDATE TO '0.38.0';
+```
+
+No breaking changes.
+
+---
+
+### 0.38.0 → 0.39.0
+
+**New SQL function:**
+
+| Function | Purpose |
+|----------|---------|
+| `pgtrickle.cdc_pause_status()` | Return the active CDC pause state: paused flag, capture mode, and operator guidance |
+
+**Extended SQL function:**
+
+- `pgtrickle.explain_stream_table(name TEXT)` — now includes CDC status, backpressure state, and explicit DIFF/FULL reasoning.
+
+**New GUC:**
+
+| GUC | Default | Description |
+|-----|---------|-------------|
+| `pg_trickle.cdc_capture_mode` | `'discard'` | CDC semantics when `cdc_paused=on`: `'discard'` (default, drops changes) or `'hold'` (reserved) |
+
+**Behavioral notes:**
+
+- **O39-2 wake truthfulness:** Setting `pg_trickle.event_driven_wake = on`
+  now explicitly emits a `WARNING` that LISTEN is not supported in background
+  workers. The scheduler remains in polling-only mode regardless of the GUC.
+  The warning can be suppressed by setting `event_driven_wake = off`.
+- **O39-6 SQLSTATE-first retry:** When `use_sqlstate_classification = true`
+  (default), scheduler retry decisions use the bracketed SQLSTATE code from
+  `PgTrickleError::SpiErrorCode` instead of English error message text,
+  making retry behavior locale-independent.
+- **O39-8 CDC capture mode:** The `cdc_paused` discard semantics are now
+  explicitly documented and operator-visible via `pgtrickle.cdc_pause_status()`.
+  The `cdc_capture_mode` GUC is reserved for a future hold mode.
+
+**TRUNCATE/CDC semantics (explicit):**
+
+When `pg_trickle.cdc_paused = on`:
+
+- `cdc_capture_mode = 'discard'` (default): All DML against source tables
+  passes through the CDC trigger, but the trigger returns `NULL` immediately
+  without writing to the change buffer. **Changes are permanently lost.**
+  After un-pausing, run a FULL refresh on any stream table that received DML
+  during the pause:
+  ```sql
+  SELECT pgtrickle.refresh_stream_table('my_stream', 'FULL');
+  ```
+- `cdc_capture_mode = 'hold'`: Not yet implemented. Emits a `WARNING` and
+  falls back to `'discard'`.
+
+When `TRUNCATE` occurs on a source table:
+
+- In trigger-based CDC mode, the TRUNCATE trigger calls `pgtrickle.pgt_ivm_handle_truncate()`
+  which schedules a FULL refresh. If `cdc_paused = on`, the trigger returns
+  `NULL` and the TRUNCATE is **not recorded**. After un-pausing, the stream
+  table will not be aware that a TRUNCATE occurred — reinitialize explicitly.
+- In WAL-based CDC mode, TRUNCATEs are detected during the next logical
+  decoding poll and scheduled for FULL refresh.
+
+**Migration note:**
+
+```sql
+ALTER EXTENSION pg_trickle UPDATE TO '0.39.0';
+```
+
+No catalog schema changes. The upgrade script is a no-op DDL-wise.
+
+---
+
 ## Supported Upgrade Paths
 
 The following migration hops are available. PostgreSQL chains them
@@ -834,8 +1073,13 @@ automatically when you run `ALTER EXTENSION pg_trickle UPDATE`.
 | 0.31.0 | 0.32.0 | `pg_trickle--0.31.0--0.32.0.sql` |
 | 0.32.0 | 0.33.0 | `pg_trickle--0.32.0--0.33.0.sql` |
 | 0.33.0 | 0.34.0 | `pg_trickle--0.33.0--0.34.0.sql` |
+| 0.34.0 | 0.35.0 | `pg_trickle--0.34.0--0.35.0.sql` |
+| 0.35.0 | 0.36.0 | `pg_trickle--0.35.0--0.36.0.sql` |
+| 0.36.0 | 0.37.0 | `pg_trickle--0.36.0--0.37.0.sql` |
+| 0.37.0 | 0.38.0 | `pg_trickle--0.37.0--0.38.0.sql` |
+| 0.38.0 | 0.39.0 | `pg_trickle--0.38.0--0.39.0.sql` |
 
-Any installation from 0.1.3 onward can be upgraded to 0.34.0 in a single
+Any installation from 0.1.3 onward can be upgraded to 0.39.0 in a single
 `ALTER EXTENSION pg_trickle UPDATE` — PostgreSQL chains the hops automatically
 after the new binaries are installed and the server has been restarted.
 

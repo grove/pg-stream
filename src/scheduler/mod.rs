@@ -674,7 +674,8 @@ pub extern "C-unwind" fn pg_trickle_refresh_worker_main(_arg: pg_sys::Datum) {
             }
 
             // Determine if this is a retryable or permanent error.
-            let is_retryable = crate::error::classify_spi_error_retryable(&error_msg);
+            // O39-6: use SQLSTATE-first classifier when use_sqlstate_classification=true.
+            let is_retryable = crate::error::classify_error_for_retry(&error_msg);
 
             // Set error state on member STs in a fresh transaction.
             if !is_retryable {
@@ -5539,7 +5540,8 @@ fn refresh_single_st(
                 st.pgt_name,
                 error_msg,
             );
-            let is_retryable = crate::error::classify_spi_error_retryable(&error_msg);
+            // O39-6: use SQLSTATE-first classifier when use_sqlstate_classification=true.
+            let is_retryable = crate::error::classify_error_for_retry(&error_msg);
             if !is_retryable {
                 let _ = StreamTableMeta::set_error_state(pgt_id, &error_msg);
             }
