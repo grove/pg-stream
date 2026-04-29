@@ -1,0 +1,52 @@
+# Gitleaks configuration — pg_trickle
+# https://github.com/gitleaks/gitleaks
+#
+# This file customizes the gitleaks secret scanner (O40-9) to suppress
+# known false positives in example, documentation, and test files.
+
+title = "pg_trickle gitleaks config"
+
+[extend]
+useDefault = true
+
+# ── Allowlist: example credentials in documentation ──────────────────────────
+
+[[rules.allowlist]]
+description = "Example passwords in documentation and test fixtures"
+paths = [
+    "docs/.*\\.md",
+    "blog/.*\\.md",
+    "examples/.*",
+    "tests/.*",
+    "demo/.*",
+    "README.md",
+    "INSTALL.md",
+]
+regexes = [
+    # Common example passwords/tokens used in docs
+    "s3cr3t",
+    "example[_-]?password",
+    "your[_-]?password[_-]?here",
+    "change[_-]?me",
+    "password123",
+    "postgres",  # default PG superuser password in examples
+]
+
+[[rules.allowlist]]
+description = "Docker Compose example passwords"
+paths = [
+    "docker-compose\\.yml",
+    "monitoring/.*",
+    "cnpg/.*",
+    "pgtrickle-relay/examples/.*",
+]
+
+[[rules.allowlist]]
+description = "CI/test connection strings"
+paths = [
+    "\\.github/.*",
+]
+regexes = [
+    "postgresql://postgres.*localhost",
+    "host=localhost.*user=postgres",
+]
