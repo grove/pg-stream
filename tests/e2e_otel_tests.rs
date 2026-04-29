@@ -43,12 +43,14 @@ async fn test_otel_trace_context_captured_in_change_buffer() {
     )
     .await;
 
-    // Set a W3C traceparent and insert a row.
+    // Set a W3C traceparent and insert a row on the same connection so the
+    // session-local GUC is visible to the INSERT (prepared statements do not
+    // allow multiple commands in a single call).
     let traceparent = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
-    db.execute(&format!(
-        "SET pg_trickle.trace_id = '{traceparent}'; \
-         INSERT INTO otel_src VALUES (1, 'hello');"
-    ))
+    db.execute_seq(&[
+        &format!("SET pg_trickle.trace_id = '{traceparent}'"),
+        "INSERT INTO otel_src VALUES (1, 'hello')",
+    ])
     .await;
 
     // Check whether the change buffer has the trace context column.
