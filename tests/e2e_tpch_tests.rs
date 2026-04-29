@@ -120,8 +120,7 @@ const LARGE_SCALE_DIFFERENTIAL_SKIP: &[&str] = &[
 /// The regression guard at the end of the test will fail if any query not in
 /// this list is skipped, catching silent regressions as the DVM evolves.
 #[rustfmt::skip]
-const IMMEDIATE_SKIP_ALLOWLIST: &[&str] = &[
-];
+const IMMEDIATE_SKIP_ALLOWLIST: &[&str] = &[];
 
 // ── P3.15: TPCH_STRICT mode ───────────────────────────────────────────
 //
