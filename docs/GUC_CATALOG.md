@@ -120,7 +120,7 @@ See [docs/CONFIGURATION.md](CONFIGURATION.md) for full descriptions and usage ex
 | `(registration pending — PGS_SLOT_LAG_WARNING_THRESHOLD_MB)` | `i32` | `100` | When a WAL-mode source retains more than this amount of WAL, pg_trickle: - emits a `slot_lag_warning` NOTIFY event from the scheduler, and - reports a WARN row in `pgtrickle.health_check()`. |
 | `(registration pending — PGS_SPILL_CONSECUTIVE_LIMIT)` | `i32` | `3` | When a stream table accumulates this many consecutive differential refreshes where `temp_blks_written > spill_threshold_blocks`, the scheduler marks the ST for reinitialization (FULL refresh) on the next cycle. |
 | `(registration pending — PGS_SPILL_THRESHOLD_BLOCKS)` | `i32` | `0` | Set to 0 to disable spill detection (default). |
-| `(registration pending — PGS_TEMPLATE_CACHE)` | `bool` | `true` | G14-SHC: Enable the cross-backend template cache backed by an UNLOGGED catalog table (`pgtrickle.pgt_template_cache`). |
+| `(registration pending — PGS_TEMPLATE_CACHE)` | `bool` | `true` | In transaction-pooling mode, rely on L2 rather than L0 warm-up for cross-connection performance. |
 | `(registration pending — PGS_TEMPLATE_CACHE_MAX_AGE_HOURS)` | `i32` | `168` | Prevents stale entries accumulating after ALTER QUERY without DROP or source-OID renumbering. |
 | `(registration pending — PGS_TEMPLATE_CACHE_MAX_ENTRIES)` | `i32` | `0` | When the cache reaches this size, the least-recently-used entry is evicted. |
 | `(registration pending — PGS_TEMPORAL_STREAM_TABLES)` | `bool` | `false` | Default: `false` (standard non-temporal storage). |
@@ -132,7 +132,7 @@ See [docs/CONFIGURATION.md](CONFIGURATION.md) for full descriptions and usage ex
 | `(registration pending — PGS_USE_PREPARED_STATEMENTS)` | `bool` | `true` | Disable if prepared-statement parameter sniffing produces poor plans (e.g., highly skewed LSN distributions). |
 | `(registration pending — PGS_USE_SQLSTATE_CLASSIFICATION)` | `bool` | `true` | The SQLSTATE-based classification is locale-safe: it works correctly regardless of `lc_messages`. |
 | `(registration pending — PGS_VOLATILE_FUNCTION_POLICY)` | `Option\<std::ffi::CString` | `"reject"` | Controls how volatile functions in defining queries are handled: - `"reject"` (default): Error — volatile functions are rejected. |
-| `(registration pending — PGS_WAKE_DEBOUNCE_MS)` | `i32` | `10` | After the scheduler receives the first `pgtrickle_wake` notification, it waits this many milliseconds to coalesce rapidly arriving notifications before starting a refresh tick. |
+| `(registration pending — PGS_WAKE_DEBOUNCE_MS)` | `i32` | `10` | **Note:** `pg_trickle.event_driven_wake` is deprecated and has no effect. |
 | `(registration pending — PGS_WAL_TRANSITION_TIMEOUT)` | `i32` | `300` | Maximum time (seconds) to wait for the WAL decoder to catch up during transition from triggers to WAL-based CDC before falling back to triggers. |
 | `(registration pending — PGS_WATERMARK_HOLDBACK_TIMEOUT)` | `i32` | `0` | Set to 0 to disable stuck-watermark detection (default). |
 | `(registration pending — PGS_WORKER_POOL_SIZE)` | `i32` | `0` | Set to 0 (default) to use the existing spawn-per-task model. |
