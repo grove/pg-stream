@@ -84,7 +84,7 @@
 | [v0.36.0](roadmap/v0.36.0.md) | Structural hardening, L0 cache, WAL backpressure, temporal IVM, columnar storage | ✅ Released | Large | [Full details](roadmap/v0.36.0.md-full.md) |
 | [v0.37.0](roadmap/v0.37.0.md) | Scheduler & merge modularisation, pgVectorMV (vector_avg/sum), OpenTelemetry trace propagation | ✅ Released | Medium | [Full details](roadmap/v0.37.0.md-full.md) |
 | [v0.38.0](roadmap/v0.38.0.md) | EC-01 Correctness Sprint (Hard Gate): join phantom rows, property-test convergence proof — BLOCKING release gate | ✅ Released | Medium | [Full details](roadmap/v0.38.0.md-full.md) |
-| [v0.39.0](roadmap/v0.39.0.md) | Operational Truthfulness & Distributed Hardening: backpressure/wake fix, generated docs, Citus chaos, SQLSTATE rollout, diagnostics | Planned | Large | [Full details](roadmap/v0.39.0.md-full.md) |
+| [v0.39.0](roadmap/v0.39.0.md) | Operational Truthfulness & Distributed Hardening: backpressure/wake fix, generated docs, Citus chaos, SQLSTATE rollout, diagnostics | ✅ Released | Large | [Full details](roadmap/v0.39.0.md-full.md) |
 | [v0.40.0](roadmap/v0.40.0.md) | Operator trust and maintainability: generated references, alerting, drain-mode proof, secret hygiene, unsafe gating | Planned | Large | [Full details](roadmap/v0.40.0.md-full.md) |
 | [v0.41.0](roadmap/v0.41.0.md) | Embedding pipeline infrastructure: post-refresh hooks, drift-based reindex, vector monitoring | Planned | Medium | [Full details](roadmap/v0.41.0.md-full.md) |
 | [v0.42.0](roadmap/v0.42.0.md) | Sparse & half-precision vector aggregates, reactive distance subscriptions, hybrid-search benchmarks | Planned | Medium | [Full details](roadmap/v0.42.0.md-full.md) |

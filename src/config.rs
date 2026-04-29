@@ -1404,6 +1404,53 @@ pub static PGS_OTEL_ENDPOINT: GucSetting<Option<std::ffi::CString>> =
 pub static PGS_TRACE_ID: GucSetting<Option<std::ffi::CString>> =
     GucSetting::<Option<std::ffi::CString>>::new(None);
 
+// ── v0.39.0 GUCs ──────────────────────────────────────────────────────────
+
+/// O39-8 (v0.39.0): CDC capture mode enum.
+///
+/// Controls what happens when CDC is paused via `pg_trickle.cdc_paused = on`:
+///
+/// - `"discard"` (default): CDC trigger bodies return `NULL` (no-op); changes
+///   that arrive while paused are **dropped**. The stream table must be
+///   reinitialized after un-pausing to recover from the data gap. This is the
+///   legacy `cdc_paused` behaviour.
+///
+/// - `"hold"`: Future mode — intended to keep CDC triggers active but pause
+///   the scheduler from consuming the change buffer. Changes accumulate in the
+///   buffer and are processed when the pause is lifted. **Not yet implemented;**
+///   setting this emits a WARNING and falls back to `"discard"`.
+///
+/// Default: `"discard"`.
+///
+/// Use `pgtrickle.cdc_capture_mode()` to inspect the active mode at runtime.
+pub static PGS_CDC_CAPTURE_MODE: GucSetting<Option<std::ffi::CString>> =
+    GucSetting::<Option<std::ffi::CString>>::new(Some(c"discard"));
+
+/// O39-8 (v0.39.0): CDC capture mode enum.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CdcCaptureMode {
+    /// Changes are discarded while paused. Reinit required after un-pause.
+    Discard,
+    /// (Future) Changes accumulate in the buffer while refreshes are paused.
+    Hold,
+}
+
+impl CdcCaptureMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CdcCaptureMode::Discard => "discard",
+            CdcCaptureMode::Hold => "hold",
+        }
+    }
+}
+
+pub fn normalize_cdc_capture_mode(value: Option<String>) -> CdcCaptureMode {
+    match value.as_deref().map(str::to_ascii_lowercase).as_deref() {
+        Some("hold") => CdcCaptureMode::Hold,
+        _ => CdcCaptureMode::Discard,
+    }
+}
+
 /// A20 (v0.36.0): Log format enum.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LogFormat {
@@ -3030,6 +3077,21 @@ pub fn register_gucs() {
         GucContext::Userset,
         GucFlags::default(),
     );
+
+    // O39-8 (v0.39.0): CDC capture mode — explicit discard vs hold semantics.
+    GucRegistry::define_string_guc(
+        c"pg_trickle.cdc_capture_mode",
+        c"O39-8: CDC capture mode when cdc_paused=on: 'discard' (default) or 'hold' (reserved).",
+        c"Controls what happens to CDC writes while pg_trickle.cdc_paused=on. \
+          'discard' (default): trigger bodies return NULL; changes arriving while \
+          paused are dropped — stream tables MUST be reinitialized after un-pausing. \
+          'hold': reserved for future use; setting this emits a WARNING and falls back \
+          to 'discard' until a durable hold path is implemented. \
+          Check pgtrickle.cdc_pause_status() to see the active mode.",
+        &PGS_CDC_CAPTURE_MODE,
+        GucContext::Suset,
+        GucFlags::default(),
+    );
 }
 
 // ── Convenience accessors ──────────────────────────────────────────────────
@@ -3744,6 +3806,28 @@ pub fn pg_trickle_trace_id() -> Option<String> {
     PGS_TRACE_ID
         .get()
         .and_then(|s| s.to_str().ok().map(|v| v.to_string()))
+}
+
+/// O39-8 (v0.39.0): Returns the active CDC capture mode.
+///
+/// When `cdc_paused = on`, this determines whether changes are discarded (default)
+/// or held for later processing. `Hold` mode is reserved; if configured, a WARNING
+/// is emitted and the function returns `Discard`.
+pub fn pg_trickle_cdc_capture_mode() -> CdcCaptureMode {
+    let raw = PGS_CDC_CAPTURE_MODE
+        .get()
+        .and_then(|s| s.to_str().ok().map(|v| v.to_string()));
+    let mode = normalize_cdc_capture_mode(raw);
+    if mode == CdcCaptureMode::Hold {
+        pgrx::warning!(
+            "pg_trickle: cdc_capture_mode='hold' is not yet implemented. \
+             Falling back to 'discard'. Changes arriving while cdc_paused=on \
+             will be dropped — reinitialize stream tables after un-pausing."
+        );
+        CdcCaptureMode::Discard
+    } else {
+        mode
+    }
 }
 
 #[cfg(test)]

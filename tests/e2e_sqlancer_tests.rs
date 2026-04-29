@@ -589,6 +589,201 @@ async fn test_sqlancer_equivalence_oracle() {
     run_equivalence_oracle(&db).await;
 }
 
+// ── O39-11 (v0.39.0): Light PR-mode SQLancer tests ─────────────────────────
+//
+// These tests run a bounded subset (50 cases, fixed seed) and are NOT marked
+// #[ignore] so they execute on every PR via the `light-e2e` CI job.  They use
+// the same crash and equivalence oracles as the full tests but with a much
+// smaller case count to keep PR CI time low (~30 s per test).
+//
+// The fixed seed ensures reproducibility: any query that triggers a crash or
+// mismatch can be replayed with:
+//   SQLANCER_SEED=0xc0ffee42dead1234 SQLANCER_CASES=50 just sqlancer-fast
+//
+// To run locally:
+//   cargo test --test e2e_sqlancer_tests test_sqlancer_light -- --nocapture
+
+/// SQLANCER-LIGHT-1: Crash oracle — 50 randomly generated queries must not crash.
+#[tokio::test]
+async fn test_sqlancer_crash_oracle_light() {
+    let db = E2eDb::new().await.with_extension().await;
+
+    // Fixed seed for deterministic PR-gate behaviour.
+    let seed = std::env::var("SQLANCER_LIGHT_SEED")
+        .ok()
+        .and_then(|v| {
+            let s = v.trim();
+            if s.starts_with("0x") || s.starts_with("0X") {
+                u64::from_str_radix(&s[2..], 16).ok()
+            } else {
+                s.parse::<u64>().ok()
+            }
+        })
+        .unwrap_or(0xc0ffee42_dead1234_u64);
+
+    let cases: usize = std::env::var("SQLANCER_LIGHT_CASES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(50);
+
+    let queries = generate_queries(seed, cases);
+    let mut crashes = 0usize;
+
+    for (i, gq) in queries.iter().enumerate() {
+        for tbl in &gq.tables {
+            db.execute(&tbl.ddl()).await;
+            let mut rng = Lcg::new(gq.seed ^ (i as u64).wrapping_mul(0x9e3779b97f4a7c15));
+            db.execute(&tbl.insert_dml(&mut rng)).await;
+        }
+
+        let st_name = format!("sqlancer_light1_{i}");
+        let create_sql = format!(
+            "SELECT pgtrickle.create_stream_table(\
+             name => '{st_name}', \
+             defining_query => $SQL${}$SQL$, \
+             schedule => '1m', \
+             mode => 'FULL'\
+             )",
+            gq.query
+        );
+        let refresh_sql = format!("SELECT pgtrickle.refresh_stream_table('{st_name}')");
+
+        let _ = db.try_execute(&create_sql).await;
+        let r = db.try_execute(&refresh_sql).await;
+        if let Err(e) = &r {
+            let msg = e.to_string();
+            if msg.contains("backend closed the connection unexpectedly")
+                || msg.contains("server closed the connection unexpectedly")
+                || msg.contains("PANIC")
+            {
+                crashes += 1;
+            }
+        }
+
+        let _ = db
+            .try_execute(&format!("SELECT pgtrickle.drop_stream_table('{st_name}')"))
+            .await;
+        for tbl in &gq.tables {
+            let _ = db
+                .try_execute(&format!("DROP TABLE IF EXISTS {} CASCADE", tbl.name))
+                .await;
+        }
+    }
+
+    assert_eq!(
+        crashes, 0,
+        "SQLANCER-LIGHT-1 crash oracle: {crashes} crash(es) in {cases} cases (seed=0x{seed:016x}).\n\
+         Replay: SQLANCER_LIGHT_SEED=0x{seed:016x} SQLANCER_LIGHT_CASES={cases} just sqlancer-fast",
+    );
+}
+
+/// SQLANCER-LIGHT-2: Equivalence oracle — 50 randomly generated queries must
+/// return the same row count as the direct SELECT.
+#[tokio::test]
+async fn test_sqlancer_equivalence_oracle_light() {
+    let db = E2eDb::new().await.with_extension().await;
+
+    let seed = std::env::var("SQLANCER_LIGHT_SEED")
+        .ok()
+        .and_then(|v| {
+            let s = v.trim();
+            if s.starts_with("0x") || s.starts_with("0X") {
+                u64::from_str_radix(&s[2..], 16).ok()
+            } else {
+                s.parse::<u64>().ok()
+            }
+        })
+        .unwrap_or(0xc0ffee42_dead1234_u64);
+
+    let cases: usize = std::env::var("SQLANCER_LIGHT_CASES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(50);
+
+    let queries = generate_queries(seed, cases);
+    let mut mismatches = Vec::<(u64, String, String)>::new();
+    let mut checked = 0usize;
+    let mut skipped = 0usize;
+
+    for (i, gq) in queries.iter().enumerate() {
+        for tbl in &gq.tables {
+            db.execute(&tbl.ddl()).await;
+            let mut rng = Lcg::new(gq.seed ^ (i as u64).wrapping_mul(0x6c62272e07bb0142));
+            db.execute(&tbl.insert_dml(&mut rng)).await;
+        }
+
+        let st_name = format!("sqlancer_light2_{i}");
+        let create_sql = format!(
+            "SELECT pgtrickle.create_stream_table(\
+             name => '{st_name}', \
+             defining_query => $SQL${}$SQL$, \
+             schedule => '1m', \
+             mode => 'FULL'\
+             )",
+            gq.query
+        );
+        let refresh_sql = format!("SELECT pgtrickle.refresh_stream_table('{st_name}')");
+
+        let result: Option<(i64, i64)> = async {
+            if db.try_execute(&create_sql).await.is_err() {
+                return None;
+            }
+            if db.try_execute(&refresh_sql).await.is_err() {
+                return None;
+            }
+            let st_count: i64 = db
+                .query_scalar(&format!("SELECT COUNT(*) FROM public.{st_name}"))
+                .await;
+            let direct_count: i64 = db
+                .query_scalar(&format!("SELECT COUNT(*) FROM ({}) AS _q", gq.query))
+                .await;
+            Some((st_count, direct_count))
+        }
+        .await;
+
+        let _ = db
+            .try_execute(&format!("SELECT pgtrickle.drop_stream_table('{st_name}')"))
+            .await;
+        for tbl in &gq.tables {
+            let _ = db
+                .try_execute(&format!("DROP TABLE IF EXISTS {} CASCADE", tbl.name))
+                .await;
+        }
+
+        match result {
+            None => {
+                skipped += 1;
+            }
+            Some((st_count, direct_count)) => {
+                checked += 1;
+                if st_count != direct_count {
+                    mismatches.push((
+                        gq.seed,
+                        gq.query.clone(),
+                        format!("{st_count} vs {direct_count}"),
+                    ));
+                }
+            }
+        }
+    }
+
+    println!(
+        "[sqlancer-light] equivalence: checked={checked}, skipped={skipped}, mismatches={}",
+        mismatches.len()
+    );
+
+    if !mismatches.is_empty() {
+        for (seed, q, diff) in &mismatches {
+            eprintln!("MISMATCH seed=0x{seed:016x}: {diff}\n  query: {q}");
+        }
+        panic!(
+            "SQLANCER-LIGHT-2: {} mismatch(es) in {checked} queries (seed=0x{seed:016x}).\n\
+             Replay: SQLANCER_LIGHT_SEED=0x{seed:016x} SQLANCER_LIGHT_CASES={cases} just sqlancer-fast",
+            mismatches.len()
+        );
+    }
+}
+
 // ── DML mutation helpers ───────────────────────────────────────────────────
 
 /// Read the number of stateful DML mutations from `SQLANCER_MUTATIONS`

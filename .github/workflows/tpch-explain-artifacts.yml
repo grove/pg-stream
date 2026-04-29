@@ -1,0 +1,128 @@
+# =============================================================================
+# TPC-H per-query EXPLAIN artifacts (O39-10, v0.39.0)
+#
+# Records EXPLAIN ANALYZE BUFFERS output, temporary block usage, and p50/p99
+# timing for TPC-H queries Q04, Q05, Q07, Q08, Q09, Q20, Q22.  The artifacts
+# are uploaded to GitHub Actions and can be compared across releases.
+#
+# The job runs:
+#   - Weekly (Sunday 06:00 UTC) on a schedule.
+#   - On manual dispatch (workflow_dispatch).
+#   - NOT on PRs or push-to-main — EXPLAIN output is too large for PR gates.
+#
+# Artifacts are retained for 90 days.
+#
+# Usage:
+#   gh workflow run tpch-explain-artifacts.yml
+# =============================================================================
+name: TPC-H EXPLAIN Artifacts
+
+on:
+  schedule:
+    - cron: '0 6 * * 0'   # Weekly Sunday 06:00 UTC
+  workflow_dispatch:
+    inputs:
+      tpch_scale:
+        description: 'TPC-H scale factor (default: 1.0)'
+        required: false
+        default: '1.0'
+      queries:
+        description: 'Comma-separated TPC-H query numbers to analyse (default: 4,5,7,8,9,20,22)'
+        required: false
+        default: '4,5,7,8,9,20,22'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  PG_VERSION: "18"
+  TPCH_SCALE: ${{ github.event.inputs.tpch_scale || '1.0' }}
+  TPCH_EXPLAIN_QUERIES: ${{ github.event.inputs.queries || '4,5,7,8,9,20,22' }}
+
+jobs:
+  # ── O39-10: Capture EXPLAIN ANALYZE BUFFERS artifacts ─────────────────────
+  tpch-explain-artifacts:
+    name: TPC-H EXPLAIN artifacts (SF-${{ env.TPCH_SCALE }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+      # ── Checkout ────────────────────────────────────────────────────────────
+      - uses: actions/checkout@v4
+
+      # ── Rust toolchain ──────────────────────────────────────────────────────
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      # ── Rust cache ──────────────────────────────────────────────────────────
+      - name: Cache Cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-explain-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-explain-
+
+      # ── Build E2E Docker image ───────────────────────────────────────────────
+      - name: Build E2E Docker image
+        run: just build-e2e-image
+        timeout-minutes: 30
+
+      # ── Install cargo-nextest ────────────────────────────────────────────────
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@nextest
+
+      # ── Create artifacts directory ───────────────────────────────────────────
+      - name: Create artifacts directory
+        run: mkdir -p /tmp/tpch-explain-artifacts
+
+      # ── Run TPC-H EXPLAIN collection script ─────────────────────────────────
+      - name: Collect TPC-H EXPLAIN ANALYZE BUFFERS
+        env:
+          TPCH_SCALE: ${{ env.TPCH_SCALE }}
+          TPCH_EXPLAIN_OUTPUT_DIR: /tmp/tpch-explain-artifacts
+        run: |
+          # Start the E2E database container.
+          export TPCH_CYCLES=1
+          export TPCH_SCALE="${TPCH_SCALE}"
+
+          # Run only the EXPLAIN-collection test (ignored by default).
+          cargo test \
+            --test e2e_tpch_tests \
+            test_tpch_explain_artifacts \
+            -- --ignored --test-threads=1 --nocapture \
+          2>&1 | tee /tmp/tpch-explain-artifacts/test-output.txt || true
+
+      # ── Generate timing summary ──────────────────────────────────────────────
+      - name: Generate timing summary (p50 / p99)
+        run: |
+          python3 scripts/tpch_explain_summary.py \
+            --input-dir /tmp/tpch-explain-artifacts \
+            --output    /tmp/tpch-explain-artifacts/timing-summary.md \
+          2>&1 || echo "timing summary script not yet available — skipping"
+
+      # ── Upload artifacts ─────────────────────────────────────────────────────
+      - name: Upload EXPLAIN artifacts
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: tpch-explain-artifacts-sf${{ env.TPCH_SCALE }}-${{ github.run_number }}
+          path: /tmp/tpch-explain-artifacts/
+          retention-days: 90
+
+      # ── Print summary to job log ─────────────────────────────────────────────
+      - name: Print timing summary
+        if: always()
+        run: |
+          if [ -f /tmp/tpch-explain-artifacts/timing-summary.md ]; then
+            cat /tmp/tpch-explain-artifacts/timing-summary.md
+          else
+            echo "No timing summary generated."
+            echo "Raw EXPLAIN files (if any):"
+            ls -lh /tmp/tpch-explain-artifacts/ || true
+          fi

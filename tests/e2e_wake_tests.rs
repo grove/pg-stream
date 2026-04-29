@@ -1,11 +1,17 @@
-//! WAKE-1: E2E tests for event-driven scheduler wake via LISTEN/NOTIFY.
+//! WAKE-1: E2E tests for scheduler wake behaviour.
+//!
+//! O39-2 (v0.39.0): `event_driven_wake` is NOT functional in background
+//! workers — PostgreSQL's `LISTEN` is restricted to B_BACKEND processes.
+//! The scheduler always operates in polling-only mode regardless of the GUC.
+//! CDC triggers still emit `pg_notify('pgtrickle_wake')` for future use
+//! once a background-worker-compatible latch mechanism is available.
 //!
 //! Verifies that:
 //! 1. CDC triggers emit `pg_notify('pgtrickle_wake', '')` after writing to
-//!    the change buffer.
-//! 2. The scheduler wakes immediately on NOTIFY instead of waiting for the
-//!    full poll interval.
-//! 3. Poll-based fallback still works when event-driven wake is disabled.
+//!    the change buffer (for future use).
+//! 2. Setting `event_driven_wake = on` emits a warning; the scheduler operates
+//!    in polling-only mode.
+//! 3. Poll-based operation works correctly regardless of the GUC value.
 
 mod e2e;
 
@@ -16,6 +22,7 @@ use std::time::Duration;
 
 /// Configure the scheduler with a long poll interval to make event-driven
 /// wake distinguishable from poll-based wake.
+#[allow(dead_code)]
 async fn configure_event_driven_scheduler(db: &E2eDb) {
     // Set a long poll interval so we can distinguish event-driven wake
     // (fast) from poll-based wake (slow).
@@ -153,17 +160,37 @@ async fn test_wake_truncate_trigger_emits_notify() {
     );
 }
 
-/// WAKE-1: Verify that event-driven wake causes a refresh to complete
-/// significantly faster than the poll interval.
+/// WAKE-O39-2: Verify that setting event_driven_wake=on still operates in
+/// poll-only mode (the GUC does not cause a panic or LISTEN attempt in the
+/// background worker).
 ///
-/// Setup: scheduler_interval_ms = 5000 (5 s), event_driven_wake = on.
-/// After inserting data, the scheduler should wake within ~100 ms (debounce +
-/// processing), NOT 5 s. We assert the refresh completes within 3 s (generous
-/// margin for CI overhead).
+/// Since LISTEN is not supported in background workers, the scheduler must
+/// remain in polling-only mode when event_driven_wake=on. This test asserts
+/// that refreshes complete via polling even with the GUC enabled.
 #[tokio::test]
-async fn test_wake_event_driven_latency() {
+async fn test_wake_event_driven_guc_falls_back_to_poll() {
     let db = E2eDb::new_on_postgres_db().await.with_extension().await;
-    configure_event_driven_scheduler(&db).await;
+
+    // Use a short poll interval so the poll completes quickly.
+    db.execute("ALTER SYSTEM SET pg_trickle.scheduler_interval_ms = 500")
+        .await;
+    db.execute("ALTER SYSTEM SET pg_trickle.min_schedule_seconds = 1")
+        .await;
+    db.execute("ALTER SYSTEM SET pg_trickle.auto_backoff = off")
+        .await;
+    // Enable event_driven_wake — this should emit a warning but still work
+    // in poll-only mode without crashing the background worker.
+    db.execute("ALTER SYSTEM SET pg_trickle.event_driven_wake = on")
+        .await;
+    db.reload_config_and_wait().await;
+    db.wait_for_setting("pg_trickle.event_driven_wake", "on")
+        .await;
+
+    let sched_running = db.wait_for_scheduler(Duration::from_secs(90)).await;
+    assert!(
+        sched_running,
+        "pg_trickle scheduler did not appear within 90 s (should not crash with event_driven_wake=on)"
+    );
 
     db.execute("CREATE TABLE lat_src (id INT PRIMARY KEY, val INT)")
         .await;
@@ -176,40 +203,13 @@ async fn test_wake_event_driven_latency() {
     )
     .await;
 
-    // Wait for the initial refresh (may use poll or schedule).
-    let initial_ok = wait_for_n_refreshes(&db, "lat_st", 1, Duration::from_secs(30)).await;
-    assert!(initial_ok, "Initial refresh did not complete");
-
-    // Record the count before our insert.
-    let before_count: i64 = db
-        .query_scalar(
-            "SELECT count(*) FROM pgtrickle.pgt_refresh_history h \
-             JOIN pgtrickle.pgt_stream_tables d ON h.pgt_id = d.pgt_id \
-             WHERE d.pgt_name = 'lat_st' AND h.status = 'COMPLETED'",
-        )
-        .await;
-
-    // Insert new data — this should trigger a NOTIFY and wake the scheduler.
-    let insert_start = std::time::Instant::now();
-    db.execute("INSERT INTO lat_src VALUES (2, 200)").await;
-
-    // Wait for a NEW completed refresh (after our insert).
-    let event_ok =
-        wait_for_n_refreshes(&db, "lat_st", before_count + 1, Duration::from_secs(10)).await;
-    let elapsed = insert_start.elapsed();
-
+    // With poll interval = 500ms, the refresh should complete via polling
+    // within a few seconds. This confirms poll-only mode is working.
+    let ok = wait_for_n_refreshes(&db, "lat_st", 1, Duration::from_secs(30)).await;
     assert!(
-        event_ok,
-        "Event-driven refresh did not complete within 10 s \
-         (elapsed={:.1}s, poll_interval=5s). This suggests NOTIFY wake is not working.",
-        elapsed.as_secs_f64(),
-    );
-
-    // The refresh should have completed faster than the poll interval.
-    assert!(
-        elapsed < Duration::from_secs(10),
-        "Event-driven refresh took {:.1}s — should be much less than the 5s poll interval",
-        elapsed.as_secs_f64(),
+        ok,
+        "Poll-only refresh with event_driven_wake=on did not complete within 30 s. \
+         Scheduler may have crashed due to LISTEN attempt in background worker.",
     );
 }
 

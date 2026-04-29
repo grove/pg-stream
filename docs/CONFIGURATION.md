@@ -2669,6 +2669,195 @@ SELECT pg_reload_conf();
 
 ---
 
+## WAL Backpressure & Logging (v0.36.0)
+
+### pg_trickle.enforce_backpressure
+
+When `true`, CDC trigger writes are suppressed when the WAL replication slot
+lag exceeds `pg_trickle.slot_lag_critical_threshold_mb`. Writes resume once
+the lag drops below 50 % of the threshold (hysteresis).
+
+When `false` (default), pg_trickle only emits `WARNING` log messages when slot
+lag is critical but does **not** suppress writes. Use `enforce_backpressure =
+true` only when disk exhaustion is an immediate risk.
+
+> **Important:** `enforce_backpressure = true` operates in **discard mode** —
+> changes that arrive while backpressure is active are **dropped** from the
+> CDC buffer. Stream tables must be reinitialized after backpressure clears to
+> recover from the data gap. See also `pg_trickle.cdc_capture_mode`.
+
+| Property | Value |
+|---|---|
+| Type | `boolean` |
+| Default | `false` |
+| Context | `SUSET` (superuser) |
+| Restart required | No |
+| Added in | v0.36.0 (A12) |
+
+```sql
+-- Enable backpressure suppression (discard mode)
+ALTER SYSTEM SET pg_trickle.enforce_backpressure = true;
+SELECT pg_reload_conf();
+-- After clearing: reinitialize affected stream tables
+SELECT pgtrickle.refresh_stream_table('my_stream', 'FULL');
+```
+
+---
+
+### pg_trickle.log_format
+
+Log format for pg_trickle structured log events.
+
+- `"text"` (default): Unstructured human-readable messages.
+- `"json"`: Structured JSON with fields `event`, `pgt_id`, `cycle_id`,
+  `duration_ms`, `refresh_reason`, `error_code`. Suitable for log aggregation
+  pipelines (Loki, OpenTelemetry).
+
+| Property | Value |
+|---|---|
+| Type | `string` |
+| Default | `text` |
+| Valid values | `text`, `json` |
+| Context | `SUSET` (superuser) |
+| Restart required | No |
+| Added in | v0.36.0 (A20) |
+
+```sql
+-- Switch to JSON structured logging
+ALTER SYSTEM SET pg_trickle.log_format = 'json';
+SELECT pg_reload_conf();
+```
+
+---
+
+## pgVectorMV & OpenTelemetry (v0.37.0)
+
+### pg_trickle.enable_vector_agg
+
+When `true`, `avg(vector_col)` and `sum(vector_col)` in stream table defining
+queries are handled by the DVM engine using incremental aggregate operators for
+`vector`, `halfvec`, and `sparsevec` types. Requires the `pgvector` extension.
+
+| Property | Value |
+|---|---|
+| Type | `boolean` |
+| Default | `false` |
+| Context | `SUSET` (superuser) |
+| Restart required | No |
+| Added in | v0.37.0 (F4) |
+
+```sql
+ALTER SYSTEM SET pg_trickle.enable_vector_agg = true;
+SELECT pg_reload_conf();
+```
+
+---
+
+### pg_trickle.enable_trace_propagation
+
+When `true`, pg_trickle reads `pg_trickle.trace_id` from the session GUC at
+CDC capture time and stores the W3C traceparent in the change buffer column
+`__pgt_trace_context`. At refresh time, spans are exported via OTLP/gRPC to
+`pg_trickle.otel_endpoint`.
+
+| Property | Value |
+|---|---|
+| Type | `boolean` |
+| Default | `false` |
+| Context | `SUSET` (superuser) |
+| Restart required | No |
+| Added in | v0.37.0 (F10) |
+
+---
+
+### pg_trickle.otel_endpoint
+
+OTLP/gRPC endpoint for OpenTelemetry span export. Empty string (default)
+disables span export.
+
+| Property | Value |
+|---|---|
+| Type | `string` |
+| Default | `''` (disabled) |
+| Example | `'http://jaeger:4317'` |
+| Context | `SUSET` (superuser) |
+| Restart required | No |
+| Added in | v0.37.0 (F10) |
+
+```sql
+-- Export spans to a local Jaeger instance
+ALTER SYSTEM SET pg_trickle.otel_endpoint = 'http://localhost:4317';
+ALTER SYSTEM SET pg_trickle.enable_trace_propagation = true;
+SELECT pg_reload_conf();
+```
+
+---
+
+### pg_trickle.trace_id
+
+Session-level W3C traceparent header for trace context propagation. Set this
+in the application session before DML so CDC capture links the changes to the
+initiating trace. Requires `enable_trace_propagation = true`.
+
+| Property | Value |
+|---|---|
+| Type | `string` |
+| Default | `''` |
+| Context | `USERSET` (any user) |
+| Restart required | No |
+| Added in | v0.37.0 (F10) |
+
+```sql
+-- Propagate a trace across CDC capture
+SET pg_trickle.trace_id = '00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01';
+INSERT INTO orders VALUES (42, 'widget', 5);
+```
+
+---
+
+## Operational Truthfulness (v0.39.0)
+
+### pg_trickle.cdc_capture_mode
+
+Controls what happens to CDC writes when `pg_trickle.cdc_paused = on`.
+
+- `"discard"` (default): CDC trigger bodies return `NULL`; changes arriving
+  while paused are **dropped**. Stream tables must be reinitialized after
+  un-pausing to recover from the data gap.
+- `"hold"`: Reserved for a future durable capture-and-hold mode. Currently
+  emits a `WARNING` and falls back to `"discard"`.
+
+> **Operator checklist:** Before setting `cdc_paused = on`, check
+> `pgtrickle.cdc_pause_status()` to confirm the active mode. After
+> un-pausing in discard mode, run `pgtrickle.refresh_stream_table('<name>')`
+> with `FULL` mode for each affected stream table.
+
+| Property | Value |
+|---|---|
+| Type | `string` |
+| Default | `discard` |
+| Valid values | `discard`, `hold` (reserved) |
+| Context | `SUSET` (superuser) |
+| Restart required | No |
+| Added in | v0.39.0 (O39-8) |
+
+```sql
+-- Check the current CDC pause status
+SELECT * FROM pgtrickle.cdc_pause_status();
+
+-- Pause CDC (discard mode — changes arriving now are DROPPED)
+ALTER SYSTEM SET pg_trickle.cdc_paused = on;
+SELECT pg_reload_conf();
+
+-- After maintenance, un-pause and reinitialize affected tables
+ALTER SYSTEM SET pg_trickle.cdc_paused = off;
+SELECT pg_reload_conf();
+-- Full refresh to recover from the gap:
+SELECT pgtrickle.refresh_stream_table('public.my_stream_table', 'FULL');
+```
+
+---
+
 ## GUC Interaction Matrix
 
 Some GUC variables interact with or depend on each other. The table below

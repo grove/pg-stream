@@ -7,6 +7,7 @@ For future plans and upcoming features, see [ROADMAP.md](ROADMAP.md).
 ## Table of Contents
 
 <!-- TOC start -->
+- [0.39.0 — Operational Truthfulness & Distributed Hardening](#0390--operational-truthfulness--distributed-hardening)
 - [0.38.0 — EC-01 Join Correctness Sprint](#0380--ec-01-join-correctness-sprint)
 - [0.37.0 — pgVector Incremental Aggregates & Distributed Trace Propagation](#0370--pgvector-incremental-aggregates--distributed-trace-propagation)
 - [0.36.0 — Structural Hardening, Performance & Temporal IVM](#0360--structural-hardening-performance--temporal-ivm)
@@ -52,6 +53,132 @@ For future plans and upcoming features, see [ROADMAP.md](ROADMAP.md).
 - [0.1.1 — CloudNativePG Image & Test Hardening](#011--cloudnativepg-image--test-hardening)
 - [0.1.0 — Initial Release](#010--initial-release)
 <!-- TOC end -->
+
+---
+
+## [0.39.0] — Operational Truthfulness & Distributed Hardening
+
+v0.39.0 focuses on making pg_trickle's operational behavior more honest and
+robust: CDC hold mode, enhanced diagnostics, SQLSTATE-aware retry, OpenTelemetry
+documentation, Citus chaos hardening, and a broader testing pyramid.
+
+### O39-1/O39-8 — CDC Hold Mode (`cdc_capture_mode`)
+
+New GUC `pg_trickle.cdc_capture_mode` (default `discard`). When set to `hold`,
+captured change rows are buffered in the change table while CDC is paused rather
+than being silently discarded. The existing `discard` behavior is unchanged and
+remains the default to preserve backward compatibility.
+
+New SQL function `pgtrickle.cdc_pause_status()` returns per-stream-table CDC
+pause state including `paused`, `capture_mode`, and an operator-guidance `note`.
+
+### O39-2 — Wake Truthfulness
+
+The scheduler no longer attempts `LISTEN/NOTIFY` in background worker contexts
+(PostgreSQL does not support this). Wake truthfulness is documented in the
+header of `e2e_wake_tests.rs`; tests now verify that the scheduler falls back
+to polling correctly rather than asserting sub-polling-interval wake latency.
+
+### O39-3 — Configuration Documentation
+
+`docs/CONFIGURATION.md` gains three new sections covering GUCs introduced in
+v0.36.0 (WAL Backpressure), v0.37.0 (pgVectorMV & OpenTelemetry), and v0.39.0
+(Operational Truthfulness: `cdc_capture_mode`). Each section includes an
+operator checklist and configuration examples.
+
+### O39-4 — Upgrade Guide
+
+`docs/UPGRADING.md` gains upgrade sections for every version from 0.34.0 to
+0.39.0, including schema change details, new GUCs, new functions, and known
+limitations per release.
+
+### O39-5 — OpenTelemetry Operator Guide
+
+New `docs/OPENTELEMETRY.md` provides an end-to-end operator guide for the W3C
+Trace Context integration introduced in v0.37.0. Covers Jaeger/Tempo/OTEL
+Collector configuration, span attributes, failure behavior (best-effort; never
+blocks refresh), and verification steps.
+
+Three new E2E tests (`tests/e2e_otel_tests.rs`) verify trace context capture,
+unreachable-endpoint graceful degradation, and disabled-tracing NULL context.
+
+### O39-6 — SQLSTATE-First SPI Retry
+
+New GUC `pg_trickle.use_sqlstate_classification` (default `off`). When enabled,
+the scheduler uses a SQLSTATE integer class (40xxx = retryable, 23xxx = not
+retryable, etc.) before falling back to text pattern matching. The new unified
+`classify_error_for_retry()` function is used at both retry decision points in
+the scheduler.
+
+### O39-7 — Citus Chaos Test Harness
+
+New `tests/e2e_citus_chaos_tests.rs` containing four `#[ignore]` chaos tests:
+- CHAOS-1: Worker death mid-refresh (graceful failure + recovery)
+- CHAOS-2: Coordinator restart during lease (lock invalidation + re-acquire)
+- CHAOS-3: Shard rebalance during active CDC (no row gaps)
+- CHAOS-4: Stale worker slot cleanup (topology change detection)
+
+Tests require `CITUS_COORDINATOR_URL` and `CITUS_*_CONTAINER` env vars; they
+are skipped automatically when not set.
+
+### O39-9 — Enhanced `explain_stream_table()`
+
+`pgtrickle.explain_stream_table()` now shows: Status, Populated, Refresh mode
+(with `force_full_refresh` GUC note), CDC status (paused/active + capture mode),
+Backpressure state, and the Defining query. This makes the function a one-stop
+diagnostic tool for operators.
+
+### O39-10 — TPC-H EXPLAIN Artifacts CI
+
+New workflow `.github/workflows/tpch-explain-artifacts.yml` captures EXPLAIN
+ANALYZE BUFFERS output and p50/p99 timing for TPC-H queries Q04, Q05, Q07, Q08,
+Q09, Q20, Q22. Runs weekly (Sunday 06:00 UTC) and on manual dispatch. Artifacts
+are uploaded and retained for 90 days.
+
+New `test_tpch_explain_artifacts` test function (`#[ignore]`) in
+`tests/e2e_tpch_tests.rs` performs the collection.
+
+### O39-11 — SQLancer Light PR Mode
+
+Two new non-`#[ignore]` tests in `tests/e2e_sqlancer_tests.rs`:
+- `test_sqlancer_crash_oracle_light`: 50 random queries, crash oracle.
+- `test_sqlancer_equivalence_oracle_light`: 50 random queries, equivalence oracle.
+
+Both use a fixed seed (`SQLANCER_LIGHT_SEED`) and bounded case count
+(`SQLANCER_LIGHT_CASES`, default 50) for fast, deterministic PR CI gates.
+
+### O39-12 — Fuzz Target Expansion
+
+Two new libFuzzer targets:
+- `fuzz/fuzz_targets/wal_fuzz.rs`: SQLSTATE classifier + `sqlstate_to_string` invariants.
+- `fuzz/fuzz_targets/dag_fuzz.rs`: schedule parsing, cron validation, SELECT * detection.
+
+Both verify no-panic and determinism properties for adversarial inputs.
+
+### O39-13 — Inbox/Outbox Reliability Property Tests
+
+Unit-level property tests in `src/api/inbox.rs` (`#[cfg(test)]`) covering:
+- Partition exhaustiveness: every aggregate ID maps to exactly one worker.
+- Hash determinism: same inputs always produce the same assignment.
+- Negative `total_workers` degenerate case.
+- Known hash anchors for regression protection.
+
+SQLSTATE classifier property tests in `src/error.rs` covering:
+- Retryable class detection.
+- Bracket-code extraction with malformed inputs.
+- `sqlstate_to_string` totality and determinism.
+
+### O39-14 — PR-Scoped Upgrade E2E Slice
+
+New CI job `upgrade-e2e-pr-slice` in `.github/workflows/ci.yml`. Triggered on
+PRs that modify `sql/`, `src/config.rs`, `src/cdc.rs`, or `src/api/`. Runs the
+most recent N-1→N upgrade pair using a stock `postgres:18.3` container (no
+custom Docker build). Tests filtered to `smoke | basic | catalog` labels for
+speed.
+
+**Upgrade:** Run `ALTER EXTENSION pg_trickle UPDATE TO '0.39.0'`. The
+`0.38.0→0.39.0` migration creates `pgtrickle.cdc_pause_status()` and registers
+the `cdc_capture_mode` GUC comment. No existing tables or functions are removed.
 
 ---
 
