@@ -253,6 +253,22 @@ pub static PGS_AGGREGATE_FAST_PATH: GucSetting<bool> = GucSetting::<bool>::new(t
 /// catalog table (`pgtrickle.pgt_template_cache`).  When enabled, delta SQL
 /// templates are persisted so that new backends avoid the ~45 ms DVM
 /// parse+differentiate cost on their first refresh of each stream table.
+///
+/// **Cache architecture (O40-7):**
+/// - **L0 — process-local `RwLock<HashMap>`** in each backend/worker process.
+///   Fast (ns lookups), but **not shared across pooler connections**. A PgBouncer
+///   transaction-pooling deployment will incur an L0 miss on every new connection
+///   to the backend. The L0 hit rate is only high for long-lived or session-pinned
+///   connections.
+/// - **L1 — thread-local delta template** per Rust thread (`DELTA_TEMPLATE_CACHE`).
+///   Fastest path; reset on each pgrx `SPI::connect()` context switch.
+/// - **L2 — catalog table** (`pgtrickle.pgt_template_cache`, UNLOGGED).
+///   Shared across all backends for the same stream table OID. Populated by the
+///   first backend to compute a template; subsequent backends load from L2 and
+///   promote to L0/L1.
+///
+/// In transaction-pooling mode, rely on L2 rather than L0 warm-up for
+/// cross-connection performance.
 pub static PGS_TEMPLATE_CACHE: GucSetting<bool> = GucSetting::<bool>::new(true);
 
 /// Maximum allowed grouping set branches for CUBE/ROLLUP expansion (EC-02).
@@ -356,29 +372,33 @@ pub fn pg_trickle_metrics_port() -> i32 {
     PGS_METRICS_PORT.get()
 }
 
-/// WAKE-1: Event-driven scheduler wake via LISTEN/NOTIFY.
+/// WAKE-1 / O40-8: **DEPRECATED** — `pg_trickle.event_driven_wake` has no
+/// effect and will be removed in a future release.
 ///
-/// When enabled, CDC triggers emit `pg_notify('pgtrickle_wake', '')` after
-/// writing to the change buffer. The scheduler LISTENs on the channel and
-/// wakes immediately instead of waiting for the full poll interval, reducing
-/// median end-to-end latency from ~500 ms to ~15 ms for low-volume workloads.
+/// **Reason for deprecation:** PostgreSQL's `LISTEN` command is not permitted
+/// inside background worker processes (`MyBackendType != B_BACKEND` —
+/// see `async.c:Async_Listen()`). Because the pg_trickle scheduler runs as a
+/// background worker, event-driven wake via `LISTEN/NOTIFY` cannot function
+/// as designed. The scheduler always uses latch-based polling
+/// (`BackgroundWorker::wait_latch(scheduler_interval_ms)`), which is the
+/// correct and supported wake mechanism for background workers.
 ///
-/// Falls back to poll-based wake (using `scheduler_interval_ms`) when no
-/// notifications arrive. Disable if the NOTIFY overhead is measurable on
-/// extremely high-throughput write paths (> 100K DML/s).
-// WAKE-1: PostgreSQL's LISTEN command is not allowed in background workers
-// (MyBackendType != B_BACKEND — see async.c:Async_Listen()). The scheduler is
-// always a background worker, so event-driven wake via LISTEN/NOTIFY cannot
-// function as designed. Default is off until a background-worker-compatible
-// wake mechanism is implemented (e.g., shared-memory latch signalling).
+/// **Migration:** Remove `pg_trickle.event_driven_wake = on` from
+/// `postgresql.conf` and `ALTER SYSTEM` settings. The scheduler behaviour
+/// is unchanged — it wakes at `pg_trickle.scheduler_interval_ms` intervals
+/// with efficient latch-based sleeping.
+///
+/// The GUC is preserved in v0.40.0 for upgrade compatibility (setting it
+/// emits a WARNING but does not break existing configurations). It will be
+/// removed in v1.0.
+// WAKE-1: This GUC is kept for upgrade compatibility only. Setting it to true
+// logs a WARNING in the scheduler loop (since v0.39.0 wake-truthfulness fix).
 pub static PGS_EVENT_DRIVEN_WAKE: GucSetting<bool> = GucSetting::<bool>::new(false);
 
 /// WAKE-1: Coalesce debounce interval in milliseconds.
 ///
-/// After the scheduler receives the first `pgtrickle_wake` notification, it
-/// waits this many milliseconds to coalesce rapidly arriving notifications
-/// before starting a refresh tick. This avoids per-statement wake overhead
-/// during bulk DML batches while preserving low single-statement latency.
+/// **Note:** `pg_trickle.event_driven_wake` is deprecated and has no effect.
+/// This GUC is likewise deprecated and will be removed in v1.0.
 pub static PGS_WAKE_DEBOUNCE_MS: GucSetting<i32> = GucSetting::<i32>::new(10);
 
 /// Buffer table partitioning mode (Task 3.3).
