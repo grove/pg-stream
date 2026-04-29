@@ -2579,6 +2579,16 @@ pub extern "C-unwind" fn pg_trickle_scheduler_main(_arg: pg_sys::Datum) {
             break;
         }
 
+        // A35 (v0.36.0): Process pending drain requests on every tick — even
+        // when the scheduler is disabled — so that pgtrickle.drain() never
+        // hangs indefinitely.  When a drain is requested and no refresh workers
+        // are active, this marks the drain as completed (DRAIN_COMPLETED =
+        // DRAIN_REQUESTED) and returns true.  We skip new dispatches for that
+        // tick so callers see a clean quiesced state before drain() returns.
+        if crate::shmem::scheduler_check_and_complete_drain() {
+            continue;
+        }
+
         if !config::pg_trickle_enabled() {
             continue;
         }

@@ -77,7 +77,7 @@ async fn test_drain_resume_catches_up() {
         "SELECT pgtrickle.create_stream_table(\
              'public.drain_view', \
              'SELECT id, val FROM public.drain_src', \
-             schedule => '1 second'\
+             schedule => '1s'\
          )",
     )
     .await;
@@ -135,7 +135,7 @@ async fn test_drain_under_workload() {
         "SELECT pgtrickle.create_stream_table(\
              'public.drain_wl_view', \
              'SELECT id, val FROM public.drain_wl_src', \
-             schedule => '1 second'\
+             schedule => '1s'\
          )",
     )
     .await;
@@ -236,7 +236,7 @@ async fn test_drain_buffer_accumulates_during_drain() {
         "SELECT pgtrickle.create_stream_table(\
              'public.drain_buf_view', \
              'SELECT id, v FROM public.drain_buf_src', \
-             schedule => '1 second'\
+             schedule => '1s'\
          )",
     )
     .await;
