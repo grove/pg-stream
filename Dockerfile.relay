@@ -3,7 +3,7 @@
 # Result: minimal distroless image (~30 MB) with the relay binary only.
 
 # ─── Stage 1: Build ────────────────────────────────────────────────────────────
-FROM rust:1.85-slim-bookworm AS builder
+FROM rust:1.88-slim-bookworm AS builder
 
 WORKDIR /build
 
@@ -21,10 +21,14 @@ COPY Cargo.toml Cargo.lock ./
 COPY pgtrickle-relay/Cargo.toml ./pgtrickle-relay/Cargo.toml
 
 # Create dummy workspace member sources so Cargo can resolve dependencies.
-RUN mkdir -p src pgtrickle-relay/src && \
+# Also create stub bench files referenced in the workspace Cargo.toml.
+RUN mkdir -p src pgtrickle-relay/src benches && \
     echo "fn main() {}" > src/main.rs && \
     echo "" > src/lib.rs && \
-    echo "fn main() {}" > pgtrickle-relay/src/main.rs
+    echo "fn main() {}" > pgtrickle-relay/src/main.rs && \
+    echo "fn main() {}" > benches/diff_operators.rs && \
+    echo "fn main() {}" > benches/refresh_bench.rs && \
+    echo "fn main() {}" > benches/scheduler_bench.rs
 
 # Pre-fetch and compile dependencies (cached layer).
 RUN cargo build -p pgtrickle-relay --release --features "nats,webhook,stdout" 2>/dev/null || true
