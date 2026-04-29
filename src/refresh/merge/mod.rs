@@ -2543,16 +2543,17 @@ pub fn execute_differential_refresh(
     // After every such differential apply, reconcile the stream table against
     // the full-query row_id set. Only for join-bearing queries where cross-cycle
     // phantom rows can materialize from partial delta application.
-    let query_has_join = {
-        let upper = st.defining_query.to_ascii_uppercase();
-        upper.contains(" JOIN ")
-            || upper.contains(" INNER JOIN ")
-            || upper.contains(" LEFT JOIN ")
-            || upper.contains(" RIGHT JOIN ")
-            || upper.contains(" FULL JOIN ")
-            || upper.contains(" CROSS JOIN ")
-    };
+    //
+    // EC-01b: use the parsed OpTree for join detection instead of keyword
+    // matching so comma-joins (`FROM a, b`) and joins inside subqueries are
+    // also covered. Falls back to `true` (run cleanup, fail-safe) if the
+    // query cannot be parsed.
+    let query_has_join = dvm::query_has_join(&st.defining_query).unwrap_or(true);
+    // Skip full-query reconciliation for recursive CTEs — it bypasses the
+    // ivm_recursive_max_depth guard and would insert suppressed rows.
+    let query_has_recursive_cte = dvm::query_has_recursive_cte(&st.defining_query).unwrap_or(false);
     let phantom_cleanup_count = if query_has_join
+        && !query_has_recursive_cte
         && !resolved.is_deduplicated
         && !st.has_keyless_source
         && st.st_partition_key.is_none()

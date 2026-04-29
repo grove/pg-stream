@@ -119,16 +119,8 @@ const LARGE_SCALE_DIFFERENTIAL_SKIP: &[&str] = &[
 /// Populated from empirical test runs — see plans/testing/TEST_SUITE_TPC_H-GAPS.md §T2.
 /// The regression guard at the end of the test will fail if any query not in
 /// this list is skipped, catching silent regressions as the DVM evolves.
+#[rustfmt::skip]
 const IMMEDIATE_SKIP_ALLOWLIST: &[&str] = &[
-    // q05: multi-table joins produce DVM SQL that exceeds
-    // the Docker container's temp_file_limit (4 GB).
-    "q05",
-    // q08: 7-table join (region, nation×2, supplier, part, customer, orders,
-    // lineitem) — largest join in TPC-H; exceeds temp_file_limit (4 GB).
-    "q08",
-    // q09: 6-table join (nation, supplier, part, partsupp, orders, lineitem)
-    // exceeds temp_file_limit (4 GB) — same root cause as q05/q07/q08.
-    "q09",
 ];
 
 // ── P3.15: TPCH_STRICT mode ───────────────────────────────────────────

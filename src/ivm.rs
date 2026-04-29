@@ -617,6 +617,77 @@ pub fn cleanup_ivm_triggers(source_relid: pg_sys::Oid, pgt_id: i64) -> Result<()
     Ok(())
 }
 
+/// EC-01b: cross-cycle phantom-row reconciliation for IMMEDIATE mode.
+///
+/// Mirrors `cleanup_cross_cycle_phantoms` in the DIFFERENTIAL refresh path.
+/// In IMMEDIATE mode, statement-level AFTER triggers compute and apply a
+/// delta in the same transaction as the base-table DML, but partial delta
+/// application can still leave stale `__pgt_row_id` values in the stream
+/// table when the defining query contains a join — for example, a
+/// non-monotone `... = (SELECT MAX(...) ...)` predicate over a comma-joined
+/// derived table where an UPDATE shifts the MAX but the previous winning
+/// row is not part of the current delta.
+///
+/// Gating mirrors the DIFFERENTIAL path (join-bearing, keyed, non-partitioned)
+/// to keep the cost localised to queries that actually need reconciliation.
+/// When parsing fails we err on the side of safety and run the cleanup.
+/// EC-01b: cross-cycle phantom-row reconciliation for IMMEDIATE mode.
+///
+/// Mirrors `cleanup_cross_cycle_phantoms` in the DIFFERENTIAL refresh path
+/// but with a relaxed gate: in IMMEDIATE mode the trigger-based delta
+/// engine can leave stale rows even for queries whose `__pgt_row_id` is
+/// derived from `row_to_json(sub)` (because the join output omits one
+/// side's PK — TPC-H q07 / q15 are the canonical cases). The full-query
+/// reconciliation is still safe in that regime because the hash is
+/// deterministic on row content: an ST row whose hash is absent from the
+/// current full result is unambiguously stale.
+///
+/// Partitioned stream tables are excluded because the per-partition
+/// reconciliation requires partition-key-aware orphan detection that the
+/// shared cleanup helper does not yet implement.
+fn run_immediate_phantom_cleanup(
+    st: &crate::catalog::StreamTableMeta,
+    st_qualified: &str,
+) -> Result<(), PgTrickleError> {
+    let query_has_join = crate::dvm::query_has_join(&st.defining_query).unwrap_or(true);
+    if !query_has_join || st.st_partition_key.is_some() {
+        return Ok(());
+    }
+    // Do NOT run the full-query reconciliation for recursive CTEs. The
+    // ivm_recursive_max_depth guard intentionally limits how many rows
+    // the delta engine materialises.  Running the full query here would
+    // bypass the guard and insert the suppressed rows back.
+    if crate::dvm::query_has_recursive_cte(&st.defining_query).unwrap_or(false) {
+        return Ok(());
+    }
+
+    let phantom_cleanup_count = crate::refresh::phd1::cleanup_cross_cycle_phantoms(
+        st.pgt_id,
+        st_qualified,
+        &st.defining_query,
+        10_000,
+    )?;
+
+    // Mark downstream ST consumers for reinit when phantom rows were
+    // removed, mirroring the DIFFERENTIAL refresh behaviour so chained
+    // stream tables stay consistent with the cleaned-up upstream state.
+    if phantom_cleanup_count > 0
+        && let Ok(downstream_ids) =
+            crate::catalog::StDependency::get_downstream_pgt_ids(st.pgt_relid)
+    {
+        for ds_id in &downstream_ids {
+            if let Err(e) = crate::catalog::StreamTableMeta::mark_for_reinitialize(*ds_id) {
+                pgrx::warning!(
+                    "[pg_trickle] EC-01b: failed to mark downstream ST {ds_id} for reinit \
+                     after IMMEDIATE phantom cleanup: {e}"
+                );
+            }
+        }
+    }
+
+    Ok(())
+}
+
 /// SQL-callable function: apply IVM delta for a stream table.
 ///
 /// Called from the PL/pgSQL AFTER trigger body after the transition tables
@@ -715,6 +786,13 @@ fn pgt_ivm_apply_delta(
     // Clean up the delta temp table.
     let _ = Spi::run(&format!("DROP TABLE IF EXISTS {delta_table}"));
 
+    // EC-01b: reconcile cross-cycle phantom rows in IMMEDIATE mode.
+    // Mirrors the post-DML cleanup in `execute_differential_refresh`.
+    // Run unconditionally — even when this trigger invocation produced an
+    // empty delta, a prior invocation in the same statement (or a prior
+    // statement) may have left orphans for non-monotone predicates.
+    run_immediate_phantom_cleanup(&st, &st_qualified)?;
+
     // Update data_timestamp so downstream stream tables that compare
     // upstream timestamps (ST-on-ST) detect the change.
     if delta_count > 0 {
@@ -803,6 +881,9 @@ fn pgt_ivm_apply_delta_enr(
     }
 
     let _ = Spi::run(&format!("DROP TABLE IF EXISTS {delta_table}")); // nosemgrep: semgrep.rust.spi.run.dynamic-format — delta_table is a fixed prefix + i64, not user input
+
+    // EC-01b: reconcile cross-cycle phantom rows in IMMEDIATE mode (ENR path).
+    run_immediate_phantom_cleanup(&st, &st_qualified)?;
 
     if delta_count > 0 {
         let now = Spi::get_one::<pgrx::datum::TimestampWithTimeZone>("SELECT now()")

@@ -271,6 +271,18 @@ pub fn query_total_scan_count(query: &str) -> Result<usize, PgTrickleError> {
     Ok(operators::join_common::total_scan_count(&result.tree))
 }
 
+/// EC-01 / EC-01b: Returns `true` when the parsed defining query contains
+/// any join-shaped node (InnerJoin / LeftJoin / FullJoin / SemiJoin /
+/// AntiJoin) at any depth, including comma-joins (which the parser
+/// normalises to `InnerJoin`).
+///
+/// Used as the gating predicate for `cleanup_cross_cycle_phantoms` in both
+/// the DIFFERENTIAL and IMMEDIATE refresh paths.
+pub fn query_has_join(query: &str) -> Result<bool, PgTrickleError> {
+    let result = parse_defining_query_full(query)?;
+    Ok(operators::join_common::tree_contains_join(&result.tree))
+}
+
 /// Check whether an OpTree is a "scan-chain" — only Scan, Filter, Project,
 /// and Subquery nodes (no Aggregate, Join, UnionAll, Distinct, Window,
 /// RecursiveCte, or CteScan).

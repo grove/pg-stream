@@ -1467,6 +1467,50 @@ pub fn total_scan_count(op: &OpTree) -> usize {
     }
 }
 
+/// EC-01 / EC-01b: Returns `true` when the operator tree contains any
+/// join-shaped node (InnerJoin, LeftJoin, FullJoin, SemiJoin, AntiJoin)
+/// at any depth.
+///
+/// This is the gating predicate for `cleanup_cross_cycle_phantoms`: only
+/// join-bearing queries can leave stale `__pgt_row_id` values in the
+/// stream table after a partial delta application, so non-join queries
+/// can skip the reconciliation pass entirely.
+///
+/// Comma-joins (`FROM a, b WHERE a.x = b.y`) are normalised to `InnerJoin`
+/// nodes by the parser, so this helper covers them too.
+pub fn tree_contains_join(op: &OpTree) -> bool {
+    match op {
+        OpTree::InnerJoin { .. }
+        | OpTree::LeftJoin { .. }
+        | OpTree::FullJoin { .. }
+        | OpTree::SemiJoin { .. }
+        | OpTree::AntiJoin { .. } => true,
+        OpTree::Filter { child, .. }
+        | OpTree::Project { child, .. }
+        | OpTree::Subquery { child, .. }
+        | OpTree::Aggregate { child, .. }
+        | OpTree::Window { child, .. }
+        | OpTree::Distinct { child, .. } => tree_contains_join(child),
+        OpTree::UnionAll { children, .. } => children.iter().any(tree_contains_join),
+        OpTree::Intersect { left, right, .. } | OpTree::Except { left, right, .. } => {
+            tree_contains_join(left) || tree_contains_join(right)
+        }
+        OpTree::CteScan { body, .. } => body.as_ref().is_some_and(|b| tree_contains_join(b)),
+        OpTree::RecursiveCte {
+            base, recursive, ..
+        } => tree_contains_join(base) || tree_contains_join(recursive),
+        OpTree::ScalarSubquery {
+            subquery, child, ..
+        } => tree_contains_join(subquery) || tree_contains_join(child),
+        OpTree::LateralFunction { child, .. } | OpTree::LateralSubquery { child, .. } => {
+            tree_contains_join(child)
+        }
+        OpTree::Scan { .. } | OpTree::RecursiveSelfRef { .. } => false,
+        // Values and any future variant — conservatively no join.
+        _ => false,
+    }
+}
+
 /// Returns true when the pre-change snapshot (via per-leaf CTE-based
 /// reconstruction) should be used for the given child node.  This is
 /// safe when:
