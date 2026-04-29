@@ -7,6 +7,7 @@ For future plans and upcoming features, see [ROADMAP.md](ROADMAP.md).
 ## Table of Contents
 
 <!-- TOC start -->
+- [0.40.0 — Operator Trust, Maintainability & Release Confidence](#0400--operator-trust-maintainability--release-confidence)
 - [0.39.0 — Operational Truthfulness & Distributed Hardening](#0390--operational-truthfulness--distributed-hardening)
 - [0.38.0 — EC-01 Join Correctness Sprint](#0380--ec-01-join-correctness-sprint)
 - [0.37.0 — pgVector Incremental Aggregates & Distributed Trace Propagation](#0370--pgvector-incremental-aggregates--distributed-trace-propagation)
@@ -53,6 +54,102 @@ For future plans and upcoming features, see [ROADMAP.md](ROADMAP.md).
 - [0.1.1 — CloudNativePG Image & Test Hardening](#011--cloudnativepg-image--test-hardening)
 - [0.1.0 — Initial Release](#010--initial-release)
 <!-- TOC end -->
+
+---
+
+## [0.40.0] — Operator Trust, Maintainability & Release Confidence
+
+v0.40.0 focuses on building confidence for operators, maintainers, and adopters:
+auto-generated API/GUC catalogs to eliminate drift, a formal security model,
+drain-mode runbook with E2E proof, expanded alert rules, dbt/relay parity,
+strict unsafe-block gate, L0-cache documentation truthfulness, formal deprecation
+of `event_driven_wake`, and secret scanning in CI.
+
+### O40-1 — Auto-Generated GUC & SQL API Catalogs
+
+`scripts/gen_catalogs.py` parses `src/config.rs` and `src/**/*.rs` to produce
+`docs/GUC_CATALOG.md` (125 GUCs) and `docs/SQL_API_CATALOG.md` (24 SQL-callable
+functions). Both are checked by a new `.github/workflows/docs-drift.yml` CI gate
+that fails if the catalogs fall out of sync with the source.
+
+Run `just gen-catalogs` to regenerate; `just check-docs-drift` (or the CI gate)
+detects drift.
+
+### O40-2 — Security Model & Secret-Handling Guide
+
+New `docs/SECURITY_MODEL.md` covers: `SECURITY DEFINER` scope, `search_path`
+hardening, RLS boundary semantics, CDC buffer access controls, TRUNCATE
+semantics, relay credential storage guide, background worker privilege model,
+incident response checklist, and v1.0 supply-chain preparation checklist.
+
+### O40-3 — Drain-Mode Runbook & E2E Proof
+
+New `docs/RUNBOOK_DRAIN.md` provides a step-by-step operator runbook for
+controlled shutdown, rolling upgrade, and load-testing drain scenarios with
+observability guidance and troubleshooting steps.
+
+Six new E2E tests in `tests/e2e_drain_mode_tests.rs` validate: idle drain
+returns `true`, `is_drained()` state reflection, post-resume catch-up,
+drain under active workload, timeout parameter semantics, and change-buffer
+accumulation during drain.
+
+### O40-4 — Expanded Alert Rules
+
+`monitoring/prometheus/alerts.yml` gains eight new production-grade alert
+rules:
+
+| Alert | Threshold | Severity |
+|-------|-----------|----------|
+| `PgTrickleFreshnessLagHigh` | staleness > 600 s for 10 min | warning |
+| `PgTrickleRefreshP99High` | avg_duration > 60 000 ms for 5 min | warning |
+| `PgTrickleCdcBufferDepthHigh` | pending_rows > 500 000 for 5 min | warning |
+| `PgTrickleWalSlotLagHigh` | retained_wal_mb > 200 for 5 min | warning |
+| `PgTrickleWalSlotLagCritical` | retained_wal_mb > 1 024 for 2 min | critical |
+| `PgTrickleWorkerPoolSaturated` | active ≥ 90 % pool_size for 5 min | warning |
+| `PgTrickleCitusLeaseUnhealthy` | lease_held == 0 for 5 min | critical |
+| `PgTrickleOtelExportErrors` | export_errors_total > 0 for 5 min | warning |
+
+### O40-5 — dbt & Relay Parity
+
+New dbt macro `pgtrickle_operational_status()` returns scheduler health,
+drain state, CDC pause state, force-full mode, and back-pressure status.
+New `pgtrickle_drain()` macro for drain from dbt. `stream_table_status()`
+updated with `cdc_paused`, `force_full`, and `is_drained` fields.
+
+### O40-6 — Unsafe-Inventory Gate (Strict Mode)
+
+`.github/workflows/unsafe-inventory.yml` changed from `--report-only` to
+strict mode: the workflow now exits 1 on unsafe-block regressions, making it
+a hard PR gate. Unsafe blocks that need to be added must update the baseline
+via an explicit PR that reviewers can audit.
+
+### O40-7 — L0-Cache Truthfulness
+
+`pg_trickle.template_cache` GUC documentation updated to explain the full
+L0/L1/L2 cache architecture:
+- **L0** (process-local `RwLock<HashMap>`) — fast, not shared across pooler
+  connections; hit rate is low in PgBouncer transaction-pooling deployments.
+- **L1** (thread-local delta template) — fastest, reset on each SPI connect.
+- **L2** (UNLOGGED catalog table) — shared across all backends; the correct
+  layer to rely on for cross-connection performance.
+
+Operators using transaction-pooling should rely on L2 warm-up, not L0.
+
+### O40-8 — `event_driven_wake` Formal Deprecation
+
+`pg_trickle.event_driven_wake` and `pg_trickle.wake_debounce_ms` are
+formally deprecated with full rationale in the GUC doc comments:
+`LISTEN` is not allowed in PostgreSQL background workers; the scheduler
+always uses latch-based polling. Both GUCs are preserved in v0.40.0 for
+upgrade compatibility and will be removed in v1.0. Setting them now
+emits a WARNING but does not break existing configurations.
+
+### O40-9 — Secret Scanning CI
+
+New `.github/workflows/secret-scan.yml` runs `gitleaks` on all pull
+requests to `main`, on pushes to `main`, and weekly. `.gitleaks.toml`
+provides an allowlist for known example credentials in documentation
+and test fixtures.
 
 ---
 

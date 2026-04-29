@@ -1,0 +1,37 @@
+-- pg_trickle 0.39.0 -> 0.40.0 upgrade migration
+--
+-- v0.40.0 — Operator Trust, Maintainability & Release Confidence
+--
+-- Changes in this release:
+--
+--   O40-1: Generated GUC and SQL API catalogs published to docs/.
+--     CI fails if source and docs drift. No SQL-level change.
+--
+--   O40-2: Security model, TRUNCATE semantics, and secret-handling
+--     guidance documented in docs/SECURITY_MODEL.md. No SQL change.
+--
+--   O40-3: Drain-mode runbook (docs/RUNBOOK_DRAIN.md) and E2E proof
+--     added as a new test. No SQL change.
+--
+--   O40-4: Alert rules and dashboards versioned under monitoring/.
+--     No SQL change.
+--
+--   O40-5: dbt and relay parity for operational surface (drain mode,
+--     force-full, temporal/vector states). No SQL change.
+--
+--   O40-6: Unsafe-inventory PR gate enforced (fails CI on regressions).
+--     No SQL change.
+--
+--   O40-7: L0 cache documented as process-local; pooler users are
+--     explicitly guided. GUC descriptions updated. No SQL change.
+--
+--   O40-8: pg_trickle.event_driven_wake deprecated; replaced by the
+--     latch-backed scheduler wake path introduced in v0.39.0.
+--     The GUC is preserved for upgrade compatibility but has no effect.
+--     No SQL-level object change.
+--
+--   O40-9: Secret-scanning workflow added to CI. v1.0 supply-chain
+--     work explicitly staged. No SQL change.
+--
+-- No SQL object additions, removals, or signature changes in v0.40.0.
+-- All changes are in documentation, CI, and operational tooling.

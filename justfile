@@ -354,12 +354,12 @@ check-upgrade-all:
 
 # Build the upgrade Docker image for testing FROM→TO migrations
 [group: "upgrade"]
-build-upgrade-image from="0.7.0" to="0.39.0": build-e2e-image
+build-upgrade-image from="0.7.0" to="0.40.0": build-e2e-image
     ./tests/build_e2e_upgrade_image.sh {{from}} {{to}}
 
 # Run upgrade E2E tests (builds base + upgrade Docker images first)
 [group: "upgrade"]
-test-upgrade from="0.7.0" to="0.39.0": (build-upgrade-image from to)
+test-upgrade from="0.7.0" to="0.40.0": (build-upgrade-image from to)
     PGS_E2E_IMAGE=pg_trickle_upgrade_e2e:latest \
     PGS_UPGRADE_FROM={{from}} PGS_UPGRADE_TO={{to}} \
         ./scripts/run_e2e_tests.sh --test e2e_upgrade_tests --run-ignored all --no-capture
@@ -420,6 +420,16 @@ test-upgrade-all: build-e2e-image
 [group: "upgrade"]
 check-version-sync:
     ./scripts/check_version_sync.sh
+
+# Generate GUC and SQL API reference catalogs from source (O40-1)
+[group: "docs"]
+gen-catalogs:
+    python3 scripts/gen_catalogs.py
+
+# Check that generated catalogs are up to date with source (O40-1 CI gate)
+[group: "docs"]
+check-docs-drift:
+    python3 scripts/gen_catalogs.py --check
 
 # ── Benchmarks ────────────────────────────────────────────────────────────
 

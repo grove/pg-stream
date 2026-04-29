@@ -1,0 +1,29 @@
+# Gitleaks configuration — pg_trickle
+# https://github.com/gitleaks/gitleaks
+#
+# This file customizes the gitleaks secret scanner (O40-9) to suppress
+# known false positives in example, documentation, and test files.
+
+title = "pg_trickle gitleaks config"
+
+[extend]
+useDefault = true
+
+# ── Global allowlist: paths that commonly contain example credentials ─────────
+
+[allowlist]
+description = "Example credentials in docs, tests, and CI config files"
+paths = [
+    '''docs/.*\.md''',
+    '''blog/.*\.md''',
+    '''examples/.*''',
+    '''tests/.*''',
+    '''demo/.*''',
+    '''README\.md''',
+    '''INSTALL\.md''',
+    '''docker-compose.*\.yml''',
+    '''monitoring/.*''',
+    '''cnpg/.*''',
+    '''pgtrickle-relay/examples/.*''',
+    '''\.github/.*''',
+]
