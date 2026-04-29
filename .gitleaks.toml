@@ -9,44 +9,21 @@ title = "pg_trickle gitleaks config"
 [extend]
 useDefault = true
 
-# ── Allowlist: example credentials in documentation ──────────────────────────
+# ── Global allowlist: paths that commonly contain example credentials ─────────
 
-[[rules.allowlist]]
-description = "Example passwords in documentation and test fixtures"
+[allowlist]
+description = "Example credentials in docs, tests, and CI config files"
 paths = [
-    "docs/.*\\.md",
-    "blog/.*\\.md",
-    "examples/.*",
-    "tests/.*",
-    "demo/.*",
-    "README.md",
-    "INSTALL.md",
-]
-regexes = [
-    # Common example passwords/tokens used in docs
-    "s3cr3t",
-    "example[_-]?password",
-    "your[_-]?password[_-]?here",
-    "change[_-]?me",
-    "password123",
-    "postgres",  # default PG superuser password in examples
-]
-
-[[rules.allowlist]]
-description = "Docker Compose example passwords"
-paths = [
-    "docker-compose\\.yml",
-    "monitoring/.*",
-    "cnpg/.*",
-    "pgtrickle-relay/examples/.*",
-]
-
-[[rules.allowlist]]
-description = "CI/test connection strings"
-paths = [
-    "\\.github/.*",
-]
-regexes = [
-    "postgresql://postgres.*localhost",
-    "host=localhost.*user=postgres",
+    '''docs/.*\.md''',
+    '''blog/.*\.md''',
+    '''examples/.*''',
+    '''tests/.*''',
+    '''demo/.*''',
+    '''README\.md''',
+    '''INSTALL\.md''',
+    '''docker-compose.*\.yml''',
+    '''monitoring/.*''',
+    '''cnpg/.*''',
+    '''pgtrickle-relay/examples/.*''',
+    '''\.github/.*''',
 ]
