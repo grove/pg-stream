@@ -44,7 +44,7 @@ env:
 jobs:
   # ── O39-10: Capture EXPLAIN ANALYZE BUFFERS artifacts ─────────────────────
   tpch-explain-artifacts:
-    name: TPC-H EXPLAIN artifacts (SF-${{ env.TPCH_SCALE }})
+    name: TPC-H EXPLAIN artifacts (SF-${{ github.event.inputs.tpch_scale || '1.0' }})
     runs-on: ubuntu-latest
     timeout-minutes: 120
 
