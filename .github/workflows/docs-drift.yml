@@ -1,0 +1,48 @@
+name: Docs drift check
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'src/config.rs'
+      - 'src/**/*.rs'
+      - 'docs/GUC_CATALOG.md'
+      - 'docs/SQL_API_CATALOG.md'
+      - 'scripts/gen_catalogs.py'
+      - '.github/workflows/docs-drift.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'src/config.rs'
+      - 'src/**/*.rs'
+      - 'docs/GUC_CATALOG.md'
+      - 'docs/SQL_API_CATALOG.md'
+      - 'scripts/gen_catalogs.py'
+      - '.github/workflows/docs-drift.yml'
+  schedule:
+    - cron: '30 6 * * 1'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  docs-drift:
+    name: GUC and SQL API catalog drift check (O40-1)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Check GUC and SQL API catalogs are up to date
+        run: |
+          python3 scripts/gen_catalogs.py --check
