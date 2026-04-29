@@ -154,3 +154,150 @@ groups:
             The overall pg_trickle health check reports WARNING status.
             Some tables may have errors or stale data. Check:
               SELECT * FROM pgtrickle.quick_health;
+
+      # ── Freshness lag (O40-4) ────────────────────────────────────────────
+
+      # A stream table's p99 end-to-end freshness lag exceeds 10 minutes.
+      # Indicates the scheduler is falling behind or there is CDC backpressure.
+      - alert: PgTrickleFreshnessLagHigh
+        expr: pg_trickle_table_stats_staleness_seconds > 600
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: >
+            Stream table {{ $labels.schema }}.{{ $labels.name }} freshness lag
+            exceeds 10 minutes
+          description: >
+            {{ $labels.schema }}.{{ $labels.name }} data is
+            {{ $value | humanizeDuration }} stale (p99 lag threshold: 10 min).
+            Check scheduler health and CDC buffer depth.
+
+      # ── Refresh p99 duration (O40-4) ─────────────────────────────────────
+
+      # Refresh p99 latency exceeds 60 seconds — may indicate runaway query
+      # or excessive row delta.
+      - alert: PgTrickleRefreshP99High
+        expr: pg_trickle_table_stats_avg_duration_ms > 60000
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: >
+            Stream table {{ $labels.schema }}.{{ $labels.name }} p99 refresh
+            latency exceeds 60 s
+          description: >
+            {{ $labels.schema }}.{{ $labels.name }} avg refresh duration is
+            {{ $value }}ms. A FULL fallback or pathological delta may be the
+            cause. Run:
+              SELECT pgtrickle.explain_stream_table('{{ $labels.schema }}.{{ $labels.name }}');
+
+      # ── CDC buffer depth (O40-4) ─────────────────────────────────────────
+
+      # CDC buffer pending row count exceeds 500 000 rows for > 5 minutes.
+      # The scheduler may not be keeping pace with the write volume.
+      - alert: PgTrickleCdcBufferDepthHigh
+        expr: pg_trickle_cdc_buffers_pending_rows > 500000
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: >
+            CDC buffer for {{ $labels.source_table }} has
+            {{ $value | humanize }} pending rows
+          description: >
+            The change buffer for {{ $labels.source_table }} (stream table:
+            {{ $labels.stream_table }}) holds {{ $value | humanize }} unprocessed
+            rows. The scheduler is not keeping up with the write volume or is
+            stalled. Check pg_trickle.health_check() and increase
+            pg_trickle.max_concurrent_refreshes if needed.
+
+      # ── WAL slot lag (O40-4) ─────────────────────────────────────────────
+
+      # WAL-mode CDC slot retaining more than the warning threshold.
+      - alert: PgTrickleWalSlotLagHigh
+        expr: pg_trickle_slot_health_retained_wal_mb > 200
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: >
+            WAL slot {{ $labels.slot_name }} retaining
+            {{ $value | humanize }}MB of WAL
+          description: >
+            The pg_trickle replication slot {{ $labels.slot_name }} for
+            {{ $labels.source_table }} is retaining {{ $value }}MB of WAL.
+            This will grow disk usage and bloat the WAL directory.
+            Check that the scheduler is consuming changes regularly:
+              SELECT * FROM pgtrickle.slot_health();
+
+      # WAL slot retention exceeds critical threshold (1 GB).
+      - alert: PgTrickleWalSlotLagCritical
+        expr: pg_trickle_slot_health_retained_wal_mb > 1024
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: >
+            WAL slot {{ $labels.slot_name }} retaining > 1 GB of WAL —
+            disk exhaustion risk
+          description: >
+            The WAL slot {{ $labels.slot_name }} is retaining
+            {{ $value }}MB of WAL. Disk exhaustion may occur.
+            If the stream table cannot catch up, consider dropping and
+            recreating the slot to prevent disk exhaustion:
+              SELECT pgtrickle.drop_stream_table('schema.table');
+              -- Then recreate after freeing disk space.
+
+      # ── Worker saturation (O40-4) ─────────────────────────────────────────
+
+      # Active dynamic refresh workers approach the cluster limit.
+      - alert: PgTrickleWorkerPoolSaturated
+        expr: >
+          pg_trickle_parallel_job_status_active_workers
+          >= 0.9 * pg_trickle_parallel_job_status_pool_size
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: >
+            pg_trickle refresh worker pool is {{ $value | humanizePercentage }}
+            saturated
+          description: >
+            The dynamic refresh worker pool is near capacity. Stream tables
+            may be queued rather than refreshing on schedule. Consider raising
+            pg_trickle.max_dynamic_refresh_workers or
+            pg_trickle.per_database_worker_quota.
+
+      # ── Citus lease health (O40-4) ───────────────────────────────────────
+
+      # Citus distributed scheduling lease is not held — distributed
+      # stream tables may not refresh across workers.
+      - alert: PgTrickleCitusLeaseUnhealthy
+        expr: pg_trickle_citus_st_lock_lease_held == 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "pg_trickle Citus scheduling lease is not held"
+          description: >
+            The pg_trickle Citus scheduling lease (pgt_st_locks) is not
+            held. Distributed stream table refreshes may be stalled or
+            uncoordinated. Check for lock contention or coordinator failures:
+              SELECT * FROM pgtrickle.citus_status();
+
+      # ── Trace export failures (O40-4) ────────────────────────────────────
+
+      # OpenTelemetry trace export errors detected.
+      - alert: PgTrickleOtelExportErrors
+        expr: pg_trickle_otel_export_errors_total > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "pg_trickle OpenTelemetry trace export errors detected"
+          description: >
+            pg_trickle has recorded {{ $value }} OpenTelemetry trace export
+            errors. Check connectivity to the OTLP endpoint configured in
+            pg_trickle.otel_endpoint and verify the collector is reachable.
+
