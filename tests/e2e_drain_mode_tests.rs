@@ -40,7 +40,7 @@ async fn test_drain_idle_returns_true() {
 
     // With no stream tables, drain() should return true immediately.
     let drained: bool = db
-        .query_scalar("SELECT pgtrickle.drain(timeout => 30)")
+        .query_scalar("SELECT pgtrickle.drain(timeout_s => 30)")
         .await;
     assert!(
         drained,
@@ -55,7 +55,7 @@ async fn test_drain_is_drained_when_idle() {
     configure_fast_scheduler(&db).await;
 
     // Drain first to ensure clean state.
-    db.execute("SELECT pgtrickle.drain(timeout => 30)").await;
+    db.execute("SELECT pgtrickle.drain(timeout_s => 30)").await;
 
     let drained: bool = db.query_scalar("SELECT pgtrickle.is_drained()").await;
     assert!(
@@ -77,7 +77,7 @@ async fn test_drain_resume_catches_up() {
         "SELECT pgtrickle.create_stream_table(\
              'public.drain_view', \
              'SELECT id, val FROM public.drain_src', \
-             schedule => '1 second'\
+             schedule => '1s'\
          )",
     )
     .await;
@@ -87,7 +87,7 @@ async fn test_drain_resume_catches_up() {
 
     // Drain the scheduler.
     let drained: bool = db
-        .query_scalar("SELECT pgtrickle.drain(timeout => 30)")
+        .query_scalar("SELECT pgtrickle.drain(timeout_s => 30)")
         .await;
     assert!(
         drained,
@@ -135,7 +135,7 @@ async fn test_drain_under_workload() {
         "SELECT pgtrickle.create_stream_table(\
              'public.drain_wl_view', \
              'SELECT id, val FROM public.drain_wl_src', \
-             schedule => '1 second'\
+             schedule => '1s'\
          )",
     )
     .await;
@@ -155,7 +155,7 @@ async fn test_drain_under_workload() {
 
     // Call drain — should complete within the timeout even under load.
     let drained: bool = db
-        .query_scalar("SELECT pgtrickle.drain(timeout => 60)")
+        .query_scalar("SELECT pgtrickle.drain(timeout_s => 60)")
         .await;
     assert!(
         drained,
@@ -215,7 +215,7 @@ async fn test_drain_timeout_returns_false_or_true() {
 
     // With no work in flight, drain(1) should return true immediately.
     let result: bool = db
-        .query_scalar("SELECT pgtrickle.drain(timeout => 1)")
+        .query_scalar("SELECT pgtrickle.drain(timeout_s => 1)")
         .await;
     // Either outcome (true = idle fast, false = timeout) is valid here,
     // but we must not panic or deadlock.
@@ -236,7 +236,7 @@ async fn test_drain_buffer_accumulates_during_drain() {
         "SELECT pgtrickle.create_stream_table(\
              'public.drain_buf_view', \
              'SELECT id, v FROM public.drain_buf_src', \
-             schedule => '1 second'\
+             schedule => '1s'\
          )",
     )
     .await;
@@ -244,7 +244,7 @@ async fn test_drain_buffer_accumulates_during_drain() {
 
     // Drain the scheduler.
     let _drained: bool = db
-        .query_scalar("SELECT pgtrickle.drain(timeout => 30)")
+        .query_scalar("SELECT pgtrickle.drain(timeout_s => 30)")
         .await;
 
     // Insert rows — these should accumulate in the change buffer.
