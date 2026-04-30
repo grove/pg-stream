@@ -32,8 +32,12 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      - name: Install Rust nightly (required for cargo-fuzz)
-        uses: dtolnay/rust-toolchain@nightly
+      - name: Setup pgrx environment (with nightly Rust for cargo-fuzz)
+        uses: ./.github/actions/setup-pgrx
+        with:
+          rust-toolchain: nightly
+          pg-version: "18"
+          pg-install-mode: system
 
       - name: Cache cargo registry and fuzz build
         uses: actions/cache@v4
