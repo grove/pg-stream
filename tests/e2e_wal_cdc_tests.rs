@@ -70,7 +70,7 @@ async fn wait_for_cdc_mode(
     let start = std::time::Instant::now();
     loop {
         let mode = get_cdc_mode(db, source_table).await;
-        if mode == target {
+        if mode.eq_ignore_ascii_case(target) {
             return mode;
         }
         if start.elapsed() > timeout {
@@ -842,7 +842,7 @@ async fn test_wal_transition_pk_drop_falls_back_to_trigger() {
         wait_for_cdc_mode(&db, "wal_pk_drop_src", "trigger", Duration::from_secs(30)).await;
 
     assert!(
-        final_mode == "trigger" || final_mode == "Trigger",
+        final_mode.eq_ignore_ascii_case("trigger"),
         "After PK drop the CDC mode should revert to trigger, got: {final_mode}"
     );
 
@@ -889,7 +889,7 @@ async fn test_wal_transition_replica_identity_drop_falls_back_to_trigger() {
         wait_for_cdc_mode(&db, "wal_ri_drop_src", "trigger", Duration::from_secs(30)).await;
 
     assert!(
-        final_mode == "trigger" || final_mode == "Trigger",
+        final_mode.eq_ignore_ascii_case("trigger"),
         "After REPLICA IDENTITY reset the CDC mode should revert to trigger, got: {final_mode}"
     );
 }
