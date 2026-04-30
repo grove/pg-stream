@@ -150,6 +150,11 @@ Socrata, and data.gov portals.
 For pg_trickle: emit `pgtrickle.stream_table_dcat_json(name)` that produces a
 DCAT `Dataset` resource with `dct:source` links pointing to each input relation.
 
+**Priority:** Low. DCAT is a catalog discovery standard, not a lineage standard;
+it duplicates what OpenLineage's dataset schema facet already provides for the
+consumer tools we care about. Defer unless a specific data portal integration
+is requested.
+
 ### 2.4 ISO/IEC 11179 (Metadata Registry)
 
 The ISO metadata registry standard defines how to represent data element
@@ -157,6 +162,10 @@ properties in interoperable registries. It is the formal basis for enterprise
 data catalogs. pg_trickle's column type/nullability information could be
 serialised in this format for integration with government and enterprise MDM
 (Master Data Management) platforms.
+
+**Priority:** Very low / on request only. Relevant only for government and
+enterprise MDM use cases with hard ISO compliance requirements. Not on the
+implementation roadmap.
 
 ### 2.5 Great Expectations / OpenMetadata / DataHub
 
@@ -240,45 +249,12 @@ Implementation:
 This enables automated GDPR compliance: `pgtrickle.pii_impact_report()` shows
 all stream tables that contain PII-derived columns.
 
-### Idea D — OpenLineage Background Worker
+### Idea D — OpenLineage Event Generation (→ implemented as Phase 5)
 
-A background worker (or configurable hook on refresh completion) that emits
-OpenLineage `RunEvent` payloads to an HTTP endpoint:
-
-```
-pg_trickle.openlineage_endpoint = 'http://marquez:5000'
-pg_trickle.openlineage_namespace = 'production-db'
-pg_trickle.openlineage_enabled = true
-```
-
-On each refresh completion the worker posts:
-
-```json
-{
-  "eventType": "COMPLETE",
-  "eventTime": "2026-04-30T14:23:01Z",
-  "job": {
-    "namespace": "production-db",
-    "name": "pgtrickle.revenue_by_region",
-    "facets": {
-      "sql": { "query": "SELECT region, SUM(amount) FROM orders JOIN ..." },
-      "documentation": { "description": "Daily revenue rollup by customer region" }
-    }
-  },
-  "run": { "runId": "<uuid>" },
-  "inputs": [ { "namespace": "...", "name": "public.orders" } ],
-  "outputs": [
-    {
-      "namespace": "...",
-      "name": "public.revenue_by_region",
-      "facets": {
-        "columnLineage": { ... },
-        "outputStatistics": { "rowCount": 12, "size": 384 }
-      }
-    }
-  ]
-}
-```
+> **Note:** This idea is fully incorporated into Phase 5. See §4 Phase 5 for
+> the complete design. The refresh hook generates a full `RunEvent` JSON and
+> writes it to `pgtrickle_changes.lineage_outbox`; `pgtrickle-relay` handles
+> delivery to Marquez, DataHub, or any OpenLineage-compatible endpoint.
 
 ### Idea E — Transitive Lineage SQL Function
 
@@ -369,11 +345,11 @@ enough for this business rule?"
 
 ## 4. Implementation Plan
 
-### Phase 1 — Enhanced Column Lineage (v0.40.x)
+### Phase 1 — Enhanced Column Lineage (v0.41.x)
 
 **Goal:** Upgrade F12's stored `column_lineage` JSON to include full
 OpenLineage-compatible transformation subtypes (DIRECT/INDIRECT, subtype,
-masking flag). No new SQL functions yet — only the stored metadata is enriched.
+masking flag), and update `stream_table_lineage()` to expose the richer format.
 
 **Changes:**
 
@@ -417,14 +393,31 @@ masking flag). No new SQL functions yet — only the stored metadata is enriched
 
 3. **`src/api/mod.rs`** — Serialise the `Vec<LineageEntry>` to JSONB on
    `create_stream_table` and `alter_stream_table`. Update the
-   `stream_table_lineage()` function to expand the new richer format.
+   `stream_table_lineage()` function to return the new columns:
+
+   ```sql
+   -- Updated return type (extends existing 3-col signature):
+   SELECT * FROM pgtrickle.stream_table_lineage(name TEXT)
+   RETURNS TABLE (
+       output_col             TEXT,
+       source_table           TEXT,
+       source_col             TEXT,
+       transformation_type    TEXT,   -- 'DIRECT' | 'INDIRECT'
+       transformation_subtype TEXT,   -- 'IDENTITY' | 'AGGREGATION' | 'FILTER' | ...
+       masking                BOOLEAN
+   );
+   ```
+
+   The three existing columns are preserved in the same positions for
+   backward compatibility. Clients reading only the first three columns
+   continue to work without changes.
 
 **Estimated effort:** 3–4 days. No schema migration required — the JSONB column
-already exists; only its content changes.
+already exists; only its content and the function's return type change.
 
 ---
 
-### Phase 2 — Transitive Lineage Function (v0.41.x)
+### Phase 2 — Transitive Lineage Function (v0.41.x or v0.42.x)
 
 **Goal:** Built-in recursive lineage traversal without requiring users to write
 CTEs.
@@ -458,7 +451,7 @@ stream tables, and recurses into each.
 
 ---
 
-### Phase 3 — Property Lineage: Type & Nullability Propagation (v0.41.x)
+### Phase 3 — Property Lineage: Type & Nullability Propagation (v0.42.x)
 
 **Goal:** Track how column types and nullability propagate through transforms.
 
@@ -495,7 +488,7 @@ RETURNS TABLE (
 
 ---
 
-### Phase 4 — Sensitivity Label Store (v0.42.x)
+### Phase 4 — Sensitivity Label Store (v0.43.x)
 
 **Goal:** Allow users to tag source columns as PII/PHI/sensitive, and have those
 labels propagate automatically through the DAG.
@@ -553,115 +546,152 @@ RETURNS TABLE (
 
 ---
 
-### Phase 5 — OpenLineage Event Generation & Outbox (v0.43.x)
+### Phase 5 — OpenLineage Event Generation & pgtrickle-relay Sink (v0.44.x)
 
-**Goal:** Generate OpenLineage `RunEvent` payloads in PostgreSQL and place them
-in a durable outbox table. HTTP emission is delegated to an external relay
-service (`pgtrickle-relay` or a standalone sidecar).
+**Goal:** Generate OpenLineage `RunEvent` payloads in PostgreSQL, write them
+to an outbox table, and deliver them via `pgtrickle-relay` to Marquez, DataHub,
+or any OpenLineage-compatible backend.
 
 **Why external relay?** PostgreSQL should not perform external HTTP calls.
 The outbox pattern keeps the database clean, enables retry logic and batching
-outside the transaction context, and allows independent scaling/deployment of
-the relay component.
+outside the transaction context, and allows the relay to be deployed/scaled
+independently. **`pgtrickle-relay` already exists** (v0.29.0) with a full HTTP
+webhook sink (`reqwest`), LISTEN/NOTIFY support, advisory locks, and a
+SQL-driven pipeline configuration API. Adding OpenLineage delivery is a
+**new `Sink` implementation** in the relay — not a new sidecar project.
 
 **Architecture:**
 
 ```
 PostgreSQL (refresh completes)
-    ↓
-    ├─ Generates OpenLineage RunEvent JSON
-    ├─ Writes to pgtrickle_changes.openlineage_events (outbox table)
-    └─ Sends NOTIFY 'pgtrickle_lineage' event
-            ↓
-pgtrickle-relay service (stateless sidecar)
-    ├─ Listens for NOTIFY or polls outbox table
-    ├─ Reads events from pgtrickle_changes.openlineage_events
-    ├─ POST to Marquez/DataHub/custom backend with exponential backoff
-    ├─ Marks events as sent via UPDATE
-    └─ Can be deployed/scaled independently
+    ↓  hook in refresh path
+    ├─ Assembles OpenLineage RunEvent JSON
+    └─ INSERTs into pgtrickle_changes.lineage_outbox
+            ↓  NOTIFY 'pgtrickle_relay' (reuses existing relay channel)
+pgtrickle-relay (existing binary, v0.29.0+)
+    ├─ Polls lineage_outbox via existing outbox source infrastructure
+    ├─ Dispatches to new `openlineage` Sink type
+    │       POST /api/v1/lineage  →  Marquez
+    │       POST /api/v1/lineage  →  DataHub
+    │       POST /api/v1/lineage  →  custom backend
+    └─ Marks events delivered (existing ack/retry logic)
 ```
 
-**Schema additions:**
+**Schema additions (PostgreSQL side):**
 
 ```sql
--- Durable outbox table (UNLOGGED for performance; data is non-critical).
--- Persists across server restarts so relay can catch up.
-CREATE TABLE pgtrickle_changes.openlineage_events (
+-- Outbox for OpenLineage events. LOGGED (not UNLOGGED) because events
+-- are not reconstructible if lost after a crash — they represent point-in-time
+-- refresh executions. Size is small (one row per refresh).
+CREATE TABLE pgtrickle_changes.lineage_outbox (
     event_id         BIGSERIAL PRIMARY KEY,
     stream_table_oid OID NOT NULL,
     stream_table_name TEXT NOT NULL,
-    event_type       TEXT NOT NULL,  -- 'START', 'COMPLETE', 'FAIL'
-    event_json       JSONB NOT NULL, -- Full OpenLineage RunEvent
-    created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
-    sent_at          TIMESTAMPTZ,
-    attempt_count    INT NOT NULL DEFAULT 0,
-    last_error       TEXT,
-    CONSTRAINT check_event_type CHECK (event_type IN ('START', 'COMPLETE', 'FAIL'))
+    event_type       TEXT NOT NULL CHECK (event_type IN ('START', 'COMPLETE', 'FAIL')),
+    event_json       JSONB NOT NULL, -- Full OpenLineage RunEvent payload
+    created_at       TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
-CREATE INDEX idx_openlineage_events_sent_at 
-    ON pgtrickle_changes.openlineage_events(sent_at) 
-    WHERE sent_at IS NULL;
+CREATE INDEX idx_lineage_outbox_undelivered
+    ON pgtrickle_changes.lineage_outbox(event_id)
+    WHERE event_id > 0;  -- relay uses offset-based polling, same as stream table outboxes
 ```
 
-**PostgreSQL-side (Phase 5):**
+**PostgreSQL-side changes (Phase 5):**
 
 1. **Hook on refresh completion** — After `refresh_stream_table()` finishes
-   (successfully or with error), insert a row into `openlineage_events` with
-   the assembled `RunEvent` JSON.
+   (successfully or with error), INSERT into `lineage_outbox` with the
+   assembled `RunEvent` JSON.
 
 2. **New SQL function:**
 
    ```sql
    -- On-demand: generate the OpenLineage JSON for a stream table (no outbox write).
-   -- Useful for testing and manual inspection.
+   -- Useful for testing, curl-based ad-hoc delivery, and relay debugging.
    pgtrickle.stream_table_obl_event(
-       name TEXT,
+       name       TEXT,
        event_type TEXT DEFAULT 'COMPLETE'
    ) RETURNS JSONB;
    ```
 
-3. **New GUCs** (for relay configuration, stored in database):
+3. **New GUCs:**
 
    ```
-   pg_trickle.openlineage_enabled = false  -- When true, write to outbox on refresh
-   pg_trickle.openlineage_namespace = ''   -- Defaults to current database
-   pg_trickle.openlineage_include_sql = true
-   pg_trickle.openlineage_include_stats = true
+   pg_trickle.openlineage_enabled           = false  -- write to outbox on refresh
+   pg_trickle.openlineage_namespace         = ''     -- defaults to current_database()
+   pg_trickle.openlineage_include_sql       = true
+   pg_trickle.openlineage_include_stats     = true
    pg_trickle.openlineage_include_column_lineage = true
    ```
 
-4. **Optional monitoring function:**
+4. **Monitoring function:**
 
    ```sql
    pgtrickle.openlineage_queue_status()
    RETURNS TABLE (
-       event_id INT, stream_table TEXT, event_type TEXT, created_at TIMESTAMPTZ,
-       sent_at TIMESTAMPTZ, attempt_count INT, last_error TEXT
+       event_id BIGINT, stream_table TEXT, event_type TEXT,
+       created_at TIMESTAMPTZ, age_s FLOAT4
    );
    ```
 
-**Relay service (separate project: `pgtrickle-relay` or new sidecar):**
+**pgtrickle-relay changes (new `openlineage` feature + Sink):**
 
-- Configurable endpoint(s): `--marquez-url http://localhost:5000`, `--dataHub-url ...`
-- Connects to PostgreSQL via libpq connection string
-- Polls `openlineage_events` for `sent_at IS NULL` rows (or listens via LISTEN)
-- For each unsent event:
-  1. POST to backend with timeout (30s)
-  2. If success (2xx): `UPDATE openlineage_events SET sent_at = now() WHERE event_id = ...`
-  3. If failure: `UPDATE openlineage_events SET attempt_count = attempt_count + 1, last_error = ... WHERE event_id = ...`
-  4. Exponential backoff: retry if `attempt_count < 5` and `created_at > now() - interval '7 days'`
-- Can run as a systemd service, Kubernetes sidecar, or Docker container
+Add `openlineage` as a new optional feature flag alongside the existing
+`webhook`, `nats`, `kafka` etc. The new `OpenLineageSink` implements the
+existing `Sink` trait:
+
+```rust
+// pgtrickle-relay/src/sink/openlineage.rs
+#[cfg(feature = "openlineage")]
+pub struct OpenLineageSink {
+    client: reqwest::Client,  // reuses existing reqwest dependency
+    endpoint: reqwest::Url,   // e.g. http://marquez:5000/api/v1/lineage
+    timeout_secs: u64,
+}
+
+#[async_trait]
+impl Sink for OpenLineageSink {
+    async fn publish(&mut self, messages: &[RelayMessage]) -> Result<(), RelayError> {
+        // Each message.payload is already a full OL RunEvent JSON.
+        // POST one event per request (OL API is not batched).
+        for msg in messages {
+            self.client.post(self.endpoint.clone())
+                .json(&msg.payload)
+                .send().await?.error_for_status()?;
+        }
+        Ok(())
+    }
+}
+```
+
+Register a lineage pipeline via the existing SQL API:
+
+```sql
+SELECT pgtrickle.set_relay_outbox(
+    'lineage-to-marquez',
+    config => '{
+        "stream_table": "__lineage_outbox__",
+        "sink_type": "openlineage",
+        "openlineage_url": "http://marquez:5000/api/v1/lineage",
+        "timeout_secs": 30
+    }'::jsonb
+);
+SELECT pgtrickle.enable_relay('lineage-to-marquez');
+```
+
+The relay's existing advisory-lock coordination, offset-based polling, retry
+logic, Prometheus metrics, and hot-reload via NOTIFY all apply without
+additional work.
 
 **Effort breakdown:**
-- PostgreSQL side (outbox table + hook + function): **2–3 days**
-- Relay service (new Rust project or Go sidecar): **4–6 days** (depends on existing relay infrastructure)
+- PostgreSQL side (outbox table + hook + GUCs + function): **2–3 days**
+- `pgtrickle-relay` new `openlineage` sink + feature flag: **1–2 days**
 
-**Total estimated effort:** 6–9 days (split between core + relay).
+**Total estimated effort:** 3–5 days (much less than an independent sidecar).
 
 ---
 
-### Phase 6 — Statistical Property Propagation (v0.44.x)
+### Phase 6 — Statistical Property Propagation (v0.45.x)
 
 **Goal:** Track lightweight statistical summaries of columns through the DAG,
 updated incrementally at each refresh.
@@ -695,7 +725,7 @@ RETURNS TABLE (
 
 ---
 
-### Phase 7 — PROV-O RDF Export (v0.45.x, optional)
+### Phase 7 — PROV-O RDF Export (v0.46.x, optional)
 
 **Goal:** Generate W3C PROV-O Turtle or JSON-LD for formal provenance
 representation, targeting regulated industries.
@@ -739,7 +769,7 @@ pgt:pg_trickle
 
 ---
 
-### Phase 8 — Differential Provenance (Stretch Goal, v0.46.x+)
+### Phase 8 — Differential Provenance (Stretch Goal, v0.47.x+)
 
 **Goal:** Row-level change provenance — explain *which input delta tuples* caused
 a specific output row to change.
@@ -787,89 +817,101 @@ mitigation needed).
 ```
 pg_trickle lineage APIs
         │
-        ├── stream_table_lineage()          ← today (F12)
+        ├── stream_table_lineage()          ← today (F12), enhanced Phase 1
         ├── transitive_lineage()            ← Phase 2
         ├── column_properties()             ← Phase 3
         ├── column_labels()                 ← Phase 4
-        ├── stream_table_obl_event()        ← Phase 5
+        ├── stream_table_obl_event()        ← Phase 5 (inspection / ad-hoc)
         ├── lineage_rdf()                   ← Phase 7
         └── explain_row_change()            ← Phase 8 (stretch)
                 │
-    ┌───────────┼──────────────────────┐
-    │           │                      │
-OpenLineage  PROV-O RDF             DCAT JSON
-    │                                  │
-    ├── Marquez                         └── Data catalogs
-    ├── OpenMetadata                        (CKAN, Socrata)
-    ├── DataHub
-    ├── Apache Airflow
-    ├── dbt integration
-    ├── Apache Spark jobs
-    └── Custom consumers
+    ┌───────────┼─────────────────────────────────────┐
+    │           │                                     │
+    │  pgtrickle_changes.lineage_outbox          PROV-O RDF
+    │           │                                     │
+    │   pgtrickle-relay                       Turtle / JSON-LD
+    │   (existing, v0.29.0+)                      │
+    │   openlineage Sink (new, Phase 5)    Regulated industries
+    │           │
+    ├── POST /api/v1/lineage
+    │       │
+    │       ├── Marquez (OL reference backend)
+    │       ├── OpenMetadata
+    │       ├── DataHub
+    │       └── Custom backends
+    │
+    └── dbt-pgtrickle (Phase 9)
+            └── dbt artifacts → OL parent facet
 ```
 
 ---
 
-## 6. dbt Integration Extension
+## 6. dbt Integration Extension (Phase 9)
 
 Extend `dbt-pgtrickle` to:
 
 1. Auto-emit OpenLineage events for `stream_table` materializations, using
    the dbt project's `run_id` as a `parent` facet so dbt → pg_trickle lineage
-   is fully connected.
+   is fully connected in Marquez/DataHub.
 2. Add a new macro `stream_table_column_lineage()` that reads
    `pgtrickle.stream_table_lineage()` and injects it into the dbt artifact
    JSON for downstream consumption by catalog tools.
+
+This is a `dbt-pgtrickle` change only (Python + Jinja) — no changes to the
+pg_trickle Rust extension. Estimated effort: 2–3 days.
 
 ---
 
 ## 7. Implementation Priority Summary
 
-| Phase | Feature | Version | Effort (PG-side) | Value | Priority |
-|-------|---------|---------|----------|-------|----------|
-| 1 | Enhanced column lineage (OL-compatible subtypes) | v0.40.x | 3–4d | High | **P1** |
-| 2 | Transitive lineage function | v0.41.x | 2d | High | **P1** |
-| 3 | Type & nullability propagation | v0.41.x | 3d | Medium | **P2** |
-| 5 | OpenLineage event generation & outbox | v0.43.x | 2–3d | Very High | **P1** |
-| 4 | Sensitivity label propagation | v0.42.x | 4–5d | High | **P2** |
-| 6 | Statistical property propagation | v0.44.x | 4–5d | Medium | **P3** |
-| 7 | PROV-O RDF export | v0.45.x | 3–4d | Low–Medium | **P3** |
-| 8 | Differential row provenance | v0.46.x+ | 10–14d | Very High (niche) | **Stretch** |
+| Phase | Feature | Version | Effort | Value | Priority |
+|-------|---------|---------|--------|-------|----------|
+| 1 | Enhanced column lineage (OL-compatible subtypes + updated function) | v0.41.x | 3–4d | High | **P1** |
+| 2 | Transitive lineage function | v0.41–42.x | 2d | High | **P1** |
+| 5 | OpenLineage outbox + pgtrickle-relay `openlineage` sink | v0.44.x | 3–5d | Very High | **P1** |
+| 3 | Type & nullability propagation | v0.42.x | 3d | Medium | **P2** |
+| 4 | Sensitivity label propagation | v0.43.x | 4–5d | High | **P2** |
+| 9 | dbt lineage bridge | — | 2–3d | High | **P2** |
+| 6 | Statistical property propagation | v0.45.x | 4–5d | Medium | **P3** |
+| 7 | PROV-O RDF export | v0.46.x | 3–4d | Low–Medium | **P3** |
+| 8 | Differential row provenance | v0.47.x+ | 10–14d | Very High (niche) | **Stretch** |
 
-**Note:** Phase 5 effort is PostgreSQL-side work only. A separate relay service
-(pgtrickle-relay or custom sidecar) would add 4–6 additional days, deployed
-independently.
+**Ideas G (Column Fingerprints) and I (Freshness Lineage)** from §3 are not
+phased here. G can be added as a bonus to Phase 1 (fingerprint stored alongside
+column lineage in the JSONB) at low cost. I overlaps with existing `pgt_refresh_history`
+staleness data and can be surfaced as a view rather than a new phase.
 
 ---
 
 ## 8. Open Questions
 
-1. **Relay infrastructure:** Where should the OpenLineage relay live?
-   - Option A: Extend `pgtrickle-relay` (if it exists and is suitable)
-   - Option B: Create a new lightweight Rust/Go sidecar (`pgtrickle-ol-relay`)
-   - Option C: User writes their own polling loop + HTTP client
-   - Recommendation: Start with Option C (documented best practice), then add
-     Option B as a reference implementation if demand warrants.
+1. **`stream_table_lineage()` backward compatibility:** The function currently
+   returns 3 columns. Phase 1 adds 3 more. Callers using `SELECT *` will see
+   the new columns — this is intentional and additive, but should be
+   communicated in the CHANGELOG.
 
-2. **NOTIFY vs polling:** Should the relay listen for NOTIFY events or poll the
-   outbox table periodically?
-   - NOTIFY: real-time, but requires a persistent connection
-   - Polling: simpler deployment (can be a cron job or systemd timer)
-   - Recommendation: Support both; relay can use LISTEN if connected, fall back
-     to polling if configured.
+2. **IMMEDIATE mode and the lineage outbox:** In IMMEDIATE (transactional IVM)
+   mode, refreshes happen inside the user's transaction. The lineage outbox
+   INSERT will also be inside that transaction, which is correct — the event
+   is only durably written if the refresh commits. No special handling needed.
 
-3. **Storage cost for differential provenance (Phase 8):** Change-buffer
-   provenance annotations could multiply storage usage. A configurable
-   `provenance_retention_days` GUC and a background vacuumer are needed.
+3. **`lineage_outbox` retention:** Unlike stream table change buffers (which are
+   vacuum'd after processing), lineage events are small and worth retaining for
+   audit. Recommend keeping rows for 30 days. A GUC
+   `pg_trickle.lineage_retention_days` (default 30) controls this; a
+   background vacuumer prunes old delivered rows.
 
 4. **k-anonymity threshold for Phase 4:** The sensitivity label rule for
    small-group COUNT(DISTINCT pii_col) requires a configurable k-threshold.
    Default k=5 following HIPAA Safe Harbor guidance.
 
-5. **Naming:** "property lineage" is not a widely standardised term. The
-   implementation uses "column properties" internally to avoid confusion with
-   OpenLineage's `columnLineage` facet. The user-visible name can be decided
-   during implementation.
+5. **Storage cost for differential provenance (Phase 8):** Change-buffer
+   provenance annotations could multiply storage usage. A configurable
+   `provenance_retention_days` GUC and a background vacuumer are needed.
+
+6. **Column fingerprints (Idea G):** Should these be computed at parse time
+   and stored alongside `column_lineage` JSONB, or lazily on demand? Given the
+   DVM parser runs at create time anyway, pre-computing is cheap and preferred.
 
 ---
 
