@@ -320,7 +320,7 @@ fn test_resolve_lsn_b3_1_zero_change_pruning() {
     let new_f = make_frontier(&[(42, "0/2000")]);
     let mut zero = std::collections::HashSet::new();
     zero.insert(42u32);
-    let result = resolve_lsn_placeholders(template, &[42], &prev, &new_f, &zero).unwrap();
+    let result = resolve_lsn_placeholders(template, &[42], &prev, &new_f, &zero).unwrap(); // nosemgrep: semgrep.rust.panic-in-sql-path
     assert!(result.contains("FALSE"));
     assert!(!result.contains("__PGS_"));
     assert!(!result.contains("0/1000"));
@@ -334,7 +334,7 @@ fn test_resolve_lsn_b3_1_partial_zero_change() {
     let new_f = make_frontier(&[(10, "0/C"), (20, "0/D")]);
     let mut zero = std::collections::HashSet::new();
     zero.insert(20u32);
-    let result = resolve_lsn_placeholders(template, &[10, 20], &prev, &new_f, &zero).unwrap();
+    let result = resolve_lsn_placeholders(template, &[10, 20], &prev, &new_f, &zero).unwrap(); // nosemgrep: semgrep.rust.panic-in-sql-path
     // OID 10 should be resolved normally
     assert!(result.contains("'0/A'"));
     assert!(result.contains("'0/C'"));
