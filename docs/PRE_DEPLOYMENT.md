@@ -135,7 +135,7 @@ monitoring data.
 # Core settings (usually fine as defaults)
 pg_trickle.enabled = true                    # Enable scheduler
 pg_trickle.schedule_interval = '5s'          # Global default refresh interval
-pg_trickle.max_workers = 4                   # Parallel refresh workers
+pg_trickle.max_concurrent_refreshes = 4      # Parallel refresh limit
 
 # Performance tuning
 pg_trickle.planner_aggressive = true         # Enable MERGE planner hints
@@ -170,10 +170,10 @@ pg_trickle.fuse_default_ceiling = 10000      # Auto-fuse change threshold
 
 ### Connections
 
-- The scheduler uses `pg_trickle.max_workers` backend connections
+- The scheduler uses `pg_trickle.max_concurrent_refreshes` backend connections
 - Ensure `max_connections` has headroom for workers + application
 
-- [ ] `max_connections` is at least application connections + `pg_trickle.max_workers` + 5
+- [ ] `max_connections` is at least application connections + `pg_trickle.max_concurrent_refreshes` + 5
 
 ---
 
@@ -300,6 +300,28 @@ These poolers generally support prepared statements and NOTIFY. Set
 
 See [Scaling — CNPG](SCALING.md#cnpg--kubernetes-operations) for connection
 pooler configuration in Kubernetes environments.
+
+---
+
+## Row-Level Security
+
+> **Important:** pg_trickle background workers execute refresh queries with
+> `SET LOCAL row_security = off`. This is intentional and matches the semantics
+> of PostgreSQL's `REFRESH MATERIALIZED VIEW`.
+
+### Implications
+
+- Stream table output always contains the **full, unfiltered result set** regardless of RLS policies on source tables.
+- Row-Level Security policies on source tables **do not filter** what ends up in a stream table.
+- If the source table has RLS and the defining query selects `*`, all rows (including those that would be hidden by RLS for normal roles) will be included in the stream table.
+
+### Mitigations
+
+- [ ] Audit all stream table queries: ensure sensitive columns are excluded or aggregated.
+- [ ] Do not expose stream tables directly to end-user roles if the source tables are protected by RLS.
+- [ ] Use a per-role VIEW on top of the stream table to re-apply filtering: `CREATE VIEW orders_view AS SELECT * FROM order_totals_st WHERE user_id = current_user_id()`.
+- [ ] Consider column-level masking extensions (e.g., `anon`) on the stream table output view.
+- [ ] Review `pgtrickle.list_stream_tables()` output for any stream tables selecting from RLS-protected sources.
 
 ---
 

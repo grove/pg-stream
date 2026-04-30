@@ -1144,7 +1144,7 @@ Repair a stream table by reinstalling any missing CDC triggers, validating
 catalog entries, and reconciling change buffer state.
 
 ```sql
-pgtrickle.repair_stream_table(name text) → void
+pgtrickle.repair_stream_table(name text) → text
 ```
 
 **Parameters:**

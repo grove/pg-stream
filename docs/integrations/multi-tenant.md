@@ -11,7 +11,7 @@ quota allocation, per-database observability, and Grafana dashboard configuratio
 In a multi-tenant setup, each PostgreSQL database gets its own pg_trickle
 background worker scheduler. All schedulers share a single worker pool via
 PostgreSQL shared memory (`ACTIVE_REFRESH_WORKERS` counter). The total number
-of concurrent refresh workers is bounded by `pg_trickle.max_parallel_refresh_workers`.
+of concurrent refresh workers is bounded by `pg_trickle.max_dynamic_refresh_workers`.
 
 ```
 ┌─────────────────────────────────────────────┐
@@ -40,7 +40,7 @@ worker quota is:
 per_db_quota = ceil(max_parallel_refresh_workers / N_databases)
 ```
 
-For example, with `pg_trickle.max_parallel_refresh_workers = 8` and 4 databases:
+For example, with `pg_trickle.max_dynamic_refresh_workers = 8` and 4 databases:
 
 ```
 per_db_quota = ceil(8 / 4) = 2 workers per database
@@ -50,11 +50,11 @@ Set this in `postgresql.conf` or in each database's `ALTER DATABASE SET`:
 
 ```sql
 -- Global limit (applies to all databases)
-ALTER SYSTEM SET pg_trickle.max_parallel_refresh_workers = 8;
+ALTER SYSTEM SET pg_trickle.max_dynamic_refresh_workers = 8;
 
 -- Per-database override (optional, for high-priority tenants)
 \c tenant_a
-ALTER DATABASE tenant_a SET pg_trickle.max_parallel_refresh_workers = 4;
+ALTER DATABASE tenant_a SET pg_trickle.max_dynamic_refresh_workers = 4;
 ```
 
 ---
@@ -142,7 +142,7 @@ label_values(pg_trickle_refreshes_total, db_name)
 
 ```promql
 sum(pg_trickle_active_workers) by (db_name)
-  / scalar(pg_trickle_max_workers)
+  / scalar(pg_trickle_max_concurrent_refreshes)
 ```
 
 ### Refresh failure rate heatmap

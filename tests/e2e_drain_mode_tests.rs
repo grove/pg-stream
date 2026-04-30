@@ -10,6 +10,7 @@
 //! 6. Drain with a running workload: in-flight work completes; no new
 //!    cycles start; buffer state is consistent after resume.
 
+mod common;
 mod e2e;
 
 use e2e::E2eDb;
@@ -83,7 +84,7 @@ async fn test_drain_resume_catches_up() {
     .await;
 
     // Wait for initial population.
-    tokio::time::sleep(Duration::from_secs(3)).await;
+    common::wait_for_first_refresh(&db.pool, "public.drain_view", Duration::from_secs(30)).await;
 
     // Drain the scheduler.
     let drained: bool = db
@@ -108,7 +109,8 @@ async fn test_drain_resume_catches_up() {
     // Resume: re-enable the scheduler.
     db.execute("ALTER SYSTEM SET pg_trickle.enabled = on").await;
     db.execute("SELECT pg_reload_conf()").await;
-    tokio::time::sleep(Duration::from_secs(5)).await;
+    common::wait_for_refresh_history(&db.pool, "public.drain_view", 2, Duration::from_secs(60))
+        .await;
 
     // After resume, the stream table should reflect the inserted rows.
     let count_after_resume: i64 = db
@@ -143,7 +145,7 @@ async fn test_drain_under_workload() {
     // Insert initial data and wait for it to be refreshed.
     db.execute("INSERT INTO public.drain_wl_src (val) SELECT generate_series(1, 100)")
         .await;
-    tokio::time::sleep(Duration::from_secs(3)).await;
+    common::wait_for_first_refresh(&db.pool, "public.drain_wl_view", Duration::from_secs(30)).await;
 
     // Continue inserting rows in the background while we call drain().
     for i in 101..=200 {
@@ -191,7 +193,8 @@ async fn test_drain_under_workload() {
     // Resume and verify catch-up.
     db.execute("ALTER SYSTEM SET pg_trickle.enabled = on").await;
     db.execute("SELECT pg_reload_conf()").await;
-    tokio::time::sleep(Duration::from_secs(5)).await;
+    common::wait_for_refresh_history(&db.pool, "public.drain_wl_view", 2, Duration::from_secs(60))
+        .await;
 
     let final_count: i64 = db
         .query_scalar("SELECT count(*) FROM public.drain_wl_view")
@@ -240,7 +243,8 @@ async fn test_drain_buffer_accumulates_during_drain() {
          )",
     )
     .await;
-    tokio::time::sleep(Duration::from_secs(2)).await;
+    common::wait_for_first_refresh(&db.pool, "public.drain_buf_view", Duration::from_secs(30))
+        .await;
 
     // Drain the scheduler.
     let _drained: bool = db
@@ -276,7 +280,13 @@ async fn test_drain_buffer_accumulates_during_drain() {
     // Resume.
     db.execute("ALTER SYSTEM SET pg_trickle.enabled = on").await;
     db.execute("SELECT pg_reload_conf()").await;
-    tokio::time::sleep(Duration::from_secs(5)).await;
+    common::wait_for_refresh_history(
+        &db.pool,
+        "public.drain_buf_view",
+        2,
+        Duration::from_secs(60),
+    )
+    .await;
 
     // After resume, stream table should contain the inserted rows.
     let count: i64 = db

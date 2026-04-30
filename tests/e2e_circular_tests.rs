@@ -14,6 +14,7 @@
 //!
 //! Prerequisites: full E2E image (`just build-e2e-image`)
 
+mod common;
 mod e2e;
 
 use e2e::E2eDb;
@@ -447,9 +448,16 @@ async fn test_circular_convergence_records_iterations() {
         "cyc_conv_a should be refreshed"
     );
 
-    // After convergence, last_fixpoint_iterations should be set
-    // (wait a bit for the iteration to complete)
-    tokio::time::sleep(Duration::from_secs(5)).await;
+    // After convergence, poll until last_fixpoint_iterations is set.
+    common::wait_for_query_count(
+        &db.pool,
+        "SELECT count(*) FROM pgtrickle.pgt_stream_tables \
+         WHERE pgt_name IN ('cyc_conv_a', 'cyc_conv_b') \
+           AND last_fixpoint_iterations IS NOT NULL",
+        1,
+        Duration::from_secs(30),
+    )
+    .await;
 
     let iterations: Option<i32> = db
         .query_scalar_opt(

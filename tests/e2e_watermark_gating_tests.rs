@@ -1006,8 +1006,8 @@ async fn test_scheduler_skips_stuck_watermark() {
     db.execute("SELECT pgtrickle.advance_watermark('stuck_b', '2026-03-01 12:00:00+00')")
         .await;
 
-    // Wait 3 seconds so the watermarks become stale (timeout is 1s).
-    tokio::time::sleep(Duration::from_secs(3)).await;
+    // Wait so the watermarks become stale (timeout is 1s).
+    tokio::time::sleep(Duration::from_millis(1500)).await;
 
     // Insert data to trigger scheduler.
     db.execute("INSERT INTO stuck_a VALUES (2, 'post_stuck')")
@@ -1115,7 +1115,7 @@ async fn test_scheduler_resumes_after_watermark_unstuck() {
         .await;
 
     // Wait for watermarks to become stale (timeout is 1s).
-    tokio::time::sleep(Duration::from_secs(3)).await;
+    tokio::time::sleep(Duration::from_millis(1500)).await;
 
     // Record the completed refresh count before unsticking.
     let completed_before: i64 = db

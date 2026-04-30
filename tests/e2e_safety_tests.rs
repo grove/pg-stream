@@ -13,6 +13,7 @@
 //! (when possible) or by dropping a source table's column, triggering an
 //! `UpstreamSchemaChanged` error for that ST.
 
+mod common;
 mod e2e;
 
 use e2e::E2eDb;
@@ -154,7 +155,7 @@ async fn test_scheduler_isolates_failing_st_from_healthy_st() {
     // the reinit query, which fails because important_col is gone.
     // The worker may crash (PG ERROR → exit), so the FAILED history record
     // may be rolled back. Wait a bit for the scheduler to process the crash.
-    tokio::time::sleep(Duration::from_secs(5)).await;
+    tokio::time::sleep(Duration::from_secs(3)).await;
 
     // ── Verify: scheduler is still alive ───────────────────────────────
     let sched_count: i64 = db

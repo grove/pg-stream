@@ -234,35 +234,34 @@ fn diff_scan_change_buffer(
 
     let col_names: Vec<String> = columns.iter().map(|c| c.name.clone()).collect();
 
-    // EC-06: Keyless table duplicate row tracking
+    // Keyless table handling (A42-14 / formerly tracked as EC-06).
     //
     // When pk_columns is empty, the source table has no primary key.
     // The pk_hash is an all-column content hash. Identical rows produce
-    // identical pk_hash values, causing three related bugs:
+    // identical pk_hash values. The current implementation uses a
+    // *net-counting* strategy:
     //
-    // 1. **Delta SQL:** pk_stats groups by pk_hash, merging independent
-    //    events for distinct-but-identical rows. Two inserts of the same
-    //    row are collapsed to one INSERT delta (should be two).
+    // **Net-counting approach (current):**
+    // - INSERT delta: adds one row per unique pk_hash, merged with existing
+    //   counts to determine whether a row appears / disappears / changes value.
+    // - DELETE delta: removes matching hash rows.
+    // - The stream table uses a non-unique row-id index for keyless sources
+    //   so duplicate rows CAN coexist (see CREATE TABLE codegen).
+    // - pk_stats aggregates net insert/delete counts per pk_hash so that
+    //   two inserts of the same row result in a count of +2, not +1.
     //
-    // 2. **Stream table:** __pgt_row_id has a UNIQUE index, so duplicate
-    //    rows cannot coexist. Full refresh silently loses all but the
-    //    first duplicate to a unique violation.
+    // **Known limitations:**
+    // - For tables where identical rows are simultaneously inserted and
+    //   deleted in the same cycle, the net delta may incorrectly cancel them.
+    //   This is acceptable for append-only and PK-bearing tables.
     //
-    // 3. **MERGE apply:** DELETE matching on __pgt_row_id removes ALL
-    //    rows with that hash, not just the intended count.
+    // **Test coverage:**
+    // - E2E: `test_keyless_multiset_property` in e2e_keyless_tests.rs
+    //   verifies multiset equivalence after insert/update/delete sequences.
+    // - Integration: `test_scan_*_keyless_*` in the unit test section below.
     //
-    // The full EC-06 fix requires:
-    //   a) Remove UNIQUE constraint on __pgt_row_id for keyless sources
-    //      (or add a disambiguation suffix).
-    //   b) Full refresh: assign unique row_ids using ROW_NUMBER() OVER
-    //      (PARTITION BY content_hash ORDER BY ctid).
-    //   c) Delta SQL: include change_id or dup_seq in the effective
-    //      pk_hash so each change is processed independently.
-    //   d) Apply logic: use counted DELETE (delete exactly N rows
-    //      per hash, not all) and skip ON CONFLICT for INSERTs.
-    //
-    // This is tracked as EC-06 in PLAN_EDGE_CASES.md.
-    // WARNING at creation time is already implemented.
+    // A creation-time WARNING is emitted when a keyless source is detected
+    // so operators can choose to add a primary key.
     let is_keyless = pk_columns.is_empty();
 
     // pk_hash is always pre-computed in the change buffer (from PK columns

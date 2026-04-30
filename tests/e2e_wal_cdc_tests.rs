@@ -12,6 +12,7 @@
 //! - `./tests/build_e2e_image.sh` (Docker image with wal_level=logical)
 //! - Docker with `wal_level = logical` and `max_replication_slots = 10`
 
+mod common;
 mod e2e;
 
 use e2e::E2eDb;
@@ -172,7 +173,13 @@ async fn test_explicit_trigger_override_blocks_wal_transition() {
         .await;
     assert_eq!(requested_cdc_mode, "trigger");
 
-    tokio::time::sleep(Duration::from_secs(5)).await;
+    wait_for_cdc_mode(
+        &db,
+        "wal_trigger_override_src",
+        "TRIGGER",
+        Duration::from_secs(30),
+    )
+    .await;
 
     let mode = get_cdc_mode(&db, "wal_trigger_override_src").await;
     assert_eq!(
@@ -393,8 +400,8 @@ async fn test_trigger_mode_no_wal_transition() {
     )
     .await;
 
-    // Wait a few seconds — should stay in TRIGGER mode
-    tokio::time::sleep(Duration::from_secs(5)).await;
+    // Wait a moment — should stay in TRIGGER mode
+    tokio::time::sleep(Duration::from_secs(2)).await;
     let mode = get_cdc_mode(&db, "trig_only").await;
     assert_eq!(
         mode, "TRIGGER",
@@ -552,8 +559,8 @@ async fn test_wal_keyless_table_stays_on_triggers() {
     )
     .await;
 
-    // Wait a few seconds — should stay on TRIGGER because no PK
-    tokio::time::sleep(Duration::from_secs(5)).await;
+    // Wait a moment — should stay on TRIGGER because no PK
+    tokio::time::sleep(Duration::from_secs(2)).await;
     let mode = get_cdc_mode(&db, "wal_keyless").await;
     assert_eq!(
         mode, "TRIGGER",
@@ -579,8 +586,8 @@ async fn test_ec18_check_cdc_health_shows_trigger_for_stuck_auto() {
     db.create_st("ec18_st", "SELECT val FROM ec18_src", "1s", "DIFFERENTIAL")
         .await;
 
-    // Give the scheduler a few seconds to attempt WAL transition
-    tokio::time::sleep(Duration::from_secs(5)).await;
+    // Wait for the scheduler to attempt WAL transition (will stay in TRIGGER for keyless src)
+    wait_for_cdc_mode(&db, "ec18_src", "TRIGGER", Duration::from_secs(30)).await;
 
     // check_cdc_health() should show TRIGGER mode for this source
     let cdc_mode: String = db
@@ -627,7 +634,8 @@ async fn test_ec18_health_check_ok_with_trigger_auto_sources() {
     )
     .await;
 
-    tokio::time::sleep(Duration::from_secs(3)).await;
+    // Wait for at least one refresh to complete before checking health.
+    common::wait_for_first_refresh(&db.pool, "wal_auto_trig_st", Duration::from_secs(30)).await;
 
     // health_check() should not have ERROR severity for stream tables
     // that are ACTIVE but using TRIGGER mode

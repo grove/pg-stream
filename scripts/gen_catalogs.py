@@ -131,7 +131,7 @@ def extract_gucs(config_rs: Path) -> list[dict]:
 
 _PG_EXTERN_RE = re.compile(r'#\[pg_extern\s*\(([^)]*)\)\]')
 _FN_SIG_RE = re.compile(
-    r'pub\s+(?:unsafe\s+)?fn\s+(\w+)\s*\(([^)]*(?:\([^)]*\)[^)]*)*)\)\s*(?:->\s*([^{;]+))?'
+    r'(?:pub\s+)?(?:unsafe\s+)?fn\s+(\w+)\s*\(([^)]*(?:\([^)]*\)[^)]*)*)\)\s*(?:->\s*([^{;]+))?'
 )
 
 

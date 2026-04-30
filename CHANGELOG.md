@@ -7,6 +7,7 @@ For future plans and upcoming features, see [ROADMAP.md](ROADMAP.md).
 ## Table of Contents
 
 <!-- TOC start -->
+- [0.42.0 — Repair API, Docs Overhaul & Test Infrastructure](#0420--repair-api-docs-overhaul--test-infrastructure)
 - [0.41.0 — DVM Correctness: Structural Cache Keys, Placeholder Safety & WAL Transition Guards](#0410--dvm-correctness-structural-cache-keys-placeholder-safety--wal-transition-guards)
 - [0.40.0 — Operator Trust, Maintainability & Release Confidence](#0400--operator-trust-maintainability--release-confidence)
 - [0.39.0 — Operational Truthfulness & Distributed Hardening](#0390--operational-truthfulness--distributed-hardening)
@@ -55,6 +56,143 @@ For future plans and upcoming features, see [ROADMAP.md](ROADMAP.md).
 - [0.1.1 — CloudNativePG Image & Test Hardening](#011--cloudnativepg-image--test-hardening)
 - [0.1.0 — Initial Release](#010--initial-release)
 <!-- TOC end -->
+
+---
+
+## [0.42.0] — Repair API, Docs Overhaul & Test Infrastructure
+
+v0.42.0 delivers a new `repair_stream_table` SQL function for disaster recovery
+and self-healing after PITR restores, a comprehensive documentation overhaul
+(deprecated GUC appendix, RLS bypass warnings, updated architecture diagrams),
+security hardening of the WAL decoder via SQL parameterization, and a major
+test infrastructure uplift with state-polling helpers, new correctness property
+tests, and two new CI gates.
+
+### A42-1 — `pgtrickle.repair_stream_table(name text) → text`
+
+New SQL-callable function for stream table repair and self-healing. Use after
+point-in-time recovery (`pg_basebackup` / PITR) or any operation that may have
+left CDC triggers, change buffer tables, or catalog state inconsistent.
+
+**Actions performed:**
+1. Acquires an advisory lock on the stream table to prevent concurrent mutations.
+2. Verifies the stream table exists in `pgtrickle.pgt_stream_tables`.
+3. Resets the refresh frontier to `NULL` and sets `needs_reinit = true`, forcing a full refresh on the next scheduler cycle.
+4. Rebuilds any missing CDC triggers on all source tables.
+5. Recreates any missing change buffer tables in `pgtrickle_changes`.
+6. Resets error fuse state and stream table status to `ACTIVE`.
+7. Returns a text summary of all actions taken.
+
+```sql
+-- After a PITR restore, reinstall all CDC infrastructure
+SELECT pgtrickle.repair_stream_table('order_totals');
+-- → "repair_stream_table(order_totals): frontier reset; triggers OK; buffers rebuilt (1 recreated); status reset to ACTIVE"
+```
+
+### A42-2 — Catalog Generator Accuracy Improvement
+
+`scripts/gen_catalogs.py` regex now correctly captures non-`pub` `#[pg_extern]`
+functions (pgrx does not require `pub`). The SQL API catalog grew from 24 to 98
+entries, including `repair_stream_table`. CI fails on catalog drift.
+
+### A42-3 — SQL Reference: `repair_stream_table` Signature
+
+`docs/SQL_REFERENCE.md` now correctly documents `→ text` (not `→ void`) return
+type with full examples and parameter table.
+
+### A42-4 — Stale-Term Docs Linter (`just docs-lint`)
+
+New `just docs-lint` recipe greps all `docs/**/*.md` for retired GUC names
+(`pg_trickle.max_workers`, `pg_trickle.max_parallel_refresh_workers`) and fails
+if any are found outside deprecated/compatibility sections. Also integrated into
+`.github/workflows/docs-drift.yml` as a CI gate.
+
+### A42-5 — Deprecated GUC Compatibility Appendix
+
+`docs/CONFIGURATION.md` now has an **Appendix: Deprecated / Compatibility
+GUCs** section documenting `event_driven_wake` and `wake_debounce_ms` with
+migration guidance. Existing active references to the two retired GUCs were
+updated to their current replacements across `PATTERNS.md`, `SCALING.md`,
+`PRE_DEPLOYMENT.md`, and `docs/integrations/multi-tenant.md`.
+
+### A42-6 — ARCHITECTURE.md Module Diagram Updated
+
+`docs/ARCHITECTURE.md` module layout now correctly reflects the `src/dvm/parser/`
+subdirectory structure introduced in v0.39.0 (G13-PRF), with all five sub-modules
+(`mod.rs`, `types.rs`, `validation.rs`, `rewrites.rs`, `sublinks.rs`) listed.
+
+### A42-7 — RLS Bypass Prominence
+
+`docs/GETTING_STARTED.md` and `docs/PRE_DEPLOYMENT.md` now include prominent
+security notices explaining that pg_trickle background workers execute with
+`SET LOCAL row_security = off` (matching PostgreSQL's own `REFRESH MATERIALIZED
+VIEW` semantics), and providing mitigation guidance.
+
+### A42-8 — Generated Docs Freshness CI Gate
+
+`.github/workflows/docs-drift.yml` now runs both the catalog check
+(`python3 scripts/gen_catalogs.py --check`) and the stale-term linter on every
+PR targeting `main`, on every push to `main`, and on a weekly schedule.
+
+### A42-9 — State-Polling Test Helpers
+
+`tests/common/mod.rs` now exports seven polling helpers:
+- `wait_for_first_refresh` / `wait_for_refresh_history` / `wait_for_refresh_after`
+- `wait_for_cdc_mode`
+- `wait_for_stream_table_status`
+- `wait_for_scheduler_tick`
+- `wait_for_query_count`
+
+All new E2E test files created in this release use these helpers exclusively
+(zero `tokio::time::sleep` calls). Existing tests had their most egregious
+blind waits replaced.
+
+### A42-10 — Differential SUM(CASE) E2E Tests
+
+New test file `tests/e2e_sum_case_differential_tests.rs` (5 tests) validating
+that `SUM(CASE WHEN ... END)` expressions correctly trigger full refresh mode
+instead of attempting algebraically incorrect incremental updates.
+
+### A42-11 — SUM(CASE) AST-Level Detection
+
+`src/dvm/operators/aggregate.rs`: `is_algebraically_invertible` now calls the
+new `expr_contains_case` helper which recursively inspects the `Expr` AST for
+CASE expressions at any nesting depth, catching wrapped forms like
+`SUM(CAST(CASE ... END AS numeric))`.
+
+### A42-12 — FULL JOIN Aggregate Property Tests
+
+New test file `tests/e2e_full_join_aggregate_tests.rs` (4 tests) including a
+`test_full_join_diff_vs_full_property_10_cycles` property test that runs 10
+insert/delete cycles and asserts DIFFERENTIAL refresh produces identical output
+to FULL refresh after each cycle.
+
+### A42-13 — WAL Decoder SQL Parameterization
+
+`src/wal_decoder.rs`: `write_decoded_change` now builds fully parameterized
+SPI queries using `$N` placeholders and `Spi::run_with_args`, eliminating
+all direct string interpolation of WAL values into SQL. This closes a class of
+SQL injection risks in the WAL CDC path.
+
+### A42-14 — Stale EC-06 Comment Cleanup
+
+`src/dvm/operators/scan.rs`: Updated design comments from the outdated EC-06
+reference to accurately describe the current net-counting strategy and point to
+the `test_keyless_multiset_property` test.
+
+### A42-15 — Keyless Multiset Property Tests
+
+New test file `tests/e2e_keyless_tests.rs` (4 tests) validating that keyless
+(no primary key) tables maintain correct multiset semantics through 10 cycles
+of insert/delete/update operations.
+
+### A42-16 — Fuzz Smoke CI Job
+
+New `.github/workflows/fuzz-smoke.yml` runs daily and on PRs that touch fuzz
+targets. On PRs: replays the corpus for each target (zero new crashes allowed).
+On schedule/dispatch: runs each target for 60 s and uploads crash artifacts.
+Targets: `parser_fuzz`, `cron_fuzz`, `dag_fuzz`, `guc_fuzz`, `cdc_fuzz`,
+`wal_fuzz`.
 
 ---
 

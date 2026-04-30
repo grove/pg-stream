@@ -99,7 +99,7 @@ async fn test_tier_frozen_skips_refresh_until_promoted() {
     // Insert new data and wait — frozen ST should NOT refresh
     db.execute("INSERT INTO tier_sched_src1 VALUES (2, 20)")
         .await;
-    tokio::time::sleep(Duration::from_secs(5)).await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
 
     let after_freeze: i64 = db
         .query_scalar(

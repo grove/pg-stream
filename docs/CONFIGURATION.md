@@ -3111,3 +3111,43 @@ SELECT pg_reload_conf();
 - [Installation](installation.md) — Installation and initial configuration
 - [ARCHITECTURE.md](ARCHITECTURE.md) — System architecture overview
 - [SQL_REFERENCE.md](SQL_REFERENCE.md) — Complete function reference
+
+---
+
+## Appendix: Deprecated / Compatibility GUCs
+
+The GUCs listed below are **deprecated** and retained only for backward
+compatibility (to allow rolling upgrades without configuration errors). They
+have no effect on extension behaviour and should be removed from new deployments.
+
+### pg_trickle.event_driven_wake
+
+**Deprecated since v0.37.0.**
+
+This GUC formerly controlled whether the scheduler woke up on PostgreSQL
+NOTIFY events. Event-driven wake is now always enabled as the default
+scheduler behaviour and is not configurable.
+
+**Migration:** Remove `pg_trickle.event_driven_wake = on` from
+`postgresql.conf`. The extension will emit a `NOTICE` if this GUC is set
+to remind you to clean up the configuration file.
+
+| Setting | Value |
+|---------|-------|
+| Default | `true` |
+| Context | `superuser` |
+
+### pg_trickle.wake_debounce_ms
+
+**Deprecated since v0.37.0.**
+
+Formerly controlled the debounce window (in milliseconds) for event-driven
+wake. Because `event_driven_wake` is now permanently enabled and the debounce
+is automatically tuned, this GUC has no effect.
+
+**Migration:** Remove `pg_trickle.wake_debounce_ms` from `postgresql.conf`.
+
+| Setting | Value |
+|---------|-------|
+| Default | `10` |
+| Context | `superuser` |

@@ -6,6 +6,7 @@ on:
     paths:
       - 'src/config.rs'
       - 'src/**/*.rs'
+      - 'docs/**/*.md'
       - 'docs/GUC_CATALOG.md'
       - 'docs/SQL_API_CATALOG.md'
       - 'scripts/gen_catalogs.py'
@@ -15,6 +16,7 @@ on:
     paths:
       - 'src/config.rs'
       - 'src/**/*.rs'
+      - 'docs/**/*.md'
       - 'docs/GUC_CATALOG.md'
       - 'docs/SQL_API_CATALOG.md'
       - 'scripts/gen_catalogs.py'
@@ -46,3 +48,23 @@ jobs:
       - name: Check GUC and SQL API catalogs are up to date
         run: |
           python3 scripts/gen_catalogs.py --check
+
+      - name: Stale-term docs lint (A42-4)
+        run: |
+          set -euo pipefail
+          RETIRED_TERMS=("pg_trickle.max_workers" "pg_trickle.max_parallel_refresh_workers")
+          EXCLUDE_PATTERN="deprecated|compat|appendix|Compatibility|Deprecated"
+          FAIL=0
+          for TERM in "${RETIRED_TERMS[@]}"; do
+            while IFS= read -r match; do
+              if ! echo "$match" | grep -qiE "$EXCLUDE_PATTERN"; then
+                echo "FAIL: retired term '$TERM' found: $match"
+                FAIL=1
+              fi
+            done < <(grep -rn "$TERM" docs/ 2>/dev/null || true)
+          done
+          if [ "$FAIL" -eq 1 ]; then
+            echo "docs-lint FAILED: retired GUC names found in active doc sections."
+            exit 1
+          fi
+          echo "docs-lint passed"

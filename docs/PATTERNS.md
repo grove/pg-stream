@@ -314,7 +314,7 @@ SELECT pgtrickle.create_stream_table('top_customers',
   is paid once regardless of how many stream tables read from `orders`.
 - Use `schedule => 'calculated'` on downstream STs when they chain from
   other stream tables.
-- Consider `pg_trickle.max_workers` if fan-out exceeds 8 (default: 4 workers).
+- Consider `pg_trickle.max_concurrent_refreshes` if fan-out exceeds 8 (default: 4 concurrent refreshes).
 
 ### Anti-Patterns
 
@@ -436,7 +436,7 @@ SELECT pgtrickle.alter_stream_table('audit_log_summary', tier => 'frozen');
 - All your stream tables are equally critical — don't introduce
   tier complexity just to have tiers; use a flat schedule instead.
 - Your scheduler runs with a single worker — tiering helps multi-worker
-  scheduling; it has no effect when `max_workers = 1`.
+  scheduling; it has no effect when `max_concurrent_refreshes = 1`.
 - Tier multipliers change too frequently — tier is a static property;
   if freshness requirements change continuously, use SLA scheduling
   (`pg_trickle.sla_scheduling`) instead.

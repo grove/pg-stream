@@ -1,0 +1,102 @@
+name: Fuzz smoke (A42-16)
+
+on:
+  schedule:
+    - cron: '0 3 * * *'   # Daily at 03:00 UTC
+  pull_request:
+    branches: [main]
+    paths:
+      - 'fuzz/**'
+      - 'src/**/*.rs'
+      - '.github/workflows/fuzz-smoke.yml'
+  workflow_dispatch:
+    inputs:
+      fuzz_seconds:
+        description: 'Seconds to fuzz each target (default: 30)'
+        required: false
+        default: '30'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  fuzz-smoke:
+    name: Fuzz corpus replay + short fuzz run
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Setup pgrx environment (with nightly Rust for cargo-fuzz)
+        uses: ./.github/actions/setup-pgrx
+        with:
+          rust-toolchain: nightly
+          pg-version: "18"
+          pg-install-mode: system
+
+      - name: Cache cargo registry and fuzz build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            fuzz/target
+          key: fuzz-${{ runner.os }}-${{ hashFiles('fuzz/Cargo.toml', 'Cargo.toml') }}
+          restore-keys: |
+            fuzz-${{ runner.os }}-
+
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+
+      - name: Replay corpus (PR smoke — fast, no new findings)
+        env:
+          FUZZ_SECONDS: ${{ github.event.inputs.fuzz_seconds || '30' }}
+        run: |
+          set -euo pipefail
+          TARGETS=(parser_fuzz cron_fuzz dag_fuzz guc_fuzz cdc_fuzz wal_fuzz)
+          for TARGET in "${TARGETS[@]}"; do
+            echo "=== Replaying corpus for $TARGET ==="
+            CORPUS_DIR="fuzz/corpus/$TARGET"
+            if [ -d "$CORPUS_DIR" ] && [ "$(ls -A "$CORPUS_DIR" 2>/dev/null)" ]; then
+              cargo fuzz run "$TARGET" "$CORPUS_DIR" -- -max_total_time=0 -runs=0 2>&1 || {
+                echo "FAIL: $TARGET crashed on existing corpus"
+                exit 1
+              }
+            else
+              echo "No corpus for $TARGET — running ${FUZZ_SECONDS}s seed smoke"
+              cargo fuzz run "$TARGET" -- -max_total_time="${FUZZ_SECONDS}" 2>&1 || {
+                echo "FAIL: $TARGET crashed during seed smoke"
+                exit 1
+              }
+            fi
+          done
+
+      - name: Short fuzz run on schedule/manual (not on PRs)
+        if: github.event_name != 'pull_request'
+        env:
+          FUZZ_SECONDS: ${{ github.event.inputs.fuzz_seconds || '60' }}
+        run: |
+          set -euo pipefail
+          TARGETS=(parser_fuzz cron_fuzz dag_fuzz guc_fuzz cdc_fuzz wal_fuzz)
+          for TARGET in "${TARGETS[@]}"; do
+            echo "=== Fuzzing $TARGET for ${FUZZ_SECONDS}s ==="
+            cargo fuzz run "$TARGET" -- -max_total_time="${FUZZ_SECONDS}" 2>&1 || {
+              echo "FAIL: $TARGET found a new crash"
+              exit 1
+            }
+          done
+
+      - name: Upload crash artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-crashes-${{ github.run_id }}
+          path: |
+            fuzz/artifacts/
+          retention-days: 30
+          if-no-files-found: ignore

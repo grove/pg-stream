@@ -1,4 +1,5 @@
 //! Shared test helpers for integration tests using Testcontainers.
+#![allow(dead_code)]
 
 use sqlx::PgPool;
 use testcontainers::{ContainerAsync, ImageExt, runners::AsyncRunner};
@@ -398,5 +399,262 @@ impl TestDb {
             cols_a, cols_b,
             "Column type mismatch between {table_a} and {table_b}"
         );
+    }
+}
+
+// ── A42-9: State-polling helpers (replace fixed sleeps) ──────────────────────
+
+use std::time::Duration;
+
+/// Poll until the refresh history for `st_name` has at least `min_count` rows,
+/// or until `timeout` elapses.
+///
+/// Returns `true` if the condition was met before the timeout.
+///
+/// Use this instead of `tokio::time::sleep(...)` in tests that wait for the
+/// background worker to complete at least one refresh cycle.
+pub async fn wait_for_refresh_history(
+    pool: &sqlx::PgPool,
+    st_name: &str,
+    min_count: i64,
+    timeout: Duration,
+) -> bool {
+    let deadline = tokio::time::Instant::now() + timeout;
+    let (schema, name) = if let Some(dot) = st_name.rfind('.') {
+        (&st_name[..dot], &st_name[dot + 1..])
+    } else {
+        ("public", st_name)
+    };
+    loop {
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM pgtrickle.pgt_refresh_history h \
+             JOIN pgtrickle.pgt_stream_tables s ON s.pgt_id = h.pgt_id \
+             WHERE s.pgt_schema = $1 AND s.pgt_name = $2 \
+               AND h.status = 'COMPLETED'",
+        )
+        .bind(schema)
+        .bind(name)
+        .fetch_one(pool)
+        .await
+        .unwrap_or(0);
+
+        if count >= min_count {
+            return true;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
+/// Poll until the stream table `st_name` has `last_refresh_at IS NOT NULL`
+/// (i.e., at least one refresh has completed), or until `timeout` elapses.
+///
+/// Returns `true` if the condition was met before the timeout.
+pub async fn wait_for_first_refresh(pool: &sqlx::PgPool, st_name: &str, timeout: Duration) -> bool {
+    wait_for_refresh_history(pool, st_name, 1, timeout).await
+}
+
+/// Poll until `last_refresh_at` for `st_name` is strictly after `after_ts`,
+/// indicating a *new* refresh cycle completed after the caller's operation.
+///
+/// Pass the current `last_refresh_at` timestamp before triggering the operation
+/// to ensure you wait for a fresh cycle rather than seeing a stale one.
+/// Pass `None` to wait for the first refresh from scratch.
+///
+/// Returns `true` if the condition was met before the timeout.
+pub async fn wait_for_refresh_after(
+    pool: &sqlx::PgPool,
+    st_name: &str,
+    after_ts: Option<&str>,
+    timeout: Duration,
+) -> bool {
+    let deadline = tokio::time::Instant::now() + timeout;
+    let (schema, name) = if let Some(dot) = st_name.rfind('.') {
+        (&st_name[..dot], &st_name[dot + 1..])
+    } else {
+        ("public", st_name)
+    };
+    loop {
+        let ts: Option<String> = sqlx::query_scalar(
+            "SELECT last_refresh_at::text \
+             FROM pgtrickle.pgt_stream_tables \
+             WHERE pgt_schema = $1 AND pgt_name = $2",
+        )
+        .bind(schema)
+        .bind(name)
+        .fetch_optional(pool)
+        .await
+        .unwrap_or(None)
+        .flatten();
+
+        let refreshed = match (ts.as_deref(), after_ts) {
+            (Some(_), None) => true,
+            (Some(t), Some(after)) => t > after,
+            _ => false,
+        };
+        if refreshed {
+            return true;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
+/// Poll until the CDC mode for `st_name` matches `expected_mode`,
+/// or until `timeout` elapses.
+///
+/// Returns `true` if the condition was met before the timeout.
+pub async fn wait_for_cdc_mode(
+    pool: &sqlx::PgPool,
+    st_name: &str,
+    expected_mode: &str,
+    timeout: Duration,
+) -> bool {
+    let deadline = tokio::time::Instant::now() + timeout;
+    let (schema, name) = if let Some(dot) = st_name.rfind('.') {
+        (&st_name[..dot], &st_name[dot + 1..])
+    } else {
+        ("public", st_name)
+    };
+    loop {
+        // CDC mode is stored per-dependency source; check the effective mode
+        // via pgt_change_tracking joined to pgt_dependencies.
+        let mode: Option<String> = sqlx::query_scalar(
+            "SELECT ct.cdc_mode \
+             FROM pgtrickle.pgt_change_tracking ct \
+             JOIN pgtrickle.pgt_dependencies d ON d.source_relid = ct.source_relid \
+             JOIN pgtrickle.pgt_stream_tables s ON s.pgt_id = d.pgt_id \
+             WHERE s.pgt_schema = $1 AND s.pgt_name = $2 \
+             LIMIT 1",
+        )
+        .bind(schema)
+        .bind(name)
+        .fetch_optional(pool)
+        .await
+        .unwrap_or(None)
+        .flatten();
+
+        if mode.as_deref() == Some(expected_mode) {
+            return true;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
+/// Poll until the scheduler watermark (last_tick_at) has advanced at least
+/// `min_ticks` times beyond the current value when this function is called,
+/// or until `timeout` elapses.
+///
+/// Returns `true` if the condition was met before the timeout.
+pub async fn wait_for_scheduler_tick(
+    pool: &sqlx::PgPool,
+    min_ticks: u32,
+    timeout: Duration,
+) -> bool {
+    let deadline = tokio::time::Instant::now() + timeout;
+    // Capture baseline tick count
+    let baseline: i64 = sqlx::query_scalar(
+        "SELECT COALESCE(COUNT(*), 0) \
+         FROM pgtrickle.pgt_refresh_history \
+         WHERE status = 'COMPLETED'",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap_or(0);
+
+    let target = baseline + min_ticks as i64;
+    loop {
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COALESCE(COUNT(*), 0) \
+             FROM pgtrickle.pgt_refresh_history \
+             WHERE status = 'COMPLETED'",
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap_or(0);
+
+        if count >= target {
+            return true;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
+}
+
+/// Poll until `st_name` has status `expected_status`, or until `timeout` elapses.
+///
+/// Returns `true` if the condition was met before the timeout.
+pub async fn wait_for_stream_table_status(
+    pool: &sqlx::PgPool,
+    st_name: &str,
+    expected_status: &str,
+    timeout: Duration,
+) -> bool {
+    let deadline = tokio::time::Instant::now() + timeout;
+    let (schema, name) = if let Some(dot) = st_name.rfind('.') {
+        (&st_name[..dot], &st_name[dot + 1..])
+    } else {
+        ("public", st_name)
+    };
+    loop {
+        let status: Option<String> = sqlx::query_scalar(
+            "SELECT status FROM pgtrickle.pgt_stream_tables \
+             WHERE pgt_schema = $1 AND pgt_name = $2",
+        )
+        .bind(schema)
+        .bind(name)
+        .fetch_optional(pool)
+        .await
+        .unwrap_or(None)
+        .flatten();
+
+        if status.as_deref() == Some(expected_status) {
+            return true;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
+/// Poll until a SQL query returning a count reaches at least `min_count`,
+/// or until `timeout` elapses.
+///
+/// Returns `true` if the condition was met before the timeout.
+///
+/// This helper replaces common polling loops like:
+/// ```ignore
+/// loop {
+///     if start.elapsed() > timeout { break; }
+///     tokio::time::sleep(Duration::from_millis(500)).await;
+///     if db.count("table").await >= N { break; }
+/// }
+/// ```
+pub async fn wait_for_query_count(
+    pool: &sqlx::PgPool,
+    sql: &str,
+    min_count: i64,
+    timeout: Duration,
+) -> bool {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let count: i64 = sqlx::query_scalar(sql).fetch_one(pool).await.unwrap_or(0);
+        if count >= min_count {
+            return true;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
     }
 }

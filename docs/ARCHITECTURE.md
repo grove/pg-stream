@@ -766,7 +766,12 @@ src/
 ├── shmem.rs         # Shared memory state (PgTrickleSharedState, DAG_REBUILD_SIGNAL, CACHE_GENERATION)
 ├── dvm/
 │   ├── mod.rs       # DVM module root + recursive CTE orchestration
-│   ├── parser.rs    # Query → OpTree converter (CTE extraction, subquery, window support)
+│   ├── parser/      # Query → OpTree converter (modularized, G13-PRF)
+│   │   ├── mod.rs        # FFI helpers, macros, entry points, tests
+│   │   ├── types.rs      # OpTree, Expr, Column, AggExpr, etc.
+│   │   ├── validation.rs # Volatility, IVM support, IMMEDIATE, monotonicity
+│   │   ├── rewrites.rs   # SQL rewrite passes (view inlining, grouping sets)
+│   │   └── sublinks.rs   # SubLink extraction from WHERE clauses
 │   ├── diff.rs      # Delta SQL generation (CTE delta cache)
 │   ├── row_id.rs    # Row ID generation
 │   └── operators/

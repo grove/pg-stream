@@ -649,7 +649,7 @@ pub(super) fn validate_defining_query(query: &str) -> Result<Vec<ColumnDef>, PgT
 /// Parsed schedule specification — either a duration-based schedule
 /// or a cron expression.
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) enum Schedule {
+pub enum Schedule {
     /// Duration-based: refresh when data is older than this many seconds.
     Duration(i64),
     /// Cron-based: refresh at the times specified by the cron expression.
@@ -717,7 +717,16 @@ pub(crate) fn parse_duration(s: &str) -> Result<i64, PgTrickleError> {
                 ))
             })?;
 
-            total_secs += n * multiplier;
+            let component = n.checked_mul(multiplier).ok_or_else(|| {
+                PgTrickleError::InvalidArgument(format!(
+                    "duration value '{num_buf}{ch}' overflows i64 seconds in '{s}'"
+                ))
+            })?;
+            total_secs = total_secs.checked_add(component).ok_or_else(|| {
+                PgTrickleError::InvalidArgument(format!(
+                    "total duration '{s}' overflows i64 seconds"
+                ))
+            })?;
             num_buf.clear();
             found_unit = true;
         }

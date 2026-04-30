@@ -744,78 +744,103 @@ fn write_decoded_change(
         std::collections::HashMap::new()
     };
 
-    // Build the INSERT statement for the buffer table
     let has_pk = !pk_columns.is_empty();
 
-    // Column names for the INSERT
-    let mut col_names = vec!["lsn".to_string(), "action".to_string()];
-    let mut col_values = vec![format!("'{}'::pg_lsn", lsn), format!("'{}'", action)];
+    // A42-13: Build a fully parameterized INSERT.
+    // All data values are passed as SPI text parameters ($1, $2, ...)
+    // instead of being escaped inline. This eliminates the risk of SQL
+    // injection via WAL-decoded column values containing quotes, backslashes,
+    // or other special characters.
+    //
+    // Column-name identifiers and schema/table identifiers are static
+    // (derived from internal catalog / OID lookup) and are not user-controlled
+    // at the point they reach this function.
 
-    // pk_hash column
+    // param_values: the ordered list of bound values (None = SQL NULL).
+    let mut param_values: Vec<Option<String>> = Vec::new();
+    // col_names:  the quoted column identifiers for the INSERT list.
+    let mut col_names: Vec<String> = Vec::new();
+    // placeholder:  the corresponding $N expressions (or sub-expressions for pk_hash).
+    let mut placeholders: Vec<String> = Vec::new();
+
+    // $1: lsn (text cast to pg_lsn)
+    param_values.push(Some(lsn.to_string()));
+    col_names.push("lsn".to_string());
+    let lsn_idx = param_values.len();
+    placeholders.push(format!("${}::pg_lsn", lsn_idx));
+
+    // $N: action (single character stored as text)
+    param_values.push(Some(action.to_string()));
+    col_names.push("action".to_string());
+    let action_idx = param_values.len();
+    placeholders.push(format!("${}", action_idx));
+
+    // pk_hash column (uses subsequent $N params for PK column values)
     if has_pk {
         col_names.push("pk_hash".to_string());
-        // Compute pk_hash using the same hash functions as the trigger
-        let pk_hash_expr = build_pk_hash_from_values(pk_columns, &parsed);
-        col_values.push(pk_hash_expr);
+        let pk_hash_expr = build_pk_hash_parameterized(pk_columns, &parsed, &mut param_values);
+        placeholders.push(pk_hash_expr);
     }
 
-    // Map parsed columns to new_<col> and old_<col> buffer columns
+    // Map parsed columns to new_<col> and/or old_<col> buffer columns.
     for (col_name, _col_type) in columns {
         let safe_name = col_name.replace('"', "\"\"");
 
-        // For INSERT: only new values
-        // For UPDATE: both new and old values
-        // For DELETE: only old values
         match action {
             'I' => {
                 col_names.push(format!("\"new_{}\"", safe_name));
-                if let Some(val) = parsed.get(col_name) {
-                    col_values.push(format!("'{}'", val.replace('\'', "''")));
-                } else {
-                    col_values.push("NULL".to_string());
-                }
+                let val = parsed.get(col_name).cloned();
+                param_values.push(val);
+                placeholders.push(format!("${}", param_values.len()));
             }
             'U' => {
-                // new values
+                // new value
                 col_names.push(format!("\"new_{}\"", safe_name));
-                if let Some(val) = parsed.get(col_name) {
-                    col_values.push(format!("'{}'", val.replace('\'', "''")));
-                } else {
-                    col_values.push("NULL".to_string());
-                }
-                // G2.2: old values from pgoutput old-key section.
-                // With REPLICA IDENTITY FULL (required by try_start_transition),
-                // pgoutput includes the complete old tuple. Parse old values
-                // from the "old-key:" section of the UPDATE message.
+                let new_val = parsed.get(col_name).cloned();
+                param_values.push(new_val);
+                placeholders.push(format!("${}", param_values.len()));
+
+                // G2.2: old value from pgoutput old-key section.
                 col_names.push(format!("\"old_{}\"", safe_name));
-                if let Some(val) = old_parsed.get(col_name) {
-                    col_values.push(format!("'{}'", val.replace('\'', "''")));
-                } else {
-                    col_values.push("NULL".to_string());
-                }
+                let old_val = old_parsed.get(col_name).cloned();
+                param_values.push(old_val);
+                placeholders.push(format!("${}", param_values.len()));
             }
             'D' => {
                 col_names.push(format!("\"old_{}\"", safe_name));
-                if let Some(val) = parsed.get(col_name) {
-                    col_values.push(format!("'{}'", val.replace('\'', "''")));
-                } else {
-                    col_values.push("NULL".to_string());
-                }
+                let val = parsed.get(col_name).cloned();
+                param_values.push(val);
+                placeholders.push(format!("${}", param_values.len()));
             }
             _ => {}
         }
     }
 
+    let buf_name = cdc::buffer_base_name_for_oid(pg_sys::Oid::from(source_oid));
+    // A42-13: Validate the slot-name / buffer-name grammar before use.
+    // Buffer names are generated from OIDs and follow the pattern
+    // `changes_<oid>` — they must contain only alphanumerics and underscores.
+    assert_valid_identifier(&buf_name, "change buffer name")?;
+    assert_valid_identifier(change_schema, "change schema")?;
+
     let sql = format!(
         // nosemgrep: rust.spi.query.dynamic-format
         "INSERT INTO {schema}.{buf_name} ({cols}) VALUES ({vals})",
         schema = change_schema,
-        buf_name = crate::cdc::buffer_base_name_for_oid(pg_sys::Oid::from(source_oid)),
+        buf_name = buf_name,
         cols = col_names.join(", "),
-        vals = col_values.join(", "),
+        vals = placeholders.join(", "),
     );
 
-    Spi::run(&sql).map_err(|e| {
+    // A42-13: Convert param_values to DatumWithOid args.
+    // Option<String> implements IntoDatum (None → SQL NULL) so we can use
+    // the standard .into() conversion for each element.
+    let spi_args: Vec<pgrx::datum::DatumWithOid<'_>> =
+        param_values.into_iter().map(|v| v.into()).collect();
+
+    // A42-13: Use run_with_args so every value is passed as a type-safe
+    // text parameter — no inline string escaping.
+    pgrx::Spi::run_with_args(&sql, &spi_args).map_err(|e| {
         PgTrickleError::WalTransitionError(format!(
             "Failed to write decoded WAL change to buffer: {}",
             e
@@ -825,7 +850,72 @@ fn write_decoded_change(
     Ok(())
 }
 
-/// Build a pk_hash expression from parsed column values.
+/// A42-13: Assert that an identifier contains only characters that are safe to
+/// embed as unquoted names in SQL (alphanumerics and underscores).
+///
+/// Change-buffer names and the change schema are generated internally from OIDs
+/// and configuration, so they should never contain special characters. This
+/// assertion converts a programming error into an immediate, actionable error
+/// instead of a silent SQL injection.
+fn assert_valid_identifier(s: &str, context: &str) -> Result<(), PgTrickleError> {
+    if s.chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '"')
+    {
+        Ok(())
+    } else {
+        Err(PgTrickleError::InternalError(format!(
+            "WAL decoder: {} '{}' contains unexpected characters (expected [A-Za-z0-9_\"])",
+            context, s
+        )))
+    }
+}
+
+/// A42-13: Build a parameterized pk_hash sub-expression.
+///
+/// Instead of embedding the PK values as SQL string literals (old approach),
+/// we add each PK value to `param_values` and reference them via `$N`
+/// placeholders in the generated expression. NULL pk-column values produce
+/// a 0 hash (matching the trigger behaviour).
+fn build_pk_hash_parameterized(
+    pk_columns: &[String],
+    parsed: &std::collections::HashMap<String, String>,
+    param_values: &mut Vec<Option<String>>,
+) -> String {
+    if pk_columns.is_empty() {
+        return "0".to_string();
+    }
+
+    if pk_columns.len() == 1 {
+        let val = parsed.get(&pk_columns[0]).cloned();
+        param_values.push(val.clone());
+        let idx = param_values.len();
+        if val.is_some() {
+            format!("pgtrickle.pg_trickle_hash(${})", idx)
+        } else {
+            // NULL pk → 0 hash (matches trigger)
+            "0".to_string()
+        }
+    } else {
+        let mut array_items: Vec<String> = Vec::new();
+        for col in pk_columns {
+            let val = parsed.get(col).cloned();
+            param_values.push(val.clone());
+            let idx = param_values.len();
+            if val.is_some() {
+                array_items.push(format!("${}", idx));
+            } else {
+                array_items.push("NULL".to_string());
+            }
+        }
+        format!(
+            "pgtrickle.pg_trickle_hash_multi(ARRAY[{}])",
+            array_items.join(", ")
+        )
+    }
+}
+
+/// Build a pk_hash expression from parsed column values (legacy — kept for
+/// any callers outside the parameterized path).
 ///
 /// Uses the same hash computation as the trigger-based CDC to ensure
 /// pk_hash values match between trigger and WAL decoder outputs.
