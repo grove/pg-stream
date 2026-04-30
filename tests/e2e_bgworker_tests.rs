@@ -657,8 +657,24 @@ async fn test_pool_worker_does_not_run_while_disabled() {
     );
 
     // After re-enabling the data inserted while disabled should trigger a refresh.
+    // We check pgt_refresh_history directly rather than data_timestamp:
+    // data_timestamp is set to now() at refresh-transaction start, and on
+    // Linux CI the first post-re-enable refresh can complete before
+    // initial_ts is captured, so wait_for_auto_refresh would need *two*
+    // refreshes to observe a change — an unnecessary timing dependency.
     let resumed = db
-        .wait_for_auto_refresh("disabled_st", Duration::from_secs(60))
+        .wait_for_condition(
+            "new refresh should complete after re-enabling",
+            &format!(
+                "SELECT count(*) > {count_before} \
+                 FROM pgtrickle.pgt_refresh_history \
+                 WHERE pgt_id = (SELECT pgt_id FROM pgtrickle.pgt_stream_tables \
+                                 WHERE pgt_name = 'disabled_st') \
+                 AND status = 'COMPLETED'"
+            ),
+            Duration::from_secs(30),
+            Duration::from_millis(500),
+        )
         .await;
     assert!(
         resumed,
