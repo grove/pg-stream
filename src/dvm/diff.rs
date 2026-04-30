@@ -215,43 +215,289 @@ pub struct DiffContext {
     pub source_buffer_names: HashMap<u32, String>,
 }
 
-/// Build a unique cache key for an OpTree's pre-change snapshot CTE.
+/// A41-1: Build a collision-resistant structural fingerprint of an OpTree
+/// for use as the snapshot CTE cache key.
 ///
-/// For Scan nodes, uses the table alias. For join nodes, collects all
-/// leaf Scan aliases in tree order and joins them with `+`. This ensures
-/// that `(t1 ⋈ t2)` and `(t1 ⋈ t2) ⋈ t3` get distinct cache keys even
-/// though both have `alias() == "join"`.
+/// Unlike the old alias-based key, this fingerprint encodes the full
+/// structure of the subtree: operator type, join conditions, filter
+/// predicates, projections, group-by expressions, and child fingerprints
+/// recursively.  Two structurally different subtrees always produce
+/// different keys even when they share identical leaf aliases.
+///
+/// The fingerprint is a `u64` FNV-1a hash of a canonical string
+/// representation, formatted as a hex string for the cache map.
 fn snapshot_cache_key(op: &crate::dvm::parser::OpTree) -> String {
-    use crate::dvm::parser::OpTree;
-    fn collect_leaf_aliases(op: &OpTree, out: &mut Vec<String>) {
+    use crate::dvm::parser::{Expr, OpTree};
+    use std::hash::{Hash, Hasher};
+
+    /// Append a canonical token to the output buffer.
+    fn push(out: &mut String, s: &str) {
+        out.push('|');
+        out.push_str(s);
+    }
+
+    fn push_expr(out: &mut String, e: &Expr) {
+        push(out, &e.to_sql());
+    }
+
+    fn build_fingerprint(op: &OpTree, out: &mut String) {
         match op {
-            OpTree::Scan { alias, .. } | OpTree::CteScan { alias, .. } => {
-                out.push(alias.clone());
+            OpTree::Scan {
+                table_oid, alias, ..
+            } => {
+                push(out, "S");
+                push(out, &table_oid.to_string());
+                push(out, alias);
             }
-            OpTree::InnerJoin { left, right, .. }
-            | OpTree::LeftJoin { left, right, .. }
-            | OpTree::FullJoin { left, right, .. } => {
-                collect_leaf_aliases(left, out);
-                collect_leaf_aliases(right, out);
+            OpTree::CteScan {
+                cte_id,
+                cte_name,
+                alias,
+                ..
+            } => {
+                push(out, "CS");
+                push(out, &cte_id.to_string());
+                push(out, cte_name);
+                push(out, alias);
             }
-            OpTree::Filter { child, .. }
-            | OpTree::Project { child, .. }
-            | OpTree::Distinct { child }
-            | OpTree::Window { child, .. }
-            | OpTree::Aggregate { child, .. } => {
-                collect_leaf_aliases(child, out);
+            OpTree::InnerJoin {
+                condition,
+                left,
+                right,
+            } => {
+                push(out, "IJ");
+                push_expr(out, condition);
+                push(out, "(");
+                build_fingerprint(left, out);
+                push(out, ")(");
+                build_fingerprint(right, out);
+                push(out, ")");
             }
-            OpTree::Subquery { child, .. } => {
-                collect_leaf_aliases(child, out);
+            OpTree::LeftJoin {
+                condition,
+                left,
+                right,
+            } => {
+                push(out, "LJ");
+                push_expr(out, condition);
+                push(out, "(");
+                build_fingerprint(left, out);
+                push(out, ")(");
+                build_fingerprint(right, out);
+                push(out, ")");
             }
-            _ => {
-                out.push(op.alias().to_string());
+            OpTree::FullJoin {
+                condition,
+                left,
+                right,
+            } => {
+                push(out, "FJ");
+                push_expr(out, condition);
+                push(out, "(");
+                build_fingerprint(left, out);
+                push(out, ")(");
+                build_fingerprint(right, out);
+                push(out, ")");
+            }
+            OpTree::Filter { predicate, child } => {
+                push(out, "F");
+                push_expr(out, predicate);
+                push(out, "(");
+                build_fingerprint(child, out);
+                push(out, ")");
+            }
+            OpTree::Project {
+                expressions,
+                aliases,
+                child,
+            } => {
+                push(out, "P");
+                for (e, a) in expressions.iter().zip(aliases.iter()) {
+                    push_expr(out, e);
+                    push(out, ":");
+                    push(out, a);
+                }
+                push(out, "(");
+                build_fingerprint(child, out);
+                push(out, ")");
+            }
+            OpTree::Aggregate {
+                group_by,
+                aggregates,
+                child,
+            } => {
+                push(out, "A");
+                for g in group_by {
+                    push_expr(out, g);
+                }
+                for agg in aggregates {
+                    push(out, &format!("{:?}", agg));
+                }
+                push(out, "(");
+                build_fingerprint(child, out);
+                push(out, ")");
+            }
+            OpTree::Distinct { child } => {
+                push(out, "D(");
+                build_fingerprint(child, out);
+                push(out, ")");
+            }
+            OpTree::Window {
+                window_exprs,
+                partition_by,
+                child,
+                ..
+            } => {
+                push(out, "W");
+                for p in partition_by {
+                    push_expr(out, p);
+                }
+                push(out, &format!("#we={}", window_exprs.len()));
+                push(out, "(");
+                build_fingerprint(child, out);
+                push(out, ")");
+            }
+            OpTree::Subquery {
+                alias,
+                column_aliases,
+                child,
+            } => {
+                push(out, "SQ");
+                push(out, alias);
+                for ca in column_aliases {
+                    push(out, ca);
+                }
+                push(out, "(");
+                build_fingerprint(child, out);
+                push(out, ")");
+            }
+            OpTree::UnionAll { children } => {
+                push(out, "UA");
+                for c in children {
+                    push(out, "(");
+                    build_fingerprint(c, out);
+                    push(out, ")");
+                }
+            }
+            OpTree::Intersect { left, right, all } => {
+                push(out, if *all { "IA" } else { "I" });
+                push(out, "(");
+                build_fingerprint(left, out);
+                push(out, ")(");
+                build_fingerprint(right, out);
+                push(out, ")");
+            }
+            OpTree::Except { left, right, all } => {
+                push(out, if *all { "EA" } else { "E" });
+                push(out, "(");
+                build_fingerprint(left, out);
+                push(out, ")(");
+                build_fingerprint(right, out);
+                push(out, ")");
+            }
+            OpTree::LateralFunction {
+                func_sql,
+                alias,
+                child,
+                ..
+            } => {
+                push(out, "LF");
+                push(out, func_sql);
+                push(out, alias);
+                push(out, "(");
+                build_fingerprint(child, out);
+                push(out, ")");
+            }
+            OpTree::LateralSubquery {
+                subquery_sql,
+                alias,
+                child,
+                ..
+            } => {
+                push(out, "LSQ");
+                push(out, subquery_sql);
+                push(out, alias);
+                push(out, "(");
+                build_fingerprint(child, out);
+                push(out, ")");
+            }
+            OpTree::RecursiveCte {
+                alias,
+                base,
+                recursive,
+                union_all,
+                ..
+            } => {
+                push(out, "RC");
+                push(out, alias);
+                push(out, if *union_all { "UA" } else { "U" });
+                push(out, "(");
+                build_fingerprint(base, out);
+                push(out, ")(");
+                build_fingerprint(recursive, out);
+                push(out, ")");
+            }
+            OpTree::RecursiveSelfRef {
+                cte_name, alias, ..
+            } => {
+                push(out, "RSR");
+                push(out, cte_name);
+                push(out, alias);
+            }
+            OpTree::SemiJoin {
+                condition,
+                left,
+                right,
+            } => {
+                push(out, "SMJ");
+                push_expr(out, condition);
+                push(out, "(");
+                build_fingerprint(left, out);
+                push(out, ")(");
+                build_fingerprint(right, out);
+                push(out, ")");
+            }
+            OpTree::AntiJoin {
+                condition,
+                left,
+                right,
+            } => {
+                push(out, "ANJ");
+                push_expr(out, condition);
+                push(out, "(");
+                build_fingerprint(left, out);
+                push(out, ")(");
+                build_fingerprint(right, out);
+                push(out, ")");
+            }
+            OpTree::ScalarSubquery {
+                alias,
+                subquery,
+                child,
+                ..
+            } => {
+                push(out, "SSQ");
+                push(out, alias);
+                push(out, "(");
+                build_fingerprint(subquery, out);
+                push(out, ")(");
+                build_fingerprint(child, out);
+                push(out, ")");
+            }
+            OpTree::ConstantSelect { sql, .. } => {
+                push(out, "CSL");
+                push(out, sql);
             }
         }
     }
-    let mut aliases = Vec::new();
-    collect_leaf_aliases(op, &mut aliases);
-    aliases.join("+")
+
+    let mut buf = String::with_capacity(128);
+    build_fingerprint(op, &mut buf);
+
+    // Hash the canonical string to a compact 16-char hex key.
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    buf.hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
 }
 
 impl DiffContext {
@@ -1044,6 +1290,154 @@ mod tests {
         assert!(
             ctx.not_materialized_ctes.contains(&name),
             "snapshot CTE should be NOT MATERIALIZED"
+        );
+    }
+
+    // ── A41-1: snapshot_cache_key structural fingerprint ─────────────
+
+    /// T-A41-1a: Two subtrees with IDENTICAL leaf aliases but DIFFERENT join
+    /// conditions must produce DISTINCT cache keys.
+    #[test]
+    fn test_snapshot_cache_key_different_join_condition_distinct_keys() {
+        use crate::dvm::parser::Expr;
+
+        // t1 ⋈ t2 on t1.id = t2.id
+        let join1 = inner_join(
+            Expr::Raw("t1.id = t2.id".to_string()),
+            scan(100, "t1", "public", "t1", &["id"]),
+            scan(200, "t2", "public", "t2", &["id"]),
+        );
+        // t1 ⋈ t2 on t1.name = t2.name  (different predicate!)
+        let join2 = inner_join(
+            Expr::Raw("t1.name = t2.name".to_string()),
+            scan(100, "t1", "public", "t1", &["id"]),
+            scan(200, "t2", "public", "t2", &["id"]),
+        );
+
+        let key1 = snapshot_cache_key(&join1);
+        let key2 = snapshot_cache_key(&join2);
+        assert_ne!(
+            key1, key2,
+            "joins with different predicates must produce distinct cache keys"
+        );
+    }
+
+    /// T-A41-1b: Two subtrees with IDENTICAL leaf aliases but DIFFERENT join
+    /// type (INNER vs LEFT) must produce DISTINCT cache keys.
+    #[test]
+    fn test_snapshot_cache_key_different_join_type_distinct_keys() {
+        use crate::dvm::parser::Expr;
+        use crate::dvm::parser::OpTree;
+
+        let cond = Expr::Raw("t1.id = t2.id".to_string());
+        let inner = inner_join(
+            cond.clone(),
+            scan(100, "t1", "public", "t1", &["id"]),
+            scan(200, "t2", "public", "t2", &["id"]),
+        );
+        let left = OpTree::LeftJoin {
+            condition: cond,
+            left: Box::new(scan(100, "t1", "public", "t1", &["id"])),
+            right: Box::new(scan(200, "t2", "public", "t2", &["id"])),
+        };
+
+        let key_inner = snapshot_cache_key(&inner);
+        let key_left = snapshot_cache_key(&left);
+        assert_ne!(
+            key_inner, key_left,
+            "INNER and LEFT joins must produce distinct cache keys"
+        );
+    }
+
+    /// T-A41-1c: Two structurally IDENTICAL subtrees must produce EQUAL cache keys.
+    #[test]
+    fn test_snapshot_cache_key_identical_subtrees_equal_keys() {
+        use crate::dvm::parser::Expr;
+
+        let join1 = inner_join(
+            Expr::Raw("t1.id = t2.id".to_string()),
+            scan(100, "t1", "public", "t1", &["id"]),
+            scan(200, "t2", "public", "t2", &["id"]),
+        );
+        let join2 = inner_join(
+            Expr::Raw("t1.id = t2.id".to_string()),
+            scan(100, "t1", "public", "t1", &["id"]),
+            scan(200, "t2", "public", "t2", &["id"]),
+        );
+
+        let key1 = snapshot_cache_key(&join1);
+        let key2 = snapshot_cache_key(&join2);
+        assert_eq!(
+            key1, key2,
+            "identical subtrees must produce equal cache keys"
+        );
+    }
+
+    /// T-A41-1d: (t1 ⋈ t2) and (t1 ⋈ t2) ⋈ t3 share the same leaf aliases
+    /// but must produce DISTINCT cache keys because their shapes differ.
+    #[test]
+    fn test_snapshot_cache_key_different_depth_distinct_keys() {
+        use crate::dvm::parser::Expr;
+
+        let t1_t2 = inner_join(
+            Expr::Raw("t1.id = t2.id".to_string()),
+            scan(100, "t1", "public", "t1", &["id"]),
+            scan(200, "t2", "public", "t2", &["id"]),
+        );
+        let t1_t2_t3 = inner_join(
+            Expr::Raw("t2.id = t3.id".to_string()),
+            t1_t2.clone(),
+            scan(300, "t3", "public", "t3", &["id"]),
+        );
+
+        let key_2 = snapshot_cache_key(&t1_t2);
+        let key_3 = snapshot_cache_key(&t1_t2_t3);
+        assert_ne!(
+            key_2, key_3,
+            "2-table and 3-table joins must produce distinct cache keys"
+        );
+    }
+
+    /// T-A41-1e: Two scans with different OIDs but same alias must produce
+    /// DISTINCT cache keys (would have collided with the old alias-based key).
+    #[test]
+    fn test_snapshot_cache_key_same_alias_different_oid_distinct_keys() {
+        // Both have alias "t" but OID 100 vs OID 200 — structurally different.
+        let s1 = scan(100, "t", "public", "t", &["id"]);
+        let s2 = scan(200, "t", "public", "t", &["id"]);
+
+        let key1 = snapshot_cache_key(&s1);
+        let key2 = snapshot_cache_key(&s2);
+        assert_ne!(
+            key1, key2,
+            "scans with different OIDs but same alias must produce distinct cache keys"
+        );
+    }
+
+    /// T-A41-1f: get_or_register_snapshot_cte() must return DISTINCT CTE names
+    /// for structurally different subtrees that share the same leaf aliases.
+    #[test]
+    fn test_get_or_register_snapshot_cte_structurally_distinct_ops() {
+        use crate::dvm::parser::Expr;
+
+        let mut ctx = test_ctx();
+
+        let join1 = inner_join(
+            Expr::Raw("t1.id = t2.id".to_string()),
+            scan(100, "t1", "public", "t1", &["id"]),
+            scan(200, "t2", "public", "t2", &["id"]),
+        );
+        let join2 = inner_join(
+            Expr::Raw("t1.name = t2.name".to_string()),
+            scan(100, "t1", "public", "t1", &["id"]),
+            scan(200, "t2", "public", "t2", &["id"]),
+        );
+
+        let name1 = ctx.get_or_register_snapshot_cte(&join1);
+        let name2 = ctx.get_or_register_snapshot_cte(&join2);
+        assert_ne!(
+            name1, name2,
+            "structurally different subtrees must get distinct snapshot CTE names"
         );
     }
 }

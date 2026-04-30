@@ -1508,13 +1508,17 @@ pub fn has_downstream_st_consumers(pgt_id: i64) -> bool {
 /// predicate for that source is replaced with `FALSE`, enabling PostgreSQL's
 /// planner to recognise the scan CTE as empty at plan time and skip
 /// downstream join branches.
+///
+/// Returns `Err(PgTrickleError::UnresolvedPlaceholder)` if any
+/// `__PGS_[A-Z0-9_]+__` or `__PGT_[A-Z0-9_]+__` token remains after
+/// all substitution passes (A41-2).
 pub(crate) fn resolve_lsn_placeholders(
     template: &str,
     source_oids: &[u32],
     prev_frontier: &Frontier,
     new_frontier: &Frontier,
     zero_change_oids: &std::collections::HashSet<u32>,
-) -> String {
+) -> Result<String, PgTrickleError> {
     let mut sql = template.to_string();
     for &oid in source_oids {
         if zero_change_oids.contains(&oid) {
@@ -1591,7 +1595,10 @@ pub(crate) fn resolve_lsn_placeholders(
         }
     }
 
-    sql
+    // A41-2: Assert no placeholders remain.
+    crate::dvm::check_no_remaining_placeholders(&sql, "resolve_lsn_placeholders")?;
+
+    Ok(sql)
 }
 
 // ── D-2: Prepared statement helpers ─────────────────────────────────

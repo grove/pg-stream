@@ -1462,12 +1462,69 @@ fn check_transition_eligible(
 /// Creates the publication and updates the catalog to TRANSITIONING mode.
 /// Called from the scheduler after slot creation succeeds in a separate
 /// transaction.
+///
+/// A41-3: Re-checks table eligibility (relkind, existence, PK,
+/// replica identity FULL) immediately before committing the TRANSITIONING
+/// catalog state update.  If any check fails, the transition is aborted:
+/// the replication slot is dropped, the catalog status is reset to TRIGGER
+/// mode, and a warning is emitted.  This closes the TOCTOU window between
+/// eligibility check and catalog commit.
 pub fn finish_wal_transition(
     source_oid: pg_sys::Oid,
     _pgt_id: i64,
     slot_name: &str,
     slot_lsn: &str,
 ) -> Result<(), PgTrickleError> {
+    // A41-3: Eligibility recheck before committing the TRANSITIONING state.
+    //
+    // Between Phase 1 (eligibility check) and Phase 3 (this function), a
+    // concurrent DDL statement could have changed the table's relkind,
+    // dropped its primary key, or changed its replica identity.  Re-verify
+    // before committing to TRANSITIONING so we never get stuck with an
+    // invalid WAL slot.
+    let still_eligible = recheck_source_eligible_for_wal(source_oid);
+    if let Ok(false) | Err(_) = still_eligible {
+        let reason = match still_eligible {
+            Ok(false) => "eligibility check failed (relkind, PK, or replica identity changed)",
+            Err(ref e) => {
+                let _ = e; // drop borrow
+                "error during eligibility recheck"
+            }
+            Ok(true) => unreachable!(),
+        };
+        warning!(
+            "pg_trickle: A41-3: WAL transition eligibility recheck failed for source OID {} \
+             — aborting transition back to trigger mode. Reason: {}",
+            source_oid.to_u32(),
+            reason,
+        );
+        // Drop the replication slot that was already created in Phase 2.
+        // If this fails (e.g. slot was already cleaned up), log and continue —
+        // the transition abort is still the correct outcome.
+        if let Err(e) = crate::wal_decoder::drop_replication_slot(slot_name) {
+            log!(
+                "pg_trickle: A41-3: could not drop slot '{}' during abort (non-fatal): {}",
+                slot_name,
+                e,
+            );
+        }
+        // Update catalog to reflect fallback to trigger mode.
+        if let Err(e) =
+            StDependency::update_cdc_mode_for_source(source_oid, CdcMode::Trigger, None, None)
+        {
+            log!(
+                "pg_trickle: A41-3: could not reset CDC mode for OID {} (non-fatal): {}",
+                source_oid.to_u32(),
+                e,
+            );
+        }
+        return Err(PgTrickleError::WalTransitionError(format!(
+            "eligibility recheck failed for source OID {}: {}",
+            source_oid.to_u32(),
+            reason,
+        )));
+    }
+
     // Create publication for this source table
     create_publication(source_oid)?;
 
@@ -1509,6 +1566,67 @@ pub fn finish_wal_transition(
     );
 
     Ok(())
+}
+
+/// A41-3: Re-check whether a source table is still eligible for WAL-based CDC.
+///
+/// Checks table existence (relkind = 'r'), primary key presence, and
+/// replica identity = FULL.  Returns `Ok(true)` when all checks pass,
+/// `Ok(false)` when the table is no longer eligible, and `Err` when a
+/// catalog lookup fails.
+///
+/// This is a pure eligibility check — it does not modify any state.
+pub(crate) fn recheck_source_eligible_for_wal(
+    source_oid: pg_sys::Oid,
+) -> Result<bool, PgTrickleError> {
+    // 1. Table must still exist and be a regular table.
+    let relkind: Option<String> = Spi::get_one(&format!(
+        "SELECT relkind::text FROM pg_class WHERE oid = {}",
+        source_oid.to_u32(),
+    ))
+    .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
+
+    match relkind.as_deref() {
+        Some("r") => {} // regular table — OK
+        Some(k) => {
+            log!(
+                "pg_trickle: A41-3: source OID {} relkind is '{}', expected 'r'",
+                source_oid.to_u32(),
+                k,
+            );
+            return Ok(false);
+        }
+        None => {
+            log!(
+                "pg_trickle: A41-3: source OID {} no longer exists",
+                source_oid.to_u32(),
+            );
+            return Ok(false);
+        }
+    }
+
+    // 2. Table must have a primary key.
+    let pk_columns = cdc::resolve_pk_columns(source_oid)?;
+    if pk_columns.is_empty() {
+        log!(
+            "pg_trickle: A41-3: source OID {} has no primary key",
+            source_oid.to_u32(),
+        );
+        return Ok(false);
+    }
+
+    // 3. Replica identity must be FULL.
+    let identity = cdc::get_replica_identity_mode(source_oid)?;
+    if identity != "full" {
+        log!(
+            "pg_trickle: A41-3: source OID {} replica identity is '{}', expected 'full'",
+            source_oid.to_u32(),
+            identity,
+        );
+        return Ok(false);
+    }
+
+    Ok(true)
 }
 
 // ── Consecutive WAL error tracking ─────────────────────────────────────────

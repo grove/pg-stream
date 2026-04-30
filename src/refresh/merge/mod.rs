@@ -1369,33 +1369,36 @@ pub fn execute_differential_refresh(
         // Substitute __PGS_PREV/NEW_LSN_{oid}__ tokens with actual values.
         // Each execution gets a fresh plan with accurate LSN selectivity
         // estimates, avoiding the PREPARE/EXECUTE custom-plan penalty.
+        let merge_sql = resolve_lsn_placeholders(
+            &entry.merge_sql_template,
+            &entry.source_oids,
+            prev_frontier,
+            new_frontier,
+            &zero_change_oids,
+        )?;
+        let trigger_using_sql = resolve_lsn_placeholders(
+            &entry.trigger_using_template,
+            &entry.source_oids,
+            prev_frontier,
+            new_frontier,
+            &zero_change_oids,
+        )?;
+        let resolved_delta_sql = resolve_lsn_placeholders(
+            &entry.delta_sql_template,
+            &entry.source_oids,
+            prev_frontier,
+            new_frontier,
+            &zero_change_oids,
+        )?;
         ResolvedSql {
-            merge_sql: resolve_lsn_placeholders(
-                &entry.merge_sql_template,
-                &entry.source_oids,
-                prev_frontier,
-                new_frontier,
-                &zero_change_oids,
-            ),
+            merge_sql,
             source_oids: entry.source_oids.clone(),
             parameterized_merge_sql: entry.parameterized_merge_sql.clone(),
             trigger_delete_sql: entry.trigger_delete_template.clone(),
             trigger_update_sql: entry.trigger_update_template.clone(),
             trigger_insert_sql: entry.trigger_insert_template.clone(),
-            trigger_using_sql: resolve_lsn_placeholders(
-                &entry.trigger_using_template,
-                &entry.source_oids,
-                prev_frontier,
-                new_frontier,
-                &zero_change_oids,
-            ),
-            resolved_delta_sql: resolve_lsn_placeholders(
-                &entry.delta_sql_template,
-                &entry.source_oids,
-                prev_frontier,
-                new_frontier,
-                &zero_change_oids,
-            ),
+            trigger_using_sql,
+            resolved_delta_sql,
             is_all_algebraic: entry.is_all_algebraic,
             is_deduplicated: entry.is_deduplicated,
         }
@@ -1541,33 +1544,36 @@ pub fn execute_differential_refresh(
         }
 
         // Resolve LSN placeholders for this execution.
+        let merge_sql = resolve_lsn_placeholders(
+            &merge_template,
+            &source_oids,
+            prev_frontier,
+            new_frontier,
+            &zero_change_oids,
+        )?;
+        let trigger_using_sql = resolve_lsn_placeholders(
+            &template_using,
+            &source_oids,
+            prev_frontier,
+            new_frontier,
+            &zero_change_oids,
+        )?;
+        let resolved_delta_sql = resolve_lsn_placeholders(
+            &delta_sql_template,
+            &source_oids,
+            prev_frontier,
+            new_frontier,
+            &zero_change_oids,
+        )?;
         ResolvedSql {
-            merge_sql: resolve_lsn_placeholders(
-                &merge_template,
-                &source_oids,
-                prev_frontier,
-                new_frontier,
-                &zero_change_oids,
-            ),
+            merge_sql,
             source_oids: source_oids.clone(),
             parameterized_merge_sql,
             trigger_delete_sql: trigger_delete_template,
             trigger_update_sql: trigger_update_template,
             trigger_insert_sql: trigger_insert_template,
-            trigger_using_sql: resolve_lsn_placeholders(
-                &template_using,
-                &source_oids,
-                prev_frontier,
-                new_frontier,
-                &zero_change_oids,
-            ),
-            resolved_delta_sql: resolve_lsn_placeholders(
-                &delta_sql_template,
-                &source_oids,
-                prev_frontier,
-                new_frontier,
-                &zero_change_oids,
-            ),
+            trigger_using_sql,
+            resolved_delta_sql,
             is_all_algebraic: delta_result.is_all_algebraic,
             is_deduplicated: delta_result.is_deduplicated,
         }

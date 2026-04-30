@@ -789,3 +789,107 @@ async fn test_ec19_wal_keyless_with_replica_identity_full_accepted() {
         result.unwrap_err()
     );
 }
+
+// ── T-A41-3: WAL transition eligibility recheck at commit ────────────────────
+
+/// T-A41-3a: Dropping the primary key during a WAL transition must cause the
+/// transition to abort and the source to fall back to Trigger CDC mode.
+///
+/// This test exercises the A41-3 eligibility recheck: after the background
+/// worker starts the TRANSITIONING phase but before it commits, we drop the PK
+/// on the source table.  The recheck detects the missing PK and should reset
+/// the catalog to Trigger mode without leaving a dangling replication slot.
+///
+/// Because the actual transition runs asynchronously in the background worker
+/// we cannot synchronise perfectly, but we can:
+/// 1. Create a WAL-mode stream table.
+/// 2. Wait for transition to begin (CDC mode becomes TRANSITIONING or WAL).
+/// 3. If already WAL: drop PK, which the heartbeat/health-check should detect.
+/// 4. Otherwise: drop PK during TRANSITIONING, let the recheck fire.
+/// 5. Assert final CDC mode is NOT WAL (reverted to trigger-based mode).
+#[tokio::test]
+async fn test_wal_transition_pk_drop_falls_back_to_trigger() {
+    let db = E2eDb::new_on_postgres_db().await.with_extension().await;
+
+    db.execute("CREATE TABLE wal_pk_drop_src (id INT PRIMARY KEY, val TEXT)")
+        .await;
+    db.execute("ALTER TABLE wal_pk_drop_src REPLICA IDENTITY FULL")
+        .await;
+    db.execute("INSERT INTO wal_pk_drop_src VALUES (1, 'a')")
+        .await;
+
+    db.execute(
+        "SELECT pgtrickle.create_stream_table(\
+            name => 'wal_pk_drop_st',\
+            query => $$SELECT id, val FROM wal_pk_drop_src$$,\
+            schedule => '1m',\
+            refresh_mode => 'DIFFERENTIAL',\
+            cdc_mode => 'wal'\
+        )",
+    )
+    .await;
+
+    // Wait a short moment for the transition to start.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    // Drop the primary key — this makes the source ineligible for WAL CDC.
+    db.execute("ALTER TABLE wal_pk_drop_src DROP CONSTRAINT wal_pk_drop_src_pkey")
+        .await;
+
+    // Give the background worker time to run the eligibility recheck and
+    // update the catalog (up to 30 s).
+    let final_mode =
+        wait_for_cdc_mode(&db, "wal_pk_drop_src", "trigger", Duration::from_secs(30)).await;
+
+    assert!(
+        final_mode == "trigger" || final_mode == "Trigger",
+        "After PK drop the CDC mode should revert to trigger, got: {final_mode}"
+    );
+
+    // Verify no dangling replication slot was left behind.
+    let slot_left = slot_exists(&db, "wal_pk_drop_src").await;
+    assert!(
+        !slot_left,
+        "No replication slot should remain after WAL transition aborted due to PK drop"
+    );
+}
+
+/// T-A41-3b: Dropping REPLICA IDENTITY FULL during transition must abort to
+/// Trigger mode (the recheck verifies replica identity = 'full').
+#[tokio::test]
+async fn test_wal_transition_replica_identity_drop_falls_back_to_trigger() {
+    let db = E2eDb::new_on_postgres_db().await.with_extension().await;
+
+    db.execute("CREATE TABLE wal_ri_drop_src (id INT PRIMARY KEY, val TEXT)")
+        .await;
+    db.execute("ALTER TABLE wal_ri_drop_src REPLICA IDENTITY FULL")
+        .await;
+    db.execute("INSERT INTO wal_ri_drop_src VALUES (1, 'b')")
+        .await;
+
+    db.execute(
+        "SELECT pgtrickle.create_stream_table(\
+            name => 'wal_ri_drop_st',\
+            query => $$SELECT id, val FROM wal_ri_drop_src$$,\
+            schedule => '1m',\
+            refresh_mode => 'DIFFERENTIAL',\
+            cdc_mode => 'wal'\
+        )",
+    )
+    .await;
+
+    // Brief pause before changing REPLICA IDENTITY.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    // Reset replica identity to default — this breaks WAL CDC eligibility.
+    db.execute("ALTER TABLE wal_ri_drop_src REPLICA IDENTITY DEFAULT")
+        .await;
+
+    let final_mode =
+        wait_for_cdc_mode(&db, "wal_ri_drop_src", "trigger", Duration::from_secs(30)).await;
+
+    assert!(
+        final_mode == "trigger" || final_mode == "Trigger",
+        "After REPLICA IDENTITY reset the CDC mode should revert to trigger, got: {final_mode}"
+    );
+}
