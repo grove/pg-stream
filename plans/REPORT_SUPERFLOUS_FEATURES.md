@@ -1,459 +1,617 @@
-# REPORT: Superfluous Features & Files for pg_trickle 1.0 Cleanup
+# Slimming Down pg_trickle for 1.0
 
-**Date:** 30 April 2026
-**Version analysed:** 0.42.0 (commit `aab1b36`)
-**Status:** Draft for review — long, prioritised list of removal candidates
-
----
-
-## Purpose
-
-The project has accumulated significant weight on the road to 1.0: aspirational
-marketing content, parallel sub-projects, deprecated knobs, duplicated demos,
-historical planning artefacts, and a long tail of optional functionality.
-
-This report catalogues **candidates for removal, archival, consolidation, or
-relocation** before tagging 1.0. Each candidate has a recommended action, a
-rough size/effort estimate, and a risk classification:
-
-- 🟢 **Low risk** — safe deletion, no user-visible impact
-- 🟡 **Medium risk** — touches docs/CI/optional features; coordinate with users
-- 🔴 **High risk** — public surface change or sub-project relocation
-
-> This is a **menu of candidates**, not a final cut list. The goal is to
-> surface every plausible piece of weight so maintainers can debate and pick.
+**Date:** 30 April 2026  
+**Version reviewed:** 0.42.0  
+**Status:** Draft — a prioritised list of what we could cut, move, or simplify
 
 ---
 
-## Top recommendations at a glance
+## Why this report exists
 
-| Priority | Candidate | Action | Risk | Est. effort |
-|----------|-----------|--------|------|-------------|
-| P0 | Garbage top-level files (`staged_files.txt`, `test_output.txt`, `arch1b_split.py`, `trace_rng.py`) | Delete | 🟢 | <30 min |
-| P0 | `doc/pg_trickle.md` (duplicate of `docs/`) | Delete | 🟢 | <15 min |
-| P0 | Deprecated GUCs (`event_driven_wake`, `wake_debounce_ms`, `merge_planner_hints`) | Delete | 🟡 | 1-2 h |
-| P0 | `proptest-regressions/` committed cases | `.gitignore` + delete tracked files | 🟢 | <30 min |
-| P1 | `blog/` (78 markdown files) | Move to a separate site/repo | 🟡 | 2-4 h |
-| P1 | `roadmap/` (109 historical version files, many `*-full.md` duplicates) | Archive old + drop `-full` variants | 🟢 | 2 h |
-| P1 | `plans/PLAN_OVERALL_ASSESSMENT_{1,2,3,7,8,9}.md` | Keep latest only, archive rest | 🟢 | 1 h |
-| P1 | Consolidate `Dockerfile.{demo,hub,ghcr}` into one parameterised image | Refactor | 🟡 | 3-4 h |
-| P1 | `playground/` (duplicate of `demo/`) | Delete | 🟢 | <30 min |
-| P2 | `dbt-pgtrickle/` | Move to standalone repo | 🔴 | 1 day |
-| P2 | `pgtrickle-relay/` | Move to standalone repo | 🔴 | 1 day |
-| P2 | `monitoring/` (Prom + Grafana stack) | Move to companion repo or `examples/` | 🟡 | 2 h |
-| P2 | `cnpg/` | Collapse into `docs/integrations/cnpg/` | 🟡 | 2 h |
-| P3 | Outbox / Inbox SQL APIs | Mark experimental or move to relay sub-project | 🔴 | 1-2 days |
-| P3 | Feature-gate `otel`, `metrics_server`, `monitor`, `diagnostics` modules | Cargo features | 🟡 | 1 day |
-| P3 | Consolidate CI workflows (`docker-hub` + `ghcr`, `docs` + `docs-drift`, benchmarks pair) | Refactor | 🟡 | 1 day |
+pg_trickle's core mission is simple: keep pre-computed query results (called
+*stream tables*) up to date, quickly and correctly, whenever underlying data
+changes.
 
----
+Over 40+ releases, however, the project has picked up a lot of extra weight:
+marketing articles, demo setups that nobody maintains, overlapping
+configuration knobs, side-projects bundled inside the main codebase, leftover
+scripts from one-off refactors, and duplicated documentation. None of this
+extra weight makes the core product faster or more correct — it just makes the
+project harder to navigate, slower to build, and more expensive to maintain.
 
-## 1. Top-level files (🟢 P0)
+This report is a **menu of things we could cut**. Nothing here is a final
+decision. The goal is to give the team a clear picture of what is sitting in
+the repo, why it is there, what value (if any) it still provides, and whether
+we should keep it for 1.0.
 
-| File | Size | Reason | Action |
-|------|------|--------|--------|
-| [arch1b_split.py](arch1b_split.py) | ~50 LOC | One-off refactor helper from the `src/refresh/mod.rs` split | **DELETE** |
-| [trace_rng.py](trace_rng.py) | ~40 LOC | Stand-alone RNG trace utility, not invoked by any test | **DELETE** |
-| [staged_files.txt](staged_files.txt) | small | Stale `git add` artefact accidentally committed | **DELETE**, add to `.gitignore` |
-| [test_output.txt](test_output.txt) | large | Captured test log from a developer's laptop | **DELETE**, add to `.gitignore` |
-| `Dockerfile.demo` / `Dockerfile.hub` / `Dockerfile.ghcr` / `Dockerfile.relay` | 4 files | Three of them produce overlapping Postgres + extension images differing only in metadata/labels | **CONSOLIDATE** to one parameterised `Dockerfile` driven by build args. Keep `Dockerfile.relay` only if the relay binary stays in-repo (see §7) |
+### How to read the priority labels
+
+- **P0** — Obvious junk. Safe to delete today with no user impact.
+- **P1** — High-value cleanup. Removes significant clutter. Minor coordination needed.
+- **P2** — Structural moves. Larger effort but big payoff for long-term maintenance.
+- **P3** — Nice-to-have polish. Can wait until after 1.0 if time is tight.
+
+### Risk levels
+
+- 🟢 **Low risk** — Internal only. No user would ever notice.
+- 🟡 **Medium risk** — Touches optional features or documentation. Might affect a small number of users.
+- 🔴 **High risk** — Changes public interfaces or relocates something users depend on.
 
 ---
 
-## 2. Documentation & marketing content
+## Quick summary table
 
-### 2.1 `blog/` — 78 markdown files (🟡 P1)
+| Priority | What | Action | Risk | Effort |
+|----------|------|--------|------|--------|
+| P0 | Leftover scripts and log files | Delete | 🟢 | <30 min |
+| P0 | Duplicate documentation folder (`doc/`) | Delete | 🟢 | <15 min |
+| P0 | Three deprecated configuration settings | Remove from code | 🟡 | 1-2 h |
+| P0 | Auto-generated test artefacts checked into git | Stop tracking them | 🟢 | <30 min |
+| P1 | 78 blog posts in the main repo | Move to a separate blog site | 🟡 | 2-4 h |
+| P1 | 109 historical roadmap files | Archive old versions, drop duplicates | 🟢 | 2 h |
+| P1 | Six iterations of the same planning document | Keep only the latest | 🟢 | 1 h |
+| P1 | Four nearly-identical Dockerfiles | Merge into one | 🟡 | 3-4 h |
+| P1 | Duplicate "playground" demo | Delete (keep the real demo) | 🟢 | <30 min |
+| P2 | The dbt integration package | Move to its own repo | 🔴 | 1 day |
+| P2 | The message relay binary | Move to its own repo | 🔴 | 1 day |
+| P2 | Pre-built monitoring dashboards | Move to a companion repo | 🟡 | 2 h |
+| P2 | Kubernetes (CloudNativePG) examples | Fold into documentation | 🟡 | 2 h |
+| P3 | Outbox & Inbox messaging APIs | Mark as experimental or move out | 🔴 | 1-2 days |
+| P3 | Optional code modules (telemetry, diagnostics, Citus) | Make them opt-in at build time | 🟡 | 1 day |
+| P3 | 23 automated test/build/deploy pipelines | Consolidate to ~17 | 🟡 | 1 day |
 
-[blog/](blog/) contains 60+ long-form posts covering use-cases (RAG, Kafka,
-PageRank, PostGIS, vector aggregates, etc.), most of which are **aspirational
-marketing** rather than maintained reference material:
+---
 
-- Not linked from `README.md`, `docs/`, or any release notes.
-- Not version-controlled against feature changes — risk of stale content
-  drifting into the official docs path.
-- Heavy SEO/marketing flavour rather than tightening technical accuracy.
+## 1. Leftover files that serve no purpose (🟢 P0)
+
+Several files in the root of the project are leftovers from past development
+sessions. They add nothing and confuse newcomers.
+
+| File | What it is | Why remove it |
+|------|-----------|---------------|
+| `arch1b_split.py` | A small Python script written once to help split a large source file during a refactor. It did its job months ago. | It will never be run again. It just clutters the top-level directory. |
+| `trace_rng.py` | A random-number utility someone wrote for generating test traces. No test or build step actually calls it. | Dead code. If needed again, it can be rewritten in minutes. |
+| `staged_files.txt` | A list of files that was accidentally committed from a developer's local staging area. | Should never have been in version control at all. |
+| `test_output.txt` | A captured log from someone's test run on their laptop. | Same — not meant for version control. |
+
+**Recommendation:** Delete all four. Add the file names to `.gitignore` to prevent accidental re-commits.
+
+---
+
+## 2. Four overlapping Dockerfiles (🟡 P1)
+
+### What they are
+
+Dockerfiles are recipes for building container images — self-contained packages
+that let users run pg_trickle without installing it manually. We have four:
+
+| File | Purpose |
+|------|---------|
+| `Dockerfile.hub` | Publishes the official image to Docker Hub |
+| `Dockerfile.ghcr` | Publishes essentially the same image to GitHub's container registry |
+| `Dockerfile.demo` | Builds a local demo image for trying things out |
+| `Dockerfile.relay` | Builds the separate message-relay binary (see §7) |
+
+### Why consider merging them
+
+The first three produce almost identical images — they differ only in a few
+metadata labels. Maintaining three separate files means any change to how we
+build the extension must be repeated in three places, which is error-prone.
+
+**Recommendation:** Merge `.hub`, `.ghcr`, and `.demo` into a single
+Dockerfile that accepts a parameter for the target registry. Keep
+`.relay` only as long as the relay binary lives in this repo (see §7 below).
+
+---
+
+## 3. The blog directory — 78 marketing articles (🟡 P1)
+
+### What it is
+
+The `blog/` folder contains 78 long-form articles exploring use-cases,
+comparisons with other tools, and deep-dive explanations. Topics range from
+"Deploying RAG at scale" to "Streaming to Kafka without Kafka" to "PostGIS
+incremental geospatial."
+
+### What value it provides
+
+These articles can help potential users understand what pg_trickle can do and
+how it compares to alternatives. They are content marketing.
+
+### Why consider removing it
+
+- **Not maintained:** When features change, nobody updates the blog posts.
+  Stale technical advice is worse than no advice.
+- **Not linked anywhere:** The README, installation guide, and official docs
+  do not point to these posts. Most users never see them.
+- **Makes the repo enormous:** 78 markdown files add hundreds of kilobytes and
+  make it harder to find what matters.
+- **Wrong home:** Blog content belongs on a website, not inside a source code
+  repository that developers clone to build the extension.
 
 **Recommendation:**
 
-1. **Move all of `blog/` to a separate site or repo** (e.g.
-   `grove/pg-trickle-blog` or a Hugo/Jekyll site) — this is the bulk win.
-2. **Promote** the handful that are genuine reference material into `docs/`:
-   - `differential-dataflow-explained.md` → `docs/THEORY.md`
-   - `ivm-without-primary-keys.md` → `docs/LIMITATIONS.md`
-   - `migrating-from-pg-ivm.md` → `docs/MIGRATION.md`
-   - `medallion-architecture-postgresql.md` → `docs/PATTERNS.md`
-3. **Delete** the rest from the repository.
-
-**Impact:** ~78 files, ~150-300 KB; cleaner repo top-level; eliminates a
-long-tail maintenance hazard.
-
-### 2.2 `roadmap/` — 109 files (🟢 P1)
-
-[roadmap/](roadmap/) contains per-version notes from `v0.1.0` through `v1.5.0`,
-many split into `vX.Y.Z.md` + `vX.Y.Z.md-full.md` pairs.
-
-Issues:
-
-- Pre-v0.20 versions are obsolete — no users running them.
-- The `-full.md` duplicates roughly double the file count.
-- Content overlaps `CHANGELOG.md`.
-
-**Recommendations (independent — pick any combination):**
-
-1. **Archive** all `v0.1.x`–`v0.20.x` notes to a separate branch (e.g.
-   `archive/old-roadmap`). Drop them from `main`.
-2. **Drop `-full.md` variants**; keep one canonical file per version.
-3. **Stop generating new `-full.md`** files going forward (see
-   `scripts/split_roadmap.py` — likely also retire-able).
-4. Forward-looking `v1.1.0`+ notes should live in [ROADMAP.md](ROADMAP.md) only.
-
-**Impact:** Potentially -60 to -90 files.
-
-### 2.3 `doc/` vs `docs/` (🟢 P0)
-
-[doc/](doc/) contains exactly one file (`pg_trickle.md`) — a placeholder for
-PGXN packaging. The canonical documentation lives in [docs/](docs/).
-
-**Recommendation:** Delete `doc/`, make PGXN packaging derive its `doc` from
-`README.md` or `docs/INDEX.md` directly.
-
-### 2.4 `plans/` consolidation (🟢 P1)
-
-[plans/](plans/) and its 12 subdirectories hold ~140 planning documents. The
-worst offender:
-
-- `PLAN_OVERALL_ASSESSMENT.md`, `PLAN_OVERALL_ASSESSMENT_2.md`, `_3`, `_7`,
-  `_8`, `_9` — six historical iterations of the same assessment.
-
-Other candidates:
-
-| File | Status | Action |
-|------|--------|--------|
-| `plans/PLAN_OVERALL_ASSESSMENT{,_2,_3,_7,_8,_9}.md` | Iterations | **Keep `_9` only**; archive the rest |
-| `plans/PLAN_PARTITIONING_SPIKE.md` | Spike completed | **Archive** |
-| `plans/PLAN_EDGE_CASES_TIVM_IMPL_ORDER.md` | Now reflected in code/tests | **Archive** |
-| `plans/REPORT_FUTURE_DIRECTIONS.md` | Predates current ROADMAP | Re-evaluate vs `ROADMAP.md` |
-| `plans/dbt/PLAN_DBT_ADAPTER.md` | Superseded by `PLAN_DBT_MACRO.md` (Implemented) | **Archive** |
-| `plans/relay/`, `plans/dbt/` | Likely move with sub-projects (see §7) | **Move out** if §7 happens |
-
-**Impact:** Easily -15 to -25 plan files without losing institutional memory
-(use a `plans/archive/` subdir if total deletion feels too risky).
+1. Move the entire `blog/` folder to a dedicated blog repository or website
+   (e.g. a Hugo site published to GitHub Pages).
+2. Identify the 3-4 articles that explain core concepts (like "Differential
+   Dataflow Explained" or "Migrating from pg_ivm") and absorb their content
+   into the official `docs/` folder.
+3. Delete the rest from this repo.
 
 ---
 
-## 3. Examples, demos, and showcase directories
+## 4. Historical roadmap files — 109 version notes (🟢 P1)
 
-### 3.1 `playground/` (🟢 P1)
+### What they are
 
-[playground/](playground/) contains `README.md`, `docker-compose.yml`,
-`seed.sql` — a thin demo stack that overlaps almost entirely with
-[demo/](demo/).
+The `roadmap/` folder contains release notes for every version ever shipped,
+from `v0.1.0` all the way to planned future versions. Many versions have two
+files: a short summary and a `-full.md` expanded version.
 
-**Recommendation:** **DELETE** `playground/`. Keep `demo/` as the single
-canonical quick-start.
+### What value they provide
 
-### 3.2 `demo/` (🟡 P2)
+Release notes tell users what changed in each version. Useful when upgrading or
+troubleshooting regressions.
 
-[demo/](demo/) is a richer demo (Postgres + dashboard generator). It is
-maintained but only nominally — see whether it is referenced from `INSTALL.md`
-or `README.md` regularly.
+### Why consider trimming
 
-**Recommendation:** Keep, but trim aggressively (single docker-compose + one
-seed SQL). Move the Python `dashboard/` generator out unless it is wired into
-nightly CI.
+- **Ancient history:** Nobody runs v0.1 through v0.20 anymore. Keeping 60+
+  files for long-dead versions is pure noise.
+- **Duplication:** The `-full.md` variants repeat the same content in longer
+  form. Two files per version is one too many.
+- **Overlap with CHANGELOG.md:** We already maintain a single changelog file
+  that covers the same ground.
 
-### 3.3 `examples/` (🟢 P2)
+**Recommendation:**
 
-[examples/](examples/) holds `dbt_getting_started/` and `non-differential.sql`.
-
-**Recommendation:** Move `dbt_getting_started/` with the dbt sub-project (§7).
-Inline `non-differential.sql` into `docs/EXAMPLES.md`. **Delete** the
-directory.
-
-### 3.4 `monitoring/` (🟡 P2)
-
-[monitoring/](monitoring/) ships an opinionated Prometheus + Grafana docker
-stack with dashboards.
-
-**Issues:**
-
-- Dashboards drift any time a metric name changes — silent maintenance debt.
-- Real users plug into their own observability stack.
-
-**Recommendation:** Move to a companion repo (e.g.
-`grove/pg-trickle-observability`) or strip down to a single example dashboard
-JSON in `docs/observability/`.
-
-### 3.5 `cnpg/` (🟡 P2)
-
-[cnpg/](cnpg/) contains 2 Dockerfiles + 2 example YAMLs for CloudNativePG.
-
-**Recommendation:** Collapse into `docs/integrations/cnpg/` with the YAMLs as
-fenced code blocks. Leave the Dockerfile only if CNPG image-volume CI is
-in scope for 1.0.
+1. Archive all files for versions older than v0.20 (move to a separate branch
+   or delete — the git history preserves them forever anyway).
+2. Stop producing the `-full.md` variant; one file per version is enough.
+3. For versions v1.0 and beyond, use `CHANGELOG.md` as the single source of
+   truth and stop creating individual roadmap files.
 
 ---
 
-## 4. Sub-projects in the workspace
+## 5. Duplicate and outdated planning documents (🟢 P1)
 
-These are major candidates because they make up a non-trivial fraction of the
-workspace, the build matrix, and the CI surface — but they are **not the core
-extension**.
+### What they are
 
-### 4.1 `dbt-pgtrickle/` (🔴 P2)
+The `plans/` folder is where design documents, architecture decision records,
+spike reports, and project assessments live. It has grown to ~140 files across
+12 subdirectories.
 
-A standalone dbt package (~500+ files including its `integration_tests/`
-fixtures, dbt project, and CI hooks).
+### The problem
 
-**Why move out:**
+The biggest offender is six numbered iterations of the same "Overall
+Assessment" document: versions 1, 2, 3, 7, 8, and 9. Each was written to
+capture the project's state at a point in time, but only the latest one
+reflects reality.
 
-- Independent versioning and release cadence already (`dbt_project.yml`
-  version differs from extension).
-- dbt users are a subset; non-dbt users carry the maintenance + CI cost.
-- A separate repo (`grove/pg-trickle-dbt`) lets the dbt package depend on a
-  pinned `pg_trickle` release without coupling its release timeline.
+Other dead weight includes:
 
-**Recommendation:** **Move to a separate repository** before 1.0. Leave a
-1-line README in this repo pointing at it.
+- **Completed spike reports** (the investigation is done, the conclusion is
+  now in the code).
+- **Superseded plans** (e.g. the "dbt adapter" plan was abandoned in favour of
+  the "dbt macro" approach that shipped).
+- **Future-direction reports** that predate the current roadmap.
 
-### 4.2 `pgtrickle-relay/` (🔴 P2)
+### Why trim
 
-A standalone Rust CLI binary bridging outbox/inbox to Kafka, NATS, RabbitMQ,
-SQS, Redis, and webhooks (six optional Cargo features).
+Planning documents that no longer reflect reality are misleading. A newcomer
+reading an old assessment will form wrong conclusions about the project's state.
 
-**Why move out:**
+**Recommendation:**
 
-- It is not the extension — it is a sidecar.
-- It pulls in many heavy optional dependencies (rdkafka, nats, etc.) that
-  inflate the workspace `Cargo.lock` even when no one is building it.
-- Tests, Dockerfile (`Dockerfile.relay`), and several CI jobs exist solely
-  for the relay.
-
-**Recommendation:** **Move to `grove/pg-trickle-relay`.** Delete
-`Dockerfile.relay`, `pgtrickle-relay/`, `plans/relay/`, and the relay-specific
-CI jobs from this repo. Coordinate with §6 (outbox/inbox API).
-
-### 4.3 `fuzz/` (🟡 keep)
-
-Six fuzz targets exist (`cdc`, `cron`, `dag`, `guc`, `parser`, `wal`). Already
-gated behind `fuzz-smoke.yml` (weekly).
-
-**Recommendation:** **Keep.** Document explicitly as a nightly/weekly tier in
-`CONTRIBUTING.md`. Re-evaluate per-target value (e.g. drop `cron_fuzz` if no
-findings).
+1. Keep only `PLAN_OVERALL_ASSESSMENT_9.md` (the latest). Archive the others.
+2. Archive completed spikes and superseded plans into a `plans/archive/`
+   subfolder so they are still findable but clearly marked as historical.
+3. If the dbt and relay sub-projects move out (see §7), their planning
+   documents should move with them.
 
 ---
 
-## 5. Configuration surface — GUCs in `src/config.rs` (🟡 P0–P2)
+## 6. Three overlapping "try it out" directories (🟢–🟡 P1–P2)
 
-`src/config.rs` is **4,509 lines** and exposes around 70 GUCs. A leaner 1.0
-surface should classify every one of them as Core, Performance, Observability,
-Experimental, or Deprecated.
+### What they are
 
-### 5.1 Deprecated — delete in 1.0 (🟡 P0)
+The repo contains three separate places for showing people how to get started:
 
-| GUC | Notes |
-|-----|-------|
-| `pg_trickle.event_driven_wake` | No-op since v0.39; marked for removal in v1.0 in docs |
-| `pg_trickle.wake_debounce_ms` | Paired with above; obsolete |
-| `pg_trickle.merge_planner_hints` | Replaced by `planner_aggressive` long ago |
+| Directory | Contents | Status |
+|-----------|----------|--------|
+| `playground/` | A minimal docker-compose setup with a seed SQL file | Barely maintained; duplicates `demo/` |
+| `demo/` | A richer setup with Postgres, a Python dashboard generator, and Grafana | Semi-maintained |
+| `examples/` | Two files: a dbt starter and a "non-differential mode" SQL example | Minimal content |
 
-**Action:** Remove the GUCs, the related plumbing, and references from docs.
+### Why consolidate
 
-### 5.2 Experimental / rarely used — review (🟡 P2)
+Having three directories that all say "try it out" confuses newcomers who don't
+know which one to use. Worse, none of them are regularly tested in CI, so they
+quietly break.
 
-Candidates to either remove, hide behind a single `experimental_features` GUC,
-or push to v1.1:
+**Recommendation:**
 
-- `pg_trickle.foreign_table_polling`
-- `pg_trickle.matview_polling`
-- `pg_trickle.buffer_partitioning`
-- `pg_trickle.online_schema_evolution`
-- `pg_trickle.ivm_topk_max_limit`
-- `pg_trickle.ivm_recursive_max_depth`
-- `pg_trickle.max_grouping_set_branches`
-
-Each one that survives should have an integration test that *fails* if the GUC
-is removed — otherwise it is dead surface.
-
-### 5.3 General principle
-
-Any GUC without (a) a user-facing doc entry in `docs/CONFIGURATION.md` and
-(b) a regression test should be a removal candidate. A pre-1.0 audit pass
-across all 70 will likely cull 5–15.
+1. **Delete `playground/`** — it is a strict subset of `demo/`.
+2. **Trim `demo/`** to the essentials: one docker-compose file and one seed
+   SQL script. Remove the Python dashboard generator unless it is actively
+   tested.
+3. **Delete `examples/`** — move the dbt example into the dbt sub-project
+   (see §7) and fold the SQL example into the documentation.
 
 ---
 
-## 6. SQL-callable API surface — `src/api/mod.rs` (🟡 P3)
+## 7. Sub-projects that should live on their own (🔴 P2)
 
-`src/api/mod.rs` is **7,387 lines** with **23 `#[pg_extern]` functions**.
+These are the two highest-impact candidates on this list. Both are legitimate
+products, but they are not the core extension and they add significant weight.
 
-### 6.1 Core (must keep)
+### 7.1 The dbt integration package (`dbt-pgtrickle/`)
 
-`create_stream_table`, `alter_stream_table`, `drop_stream_table`,
-`refresh_stream_table`, `pgt_status`, `health_check`, `explain_stream_table`.
+**What it is:** [dbt](https://www.getdbt.com/) is a popular tool for managing
+data transformations. Our dbt package lets dbt users define stream tables using
+dbt's workflow instead of raw SQL.
 
-### 6.2 Diagnostics — review (🟡 P3)
+**What value it provides:** Makes pg_trickle accessible to teams that already
+use dbt. Gives them familiar commands (`dbt run`, `dbt test`) instead of raw
+SQL.
 
-`diagnose_errors`, `list_auxiliary_columns`, `validate_query`,
-`check_cdc_health`, `recommend_schedule`, `repair_stream_table`.
+**Why move it out:**
 
-These are valuable but should arguably live in a `pgtrickle_diag` submodule or
-behind a `diagnostics` Cargo feature so they can be excluded from minimal
-builds.
+- It already has its own version number (independent from the extension).
+- It includes 500+ files (test fixtures, dbt configurations, integration
+  tests) that have nothing to do with the core Postgres extension.
+- Users who do not use dbt still pay the cost: longer builds, more CI time,
+  a larger download.
+- A separate repository (`grove/pg-trickle-dbt`) would let it evolve on its
+  own schedule without blocking core releases.
 
-### 6.3 Outbox / Inbox / Drain — move out or mark experimental (🔴 P3)
+### 7.2 The message relay binary (`pgtrickle-relay/`)
 
-- `pgtrickle.enable_outbox()`
-- `pgtrickle.enable_inbox()`
-- `pgtrickle.drain()`
-- `pgtrickle.rebuild_cdc_triggers()`
+**What it is:** A standalone command-line program that watches for outbox/inbox
+events produced by pg_trickle and forwards them to external messaging systems
+like Kafka, NATS, RabbitMQ, Amazon SQS, Redis, or plain HTTP webhooks.
 
-Outbox and Inbox are tightly coupled to `pgtrickle-relay/`. If §4.2 moves the
-relay out, these should follow — either into a companion extension
-(`pg_trickle_outbox`) or into the relay repo with its own SQL bootstrap.
+**What value it provides:** Lets pg_trickle push change notifications to the
+rest of your infrastructure — useful for event-driven architectures where
+downstream services need to react when data changes.
 
-### 6.4 General principle
+**Why move it out:**
 
-Every `#[pg_extern]` is a public contract for 1.0. Any function that is not
-explicitly documented in `docs/SQL_REFERENCE.md` should be either documented or
-removed before tagging.
+- It is a separate binary, not a Postgres extension. It has its own
+  dependencies (networking libraries for each messaging system) that are
+  irrelevant to users who just want the extension.
+- Those extra dependencies make the project's build heavier and its lock file
+  larger.
+- It already has a separate Dockerfile and several CI pipelines dedicated to
+  building and testing it alone.
+- A separate repository (`grove/pg-trickle-relay`) would make both projects
+  simpler to build and release.
 
----
-
-## 7. Source modules — feature-gating (🟡 P3)
-
-[src/lib.rs](src/lib.rs) wires in roughly 20 modules. The core (catalog, cdc,
-dag, dvm, refresh, scheduler, hooks, shmem, hash, version, logging) is
-non-negotiable. The optional layers below are candidates for **Cargo feature
-gating** so packagers can build a slimmer binary:
-
-| Module | Purpose | Feature flag candidate |
-|--------|---------|------------------------|
-| `otel` | OpenTelemetry exporter | `otel` |
-| `metrics_server` | Prometheus HTTP endpoint | `metrics-server` |
-| `monitor` | Background monitor worker | `monitoring` |
-| `diagnostics` | `diagnose_errors`, `validate_query`, etc. | `diagnostics` |
-| `citus` | Citus distributed-table compatibility | `citus` |
-
-Default profile would include all of them; downstream packagers / minimal
-builds get a smaller surface. None of these are actively required by the core
-refresh / DVM path.
+**Impact of moving both:** The core repo loses ~800+ files, the build becomes
+faster, and the release process becomes cleaner. Existing users of these
+sub-projects are unaffected — they would simply clone from a different URL.
 
 ---
 
-## 8. CI workflows — `.github/workflows/` (🟡 P3)
+## 8. The monitoring stack (`monitoring/`) (🟡 P2)
 
-23 workflows is a lot. Consolidation candidates:
+### What it is
 
-| Pair / group | Today | Proposed |
-|--------------|-------|----------|
-| `docker-hub.yml` + `ghcr.yml` | Two near-identical pipelines | Single workflow, two registry-push steps |
-| `benchmarks.yml` + `e2e-benchmarks.yml` | Similar matrix split by trigger | One workflow with `on:` filter |
-| `docs.yml` + `docs-drift.yml` | Two passes over the same docs tree | Single workflow with two jobs |
-| `tpch-explain-artifacts.yml` | Manual-only artefact dump | Move to `workflow_dispatch`-only release script outside CI |
-| `unsafe-inventory.yml` | Weekly | Drop to monthly; or roll into `security.yml` |
+A ready-made Docker setup containing Prometheus (for collecting metrics) and
+Grafana (for displaying dashboards), pre-configured to show pg_trickle's
+internal metrics.
 
-Conservative target: **23 → ~17–18 workflows.**
+### What value it provides
 
-If the relay/dbt sub-projects move out (§4), several workflows go with them.
+Makes it easy for someone evaluating the extension to see graphs of refresh
+latency, queue depth, and error counts without configuring their own monitoring
+tools.
 
----
+### Why consider removing it
 
-## 9. Scripts (`scripts/`) (🟢 P2)
+- Real production users already have their own monitoring infrastructure
+  (Datadog, Grafana Cloud, New Relic, etc.). They will not use our bundled
+  stack.
+- Every time we rename or add a metric in the extension, the bundled dashboard
+  JSON needs updating. If we forget, the dashboards silently break — creating
+  a support burden.
+- It is ~20 files of configuration that rarely gets tested.
 
-`scripts/` contains ~20 shell + Python utilities. Most are useful, but the
-following are likely safe to retire:
-
-- `add_roadmap_crosslinks.py` — one-shot doc helper.
-- `split_roadmap.py` — only useful if we keep the `-full.md` convention; if
-  §2.2 lands, retire.
-- `convert_matviews_to_pgtrickle.py` — one-off migration helper. Move to
-  `docs/MIGRATION.md` as documentation, delete the script if unmaintained.
-- `gen_catalogs.py` — verify it is still triggered by the build; otherwise
-  drop.
+**Recommendation:** Move to a companion repository (e.g.
+`grove/pg-trickle-observability`) or reduce to a single example dashboard JSON
+file in the documentation.
 
 ---
 
-## 10. Tests, regression artefacts, and benches
+## 9. CloudNativePG examples (`cnpg/`) (🟡 P2)
 
-### 10.1 `proptest-regressions/` (🟢 P0)
+### What it is
 
-These files are **machine-generated regression seeds** committed verbatim.
-Standard practice is to gitignore them and rely on developers to share
-interesting cases via test fixtures.
+[CloudNativePG](https://cloudnative-pg.io/) is an operator for running
+PostgreSQL on Kubernetes. The `cnpg/` folder provides Dockerfiles and YAML
+templates for deploying pg_trickle in a CNPG-managed cluster.
 
-**Recommendation:** Add `proptest-regressions/` to `.gitignore`, delete tracked
-files. If a specific failing case needs to be preserved, promote it to a named
-proptest seed in source.
+### What value it provides
 
-### 10.2 `benches/` (🟢 keep)
+Kubernetes users get a working starting point for their deployment instead of
+figuring it out from scratch.
 
-Three benches (`diff_operators.rs`, `refresh_bench.rs`, `scheduler_bench.rs`)
-all show recent activity and are wired into the regression check. **Keep all
-three.**
+### Why consider simplifying
 
-### 10.3 `tests/`
+- This is documentation, not code. The Dockerfiles and YAML templates are
+  better served as code blocks inside an integration guide in `docs/`.
+- Four standalone files in a top-level directory overstate the importance of
+  this one deployment method.
 
-A test inventory pass would likely surface a few overlapping E2E test files
-(particularly older `e2e_*` files that predate the Light-E2E refactor).
-Recommend a follow-up audit, not in scope for this report.
-
----
-
-## 11. Cargo dependency audit (🟡 P3)
-
-Out of scope for this textual report, but worth a `cargo machete` /
-`cargo +nightly udeps` pass before 1.0. Likely candidates for trimming:
-
-- Optional relay-only dependencies (rdkafka, nats, lapin, aws-sdk-sqs, etc.)
-  — auto-resolved if §4.2 lands.
-- Heavy serde alternatives if any are unused.
+**Recommendation:** Collapse into a page under `docs/integrations/cnpg/` with
+the examples shown inline.
 
 ---
 
-## Summary — what 1.0 looks like after the cuts
+## 10. Deprecated configuration settings (🟡 P0)
 
-If even the P0 and P1 items land:
+### What they are
 
-- **~5 garbage top-level files removed.**
-- **78 blog posts** → external site.
-- **~60 roadmap files** → archived.
-- **~12 plan files** → consolidated.
-- **`playground/` deleted, `monitoring/` + `cnpg/` relocated.**
-- **3 deprecated GUCs gone.**
-- **3 Dockerfiles → 1.**
+pg_trickle exposes about 70 configuration settings (called GUCs in PostgreSQL
+terminology) that let administrators tune its behaviour. Three of these were
+deprecated in earlier releases and are now completely non-functional:
 
-P2/P3 (sub-projects + feature-gating + CI consolidation) take longer but
-deliver a much leaner core extension that maps tightly to the README's
-"streaming tables with incremental view maintenance" pitch.
+| Setting | What it used to do | Why remove it |
+|---------|-------------------|---------------|
+| `pg_trickle.event_driven_wake` | Controlled whether the scheduler should wake immediately when data changes, rather than waiting for its next scheduled cycle. | This behaviour is now always on — the setting does nothing since v0.39. Our own docs already say "will be removed in v1.0." |
+| `pg_trickle.wake_debounce_ms` | Set how long to wait before waking the scheduler after a burst of changes, to avoid excessive CPU use. | Paired with `event_driven_wake` — equally dead. |
+| `pg_trickle.merge_planner_hints` | Gave the query planner extra hints about how to merge changes. | Replaced by a better mechanism (`planner_aggressive`) many versions ago. |
 
-**None of this should compromise correctness, durability, or the differential
-refresh path** — the explicit non-negotiables in `AGENTS.md`. Every cut above
-is in marketing, demo, optional integration, or deprecated-knob territory.
+### Why remove them now
+
+Keeping dead settings around confuses users who try to tune them. It also means
+we carry code that processes them (parsing, validation, documentation) even
+though it does nothing useful. Removing them simplifies the codebase and sends
+a clear signal that the 1.0 surface is intentional, not accidental.
+
+### Additional experimental settings to review
+
+Seven more settings exist for features that are incomplete or rarely used. They
+should be individually evaluated before 1.0 — either finish the feature, test
+it properly, or remove the setting:
+
+| Setting | What it controls |
+|---------|------------------|
+| `pg_trickle.foreign_table_polling` | Support for polling changes from foreign (remote) tables |
+| `pg_trickle.matview_polling` | Support for watching materialized views for changes |
+| `pg_trickle.buffer_partitioning` | An optimisation that splits change buffers into partitions for throughput |
+| `pg_trickle.online_schema_evolution` | Ability to change a stream table's query without downtime |
+| `pg_trickle.ivm_topk_max_limit` | Maximum number of rows for "top-K" immediate-mode queries |
+| `pg_trickle.ivm_recursive_max_depth` | How deep recursive queries are allowed to go in immediate mode |
+| `pg_trickle.max_grouping_set_branches` | Parser limit for `GROUP BY ROLLUP/CUBE` complexity |
+
+The general rule: any setting that lacks both documentation and a test is a
+removal candidate. A sweep across all 70 settings will likely identify 5-15
+that can be cut.
 
 ---
 
-## Suggested phasing
+## 11. SQL functions that might not belong in the core (🟡–🔴 P3)
 
-1. **Phase 1 (½ day):** Section 1, §2.3, §3.1, §5.1, §10.1, §2.4 partial.
-2. **Phase 2 (2-3 days):** §2.1 (blog), §2.2 (roadmap), §3.4, §3.5, §9.
-3. **Phase 3 (1 week):** §4.1 (dbt repo split), §4.2 (relay repo split),
-   §6.3 (outbox/inbox follow), §8 (CI consolidation), §11 (deps).
-4. **Phase 4 (post-1.0):** §5.2, §6.2, §7 feature-gating, broader test
-   inventory.
+### What they are
+
+pg_trickle exposes 23 SQL functions that users can call. These are the
+extension's public interface — the "buttons" that users press.
+
+### The core — definitely keeping
+
+These are the reason the extension exists:
+
+- `create_stream_table()` — Define a new stream table from a SQL query
+- `alter_stream_table()` — Change its configuration
+- `drop_stream_table()` — Remove it
+- `refresh_stream_table()` — Manually trigger an update
+- `pgt_status()` — See the current state of all stream tables
+- `health_check()` — Verify the extension is working properly
+- `explain_stream_table()` — Show how a refresh will be executed
+
+### Diagnostic helpers — useful but optional
+
+- `diagnose_errors()` — Show what went wrong with the last refresh
+- `validate_query()` — Check if a SQL query can be used as a stream table
+- `check_cdc_health()` — Verify that change tracking is healthy
+- `recommend_schedule()` — Suggest a good refresh interval
+- `repair_stream_table()` — Fix a stream table that got into a bad state
+
+These are genuinely helpful for troubleshooting but could be made optional
+(only included in "full" builds) to keep the minimal surface small.
+
+### Outbox, Inbox, and Drain — should probably move out
+
+- `enable_outbox()` — Start publishing change events to an outbox table for
+  external consumers
+- `enable_inbox()` — Accept incoming events from external systems
+- `drain()` — Gracefully stop all stream table processing (for shutdowns)
+- `rebuild_cdc_triggers()` — Recreate the internal change-tracking triggers
+
+The outbox and inbox functions are designed to work with the relay binary (§7.2
+above). If the relay moves to its own repository, these functions should
+probably go with it — either as a separate small extension or as part of the
+relay's setup scripts. Keeping them in the core extension adds API surface that
+only a subset of users need.
+
+**General rule:** Every SQL function we ship in 1.0 becomes a contract we must
+maintain. Any function not documented in the SQL reference should either be
+documented (meaning we commit to supporting it) or removed.
 
 ---
 
-## Open questions for maintainers
+## 12. Optional code modules that could be made opt-in (🟡 P3)
 
-1. Are the `blog/` posts authored elsewhere and mirrored here, or is this the
-   source of truth? That changes whether we can simply delete them.
-2. Is `pgtrickle-relay/` already a public surface customers depend on? Moving
-   it out is much cheaper if not.
-3. Same question for `dbt-pgtrickle/` — does the dbt Hub package point at this
-   path?
-4. Do we want a `pg_trickle_minimal` Cargo profile for embedded/cloud
-   deployments, justifying §7's feature-gating?
-5. Which experimental GUCs in §5.2 are slated for v1.x feature work? Those
-   should be kept (and tested); the rest can be culled.
+### What this means
+
+The extension is built from about 20 internal modules. Some of them provide
+functionality that not every deployment needs. By making these optional at build
+time, packagers (and cloud providers hosting the extension) could produce
+smaller, faster binaries.
+
+| Module | What it does | Who needs it |
+|--------|-------------|--------------|
+| **OpenTelemetry exporter** | Sends traces and spans to observability platforms (Jaeger, Honeycomb, etc.) | Only teams with distributed tracing infrastructure |
+| **Prometheus metrics server** | Runs a tiny HTTP server inside Postgres to expose metrics for Prometheus to scrape | Only teams using Prometheus |
+| **Background monitor** | Periodically checks stream table health and logs warnings | Useful but not critical to operation |
+| **Diagnostic functions** | The `diagnose_errors()`, `validate_query()` etc. from §11 | Debugging only |
+| **Citus compatibility** | Special handling for Citus distributed tables | Only Citus users (a small minority) |
+
+None of these are needed for the core job of creating, refreshing, and
+maintaining stream tables. Making them opt-in would not remove them — it would
+just let people choose whether to include them.
+
+---
+
+## 13. Too many CI pipelines (🟡 P3)
+
+### What they are
+
+We have 23 automated workflows (GitHub Actions) that run on every commit,
+nightly, weekly, or on releases. They build the code, run tests, check
+security, publish images, and report coverage.
+
+### The problem
+
+Several workflows do nearly the same thing but are split into separate files
+for historical reasons:
+
+| Current (2 pipelines) | Could become (1 pipeline) | Why |
+|----------------------|--------------------------|-----|
+| `docker-hub.yml` + `ghcr.yml` | One pipeline that pushes to both registries | The only difference is the registry URL |
+| `benchmarks.yml` + `e2e-benchmarks.yml` | One pipeline with different triggers | Same benchmarking logic, just different scope |
+| `docs.yml` + `docs-drift.yml` | One pipeline with two checks | Both look at the same documentation tree |
+
+Additionally, `tpch-explain-artifacts.yml` only runs manually and produces
+artefacts for analysis — it is more of a developer tool than a CI check.
+
+**Recommendation:** Consolidate from 23 to about 17-18 workflows. Fewer files
+means less duplication and a smaller maintenance surface. If the dbt and relay
+sub-projects move out, their dedicated workflows go with them automatically.
+
+---
+
+## 14. Scripts that have outlived their purpose (🟢 P2)
+
+The `scripts/` directory contains ~20 utility scripts. Most are actively used
+by CI or developers, but a few are one-off helpers that did their job and are
+now just sitting around:
+
+| Script | What it did | Why consider removing |
+|--------|-----------|---------------------|
+| `add_roadmap_crosslinks.py` | Added cross-reference links between roadmap documents | A one-time documentation fixup; never needs to run again |
+| `split_roadmap.py` | Splits a roadmap file into short and `-full.md` variants | Only needed if we keep the dual-file convention (§4 recommends dropping it) |
+| `convert_matviews_to_pgtrickle.py` | Helps users migrate from PostgreSQL materialized views to stream tables | Better as documentation (a page in the migration guide) than a standalone script |
+| `gen_catalogs.py` | Generates internal catalog SQL files | Verify if the build still uses it; if not, it is dead |
+
+---
+
+## 15. Auto-generated test files in version control (🟢 P0)
+
+### What they are
+
+The `proptest-regressions/` directory contains automatically generated test
+inputs that a testing library (proptest) creates when it finds a bug. These
+files are meant to help developers reproduce issues on their own machine.
+
+### Why remove them from version control
+
+- They are machine-generated noise — not human-written code.
+- Standard practice is to list this directory in `.gitignore` and let each
+  developer's local copy accumulate its own regression seeds.
+- If a particular test input is important, it should be turned into a proper
+  named test case in the source code, not left as a binary seed file.
+
+**Recommendation:** Add `proptest-regressions/` to `.gitignore` and delete the
+currently tracked files.
+
+---
+
+## 16. Performance benchmarks (🟢 — keep)
+
+Three benchmark files (`diff_operators.rs`, `refresh_bench.rs`,
+`scheduler_bench.rs`) are all actively maintained and integrated into our
+regression-detection pipeline. **Keep all three.** They are small, valuable,
+and not adding unnecessary weight.
+
+---
+
+## 17. Third-party library audit (🟡 P3)
+
+Not covered in detail here, but worth a dedicated pass before 1.0. Tools like
+`cargo machete` can detect libraries listed as dependencies that are never
+actually used in the code. The relay sub-project (if still bundled) is the
+biggest offender — it pulls in networking libraries for six different messaging
+systems, all of which inflate the project's dependency tree even when nobody
+is building the relay.
+
+---
+
+## What 1.0 looks like after the cleanup
+
+If we do the P0 and P1 items alone:
+
+- **5 junk files gone** from the top-level
+- **78 blog posts** moved to their own home
+- **~60 outdated roadmap files** archived
+- **~12 duplicate planning docs** consolidated
+- **`playground/` deleted** (one less confusing directory)
+- **3 dead settings** removed from the configuration surface
+- **3 Dockerfiles merged** into 1
+- **Auto-generated test files** stopped cluttering git history
+
+If we also do P2:
+
+- **The dbt package** and **the relay binary** live in their own repositories,
+  each free to release on their own schedule
+- **The monitoring stack** lives in a companion repo where dashboard drift
+  doesn't slow down core development
+- **The Kubernetes examples** are folded into the docs where they belong
+
+The result is a core repository that is clearly focused on its stated mission:
+*streaming tables with incremental view maintenance for PostgreSQL*. Nothing
+more, nothing less.
+
+**Importantly, none of these changes affect correctness or data safety.** Every
+candidate on this list is in the territory of marketing content, demo
+scaffolding, optional integrations, or dead code. The differential refresh
+engine, the change-data-capture pipeline, the dependency graph, and the
+scheduler are all untouched.
+
+---
+
+## Suggested order of work
+
+1. **Day 1 — Quick wins (P0):** Delete junk files, remove `doc/`, gitignore
+   proptest regressions, remove three deprecated settings.
+2. **Days 2-4 — Content cleanup (P1):** Move blog posts out, archive old
+   roadmap files, consolidate planning docs, merge Dockerfiles, delete
+   playground.
+3. **Week 2 — Structural moves (P2):** Split dbt and relay into their own
+   repos, relocate monitoring and CNPG.
+4. **Post-1.0 — Polish (P3):** Feature-gate optional modules, consolidate CI
+   pipelines, audit dependencies, review remaining settings.
+
+---
+
+## Open questions
+
+1. **Blog ownership:** Are the blog posts maintained elsewhere (a CMS, a
+   separate writing tool) and mirrored here? Or is this repo the only copy?
+   The answer determines whether "move out" means "copy to a new home" or
+   "just delete."
+
+2. **Relay users:** Do any customers or partners already depend on
+   `pgtrickle-relay`? If so, moving it requires coordination (new download
+   URL, new release announcements). If not, it can be moved silently.
+
+3. **dbt Hub listing:** Does the dbt package registry point to a path inside
+   this repository? If so, moving it means updating that listing.
+
+4. **Minimal builds:** Do we anticipate cloud providers or embedded deployments
+   wanting a stripped-down build without telemetry and diagnostics? If yes,
+   the feature-gating work in §12 is worth prioritising.
+
+5. **Experimental settings:** Which of the seven experimental settings in §10
+   are actually slated for completion in the v1.x timeline? Those should stay
+   (and get proper tests). The rest should go.
