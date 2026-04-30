@@ -110,6 +110,12 @@ new entries when creating documents.
 | [GAP_SQL_PHASE_7.md](sql/GAP_SQL_PHASE_7.md) | GAP | In progress | SQL gaps — phase 7 (deep analysis) |
 | [GAP_SQL_PHASE_7_QUESTIONS.md](sql/GAP_SQL_PHASE_7_QUESTIONS.md) | GAP | — | Open questions from GAP_SQL_PHASE_7 |
 
+## lineage/
+
+| File | Type | Status | Summary |
+|------|------|--------|---------|
+| [PLAN_LINEAGE.md](lineage/PLAN_LINEAGE.md) | PLAN | Proposed | Property & data lineage — OpenLineage, W3C PROV, statistical and sensitivity propagation |
+
 ## safety/
 
 | File | Type | Status | Summary |
