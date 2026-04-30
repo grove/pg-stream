@@ -553,58 +553,111 @@ RETURNS TABLE (
 
 ---
 
-### Phase 5 — OpenLineage Event Emitter (v0.43.x)
+### Phase 5 — OpenLineage Event Generation & Outbox (v0.43.x)
 
-**Goal:** Emit OpenLineage `RunEvent` payloads to a configurable HTTP endpoint
-after each refresh.
+**Goal:** Generate OpenLineage `RunEvent` payloads in PostgreSQL and place them
+in a durable outbox table. HTTP emission is delegated to an external relay
+service (`pgtrickle-relay` or a standalone sidecar).
 
-**New GUCs:**
-
-```
-pg_trickle.openlineage_enabled          = false
-pg_trickle.openlineage_endpoint         = ''       -- e.g. 'http://marquez:5000'
-pg_trickle.openlineage_namespace        = ''       -- defaults to current database name
-pg_trickle.openlineage_emit_on          = 'COMPLETE'  -- 'START', 'COMPLETE', 'FAIL', 'ALL'
-pg_trickle.openlineage_include_sql      = true     -- include defining query in sql facet
-pg_trickle.openlineage_include_stats    = true     -- include outputStatistics facet
-pg_trickle.openlineage_include_column_lineage = true
-```
+**Why external relay?** PostgreSQL should not perform external HTTP calls.
+The outbox pattern keeps the database clean, enables retry logic and batching
+outside the transaction context, and allows independent scaling/deployment of
+the relay component.
 
 **Architecture:**
 
-The emitter runs as a hook inside the refresh path. After a refresh completes
-(or fails), it:
-
-1. Assembles a `RunEvent` payload (JSON) from:
-   - `pgt_stream_tables` (job metadata, sql, column lineage)
-   - `pgt_dependencies` (input datasets)
-   - Refresh result (row count, duration, error message)
-2. Pushes the payload to `pgtrickle_changes.openlineage_queue` (a lightweight
-   UNLOGGED table acting as an outbox).
-3. A background worker drains the queue via HTTP POST with retries (exponential
-   backoff, max 5 attempts).
-
-This design keeps the refresh path non-blocking and tolerates temporary
-unavailability of the lineage backend.
-
-**New SQL functions:**
-
-```sql
--- On-demand: generate the OpenLineage JSON for a stream table (does not send it).
-pgtrickle.stream_table_obl_event(
-    name TEXT,
-    event_type TEXT DEFAULT 'COMPLETE'
-) RETURNS JSONB;
-
--- Show pending / recently sent events.
-pgtrickle.openlineage_queue_status()
-RETURNS TABLE (
-    id BIGINT, stream_table TEXT, event_type TEXT, created_at TIMESTAMPTZ,
-    sent_at TIMESTAMPTZ, attempt_count INT, last_error TEXT
-);
+```
+PostgreSQL (refresh completes)
+    ↓
+    ├─ Generates OpenLineage RunEvent JSON
+    ├─ Writes to pgtrickle_changes.openlineage_events (outbox table)
+    └─ Sends NOTIFY 'pgtrickle_lineage' event
+            ↓
+pgtrickle-relay service (stateless sidecar)
+    ├─ Listens for NOTIFY or polls outbox table
+    ├─ Reads events from pgtrickle_changes.openlineage_events
+    ├─ POST to Marquez/DataHub/custom backend with exponential backoff
+    ├─ Marks events as sent via UPDATE
+    └─ Can be deployed/scaled independently
 ```
 
-**Estimated effort:** 6–8 days (most complexity in retry logic and HTTP client).
+**Schema additions:**
+
+```sql
+-- Durable outbox table (UNLOGGED for performance; data is non-critical).
+-- Persists across server restarts so relay can catch up.
+CREATE TABLE pgtrickle_changes.openlineage_events (
+    event_id         BIGSERIAL PRIMARY KEY,
+    stream_table_oid OID NOT NULL,
+    stream_table_name TEXT NOT NULL,
+    event_type       TEXT NOT NULL,  -- 'START', 'COMPLETE', 'FAIL'
+    event_json       JSONB NOT NULL, -- Full OpenLineage RunEvent
+    created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+    sent_at          TIMESTAMPTZ,
+    attempt_count    INT NOT NULL DEFAULT 0,
+    last_error       TEXT,
+    CONSTRAINT check_event_type CHECK (event_type IN ('START', 'COMPLETE', 'FAIL'))
+);
+
+CREATE INDEX idx_openlineage_events_sent_at 
+    ON pgtrickle_changes.openlineage_events(sent_at) 
+    WHERE sent_at IS NULL;
+```
+
+**PostgreSQL-side (Phase 5):**
+
+1. **Hook on refresh completion** — After `refresh_stream_table()` finishes
+   (successfully or with error), insert a row into `openlineage_events` with
+   the assembled `RunEvent` JSON.
+
+2. **New SQL function:**
+
+   ```sql
+   -- On-demand: generate the OpenLineage JSON for a stream table (no outbox write).
+   -- Useful for testing and manual inspection.
+   pgtrickle.stream_table_obl_event(
+       name TEXT,
+       event_type TEXT DEFAULT 'COMPLETE'
+   ) RETURNS JSONB;
+   ```
+
+3. **New GUCs** (for relay configuration, stored in database):
+
+   ```
+   pg_trickle.openlineage_enabled = false  -- When true, write to outbox on refresh
+   pg_trickle.openlineage_namespace = ''   -- Defaults to current database
+   pg_trickle.openlineage_include_sql = true
+   pg_trickle.openlineage_include_stats = true
+   pg_trickle.openlineage_include_column_lineage = true
+   ```
+
+4. **Optional monitoring function:**
+
+   ```sql
+   pgtrickle.openlineage_queue_status()
+   RETURNS TABLE (
+       event_id INT, stream_table TEXT, event_type TEXT, created_at TIMESTAMPTZ,
+       sent_at TIMESTAMPTZ, attempt_count INT, last_error TEXT
+   );
+   ```
+
+**Relay service (separate project: `pgtrickle-relay` or new sidecar):**
+
+- Configurable endpoint(s): `--marquez-url http://localhost:5000`, `--dataHub-url ...`
+- Connects to PostgreSQL via libpq connection string
+- Polls `openlineage_events` for `sent_at IS NULL` rows (or listens via LISTEN)
+- For each unsent event:
+  1. POST to backend with timeout (30s)
+  2. If success (2xx): `UPDATE openlineage_events SET sent_at = now() WHERE event_id = ...`
+  3. If failure: `UPDATE openlineage_events SET attempt_count = attempt_count + 1, last_error = ... WHERE event_id = ...`
+  4. Exponential backoff: retry if `attempt_count < 5` and `created_at > now() - interval '7 days'`
+- Can run as a systemd service, Kubernetes sidecar, or Docker container
+
+**Effort breakdown:**
+- PostgreSQL side (outbox table + hook + function): **2–3 days**
+- Relay service (new Rust project or Go sidecar): **4–6 days** (depends on existing relay infrastructure)
+
+**Total estimated effort:** 6–9 days (split between core + relay).
 
 ---
 
@@ -772,42 +825,51 @@ Extend `dbt-pgtrickle` to:
 
 ## 7. Implementation Priority Summary
 
-| Phase | Feature | Version | Effort | Value | Priority |
-|-------|---------|---------|--------|-------|----------|
+| Phase | Feature | Version | Effort (PG-side) | Value | Priority |
+|-------|---------|---------|----------|-------|----------|
 | 1 | Enhanced column lineage (OL-compatible subtypes) | v0.40.x | 3–4d | High | **P1** |
 | 2 | Transitive lineage function | v0.41.x | 2d | High | **P1** |
 | 3 | Type & nullability propagation | v0.41.x | 3d | Medium | **P2** |
-| 5 | OpenLineage event emitter | v0.43.x | 6–8d | Very High | **P1** |
+| 5 | OpenLineage event generation & outbox | v0.43.x | 2–3d | Very High | **P1** |
 | 4 | Sensitivity label propagation | v0.42.x | 4–5d | High | **P2** |
 | 6 | Statistical property propagation | v0.44.x | 4–5d | Medium | **P3** |
 | 7 | PROV-O RDF export | v0.45.x | 3–4d | Low–Medium | **P3** |
 | 8 | Differential row provenance | v0.46.x+ | 10–14d | Very High (niche) | **Stretch** |
 
+**Note:** Phase 5 effort is PostgreSQL-side work only. A separate relay service
+(pgtrickle-relay or custom sidecar) would add 4–6 additional days, deployed
+independently.
+
 ---
 
 ## 8. Open Questions
 
-1. **HTTP client in Rust/pgrx:** pgrx does not bundle an HTTP client. The
-   OpenLineage emitter can use `libcurl` via `curl-sys` or PostgreSQL's own
-   `pg_curl` wrapper. Alternatively, emit to a NOTIFY channel and let an
-   external sidecar handle the HTTP call.
+1. **Relay infrastructure:** Where should the OpenLineage relay live?
+   - Option A: Extend `pgtrickle-relay` (if it exists and is suitable)
+   - Option B: Create a new lightweight Rust/Go sidecar (`pgtrickle-ol-relay`)
+   - Option C: User writes their own polling loop + HTTP client
+   - Recommendation: Start with Option C (documented best practice), then add
+     Option B as a reference implementation if demand warrants.
 
-2. **Storage cost for differential provenance (Phase 8):** Change-buffer
+2. **NOTIFY vs polling:** Should the relay listen for NOTIFY events or poll the
+   outbox table periodically?
+   - NOTIFY: real-time, but requires a persistent connection
+   - Polling: simpler deployment (can be a cron job or systemd timer)
+   - Recommendation: Support both; relay can use LISTEN if connected, fall back
+     to polling if configured.
+
+3. **Storage cost for differential provenance (Phase 8):** Change-buffer
    provenance annotations could multiply storage usage. A configurable
    `provenance_retention_days` GUC and a background vacuumer are needed.
 
-3. **k-anonymity threshold for Phase 4:** The sensitivity label rule for
+4. **k-anonymity threshold for Phase 4:** The sensitivity label rule for
    small-group COUNT(DISTINCT pii_col) requires a configurable k-threshold.
    Default k=5 following HIPAA Safe Harbor guidance.
 
-4. **Naming:** "property lineage" is not a widely standardised term. The
+5. **Naming:** "property lineage" is not a widely standardised term. The
    implementation uses "column properties" internally to avoid confusion with
    OpenLineage's `columnLineage` facet. The user-visible name can be decided
    during implementation.
-
-5. **Compatibility with pg_trickle IMMEDIATE mode:** In IMMEDIATE (transactional
-   IVM) mode, refreshes happen synchronously inside the user's transaction.
-   HTTP event emission must be deferred to post-commit to avoid blocking.
 
 ---
 
