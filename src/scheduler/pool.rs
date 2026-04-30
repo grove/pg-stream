@@ -116,6 +116,16 @@ pub extern "C-unwind" fn pg_trickle_pool_worker_main(_arg: pg_sys::Datum) {
             break;
         }
 
+        // A41-4: Process any pending SIGHUP config reload so that GUC
+        // changes (e.g. pg_trickle.enabled toggled back to on) take effect
+        // without requiring a process restart.
+        unsafe {
+            if pg_sys::ConfigReloadPending != 0 {
+                pg_sys::ConfigReloadPending = 0;
+                pg_sys::ProcessConfigFile(pg_sys::GucContext::PGC_SIGHUP);
+            }
+        }
+
         // A41-4: Check pg_trickle.enabled before claiming any job.
         // When the extension is disabled, defer all work and sleep until
         // re-enabled to avoid processing jobs while maintenance is in progress.

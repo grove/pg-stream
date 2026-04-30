@@ -614,7 +614,8 @@ async fn test_pool_worker_does_not_run_while_disabled() {
     let count_before: i64 = db
         .query_scalar(
             "SELECT count(*) FROM pgtrickle.pgt_refresh_history \
-             WHERE pgt_name = 'disabled_st' AND status = 'success'",
+             WHERE pgt_id = (SELECT pgt_id FROM pgtrickle.pgt_stream_tables WHERE pgt_name = 'disabled_st') \
+             AND status = 'COMPLETED'",
         )
         .await;
 
@@ -636,7 +637,8 @@ async fn test_pool_worker_does_not_run_while_disabled() {
     let count_disabled: i64 = db
         .query_scalar(
             "SELECT count(*) FROM pgtrickle.pgt_refresh_history \
-             WHERE pgt_name = 'disabled_st' AND status = 'success'",
+             WHERE pgt_id = (SELECT pgt_id FROM pgtrickle.pgt_stream_tables WHERE pgt_name = 'disabled_st') \
+             AND status = 'COMPLETED'",
         )
         .await;
     assert_eq!(
