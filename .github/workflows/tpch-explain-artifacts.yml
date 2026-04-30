@@ -38,13 +38,11 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   PG_VERSION: "18"
-  TPCH_SCALE: ${{ github.event.inputs.tpch_scale || '1.0' }}
-  TPCH_EXPLAIN_QUERIES: ${{ github.event.inputs.queries || '4,5,7,8,9,20,22' }}
 
 jobs:
   # ── O39-10: Capture EXPLAIN ANALYZE BUFFERS artifacts ─────────────────────
   tpch-explain-artifacts:
-    name: TPC-H EXPLAIN artifacts (SF-${{ github.event.inputs.tpch_scale || '1.0' }})
+    name: TPC-H EXPLAIN artifacts (SF-${{ inputs.tpch_scale || '1.0' }})
     runs-on: ubuntu-latest
     timeout-minutes: 120
 
@@ -84,7 +82,8 @@ jobs:
       # ── Run TPC-H EXPLAIN collection script ─────────────────────────────────
       - name: Collect TPC-H EXPLAIN ANALYZE BUFFERS
         env:
-          TPCH_SCALE: ${{ env.TPCH_SCALE }}
+          TPCH_SCALE: ${{ inputs.tpch_scale || '1.0' }}
+          TPCH_EXPLAIN_QUERIES: ${{ inputs.queries || '4,5,7,8,9,20,22' }}
           TPCH_EXPLAIN_OUTPUT_DIR: /tmp/tpch-explain-artifacts
         run: |
           # Start the E2E database container.
@@ -111,7 +110,7 @@ jobs:
         uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: tpch-explain-artifacts-sf${{ env.TPCH_SCALE }}-${{ github.run_number }}
+          name: tpch-explain-artifacts-sf${{ inputs.tpch_scale || '1.0' }}-${{ github.run_number }}
           path: /tmp/tpch-explain-artifacts/
           retention-days: 90
 
