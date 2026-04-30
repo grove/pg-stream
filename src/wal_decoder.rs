@@ -901,6 +901,33 @@ pub fn check_and_complete_transition(
     dep: &StDependency,
     change_schema: &str,
 ) -> Result<(), PgTrickleError> {
+    // A41-3: Re-check eligibility (PK, replica identity FULL) before advancing
+    // or completing the transition.  DDL executed concurrently during the
+    // TRANSITIONING window must abort immediately rather than proceeding to WAL
+    // mode with an invalid slot.
+    match recheck_source_eligible_for_wal(source_oid) {
+        Ok(true) => {}
+        Ok(false) => {
+            warning!(
+                "pg_trickle: TRANSITIONING source OID {} is no longer eligible \
+                 (PK or replica identity changed) — aborting WAL transition",
+                source_oid.to_u32()
+            );
+            abort_wal_transition(source_oid, pgt_id, change_schema)?;
+            return Ok(());
+        }
+        Err(e) => {
+            warning!(
+                "pg_trickle: eligibility recheck error for TRANSITIONING source OID {}: {} \
+                 — aborting WAL transition",
+                source_oid.to_u32(),
+                e
+            );
+            abort_wal_transition(source_oid, pgt_id, change_schema)?;
+            return Ok(());
+        }
+    }
+
     let default_slot = slot_name_for_source(source_oid);
     let slot_name = dep.slot_name.as_deref().unwrap_or(&default_slot);
 
@@ -1058,27 +1085,72 @@ pub fn abort_wal_transition(
     // Step 3: Revert catalog to trigger mode for all dependents of this source.
     StDependency::update_cdc_mode_for_source(source_oid, CdcMode::Trigger, None, None)?;
 
-    // Step 4: Verify the trigger still exists — recreate if lost
+    // Step 4: Verify the trigger still exists — recreate if lost.
+    // This step is best-effort: if the source table lost its primary key (the
+    // common case when falling back due to A41-3 eligibility failure), trigger
+    // recreation will fail.  Log a warning and continue — the catalog is already
+    // in TRIGGER mode and the slot/publication have been cleaned up.
     if !cdc::trigger_exists(source_oid)? {
-        let pk_columns = cdc::resolve_pk_columns(source_oid)?;
-        let columns = cdc::resolve_source_column_defs(source_oid)?;
-        let src_id = crate::citus::SourceIdentifier::from_oid(source_oid).unwrap_or_else(|_| {
-            crate::citus::SourceIdentifier::from_oid_and_stable_name(
-                source_oid,
-                source_oid.to_u32().to_string(),
-            )
-        });
-        cdc::create_change_trigger(
-            source_oid,
-            change_schema,
-            &pk_columns,
-            &columns,
-            &src_id.stable_name,
-        )?;
-        warning!(
-            "pg_trickle: recreated CDC trigger for source OID {} during abort",
-            oid_u32
-        );
+        match cdc::resolve_pk_columns(source_oid) {
+            Ok(pk_columns) if !pk_columns.is_empty() => {
+                match cdc::resolve_source_column_defs(source_oid) {
+                    Ok(columns) => {
+                        let src_id = crate::citus::SourceIdentifier::from_oid(source_oid)
+                            .unwrap_or_else(|_| {
+                                crate::citus::SourceIdentifier::from_oid_and_stable_name(
+                                    source_oid,
+                                    source_oid.to_u32().to_string(),
+                                )
+                            });
+                        if let Err(e) = cdc::create_change_trigger(
+                            source_oid,
+                            change_schema,
+                            &pk_columns,
+                            &columns,
+                            &src_id.stable_name,
+                        ) {
+                            warning!(
+                                "pg_trickle: could not recreate CDC trigger for source OID {} \
+                                 during abort (non-fatal): {}",
+                                oid_u32,
+                                e
+                            );
+                        } else {
+                            warning!(
+                                "pg_trickle: recreated CDC trigger for source OID {} during abort",
+                                oid_u32
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        warning!(
+                            "pg_trickle: could not resolve column defs for source OID {} \
+                             during abort (non-fatal): {}",
+                            oid_u32,
+                            e
+                        );
+                    }
+                }
+            }
+            Ok(_) => {
+                // No primary key — cannot recreate trigger.  Log and continue.
+                // The source must have a PK restored before CDC can resume.
+                warning!(
+                    "pg_trickle: source OID {} has no primary key — \
+                     CDC trigger not recreated during WAL abort. \
+                     Restore a primary key to re-enable trigger-based CDC.",
+                    oid_u32
+                );
+            }
+            Err(e) => {
+                warning!(
+                    "pg_trickle: could not resolve PK columns for source OID {} \
+                     during abort (non-fatal): {}",
+                    oid_u32,
+                    e
+                );
+            }
+        }
     }
 
     warning!(
@@ -1804,6 +1876,33 @@ pub fn check_decoder_health(
         );
         abort_wal_transition(source_oid, pgt_id, change_schema)?;
         return Ok(());
+    }
+
+    // A41-3: Re-check eligibility (primary key, replica identity FULL) for the
+    // WAL steady-state.  DDL executed after the transition completed (DROP
+    // CONSTRAINT, ALTER TABLE REPLICA IDENTITY) can invalidate the session;
+    // detect this and fall back to triggers immediately.
+    match recheck_source_eligible_for_wal(source_oid) {
+        Ok(true) => {}
+        Ok(false) => {
+            warning!(
+                "pg_trickle: WAL source OID {} is no longer eligible \
+                 (PK or replica identity changed) — falling back to triggers",
+                source_oid.to_u32()
+            );
+            abort_wal_transition(source_oid, pgt_id, change_schema)?;
+            return Ok(());
+        }
+        Err(e) => {
+            warning!(
+                "pg_trickle: eligibility recheck error for WAL source OID {}: {} \
+                 — falling back to triggers",
+                source_oid.to_u32(),
+                e
+            );
+            abort_wal_transition(source_oid, pgt_id, change_schema)?;
+            return Ok(());
+        }
     }
 
     // Check lag — if excessive (>1GB), warn but keep running
