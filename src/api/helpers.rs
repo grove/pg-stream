@@ -717,7 +717,16 @@ pub(crate) fn parse_duration(s: &str) -> Result<i64, PgTrickleError> {
                 ))
             })?;
 
-            total_secs += n * multiplier;
+            let component = n.checked_mul(multiplier).ok_or_else(|| {
+                PgTrickleError::InvalidArgument(format!(
+                    "duration value '{num_buf}{ch}' overflows i64 seconds in '{s}'"
+                ))
+            })?;
+            total_secs = total_secs.checked_add(component).ok_or_else(|| {
+                PgTrickleError::InvalidArgument(format!(
+                    "total duration '{s}' overflows i64 seconds"
+                ))
+            })?;
             num_buf.clear();
             found_unit = true;
         }
