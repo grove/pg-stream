@@ -318,7 +318,7 @@ spec:
 
 When pg_trickle is installed across multiple databases on the same PostgreSQL
 instance, all scheduler background workers share a single worker pool bounded
-by `pg_trickle.max_parallel_refresh_workers`. Without care, high-throughput
+by `pg_trickle.max_dynamic_refresh_workers`. Without care, high-throughput
 databases can starve lower-priority databases of worker slots.
 
 ### Quota allocation
@@ -326,13 +326,13 @@ databases can starve lower-priority databases of worker slots.
 Use the quota formula to distribute workers fairly:
 
 ```
-per_db_quota = ceil(max_parallel_refresh_workers / N_databases)
+per_db_quota = ceil(max_dynamic_refresh_workers / N_databases)
 ```
 
 For high-priority databases, increase their individual quota via `ALTER DATABASE SET`:
 
 ```sql
-ALTER DATABASE tenant_high SET pg_trickle.max_parallel_refresh_workers = 4;
+ALTER DATABASE tenant_high SET pg_trickle.max_dynamic_refresh_workers = 4;
 ```
 
 ### Monitoring cluster-wide allocation

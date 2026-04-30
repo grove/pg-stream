@@ -59,6 +59,30 @@ clippy:
 [group: "lint"]
 lint: fmt-check clippy
 
+# A42-4: Docs linter — check for stale/retired GUC names and doc drift.
+# Fails if any docs/**/*.md references deprecated GUC names as if they are
+# current/active (references inside "Deprecated" sections are allowed).
+[group: "lint"]
+docs-lint:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    FAILED=0
+    RETIRED_TERMS=("pg_trickle.max_workers" "pg_trickle.max_parallel_refresh_workers")
+    for TERM in "${RETIRED_TERMS[@]}"; do
+        MATCHES=$(grep -rn "$TERM" docs/ 2>/dev/null | \
+            grep -v -i "deprecated\|compat\|appendix\|Compatibility\|Deprecated" || true)
+        if [ -n "$MATCHES" ]; then
+            echo "ERROR: Retired GUC '$TERM' found in active docs:"
+            echo "$MATCHES"
+            FAILED=1
+        fi
+    done
+    if [ "$FAILED" -eq 1 ]; then
+        echo "docs-lint FAILED: retired terms found in active docs"
+        exit 1
+    fi
+    echo "docs-lint passed"
+
 # Audit unsafe block counts against the committed baseline (.unsafe-baseline)
 [group: "lint"]
 unsafe-inventory:

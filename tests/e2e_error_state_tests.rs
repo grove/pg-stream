@@ -11,6 +11,7 @@
 //!
 //! These tests require the background scheduler (full E2E only).
 
+mod common;
 mod e2e;
 
 use e2e::E2eDb;
@@ -148,7 +149,7 @@ async fn test_permanent_error_sets_error_status_and_alter_clears() {
         )
         .await;
 
-    tokio::time::sleep(Duration::from_secs(3)).await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
 
     let failed_after: i64 = db
         .query_scalar(

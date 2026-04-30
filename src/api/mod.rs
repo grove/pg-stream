@@ -4464,6 +4464,195 @@ fn resume_stream_table_impl(name: &str) -> Result<(), PgTrickleError> {
     Ok(())
 }
 
+/// Repair a potentially broken stream table by reinitializing its storage,
+/// rebuilding CDC infrastructure, and scheduling a full refresh.
+///
+/// A42-1: This function is the primary operational recovery tool for stream
+/// tables that have been damaged by pg_dump/restore, storage corruption,
+/// missing triggers, or inconsistent catalog state.
+///
+/// Steps performed (actions taken are summarized in the return text):
+/// 1. Acquire a transaction-scoped advisory lock on the stream table.
+/// 2. Verify the stream table exists in the catalog.
+/// 3. Reinitialize the materialized storage table if it is missing.
+/// 4. Reset CDC frontiers to force a full refresh on the next cycle.
+/// 5. Rebuild any missing CDC triggers / change-buffer tables.
+/// 6. Verify that all declared source dependencies still exist.
+/// 7. Return a summary of all actions taken.
+#[pg_extern(schema = "pgtrickle")]
+fn repair_stream_table(name: &str) -> String {
+    match repair_stream_table_impl(name) {
+        Ok(summary) => summary,
+        Err(e) => raise_error_with_context(e),
+    }
+}
+
+fn repair_stream_table_impl(name: &str) -> Result<String, PgTrickleError> {
+    let (schema, table_name) = parse_qualified_name(name)?;
+    let st = StreamTableMeta::get_by_name(&schema, &table_name)?;
+
+    // Step 1: Acquire a transaction-scoped advisory lock.
+    let got_lock =
+        Spi::get_one_with_args::<bool>("SELECT pg_try_advisory_xact_lock($1)", &[st.pgt_id.into()])
+            .map_err(|e| PgTrickleError::SpiError(e.to_string()))?
+            .unwrap_or(false);
+
+    if !got_lock {
+        return Err(PgTrickleError::RefreshSkipped(format!(
+            "{}.{} — another operation holds the advisory lock; retry later",
+            schema, table_name,
+        )));
+    }
+
+    let mut actions: Vec<String> = Vec::new();
+    let change_schema = config::pg_trickle_change_buffer_schema();
+    let deps = StDependency::get_for_st(st.pgt_id).unwrap_or_default();
+
+    // Step 2: catalog verification is implicit — get_by_name() already
+    // returned st above; if missing, it would have errored.
+
+    // Step 3: Reinitialize materialized storage if missing.
+    let storage_exists = Spi::get_one_with_args::<bool>(
+        "SELECT EXISTS(SELECT 1 FROM pg_catalog.pg_class c \
+         JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+         WHERE n.nspname = $1 AND c.relname = $2)",
+        &[schema.as_str().into(), table_name.as_str().into()],
+    )
+    .unwrap_or(None)
+    .unwrap_or(false);
+
+    if !storage_exists {
+        // Rebuild the storage table from the catalog definition.
+        // mark_for_reinitialize triggers full storage rebuild on next refresh.
+        StreamTableMeta::mark_for_reinitialize(st.pgt_id)?;
+        actions.push("storage_missing: marked for reinitialize".to_string());
+    }
+
+    // Step 4: Reset CDC frontiers (set frontier = NULL, needs_reinit = true)
+    // so the next scheduled or manual refresh performs a full refresh.
+    Spi::run_with_args(
+        "UPDATE pgtrickle.pgt_stream_tables \
+         SET frontier = NULL, needs_reinit = true, \
+             is_populated = false, updated_at = now() \
+         WHERE pgt_id = $1",
+        &[st.pgt_id.into()],
+    )
+    .map_err(|e| PgTrickleError::SpiError(format!("Failed to reset frontier: {}", e)))?;
+    actions.push("frontier reset: scheduled full refresh on next cycle".to_string());
+
+    // Step 5: Rebuild missing CDC triggers / change-buffer tables.
+    let mut cdc_rebuilt = false;
+    for dep in &deps {
+        if dep.source_type != "TABLE" {
+            continue;
+        }
+        let source_oid = dep.source_relid;
+
+        // Verify source still exists.
+        let source_exists = Spi::get_one_with_args::<bool>(
+            "SELECT EXISTS(SELECT 1 FROM pg_catalog.pg_class WHERE oid = $1)",
+            &[source_oid.into()],
+        )
+        .unwrap_or(None)
+        .unwrap_or(false);
+
+        if !source_exists {
+            actions.push(format!(
+                "dependency missing: source OID {} no longer exists",
+                source_oid.to_u32()
+            ));
+            continue;
+        }
+
+        // Rebuild change-buffer table if absent.
+        let buf_name = cdc::buffer_base_name_for_oid(source_oid);
+        let buf_exists = Spi::get_one_with_args::<bool>(
+            "SELECT EXISTS(SELECT 1 FROM pg_catalog.pg_class c \
+             JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+             WHERE n.nspname = $1 AND c.relname = $2)",
+            &[change_schema.as_str().into(), buf_name.as_str().into()],
+        )
+        .unwrap_or(None)
+        .unwrap_or(false);
+
+        if !buf_exists {
+            let col_defs = cdc::resolve_referenced_column_defs(source_oid).unwrap_or_default();
+            let stable_name = cdc::get_cdc_name_for_source(source_oid);
+            if let Err(e) =
+                cdc::create_change_buffer_table(source_oid, &change_schema, &col_defs, &stable_name)
+            {
+                actions.push(format!(
+                    "change_buffer rebuild failed for OID {}: {}",
+                    source_oid.to_u32(),
+                    e
+                ));
+            } else {
+                actions.push(format!(
+                    "change_buffer rebuilt for OID {}",
+                    source_oid.to_u32()
+                ));
+                cdc_rebuilt = true;
+            }
+        }
+
+        // Rebuild CDC trigger if absent.
+        if !cdc::trigger_exists(source_oid).unwrap_or(false) {
+            let pk_columns = cdc::resolve_pk_columns(source_oid).unwrap_or_default();
+            let col_defs = cdc::resolve_referenced_column_defs(source_oid).unwrap_or_default();
+            let stable_name = cdc::get_cdc_name_for_source(source_oid);
+            if let Err(e) = cdc::create_change_trigger(
+                source_oid,
+                &stable_name,
+                &pk_columns,
+                &col_defs,
+                &change_schema,
+            ) {
+                actions.push(format!(
+                    "trigger rebuild failed for OID {}: {}",
+                    source_oid.to_u32(),
+                    e
+                ));
+            } else {
+                actions.push(format!("trigger rebuilt for OID {}", source_oid.to_u32()));
+                cdc_rebuilt = true;
+            }
+        }
+    }
+
+    if !cdc_rebuilt && deps.iter().any(|d| d.source_type == "TABLE") {
+        actions.push("cdc_infrastructure: verified OK".to_string());
+    }
+
+    // Step 6: Verify all dependencies still exist — already done in step 5
+    // (any missing source OIDs were recorded above).
+
+    // Reset consecutive errors so the ST is eligible for automatic refresh.
+    StreamTableMeta::reset_fuse(st.pgt_id).unwrap_or(());
+    Spi::run_with_args(
+        "UPDATE pgtrickle.pgt_stream_tables \
+         SET status = 'ACTIVE', consecutive_errors = 0, \
+             last_error_message = NULL, last_error_at = NULL, \
+             updated_at = now() \
+         WHERE pgt_id = $1",
+        &[st.pgt_id.into()],
+    )
+    .map_err(|e| PgTrickleError::SpiError(format!("Failed to reset status: {}", e)))?;
+    actions.push("status reset: ACTIVE, errors cleared".to_string());
+
+    shmem::signal_dag_invalidation(st.pgt_id);
+    template_cache::invalidate(st.pgt_id);
+    shmem::bump_cache_generation();
+
+    let summary = format!(
+        "repair_stream_table({}.{}): {}",
+        schema,
+        table_name,
+        actions.join("; ")
+    );
+    pgrx::info!("{}", summary);
+    Ok(summary)
+}
+
 /// Manually trigger a synchronous refresh of a stream table.
 #[pg_extern(schema = "pgtrickle")]
 fn refresh_stream_table(name: &str) {

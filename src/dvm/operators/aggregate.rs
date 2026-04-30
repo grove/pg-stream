@@ -430,11 +430,12 @@ fn is_algebraically_invertible(agg: &AggExpr) -> bool {
         return false;
     }
 
-    // DI-8: SUM(CASE WHEN …) can drift when the CASE condition references
-    // mutable non-group-key columns — fall back to GROUP_RESCAN (EXCEPT ALL).
-    if matches!(agg.function, AggFunc::Sum)
-        && let Some(Expr::Raw(s)) = &agg.argument
-        && s.trim_start().to_uppercase().starts_with("CASE")
+    // A42-11: DI-8: SUM(CASE WHEN …) can drift when the CASE condition
+    // references mutable non-group-key columns — fall back to GROUP_RESCAN
+    // (EXCEPT ALL). Detection is now AST-level so it handles CASE expressions
+    // wrapped in casts, type coercions, or function calls (e.g.
+    // SUM(CAST(CASE WHEN x > 1 THEN y ELSE 0 END AS numeric))).
+    if matches!(agg.function, AggFunc::Sum) && agg.argument.as_ref().is_some_and(expr_contains_case)
     {
         return false;
     }
@@ -443,6 +444,22 @@ fn is_algebraically_invertible(agg: &AggExpr) -> bool {
         agg.function,
         AggFunc::CountStar | AggFunc::Count | AggFunc::Sum
     )
+}
+
+/// A42-11: Return true if the expression tree contains a CASE expression at
+/// any level — including CASE wrapped in casts, function calls, or binary ops.
+///
+/// Since CASE expressions reach us as `Expr::Raw(s)` (the parser does not yet
+/// have a dedicated `Expr::Case` variant), we identify them by checking
+/// whether the normalized raw text starts with "CASE". We recurse into
+/// `FuncCall` and `BinaryOp` nodes to catch wrapped CASE expressions.
+fn expr_contains_case(expr: &Expr) -> bool {
+    match expr {
+        Expr::Raw(s) => s.trim_start().to_uppercase().starts_with("CASE"),
+        Expr::FuncCall { args, .. } => args.iter().any(expr_contains_case),
+        Expr::BinaryOp { left, right, .. } => expr_contains_case(left) || expr_contains_case(right),
+        Expr::ColumnRef { .. } | Expr::Literal(_) | Expr::Star { .. } => false,
+    }
 }
 
 /// Returns true if the aggregate uses auxiliary columns for algebraic

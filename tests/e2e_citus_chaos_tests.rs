@@ -174,7 +174,7 @@ async fn test_citus_chaos_worker_death_mid_refresh() {
 
     // Bring the worker back.
     docker_restart(&worker_container).await;
-    tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+    tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
 
     // After recovery the stream table must be refreshable without error.
     db.execute("SELECT pgtrickle.refresh_stream_table('chaos1_st')")
