@@ -1595,8 +1595,10 @@ pub(crate) fn resolve_lsn_placeholders(
         }
     }
 
-    // A41-2: Assert no placeholders remain.
-    crate::dvm::check_no_remaining_placeholders(&sql, "resolve_lsn_placeholders")?;
+    // A41-2: Assert no LSN placeholders remain.  __PGT_*__ tokens (e.g.
+    // __PGT_PART_PRED__) are resolved in a later stage and must not be
+    // flagged here.
+    crate::dvm::check_no_remaining_placeholders_for(&sql, "resolve_lsn_placeholders", &["__PGS_"])?;
 
     Ok(sql)
 }

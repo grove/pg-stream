@@ -137,13 +137,25 @@ pub(crate) fn check_no_remaining_placeholders(
     sql: &str,
     context: &str,
 ) -> Result<(), PgTrickleError> {
-    // Fast path: neither prefix is present.
-    if !sql.contains("__PGS_") && !sql.contains("__PGT_") {
+    check_no_remaining_placeholders_for(sql, context, &["__PGS_", "__PGT_"])
+}
+
+/// Like [`check_no_remaining_placeholders`] but only checks the specified
+/// placeholder prefix families.  Use this when a resolution step is only
+/// responsible for a subset of placeholder families (e.g. `resolve_lsn_placeholders`
+/// only resolves `__PGS_*__` tokens; `__PGT_*__` tokens are resolved later).
+pub(crate) fn check_no_remaining_placeholders_for(
+    sql: &str,
+    context: &str,
+    prefixes: &[&str],
+) -> Result<(), PgTrickleError> {
+    // Fast path: none of the prefixes are present.
+    if prefixes.iter().all(|p| !sql.contains(p)) {
         return Ok(());
     }
 
     // Extract the first unresolved token.
-    for prefix in &["__PGS_", "__PGT_"] {
+    for prefix in prefixes {
         let mut pos = 0;
         while let Some(start) = sql[pos..].find(prefix) {
             let token_start = pos + start;
@@ -1991,6 +2003,29 @@ mod tests {
             ok.is_ok(),
             "pgt placeholder with missing frontier defaults to 0/0 — no error"
         );
+    }
+
+    /// T-A41-2h: check_no_remaining_placeholders_for() with only __PGS_ prefix
+    /// does NOT flag __PGT_PART_PRED__, which is a legitimate later-stage token.
+    #[test]
+    fn test_check_no_remaining_placeholders_for_pgs_only_ignores_pgt() {
+        // Simulate the SQL that resolve_lsn_placeholders produces: all __PGS_*__
+        // tokens are gone, but __PGT_PART_PRED__ remains (resolved later).
+        let sql = "MERGE INTO st USING d ON st.id = d.id __PGT_PART_PRED__";
+        let result = check_no_remaining_placeholders_for(sql, "test", &["__PGS_"]);
+        assert!(
+            result.is_ok(),
+            "checking only __PGS_ should ignore __PGT_PART_PRED__"
+        );
+    }
+
+    /// T-A41-2i: check_no_remaining_placeholders (both families) DOES catch
+    /// __PGT_PART_PRED__ when called in a context that resolves all __PGT__s.
+    #[test]
+    fn test_check_no_remaining_placeholders_both_catches_pgt_part_pred() {
+        let sql = "MERGE INTO st USING d ON st.id = d.id __PGT_PART_PRED__";
+        let result = check_no_remaining_placeholders(sql, "full_check");
+        assert!(result.is_err(), "full check should catch __PGT_PART_PRED__");
     }
 
     // ── is_scan_chain_tree() ────────────────────────────────────────
