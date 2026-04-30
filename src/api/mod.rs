@@ -6033,7 +6033,7 @@ fn stream_table_lineage(
 /// This matches the version reported by `pg_extension.extversion`.
 // ── Sub-modules ─────────────────────────────────────────────────────────────
 mod diagnostics;
-mod helpers;
+pub mod helpers;
 pub(crate) mod metrics_ext;
 pub(crate) mod planner;
 mod self_monitoring;

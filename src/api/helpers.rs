@@ -649,7 +649,7 @@ pub(super) fn validate_defining_query(query: &str) -> Result<Vec<ColumnDef>, PgT
 /// Parsed schedule specification — either a duration-based schedule
 /// or a cron expression.
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) enum Schedule {
+pub enum Schedule {
     /// Duration-based: refresh when data is older than this many seconds.
     Duration(i64),
     /// Cron-based: refresh at the times specified by the cron expression.

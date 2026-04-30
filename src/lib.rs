@@ -23,11 +23,11 @@
 
 use pgrx::prelude::*;
 
-mod api;
+pub mod api;
 mod catalog;
 mod cdc;
 pub mod citus;
-mod config;
+pub mod config;
 pub mod dag;
 mod diagnostics;
 pub mod dvm;
