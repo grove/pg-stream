@@ -488,29 +488,37 @@ RETURNS TABLE (
 
 ---
 
-### Phase 4 — Sensitivity Label Store (v0.43.x)
+### Phase 4 — Sensitivity Labels, Audit Trail & Masking Policies (v0.43.x)
 
-**Goal:** Allow users to tag source columns as PII/PHI/sensitive, and have those
-labels propagate automatically through the DAG.
+**Goal:** Allow users to tag source columns with arbitrary hierarchical labels,
+have those labels propagate automatically through the DAG, record every label
+change in an immutable audit trail, and define reusable masking policies.
 
-**Schema additions:**
+#### 4a — Hierarchical Custom Tags
+
+Labels are free-form dot-separated strings, not a closed enum. Built-in
+prefixes (`pii`, `phi`, `confidential`) are conventions only.
+
+**Schema:**
 
 ```sql
 -- Per-column sensitivity labels on source tables (user-managed).
+-- 'label' is a free-form hierarchical tag, e.g. 'pii', 'compliance.gdpr.article_17',
+-- 'business_domain.financial', 'data_quality.verified'.
 CREATE TABLE pgtrickle.pgt_column_labels (
     relation_oid  OID NOT NULL,
     column_name   TEXT NOT NULL,
-    label         TEXT NOT NULL,  -- 'PII', 'PHI', 'CONFIDENTIAL', custom
+    label         TEXT NOT NULL,
     added_by      TEXT NOT NULL DEFAULT current_user,
     added_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
     PRIMARY KEY (relation_oid, column_name, label)
 );
 ```
 
-**New SQL functions:**
+**SQL functions:**
 
 ```sql
--- Set / remove a label on a column.
+-- Set / remove a label on a column (any free-form tag).
 pgtrickle.set_column_label(
     table_name TEXT, column_name TEXT, label TEXT
 ) RETURNS void;
@@ -524,8 +532,9 @@ pgtrickle.column_labels(
     name TEXT
 ) RETURNS TABLE (col TEXT, label TEXT, inherited_from TEXT, masked BOOLEAN);
 
--- Cross-DAG impact: which stream tables expose PII-derived columns?
-pgtrickle.pii_impact_report()
+-- Cross-DAG impact: which stream tables carry columns with a given label?
+-- (Replaces the PII-specific function with a general-purpose one.)
+pgtrickle.label_impact_report(label_prefix TEXT DEFAULT 'pii')
 RETURNS TABLE (
     stream_table TEXT, col TEXT, source_table TEXT, source_col TEXT, label TEXT
 );
@@ -536,13 +545,132 @@ RETURNS TABLE (
 | Transform | Label propagation |
 |-----------|------------------|
 | IDENTITY | Inherits all source labels |
-| COUNT(*) | No PII label (aggregate anonymises) |
-| COUNT(DISTINCT pii_col) | Inherits PII if group is small (warn if group < k) |
-| SUM / AVG | Inherits PII unless group_by makes it safe |
-| HASH(pii_col) — non-reversible | Drops PII, adds DERIVED_PII |
-| JOIN on PII key | Joined relation may inherit PII if key is exposed |
+| COUNT(*) | No labels propagated (aggregate anonymises) |
+| COUNT(DISTINCT col) | Inherits labels if group is small (warn if group < k) |
+| SUM / AVG | Inherits labels unless group_by makes it safe |
+| HASH(col) — non-reversible | Drops labels, adds `derived_pii` |
+| JOIN on labelled key | Joined output columns inherit labels from the key source |
 
-**Estimated effort:** 4–5 days.
+#### 4b — Immutable Audit Trail
+
+Every label change (add, remove) and every lineage metadata update is
+recorded in an append-only audit log, enabling temporal queries and compliance
+evidence.
+
+```sql
+CREATE TABLE pgtrickle.lineage_audit_log (
+    event_id      BIGSERIAL PRIMARY KEY,
+    stream_table  TEXT NOT NULL,
+    event_type    TEXT NOT NULL CHECK (event_type IN (
+                      'label_added', 'label_removed',
+                      'column_lineage_updated', 'schema_evolved',
+                      'masking_policy_applied', 'masking_policy_removed')),
+    column_name   TEXT,
+    label         TEXT,
+    changed_by    TEXT NOT NULL,
+    changed_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+    details       JSONB
+);
+```
+
+**New SQL function:**
+
+```sql
+-- What did the label set look like on a given date?
+pgtrickle.column_labels_as_of(name TEXT, as_of TIMESTAMPTZ)
+RETURNS TABLE (col TEXT, label TEXT, inherited_from TEXT);
+```
+
+#### 4c — Masking Policies
+
+A masking policy is a named rule that specifies a masking function and which
+label tags it applies to. Policies are defined once and applied globally.
+
+```sql
+CREATE TABLE pgtrickle.pgt_masking_policies (
+    policy_name       TEXT PRIMARY KEY,
+    masking_function  TEXT NOT NULL,   -- e.g. 'sha256_hex', 'nullif_non_admin'
+    applies_to_tags   TEXT[] NOT NULL, -- label prefixes this policy covers
+    exceptions        TEXT[],          -- role/condition expressions
+    created_by        TEXT NOT NULL DEFAULT current_user,
+    created_at        TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- Define and apply:
+pgtrickle.create_masking_policy(
+    policy_name TEXT, masking_function TEXT,
+    applies_to_tags TEXT[], exceptions TEXT[] DEFAULT NULL
+) RETURNS void;
+
+pgtrickle.apply_masking_policy(
+    policy_name TEXT, table_name TEXT, column_name TEXT
+) RETURNS void;
+
+-- Query effective masks:
+pgtrickle.column_masks(table_name TEXT)
+RETURNS TABLE (col TEXT, policy_name TEXT, masking_function TEXT, applied_at TIMESTAMPTZ);
+```
+
+#### 4d — Schema Evolution Timeline
+
+Track how column types and nullability change over time, enabling "when did
+this column become nullable?" queries for debugging and compliance.
+
+```sql
+CREATE TABLE pgtrickle.column_schema_history (
+    stream_table  TEXT NOT NULL,
+    column_name   TEXT NOT NULL,
+    pg_type       TEXT NOT NULL,
+    not_null      BOOLEAN NOT NULL,
+    effective_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    changed_by    TEXT NOT NULL DEFAULT current_user,
+    reason        TEXT,
+    PRIMARY KEY (stream_table, column_name, effective_at)
+);
+```
+
+**New SQL function:**
+
+```sql
+-- Full type/nullability history for a column.
+pgtrickle.column_schema_history(stream_table TEXT, column_name TEXT)
+RETURNS TABLE (pg_type TEXT, not_null BOOLEAN, effective_at TIMESTAMPTZ, reason TEXT);
+```
+
+This table is written at `create_stream_table` time (initial snapshot) and on
+every `alter_stream_table` that changes the output schema.
+
+#### 4e — Pre-built Governance Query Patterns
+
+Phase 4 ships a `sql/governance_queries.sql` file with annotated examples:
+
+```sql
+-- Q1: All stream tables with any 'pii' tag
+SELECT DISTINCT st.name FROM pgt_stream_tables st
+JOIN pgtrickle.lineage_audit_log al ON al.stream_table = st.name
+WHERE al.label LIKE 'pii%' AND al.event_type = 'label_added'
+  AND NOT EXISTS (SELECT 1 FROM pgtrickle.lineage_audit_log al2
+      WHERE al2.stream_table = al.stream_table AND al2.column_name = al.column_name
+        AND al2.label = al.label AND al2.event_type = 'label_removed'
+        AND al2.changed_at > al.changed_at);
+
+-- Q2: Schema stability — which columns change type most often?
+SELECT stream_table, column_name, COUNT(*) AS schema_changes
+FROM pgtrickle.column_schema_history
+GROUP BY stream_table, column_name
+ORDER BY schema_changes DESC;
+
+-- Q3: Freshness SLA check — stream tables not refreshed in the last hour
+SELECT st.name, MAX(rh.refresh_at) AS last_refresh,
+       EXTRACT(EPOCH FROM (now() - MAX(rh.refresh_at))) AS age_s
+FROM pgt_stream_tables st
+LEFT JOIN pgt_refresh_history rh ON rh.stream_table_oid = st.relation_oid
+GROUP BY st.name
+HAVING MAX(rh.refresh_at) < now() - interval '1 hour';
+```
+
+**Estimated effort:** 7–9 days (expanded from original 4–5 due to audit trail,
+schema history, and masking policy infrastructure).
 
 ---
 
@@ -619,10 +747,15 @@ CREATE INDEX idx_lineage_outbox_undelivered
    ```
    pg_trickle.openlineage_enabled           = false  -- write to outbox on refresh
    pg_trickle.openlineage_namespace         = ''     -- defaults to current_database()
+   pg_trickle.openlineage_catalog           = ''     -- logical catalog/hierarchy name, e.g. 'production.analytics'
    pg_trickle.openlineage_include_sql       = true
    pg_trickle.openlineage_include_stats     = true
    pg_trickle.openlineage_include_column_lineage = true
    ```
+
+   The `catalog` setting is included in the OpenLineage dataset namespace path so that
+   consumers (Marquez, DataHub, custom backends) can scope pg_trickle datasets within
+   a multi-source or multi-tenant deployment without name collisions.
 
 4. **Monitoring function:**
 
@@ -691,10 +824,15 @@ additional work.
 
 ---
 
-### Phase 6 — Statistical Property Propagation (v0.45.x)
+### Phase 6 — Statistical Property Propagation (v0.44.x or v0.45.x)
 
 **Goal:** Track lightweight statistical summaries of columns through the DAG,
 updated incrementally at each refresh.
+
+**Elevated to P2:** Data quality metrics (null rates, cardinality, freshness)
+are cheap to collect at refresh time (catalog reads only, no ANALYZE) and are
+among the most-requested operational signals. Prefer shipping Phase 6 alongside
+or immediately after Phase 5 rather than deferring to P3.
 
 **What is tracked per output column:**
 
@@ -870,9 +1008,9 @@ pg_trickle Rust extension. Estimated effort: 2–3 days.
 | 2 | Transitive lineage function | v0.41–42.x | 2d | High | **P1** |
 | 5 | OpenLineage outbox + pgtrickle-relay `openlineage` sink | v0.44.x | 3–5d | Very High | **P1** |
 | 3 | Type & nullability propagation | v0.42.x | 3d | Medium | **P2** |
-| 4 | Sensitivity label propagation | v0.43.x | 4–5d | High | **P2** |
+| 4 | Hierarchical labels + audit trail + masking policies + schema history | v0.43.x | 7–9d | High | **P2** |
+| 6 | Statistical property propagation (null rates, cardinality, freshness) | v0.44–45.x | 4–5d | High | **P2** |
 | 9 | dbt lineage bridge | — | 2–3d | High | **P2** |
-| 6 | Statistical property propagation | v0.45.x | 4–5d | Medium | **P3** |
 | 7 | PROV-O RDF export | v0.46.x | 3–4d | Low–Medium | **P3** |
 | 8 | Differential row provenance | v0.47.x+ | 10–14d | Very High (niche) | **Stretch** |
 
@@ -912,6 +1050,24 @@ staleness data and can be surfaced as a view rather than a new phase.
 6. **Column fingerprints (Idea G):** Should these be computed at parse time
    and stored alongside `column_lineage` JSONB, or lazily on demand? Given the
    DVM parser runs at create time anyway, pre-computing is cheap and preferred.
+
+7. **Label hierarchy depth and search:** The hierarchical tag system uses
+   dot-separated strings (`pii.email`, `compliance.gdpr.article_17`). Prefix
+   searches via `label LIKE 'pii%'` are fast on small label tables, but a
+   GiST/ltree index on `pgt_column_labels.label` may be worth adding if label
+   counts exceed tens of thousands.
+
+8. **Audit log retention:** `lineage_audit_log` rows should be retained for
+   the lifetime of the stream table plus a configurable grace period (e.g.
+   `pg_trickle.lineage_audit_retention_days`, default 365). Unlike the
+   `lineage_outbox` (30-day delivery window), audit rows are compliance
+   evidence and should survive relay delivery.
+
+9. **Masking policy execution vs. description:** Phase 4 masking policies
+   *describe* how a column should be masked; they do not intercept queries.
+   Enforcement at read time is PostgreSQL's job (column-level privileges,
+   RLS, views). The policy store is a governance signal, not an access
+   control mechanism.
 
 ---
 
