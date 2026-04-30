@@ -87,19 +87,17 @@
 | [v0.39.0](roadmap/v0.39.0.md) | Operational Truthfulness & Distributed Hardening: backpressure/wake fix, generated docs, Citus chaos, SQLSTATE rollout, diagnostics | ✅ Released | Large | [Full details](roadmap/v0.39.0.md-full.md) |
 | [v0.40.0](roadmap/v0.40.0.md) | Operator trust and maintainability: generated references, alerting, drain-mode proof, secret hygiene, unsafe gating | ✅ Released | Large | [Full details](roadmap/v0.40.0.md-full.md) |
 | [v0.41.0](roadmap/v0.41.0.md) | DVM correctness: structural cache keys, placeholder safety, WAL transition guards | Planned | Medium | [Full details](roadmap/v0.41.0.md-full.md) |
-| [v0.42.0](roadmap/v0.42.0.md) | Documentation truthfulness: repair_stream_table, catalog generator rewrite, SQL reference repair, CI gates | Planned | Large | [Full details](roadmap/v0.42.0.md-full.md) |
-| [v0.43.0](roadmap/v0.43.0.md) | Test quality: replace fixed sleeps, aggregate correctness property tests, fuzz automation in CI | Planned | Large | [Full details](roadmap/v0.43.0.md-full.md) |
-| [v0.44.0](roadmap/v0.44.0.md) | Performance tunability: deep-join GUCs, GROUP_RESCAN improvement, explain_stream_table diagnostics | Planned | Large | [Full details](roadmap/v0.44.0.md-full.md) |
-| [v0.45.0](roadmap/v0.45.0.md) | Security hardening: IVM search_path fix, centralized SQL builder, RLS warnings, module decomposition | Planned | Large | [Full details](roadmap/v0.45.0.md-full.md) |
-| [v0.46.0](roadmap/v0.46.0.md) | Operational readiness: preflight functions, scalability infrastructure, CI completeness, CNPG production examples | Planned | Large | [Full details](roadmap/v0.46.0.md-full.md) |
+| [v0.42.0](roadmap/v0.42.0.md) | Documentation truthfulness + test quality: repair_stream_table, catalog generator, SQL reference, sleep removal, fuzz CI | Planned | Large | [Full details](roadmap/v0.42.0.md-full.md) |
+| [v0.43.0](roadmap/v0.43.0.md) | Performance tunability: deep-join GUCs, GROUP_RESCAN improvement, explain_stream_table diagnostics | Planned | Large | [Full details](roadmap/v0.43.0.md-full.md) |
+| [v0.44.0](roadmap/v0.44.0.md) | Security hardening: IVM search_path fix, centralized SQL builder, RLS warnings, module decomposition | Planned | Large | [Full details](roadmap/v0.44.0.md-full.md) |
+| [v0.45.0](roadmap/v0.45.0.md) | Operational readiness: preflight functions, scalability infrastructure, CI completeness, CNPG production examples | Planned | Large | [Full details](roadmap/v0.45.0.md-full.md) |
 
-### Embedding & AI Programme (v0.47.x – v0.49.x)
+### Embedding & AI Programme (v0.46.x – v0.47.x)
 
 | Version | Theme | Status | Scope | Full details |
 |---------|-------|--------|------- |---------- |
-| [v0.47.0](roadmap/v0.47.0.md) | Embedding pipeline infrastructure: post-refresh hooks, drift-based reindex, vector monitoring | Planned | Medium | [Full details](roadmap/v0.47.0.md-full.md) |
-| [v0.48.0](roadmap/v0.48.0.md) | Sparse & half-precision vector aggregates, reactive distance subscriptions, hybrid-search benchmarks | Planned | Medium | [Full details](roadmap/v0.48.0.md-full.md) |
-| [v0.49.0](roadmap/v0.49.0.md) | embedding_stream_table() ergonomic API, per-tenant ANN patterns, outbox embedding events | Planned | Large | [Full details](roadmap/v0.49.0.md-full.md) |
+| [v0.46.0](roadmap/v0.46.0.md) | Embedding pipeline infrastructure: post-refresh hooks, drift-based reindex, vector monitoring | Planned | Medium | [Full details](roadmap/v0.46.0.md-full.md) |
+| [v0.47.0](roadmap/v0.47.0.md) | Complete embedding programme: sparse/half-precision vector aggregates, hybrid search, embedding_stream_table() API, per-tenant ANN, embedding outbox | Planned | Large | [Full details](roadmap/v0.47.0.md-full.md) |
 
 ### Beyond v1.0
 
@@ -153,21 +151,17 @@ v0.40    ─── Operator trust and maintainability: generated docs, alerting,
     │
 v0.41    ─── DVM correctness: structural cache keys, placeholder safety, WAL transition guards
     │
-v0.42    ─── Documentation truthfulness: repair_stream_table, catalog generator, SQL reference, CI gates
+v0.42    ─── Docs truthfulness + test quality: repair_stream_table, catalog generator, sleep removal, fuzz CI
     │
-v0.43    ─── Test quality: polling helpers, aggregate property tests, fuzz CI automation
+v0.43    ─── Performance tunability: deep-join GUCs, GROUP_RESCAN improvement, explain diagnostics
     │
-v0.44    ─── Performance tunability: deep-join GUCs, GROUP_RESCAN improvement, explain diagnostics
+v0.44    ─── Security hardening: IVM search_path, SQL builder, RLS warnings, module decomposition
     │
-v0.45    ─── Security hardening: IVM search_path, SQL builder, RLS warnings, module decomposition
+v0.45    ─── Operational readiness: preflight, scalability, CI completeness, CNPG production
     │
-v0.46    ─── Operational readiness: preflight, scalability, CI completeness, CNPG production
+v0.46    ─── Embedding infrastructure: post-refresh actions, drift-based reindex, vector monitoring
     │
-v0.47    ─── Embedding infrastructure: post-refresh actions, drift-based reindex, vector monitoring
-    │
-v0.48    ─── Hybrid search & sparse vectors: sparsevec_avg, halfvec_avg, reactive distance alerts
-    │
-v0.49    ─── Embedding API & advanced RAG: embedding_stream_table(), per-tenant ANN, embedding outbox
+v0.47    ─── Complete embedding programme: sparse vectors, hybrid search, embedding_stream_table(), per-tenant ANN
     │
 v1.0.0   ─── Stable release, PostgreSQL 19, package registries, signed artifacts, SBOMs
 ```
@@ -210,15 +204,20 @@ references, drain-mode proof, monitoring/alert rules, security-model and
 secret-handling docs, upgrade-gate coverage, unsafe-inventory PR gating, and
 continued decomposition of the largest files.
 
-**v0.41.0 through v0.46.0 form a second hardening arc** driven by the findings
+**v0.41.0 through v0.45.0 form a second hardening arc** driven by the findings
 in the v0.40 overall assessment (plans/PLAN_OVERALL_ASSESSMENT_9.md). These
-six releases systematically close every gap identified across 10 dimensions:
+five releases systematically close every gap identified across 10 dimensions:
 correctness (P0 cache-key and placeholder fixes), documentation truthfulness
 (repair function implementation, catalog generator rewrite), test quality
-(sleep removal, property tests, fuzz CI), performance tunability (GUC-exposed
-thresholds, explain diagnostics), security (search_path hardening, centralized
-SQL building), and operational readiness (preflight functions, scalability
-infrastructure, CI completeness). Only after this arc does the roadmap resume
-the embedding programme in v0.47.0–v0.49.0, preserving the pgvector work while
-aligning the release order with the assessment's conclusion that closing
-correctness and operational gaps matters more than adding new surface area.
+(sleep removal, property tests, fuzz CI — merged into v0.42.0), performance
+tunability (GUC-exposed thresholds, explain diagnostics), security
+(search_path hardening, centralized SQL building), and operational readiness
+(preflight functions, scalability infrastructure, CI completeness). Only after
+this arc does the roadmap resume the embedding programme in v0.46.0–v0.47.0,
+preserving the pgvector work while aligning the release order with the
+assessment's conclusion that closing correctness and operational gaps matters
+more than adding new surface area. The embedding programme itself is
+consolidated into two releases: v0.46.0 for infrastructure and ANN maintenance,
+and v0.47.0 completing the full feature set (sparse/half-precision aggregates,
+hybrid search, the ergonomic `embedding_stream_table()` API, per-tenant ANN
+patterns, and outbox-emitted embedding events).
