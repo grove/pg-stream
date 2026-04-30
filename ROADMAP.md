@@ -88,7 +88,7 @@
 | [v0.40.0](roadmap/v0.40.0.md) | Operator trust and maintainability: generated references, alerting, drain-mode proof, secret hygiene, unsafe gating | ✅ Released | Large | [Full details](roadmap/v0.40.0.md-full.md) |
 | [v0.41.0](roadmap/v0.41.0.md) | DVM correctness: structural cache keys, placeholder safety, WAL transition guards | Released | Medium | [Full details](roadmap/v0.41.0.md-full.md) |
 | [v0.42.0](roadmap/v0.42.0.md) | Documentation truthfulness + test quality: repair_stream_table, catalog generator, SQL reference, sleep removal, fuzz CI | Planned | Large | [Full details](roadmap/v0.42.0.md-full.md) |
-| [v0.43.0](roadmap/v0.43.0.md) | Performance tunability: deep-join GUCs, GROUP_RESCAN improvement, explain_stream_table diagnostics | Planned | Large | [Full details](roadmap/v0.43.0.md-full.md) |
+| [v0.43.0](roadmap/v0.43.0.md) | Performance tunability: deep-join GUCs, GROUP_RESCAN improvement, explain_stream_table diagnostics, D+I change buffer refactor | Planned | Large | [Full details](roadmap/v0.43.0.md-full.md) |
 | [v0.44.0](roadmap/v0.44.0.md) | Security hardening: IVM search_path fix, centralized SQL builder, RLS warnings, module decomposition | Planned | Large | [Full details](roadmap/v0.44.0.md-full.md) |
 | [v0.45.0](roadmap/v0.45.0.md) | Operational readiness: preflight functions, scalability infrastructure, CI completeness, CNPG production examples | Planned | Large | [Full details](roadmap/v0.45.0.md-full.md) |
 
@@ -153,7 +153,7 @@ v0.41    ─── DVM correctness: structural cache keys, placeholder safety, W
     │
 v0.42    ─── Docs truthfulness + test quality: repair_stream_table, catalog generator, sleep removal, fuzz CI
     │
-v0.43    ─── Performance tunability: deep-join GUCs, GROUP_RESCAN improvement, explain diagnostics
+v0.43    ─── Performance tunability: deep-join GUCs, GROUP_RESCAN improvement, explain diagnostics, D+I CB refactor
     │
 v0.44    ─── Security hardening: IVM search_path, SQL builder, RLS warnings, module decomposition
     │
