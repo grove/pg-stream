@@ -7,6 +7,7 @@ For future plans and upcoming features, see [ROADMAP.md](ROADMAP.md).
 ## Table of Contents
 
 <!-- TOC start -->
+- [0.41.0 — DVM Correctness: Structural Cache Keys, Placeholder Safety & WAL Transition Guards](#0410--dvm-correctness-structural-cache-keys-placeholder-safety--wal-transition-guards)
 - [0.40.0 — Operator Trust, Maintainability & Release Confidence](#0400--operator-trust-maintainability--release-confidence)
 - [0.39.0 — Operational Truthfulness & Distributed Hardening](#0390--operational-truthfulness--distributed-hardening)
 - [0.38.0 — EC-01 Join Correctness Sprint](#0380--ec-01-join-correctness-sprint)
@@ -54,6 +55,78 @@ For future plans and upcoming features, see [ROADMAP.md](ROADMAP.md).
 - [0.1.1 — CloudNativePG Image & Test Hardening](#011--cloudnativepg-image--test-hardening)
 - [0.1.0 — Initial Release](#010--initial-release)
 <!-- TOC end -->
+
+---
+
+## [0.41.0] — DVM Correctness: Structural Cache Keys, Placeholder Safety & WAL Transition Guards
+
+v0.41.0 targets internal correctness of the Differential View Maintenance (DVM)
+engine: eliminating snapshot-CTE cache collisions on structurally different
+subtrees, making unresolved SQL placeholders hard errors, guarding WAL CDC
+transitions against concurrent DDL, and ensuring the pool worker obeys the
+global `pg_trickle.enabled` switch.
+
+### A41-1 — Structural Snapshot CTE Cache Key Fingerprint
+
+The old `snapshot_cache_key()` concatenated leaf-table aliases, meaning two
+OpTrees with identical source tables but different join conditions, join types,
+predicates, projections, or grouping expressions mapped to the *same* key and
+could silently share a snapshot CTE.
+
+The function now computes a 64-bit structural fingerprint via `DefaultHasher`,
+recursively encoding every operator type, join condition, predicate, projection,
+group-by expression, and child fingerprints before formatting the key as a
+16-character hex string.  Collision probability is now astronomically low for
+any realistic OpTree and is independent of alias names.
+
+### A41-2 — Placeholder Resolution Full-Validation Assertion
+
+`resolve_delta_template()` and `resolve_lsn_placeholders()` now return
+`Result<String, PgTrickleError>` instead of `String`. After all substitutions
+a `check_no_remaining_placeholders()` call scans for any leftover `__PGS_*__`
+or `__PGT_*__` tokens. If any are found, `PgTrickleError::UnresolvedPlaceholder`
+is returned and propagated all the way to the SQL surface as a clear
+`ERRCODE_INTERNAL_ERROR` with a detail message naming the offending token and
+the calling context.
+
+This converts a class of silent wrong-query bugs (where an unresolved
+placeholder was executed as literal SQL text) into an immediate, actionable
+server error.
+
+### A41-3 — WAL Transition Eligibility Recheck at Commit Point
+
+Before committing the `TRANSITIONING → WAL` state change, the background
+worker now calls `recheck_source_eligible_for_wal()` to verify that:
+
+- `pg_class.relkind = 'r'` (table not dropped)
+- primary-key columns are still present
+- `REPLICA IDENTITY = FULL` is still set
+
+If any check fails, the replication slot is immediately dropped, the catalog is
+reset to `Trigger` mode, and a `WalTransitionError` is returned.  This closes a
+race window in which a concurrent `DROP CONSTRAINT` or `ALTER TABLE … REPLICA
+IDENTITY DEFAULT` could leave the CDC pipeline in an inconsistent WAL mode with
+stale slot resources.
+
+### A41-4 — Pool Worker `pg_trickle.enabled` Check
+
+The persistent pool-worker main loop now checks `config::pg_trickle_enabled()`
+at the top of each iteration. When `pg_trickle.enabled = off` the worker sleeps
+500 ms and skips all job claiming, ensuring that a live-reload of the GUC
+immediately quiesces all workers without requiring a process restart.
+
+### A41-5 — Document Isolation Invariants (All Execution Modes)
+
+`// A41-5 — Isolation invariant:` doc comments have been added to all five
+execution-mode functions in `src/scheduler/mod.rs`:
+
+| Mode | Invariant |
+|------|-----------|
+| `execute_worker_singleton` | `READ COMMITTED` per-refresh; no cross-session writes visible |
+| `execute_worker_atomic_group` | `READ COMMITTED` with sub-transactions; repeatable-read group shares a snapshot |
+| `execute_worker_immediate_closure` | Single `READ COMMITTED` transaction; trigger-propagated and atomic |
+| `execute_worker_cyclic_scc` | Per-iteration `READ COMMITTED`; external observers see partial states between iterations |
+| `execute_worker_fused_chain` | Single `READ COMMITTED` transaction; bypass tables `ON COMMIT DROP`; externally atomic |
 
 ---
 

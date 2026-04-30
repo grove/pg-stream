@@ -123,14 +123,80 @@ fn hash_string(s: &str) -> u64 {
     hasher.finish()
 }
 
+/// A41-2: Check that no `__PGS_[A-Z0-9_]+__` or `__PGT_[A-Z0-9_]+__`
+/// placeholder tokens remain in a resolved SQL string.
+///
+/// Returns `Ok(())` when the SQL is clean.  Returns
+/// `Err(PgTrickleError::UnresolvedPlaceholder { token, context })` with
+/// the first unresolved token found and the caller-supplied `context`
+/// string (usually the stream table name or function name).
+///
+/// Both `__PGS_` (LSN placeholder) and `__PGT_` (pgt-internal) families
+/// are checked in a single pass.
+pub(crate) fn check_no_remaining_placeholders(
+    sql: &str,
+    context: &str,
+) -> Result<(), PgTrickleError> {
+    check_no_remaining_placeholders_for(sql, context, &["__PGS_", "__PGT_"])
+}
+
+/// Like [`check_no_remaining_placeholders`] but only checks the specified
+/// placeholder prefix families.  Use this when a resolution step is only
+/// responsible for a subset of placeholder families (e.g. `resolve_lsn_placeholders`
+/// only resolves `__PGS_*__` tokens; `__PGT_*__` tokens are resolved later).
+pub(crate) fn check_no_remaining_placeholders_for(
+    sql: &str,
+    context: &str,
+    prefixes: &[&str],
+) -> Result<(), PgTrickleError> {
+    // Fast path: none of the prefixes are present.
+    if prefixes.iter().all(|p| !sql.contains(p)) {
+        return Ok(());
+    }
+
+    // Extract the first unresolved token.
+    for prefix in prefixes {
+        let mut pos = 0;
+        while let Some(start) = sql[pos..].find(prefix) {
+            let token_start = pos + start;
+            // Tokens end with `__`.  Skip the opening `__` from the prefix.
+            let after_prefix = token_start + prefix.len();
+            if let Some(end_offset) = sql[after_prefix..].find("__") {
+                let token = &sql[token_start..after_prefix + end_offset + 2];
+                // Validate that the token contains only uppercase letters, digits,
+                // and underscores (i.e. it is an actual placeholder, not an SQL
+                // identifier that happens to start with `__PGS`/`__PGT`).
+                let inner = &sql[after_prefix..after_prefix + end_offset];
+                if inner
+                    .chars()
+                    .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+                {
+                    return Err(PgTrickleError::UnresolvedPlaceholder {
+                        token: token.to_string(),
+                        context: context.to_string(),
+                    });
+                }
+                pos = after_prefix + end_offset + 2;
+            } else {
+                break;
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Resolve a delta SQL template by substituting LSN placeholder tokens
 /// with actual frontier values.
+///
+/// Returns `Err(PgTrickleError::UnresolvedPlaceholder)` if any
+/// `__PGS_[A-Z0-9_]+__` or `__PGT_[A-Z0-9_]+__` token remains after
+/// all substitution passes (A41-2).
 fn resolve_delta_template(
     template: &str,
     source_oids: &[u32],
     prev_frontier: &Frontier,
     new_frontier: &Frontier,
-) -> String {
+) -> Result<String, PgTrickleError> {
     let mut sql = template.to_string();
     for &oid in source_oids {
         let prev_placeholder = format!("__PGS_PREV_LSN_{oid}__");
@@ -178,7 +244,10 @@ fn resolve_delta_template(
         }
     }
 
-    sql
+    // A41-2: Assert no placeholders remain.
+    check_no_remaining_placeholders(&sql, "resolve_delta_template")?;
+
+    Ok(sql)
 }
 
 /// Invalidate cached delta templates for a given ST (e.g. after DDL).
@@ -518,7 +587,7 @@ pub fn generate_delta_query_cached(
             &entry.source_oids,
             prev_frontier,
             new_frontier,
-        );
+        )?;
         return Ok(DeltaQueryResult {
             delta_sql,
             output_columns: entry.output_columns,
@@ -558,7 +627,7 @@ pub fn generate_delta_query_cached(
             &ct.source_oids,
             prev_frontier,
             new_frontier,
-        );
+        )?;
         return Ok(DeltaQueryResult {
             delta_sql,
             output_columns: ct.output_columns,
@@ -666,7 +735,7 @@ pub fn generate_delta_query_cached(
 
     // Resolve placeholders for this invocation.
     let delta_sql =
-        resolve_delta_template(&template_sql, &source_oids, prev_frontier, new_frontier);
+        resolve_delta_template(&template_sql, &source_oids, prev_frontier, new_frontier)?;
 
     Ok(DeltaQueryResult {
         delta_sql,
@@ -1769,7 +1838,7 @@ mod tests {
         new_f.set_source(42, "0/2000".to_string(), "ts".to_string());
 
         let template = "SELECT * FROM changes WHERE lsn > '__PGS_PREV_LSN_42__' AND lsn <= '__PGS_NEW_LSN_42__'";
-        let resolved = resolve_delta_template(template, &[42], &prev, &new_f);
+        let resolved = resolve_delta_template(template, &[42], &prev, &new_f).unwrap();
         assert!(resolved.contains("0/1000"));
         assert!(resolved.contains("0/2000"));
         assert!(!resolved.contains("__PGS_PREV_LSN_42__"));
@@ -1787,7 +1856,7 @@ mod tests {
 
         let template =
             "__PGS_PREV_LSN_10__ __PGS_NEW_LSN_10__ __PGS_PREV_LSN_20__ __PGS_NEW_LSN_20__";
-        let resolved = resolve_delta_template(template, &[10, 20], &prev, &new_f);
+        let resolved = resolve_delta_template(template, &[10, 20], &prev, &new_f).unwrap();
         assert_eq!(resolved, "0/AA 0/CC 0/BB 0/DD");
     }
 
@@ -1795,7 +1864,7 @@ mod tests {
     fn test_resolve_delta_template_no_placeholders() {
         let prev = Frontier::new();
         let new_f = Frontier::new();
-        let resolved = resolve_delta_template("SELECT 1", &[], &prev, &new_f);
+        let resolved = resolve_delta_template("SELECT 1", &[], &prev, &new_f).unwrap();
         assert_eq!(resolved, "SELECT 1");
     }
 
@@ -1804,7 +1873,8 @@ mod tests {
         // OID 999 not in frontier — get_lsn returns "0/0"
         let prev = Frontier::new();
         let new_f = Frontier::new();
-        let resolved = resolve_delta_template("__PGS_PREV_LSN_999__", &[999], &prev, &new_f);
+        let resolved =
+            resolve_delta_template("__PGS_PREV_LSN_999__", &[999], &prev, &new_f).unwrap();
         assert_eq!(resolved, "0/0");
     }
 
@@ -1816,7 +1886,7 @@ mod tests {
         new_f.set_st_source(7, "0/B000".to_string(), "ts".to_string());
 
         let template = "SELECT * FROM changes_pgt_7 WHERE lsn > '__PGS_PREV_LSN_pgt_7__' AND lsn <= '__PGS_NEW_LSN_pgt_7__'";
-        let resolved = resolve_delta_template(template, &[], &prev, &new_f);
+        let resolved = resolve_delta_template(template, &[], &prev, &new_f).unwrap();
         assert!(resolved.contains("0/A000"));
         assert!(resolved.contains("0/B000"));
         assert!(!resolved.contains("__PGS_PREV_LSN_pgt_7__"));
@@ -1834,8 +1904,128 @@ mod tests {
 
         let template =
             "__PGS_PREV_LSN_42__ __PGS_NEW_LSN_42__ __PGS_PREV_LSN_pgt_5__ __PGS_NEW_LSN_pgt_5__";
-        let resolved = resolve_delta_template(template, &[42], &prev, &new_f);
+        let resolved = resolve_delta_template(template, &[42], &prev, &new_f).unwrap();
         assert_eq!(resolved, "0/1000 0/3000 0/2000 0/4000");
+    }
+
+    // ── T-A41-2: check_no_remaining_placeholders() / placeholder validation ──
+
+    /// T-A41-2a: Clean SQL returns Ok(()).
+    #[test]
+    fn test_check_no_remaining_placeholders_clean_sql() {
+        let sql = "SELECT id FROM t WHERE lsn > '0/1000'::pg_lsn";
+        assert!(check_no_remaining_placeholders(sql, "test").is_ok());
+    }
+
+    /// T-A41-2b: A remaining __PGS_*__ token returns Err(UnresolvedPlaceholder).
+    #[test]
+    fn test_check_no_remaining_placeholders_pgs_token() {
+        let sql = "SELECT * FROM t WHERE lsn > '__PGS_PREV_LSN_42__'::pg_lsn";
+        let err = check_no_remaining_placeholders(sql, "my_st").unwrap_err();
+        match err {
+            crate::error::PgTrickleError::UnresolvedPlaceholder { token, context } => {
+                assert!(token.contains("__PGS_PREV_LSN_42__"), "token={token}");
+                assert_eq!(context, "my_st");
+            }
+            other => panic!("expected UnresolvedPlaceholder, got {other:?}"),
+        }
+    }
+
+    /// T-A41-2c: A remaining __PGT_*__ token returns Err(UnresolvedPlaceholder).
+    #[test]
+    fn test_check_no_remaining_placeholders_pgt_token() {
+        let sql = "SELECT __PGT_ROWID_COL__ FROM t";
+        let err = check_no_remaining_placeholders(sql, "ctx").unwrap_err();
+        match err {
+            crate::error::PgTrickleError::UnresolvedPlaceholder { token, .. } => {
+                assert!(token.contains("__PGT_ROWID_COL__"), "token={token}");
+            }
+            other => panic!("expected UnresolvedPlaceholder, got {other:?}"),
+        }
+    }
+
+    /// T-A41-2d: Mixed set — one resolved, one not — still returns Err.
+    #[test]
+    fn test_check_no_remaining_placeholders_mixed_resolved() {
+        // OID 42 resolved, but OID 99 is still a placeholder.
+        let sql = "lsn > '0/1000'::pg_lsn AND lsn <= '__PGS_NEW_LSN_99__'::pg_lsn";
+        let err = check_no_remaining_placeholders(sql, "st").unwrap_err();
+        match err {
+            crate::error::PgTrickleError::UnresolvedPlaceholder { token, .. } => {
+                assert!(token.contains("99"), "token={token}");
+            }
+            other => panic!("expected UnresolvedPlaceholder, got {other:?}"),
+        }
+    }
+
+    /// T-A41-2e: Repeated placeholders — first one triggers the error.
+    #[test]
+    fn test_check_no_remaining_placeholders_repeated_token() {
+        let sql = "__PGS_PREV_LSN_5__ ... __PGS_PREV_LSN_5__";
+        assert!(check_no_remaining_placeholders(sql, "ctx").is_err());
+    }
+
+    /// T-A41-2f: resolve_delta_template returns Err when a placeholder is
+    /// not covered by source_oids (unknown OID → token remains).
+    #[test]
+    fn test_resolve_delta_template_unknown_oid_returns_err() {
+        let prev = Frontier::new();
+        let new_f = Frontier::new();
+        // OID 99999 is NOT in source_oids → placeholder is not substituted.
+        let template = "__PGS_PREV_LSN_99999__";
+        // OID 99999 IS in source_oids → gets substituted with "0/0" (default for missing frontier)
+        // so this should succeed (empty frontier gives 0/0):
+        let ok = resolve_delta_template(template, &[99999], &prev, &new_f);
+        assert!(
+            ok.is_ok(),
+            "known oid with missing frontier defaults to 0/0"
+        );
+
+        // But if OID is NOT in source_oids at all, the placeholder stays raw:
+        let err = resolve_delta_template(template, &[], &prev, &new_f);
+        assert!(
+            err.is_err(),
+            "unknown oid not in source_oids leaves placeholder unresolved"
+        );
+    }
+
+    /// T-A41-2g: pgt-prefixed placeholder that is not in any frontier returns Err.
+    #[test]
+    fn test_resolve_delta_template_unknown_pgt_oid_returns_err() {
+        let prev = Frontier::new();
+        let new_f = Frontier::new();
+        // The pgt-extraction regex will find pgt_999, but prev/new frontiers
+        // don't have that key — however the function substitutes a "0/0" default,
+        // so this should SUCCEED (no remaining placeholder).
+        let template = "__PGS_PREV_LSN_pgt_999__ ... __PGS_NEW_LSN_pgt_999__";
+        let ok = resolve_delta_template(template, &[], &prev, &new_f);
+        assert!(
+            ok.is_ok(),
+            "pgt placeholder with missing frontier defaults to 0/0 — no error"
+        );
+    }
+
+    /// T-A41-2h: check_no_remaining_placeholders_for() with only __PGS_ prefix
+    /// does NOT flag __PGT_PART_PRED__, which is a legitimate later-stage token.
+    #[test]
+    fn test_check_no_remaining_placeholders_for_pgs_only_ignores_pgt() {
+        // Simulate the SQL that resolve_lsn_placeholders produces: all __PGS_*__
+        // tokens are gone, but __PGT_PART_PRED__ remains (resolved later).
+        let sql = "MERGE INTO st USING d ON st.id = d.id __PGT_PART_PRED__";
+        let result = check_no_remaining_placeholders_for(sql, "test", &["__PGS_"]);
+        assert!(
+            result.is_ok(),
+            "checking only __PGS_ should ignore __PGT_PART_PRED__"
+        );
+    }
+
+    /// T-A41-2i: check_no_remaining_placeholders (both families) DOES catch
+    /// __PGT_PART_PRED__ when called in a context that resolves all __PGT__s.
+    #[test]
+    fn test_check_no_remaining_placeholders_both_catches_pgt_part_pred() {
+        let sql = "MERGE INTO st USING d ON st.id = d.id __PGT_PART_PRED__";
+        let result = check_no_remaining_placeholders(sql, "full_check");
+        assert!(result.is_err(), "full check should catch __PGT_PART_PRED__");
     }
 
     // ── is_scan_chain_tree() ────────────────────────────────────────

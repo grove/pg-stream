@@ -213,6 +213,23 @@ pub enum PgTrickleError {
     /// OUTBOX-B2 (v0.28.0): The specified consumer group was not found.
     #[error("consumer group not found: {0}")]
     ConsumerGroupNotFound(String),
+
+    // ── A41-2: Placeholder validation errors ─────────────────────────────
+    /// A41-2: A delta SQL template still contains unresolved placeholder
+    /// tokens after all substitution passes have completed.
+    ///
+    /// This indicates a bug where a `__PGS_*__` or `__PGT_*__` token was
+    /// not mapped to any known source OID or stream table ID.  Executing
+    /// the SQL with a raw token would cause a PostgreSQL syntax/type error
+    /// that is hard to diagnose.  Raising this error early gives the
+    /// caller a deterministic, actionable message.
+    #[error("unresolved placeholder '{token}' in SQL for {context}")]
+    UnresolvedPlaceholder {
+        /// The unresolved token (e.g. `__PGS_PREV_LSN_99999__`).
+        token: String,
+        /// Contextual description (stream table name or function name).
+        context: String,
+    },
 }
 
 impl PgTrickleError {
@@ -573,7 +590,8 @@ impl PgTrickleError {
             | PgTrickleError::InboxColumnMissing(_, _)
             | PgTrickleError::InboxOrderingPriorityConflict(_)
             | PgTrickleError::ConsumerGroupAlreadyExists(_)
-            | PgTrickleError::ConsumerGroupNotFound(_) => PgTrickleErrorKind::User,
+            | PgTrickleError::ConsumerGroupNotFound(_)
+            | PgTrickleError::UnresolvedPlaceholder { .. } => PgTrickleErrorKind::Internal,
         }
     }
 }

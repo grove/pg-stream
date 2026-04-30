@@ -966,6 +966,14 @@ fn emit_holdback_warning_if_needed(oldest_txn_age_secs: u64) {
 }
 
 /// Execute a singleton unit: refresh a single stream table using the existing inline path.
+///
+/// A41-5 — Isolation invariant:
+/// Each singleton refresh executes in its own `READ COMMITTED` transaction
+/// (the implicit BGW transaction).  The refresh sees a consistent snapshot
+/// of the source tables as of the transaction start and is not affected by
+/// concurrent insertions that arrive after the snapshot was taken.
+/// Snapshot isolation means a singleton never reads its own or another
+/// stream table's uncommitted writes.
 fn execute_worker_singleton(job: &SchedulerJob) -> RefreshOutcome {
     let pgt_id = job.root_pgt_id;
     let st = match load_st_by_id(pgt_id) {
@@ -1058,6 +1066,17 @@ fn execute_worker_singleton(job: &SchedulerJob) -> RefreshOutcome {
 /// Uses the C-level internal sub-transaction API (`BeginInternalSubTransaction`
 /// / `ReleaseCurrentSubTransaction` / `RollbackAndReleaseCurrentSubTransaction`)
 /// because PostgreSQL rejects transaction-control SQL via SPI.
+///
+/// A41-5 — Isolation invariants:
+/// - `atomic_group` (`is_repeatable_read = false`): each member refresh runs
+///   in its own internal sub-transaction with `READ COMMITTED` isolation.
+///   Members see each other's committed writes once the prior sub-transaction
+///   commits.  Failure of any member rolls back the entire group atomically.
+/// - `repeatable_read_group` (`is_repeatable_read = true`): an explicit
+///   `SET TRANSACTION ISOLATION LEVEL REPEATABLE READ` is issued before the
+///   group executes.  All members share the same snapshot as of the group
+///   transaction start.  No member sees writes from others, and the group
+///   appears as a single atomic unit to external observers.
 fn execute_worker_atomic_group(job: &SchedulerJob, is_repeatable_read: bool) -> RefreshOutcome {
     log!(
         "pg_trickle refresh worker: {} group — {} members (job {})",
@@ -1196,6 +1215,13 @@ fn execute_worker_atomic_group(job: &SchedulerJob, is_repeatable_read: bool) -> 
 /// synchronously within the same transaction, so they do not need to be
 /// explicitly refreshed by the worker.  The coordinator must not independently
 /// schedule any member of the closure.
+///
+/// A41-5 — Isolation invariant:
+/// The root refresh and all downstream IMMEDIATE trigger firings share the
+/// same `READ COMMITTED` transaction.  Because triggers fire synchronously
+/// within the outer statement, they see the root's writes but not writes from
+/// other concurrent transactions.  The closure behaves as a single atomic
+/// unit: either all members update or none do (sub-transaction rollback).
 fn execute_worker_immediate_closure(job: &SchedulerJob) -> RefreshOutcome {
     log!(
         "pg_trickle refresh worker: immediate closure — root pgt_id={} ({} members, job {})",
@@ -1249,6 +1275,14 @@ fn execute_worker_immediate_closure(job: &SchedulerJob) -> RefreshOutcome {
 /// Execute a full cyclic Strongly Connected Component in parallel mode.
 ///
 /// Runs iterative fixed-point refresh until convergence.
+///
+/// A41-5 — Isolation invariant:
+/// Each iteration of the fixed-point loop runs in its own `READ COMMITTED`
+/// transaction.  After each iteration, all members' writes are committed and
+/// visible to the next iteration.  Convergence is detected when no member
+/// produces output changes.  External observers may transiently see partially
+/// converged states between iterations; use a repeatable_read_group wrapping
+/// the SCC members when strict external consistency is required.
 fn execute_worker_cyclic_scc(job: &SchedulerJob) -> RefreshOutcome {
     log!(
         "pg_trickle refresh worker: cyclic SCC — {} members (job {})",
@@ -1392,6 +1426,14 @@ fn execute_worker_cyclic_scc(job: &SchedulerJob) -> RefreshOutcome {
 ///
 /// The last member writes to the persistent buffer as normal so that
 /// any external consumers (outside the chain) see the delta.
+///
+/// A41-5 — Isolation invariant:
+/// All members of a fused chain execute within a single `READ COMMITTED`
+/// transaction.  Intermediate bypass tables are `ON COMMIT DROP` temp
+/// tables, so they are automatically cleaned up on transaction boundary.
+/// Because all members share one transaction, the chain is atomic: either
+/// the entire chain commits or, on error, the entire chain rolls back.
+/// External consumers do not see partial chain results.
 fn execute_worker_fused_chain(job: &SchedulerJob) -> RefreshOutcome {
     log!(
         "pg_trickle refresh worker: fused chain — {} members, job {}",

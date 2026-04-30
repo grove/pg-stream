@@ -566,6 +566,27 @@ fn raise_error_with_context(e: PgTrickleError) -> ! {
             .report(PgLogLevel::ERROR);
             unreachable!()
         }
+        // A41-2: Unresolved placeholder in delta SQL template.
+        PgTrickleError::UnresolvedPlaceholder { token, context } => {
+            ErrorReport::new(
+                PgSqlErrorCode::ERRCODE_INTERNAL_ERROR,
+                format!("unresolved placeholder '{}' in SQL for {}", token, context),
+                "",
+            )
+            .set_detail(
+                "A delta SQL template still contained a __PGS_*__ or __PGT_*__ token \
+                 after all substitution passes completed. This indicates an internal bug \
+                 where a source OID or stream table ID was not mapped correctly."
+                    .to_string(),
+            )
+            .set_hint(
+                "This is a bug in pg_trickle. Please report it at \
+                 https://github.com/grove/pg-trickle/issues with the full error message."
+                    .to_string(),
+            )
+            .report(PgLogLevel::ERROR);
+            unreachable!()
+        }
         // INBOX-1..9 / INBOX-B1..B4 (v0.28.0): Inbox errors
         PgTrickleError::InboxAlreadyExists(name) => {
             ErrorReport::new(

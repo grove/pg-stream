@@ -584,3 +584,82 @@ async fn test_auto_refresh_updates_catalog_metadata() {
     let (_, _, _, errors) = db.pgt_status("meta_st").await;
     assert_eq!(errors, 0, "consecutive_errors should be 0 after success");
 }
+
+// ── T-A41-4: Pool worker respects pg_trickle.enabled GUC ────────────────────
+
+/// T-A41-4: While pg_trickle.enabled = off the pool worker must not execute
+/// any queued refresh jobs.  When enabled is restored the scheduler must
+/// resume processing normally.
+#[tokio::test]
+async fn test_pool_worker_does_not_run_while_disabled() {
+    let db = E2eDb::new_on_postgres_db().await.with_extension().await;
+
+    // Configure a fast scheduler so timing artefacts don't dominate.
+    configure_fast_scheduler(&db).await;
+
+    // Create a source table and a stream table with a short schedule.
+    db.execute("CREATE TABLE disabled_src (id INT PRIMARY KEY, val TEXT)")
+        .await;
+    db.execute("INSERT INTO disabled_src VALUES (1, 'initial')")
+        .await;
+    db.create_st(
+        "disabled_st",
+        "SELECT id, val FROM disabled_src",
+        "1s",
+        "FULL",
+    )
+    .await;
+
+    // Record the initial refresh count from history.
+    let count_before: i64 = db
+        .query_scalar(
+            "SELECT count(*) FROM pgtrickle.pgt_refresh_history \
+             WHERE pgt_name = 'disabled_st' AND status = 'success'",
+        )
+        .await;
+
+    // Disable the extension — pool workers must stop claiming jobs.
+    db.alter_system_set_and_wait("pg_trickle.enabled", "false", "off")
+        .await;
+    let enabled_off = db.show_setting("pg_trickle.enabled").await;
+    assert_eq!(enabled_off, "off", "pg_trickle.enabled should be 'off'");
+
+    // Insert new data to create a pending refresh opportunity.
+    db.execute("INSERT INTO disabled_src VALUES (2, 'new_data')")
+        .await;
+
+    // Wait long enough for the scheduler to have attempted a refresh IF it
+    // were enabled (scheduler_interval_ms=100, so 3 seconds is ~30 wakeups).
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
+    // Verify: no new successful refreshes should have occurred.
+    let count_disabled: i64 = db
+        .query_scalar(
+            "SELECT count(*) FROM pgtrickle.pgt_refresh_history \
+             WHERE pgt_name = 'disabled_st' AND status = 'success'",
+        )
+        .await;
+    assert_eq!(
+        count_before, count_disabled,
+        "no refreshes should execute while pg_trickle.enabled = off; \
+         before={count_before}, after_disabled_period={count_disabled}"
+    );
+
+    // Re-enable and confirm refreshes resume.
+    db.alter_system_set_and_wait("pg_trickle.enabled", "true", "on")
+        .await;
+    let enabled_on = db.show_setting("pg_trickle.enabled").await;
+    assert_eq!(
+        enabled_on, "on",
+        "pg_trickle.enabled should be restored to 'on'"
+    );
+
+    // After re-enabling the data inserted while disabled should trigger a refresh.
+    let resumed = db
+        .wait_for_auto_refresh("disabled_st", Duration::from_secs(60))
+        .await;
+    assert!(
+        resumed,
+        "scheduler should resume refreshes after re-enabling"
+    );
+}

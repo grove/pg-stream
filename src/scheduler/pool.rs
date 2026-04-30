@@ -116,6 +116,18 @@ pub extern "C-unwind" fn pg_trickle_pool_worker_main(_arg: pg_sys::Datum) {
             break;
         }
 
+        // A41-4: Check pg_trickle.enabled before claiming any job.
+        // When the extension is disabled, defer all work and sleep until
+        // re-enabled to avoid processing jobs while maintenance is in progress.
+        if !config::pg_trickle_enabled() {
+            let ok = BackgroundWorker::wait_latch(Some(std::time::Duration::from_millis(500)));
+            if !ok {
+                // SIGTERM received during sleep.
+                break;
+            }
+            continue;
+        }
+
         // Try to claim one QUEUED job.
         let claimed = execute_pool_worker_tick(&db_name, worker_idx);
 

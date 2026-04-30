@@ -1,0 +1,30 @@
+-- pg_trickle 0.40.0 -> 0.41.0 upgrade migration
+--
+-- v0.41.0 — DVM Correctness: Structural Cache Keys, Placeholder Safety & WAL Transition Guards
+--
+-- Changes in this release:
+--
+--   A41-1: Structural snapshot CTE cache key fingerprint.
+--     Replace alias-based cache key with a structural fingerprint of the
+--     OpTree. No SQL-level change.
+--
+--   A41-2: Placeholder resolution full-validation assertion.
+--     After every placeholder substitution pass, run a strict regex check
+--     for remaining __PGS_* / __PGT_* tokens.  Returns a typed error on
+--     any unresolved token.  No SQL-level change.
+--
+--   A41-3: WAL transition eligibility recheck at commit point.
+--     Re-check table eligibility (relkind, PK, replica identity FULL)
+--     immediately before committing the TRANSITIONING catalog state update.
+--     Falls back to trigger mode with a logged warning on failure.
+--     No SQL-level change.
+--
+--   A41-4: Pool worker pg_trickle.enabled check before job claim.
+--     Pool workers now check config::pg_trickle_enabled() before claiming
+--     each job. No SQL-level change.
+--
+--   A41-5: Document isolation invariants for job execution modes.
+--     Code-level comments added to scheduler. No SQL-level change.
+--
+-- No schema changes in this release.
+SELECT 1;
