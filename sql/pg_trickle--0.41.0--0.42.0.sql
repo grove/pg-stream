@@ -10,7 +10,14 @@
 --   A42-14: Stale EC-06 comment cleanup.
 --
 -- Schema changes:
---   - pgtrickle.repair_stream_table(text) → text (added via pg_extern)
---     No SQL-level DDL needed; pgrx registers this on CREATE/ALTER EXTENSION.
+--   - pgtrickle.repair_stream_table(text) → text (new pg_extern, A42-1)
 
-SELECT 1;
+-- A42-1: Register the new repair_stream_table function.
+-- pgrx does not automatically add new functions during ALTER EXTENSION UPDATE,
+-- so we must register it explicitly here.
+CREATE OR REPLACE FUNCTION pgtrickle."repair_stream_table"(
+        "name" TEXT
+) RETURNS TEXT
+STRICT
+LANGUAGE c
+AS 'MODULE_PATHNAME', 'repair_stream_table_wrapper';

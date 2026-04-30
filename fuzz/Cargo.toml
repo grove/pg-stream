@@ -7,9 +7,6 @@ edition = "2024"
 [package.metadata]
 cargo-fuzz = true
 
-[lib]
-crate-type = ["cdylib"]
-
 [[bin]]
 name = "parser_fuzz"
 path = "fuzz_targets/parser_fuzz.rs"
