@@ -19,6 +19,25 @@ runs:
   using: composite
   steps:
     # ── Rust toolchain ────────────────────────────────────────────────────
+    # On Windows runners, spurious BASH_FUNC_* environment variables are
+    # occasionally injected by prior steps, causing dtolnay/rust-toolchain
+    # to abort with "bash function injection" errors.
+    # See https://github.com/actions/partner-runner-images/issues/169
+    - name: Remove spurious BASH_FUNC_ env vars (Windows)
+      if: runner.os == 'Windows'
+      shell: pwsh
+      run: |
+        $removed = @()
+        Get-ChildItem -Path Env: | Where-Object { $_.Name -like 'BASH_FUNC_*' } | ForEach-Object {
+          [Environment]::SetEnvironmentVariable($_.Name, $null, [EnvironmentVariableTarget]::Process)
+          $removed += $_.Name
+        }
+        if ($removed.Count -gt 0) {
+          Write-Host "Removed BASH_FUNC_ env vars: $($removed -join ', ')"
+        } else {
+          Write-Host "No BASH_FUNC_ env vars found"
+        }
+
     - name: Install Rust
       uses: dtolnay/rust-toolchain@master
       with:
