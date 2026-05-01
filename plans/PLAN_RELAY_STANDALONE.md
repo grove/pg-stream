@@ -632,6 +632,45 @@ Measured baseline of `outbox` write today is ~50µs; an SPI function call
 adds ~5µs of plan-cache lookup. Negligible against a refresh that already
 runs the user's SELECT query.
 
+**Dependency direction (soft, not hard):** `pg_trickle.control` does
+**not** declare `requires = 'pg_tide'`. The relationship is the mirror
+of option B's old "soft dependency" framing — option B had the relay
+soft-depending on `pg_trickle`; option C-revised has `pg_trickle`
+soft-depending on `pg_tide`. Concretely:
+
+- Installing `pg_trickle` on a database without `pg_tide` succeeds.
+  All IVM features (stream tables, refresh, scheduler, CDC) work
+  unchanged. `pg_trickle` is fundamentally an IVM engine; outbox
+  publishing is an *optional* downstream concern.
+- `pgtrickle.attach_outbox()` probes at call time:
+  ```sql
+  IF to_regproc('tide.outbox_create(...)') IS NULL THEN
+      RAISE EXCEPTION 'pg_trickle.attach_outbox() requires the pg_tide
+                       extension. Install it with: CREATE EXTENSION pg_tide;'
+          USING HINT = 'See https://github.com/grove/pg-tide';
+  END IF;
+  ```
+  Clear actionable error rather than a `function does not exist` cryptic
+  failure or a hard-fail at `CREATE EXTENSION pg_trickle` time.
+- `pg_trickle`'s test suite continues to cover the IVM core without
+  installing `pg_tide`. A *separate* integration tier exercises the
+  with-`pg_tide` paths and runs only when both extensions are present.
+
+**Why soft and not hard:**
+
+| Concern | Hard dep (`requires`) | Soft dep (runtime probe) ✓ |
+|---|---|---|
+| Install simplicity | Both extensions install in one DDL chain | Two `CREATE EXTENSION` statements, but only if you want outbox |
+| `pg_trickle` for IVM-only users | Forced to also install `pg_tide` | Pay-for-what-you-use |
+| Failure mode if `pg_tide` missing | `CREATE EXTENSION pg_trickle` fails | `attach_outbox()` raises with install hint; everything else works |
+| Packaging coupling (PGXN, distro packages) | `pg_trickle` package metadata pulls `pg_tide` | Independent packages |
+| Aligns with §7.4 "useful to users who don't know what IVM is" | Forces the inverse coupling | Each extension genuinely standalone |
+| Aligns with `pg_tide.control` (also `# no requires`) | Asymmetric | Symmetric — both are first-class citizens |
+
+The soft direction is consistent with the whole point of the cut: each
+extension stands on its own, the integration is opt-in. A hard `requires`
+would re-introduce the coupling we are deliberately removing.
+
 ### 7.4 Why this is realistic for non-`pg_trickle` users
 
 Unlike the option-B framing ("anyone with an outbox-shaped table"), the
@@ -851,7 +890,11 @@ this is acceptable because there are no known users.
   — drop the `aws-smithy-http-client` exception (only existed for the
   relay's optional SQS feature)
 - [tests/Dockerfile.e2e](tests/Dockerfile.e2e) lines 36–48 — drop relay
-  placeholder
+  placeholdert reads a Postgres table *(once `WireFormat` phase 2 ships — see §7.10)* |
+| Postgres-first stacks (Supabase, Crunchy, Neon, plain self-hosted) wanting "publish-to-Kafka" | Roll their own | Install one extension |
+| Anyone needing the inbox pattern (idempotent receive + DLQ) | Hand-roll | Built-in |
+| `pg_trickle` users who also want to publish change events | Today: `enable_outbox()` | Same UX via `attach_outbox()`, plus the option to use the same outbox infrastructure for non-stream-table events |
+
 - [Cargo.toml](Cargo.toml): drop `pgtrickle-relay` from the workspace
   `members` list
 - [deny.toml](deny.toml) lines 44–45 — drop the SQS-feature license
