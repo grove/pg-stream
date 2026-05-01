@@ -129,3 +129,10 @@ rules:
         - /src/dvm/**
         # Standalone CLI binary — not loaded into the PostgreSQL process
         - /src/bin/**
+        # Separate-file test modules (declared as `mod tests;` inside
+        # `#[cfg(test)] mod tests` in the parent module).  Semgrep's AST
+        # does not see the `#[cfg(test)]` wrapper in the parent file when
+        # analysing the child file in isolation, so `pattern-not-inside:
+        # mod tests { ... }` above cannot match.  These files are compiled
+        # only for `cargo test` and never loaded into a PostgreSQL backend.
+        - /src/**/tests.rs
