@@ -19,7 +19,7 @@
 //! 9. **Part 7a** — Delete stale NULL-padded right rows when new left matches appear
 //!    (guard: NOT EXISTS L_old — right was previously unmatched)
 //! 10. **Part 7b** — Insert NULL-padded right rows when right row loses all left matches
-//!    (guards: NOT EXISTS L₁, AND EXISTS L_old, AND NOT EXISTS ΔR_I-same-key)
+//!     (guards: NOT EXISTS L₁, AND EXISTS L_old, AND NOT EXISTS ΔR_I-same-key)
 //!
 //! ## EC-01 path (complex left children):
 //!
@@ -28,7 +28,7 @@
 //! 3. **Part 2** — current_left JOIN delta_right
 //! 4. **Part 3a** — delta_left INSERTS anti-join R₁
 //! 5. **Part 3b** — delta_left DELETES anti-join R₀
-//! 6–10. Parts 4–7b same as L₀ path with R_old/L_old guards
+//!    6–10. Parts 4–7b same as L₀ path with R_old/L_old guards
 //!
 //! ## L₀ fix: Pre-change left snapshot for Part 2
 //!
@@ -51,6 +51,7 @@
 //! - Part 5 AND EXISTS R_old: fires only when left previously had a match
 //! - Part 5 AND NOT EXISTS ΔL_I-same-key: prevents duplicate with Part 3a
 //!   when a left UPDATE and right DELETE happen for the same key in the same cycle
+//!
 //! Parts 7a/7b have symmetric guards for the right side.
 
 use crate::dvm::diff::{DiffContext, DiffResult, quote_ident};
@@ -224,13 +225,12 @@ pub fn diff_full_join(ctx: &mut DiffContext, op: &OpTree) -> Result<DiffResult, 
             mark_leaf_delta_ctes_not_materialized(left, ctx);
             pre_change
         } else {
-            let l0 = build_leaf_snapshot_sql(
+            build_leaf_snapshot_sql(
                 left,
                 &left_result.cte_name,
                 left_cols,
                 &ctx.fallback_leaf_oids,
-            );
-            l0
+            )
         }
     } else {
         left_table.clone()

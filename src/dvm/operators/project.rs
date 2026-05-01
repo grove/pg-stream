@@ -75,20 +75,19 @@ pub fn diff_project(ctx: &mut DiffContext, op: &OpTree) -> Result<DiffResult, Pg
     // the ST should store NULL.  We communicate this via agg_sum_coalesce_defaults.
     let saved_coalesce_defaults = ctx.agg_sum_coalesce_defaults.clone();
     for (expr, alias) in expressions.iter().zip(aliases.iter()) {
-        if let crate::dvm::parser::Expr::FuncCall { func_name, args } = expr {
-            if func_name.eq_ignore_ascii_case("coalesce") && args.len() >= 2 {
-                if let (
-                    crate::dvm::parser::Expr::ColumnRef { column_name, .. },
-                    crate::dvm::parser::Expr::Literal(default_val),
-                ) = (&args[0], &args[1])
-                {
-                    // The column being wrapped is a child output column.
-                    // Record the mapping: alias (ST col name) → default.
-                    let _ = alias; // alias matches the outer SELECT alias
-                    ctx.agg_sum_coalesce_defaults
-                        .insert(column_name.clone(), default_val.clone());
-                }
-            }
+        if let crate::dvm::parser::Expr::FuncCall { func_name, args } = expr
+            && func_name.eq_ignore_ascii_case("coalesce")
+            && args.len() >= 2
+            && let (
+                crate::dvm::parser::Expr::ColumnRef { column_name, .. },
+                crate::dvm::parser::Expr::Literal(default_val),
+            ) = (&args[0], &args[1])
+        {
+            // The column being wrapped is a child output column.
+            // Record the mapping: alias (ST col name) → default.
+            let _ = alias; // alias matches the outer SELECT alias
+            ctx.agg_sum_coalesce_defaults
+                .insert(column_name.clone(), default_val.clone());
         }
     }
 
