@@ -60,6 +60,8 @@ psql postgresql://postgres:playground@localhost:5432/playground
 ```
 
 Or connect with any PostgreSQL client:
+
+```bash
 pgtrickle --url postgresql://postgres:playground@localhost:5432/playground
 ```
 
