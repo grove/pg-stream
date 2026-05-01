@@ -284,9 +284,10 @@ fn diff_scan_change_buffer(
     // D-rows carry old values in c."col"; I-rows carry new values.
     // The ST-source (is_st_source) distinction is gone — both base and ST
     // change buffers use the same flat schema.
+    // Use cb_col_name() to map reserved names (e.g. user column "action" → "__usr_action").
     let col_refs: Vec<String> = columns
         .iter()
-        .map(|c| format!("c.{}", quote_ident(&c.name)))
+        .map(|c| format!("c.{}", quote_ident(&crate::cdc::cb_col_name(&c.name))))
         .collect();
     let typed_col_refs_str = col_refs.join(",\n       ");
 
@@ -294,7 +295,13 @@ fn diff_scan_change_buffer(
     // The alias is the original column name for downstream CTE compatibility.
     let col_ref_aliased: Vec<String> = columns
         .iter()
-        .map(|c| format!("c.{} AS {}", quote_ident(&c.name), quote_ident(&c.name),))
+        .map(|c| {
+            format!(
+                "c.{} AS {}",
+                quote_ident(&crate::cdc::cb_col_name(&c.name)),
+                quote_ident(&c.name),
+            )
+        })
         .collect();
     let old_col_refs: Vec<String> = col_ref_aliased.clone();
     let new_col_refs: Vec<String> = col_ref_aliased;
@@ -413,9 +420,16 @@ fn diff_scan_change_buffer(
     // (D-row + I-row), so no UNION ALL for 'U' rows is needed here.
     if is_keyless {
         // A44-10: Flat column references (no new_/old_ prefix).
+        // Use cb_col_name() to map reserved source column names to their CB storage names.
         let col_refs_raw: Vec<String> = columns
             .iter()
-            .map(|c| format!("c.{} AS {}", quote_ident(&c.name), quote_ident(&c.name),))
+            .map(|c| {
+                format!(
+                    "c.{} AS {}",
+                    quote_ident(&crate::cdc::cb_col_name(&c.name)),
+                    quote_ident(&c.name),
+                )
+            })
             .collect();
         // Use array_agg(col)[1] instead of MAX(col) so that types without a
         // comparison operator (e.g. jsonb, json, arrays, composites) are handled
@@ -858,7 +872,10 @@ pub fn rewrite_predicate_for_scan(expr: &Expr, prefix: &str) -> String {
     match expr {
         Expr::ColumnRef { column_name, .. } => {
             // A44-10 (D+I schema): prefix is "" — just use the flat column name.
-            format!("c.\"{}{}\"", prefix, column_name.replace('"', "\"\""))
+            // Apply cb_col_name() so reserved source column names (e.g. "action")
+            // resolve to their change-buffer storage name ("__usr_action").
+            let cb_name = crate::cdc::cb_col_name(column_name);
+            format!("c.\"{}{}\"", prefix, cb_name.replace('"', "\"\""))
         }
         Expr::Literal(val) => val.clone(),
         Expr::BinaryOp { op, left, right } => {

@@ -329,7 +329,12 @@ async fn test_fuse_reset_reinitialize() {
     let blown = wait_for_fuse_blown(&db, "st_fuse_reinit", Duration::from_secs(30)).await;
     assert!(blown, "fuse should have blown");
 
-    // Raise ceiling to prevent re-blow, then reset with reinitialize
+    // Raise ceiling to prevent re-blow, then reset with reinitialize.
+    // Pause the scheduler first so it cannot process needs_reinit before we assert it.
+    db.execute("ALTER SYSTEM SET pg_trickle.enabled = off")
+        .await;
+    db.reload_config_and_wait().await;
+
     db.execute("SELECT pgtrickle.alter_stream_table('st_fuse_reinit', fuse_ceiling => 100000)")
         .await;
     db.execute("SELECT pgtrickle.reset_fuse('st_fuse_reinit', 'reinitialize')")
@@ -344,6 +349,10 @@ async fn test_fuse_reset_reinitialize() {
         needs_reinit,
         "needs_reinit should be true after reinitialize reset"
     );
+
+    // Re-enable scheduler.
+    db.execute("ALTER SYSTEM RESET pg_trickle.enabled").await;
+    db.reload_config_and_wait().await;
 }
 
 /// fuse_status() introspection function returns expected rows.

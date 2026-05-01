@@ -49,6 +49,27 @@ use std::collections::HashMap;
 use crate::config;
 use crate::error::PgTrickleError;
 
+// ── Reserved change-buffer column names ────────────────────────────────────
+
+/// Built-in CDC metadata column names that live at the top of every change-buffer
+/// table.  A source table column with any of these names would collide with the
+/// metadata column in a flat (A44-10 D+I) change-buffer schema.
+const RESERVED_CB_COLS: &[&str] = &["change_id", "lsn", "action", "pk_hash", "changed_cols"];
+
+/// Map a *source* column name to its change-buffer storage name.
+///
+/// When a source column name matches one of [`RESERVED_CB_COLS`], the column is
+/// stored in the change buffer as `__usr_{name}` to prevent a
+/// `column "…" specified more than once` error in PostgreSQL.
+/// All other names pass through unchanged.
+pub fn cb_col_name(name: &str) -> String {
+    if RESERVED_CB_COLS.contains(&name) {
+        format!("__usr_{name}")
+    } else {
+        name.to_string()
+    }
+}
+
 // ── CITUS-4: Stable buffer naming helpers ──────────────────────────────────
 
 /// Return the base name (without schema) for the change buffer table of a source.
@@ -607,7 +628,8 @@ fn build_typed_col_defs(columns: &[(String, String)]) -> String {
     columns
         .iter()
         .map(|(name, type_name)| {
-            let qname = name.replace('"', "\"\"");
+            let cb_name = cb_col_name(name);
+            let qname = cb_name.replace('"', "\"\"");
             format!(",\"{qname}\" {type_name}")
         })
         .collect::<Vec<_>>()
@@ -1460,8 +1482,10 @@ pub fn alter_change_buffer_add_columns(
 
     for (col_name, col_type) in &source_cols {
         // A44-10 (D+I schema): add flat column "col" instead of "new_col"/"old_col".
-        if !existing_set.contains(col_name.as_str()) {
-            let qcol = col_name.replace('"', "\"\"");
+        // Use cb_col_name() so reserved names (e.g. "action") are stored as "__usr_action".
+        let cb_name = cb_col_name(col_name);
+        if !existing_set.contains(cb_name.as_str()) {
+            let qcol = cb_name.replace('"', "\"\"");
             let qtype = col_type.as_str();
             let add_flat = format!(
                 "ALTER TABLE {schema}.{buf} \
@@ -1743,12 +1767,14 @@ fn build_row_trigger_fn_sql(
         .unwrap_or_default();
 
     // A44-10: Flat column names (no new_/old_ prefix).
+    // Use cb_col_name() so reserved names (e.g. "action") are stored as "__usr_action".
     let cn: String = columns
         .iter()
-        .map(|(n, _)| format!(", \"{}\"", n.replace('"', "\"\"")))
+        .map(|(n, _)| format!(", \"{}\"", cb_col_name(n).replace('"', "\"\"")))
         .collect::<Vec<_>>()
         .join("");
     // NEW row values (for INSERT and the I-row of UPDATE).
+    // Always reference the source record with the original column name.
     let nv: String = columns
         .iter()
         .map(|(n, _)| format!(", NEW.\"{}\"", n.replace('"', "\"\"")))
@@ -1852,12 +1878,14 @@ fn build_stmt_trigger_fn_sql(
     let pko = build_pk_hash_stmt_expr("o", pk_columns, columns);
 
     // A44-10: Flat column names (no new_/old_ prefix) for INSERT/DELETE/UPDATE.
+    // Use cb_col_name() so reserved names (e.g. "action") are stored as "__usr_action".
     let cn: String = columns
         .iter()
-        .map(|(n, _)| format!(", \"{}\"", n.replace('"', "\"\"")))
+        .map(|(n, _)| format!(", \"{}\"", cb_col_name(n).replace('"', "\"\"")))
         .collect::<Vec<_>>()
         .join("");
     // New-row values (n.col from __pgt_new).
+    // Always reference the transition table with the original column name.
     let ncr: String = columns
         .iter()
         .map(|(n, _)| format!(", n.\"{}\"", n.replace('"', "\"\"")))
@@ -2929,7 +2957,13 @@ pub fn poll_foreign_table_changes(
     // Build column lists for INSERT into change buffer.
     // A44-10: Flat column names (no new_/old_ prefix) matching base table
     // change buffer schema created by create_change_buffer_table().
-    let col_names: Vec<String> = col_defs
+    // cb_col_names: change-buffer INSERT target names (uses cb_col_name() for reserved cols).
+    // src_col_names: SELECT source names from the actual table (original names).
+    let cb_col_names: Vec<String> = col_defs
+        .iter()
+        .map(|(name, _)| format!("\"{}\"", cb_col_name(name).replace('"', "\"\"")))
+        .collect();
+    let src_col_names: Vec<String> = col_defs
         .iter()
         .map(|(name, _)| format!("\"{}\"", name.replace('"', "\"\"")))
         .collect();
@@ -2954,17 +2988,20 @@ pub fn poll_foreign_table_changes(
         )
     };
 
-    let col_list = col_names.join(", ");
+    let cb_col_list = cb_col_names.join(", ");
+    let src_col_list = src_col_names.join(", ");
 
     // ── Deleted rows: in snapshot but not in current foreign table ──
     // These appear as 'D' (delete) rows in the change buffer.
+    // INSERT target uses cb_col_list (change-buffer names); SELECT uses src_col_list
+    // (original source names). Values are matched positionally.
     let deleted_sql = format!(
-        "INSERT INTO {change_table} (lsn, action, pk_hash, {col_list}) \
-         SELECT pg_current_wal_insert_lsn(), 'D', {pk_hash_expr}, {col_list} \
+        "INSERT INTO {change_table} (lsn, action, pk_hash, {cb_col_list}) \
+         SELECT pg_current_wal_insert_lsn(), 'D', {pk_hash_expr}, {src_col_list} \
          FROM (\
-           SELECT {col_list} FROM {snapshot_table} \
+           SELECT {src_col_list} FROM {snapshot_table} \
            EXCEPT ALL \
-           SELECT {col_list} FROM {source_table}\
+           SELECT {src_col_list} FROM {source_table}\
          ) __pgt_del"
     );
     Spi::run(&deleted_sql).map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
@@ -2972,12 +3009,12 @@ pub fn poll_foreign_table_changes(
     // ── Inserted rows: in current foreign table but not in snapshot ──
     // These appear as 'I' (insert) rows in the change buffer.
     let inserted_sql = format!(
-        "INSERT INTO {change_table} (lsn, action, pk_hash, {col_list}) \
-         SELECT pg_current_wal_insert_lsn(), 'I', {pk_hash_expr}, {col_list} \
+        "INSERT INTO {change_table} (lsn, action, pk_hash, {cb_col_list}) \
+         SELECT pg_current_wal_insert_lsn(), 'I', {pk_hash_expr}, {src_col_list} \
          FROM (\
-           SELECT {col_list} FROM {source_table} \
+           SELECT {src_col_list} FROM {source_table} \
            EXCEPT ALL \
-           SELECT {col_list} FROM {snapshot_table}\
+           SELECT {src_col_list} FROM {snapshot_table}\
          ) __pgt_ins"
     );
     Spi::run(&inserted_sql).map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
@@ -3797,6 +3834,47 @@ mod tests {
         let cols = vec![("ts".to_string(), "timestamp with time zone".to_string())];
         let result = build_typed_col_defs(&cols);
         assert!(result.contains("timestamp with time zone"));
+    }
+
+    #[test]
+    fn test_typed_col_defs_reserved_name_prefixed() {
+        // A source column named "action" must be stored as "__usr_action" to
+        // avoid colliding with the built-in change-buffer metadata column.
+        let cols = vec![
+            ("id".to_string(), "integer".to_string()),
+            ("action".to_string(), "text".to_string()),
+            ("lsn".to_string(), "bigint".to_string()),
+        ];
+        let result = build_typed_col_defs(&cols);
+        assert!(
+            result.contains(r#","id" integer"#),
+            "non-reserved column unchanged: {result}"
+        );
+        assert!(
+            result.contains(r#","__usr_action" text"#),
+            "reserved 'action' should become '__usr_action': {result}"
+        );
+        assert!(
+            result.contains(r#","__usr_lsn" bigint"#),
+            "reserved 'lsn' should become '__usr_lsn': {result}"
+        );
+        assert!(
+            !result.contains(r#","action" text"#),
+            "bare 'action' must not appear: {result}"
+        );
+    }
+
+    #[test]
+    fn test_cb_col_name_reserved_names() {
+        assert_eq!(cb_col_name("action"), "__usr_action");
+        assert_eq!(cb_col_name("lsn"), "__usr_lsn");
+        assert_eq!(cb_col_name("pk_hash"), "__usr_pk_hash");
+        assert_eq!(cb_col_name("changed_cols"), "__usr_changed_cols");
+        assert_eq!(cb_col_name("change_id"), "__usr_change_id");
+        // Non-reserved names pass through unchanged.
+        assert_eq!(cb_col_name("id"), "id");
+        assert_eq!(cb_col_name("status"), "status");
+        assert_eq!(cb_col_name("amount"), "amount");
     }
 
     // ── F15: Selective CDC Column Capture ─────────────────────────────────────

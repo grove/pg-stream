@@ -841,8 +841,9 @@ fn write_decoded_change(
         }
 
         for (col_name, col_type) in columns {
-            let safe_name = col_name.replace('"', "\"\"");
-            flat_col_names.push(format!("\"{}\"", safe_name));
+            let cb_name = crate::cdc::cb_col_name(col_name);
+            let safe_cb_name = cb_name.replace('"', "\"\"");
+            flat_col_names.push(format!("\"{}\"", safe_cb_name));
             d_params.push(old_parsed.get(col_name).cloned());
             i_params.push(parsed.get(col_name).cloned());
             let d_idx = d_params.len();
@@ -865,7 +866,10 @@ fn write_decoded_change(
         // Build col list (excluding lsn, action, pk_hash — handled separately).
         let data_col_names: Vec<String> = columns
             .iter()
-            .map(|(n, _)| format!("\"{}\"", n.replace('"', "\"\"")))
+            .map(|(n, _)| {
+                let cb_name = crate::cdc::cb_col_name(n);
+                format!("\"{}\"", cb_name.replace('"', "\"\""))
+            })
             .collect();
         let data_col_str = if data_col_names.is_empty() {
             String::new()
@@ -943,19 +947,21 @@ fn write_decoded_change(
     }
 
     for (col_name, col_type) in columns {
-        let safe_name = col_name.replace('"', "\"\"");
+        let cb_name = crate::cdc::cb_col_name(col_name);
+        let safe_cb_name = cb_name.replace('"', "\"\"");
 
         match action {
             'I' => {
                 // A44-10: flat column "col" (was "new_col").
-                col_names.push(format!("\"{}\"", safe_name));
+                // Use cb_col_name() so reserved names are stored as "__usr_{name}".
+                col_names.push(format!("\"{}\"", safe_cb_name));
                 let val = parsed.get(col_name).cloned();
                 param_values.push(val);
                 placeholders.push(format!("${}::{}", param_values.len(), col_type));
             }
             'D' => {
                 // A44-10: flat column "col" (was "old_col").
-                col_names.push(format!("\"{}\"", safe_name));
+                col_names.push(format!("\"{}\"", safe_cb_name));
                 let val = parsed.get(col_name).cloned();
                 param_values.push(val);
                 placeholders.push(format!("${}::{}", param_values.len(), col_type));
