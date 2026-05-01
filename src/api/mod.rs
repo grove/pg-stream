@@ -4602,10 +4602,10 @@ fn repair_stream_table_impl(name: &str) -> Result<String, PgTrickleError> {
             let stable_name = cdc::get_cdc_name_for_source(source_oid);
             if let Err(e) = cdc::create_change_trigger(
                 source_oid,
-                &stable_name,
+                &change_schema,
                 &pk_columns,
                 &col_defs,
-                &change_schema,
+                &stable_name,
             ) {
                 actions.push(format!(
                     "trigger rebuild failed for OID {}: {}",
