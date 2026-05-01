@@ -2667,9 +2667,15 @@ pub fn trigger_exists(source_oid: pg_sys::Oid) -> Result<bool, PgTrickleError> {
             format!("pg_trickle_cdc_upd_{}", oid_u32).as_str().into(),
             format!("pg_trickle_cdc_del_{}", oid_u32).as_str().into(),
             format!("pg_trickle_cdc_{}", stable_name).as_str().into(),
-            format!("pg_trickle_cdc_ins_{}", stable_name).as_str().into(),
-            format!("pg_trickle_cdc_upd_{}", stable_name).as_str().into(),
-            format!("pg_trickle_cdc_del_{}", stable_name).as_str().into(),
+            format!("pg_trickle_cdc_ins_{}", stable_name)
+                .as_str()
+                .into(),
+            format!("pg_trickle_cdc_upd_{}", stable_name)
+                .as_str()
+                .into(),
+            format!("pg_trickle_cdc_del_{}", stable_name)
+                .as_str()
+                .into(),
         ],
     )
     .map_err(|e: pgrx::spi::SpiError| PgTrickleError::SpiError(e.to_string()))?;

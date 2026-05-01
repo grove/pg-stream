@@ -371,10 +371,7 @@ fn build_snapshot_inline_from_for_join(op: &OpTree) -> Option<String> {
             left,
             right,
         } => Some(build_snapshot_inline_join_from(
-            "JOIN",
-            condition,
-            left,
-            right,
+            "JOIN", condition, left, right,
         )),
         OpTree::LeftJoin {
             condition,

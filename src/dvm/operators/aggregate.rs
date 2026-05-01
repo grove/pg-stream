@@ -1050,7 +1050,9 @@ fn build_rescan_cte(
         // so `__pgt_dq` is referenced with the correct defining_query column name.
         let dq_col_name = |delta_col: &str| -> String {
             if let Some(ref map) = ctx.st_column_alias_map {
-                map.get(delta_col).cloned().unwrap_or_else(|| delta_col.to_string())
+                map.get(delta_col)
+                    .cloned()
+                    .unwrap_or_else(|| delta_col.to_string())
             } else {
                 delta_col.to_string()
             }
@@ -2530,9 +2532,7 @@ fn agg_merge_expr_mapped(
                 let else_branch = if else_default.is_some() {
                     // COALESCE-wrapped SUM: keep algebraic formula so the ST
                     // stores 0 (the COALESCE default) when the group empties.
-                    format!(
-                        "COALESCE(st.{qt}, 0) + COALESCE(d.{ins}, 0) - COALESCE(d.{del}, 0)"
-                    )
+                    format!("COALESCE(st.{qt}, 0) + COALESCE(d.{ins}, 0) - COALESCE(d.{del}, 0)")
                 } else {
                     // Bare SUM: when nonnull_count drops to 0, result is NULL.
                     "NULL".to_string()
