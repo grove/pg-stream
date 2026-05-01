@@ -4,26 +4,54 @@
 //!
 //! The delta is a multi-part UNION ALL:
 //!
-//! 1. **Part 1a** — delta_left INSERTS JOIN R₁ (matching insert rows)
-//! 2. **Part 1b** — delta_left DELETES JOIN R₀ (matching delete rows, EC-01 fix)
-//! 3. **Part 2** — current_left JOIN delta_right (matching rows)
-//! 4. **Part 3a** — delta_left INSERTS anti-join R₁ (non-matching left → NULL right)
-//! 5. **Part 3b** — delta_left DELETES anti-join R₀ (non-matching left → NULL right)
-//! 6. **Part 4** — Delete stale NULL-padded left rows when new right matches
-//! 7. **Part 5** — Insert NULL-padded left rows when last right match removed
-//! 8. **Part 6** — delta_right anti-join left (non-matching right → NULL left)
-//! 9. **Part 7** — Symmetric transitions for right side gaining/losing left matches
+//! ## L₀ path (simple/Scan children — default):
 //!
-//! Parts 1-5 mirror the LEFT JOIN operator (outer_join.rs). Parts 6-7 add
-//! the symmetric right-side anti-join handling.
+//! 1. **Part 1** — delta_left JOIN R₁ (unsplit — standard DBSP L₀ formula)
+//! 2. **Part 2** — L₀ JOIN delta_right (pre-change left, correct attribution)
+//! 3. **Part 3a** — delta_left INSERTS anti-join R₁ (non-matching left → NULL right)
+//! 4. **Part 3b** — delta_left DELETES anti-join R_old (non-matching left → NULL right)
+//! 5. **Part 4** — Delete stale NULL-padded left rows when new right matches appear
+//!    (guard: NOT EXISTS R_old — left was previously unmatched)
+//! 6. **Part 5** — Insert NULL-padded left rows when last right match removed
+//!    (guards: NOT EXISTS R₁, AND EXISTS R_old, AND NOT EXISTS ΔL_I-same-key)
+//! 7. **Part 6a** — delta_right INSERTS anti-join L₁ (non-matching right → NULL left)
+//! 8. **Part 6b** — delta_right DELETES anti-join L_old (non-matching right → NULL left)
+//! 9. **Part 7a** — Delete stale NULL-padded right rows when new left matches appear
+//!    (guard: NOT EXISTS L_old — right was previously unmatched)
+//! 10. **Part 7b** — Insert NULL-padded right rows when right row loses all left matches
+//!    (guards: NOT EXISTS L₁, AND EXISTS L_old, AND NOT EXISTS ΔR_I-same-key)
 //!
-//! ## EC-01 fix: R₀ for DELETE deltas in Parts 1 and 3
+//! ## EC-01 path (complex left children):
 //!
-//! Same as LEFT JOIN: Part 1 and Part 3 together partition delta_left rows
-//! into "matched" and "unmatched". When the right partner is simultaneously
-//! deleted, using R₁ (post-change) misses the match. Split by action:
-//! - INSERTs check R₁ (need current right state)
-//! - DELETEs check R₀ (need pre-change right state)
+//! 1. **Part 1a** — delta_left INSERTS JOIN R₁
+//! 2. **Part 1b** — delta_left DELETES JOIN R₀ (EC-01 fix)
+//! 3. **Part 2** — current_left JOIN delta_right
+//! 4. **Part 3a** — delta_left INSERTS anti-join R₁
+//! 5. **Part 3b** — delta_left DELETES anti-join R₀
+//! 6–10. Parts 4–7b same as L₀ path with R_old/L_old guards
+//!
+//! ## L₀ fix: Pre-change left snapshot for Part 2
+//!
+//! Standard DBSP formula: Δ(L ⋈ R) = (ΔL ⋈ R₁) + (L₀ ⋈ ΔR).
+//! Using L₀ in Part 2 ensures right-side changes are attributed to the
+//! old (pre-change) left values, preventing double-counting when both
+//! sides change simultaneously (e.g. L UPDATE + R DELETE for same key).
+//!
+//! ## L₀ and EC-01 are mutually exclusive
+//!
+//! When L₀ is available (simple left children), EC-01 R₀ split for
+//! Part 1/3 is NOT used. The standard formula (ΔL ⋈ R₁) + (L₀ ⋈ ΔR)
+//! is already exact; splitting Part 1 would double-count Part 1b and Part 2(L₀).
+//!
+//! ## R_old and L_old guards for Parts 4/5 and 7a/7b
+//!
+//! Parts 4/5 handle left rows transitioning between matched and null-padded
+//! states due to right-side changes. Guards prevent spurious transitions:
+//! - Part 4 NOT EXISTS R_old: fires only when left was previously unmatched
+//! - Part 5 AND EXISTS R_old: fires only when left previously had a match
+//! - Part 5 AND NOT EXISTS ΔL_I-same-key: prevents duplicate with Part 3a
+//!   when a left UPDATE and right DELETE happen for the same key in the same cycle
+//! Parts 7a/7b have symmetric guards for the right side.
 
 use crate::dvm::diff::{DiffContext, DiffResult, quote_ident};
 use crate::dvm::operators::join::mark_leaf_delta_ctes_not_materialized;
@@ -144,12 +172,26 @@ pub fn diff_full_join(ctx: &mut DiffContext, op: &OpTree) -> Result<DiffResult, 
         .concat()
         .join(", ");
 
+    // ── L₀ fix: Pre-change left snapshot for Part 2 ────────────────
+    //
+    // Standard DBSP: Δ(L ⋈ R) inner part = (ΔL ⋈ R₁) + (L₀ ⋈ ΔR).
+    // When both sides change simultaneously (e.g. L UPDATE + R DELETE for
+    // the same key), using L₁ in Part 2 generates spurious deletes for
+    // rows that never existed in J₀. Using L₀ avoids this.
+    //
+    // L₀ and EC-01 R₀ are mutually exclusive: when L₀ is available,
+    // Part 1 is unsplit (no EC-01), and the standard formula is exact.
+    let use_l0 = use_pre_change_snapshot(left, ctx.inside_semijoin, 4);
+
     // ── EC-01: Pre-change right snapshot for Parts 1b / 3b ─────────
     //
-    // Same fix as inner_join / outer_join: when a left DELETE's old right
-    // partner is simultaneously deleted, R₁ misses the match.
+    // Only used when L₀ is NOT available (complex left children).
     // DI-11: Use same threshold as inner join for deep R₀ reconstruction.
-    let use_r0 = use_pre_change_snapshot(right, ctx.inside_semijoin, 4);
+    let use_r0 = if use_l0 {
+        false
+    } else {
+        use_pre_change_snapshot(right, ctx.inside_semijoin, 4)
+    };
 
     let r0_snapshot = if use_r0 {
         if is_join_child(right) {
@@ -174,6 +216,113 @@ pub fn diff_full_join(ctx: &mut DiffContext, op: &OpTree) -> Result<DiffResult, 
     if use_r0 {
         ctx.mark_cte_not_materialized(&right_result.cte_name);
     }
+
+    // ── L₀ snapshot for Part 2 (when use_l0=true) ──────────────────
+    let left_part2_source = if use_l0 {
+        if is_join_child(left) {
+            let pre_change = ctx.get_or_register_snapshot_cte(left);
+            mark_leaf_delta_ctes_not_materialized(left, ctx);
+            pre_change
+        } else {
+            let l0 = build_leaf_snapshot_sql(
+                left,
+                &left_result.cte_name,
+                left_cols,
+                &ctx.fallback_leaf_oids,
+            );
+            l0
+        }
+    } else {
+        left_table.clone()
+    };
+
+    if use_l0 {
+        ctx.mark_cte_not_materialized(&left_result.cte_name);
+    }
+
+    // ── R_old snapshot: pre-change right for Parts 3b/4/5 guards ───
+    //
+    // Always computed (unlike r0_snapshot which is only for EC-01).
+    // Used in Part 3b anti-join, Part 4 NOT EXISTS guard, and Part 5
+    // AND EXISTS guard to check whether left rows were previously matched.
+    let right_user_cols: Vec<String> = right_cols
+        .iter()
+        .filter(|c| *c != "__pgt_count")
+        .cloned()
+        .collect();
+    let r_old_snapshot = if is_join_child(right) {
+        ctx.get_or_register_snapshot_cte(right)
+    } else {
+        build_leaf_snapshot_sql(
+            right,
+            &right_result.cte_name,
+            &right_user_cols,
+            &ctx.fallback_leaf_oids,
+        )
+    };
+
+    // ── L_old snapshot: pre-change left for Parts 6b/7a/7b guards ──
+    //
+    // Symmetric to r_old_snapshot for the right anti-join side.
+    let left_user_cols: Vec<String> = left_cols
+        .iter()
+        .filter(|c| *c != "__pgt_count")
+        .cloned()
+        .collect();
+    let l_old_snapshot = if is_join_child(left) {
+        ctx.get_or_register_snapshot_cte(left)
+    } else {
+        build_leaf_snapshot_sql(
+            left,
+            &left_result.cte_name,
+            &left_user_cols,
+            &ctx.fallback_leaf_oids,
+        )
+    };
+
+    // ── Join conditions for R_old / L_old guards ────────────────────
+    //
+    // r_old_cond: `l.k = __pgt_r_old.k` — for Parts 4/5 NOT EXISTS/EXISTS.
+    // l_old_cond: `__pgt_l_old.k = r.k` — for Parts 7a/7b NOT EXISTS/EXISTS.
+    let r_old_cond = rewrite_join_condition(condition, left, "l", right, "__pgt_r_old");
+    let l_old_cond = rewrite_join_condition(condition, left, "__pgt_l_old", right, "r");
+
+    // ── Part 5 / Part 7b exclusion guards ───────────────────────────
+    //
+    // Prevents Part 5 from duplicating Part 3a when both a left row
+    // INSERT (ΔL_I) and a right DELETE (ΔR_D) occur for the same join key
+    // in the same cycle. Part 3a handles the null-padded insertion for new
+    // left rows; Part 5 should only fire for pre-existing left rows.
+    //
+    // Guard: AND NOT EXISTS (SELECT 1 FROM delta_left dl2
+    //                        WHERE dl2.__pgt_action = 'I'
+    //                          AND join_cond(l, dl2))
+    // NOTE: This uses right→dl2 substitution in the join condition, which
+    // is correct for symmetric join conditions (ON l.k = r.k). For
+    // asymmetric conditions, the guard may be imprecise but errs on the
+    // side of allowing Part 5 to fire (duplicates are less harmful than
+    // missed insertions for most queries).
+    let part5_excl_cond = rewrite_join_condition(condition, left, "l", right, "dl2");
+    // Symmetric for Part 7b: AND NOT EXISTS ΔR_I with same join key as r.
+    let part7b_excl_cond = rewrite_join_condition(condition, left, "dr2", right, "r");
+
+    // ── Part 4 exclusion guard ───────────────────────────────────────
+    //
+    // Prevents Part 4 from spuriously firing D(l_new, NULL) when both a
+    // new left row is INSERTED and a new right row is INSERTED for the same
+    // join key in the same cycle. Part 4's purpose is to remove a
+    // pre-existing null-padded left row when it gains its first right match.
+    // If the left row is itself new (appearing in ΔL), it was never
+    // null-padded so Part 4 must not fire.
+    //
+    // This guard also prevents duplication with Part 3b when L UPDATE
+    // (ΔL has DEL) + R INSERT happen for same key: Part 3b handles
+    // D(l_old, NULL), so Part 4 must stay silent.
+    //
+    // Guard: AND NOT EXISTS (SELECT 1 FROM delta_left dl2
+    //                        WHERE join_cond(l, dl2))   -- any ΔL action
+    // Reuses part5_excl_cond (same key-matching expression) without action filter.
+    let part4_excl_cond = &part5_excl_cond;
 
     // ── Pre-compute delta action flags for both sides ──────────────
     let left_flags_cte = ctx.next_cte_name("fj_left_flags");
@@ -200,8 +349,183 @@ pub fn diff_full_join(ctx: &mut DiffContext, op: &OpTree) -> Result<DiffResult, 
 
     let cte_name = ctx.next_cte_name("full_join");
 
-    let sql = if let Some(ref r0) = r0_snapshot {
-        // ── EC-01: Split Part 1 and Part 3 by action ────────────────
+    let sql = if use_l0 {
+        // ── L₀ path: standard DBSP formula with comprehensive guards ─
+        //
+        // Part 1 unsplit (no EC-01): ΔL ⋈ R₁ — standard DBSP left term.
+        // Part 2: L₀ ⋈ ΔR — right term uses pre-change left for correct
+        //   attribution when both sides change simultaneously.
+        // Part 3 split by action using R_old: prevents spurious nulls.
+        // Parts 4/5/7a/7b have R_old/L_old guards and exclusion guards.
+        format!(
+            "\
+-- Part 1: delta_left JOIN current_right R₁ (unsplit — standard DBSP L₀ formula)
+SELECT pgtrickle.pg_trickle_hash_multi(ARRAY[dl.__pgt_row_id::TEXT, pgtrickle.pg_trickle_hash(row_to_json(r)::text)::TEXT]) AS __pgt_row_id,
+       dl.__pgt_action,
+       {part1_cols}
+FROM {delta_left} dl
+JOIN {right_table} r ON {join_cond_part1}
+
+UNION ALL
+
+-- Part 2: L₀ (pre-change left) JOIN delta_right
+-- Uses pre-change left state to avoid double-counting when L is updated
+-- and R is changed simultaneously for the same join key.
+SELECT pgtrickle.pg_trickle_hash_multi(ARRAY[pgtrickle.pg_trickle_hash(row_to_json(l)::text)::TEXT, dr.__pgt_row_id::TEXT]) AS __pgt_row_id,
+       dr.__pgt_action,
+       {part2_cols}
+FROM {left_part2} l
+JOIN {delta_right} dr ON {join_cond_part2}
+
+UNION ALL
+
+-- Part 3a: delta_left INSERTS anti-join R₁ (non-matching inserts → NULL right cols)
+SELECT dl.__pgt_row_id,
+       dl.__pgt_action,
+       {antijoin_left_cols}
+FROM {delta_left} dl
+WHERE dl.__pgt_action = 'I'
+  AND NOT EXISTS (
+    SELECT 1 FROM {right_table} r WHERE {join_cond_antijoin_l}
+)
+
+UNION ALL
+
+-- Part 3b: delta_left DELETES anti-join R_old (non-matching deletes → NULL right cols)
+-- Uses R_old (pre-change right) so that simultaneously-deleted right rows
+-- are correctly excluded from the anti-join (avoiding spurious null-padded DELETEs
+-- for rows that were matched in J₀ but whose right partner was also deleted).
+SELECT dl.__pgt_row_id,
+       dl.__pgt_action,
+       {antijoin_left_cols}
+FROM {delta_left} dl
+WHERE dl.__pgt_action = 'D'
+  AND NOT EXISTS (
+    SELECT 1 FROM {r_old_snapshot} r WHERE {join_cond_antijoin_l}
+)
+
+UNION ALL
+
+-- Part 4: Delete stale NULL-padded left rows when a left row gains its FIRST right match.
+-- Source: L₀ (pre-change left) — excludes newly-inserted left rows that were never null-padded.
+-- Guard NOT EXISTS R_old: only fire when left was previously unmatched (null-padded).
+-- Guard NOT EXISTS ΔL same-key: prevents duplication with Part 3b when L is also
+--   being changed (UPDATE or INSERT) in the same cycle — those parts already handle the
+--   null-padded removal; Part 4 must only fire for pre-existing, unchanging left rows.
+SELECT 0::BIGINT AS __pgt_row_id,
+       'D'::TEXT AS __pgt_action,
+       {l_null_right_padded}
+FROM {left_part2} l
+JOIN {delta_right} dr ON {join_cond_part2}
+WHERE dr.__pgt_action = 'I'
+  AND (SELECT has_ins FROM {right_flags_cte})
+  AND NOT EXISTS (
+    SELECT 1 FROM {r_old_snapshot} __pgt_r_old WHERE {r_old_cond}
+  )
+  AND NOT EXISTS (
+    SELECT 1 FROM {delta_left} dl2 WHERE {part4_excl_cond}
+  )
+
+UNION ALL
+
+-- Part 5: Insert NULL-padded left rows when a left row loses ALL right matches.
+-- Guard AND EXISTS R_old: fires only when left row previously had a match.
+-- Guard AND NOT EXISTS ΔL_I same-key: prevents duplicate with Part 3a when a
+-- left INSERT (from UPDATE) and a right DELETE happen for the same key in the
+-- same cycle — Part 3a handles new left rows; Part 5 handles pre-existing ones.
+SELECT 0::BIGINT AS __pgt_row_id,
+       'I'::TEXT AS __pgt_action,
+       {l_null_right_padded}
+FROM {left_table} l
+JOIN {delta_right} dr ON {join_cond_part2}
+WHERE dr.__pgt_action = 'D'
+  AND (SELECT has_del FROM {right_flags_cte})
+  AND NOT EXISTS (
+    SELECT 1 FROM {right_table} r WHERE {not_exists_cond_lr}
+  )
+  AND EXISTS (
+    SELECT 1 FROM {r_old_snapshot} __pgt_r_old WHERE {r_old_cond}
+  )
+  AND NOT EXISTS (
+    SELECT 1 FROM {delta_left} dl2 WHERE dl2.__pgt_action = 'I' AND {part5_excl_cond}
+  )
+
+UNION ALL
+
+-- Part 6a: delta_right INSERTS anti-join L₁ (non-matching inserts → NULL left cols)
+SELECT dr.__pgt_row_id,
+       dr.__pgt_action,
+       {antijoin_right_cols}
+FROM {delta_right} dr
+WHERE dr.__pgt_action = 'I'
+  AND NOT EXISTS (
+    SELECT 1 FROM {left_table} l WHERE {join_cond_antijoin_r}
+)
+
+UNION ALL
+
+-- Part 6b: delta_right DELETES anti-join L_old (non-matching deletes → NULL left cols)
+-- Uses L_old (pre-change left) so that simultaneously-deleted left rows are
+-- correctly excluded from the anti-join (avoiding spurious null-padded DELETEs
+-- for right rows that were matched in J₀ but whose left partner was also deleted).
+SELECT dr.__pgt_row_id,
+       dr.__pgt_action,
+       {antijoin_right_cols}
+FROM {delta_right} dr
+WHERE dr.__pgt_action = 'D'
+  AND NOT EXISTS (
+    SELECT 1 FROM {l_old_snapshot} l WHERE {join_cond_antijoin_r}
+)
+
+UNION ALL
+
+-- Part 7a: Delete stale NULL-padded right rows when a right row gains its FIRST left match.
+-- Uses R_old (pre-change right) to find right rows that existed before the left INSERT.
+-- Guard NOT EXISTS L_old: fires only when right was previously unmatched (null-padded).
+SELECT 0::BIGINT AS __pgt_row_id,
+       'D'::TEXT AS __pgt_action,
+       {null_left_r_padded}
+FROM {r_old_snapshot} r
+JOIN {delta_left} dl ON {join_cond_antijoin_l}
+WHERE dl.__pgt_action = 'I'
+  AND (SELECT has_ins FROM {left_flags_cte})
+  AND NOT EXISTS (
+    SELECT 1 FROM {l_old_snapshot} __pgt_l_old WHERE {l_old_cond}
+  )
+
+UNION ALL
+
+-- Part 7b: Insert NULL-padded right rows when a right row loses ALL left matches.
+-- Guard AND EXISTS L_old: fires only when right row previously had a left match.
+-- Guard AND NOT EXISTS ΔR_I same-key: prevents duplicate with Part 6a when a
+-- right INSERT (from UPDATE) and a left DELETE happen for the same key in the
+-- same cycle — Part 6a handles new right rows; Part 7b handles pre-existing ones.
+SELECT 0::BIGINT AS __pgt_row_id,
+       'I'::TEXT AS __pgt_action,
+       {null_left_r_padded}
+FROM {right_table} r
+JOIN {delta_left} dl ON {join_cond_antijoin_l}
+WHERE dl.__pgt_action = 'D'
+  AND (SELECT has_del FROM {left_flags_cte})
+  AND NOT EXISTS (
+    SELECT 1 FROM {left_table} l WHERE {not_exists_cond_lr}
+  )
+  AND EXISTS (
+    SELECT 1 FROM {l_old_snapshot} __pgt_l_old WHERE {l_old_cond}
+  )
+  AND NOT EXISTS (
+    SELECT 1 FROM {delta_right} dr2 WHERE dr2.__pgt_action = 'I' AND {part7b_excl_cond}
+  )",
+            delta_left = left_result.cte_name,
+            delta_right = right_result.cte_name,
+            left_part2 = left_part2_source,
+            r_old_snapshot = r_old_snapshot,
+            l_old_snapshot = l_old_snapshot,
+            left_flags_cte = left_flags_cte,
+            right_flags_cte = right_flags_cte,
+        )
+    } else if let Some(ref r0) = r0_snapshot {
+        // ── EC-01 path: Split Part 1 and Part 3 by action ────────────
         format!(
             "\
 -- Part 1a: delta_left INSERTS JOIN current_right R₁ (matching insert rows)
@@ -258,6 +582,7 @@ WHERE dl.__pgt_action = 'D'
 UNION ALL
 
 -- Part 4: Delete stale NULL-padded left rows when new right matches appear
+-- Guard NOT EXISTS R_old: left was previously unmatched.
 SELECT 0::BIGINT AS __pgt_row_id,
        'D'::TEXT AS __pgt_action,
        {l_null_right_padded}
@@ -265,10 +590,17 @@ FROM {left_table} l
 JOIN {delta_right} dr ON {join_cond_part2}
 WHERE dr.__pgt_action = 'I'
   AND (SELECT has_ins FROM {right_flags_cte})
+  AND NOT EXISTS (
+    SELECT 1 FROM {r_old_snapshot} __pgt_r_old WHERE {r_old_cond}
+  )
+  AND NOT EXISTS (
+    SELECT 1 FROM {delta_left} dl2 WHERE {part4_excl_cond}
+  )
 
 UNION ALL
 
 -- Part 5: Insert NULL-padded left rows when left row loses all right matches
+-- Guards: NOT EXISTS R₁, AND EXISTS R_old, AND NOT EXISTS ΔL_I same-key.
 SELECT 0::BIGINT AS __pgt_row_id,
        'I'::TEXT AS __pgt_action,
        {l_null_right_padded}
@@ -278,26 +610,43 @@ WHERE dr.__pgt_action = 'D'
   AND (SELECT has_del FROM {right_flags_cte})
   AND NOT EXISTS (
     SELECT 1 FROM {right_table} r WHERE {not_exists_cond_lr}
-)
+  )
+  AND EXISTS (
+    SELECT 1 FROM {r_old_snapshot} __pgt_r_old WHERE {r_old_cond}
+  )
+  AND NOT EXISTS (
+    SELECT 1 FROM {delta_left} dl2 WHERE dl2.__pgt_action = 'I' AND {part5_excl_cond}
+  )
 
 UNION ALL
 
--- Part 6: delta_right anti-join left (non-matching right rows → NULL left cols)
+-- Part 6a: delta_right INSERTS anti-join L₁ (non-matching right rows → NULL left cols)
 SELECT dr.__pgt_row_id,
        dr.__pgt_action,
        {antijoin_right_cols}
 FROM {delta_right} dr
-WHERE NOT EXISTS (
+WHERE dr.__pgt_action = 'I'
+  AND NOT EXISTS (
     SELECT 1 FROM {left_table} l WHERE {join_cond_antijoin_r}
 )
 
 UNION ALL
 
+-- Part 6b: delta_right DELETES anti-join L_old (non-matching deletes → NULL left cols)
+SELECT dr.__pgt_row_id,
+       dr.__pgt_action,
+       {antijoin_right_cols}
+FROM {delta_right} dr
+WHERE dr.__pgt_action = 'D'
+  AND NOT EXISTS (
+    SELECT 1 FROM {l_old_snapshot} l WHERE {join_cond_antijoin_r}
+)
+
+UNION ALL
+
 -- Part 7a: Delete stale NULL-padded right rows when new left matches appear
--- Use r0_snapshot (pre-change right) so that right rows deleted in the SAME
--- cycle as a matching left INSERT are still found here. If we used right_table
--- (post-change), a simultaneously-deleted right row would be absent and the
--- stale right-only ST row would never be cleaned up.
+-- Uses r0_snapshot (pre-change right) to find right rows deleted in same cycle.
+-- Guard NOT EXISTS L_old: right was previously unmatched.
 SELECT 0::BIGINT AS __pgt_row_id,
        'D'::TEXT AS __pgt_action,
        {null_left_r_padded}
@@ -305,10 +654,14 @@ FROM {r0_snapshot} r
 JOIN {delta_left} dl ON {join_cond_antijoin_l}
 WHERE dl.__pgt_action = 'I'
   AND (SELECT has_ins FROM {left_flags_cte})
+  AND NOT EXISTS (
+    SELECT 1 FROM {l_old_snapshot} __pgt_l_old WHERE {l_old_cond}
+  )
 
 UNION ALL
 
 -- Part 7b: Insert NULL-padded right rows when right row loses all left matches
+-- Guards: NOT EXISTS L₁, AND EXISTS L_old, AND NOT EXISTS ΔR_I same-key.
 SELECT 0::BIGINT AS __pgt_row_id,
        'I'::TEXT AS __pgt_action,
        {null_left_r_padded}
@@ -318,14 +671,23 @@ WHERE dl.__pgt_action = 'D'
   AND (SELECT has_del FROM {left_flags_cte})
   AND NOT EXISTS (
     SELECT 1 FROM {left_table} l WHERE {not_exists_cond_lr}
-)",
+  )
+  AND EXISTS (
+    SELECT 1 FROM {l_old_snapshot} __pgt_l_old WHERE {l_old_cond}
+  )
+  AND NOT EXISTS (
+    SELECT 1 FROM {delta_right} dr2 WHERE dr2.__pgt_action = 'I' AND {part7b_excl_cond}
+  )",
             delta_left = left_result.cte_name,
             delta_right = right_result.cte_name,
             r0_snapshot = r0,
+            r_old_snapshot = r_old_snapshot,
+            l_old_snapshot = l_old_snapshot,
             left_flags_cte = left_flags_cte,
             right_flags_cte = right_flags_cte,
         )
     } else {
+        // ── Fallback: both children complex, no snapshot available ───
         // Right child is complex — keep Part 1 and Part 3 unsplit.
         format!(
             "\
@@ -359,6 +721,9 @@ WHERE NOT EXISTS (
 UNION ALL
 
 -- Part 4: Delete stale NULL-padded left rows when new right matches appear
+-- Guard NOT EXISTS R_old: left was previously unmatched.
+-- Guard NOT EXISTS ΔL same-key: prevents spurious fire when L is also changing
+--   (INSERT or UPDATE) — Part 3b handles those transitions.
 SELECT 0::BIGINT AS __pgt_row_id,
        'D'::TEXT AS __pgt_action,
        {l_null_right_padded}
@@ -366,10 +731,17 @@ FROM {left_table} l
 JOIN {delta_right} dr ON {join_cond_part2}
 WHERE dr.__pgt_action = 'I'
   AND (SELECT has_ins FROM {right_flags_cte})
+  AND NOT EXISTS (
+    SELECT 1 FROM {r_old_snapshot} __pgt_r_old WHERE {r_old_cond}
+  )
+  AND NOT EXISTS (
+    SELECT 1 FROM {delta_left} dl2 WHERE {part4_excl_cond}
+  )
 
 UNION ALL
 
 -- Part 5: Insert NULL-padded left rows when left row loses all right matches
+-- Guards: NOT EXISTS R₁, AND EXISTS R_old, AND NOT EXISTS ΔL_I same-key.
 SELECT 0::BIGINT AS __pgt_row_id,
        'I'::TEXT AS __pgt_action,
        {l_null_right_padded}
@@ -379,7 +751,13 @@ WHERE dr.__pgt_action = 'D'
   AND (SELECT has_del FROM {right_flags_cte})
   AND NOT EXISTS (
     SELECT 1 FROM {right_table} r WHERE {not_exists_cond_lr}
-)
+  )
+  AND EXISTS (
+    SELECT 1 FROM {r_old_snapshot} __pgt_r_old WHERE {r_old_cond}
+  )
+  AND NOT EXISTS (
+    SELECT 1 FROM {delta_left} dl2 WHERE dl2.__pgt_action = 'I' AND {part5_excl_cond}
+  )
 
 UNION ALL
 
@@ -395,6 +773,7 @@ WHERE NOT EXISTS (
 UNION ALL
 
 -- Part 7a: Delete stale NULL-padded right rows when new left matches appear
+-- Guard NOT EXISTS L_old: right was previously unmatched.
 SELECT 0::BIGINT AS __pgt_row_id,
        'D'::TEXT AS __pgt_action,
        {null_left_r_padded}
@@ -402,10 +781,14 @@ FROM {right_table} r
 JOIN {delta_left} dl ON {join_cond_antijoin_l}
 WHERE dl.__pgt_action = 'I'
   AND (SELECT has_ins FROM {left_flags_cte})
+  AND NOT EXISTS (
+    SELECT 1 FROM {l_old_snapshot} __pgt_l_old WHERE {l_old_cond}
+  )
 
 UNION ALL
 
 -- Part 7b: Insert NULL-padded right rows when right row loses all left matches
+-- Guards: NOT EXISTS L₁, AND EXISTS L_old, AND NOT EXISTS ΔR_I same-key.
 SELECT 0::BIGINT AS __pgt_row_id,
        'I'::TEXT AS __pgt_action,
        {null_left_r_padded}
@@ -415,9 +798,17 @@ WHERE dl.__pgt_action = 'D'
   AND (SELECT has_del FROM {left_flags_cte})
   AND NOT EXISTS (
     SELECT 1 FROM {left_table} l WHERE {not_exists_cond_lr}
-)",
+  )
+  AND EXISTS (
+    SELECT 1 FROM {l_old_snapshot} __pgt_l_old WHERE {l_old_cond}
+  )
+  AND NOT EXISTS (
+    SELECT 1 FROM {delta_right} dr2 WHERE dr2.__pgt_action = 'I' AND {part7b_excl_cond}
+  )",
             delta_left = left_result.cte_name,
             delta_right = right_result.cte_name,
+            r_old_snapshot = r_old_snapshot,
+            l_old_snapshot = l_old_snapshot,
             left_flags_cte = left_flags_cte,
             right_flags_cte = right_flags_cte,
         )
@@ -472,23 +863,30 @@ mod tests {
         let result = diff_full_join(&mut ctx, &tree).unwrap();
         let sql = ctx.build_with_query(&result.cte_name);
 
-        // EC-01: Parts 1 and 3 are split when right child is simple (Scan)
-        assert_sql_contains(&sql, "Part 1a");
-        assert_sql_contains(&sql, "Part 1b");
+        // L₀ path: Parts 1 and 2 are standard DBSP (unsplit), Parts 3a/3b split.
+        // When both left and right are Scan children, use_l0=true → no EC-01 split.
+        assert_sql_contains(&sql, "Part 1");
+        assert_sql_not_contains(&sql, "Part 1a");
+        assert_sql_not_contains(&sql, "Part 1b");
         assert_sql_contains(&sql, "Part 2");
         assert_sql_contains(&sql, "Part 3a");
         assert_sql_contains(&sql, "Part 3b");
         assert_sql_contains(&sql, "Part 4");
         assert_sql_contains(&sql, "Part 5");
-        assert_sql_contains(&sql, "Part 6");
+        assert_sql_contains(&sql, "Part 6a");
+        assert_sql_contains(&sql, "Part 6b");
         assert_sql_contains(&sql, "Part 7a");
         assert_sql_contains(&sql, "Part 7b");
+        // R_old and L_old guards present
+        assert_sql_contains(&sql, "__pgt_r_old");
+        assert_sql_contains(&sql, "__pgt_l_old");
     }
 
     #[test]
-    fn test_ec01_full_join_r0_uses_except_all() {
-        // For Scan right children, Part 1b and Part 3b should use R₀ via
-        // EXCEPT ALL to find pre-change right partners.
+    fn test_l0_full_join_uses_pre_change_left_for_part2() {
+        // For Scan children (use_l0=true), Part 2 should use L₀ (pre-change left).
+        // This prevents spurious DELETEs when both L is updated and R is changed
+        // for the same join key in the same cycle.
         let mut ctx = test_ctx();
         let left = scan(1, "a", "public", "a", &["id"]);
         let right = scan(2, "b", "public", "b", &["id", "name"]);
@@ -501,11 +899,17 @@ mod tests {
         let result = diff_full_join(&mut ctx, &tree).unwrap();
         let sql = ctx.build_with_query(&result.cte_name);
 
-        // R₀ uses DI-2 NOT EXISTS anti-join pattern
+        // L₀ uses NOT EXISTS anti-join (DI-2) — EXCEPT ALL pattern
         assert_sql_contains(&sql, "NOT EXISTS");
-        // Part 1b and Part 3b present
-        assert_sql_contains(&sql, "Part 1b");
+        // Part 1 is NOT split (no EC-01 for Scan children with L₀)
+        assert_sql_not_contains(&sql, "Part 1a");
+        assert_sql_not_contains(&sql, "Part 1b");
+        // Part 3 IS split by action using R_old
+        assert_sql_contains(&sql, "Part 3a");
         assert_sql_contains(&sql, "Part 3b");
+        // R_old and L_old guards for Parts 4/5 and 7a/7b
+        assert_sql_contains(&sql, "__pgt_r_old");
+        assert_sql_contains(&sql, "__pgt_l_old");
     }
 
     #[test]

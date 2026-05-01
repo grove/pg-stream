@@ -154,8 +154,12 @@ pub fn build_snapshot_sql(op: &OpTree) -> String {
             // these aliases so that downstream join conditions can reference
             // the projected column names (e.g., `__pgt_scalar_1` from a
             // scalar subquery CROSS JOIN rewrite).
-            let inner = build_snapshot_sql(child);
-            let child_alias = child.alias();
+            //
+            // When the child is a join, inline its FROM clause to keep the
+            // original table aliases (e.g., "a", "b") accessible so that
+            // project expressions like COALESCE(a.k, b.k) can reference them.
+            // Without this, wrapping the join snapshot as "full_join" hides
+            // the inner aliases, causing "missing FROM-clause entry" errors.
             let selects: Vec<String> = expressions
                 .iter()
                 .zip(aliases.iter())
@@ -169,12 +173,18 @@ pub fn build_snapshot_sql(op: &OpTree) -> String {
                     }
                 })
                 .collect();
-            format!(
-                "(SELECT {} FROM {} {})",
-                selects.join(", "),
-                inner,
-                quote_ident(child_alias),
-            )
+            if let Some(from_clause) = build_snapshot_inline_from_for_join(child) {
+                format!("(SELECT {} FROM {})", selects.join(", "), from_clause)
+            } else {
+                let inner = build_snapshot_sql(child);
+                let child_alias = child.alias();
+                format!(
+                    "(SELECT {} FROM {} {})",
+                    selects.join(", "),
+                    inner,
+                    quote_ident(child_alias),
+                )
+            }
         }
         OpTree::Subquery {
             column_aliases,
@@ -316,6 +326,78 @@ pub fn build_snapshot_sql(op: &OpTree) -> String {
                 op.node_kind()
             );
         }
+    }
+}
+
+/// Build an inline FROM clause for a join node using `build_snapshot_sql` for each child.
+///
+/// Returns the raw FROM clause string (e.g., `<left_snap> "a" FULL JOIN <right_snap> "b" ON ...`)
+/// *without* a wrapping `(SELECT ... FROM ...)`. This preserves the original table aliases (`a`, `b`)
+/// so that `Project` expressions like `COALESCE(a.k, b.k)` can reference them directly.
+fn build_snapshot_inline_join_from(
+    join_type: &str,
+    condition: &Expr,
+    left: &OpTree,
+    right: &OpTree,
+) -> String {
+    let left_alias = left.alias();
+    let right_alias = right.alias();
+    let left_snap = build_snapshot_sql(left);
+    let right_snap = build_snapshot_sql(right);
+    let cond_sql = rewrite_join_condition(condition, left, left_alias, right, right_alias);
+    format!(
+        "{} {} {} {} {} ON {}",
+        left_snap,
+        quote_ident(left_alias),
+        join_type,
+        right_snap,
+        quote_ident(right_alias),
+        cond_sql,
+    )
+}
+
+/// When a `Project` node sits directly over a join, return an inline FROM clause that
+/// keeps the original join table aliases accessible.
+///
+/// This prevents the "missing FROM-clause entry for table 'a'" error that arises when
+/// a Project wraps a join snapshot subquery (aliased as `"full_join"` etc.) — inside
+/// that subquery the original aliases `a`, `b` are no longer visible.
+///
+/// Returns `Some(from_clause)` for direct join children; `None` otherwise.
+fn build_snapshot_inline_from_for_join(op: &OpTree) -> Option<String> {
+    match op {
+        OpTree::InnerJoin {
+            condition,
+            left,
+            right,
+        } => Some(build_snapshot_inline_join_from(
+            "JOIN",
+            condition,
+            left,
+            right,
+        )),
+        OpTree::LeftJoin {
+            condition,
+            left,
+            right,
+        } => Some(build_snapshot_inline_join_from(
+            "LEFT JOIN",
+            condition,
+            left,
+            right,
+        )),
+        OpTree::FullJoin {
+            condition,
+            left,
+            right,
+        } => Some(build_snapshot_inline_join_from(
+            "FULL JOIN",
+            condition,
+            left,
+            right,
+        )),
+        // No recursion through Filter (would lose the predicate) or other wrappers.
+        _ => None,
     }
 }
 
@@ -585,8 +667,11 @@ pub fn build_pre_change_snapshot_sql(
             aliases,
             child,
         } => {
-            let inner = build_pre_change_snapshot_sql(child, scan_delta_ctes, fallback_oids);
-            let child_alias = child.alias();
+            // When the child is a join, inline its FROM clause to preserve the
+            // original table aliases (e.g., "a", "b") so that project expressions
+            // like COALESCE(a.k, b.k) can reference them directly. Without this,
+            // wrapping the join snapshot as a subquery (e.g., aliased "full_join")
+            // hides the inner aliases, causing "missing FROM-clause entry" errors.
             let selects: Vec<String> = expressions
                 .iter()
                 .zip(aliases.iter())
@@ -600,12 +685,20 @@ pub fn build_pre_change_snapshot_sql(
                     }
                 })
                 .collect();
-            format!(
-                "(SELECT {} FROM {} {})",
-                selects.join(", "),
-                inner,
-                quote_ident(child_alias),
-            )
+            if let Some(from_clause) =
+                build_pre_change_inline_from_for_join(child, scan_delta_ctes, fallback_oids)
+            {
+                format!("(SELECT {} FROM {})", selects.join(", "), from_clause)
+            } else {
+                let inner = build_pre_change_snapshot_sql(child, scan_delta_ctes, fallback_oids);
+                let child_alias = child.alias();
+                format!(
+                    "(SELECT {} FROM {} {})",
+                    selects.join(", "),
+                    inner,
+                    quote_ident(child_alias),
+                )
+            }
         }
         OpTree::Subquery {
             column_aliases,
@@ -643,6 +736,81 @@ pub fn build_pre_change_snapshot_sql(
         // For all other node types, fall back to the current snapshot.
         // CteScan, Aggregate, etc. don't have per-leaf delta tracking.
         _ => build_snapshot_sql(op),
+    }
+}
+
+/// Build an inline FROM clause for a join node using `build_pre_change_snapshot_sql` for each child.
+///
+/// Mirrors [`build_snapshot_inline_join_from`] but uses the pre-change snapshots so that
+/// original table aliases remain accessible when a `Project` node sits directly over the join.
+fn build_pre_change_inline_join_from(
+    join_type: &str,
+    condition: &Expr,
+    left: &OpTree,
+    right: &OpTree,
+    scan_delta_ctes: &HashMap<String, String>,
+    fallback_oids: &HashSet<u32>,
+) -> String {
+    let left_alias = left.alias();
+    let right_alias = right.alias();
+    let left_snap = build_pre_change_snapshot_sql(left, scan_delta_ctes, fallback_oids);
+    let right_snap = build_pre_change_snapshot_sql(right, scan_delta_ctes, fallback_oids);
+    let cond_sql = rewrite_join_condition(condition, left, left_alias, right, right_alias);
+    format!(
+        "{} {} {} {} {} ON {}",
+        left_snap,
+        quote_ident(left_alias),
+        join_type,
+        right_snap,
+        quote_ident(right_alias),
+        cond_sql,
+    )
+}
+
+/// Pre-change variant of [`build_snapshot_inline_from_for_join`].
+fn build_pre_change_inline_from_for_join(
+    op: &OpTree,
+    scan_delta_ctes: &HashMap<String, String>,
+    fallback_oids: &HashSet<u32>,
+) -> Option<String> {
+    match op {
+        OpTree::InnerJoin {
+            condition,
+            left,
+            right,
+        } => Some(build_pre_change_inline_join_from(
+            "JOIN",
+            condition,
+            left,
+            right,
+            scan_delta_ctes,
+            fallback_oids,
+        )),
+        OpTree::LeftJoin {
+            condition,
+            left,
+            right,
+        } => Some(build_pre_change_inline_join_from(
+            "LEFT JOIN",
+            condition,
+            left,
+            right,
+            scan_delta_ctes,
+            fallback_oids,
+        )),
+        OpTree::FullJoin {
+            condition,
+            left,
+            right,
+        } => Some(build_pre_change_inline_join_from(
+            "FULL JOIN",
+            condition,
+            left,
+            right,
+            scan_delta_ctes,
+            fallback_oids,
+        )),
+        _ => None,
     }
 }
 
