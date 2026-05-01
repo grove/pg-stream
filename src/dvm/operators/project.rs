@@ -68,12 +68,36 @@ pub fn diff_project(ctx: &mut DiffContext, op: &OpTree) -> Result<DiffResult, Pg
         }
     }
 
+    // P2-2: Detect COALESCE(aggregate_col, default) wrappers in the Project
+    // expressions and inform diff_aggregate about the ELSE branch semantics.
+    // When a SUM over FULL JOIN is wrapped in COALESCE(SUM(...), 0), the ST
+    // should store 0 (not NULL) when the group becomes empty.  For bare SUM
+    // the ST should store NULL.  We communicate this via agg_sum_coalesce_defaults.
+    let saved_coalesce_defaults = ctx.agg_sum_coalesce_defaults.clone();
+    for (expr, alias) in expressions.iter().zip(aliases.iter()) {
+        if let crate::dvm::parser::Expr::FuncCall { func_name, args } = expr
+            && func_name.eq_ignore_ascii_case("coalesce")
+            && args.len() >= 2
+            && let (
+                crate::dvm::parser::Expr::ColumnRef { column_name, .. },
+                crate::dvm::parser::Expr::Literal(default_val),
+            ) = (&args[0], &args[1])
+        {
+            // The column being wrapped is a child output column.
+            // Record the mapping: alias (ST col name) → default.
+            let _ = alias; // alias matches the outer SELECT alias
+            ctx.agg_sum_coalesce_defaults
+                .insert(column_name.clone(), default_val.clone());
+        }
+    }
+
     // Differentiate the child
     let child_result = ctx.diff_node(child)?;
 
-    // Restore st_user_columns and alias map
+    // Restore st_user_columns, alias map, and coalesce defaults
     ctx.st_user_columns = saved_st_cols;
     ctx.st_column_alias_map = saved_alias_map;
+    ctx.agg_sum_coalesce_defaults = saved_coalesce_defaults;
 
     // The child CTE's column names. For join children, columns are
     // disambiguated as "table__col" (e.g., "l__id", "r__id").

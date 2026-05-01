@@ -213,6 +213,16 @@ pub struct DiffContext {
     /// to `changes_{oid}` (pre-v0.32.0 rows or unit-test contexts where
     /// no SPI connection is available).
     pub source_buffer_names: HashMap<u32, String>,
+    /// P2-2: Maps aggregate alias → COALESCE default value (e.g., "0") for
+    /// SUM aggregates wrapped in `COALESCE(SUM(...), default)` at the Project
+    /// level.
+    ///
+    /// Set by `diff_project` when it detects a COALESCE wrapper around an
+    /// aggregate output column. Read by `diff_aggregate` / `agg_merge_expr_mapped`
+    /// to determine the ELSE branch when the nonnull-count drops to zero:
+    /// - `Some(default)` → use the algebraic formula (result is `default` for empty groups)
+    /// - `None` → return NULL (bare SUM result for empty groups)
+    pub agg_sum_coalesce_defaults: HashMap<String, String>,
 }
 
 /// A41-1: Build a collision-resistant structural fingerprint of an OpTree
@@ -531,6 +541,7 @@ impl DiffContext {
             snapshot_cte_cache: HashMap::new(),
             fallback_leaf_oids: HashSet::new(),
             source_buffer_names: HashMap::new(),
+            agg_sum_coalesce_defaults: HashMap::new(),
         }
     }
 
@@ -567,6 +578,7 @@ impl DiffContext {
             snapshot_cte_cache: HashMap::new(),
             fallback_leaf_oids: HashSet::new(),
             source_buffer_names: HashMap::new(),
+            agg_sum_coalesce_defaults: HashMap::new(),
         }
     }
 

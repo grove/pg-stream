@@ -1043,23 +1043,42 @@ fn build_rescan_cte(
         // Fallback: wrap the defining query as a subquery and filter to
         // affected groups. Less efficient (re-aggregates all groups then
         // filters) but correct for any child OpTree shape.
+        //
+        // The defining_query output columns use the SELECT aliases (e.g., "k"),
+        // while the delta CTE columns use the raw GROUP BY output_name()
+        // (e.g., `COALESCE("ab"."k", "c"."k")`). Translate via alias_map
+        // so `__pgt_dq` is referenced with the correct defining_query column name.
+        let dq_col_name = |delta_col: &str| -> String {
+            if let Some(ref map) = ctx.st_column_alias_map {
+                map.get(delta_col)
+                    .cloned()
+                    .unwrap_or_else(|| delta_col.to_string())
+            } else {
+                delta_col.to_string()
+            }
+        };
+
         let where_clause = if group_output.is_empty() {
             String::new()
         } else if group_output.len() == 1 {
             // Use EXISTS with IS NOT DISTINCT FROM instead of IN to
             // correctly match NULL group-key values (NULL IN (...) → NULL).
-            let col = &group_output[0];
+            let delta_col = &group_output[0];
+            let dq_col = dq_col_name(delta_col);
             format!(
-                "\nWHERE EXISTS (SELECT 1 FROM {delta_cte} __pgt_d2 WHERE __pgt_dq.{qc} IS NOT DISTINCT FROM __pgt_d2.{qc})",
-                qc = quote_ident(col),
+                "\nWHERE EXISTS (SELECT 1 FROM {delta_cte} __pgt_d2 WHERE __pgt_dq.{dqc} IS NOT DISTINCT FROM __pgt_d2.{d2c})",
+                dqc = quote_ident(&dq_col),
+                d2c = quote_ident(delta_col),
             )
         } else {
             let corr: Vec<String> = group_output
                 .iter()
-                .map(|c| {
+                .map(|delta_col| {
+                    let dq_col = dq_col_name(delta_col);
                     format!(
-                        "__pgt_dq.{qc} IS NOT DISTINCT FROM __pgt_d2.{qc}",
-                        qc = quote_ident(c),
+                        "__pgt_dq.{dqc} IS NOT DISTINCT FROM __pgt_d2.{d2c}",
+                        dqc = quote_ident(&dq_col),
+                        d2c = quote_ident(delta_col),
                     )
                 })
                 .collect();
@@ -1069,10 +1088,27 @@ fn build_rescan_cte(
             )
         };
 
-        // Select only the rescan aggregate columns from the defining query
+        // Select only the rescan aggregate columns from the defining query,
+        // using defining_query column names (SELECT aliases) for __pgt_dq.
+        // Alias the output back to the delta CTE column name so that the
+        // merge CTE's rescan join condition `r.{col} = d.{col}` works
+        // correctly when the delta column name differs from the ST alias.
         let dq_selects: Vec<String> = group_output
             .iter()
-            .map(|c| format!("__pgt_dq.{}", quote_ident(c)))
+            .map(|delta_col| {
+                let dq_col = dq_col_name(delta_col);
+                if dq_col == *delta_col {
+                    format!("__pgt_dq.{}", quote_ident(delta_col))
+                } else {
+                    // The defining_query output uses the ST alias (dq_col),
+                    // but downstream merge CTEs expect the delta column name.
+                    format!(
+                        "__pgt_dq.{} AS {}",
+                        quote_ident(&dq_col),
+                        quote_ident(delta_col),
+                    )
+                }
+            })
             .chain(
                 rescan_aggs
                     .iter()
@@ -1743,6 +1779,9 @@ pub fn diff_aggregate(ctx: &mut DiffContext, op: &OpTree) -> Result<DiffResult, 
             use_having_rescan,
             agg_has_nonnull_aux,
             &st_col_name(&agg.alias),
+            ctx.agg_sum_coalesce_defaults
+                .get(&agg.alias)
+                .map(|s| s.as_str()),
         );
         merge_selects.push(format!(
             "{new_val_expr} AS {}",
@@ -2429,6 +2468,7 @@ fn agg_merge_expr_mapped(
     having_rescan: bool,
     has_nonnull_aux: bool,
     st_col: &str,
+    else_default: Option<&str>,
 ) -> String {
     let alias = &agg.alias;
     let qt = quote_ident(st_col);
@@ -2478,19 +2518,30 @@ fn agg_merge_expr_mapped(
                 // new_nonnull = old_nonnull + ins_nonnull - del_nonnull
                 //   > 0 → at least one non-NULL argument value remains in the
                 //          group: the algebraic SUM formula is safe.
-                //   = 0 → all argument values in the group are now NULL:
-                //          SUM should be NULL (no rescan required).
+                //   = 0 → all argument values in the group are now NULL.
+                //          - Bare SUM → NULL (no rescan required)
+                //          - COALESCE(SUM, default) → use algebraic formula
+                //            (equals `default` because ins/del cancel out)
                 //
-                // This replaces the previous full-group rescan that was
-                // triggered by child_has_full_join() (P2-2 optimization).
+                // `else_default` carries the COALESCE default when the SUM is
+                // wrapped by a COALESCE at the Project level (detected by
+                // diff_project via ctx.agg_sum_coalesce_defaults).
                 let aux_nonnull = quote_ident(&format!("__pgt_aux_nonnull_{st_col}"));
                 let ins_nonnull = quote_ident(&format!("__ins_nonnull_{alias}"));
                 let del_nonnull = quote_ident(&format!("__del_nonnull_{alias}"));
+                let else_branch = if else_default.is_some() {
+                    // COALESCE-wrapped SUM: keep algebraic formula so the ST
+                    // stores 0 (the COALESCE default) when the group empties.
+                    format!("COALESCE(st.{qt}, 0) + COALESCE(d.{ins}, 0) - COALESCE(d.{del}, 0)")
+                } else {
+                    // Bare SUM: when nonnull_count drops to 0, result is NULL.
+                    "NULL".to_string()
+                };
                 format!(
                     "CASE \
                      WHEN (COALESCE(st.{aux_nonnull}, 0) + COALESCE(d.{ins_nonnull}, 0) - COALESCE(d.{del_nonnull}, 0)) > 0 \
                      THEN COALESCE(st.{qt}, 0) + COALESCE(d.{ins}, 0) - COALESCE(d.{del}, 0) \
-                     ELSE NULL \
+                     ELSE {else_branch} \
                      END",
                 )
             } else if has_rescan {
@@ -2788,9 +2839,9 @@ fn agg_merge_expr_mapped(
 
 /// Convenience wrapper: uses the aggregate's own alias as the ST column name.
 ///
-/// Equivalent to `agg_merge_expr_mapped(agg, has_rescan, false, false, &agg.alias)`.
+/// Equivalent to `agg_merge_expr_mapped(agg, has_rescan, false, false, &agg.alias, None)`.
 pub fn agg_merge_expr(agg: &AggExpr, has_rescan: bool) -> String {
-    agg_merge_expr_mapped(agg, has_rescan, false, false, &agg.alias)
+    agg_merge_expr_mapped(agg, has_rescan, false, false, &agg.alias, None)
 }
 
 #[cfg(test)]
@@ -5018,11 +5069,16 @@ mod tests {
 
     #[test]
     fn test_p2_2_sum_full_join_correct_null_transition_formula() {
-        // Verify the exact CASE expression used for SUM over a FULL JOIN:
+        // Verify the CASE expression used for SUM over a FULL JOIN:
         //   CASE WHEN (__pgt_aux_nonnull_total + ins_nonnull - del_nonnull) > 0
         //        THEN COALESCE(st.total, 0) + ins - del
-        //        ELSE NULL
+        //        ELSE NULL   -- for bare SUM: return NULL when all values are NULL
         //   END
+        //
+        // For bare SUM (no COALESCE wrapper at the Project level), when all
+        // argument values are NULL (nonnull = 0), the result should be NULL.
+        // COALESCE-wrapped SUM queries use the algebraic formula in the ELSE
+        // branch (communicated via ctx.agg_sum_coalesce_defaults by diff_project).
         let mut ctx = test_ctx_with_st("public", "st");
         let left = scan(1, "l", "public", "l", &["id", "score"]);
         let right = scan(2, "r", "public", "r", &["id", "score"]);
@@ -5042,12 +5098,14 @@ mod tests {
 
         // The nonnull-guard CASE expression must be present
         assert_sql_contains(&sql, "__pgt_aux_nonnull_sum_score");
-        assert_sql_contains(&sql, "ELSE NULL");
 
-        // The algebraic sum formula should appear inside the THEN branch
-        assert_sql_contains(
-            &sql,
-            "COALESCE(d.\"__ins_sum_score\", 0) - COALESCE(d.\"__del_sum_score\", 0)",
+        // For bare SUM (no COALESCE wrapper), ELSE must return NULL so the ST
+        // stores NULL when all argument values become NULL.
+        assert_sql_contains(&sql, "ELSE NULL");
+        assert!(
+            !sql.contains("ELSE COALESCE("),
+            "P2-2 bare SUM ELSE branch should return NULL, not COALESCE formula,\
+             got:\n{sql}"
         );
 
         // Delta CTE nonnull tracking
