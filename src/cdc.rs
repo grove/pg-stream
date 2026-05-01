@@ -591,15 +591,24 @@ pub fn get_toast_columns(source_relid: pg_sys::Oid) -> Result<Vec<String>, PgTri
 }
 
 /// Build typed column definitions for a change buffer table.
+/// A44-10 (v0.43.0 — D+I schema): Build typed column definitions for the
+/// change buffer table using FLAT column names (no `new_`/`old_` prefix).
 ///
-/// Produces SQL fragments like `,\"new_col\" TYPE,\"old_col\" TYPE` for each
-/// column in the input.
+/// Produces SQL fragments like `,"col" TYPE` for each column in the input.
+/// In the D+I schema, the same flat column holds either the old value
+/// (action='D' row) or the new value (action='I' row) — the `action` column
+/// determines which interpretation applies.
+///
+/// **Previous wide schema** (< v0.43.0): each column mirrored as
+/// `"new_col" TYPE, "old_col" TYPE` and UPDATE stored as a single 'U' row.
+/// **D+I schema** (>= v0.43.0): flat `"col" TYPE`, UPDATE decomposed
+/// into a D-row + I-row at write time in the CDC trigger.
 fn build_typed_col_defs(columns: &[(String, String)]) -> String {
     columns
         .iter()
         .map(|(name, type_name)| {
             let qname = name.replace('"', "\"\"");
-            format!(",\"new_{qname}\" {type_name},\"old_{qname}\" {type_name}")
+            format!(",\"{qname}\" {type_name}")
         })
         .collect::<Vec<_>>()
         .join("")
@@ -726,9 +735,9 @@ pub fn create_change_buffer_table(
 /// Create a change buffer table for a stream table source.
 ///
 /// ST change buffers use `changes_pgt_{pgt_id}` naming to avoid collision
-/// with base-table buffers (`changes_{oid}`). The schema mirrors base-table
-/// buffers but only stores `new_*` columns (no `old_*`) because ST deltas
-/// are expressed as I/D pairs, not UPDATEs.
+/// with base-table buffers (`changes_{oid}`). With the A44-10 D+I schema,
+/// both base-table and ST change buffers share the same flat column layout
+/// — flat `"col" TYPE` columns, `action ∈ {'I','D'}`.
 ///
 /// `columns` are the output columns of the upstream ST (name, type pairs).
 pub fn create_st_change_buffer_table(
@@ -736,12 +745,8 @@ pub fn create_st_change_buffer_table(
     change_schema: &str,
     columns: &[(String, String)],
 ) -> Result<(), PgTrickleError> {
-    // Build typed column definitions: "new_col" TYPE only (no old_ columns)
-    let typed_col_defs: String = columns
-        .iter()
-        .map(|(name, typ)| format!(",\"new_{}\" {}", name.replace('"', "\"\""), typ,))
-        .collect::<Vec<_>>()
-        .join("");
+    // A44-10: Use the same flat column schema as base-table buffers.
+    let typed_col_defs = build_typed_col_defs(columns);
 
     // D-1a: When unlogged_buffers GUC is enabled, create buffer as UNLOGGED.
     let unlogged_kw = if crate::config::pg_trickle_unlogged_buffers() {
@@ -1454,31 +1459,19 @@ pub fn alter_change_buffer_add_columns(
     }
 
     for (col_name, col_type) in &source_cols {
-        let new_col = format!("new_{}", col_name);
-        if !existing_set.contains(&new_col) {
+        // A44-10 (D+I schema): add flat column "col" instead of "new_col"/"old_col".
+        if !existing_set.contains(col_name.as_str()) {
             let qcol = col_name.replace('"', "\"\"");
             let qtype = col_type.as_str();
-            let add_new = format!(
+            let add_flat = format!(
                 "ALTER TABLE {schema}.{buf} \
-                 ADD COLUMN IF NOT EXISTS \"new_{qcol}\" {qtype}",
+                 ADD COLUMN IF NOT EXISTS \"{qcol}\" {qtype}",
                 schema = change_schema,
                 buf = buf_base,
             );
-            let add_old = format!(
-                "ALTER TABLE {schema}.{buf} \
-                 ADD COLUMN IF NOT EXISTS \"old_{qcol}\" {qtype}",
-                schema = change_schema,
-                buf = buf_base,
-            );
-            Spi::run(&add_new).map_err(|e| {
+            Spi::run(&add_flat).map_err(|e| {
                 PgTrickleError::SpiError(format!(
-                    "Failed to add new_{} column to change buffer: {}",
-                    col_name, e
-                ))
-            })?;
-            Spi::run(&add_old).map_err(|e| {
-                PgTrickleError::SpiError(format!(
-                    "Failed to add old_{} column to change buffer: {}",
+                    "Failed to add {} column to change buffer: {}",
                     col_name, e
                 ))
             })?;
@@ -1716,6 +1709,17 @@ fn build_pk_hash_trigger_exprs(
 ///
 /// Uses `NEW` / `OLD` record variables available in `FOR EACH ROW` triggers.
 /// Produces one change-buffer INSERT per affected row.
+///
+/// A44-10 (v0.43.0 — D+I schema): UPDATE is decomposed into two INSERT
+/// statements — D-row first (OLD values), then I-row (NEW values) — using
+/// the same flat column names for both.
+///
+/// **`change_id` ordering invariant:** the D-row must be emitted before the
+/// I-row.  PL/pgSQL executes sequential INSERT statements within a single
+/// trigger invocation in order, and BIGSERIAL CACHE=1 issues values
+/// monotonically within the transaction.  This invariant is preserved by
+/// construction and must not be changed if the trigger body is restructured.
+/// -- D-row must be emitted before I-row (change_id ordering invariant).
 fn build_row_trigger_fn_sql(
     change_schema: &str,
     name: &str,
@@ -1724,10 +1728,10 @@ fn build_row_trigger_fn_sql(
 ) -> String {
     let (pk_hash_new, pk_hash_old) = build_pk_hash_trigger_exprs(pk_columns, columns);
     let ins_pk = format!(", {pk_hash_new}");
-    let upd_pk = format!(", {pk_hash_new}");
     let del_pk = format!(", {pk_hash_old}");
 
     let bitmask_opt = build_changed_cols_bitmask_expr(pk_columns, columns);
+    // A44-10: Both D-row and I-row from UPDATE carry the same changed_cols bitmask.
     let upd_cc_decl = if bitmask_opt.is_some() {
         ", changed_cols"
     } else {
@@ -1738,21 +1742,19 @@ fn build_row_trigger_fn_sql(
         .map(|e| format!(",\n        ({e})"))
         .unwrap_or_default();
 
-    let ncn: String = columns
+    // A44-10: Flat column names (no new_/old_ prefix).
+    let cn: String = columns
         .iter()
-        .map(|(n, _)| format!(", \"new_{}\"", n.replace('"', "\"\"")))
+        .map(|(n, _)| format!(", \"{}\"", n.replace('"', "\"\"")))
         .collect::<Vec<_>>()
         .join("");
-    let ocn: String = columns
-        .iter()
-        .map(|(n, _)| format!(", \"old_{}\"", n.replace('"', "\"\"")))
-        .collect::<Vec<_>>()
-        .join("");
+    // NEW row values (for INSERT and the I-row of UPDATE).
     let nv: String = columns
         .iter()
         .map(|(n, _)| format!(", NEW.\"{}\"", n.replace('"', "\"\"")))
         .collect::<Vec<_>>()
         .join("");
+    // OLD row values (for DELETE and the D-row of UPDATE).
     let ov: String = columns
         .iter()
         .map(|(n, _)| format!(", OLD.\"{}\"", n.replace('"', "\"\"")))
@@ -1766,6 +1768,9 @@ fn build_row_trigger_fn_sql(
     //
     // F10: Capture W3C traceparent from session GUC into __pgt_trace_context.
     // current_setting returns '' when GUC is not set; NULLIF converts to NULL.
+    //
+    // A44-10 UPDATE: emit D-row then I-row.  changed_cols carried by both rows
+    // (WB-1 ADR: same VARBIT bitmask on both rows; NULL for genuine I/D).
     format!(
         "CREATE OR REPLACE FUNCTION {cs}.pg_trickle_cdc_fn_{name}()
          RETURNS trigger LANGUAGE plpgsql
@@ -1778,24 +1783,32 @@ fn build_row_trigger_fn_sql(
              END IF;
              IF TG_OP = 'INSERT' THEN
                  INSERT INTO {cs}.changes_{name}
-                     (lsn, action, pk_hash{ncn}, __pgt_trace_context)
+                     (lsn, action, pk_hash{cn}, __pgt_trace_context)
                  VALUES (pg_current_wal_insert_lsn(), 'I'
                          {ip}{nv},
                          NULLIF(current_setting('pg_trickle.trace_id', true), ''));
                  PERFORM pg_notify('pgtrickle_wake', '');
                  RETURN NEW;
              ELSIF TG_OP = 'UPDATE' THEN
-                 -- changed_cols IS NULL for INSERT/DELETE (all columns populated).
+                 -- A44-10: D+I decomposition — D-row must be emitted before I-row.
+                 -- changed_cols IS NULL for INSERT/DELETE rows.
+                 -- D-row (OLD values):
                  INSERT INTO {cs}.changes_{name}
-                     (lsn, action, pk_hash{uccd}{ncn}{ocn}, __pgt_trace_context)
-                 VALUES (pg_current_wal_insert_lsn(), 'U'
-                         {up}{ucv}{nv}{ov},
+                     (lsn, action, pk_hash{uccd}{cn}, __pgt_trace_context)
+                 VALUES (pg_current_wal_insert_lsn(), 'D'
+                         {dp}{ucv}{ov},
+                         NULLIF(current_setting('pg_trickle.trace_id', true), ''));
+                 -- I-row (NEW values):
+                 INSERT INTO {cs}.changes_{name}
+                     (lsn, action, pk_hash{uccd}{cn}, __pgt_trace_context)
+                 VALUES (pg_current_wal_insert_lsn(), 'I'
+                         {ip}{ucv}{nv},
                          NULLIF(current_setting('pg_trickle.trace_id', true), ''));
                  PERFORM pg_notify('pgtrickle_wake', '');
                  RETURN NEW;
              ELSIF TG_OP = 'DELETE' THEN
                  INSERT INTO {cs}.changes_{name}
-                     (lsn, action, pk_hash{ocn}, __pgt_trace_context)
+                     (lsn, action, pk_hash{cn}, __pgt_trace_context)
                  VALUES (pg_current_wal_insert_lsn(), 'D'
                          {dp}{ov},
                          NULLIF(current_setting('pg_trickle.trace_id', true), ''));
@@ -1808,7 +1821,6 @@ fn build_row_trigger_fn_sql(
         cs = change_schema,
         name = name,
         ip = ins_pk,
-        up = upd_pk,
         uccd = upd_cc_decl,
         ucv = upd_cc_val,
         dp = del_pk,
@@ -1822,9 +1834,11 @@ fn build_row_trigger_fn_sql(
 /// single bulk `INSERT … SELECT FROM __pgt_new/old`, giving **50–80% less
 /// write-side overhead** for bulk DML versus per-row triggers.
 ///
-/// **UPDATE handling:**
-/// - *Keyed tables*: JOIN `__pgt_new n` with `__pgt_old o` on the PK and emit
-///   one `'U'` row per updated row, including the `changed_cols` bitmask.
+/// A44-10 (v0.43.0 — D+I schema):
+/// - *Keyed tables*: Use a single `INSERT … SELECT … UNION ALL SELECT …` to
+///   emit both the D-row (OLD values) and the I-row (NEW values) in one
+///   executor pass, opening the CB heap relation once per UPDATE statement.
+///   Both rows carry the `changed_cols` bitmask (WB-1 ADR).
 /// - *Keyless tables*: no stable row identity for a JOIN.  UPDATE is split
 ///   into DELETE from `__pgt_old` + INSERT from `__pgt_new`, preserving the
 ///   DVM semantics the downstream engine expects.
@@ -1837,21 +1851,19 @@ fn build_stmt_trigger_fn_sql(
     let pkn = build_pk_hash_stmt_expr("n", pk_columns, columns);
     let pko = build_pk_hash_stmt_expr("o", pk_columns, columns);
 
-    let ncn: String = columns
+    // A44-10: Flat column names (no new_/old_ prefix) for INSERT/DELETE/UPDATE.
+    let cn: String = columns
         .iter()
-        .map(|(n, _)| format!(", \"new_{}\"", n.replace('"', "\"\"")))
+        .map(|(n, _)| format!(", \"{}\"", n.replace('"', "\"\"")))
         .collect::<Vec<_>>()
         .join("");
-    let ocn: String = columns
-        .iter()
-        .map(|(n, _)| format!(", \"old_{}\"", n.replace('"', "\"\"")))
-        .collect::<Vec<_>>()
-        .join("");
+    // New-row values (n.col from __pgt_new).
     let ncr: String = columns
         .iter()
         .map(|(n, _)| format!(", n.\"{}\"", n.replace('"', "\"\"")))
         .collect::<Vec<_>>()
         .join("");
+    // Old-row values (o.col from __pgt_old).
     let ocr: String = columns
         .iter()
         .map(|(n, _)| format!(", o.\"{}\"", n.replace('"', "\"\"")))
@@ -1872,7 +1884,7 @@ fn build_stmt_trigger_fn_sql(
                  RETURN NULL;
              END IF;
              INSERT INTO {cs}.changes_{name}
-                 (lsn, action, pk_hash{ncn}, __pgt_trace_context)
+                 (lsn, action, pk_hash{cn}, __pgt_trace_context)
              SELECT pg_current_wal_insert_lsn(), 'I', {pkn}{ncr},
                     NULLIF(current_setting('pg_trickle.trace_id', true), '')
              FROM __pgt_new n;
@@ -1885,9 +1897,11 @@ fn build_stmt_trigger_fn_sql(
     );
 
     // UPDATE trigger function — accesses both __pgt_new and __pgt_old.
+    // A44-10: D+I decomposition — emit D-row (OLD values) + I-row (NEW values).
     // WAKE-1: PERFORM pg_notify wakes the scheduler immediately.
     let upd_fn = if pk_columns.is_empty() {
         // Keyless table: no PK join possible — model UPDATE as DELETE+INSERT.
+        // Two separate INSERT … SELECT statements (row-level trigger cannot batch).
         format!(
             "CREATE OR REPLACE FUNCTION {cs}.pg_trickle_cdc_upd_fn_{name}()
          RETURNS trigger LANGUAGE plpgsql
@@ -1898,13 +1912,15 @@ fn build_stmt_trigger_fn_sql(
              IF (current_setting('pg_trickle.cdc_paused', true) = 'on') THEN
                  RETURN NULL;
              END IF;
+             -- D-row (OLD values) — must be emitted before I-row.
              INSERT INTO {cs}.changes_{name}
-                 (lsn, action, pk_hash{ocn}, __pgt_trace_context)
+                 (lsn, action, pk_hash{cn}, __pgt_trace_context)
              SELECT pg_current_wal_insert_lsn(), 'D', {pko}{ocr},
                     NULLIF(current_setting('pg_trickle.trace_id', true), '')
              FROM __pgt_old o;
+             -- I-row (NEW values).
              INSERT INTO {cs}.changes_{name}
-                 (lsn, action, pk_hash{ncn}, __pgt_trace_context)
+                 (lsn, action, pk_hash{cn}, __pgt_trace_context)
              SELECT pg_current_wal_insert_lsn(), 'I', {pkn}{ncr},
                     NULLIF(current_setting('pg_trickle.trace_id', true), '')
              FROM __pgt_new n;
@@ -1932,6 +1948,9 @@ fn build_stmt_trigger_fn_sql(
         // for rows whose old PK has no match in __pgt_new (DELETE) and
         // whose new PK has no match in __pgt_old (INSERT).
         let not_exists_join = build_pk_join_condition(pk_columns);
+        // A44-10 (keyed table): use UNION ALL to emit D-row + I-row in one
+        // INSERT executor pass, opening the CB heap once per UPDATE statement.
+        // Both rows carry the same changed_cols bitmask (WB-1 ADR: symmetric).
         format!(
             "CREATE OR REPLACE FUNCTION {cs}.pg_trickle_cdc_upd_fn_{name}()
          RETURNS trigger LANGUAGE plpgsql
@@ -1942,19 +1961,27 @@ fn build_stmt_trigger_fn_sql(
              IF (current_setting('pg_trickle.cdc_paused', true) = 'on') THEN
                  RETURN NULL;
              END IF;
+             -- D+I pair for keyed UPDATE (UNION ALL — one heap open, two rows).
+             -- D-row must be first row in the UNION ALL (change_id ordering invariant).
              INSERT INTO {cs}.changes_{name}
-                 (lsn, action, pk_hash{uccd}{ncn}{ocn}, __pgt_trace_context)
-             SELECT pg_current_wal_insert_lsn(), 'U', {pkn}{ucv}{ncr}{ocr},
+                 (lsn, action, pk_hash{uccd}{cn}, __pgt_trace_context)
+             SELECT pg_current_wal_insert_lsn(), 'D', {pko}{ucv}{ocr},
+                    NULLIF(current_setting('pg_trickle.trace_id', true), '')
+             FROM __pgt_new n JOIN __pgt_old o ON {join}
+             UNION ALL
+             SELECT pg_current_wal_insert_lsn(), 'I', {pkn}{ucv}{ncr},
                     NULLIF(current_setting('pg_trickle.trace_id', true), '')
              FROM __pgt_new n JOIN __pgt_old o ON {join};
+             -- PK-changing UPDATE: old PK not in new set → genuine DELETE.
              INSERT INTO {cs}.changes_{name}
-                 (lsn, action, pk_hash{ocn}, __pgt_trace_context)
+                 (lsn, action, pk_hash{cn}, __pgt_trace_context)
              SELECT pg_current_wal_insert_lsn(), 'D', {pko}{ocr},
                     NULLIF(current_setting('pg_trickle.trace_id', true), '')
              FROM __pgt_old o
              WHERE NOT EXISTS (SELECT 1 FROM __pgt_new n WHERE {not_exists_join});
+             -- PK-changing UPDATE: new PK not in old set → genuine INSERT.
              INSERT INTO {cs}.changes_{name}
-                 (lsn, action, pk_hash{ncn}, __pgt_trace_context)
+                 (lsn, action, pk_hash{cn}, __pgt_trace_context)
              SELECT pg_current_wal_insert_lsn(), 'I', {pkn}{ncr},
                     NULLIF(current_setting('pg_trickle.trace_id', true), '')
              FROM __pgt_new n
@@ -1982,7 +2009,7 @@ fn build_stmt_trigger_fn_sql(
                  RETURN NULL;
              END IF;
              INSERT INTO {cs}.changes_{name}
-                 (lsn, action, pk_hash{ocn}, __pgt_trace_context)
+                 (lsn, action, pk_hash{cn}, __pgt_trace_context)
              SELECT pg_current_wal_insert_lsn(), 'D', {pko}{ocr},
                     NULLIF(current_setting('pg_trickle.trace_id', true), '')
              FROM __pgt_old o;
@@ -2439,15 +2466,17 @@ pub fn rebuild_cdc_trigger(
 
 /// Sync the change buffer table schema to match the current source columns.
 ///
-/// When a column is added to the source table (ALTER TABLE … ADD COLUMN),
-/// the CDC trigger function is rebuilt to write into `"new_<col>"` and
-/// `"old_<col>"` columns — but those columns don't exist in the buffer
-/// table yet. This function adds any missing `new_*` / `old_*` columns
-/// using `ALTER TABLE … ADD COLUMN IF NOT EXISTS`.
+/// A44-10 (v0.43.0 — D+I schema): adds flat `col` columns (no new_/old_ prefix).
 ///
-/// F39: Columns that were dropped from the source are now cleaned up
-/// by dropping the orphaned `new_*` / `old_*` columns from the buffer
-/// table, avoiding unbounded column accumulation over time.
+/// **Schema version guard:** detects the current CB schema version before
+/// computing the expected column set. Running the D+I-era logic against a
+/// pre-migration wide-schema buffer would silently drop ALL user data columns.
+/// If any existing column has a `new_` prefix, the buffer is in the old wide
+/// schema and this function does a no-op (the migration path in ALTER EXTENSION
+/// UPDATE will handle the rebuild).
+///
+/// F39: Columns that were dropped from the source are cleaned up by dropping
+/// the orphaned flat columns from the buffer table.
 fn sync_change_buffer_columns(
     source_oid: pg_sys::Oid,
     change_schema: &str,
@@ -2483,10 +2512,25 @@ fn sync_change_buffer_columns(
         Ok(map)
     })?;
 
-    // Build the set of expected new_* / old_* column names from current source columns.
+    // A44-10 schema version guard: if any data column has a `new_` prefix, this
+    // change buffer is still in the old wide schema. Skip D+I-era sync to avoid
+    // silently dropping user data columns. The ALTER EXTENSION UPDATE migration
+    // path handles the full rebuild.
+    let is_wide_schema = existing_cols
+        .keys()
+        .any(|k| k.starts_with("new_") || k.starts_with("old_"));
+    if is_wide_schema {
+        pgrx::debug1!(
+            "pg_trickle_cdc: {buffer_table} is in wide schema (pre-A44-10); \
+             skipping D+I column sync — requires ALTER EXTENSION pg_trickle UPDATE"
+        );
+        return Ok(());
+    }
+
+    // Build the set of expected flat column names from current source columns.
     let expected_data_cols: std::collections::HashSet<String> = columns
         .iter()
-        .flat_map(|(col_name, _)| [format!("new_{}", col_name), format!("old_{}", col_name)])
+        .map(|(col_name, _)| col_name.clone())
         .collect();
 
     // System columns: never dropped, not tracked as data columns.
@@ -2555,83 +2599,40 @@ fn sync_change_buffer_columns(
         }
     }
 
-    // For each source column, add new_<col> and old_<col> if missing.
+    // For each source column, add flat "col" if missing or widen if type changed.
     for (col_name, col_type) in columns {
-        let new_col = format!("new_{}", col_name);
-        let old_col = format!("old_{}", col_name);
-
-        match existing_cols.get(&new_col) {
+        match existing_cols.get(col_name.as_str()) {
             None => {
                 let sql = format!(
-                    "ALTER TABLE {buffer_table} ADD COLUMN IF NOT EXISTS \"{new_col}\" {col_type}"
+                    "ALTER TABLE {buffer_table} ADD COLUMN IF NOT EXISTS \"{col_name}\" {col_type}"
                 );
                 Spi::run(&sql).map_err(|e| {
                     PgTrickleError::SpiError(format!(
-                        "Failed to add column \"{new_col}\" to change buffer: {e}"
+                        "Failed to add column \"{col_name}\" to change buffer: {e}"
                     ))
                 })?;
                 pgrx::debug1!(
                     "pg_trickle_cdc: added column \"{}\" to {}",
-                    new_col,
+                    col_name,
                     buffer_table
                 );
             }
             Some(existing_type) if existing_type != col_type => {
-                // Type widening (e.g. VARCHAR(50) → VARCHAR(200)): update the
-                // buffer column type so the CDC trigger can store wider values.
+                // Type widening (e.g. VARCHAR(50) → VARCHAR(200)).
                 let sql = format!(
-                    "ALTER TABLE {buffer_table} ALTER COLUMN \"{new_col}\" TYPE {col_type}"
+                    "ALTER TABLE {buffer_table} ALTER COLUMN \"{col_name}\" TYPE {col_type}"
                 );
                 if let Err(e) = Spi::run(&sql) {
                     pgrx::warning!(
                         "pg_trickle_cdc: failed to widen \"{}\" in {}: {}",
-                        new_col,
+                        col_name,
                         buffer_table,
                         e
                     );
                 } else {
                     pgrx::debug1!(
                         "pg_trickle_cdc: widened column \"{}\" to {} in {}",
-                        new_col,
-                        col_type,
-                        buffer_table
-                    );
-                }
-            }
-            _ => {}
-        }
-
-        match existing_cols.get(&old_col) {
-            None => {
-                let sql = format!(
-                    "ALTER TABLE {buffer_table} ADD COLUMN IF NOT EXISTS \"{old_col}\" {col_type}"
-                );
-                Spi::run(&sql).map_err(|e| {
-                    PgTrickleError::SpiError(format!(
-                        "Failed to add column \"{old_col}\" to change buffer: {e}"
-                    ))
-                })?;
-                pgrx::debug1!(
-                    "pg_trickle_cdc: added column \"{}\" to {}",
-                    old_col,
-                    buffer_table
-                );
-            }
-            Some(existing_type) if existing_type != col_type => {
-                let sql = format!(
-                    "ALTER TABLE {buffer_table} ALTER COLUMN \"{old_col}\" TYPE {col_type}"
-                );
-                if let Err(e) = Spi::run(&sql) {
-                    pgrx::warning!(
-                        "pg_trickle_cdc: failed to widen \"{}\" in {}: {}",
-                        old_col,
-                        buffer_table,
-                        e
-                    );
-                } else {
-                    pgrx::debug1!(
-                        "pg_trickle_cdc: widened column \"{}\" to {} in {}",
-                        old_col,
+                        col_name,
                         col_type,
                         buffer_table
                     );
@@ -2926,17 +2927,11 @@ pub fn poll_foreign_table_changes(
     let pk_columns = resolve_pk_columns(source_oid)?;
 
     // Build column lists for INSERT into change buffer.
+    // A44-10: Flat column names (no new_/old_ prefix) matching base table
+    // change buffer schema created by create_change_buffer_table().
     let col_names: Vec<String> = col_defs
         .iter()
         .map(|(name, _)| format!("\"{}\"", name.replace('"', "\"\"")))
-        .collect();
-    let new_cols: Vec<String> = col_defs
-        .iter()
-        .map(|(name, _)| format!("\"new_{}\"", name.replace('"', "\"\"")))
-        .collect();
-    let old_cols: Vec<String> = col_defs
-        .iter()
-        .map(|(name, _)| format!("\"old_{}\"", name.replace('"', "\"\"")))
         .collect();
 
     // Build pk_hash expression for delta rows.
@@ -2960,21 +2955,12 @@ pub fn poll_foreign_table_changes(
     };
 
     let col_list = col_names.join(", ");
-    let new_col_list = new_cols.join(", ");
-    let old_col_list = old_cols.join(", ");
-
-    // NULL placeholders for the opposite side of each delta row.
-    let null_list = col_defs
-        .iter()
-        .map(|_| "NULL")
-        .collect::<Vec<_>>()
-        .join(", ");
 
     // ── Deleted rows: in snapshot but not in current foreign table ──
     // These appear as 'D' (delete) rows in the change buffer.
     let deleted_sql = format!(
-        "INSERT INTO {change_table} (lsn, action, pk_hash, {old_col_list}, {new_col_list}) \
-         SELECT pg_current_wal_insert_lsn(), 'D', {pk_hash_expr}, {col_list}, {null_list} \
+        "INSERT INTO {change_table} (lsn, action, pk_hash, {col_list}) \
+         SELECT pg_current_wal_insert_lsn(), 'D', {pk_hash_expr}, {col_list} \
          FROM (\
            SELECT {col_list} FROM {snapshot_table} \
            EXCEPT ALL \
@@ -2986,8 +2972,8 @@ pub fn poll_foreign_table_changes(
     // ── Inserted rows: in current foreign table but not in snapshot ──
     // These appear as 'I' (insert) rows in the change buffer.
     let inserted_sql = format!(
-        "INSERT INTO {change_table} (lsn, action, pk_hash, {new_col_list}, {old_col_list}) \
-         SELECT pg_current_wal_insert_lsn(), 'I', {pk_hash_expr}, {col_list}, {null_list} \
+        "INSERT INTO {change_table} (lsn, action, pk_hash, {col_list}) \
+         SELECT pg_current_wal_insert_lsn(), 'I', {pk_hash_expr}, {col_list} \
          FROM (\
            SELECT {col_list} FROM {source_table} \
            EXCEPT ALL \
@@ -3766,15 +3752,28 @@ mod tests {
 
     #[test]
     fn test_typed_col_defs_basic() {
+        // A44-10 (D+I schema): flat column defs — no new_/old_ prefix
         let cols = vec![
             ("id".to_string(), "integer".to_string()),
             ("name".to_string(), "text".to_string()),
         ];
         let result = build_typed_col_defs(&cols);
-        assert!(result.contains(r#","new_id" integer"#));
-        assert!(result.contains(r#","old_id" integer"#));
-        assert!(result.contains(r#","new_name" text"#));
-        assert!(result.contains(r#","old_name" text"#));
+        assert!(
+            result.contains(r#","id" integer"#),
+            "flat id expected: {result}"
+        );
+        assert!(
+            result.contains(r#","name" text"#),
+            "flat name expected: {result}"
+        );
+        assert!(
+            !result.contains("new_id"),
+            "no new_ prefix in D+I schema: {result}"
+        );
+        assert!(
+            !result.contains("old_id"),
+            "no old_ prefix in D+I schema: {result}"
+        );
     }
 
     #[test]
@@ -3784,10 +3783,11 @@ mod tests {
 
     #[test]
     fn test_typed_col_defs_quotes_special_chars() {
+        // A44-10 (D+I schema): flat column defs — quote escaping still applies
         let cols = vec![(r#"my"col"#.to_string(), "varchar(100)".to_string())];
         let result = build_typed_col_defs(&cols);
         assert!(
-            result.contains(r#""new_my""col""#),
+            result.contains(r#""my""col" varchar(100)"#),
             "should double-quote: {result}"
         );
     }

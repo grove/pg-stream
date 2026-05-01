@@ -636,6 +636,7 @@ mod tests {
     fn test_p2_7_filter_pushdown_into_scan() {
         // Filter with a simple ColumnRef predicate over a PK-based Scan
         // should be pushed into the scan CTE (no separate filter CTE).
+        // A44-10 (D+I schema): pushed filter uses flat c."col" (no old_/new_ prefix).
         let mut ctx = test_ctx();
         let child = scan_with_pk(1, "orders", "public", "o", &["id", "status"], &["id"]);
         let tree = filter(
@@ -652,9 +653,10 @@ mod tests {
         let result = diff_filter(&mut ctx, &tree).unwrap();
         let sql = ctx.build_with_query(&result.cte_name);
 
-        // The scan CTE should contain pushed filter with old_/new_ prefixes
-        assert_sql_contains(&sql, "old_status");
-        assert_sql_contains(&sql, "new_status");
+        // A44-10: flat c."status" reference in pushed filter (no old_/new_ prefix)
+        assert_sql_contains(&sql, "c.\"status\"");
+        assert_sql_not_contains(&sql, "old_status");
+        assert_sql_not_contains(&sql, "new_status");
         // No separate filter CTE should exist
         assert!(!result.cte_name.contains("filter"));
     }

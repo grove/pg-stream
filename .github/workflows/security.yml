@@ -52,9 +52,12 @@ jobs:
           # RUSTSEC-2026-0098, RUSTSEC-2026-0099: rustls-webpki name-constraint bugs.
           # Pulled in via aws-smithy-http-client (optional sqs feature of pgtrickle-relay).
           # Not reachable in relay code. Will resolve when AWS SDK migrates to rustls 0.23.x.
-          ignore: RUSTSEC-2023-0071,RUSTSEC-2026-0104,RUSTSEC-2026-0098,RUSTSEC-2026-0099
-
-  scheduled_audit:
+          # RUSTSEC-2026-0118, RUSTSEC-2026-0119, RUSTSEC-2026-0120: hickory-dns DoS advisories
+          # published 2026-05-01 affecting hickory-proto 0.26.0 and hickory-net 0.26.0 (NSEC3
+          # unbounded loop and O(n²) name compression). These crates are only transitive test
+          # dependencies via sqlx's integration tests and are not reachable in the extension.
+          # Will be resolved when upstream releases hickory-dns 0.26.1.
+          ignore: RUSTSEC-2023-0071,RUSTSEC-2026-0104,RUSTSEC-2026-0098,RUSTSEC-2026-0099,RUSTSEC-2026-0118,RUSTSEC-2026-0119,RUSTSEC-2026-0120
     if: github.event_name == 'schedule'
     name: cargo audit (scheduled)
     runs-on: ubuntu-latest
@@ -79,4 +82,9 @@ jobs:
           # RUSTSEC-2026-0098, RUSTSEC-2026-0099: rustls-webpki name-constraint bugs.
           # Pulled in via aws-smithy-http-client (optional sqs feature of pgtrickle-relay).
           # Not reachable in relay code. Will resolve when AWS SDK migrates to rustls 0.23.x.
-          ignore: RUSTSEC-2023-0071,RUSTSEC-2026-0104,RUSTSEC-2026-0098,RUSTSEC-2026-0099
+          # RUSTSEC-2026-0118, RUSTSEC-2026-0119, RUSTSEC-2026-0120: hickory-dns DoS advisories
+          # published 2026-05-01 affecting hickory-proto 0.26.0 and hickory-net 0.26.0 (NSEC3
+          # unbounded loop and O(n²) name compression). These crates are only transitive test
+          # dependencies via sqlx's integration tests and are not reachable in the extension.
+          # Will be resolved when upstream releases hickory-dns 0.26.1.
+          ignore: RUSTSEC-2023-0071,RUSTSEC-2026-0104,RUSTSEC-2026-0098,RUSTSEC-2026-0099,RUSTSEC-2026-0118,RUSTSEC-2026-0119,RUSTSEC-2026-0120

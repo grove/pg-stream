@@ -501,10 +501,11 @@ pub fn is_backpressure_active(slot_name: &str) -> bool {
     false
 }
 
-/// Maximum number of changes to process per poll cycle.
+/// A44-3 (v0.43.0): Maximum number of changes to process per poll cycle.
 ///
-/// Limits memory usage and keeps each scheduler tick bounded.
-/// Remaining changes are picked up in the next cycle.
+/// Previously hardcoded at 10 000. Now controlled by
+/// `pg_trickle.wal_max_changes_per_poll` GUC. Kept as fallback for tests.
+#[cfg(test)]
 const MAX_CHANGES_PER_POLL: i64 = 10_000;
 
 /// Number of consecutive WAL poll errors before automatically falling back
@@ -548,13 +549,15 @@ pub fn poll_wal_changes(
     // pg_logical_slot_get_changes() advances the slot position
     // automatically.  We use test_decoding which produces text output
     // in the format: "table schema.table: ACTION: col[type]:val ..."
+    // A44-3: Read max changes per poll from GUC (default 10 000, previously hardcoded).
+    let max_changes_per_poll = crate::config::pg_trickle_wal_max_changes_per_poll();
     let poll_sql = format!(
         "SELECT lsn::text, xid, data \
          FROM pg_logical_slot_get_changes(\
              '{slot_name}', NULL, {max_changes}\
          )",
         slot_name = slot_name,
-        max_changes = MAX_CHANGES_PER_POLL,
+        max_changes = max_changes_per_poll,
     );
 
     let mut count: i64 = 0;
@@ -800,36 +803,159 @@ fn write_decoded_change(
         placeholders.push(pk_hash_expr);
     }
 
-    // Map parsed columns to new_<col> and/or old_<col> buffer columns.
+    // Map parsed columns to flat buffer columns (A44-10 D+I schema).
     // A42-14: Add explicit `::col_type` casts to each placeholder so that
     // the text-typed SPI parameter datums are cast to the actual column type
     // at query-plan time. Without explicit casts, PostgreSQL rejects text→integer
     // (and other non-implicit-coercible) assignments in parameterized queries.
+
+    // A44-10: UPDATE is decomposed into D-row (OLD values) + I-row (NEW values)
+    // emitted as a single multi-row VALUES INSERT for atomicity (single SPI call,
+    // single heap operation). This avoids the risk of a crash between D and I rows.
+    if *action == 'U' {
+        // Build D-row and I-row in a UNION VALUES insert.
+        // D-row: pk_hash from OLD values, flat columns with OLD values.
+        // I-row: pk_hash from NEW values, flat columns with NEW values.
+        let mut d_params: Vec<Option<String>> = Vec::new();
+        let mut i_params: Vec<Option<String>> = Vec::new();
+        let mut flat_col_names: Vec<String> = Vec::new();
+        let mut d_placeholders: Vec<String> = Vec::new();
+        let mut i_placeholders: Vec<String> = Vec::new();
+
+        // lsn: same for both rows.
+        flat_col_names.push("lsn".to_string());
+        d_params.push(Some(lsn.to_string()));
+        i_params.push(Some(lsn.to_string()));
+        d_placeholders.push(format!("${}::pg_lsn", 1));
+        i_placeholders.push(format!("${}::pg_lsn", 1));
+
+        // action: 'D' for the first row, 'I' for the second.
+        flat_col_names.push("action".to_string());
+        // These will be literal values, not params, to avoid duplicate param handling.
+
+        // pk_hash.
+        if has_pk {
+            flat_col_names.push("pk_hash".to_string());
+            // D-row pk_hash: from OLD values (old_parsed).
+            // I-row pk_hash: from NEW values (parsed).
+        }
+
+        for (col_name, col_type) in columns {
+            let safe_name = col_name.replace('"', "\"\"");
+            flat_col_names.push(format!("\"{}\"", safe_name));
+            d_params.push(old_parsed.get(col_name).cloned());
+            i_params.push(parsed.get(col_name).cloned());
+            let d_idx = d_params.len();
+            let i_idx = i_params.len();
+            d_placeholders.push(format!("${}::{}", d_idx, col_type));
+            i_placeholders.push(format!("${}::{}", i_idx, col_type));
+        }
+
+        let buf_name = cdc::buffer_base_name_for_oid(pg_sys::Oid::from(source_oid));
+        assert_valid_identifier(&buf_name, "change buffer name")?;
+        assert_valid_identifier(change_schema, "change schema")?;
+
+        // Build the pk_hash expressions using the OLD-value and NEW-value parsers.
+        // We use inline literal expressions (via build_pk_hash_from_values) because
+        // pk values come from PostgreSQL's WAL pgoutput and are properly encoded.
+        // build_pk_hash_from_values uses single-quote escaping for the literals.
+        let d_pk_hash_expr = build_pk_hash_from_values(pk_columns, &old_parsed);
+        let i_pk_hash_expr = build_pk_hash_from_values(pk_columns, &parsed);
+
+        // Build col list (excluding lsn, action, pk_hash — handled separately).
+        let data_col_names: Vec<String> = columns
+            .iter()
+            .map(|(n, _)| format!("\"{}\"", n.replace('"', "\"\"")))
+            .collect();
+        let data_col_str = if data_col_names.is_empty() {
+            String::new()
+        } else {
+            format!(", {}", data_col_names.join(", "))
+        };
+
+        // D-row params (1-indexed): lsn=1 + data cols start at 2.
+        let mut d_all_params: Vec<Option<String>> = vec![Some(lsn.to_string())];
+        let mut d_data_placeholders: Vec<String> = Vec::new();
+        for (col_name, col_type) in columns {
+            d_all_params.push(old_parsed.get(col_name).cloned());
+            d_data_placeholders.push(format!("${}::{}", d_all_params.len(), col_type));
+        }
+
+        // I-row params: offset all by d_all_params.len() since they go in the same VALUES list.
+        let d_len = d_all_params.len();
+        let mut i_all_params: Vec<Option<String>> = Vec::new();
+        let mut i_data_placeholders: Vec<String> = Vec::new();
+        for (col_name, col_type) in columns {
+            i_all_params.push(parsed.get(col_name).cloned());
+            i_data_placeholders.push(format!("${}::{}", d_len + i_all_params.len(), col_type));
+        }
+
+        let pk_col_clause = if has_pk { ", pk_hash" } else { "" };
+        let d_data_str = if d_data_placeholders.is_empty() {
+            String::new()
+        } else {
+            format!(", {}", d_data_placeholders.join(", "))
+        };
+        let i_data_str = if i_data_placeholders.is_empty() {
+            String::new()
+        } else {
+            format!(", {}", i_data_placeholders.join(", "))
+        };
+
+        // A44-10 atomicity: single multi-row INSERT for D+I pair.
+        // D-row must appear before I-row (change_id ordering invariant).
+        let sql = format!(
+            // nosemgrep: rust.spi.query.dynamic-format
+            "INSERT INTO {schema}.{buf_name} \
+             (lsn, action{pk_col_clause}{data_col_str}) VALUES \
+             ($1::pg_lsn, 'D', {d_pk}{d_data}), \
+             ($1::pg_lsn, 'I', {i_pk}{i_data})",
+            schema = change_schema,
+            buf_name = buf_name,
+            pk_col_clause = pk_col_clause,
+            data_col_str = data_col_str,
+            d_pk = if has_pk {
+                format!("{}, ", d_pk_hash_expr)
+            } else {
+                String::new()
+            },
+            d_data = d_data_str,
+            i_pk = if has_pk {
+                format!("{}, ", i_pk_hash_expr)
+            } else {
+                String::new()
+            },
+            i_data = i_data_str,
+        );
+
+        let mut all_params = d_all_params;
+        all_params.extend(i_all_params);
+        let spi_args: Vec<pgrx::datum::DatumWithOid<'_>> =
+            all_params.into_iter().map(|v| v.into()).collect();
+
+        pgrx::Spi::run_with_args(&sql, &spi_args).map_err(|e| {
+            PgTrickleError::WalTransitionError(format!(
+                "Failed to write D+I pair for WAL UPDATE to buffer: {}",
+                e
+            ))
+        })?;
+        return Ok(());
+    }
+
     for (col_name, col_type) in columns {
         let safe_name = col_name.replace('"', "\"\"");
 
         match action {
             'I' => {
-                col_names.push(format!("\"new_{}\"", safe_name));
+                // A44-10: flat column "col" (was "new_col").
+                col_names.push(format!("\"{}\"", safe_name));
                 let val = parsed.get(col_name).cloned();
                 param_values.push(val);
                 placeholders.push(format!("${}::{}", param_values.len(), col_type));
             }
-            'U' => {
-                // new value
-                col_names.push(format!("\"new_{}\"", safe_name));
-                let new_val = parsed.get(col_name).cloned();
-                param_values.push(new_val);
-                placeholders.push(format!("${}::{}", param_values.len(), col_type));
-
-                // G2.2: old value from pgoutput old-key section.
-                col_names.push(format!("\"old_{}\"", safe_name));
-                let old_val = old_parsed.get(col_name).cloned();
-                param_values.push(old_val);
-                placeholders.push(format!("${}::{}", param_values.len(), col_type));
-            }
             'D' => {
-                col_names.push(format!("\"old_{}\"", safe_name));
+                // A44-10: flat column "col" (was "old_col").
+                col_names.push(format!("\"{}\"", safe_name));
                 let val = parsed.get(col_name).cloned();
                 param_values.push(val);
                 placeholders.push(format!("${}::{}", param_values.len(), col_type));

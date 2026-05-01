@@ -112,5 +112,81 @@ fn bench_dag_construction(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_unit_by_id, bench_dag_construction);
+criterion_group!(
+    benches,
+    bench_unit_by_id,
+    bench_dag_construction,
+    bench_a44_5_pool_vs_spawn,
+);
 criterion_main!(benches);
+
+// ── A44-5: Pool-vs-spawn comparison ───────────────────────────────────────
+//
+// Compares the overhead of reusing a pre-built ExecutionUnitDag ("pool") vs.
+// rebuilding it from scratch for every dispatch tick ("spawn").
+//
+// In production the DAG is rebuilt on schema changes only; this benchmark
+// demonstrates the cost difference between incremental-update and full-rebuild
+// dispatch strategies at various DAG sizes, supporting the auto-enable
+// threshold documented in A44-5.
+fn bench_a44_5_pool_vs_spawn(c: &mut Criterion) {
+    let mut group = c.benchmark_group("a44_5_pool_vs_spawn");
+    group.measurement_time(Duration::from_secs(12));
+
+    for n_sts in [50u32, 200, 500, 1000] {
+        // Build a DAG with `n_sts` stream tables.
+        let st_dag = {
+            let mut d = StDag::new();
+            for pgt_id in 1..=(n_sts as i64) {
+                let node = DagNode {
+                    id: NodeId::StreamTable(pgt_id),
+                    schedule: Some(Duration::from_secs(60)),
+                    effective_schedule: Duration::from_secs(60),
+                    name: format!("st_{pgt_id}"),
+                    status: StStatus::Active,
+                    schedule_raw: Some("1m".to_string()),
+                };
+                d.add_st_node(node);
+                let base_oid = ((pgt_id as u32 - 1) % 50) + 16384;
+                d.add_edge(NodeId::BaseTable(base_oid), NodeId::StreamTable(pgt_id));
+            }
+            d
+        };
+
+        // "Pool" strategy: build once, reuse the same EU-DAG for every tick.
+        let pool_dag =
+            ExecutionUnitDag::build_from_st_dag(&st_dag, |_| Some(RefreshMode::Differential));
+        let unit_ids: Vec<ExecutionUnitId> = pool_dag.units().map(|u| u.id).collect();
+
+        group.bench_with_input(
+            BenchmarkId::new("pool_dispatch", n_sts),
+            &unit_ids,
+            |b, ids| {
+                b.iter(|| {
+                    for &uid in ids {
+                        black_box(pool_dag.unit_by_id(uid));
+                    }
+                });
+            },
+        );
+
+        // "Spawn" strategy: rebuild the EU-DAG on every tick.
+        group.bench_with_input(
+            BenchmarkId::new("spawn_rebuild", n_sts),
+            &st_dag,
+            |b, dag| {
+                b.iter(|| {
+                    let eu_dag = ExecutionUnitDag::build_from_st_dag(dag, |_| {
+                        Some(RefreshMode::Differential)
+                    });
+                    let ids: Vec<ExecutionUnitId> = eu_dag.units().map(|u| u.id).collect();
+                    for uid in ids {
+                        black_box(eu_dag.unit_by_id(uid));
+                    }
+                });
+            },
+        );
+    }
+
+    group.finish();
+}

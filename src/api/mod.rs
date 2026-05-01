@@ -5525,6 +5525,13 @@ fn sla_summary() -> TableIterator<
 /// Useful for diagnosing unexpected fallback behaviour or understanding
 /// which joins and filters pg_trickle resolves at each hop.
 ///
+/// A44-8 (v0.43.0) extends the output to include:
+/// - DVM plan: join strategy (L0/L1+Part3), aggregate mode (algebraic/GROUP_RESCAN)
+/// - Fallback reasons (SUM(CASE), window functions, deep joins)
+/// - Current GUC threshold values (part3_max_scan_count, deep_join_l0_scan_threshold)
+/// - Estimated query complexity class
+/// - Suggested tuning actions
+///
 /// v0.39.0 extends the output to include:
 /// - Explicit DIFF/FULL fallback reason from the stream table catalog
 /// - Whether `force_full_refresh` GUC is overriding the mode
@@ -5567,6 +5574,97 @@ fn explain_stream_table(name: &str) -> Result<String, PgTrickleError> {
         "active".to_string()
     };
 
+    // A44-8: Query complexity analysis — detect join depth and aggregate patterns.
+    let query_upper = st.defining_query.to_uppercase();
+    let join_count = query_upper.matches(" JOIN ").count();
+    let has_aggregate = query_upper.contains(" GROUP BY ")
+        || query_upper.contains("COUNT(")
+        || query_upper.contains("SUM(")
+        || query_upper.contains("AVG(")
+        || query_upper.contains("MIN(")
+        || query_upper.contains("MAX(");
+    let has_case_in_agg =
+        (query_upper.contains("SUM(CASE") || query_upper.contains("SUM( CASE")) && has_aggregate;
+    let has_window = query_upper.contains(" OVER (") || query_upper.contains(" OVER(");
+    let has_distinct_agg =
+        query_upper.contains("COUNT(DISTINCT") || query_upper.contains("SUM(DISTINCT");
+    let has_recursive = query_upper.contains("RECURSIVE ");
+
+    let complexity_class = if has_recursive {
+        "recursive"
+    } else if join_count >= 6 {
+        "very_deep_join"
+    } else if join_count >= 4 {
+        "deep_join"
+    } else if join_count >= 2 {
+        "multi_join"
+    } else if join_count == 1 {
+        "single_join"
+    } else if has_aggregate {
+        "aggregate_only"
+    } else {
+        "simple_scan"
+    };
+
+    let deep_threshold = crate::config::pg_trickle_deep_join_l0_scan_threshold();
+    let part3_threshold = crate::config::pg_trickle_part3_max_scan_count();
+
+    let join_strategy_note = if join_count == 0 {
+        "no_join".to_string()
+    } else if join_count > deep_threshold {
+        format!(
+            "L1+Part3 correction (join depth {join_count} > deep_join_l0_scan_threshold {deep_threshold})"
+        )
+    } else if join_count > part3_threshold {
+        format!(
+            "L1 without Part3 (join depth {join_count} > part3_max_scan_count {part3_threshold})"
+        )
+    } else {
+        format!("L0 per-leaf snapshot (join depth {join_count} <= threshold {deep_threshold})")
+    };
+
+    let aggregate_strategy_note = if !has_aggregate {
+        "no_aggregate".to_string()
+    } else if has_case_in_agg {
+        "GROUP_RESCAN — SUM(CASE) is not algebraically invertible (DI-8)".to_string()
+    } else if has_window {
+        "GROUP_RESCAN — window functions require full rescan".to_string()
+    } else if has_distinct_agg {
+        "GROUP_RESCAN — DISTINCT aggregates require full rescan".to_string()
+    } else {
+        "algebraic — COUNT/SUM algebraically invertible".to_string()
+    };
+
+    let mut fallback_reasons: Vec<String> = Vec::new();
+    if has_case_in_agg {
+        fallback_reasons.push("SUM(CASE) → GROUP_RESCAN (DI-8)".to_string());
+    }
+    if has_window {
+        fallback_reasons.push("window functions → GROUP_RESCAN".to_string());
+    }
+    if has_distinct_agg {
+        fallback_reasons.push("DISTINCT aggregate → GROUP_RESCAN".to_string());
+    }
+    if join_count > deep_threshold {
+        fallback_reasons.push(format!(
+            "deep join ({join_count} tables > {deep_threshold}) → L1+Part3"
+        ));
+    }
+
+    let mut suggestions: Vec<String> = Vec::new();
+    if has_case_in_agg {
+        suggestions.push(
+            "Rewrite SUM(CASE WHEN ...) as a conditional column to enable algebraic maintenance"
+                .to_string(),
+        );
+    }
+    if join_count > deep_threshold && join_count <= deep_threshold + 2 {
+        suggestions.push(format!(
+            "SET pg_trickle.deep_join_l0_scan_threshold = {join_count} \
+             to use L1+Part3 for this query depth"
+        ));
+    }
+
     let explanation = format!(
         "Stream table: {schema}.{table_name}\n\
          Status:       {status:?}\n\
@@ -5574,6 +5672,22 @@ fn explain_stream_table(name: &str) -> Result<String, PgTrickleError> {
          Refresh mode: {refresh_mode}\n\
          CDC status:   {cdc_status}\n\
          Backpressure: {backpressure}\n\
+         \n\
+         === A44-8: DVM Plan Analysis ===\n\
+         Complexity:        {complexity_class}\n\
+         Join count:        {join_count}\n\
+         Join strategy:     {join_strategy}\n\
+         Aggregate strategy:{aggregate_strategy}\n\
+         Fallback reasons:  {fallbacks}\n\
+         Suggestions:       {suggestions_text}\n\
+         \n\
+         === GUC Thresholds ===\n\
+         part3_max_scan_count:         {part3_max}\n\
+         deep_join_l0_scan_threshold:  {deep_l0}\n\
+         wal_max_changes_per_poll:     {wal_max_changes}\n\
+         wal_max_lag_bytes:            {wal_max_lag}\n\
+         cost_cache_capacity:          {cost_cap}\n\
+         \n\
          Defining query:\n\
          {query}",
         schema = schema,
@@ -5583,6 +5697,25 @@ fn explain_stream_table(name: &str) -> Result<String, PgTrickleError> {
         refresh_mode = refresh_mode_note,
         cdc_status = cdc_status,
         backpressure = backpressure_note,
+        complexity_class = complexity_class,
+        join_count = join_count,
+        join_strategy = join_strategy_note,
+        aggregate_strategy = aggregate_strategy_note,
+        fallbacks = if fallback_reasons.is_empty() {
+            "none".to_string()
+        } else {
+            fallback_reasons.join("; ")
+        },
+        suggestions_text = if suggestions.is_empty() {
+            "none".to_string()
+        } else {
+            suggestions.join("; ")
+        },
+        part3_max = crate::config::pg_trickle_part3_max_scan_count(),
+        deep_l0 = crate::config::pg_trickle_deep_join_l0_scan_threshold(),
+        wal_max_changes = crate::config::pg_trickle_wal_max_changes_per_poll(),
+        wal_max_lag = crate::config::pg_trickle_wal_max_lag_bytes(),
+        cost_cap = crate::config::pg_trickle_cost_cache_capacity(),
         query = st.defining_query,
     );
     Ok(explanation)

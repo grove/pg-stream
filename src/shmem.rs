@@ -932,13 +932,24 @@ pub fn is_l0_cache_available() -> bool {
 
 // ── PERF-3 (v0.25.0): Shmem adaptive cost-model state ─────────────────────
 
-/// Number of per-ST cost model slots in the shmem cache.
+/// A44-4 (v0.43.0): Physical number of per-ST cost model slots in the shmem cache.
 ///
-/// Slots are addressed by `(pgt_id as usize) % COST_CACHE_CAPACITY`.
+/// This is the compile-time maximum. The runtime effective capacity is
+/// controlled by `pg_trickle.cost_cache_capacity` GUC (default 256).
+/// Slots are addressed by `(pgt_id as usize) % effective_capacity`.
 /// Collisions are tolerated — a wrong slot is treated as a miss and
 /// triggers an SPI fallback. 256 slots give < 0.4% expected collision
 /// rate for workloads with ≤ 1 000 stream tables.
 const COST_CACHE_CAPACITY: usize = 256;
+
+/// A44-4 (v0.43.0): Returns the effective cost-cache capacity from the GUC.
+/// Capped to COST_CACHE_CAPACITY (256) regardless of GUC value.
+#[inline]
+fn effective_cost_cache_capacity() -> usize {
+    // In test environments (no PostgreSQL backend), GucSetting returns its
+    // compile-time default, so this is safe to call unconditionally.
+    crate::config::pg_trickle_cost_cache_capacity().min(COST_CACHE_CAPACITY)
+}
 
 /// One cost model entry for a single stream table.
 ///
@@ -993,7 +1004,7 @@ pub fn update_cost_model(pgt_id: i64, last_full_ms: Option<f64>, last_diff_ms: O
     if !is_shmem_available() {
         return;
     }
-    let slot = (pgt_id as usize).wrapping_rem(COST_CACHE_CAPACITY);
+    let slot = (pgt_id as usize).wrapping_rem(effective_cost_cache_capacity());
     let mut cache = COST_MODEL_STATE.exclusive();
     let entry = &mut cache.entries[slot];
     // If the slot is taken by a different pgt_id, overwrite it.
@@ -1015,7 +1026,7 @@ pub fn read_cost_model(pgt_id: i64) -> Option<(f64, f64)> {
     if !is_shmem_available() {
         return None;
     }
-    let slot = (pgt_id as usize).wrapping_rem(COST_CACHE_CAPACITY);
+    let slot = (pgt_id as usize).wrapping_rem(effective_cost_cache_capacity());
     let cache = COST_MODEL_STATE.share();
     let entry = &cache.entries[slot];
     if entry.pgt_id != pgt_id || entry.pgt_id == 0 {

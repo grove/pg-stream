@@ -7,6 +7,7 @@ For future plans and upcoming features, see [ROADMAP.md](ROADMAP.md).
 ## Table of Contents
 
 <!-- TOC start -->
+- [0.43.0 — D+I Change-Buffer Schema, GUC Tuning & WAL Diagnostics](#0430--di-change-buffer-schema-guc-tuning--wal-diagnostics)
 - [0.42.0 — Repair API, Docs Overhaul & Test Infrastructure](#0420--repair-api-docs-overhaul--test-infrastructure)
 - [0.41.0 — DVM Correctness: Structural Cache Keys, Placeholder Safety & WAL Transition Guards](#0410--dvm-correctness-structural-cache-keys-placeholder-safety--wal-transition-guards)
 - [0.40.0 — Operator Trust, Maintainability & Release Confidence](#0400--operator-trust-maintainability--release-confidence)
@@ -56,6 +57,130 @@ For future plans and upcoming features, see [ROADMAP.md](ROADMAP.md).
 - [0.1.1 — CloudNativePG Image & Test Hardening](#011--cloudnativepg-image--test-hardening)
 - [0.1.0 — Initial Release](#010--initial-release)
 <!-- TOC end -->
+
+---
+
+## [0.43.0] — D+I Change-Buffer Schema, GUC Tuning & WAL Diagnostics
+
+v0.43.0 delivers a fundamental change to how CDC change buffers are stored
+(D+I schema: flat column names, UPDATE decomposed into a D-row + I-row at
+write time), five new operator-tuning GUCs, a new `wal_source_status()`
+diagnostic view for per-source WAL CDC state, extended `explain_stream_table()`
+output, and a comprehensive microbenchmark suite for all new code paths.
+
+### A44-1 — Deep-Join Threshold GUCs
+
+Two new GUCs let operators tune when the DVM planner switches from the fast
+L0-scan path to the full recursive join decomposition:
+
+| GUC | Default | Description |
+|-----|---------|-------------|
+| `pg_trickle.part3_max_scan_count` | `10000` | Maximum number of source rows before the planner escalates from P3 (direct scan) to a deeper join strategy. |
+| `pg_trickle.deep_join_l0_scan_threshold` | `256` | Row count at which multi-level join decomposition uses an L0 pre-scan instead of a full plan. |
+
+```sql
+-- Lower threshold to force deep-join path for testing
+SET pg_trickle.deep_join_l0_scan_threshold = 1;
+```
+
+### A44-2 — GROUP_RESCAN: Correct Incremental SUM(CASE …) Aggregates
+
+The P5 aggregate differentiation path now produces correct incremental results
+for non-invertible expressions such as `SUM(CASE WHEN status = 'active' THEN
+amount ELSE 0 END)`.  The previous LATERAL VALUES decomposition has been
+replaced with direct `c.action = 'I'` / `c.action = 'D'` filtering against
+the D+I change buffer, eliminating the extra join overhead and fixing a
+correctness gap for UPDATE rows that cross a CASE boundary.
+
+### A44-3 — WAL Poll GUCs
+
+Two new GUCs for tuning the WAL logical replication decoder polling loop:
+
+| GUC | Default | Description |
+|-----|---------|-------------|
+| `pg_trickle.wal_max_changes_per_poll` | `10000` | Maximum number of change messages to consume from a WAL slot in a single poll pass. |
+| `pg_trickle.wal_max_lag_bytes` | `104857600` (100 MiB) | WAL slot lag threshold (bytes) above which the decoder pauses to avoid slot saturation. |
+
+### A44-4 — Cost-Cache Capacity GUC
+
+`pg_trickle.cost_cache_capacity` (default `4096`) controls the maximum number
+of entries in the shared refresh-cost estimate cache. On deployments with
+thousands of stream tables, increasing this value avoids cold-cache fallback to
+full-plan estimation.
+
+### A44-5 through A44-7 — Mandatory Microbenchmarks
+
+Three new Criterion benchmark groups:
+
+- **`bench_a44_5_pool_vs_spawn`** — measures EU-DAG pool reuse vs. per-tick
+  rebuild at `n_sts ∈ {50, 200, 500, 1000}`.
+- **`bench_a44_6_write_amplification`** — compares single-hash (pre-D+I wide
+  schema) vs. double-hash (D+I) write overhead at `cols ∈ {4, 10, 20, 50}`.
+- **`bench_a44_7_join_codegen_by_depth`** and
+  **`bench_a44_7_scan_agg_delta_sql`** — join chain depth 2–16 and P5
+  aggregate SQL generation at 1–5 group columns.
+
+### A44-8 — `explain_stream_table()` GUC Threshold Section
+
+`pgtrickle.explain_stream_table(name)` now includes a **GUC thresholds**
+section in its output, showing the effective values of all tuning GUCs
+(deep-join threshold, WAL poll limits, cost-cache capacity) alongside the
+existing plan and mode information.
+
+### A44-9 — `pgtrickle.wal_source_status()` — Per-Source WAL Diagnostics
+
+New SQL function returning one row per registered source table with WAL CDC
+diagnostics:
+
+```sql
+SELECT * FROM pgtrickle.wal_source_status();
+```
+
+| Column | Description |
+|--------|-------------|
+| `source_relid` | Source table OID |
+| `source_name` | Fully-qualified source table name |
+| `cdc_mode` | `trigger`, `wal`, or `transitioning` |
+| `slot_name` | Logical replication slot name (NULL if trigger-based) |
+| `slot_lag_bytes` | Current WAL slot lag in bytes |
+| `publication_name` | Publication name (NULL if trigger-based) |
+| `blocked_reason` | Human-readable reason why WAL CDC is unavailable (NULL if active) |
+| `transition_started_at` | Timestamp when WAL transition began (NULL if not transitioning) |
+| `decoder_confirmed_lsn` | Last LSN confirmed by the decoder (NULL if trigger-based) |
+
+### A44-10 — D+I Change-Buffer Schema
+
+**Breaking internal change** — the CDC change buffer table schema has been
+redesigned for correctness and performance.
+
+**Before (wide schema):** Each source column was stored as two columns
+(`new_<col>` and `old_<col>`). UPDATE was stored as a single `action = 'U'`
+row; the DVM scan operator decomposed it at read time using a 5-CTE UNION ALL
+pipeline.
+
+**After (D+I schema):** Source columns are stored with their original names
+(`"col"`). `UPDATE` is decomposed at write time into:
+- A **D-row** (`action = 'D'`) carrying the **old** values.
+- An **I-row** (`action = 'I'`) carrying the **new** values.
+
+Both rows carry the same `changed_cols` VARBIT bitmask; genuine
+INSERT/DELETE rows have `changed_cols = NULL`.
+
+Benefits:
+- Scan SQL is significantly simpler (no UNION ALL decomposition at read time).
+- Aggregate differentiation eliminates the LATERAL VALUES join.
+- Write amplification is constant (2 rows per UPDATE regardless of column count).
+- Change buffer tables are compatible with standard SQL tooling.
+
+The `sync_change_buffer_columns()` migration guard detects existing wide-schema
+buffers (any `new_*`/`old_*` columns) and performs a no-op, logging a warning.
+To migrate an existing deployment, use `pgtrickle.repair_stream_table(name)`.
+
+### A44-11 — D+I Benchmark Suite
+
+`bench_a44_11_di_delta_scan` exercises the full D+I Scan→Aggregate pipeline
+at `cols ∈ {4, 10, 20, 50}` to track differential scan performance as the
+column count grows.
 
 ---
 

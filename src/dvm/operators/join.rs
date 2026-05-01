@@ -81,6 +81,7 @@
 //! lookup when the join key has an index, providing 10x+ speedup at low
 //! change rates.
 
+use crate::config;
 use crate::dvm::diff::{DiffContext, DiffResult, quote_ident};
 use crate::dvm::operators::join_common::{
     build_base_table_key_exprs, build_leaf_snapshot_sql, build_snapshot_sql, is_join_child,
@@ -89,19 +90,11 @@ use crate::dvm::operators::join_common::{
 use crate::dvm::parser::{Expr, OpTree};
 use crate::error::PgTrickleError;
 
-/// DI-5: Maximum number of Scan nodes in the left child for which Part 3
-/// correction is emitted. Raised from 3 (original) to 5 thanks to DI-1's
-/// named CTE L₀ snapshots reducing temp file pressure. Covers up to
-/// 6-table semi-join chains.
-const PART3_MAX_SCAN_COUNT: usize = 5;
-
-/// DI-11: Maximum number of Scan nodes in a join child before switching
-/// from L₀/R₀ per-leaf reconstruction to L₁/R₁ + Part 3 correction.
-/// At 4+ scans, the per-leaf CTE snapshot (5-table re-join with NOT
-/// EXISTS per leaf) generates 100+ GB of temp files at SF=0.01.
-/// Using L₁ + correction is dramatically cheaper (joins only ΔL × ΔR)
-/// and equally correct for pure inner-join chains.
-const DEEP_JOIN_L0_SCAN_THRESHOLD: usize = 4;
+// A44-1 (v0.43.0): Part 3 correction term scan count limit is now controlled
+// by the `pg_trickle.part3_max_scan_count` GUC (default 5, previously hardcoded).
+// The default value of 5 was chosen to cover 6-table semi-join chains.
+// A44-1 (v0.43.0): Deep-join L0 snapshot threshold is now controlled
+// by the `pg_trickle.deep_join_l0_scan_threshold` GUC (default 4, previously hardcoded).
 
 /// Returns true if `op` is a join whose **both** children are simple (Scan)
 /// nodes.  Previously this gated Part 3 correction term generation — now
@@ -281,8 +274,10 @@ pub fn diff_inner_join(ctx: &mut DiffContext, op: &OpTree) -> Result<DiffResult,
     // The correction is computed eagerly here but only emitted when
     // `!use_l0` (see `correction_sql` below).
     let left_scan_count = join_scan_count(left);
+    // A44-1: Read deep-join threshold from GUC (default 5, previously hardcoded).
+    let part3_max_scan_count = config::pg_trickle_part3_max_scan_count();
     let join_cond_correction =
-        if !is_simple_child(left) && is_join_child(left) && left_scan_count <= PART3_MAX_SCAN_COUNT
+        if !is_simple_child(left) && is_join_child(left) && left_scan_count <= part3_max_scan_count
         {
             Some(rewrite_join_condition(condition, left, "dl", right, "dr"))
         } else {
@@ -337,7 +332,9 @@ pub fn diff_inner_join(ctx: &mut DiffContext, op: &OpTree) -> Result<DiffResult,
     // Additionally, joins inside a SemiJoin/AntiJoin ancestor must use
     // L₁ to avoid Q21-type regressions where sub-join EXCEPT ALL
     // interacts with the SemiJoin's R_old computation.
-    let use_l0 = use_pre_change_snapshot(left, ctx.inside_semijoin, DEEP_JOIN_L0_SCAN_THRESHOLD);
+    // A44-1: Read L0 scan threshold from GUC (default 4, previously hardcoded).
+    let deep_join_l0_threshold = config::pg_trickle_deep_join_l0_scan_threshold();
+    let use_l0 = use_pre_change_snapshot(left, ctx.inside_semijoin, deep_join_l0_threshold);
 
     let left_part2_source = if use_l0 {
         if is_join_child(left) {
@@ -452,7 +449,7 @@ pub fn diff_inner_join(ctx: &mut DiffContext, op: &OpTree) -> Result<DiffResult,
         // L₀ available → standard formula is exact → no split needed.
         false
     } else {
-        use_pre_change_snapshot(right, ctx.inside_semijoin, DEEP_JOIN_L0_SCAN_THRESHOLD)
+        use_pre_change_snapshot(right, ctx.inside_semijoin, deep_join_l0_threshold)
     };
 
     let right_part1_source = if use_r0 {

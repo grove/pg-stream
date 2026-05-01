@@ -472,5 +472,143 @@ criterion_group!(
     bench_dag_operations,
     bench_dag_incremental,
     bench_xxh64,
+    bench_a44_6_write_amplification,
+    bench_a44_11_di_delta_scan,
 );
 criterion_main!(benches);
+
+// ── A44-6: Write-amplification benchmarks ─────────────────────────────────
+//
+// Measures how write-heavy workloads affect hash computation cost (pure Rust).
+//
+// Key insight: D+I schema computes two pk_hash values per UPDATE (one for
+// D-row from old values, one for I-row from new values), whereas the wide
+// schema computes only one. This benchmark documents the overhead at
+// various column counts. The expected overhead is ≤15% total per UPDATE
+// after accounting for trigger/SPI savings.
+fn bench_a44_6_write_amplification(c: &mut Criterion) {
+    use xxhash_rust::xxh64;
+    const SEED: u64 = 42;
+    let mut group = c.benchmark_group("a44_6_write_amplification");
+    group.measurement_time(Duration::from_secs(10));
+
+    for n_cols in [4u32, 10, 20, 50] {
+        let old_data: Vec<Vec<u8>> = (0..n_cols)
+            .map(|i| format!("old_value_{i}").into_bytes())
+            .collect();
+        let new_data: Vec<Vec<u8>> = (0..n_cols)
+            .map(|i| format!("new_value_{i}").into_bytes())
+            .collect();
+
+        // Wide schema: one hash per UPDATE (concatenated old values)
+        let old_concat: Vec<u8> = old_data.iter().flat_map(|v| v.iter().copied()).collect();
+        group.bench_with_input(
+            BenchmarkId::new("wide_single_hash", n_cols),
+            &old_concat,
+            |b, data| {
+                b.iter(|| xxh64::xxh64(black_box(data), SEED));
+            },
+        );
+
+        // D+I schema: two hashes per UPDATE (old + new values separately)
+        group.bench_with_input(
+            BenchmarkId::new("di_double_hash", n_cols),
+            &(old_data.clone(), new_data.clone()),
+            |b, (olds, news)| {
+                b.iter(|| {
+                    let old_concat: Vec<u8> = olds.iter().flat_map(|v| v.iter().copied()).collect();
+                    let new_concat: Vec<u8> = news.iter().flat_map(|v| v.iter().copied()).collect();
+                    let _d = xxh64::xxh64(black_box(&old_concat), SEED);
+                    let _i = xxh64::xxh64(black_box(&new_concat), SEED);
+                    black_box((_d, _i))
+                });
+            },
+        );
+    }
+    group.finish();
+}
+
+// ── A44-11: D+I delta scan benchmarks ─────────────────────────────────────
+//
+// Measures the delta SQL generation cost for the D+I CB scan path
+// (diff_scan_change_buffer) at various buffer sizes and column counts.
+//
+// These benchmarks serve as the A44-11 baseline. Post-D+I schema, the scan
+// path has no UNION ALL for UPDATE decomposition — this is the performance
+// model for CB scan improvement assertions:
+// - CB scan: improvement ≥20% for 50-column table at 10K+ buffer rows
+// - Multi-change: improvement ≥30% when ≥50% of PKs have 2+ changes
+fn bench_a44_11_di_delta_scan(c: &mut Criterion) {
+    use pg_trickle::dvm::diff::DiffContext;
+    use pg_trickle::dvm::parser::{AggExpr, AggFunc, Column, Expr, OpTree};
+
+    let mut group = c.benchmark_group("a44_11_di_delta_scan");
+    group.measurement_time(Duration::from_secs(10));
+
+    for n_cols in [4u32, 10, 20, 50] {
+        let cols: Vec<String> = (0..n_cols).map(|i| format!("col_{i}")).collect();
+        let col_strs: Vec<&str> = cols.iter().map(|s| s.as_str()).collect();
+
+        // Build a simple Scan → Aggregate tree to exercise the P5 direct delta path
+        let scan = OpTree::Scan {
+            table_oid: 16384,
+            table_name: "orders".to_string(),
+            schema: "public".to_string(),
+            columns: col_strs
+                .iter()
+                .map(|&c| Column {
+                    name: c.to_string(),
+                    type_oid: 23,
+                    is_nullable: false,
+                })
+                .collect(),
+            pk_columns: vec!["col_0".to_string()],
+            alias: "o".to_string(),
+        };
+
+        let agg = OpTree::Aggregate {
+            group_by: vec![Expr::ColumnRef {
+                table_alias: None,
+                column_name: "col_1".to_string(),
+            }],
+            aggregates: vec![AggExpr {
+                function: AggFunc::Sum,
+                argument: Some(Expr::ColumnRef {
+                    table_alias: None,
+                    column_name: "col_2".to_string(),
+                }),
+                alias: "total".to_string(),
+                is_distinct: false,
+                filter: None,
+                second_arg: None,
+                order_within_group: None,
+            }],
+            child: Box::new(scan),
+        };
+
+        let mut prev = pg_trickle::version::Frontier::new();
+        prev.set_source(
+            16384,
+            "0/1000".to_string(),
+            "2024-01-01T00:00:00Z".to_string(),
+        );
+        let mut new_f = pg_trickle::version::Frontier::new();
+        new_f.set_source(
+            16384,
+            "0/2000".to_string(),
+            "2024-01-01T00:01:00Z".to_string(),
+        );
+
+        group.bench_with_input(
+            BenchmarkId::new("p5_agg_delta_ncols", n_cols),
+            &agg,
+            |b, agg| {
+                b.iter(|| {
+                    let mut ctx = DiffContext::new_standalone(prev.clone(), new_f.clone());
+                    black_box(ctx.diff_node(agg).ok())
+                });
+            },
+        );
+    }
+    group.finish();
+}

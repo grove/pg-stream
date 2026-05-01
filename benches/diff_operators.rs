@@ -1608,6 +1608,92 @@ fn bench_diff_vector_avg(c: &mut Criterion) {
     group.finish();
 }
 
+// ── A44-7: Mandatory microbenchmarks (join depth, placeholder, DAG rebuild) ──
+//
+// These are the CI-gated benchmarks required by A44-7. They measure:
+// 1. Join codegen time as a function of join depth (template construction cost)
+// 2. Scan+aggregate delta SQL generation time (P5 direct bypass path)
+// 3. Scheduler DAG rebuild time for incremental updates
+
+/// A44-7: Join codegen by depth.
+fn bench_a44_7_join_codegen_by_depth(c: &mut Criterion) {
+    let mut group = c.benchmark_group("a44_7_join_codegen_depth");
+    group.measurement_time(std::time::Duration::from_secs(8));
+
+    for depth in [2u32, 4, 8, 12, 16] {
+        // Build a linear join chain of `depth` tables
+        let base = make_scan("t0", 16384, &["id", "val"]);
+        let tree = (1..depth).fold(base, |left, i| OpTree::InnerJoin {
+            condition: Expr::BinaryOp {
+                op: "=".to_string(),
+                left: Box::new(Expr::ColumnRef {
+                    table_alias: Some(format!("t{}", i - 1)),
+                    column_name: "id".to_string(),
+                }),
+                right: Box::new(Expr::ColumnRef {
+                    table_alias: Some(format!("t{i}")),
+                    column_name: "id".to_string(),
+                }),
+            },
+            left: Box::new(left),
+            right: Box::new(make_scan(&format!("t{i}"), 16384 + i, &["id", "val"])),
+        });
+
+        group.bench_with_input(BenchmarkId::new("depth", depth), &tree, |b, tree| {
+            b.iter(|| {
+                let mut ctx = test_ctx();
+                black_box(ctx.diff_node(tree).ok())
+            });
+        });
+    }
+    group.finish();
+}
+
+/// A44-7: Scan+aggregate delta SQL generation (P5 direct bypass path).
+fn bench_a44_7_scan_agg_delta_sql(c: &mut Criterion) {
+    let mut group = c.benchmark_group("a44_7_scan_agg_delta");
+    group.measurement_time(std::time::Duration::from_secs(8));
+
+    for n_groups in [1u32, 3, 5] {
+        let group_exprs: Vec<Expr> = (0..n_groups)
+            .map(|i| Expr::ColumnRef {
+                table_alias: None,
+                column_name: format!("g{i}"),
+            })
+            .collect();
+        let mut cols: Vec<&str> = vec!["id", "amount"];
+        let group_col_names: Vec<String> = (0..n_groups).map(|i| format!("g{i}")).collect();
+        let group_col_strs: Vec<&str> = group_col_names.iter().map(|s| s.as_str()).collect();
+        cols.extend_from_slice(&group_col_strs);
+        let cols: Vec<&str> = cols.clone();
+
+        let tree = OpTree::Aggregate {
+            group_by: group_exprs,
+            aggregates: vec![AggExpr {
+                function: AggFunc::Sum,
+                argument: Some(Expr::ColumnRef {
+                    table_alias: None,
+                    column_name: "amount".to_string(),
+                }),
+                alias: "total".to_string(),
+                is_distinct: false,
+                filter: None,
+                second_arg: None,
+                order_within_group: None,
+            }],
+            child: Box::new(make_scan("orders", 16384, &cols)),
+        };
+
+        group.bench_with_input(BenchmarkId::new("n_groups", n_groups), &tree, |b, tree| {
+            b.iter(|| {
+                let mut ctx = test_ctx();
+                black_box(ctx.diff_node(tree).ok())
+            });
+        });
+    }
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_diff_scan,
@@ -1615,6 +1701,8 @@ criterion_group!(
     bench_diff_project,
     bench_diff_aggregate,
     bench_diff_vector_avg,
+    bench_a44_7_join_codegen_by_depth,
+    bench_a44_7_scan_agg_delta_sql,
     bench_diff_inner_join,
     bench_diff_left_join,
     bench_diff_distinct,

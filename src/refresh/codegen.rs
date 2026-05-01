@@ -904,9 +904,10 @@ pub(crate) fn capture_delta_to_st_buffer(
         return Ok(0);
     }
 
-    let new_col_list: String = user_cols
+    // A44-10: ST change buffers use flat D+I schema (no new_/old_ prefix).
+    let flat_col_list: String = user_cols
         .iter()
-        .map(|c| format!("\"new_{}\"", c.replace('"', "\"\"")))
+        .map(|c| format!("\"{}\"", c.replace('"', "\"\"")))
         .collect::<Vec<_>>()
         .join(", ");
 
@@ -931,7 +932,7 @@ pub(crate) fn capture_delta_to_st_buffer(
     {
         format!(
             "INSERT INTO \"{change_schema}\".changes_pgt_{pgt_id} \
-             (lsn, action, pk_hash, {new_col_list}) \
+             (lsn, action, pk_hash, {flat_col_list}) \
              SELECT pg_current_wal_lsn(), \
                     CASE WHEN ins.__pgt_row_id IS NOT NULL \
                               AND del.__pgt_row_id IS NOT NULL \
@@ -945,7 +946,7 @@ pub(crate) fn capture_delta_to_st_buffer(
              ON ins.__pgt_row_id = del.__pgt_row_id",
             change_schema = change_schema,
             pgt_id = pgt_id,
-            new_col_list = new_col_list,
+            flat_col_list = flat_col_list,
             pk_ins = build_content_hash_expr("ins.", user_cols),
             pk_del = build_content_hash_expr("del.", user_cols),
             coal_cols = user_cols
@@ -960,7 +961,7 @@ pub(crate) fn capture_delta_to_st_buffer(
     } else {
         format!(
             "INSERT INTO \"{change_schema}\".changes_pgt_{pgt_id} \
-             (lsn, action, pk_hash, {new_col_list}) \
+             (lsn, action, pk_hash, {flat_col_list}) \
              SELECT pg_current_wal_lsn(), d.__pgt_action, {pk_hash_expr}, \
                     {d_col_list} \
              FROM __pgt_delta_{pgt_id} d \
@@ -1057,13 +1058,14 @@ pub fn capture_delta_to_bypass_table(
 
     let count = if pre_snapshot_exists {
         let user_cols: Vec<String> = user_cols_typed.iter().map(|(n, _)| n.clone()).collect();
+        // A44-10: Bypass tables use flat D+I schema (no new_/old_ prefix).
         let col_defs: String = std::iter::once("lsn pg_lsn".to_string())
             .chain(std::iter::once("action \"char\"".to_string()))
             .chain(std::iter::once("pk_hash bigint".to_string()))
             .chain(
                 user_cols_typed
                     .iter()
-                    .map(|(name, typ)| format!("\"new_{}\" {}", name.replace('"', "\"\""), typ)),
+                    .map(|(name, typ)| format!("\"{}\" {}", name.replace('"', "\"\""), typ)),
             )
             .collect::<Vec<_>>()
             .join(", ");
@@ -1107,7 +1109,7 @@ pub fn capture_delta_to_bypass_table(
 /// `capture_incremental_diff_to_st_buffer` (persistent buffer path).
 ///
 /// `target_table` must already exist with the appropriate schema
-/// (`lsn, action, pk_hash, new_col1, ...`).
+/// (`lsn, action, pk_hash, col1, col2, ...` — flat D+I schema, A44-10).
 /// Reads the pre-snapshot from `__pgt_pre_{pgt_id}` and compares with the
 /// current state of the ST backing table.
 ///
@@ -1131,9 +1133,10 @@ pub(crate) fn capture_diff_to_table(
         name.replace('"', "\"\""),
     );
 
-    let new_col_list: String = user_cols
+    // A44-10: ST change buffers use flat D+I schema (no new_/old_ prefix).
+    let flat_col_list: String = user_cols
         .iter()
-        .map(|c| format!("\"new_{}\"", c.replace('"', "\"\"")))
+        .map(|c| format!("\"{}\"", c.replace('"', "\"\"")))
         .collect::<Vec<_>>()
         .join(", ");
 
@@ -1172,7 +1175,7 @@ pub(crate) fn capture_diff_to_table(
 
     // Deleted rows: in pre but no longer in the table.
     let del_sql = format!(
-        "INSERT INTO {target_table} (lsn, action, pk_hash, {new_col_list}) \
+        "INSERT INTO {target_table} (lsn, action, pk_hash, {flat_col_list}) \
          SELECT {lsn_expr}, 'D', {pre_pk_hash}, {pre_col_refs} \
          FROM __pgt_pre_{pgt_id} pre \
          LEFT JOIN {quoted_table} post ON pre.__pgt_row_id = post.__pgt_row_id \
@@ -1188,7 +1191,7 @@ pub(crate) fn capture_diff_to_table(
 
     // Inserted rows: in table (scoped to delta row_ids) but not in pre.
     let ins_sql = format!(
-        "INSERT INTO {target_table} (lsn, action, pk_hash, {new_col_list}) \
+        "INSERT INTO {target_table} (lsn, action, pk_hash, {flat_col_list}) \
          SELECT {lsn_expr}, 'I', {post_pk_hash}, {post_col_refs} \
          FROM {quoted_table} post \
          JOIN (SELECT DISTINCT __pgt_row_id FROM __pgt_delta_{pgt_id}) delta \
@@ -1207,7 +1210,7 @@ pub(crate) fn capture_diff_to_table(
     // Changed rows: same row_id, different column values.
     if !is_distinct_pairs.is_empty() {
         let chg_del_sql = format!(
-            "INSERT INTO {target_table} (lsn, action, pk_hash, {new_col_list}) \
+            "INSERT INTO {target_table} (lsn, action, pk_hash, {flat_col_list}) \
              SELECT {lsn_expr}, 'D', {pre_pk_hash}, {pre_col_refs} \
              FROM __pgt_pre_{pgt_id} pre \
              JOIN {quoted_table} post ON post.__pgt_row_id = pre.__pgt_row_id \
@@ -1222,7 +1225,7 @@ pub(crate) fn capture_diff_to_table(
         })?;
 
         let chg_ins_sql = format!(
-            "INSERT INTO {target_table} (lsn, action, pk_hash, {new_col_list}) \
+            "INSERT INTO {target_table} (lsn, action, pk_hash, {flat_col_list}) \
              SELECT {lsn_expr}, 'I', {post_pk_hash}, {post_col_refs} \
              FROM {quoted_table} post \
              JOIN __pgt_pre_{pgt_id} pre ON post.__pgt_row_id = pre.__pgt_row_id \
@@ -1249,20 +1252,21 @@ pub fn build_bypass_capture_sql(
     bypass_table: &str,
     lsn_override: Option<&str>,
 ) -> String {
+    // A44-10: Bypass tables use flat D+I schema (no new_/old_ prefix).
     let col_defs: String = std::iter::once("lsn pg_lsn".to_string())
         .chain(std::iter::once("action \"char\"".to_string()))
         .chain(std::iter::once("pk_hash bigint".to_string()))
         .chain(
             user_cols_typed
                 .iter()
-                .map(|(name, typ)| format!("\"new_{}\" {}", name.replace('"', "\"\""), typ)),
+                .map(|(name, typ)| format!("\"{}\" {}", name.replace('"', "\"\""), typ)),
         )
         .collect::<Vec<_>>()
         .join(", ");
 
-    let new_col_list: String = user_cols_typed
+    let flat_col_list: String = user_cols_typed
         .iter()
-        .map(|(name, _)| format!("\"new_{}\"", name.replace('"', "\"\"")))
+        .map(|(name, _)| format!("\"{}\"", name.replace('"', "\"\"")))
         .collect::<Vec<_>>()
         .join(", ");
 
@@ -1286,7 +1290,7 @@ pub fn build_bypass_capture_sql(
 
     format!(
         "CREATE TEMP TABLE IF NOT EXISTS {bypass_table} ({col_defs}) ON COMMIT DROP;\n\
-         INSERT INTO {bypass_table} (lsn, action, pk_hash, {new_col_list}) \
+         INSERT INTO {bypass_table} (lsn, action, pk_hash, {flat_col_list}) \
          SELECT {lsn_expr}, d.__pgt_action, {pk_hash_expr}, {d_col_list} \
          FROM __pgt_delta_{pgt_id} d \
          WHERE d.__pgt_action IN ('I', 'D')"
@@ -1349,9 +1353,10 @@ pub(crate) fn capture_full_refresh_diff_to_st_buffer(
         name.replace('"', "\"\""),
     );
 
-    let new_col_list: String = user_cols
+    // A44-10: ST change buffers use flat D+I schema (no new_/old_ prefix).
+    let flat_col_list: String = user_cols
         .iter()
-        .map(|c| format!("\"new_{}\"", c.replace('"', "\"\"")))
+        .map(|c| format!("\"{}\"", c.replace('"', "\"\"")))
         .collect::<Vec<_>>()
         .join(", ");
 
@@ -1387,7 +1392,7 @@ pub(crate) fn capture_full_refresh_diff_to_st_buffer(
     // Deleted rows: in pre but not in post
     let deleted_sql = format!(
         "INSERT INTO \"{change_schema}\".changes_pgt_{pgt_id} \
-         (lsn, action, pk_hash, {new_col_list}) \
+         (lsn, action, pk_hash, {flat_col_list}) \
          SELECT pg_current_wal_lsn(), 'D', {pre_pk_hash}, {pre_col_refs} \
          FROM __pgt_pre_{pgt_id} pre \
          LEFT JOIN {quoted_table} post ON pre.__pgt_row_id = post.__pgt_row_id \
@@ -1404,7 +1409,7 @@ pub(crate) fn capture_full_refresh_diff_to_st_buffer(
     // Inserted rows: in post but not in pre
     let inserted_sql = format!(
         "INSERT INTO \"{change_schema}\".changes_pgt_{pgt_id} \
-         (lsn, action, pk_hash, {new_col_list}) \
+         (lsn, action, pk_hash, {flat_col_list}) \
          SELECT pg_current_wal_lsn(), 'I', {post_pk_hash}, {post_col_refs} \
          FROM {quoted_table} post \
          LEFT JOIN __pgt_pre_{pgt_id} pre ON post.__pgt_row_id = pre.__pgt_row_id \
@@ -1430,7 +1435,7 @@ pub(crate) fn capture_full_refresh_diff_to_st_buffer(
         // D event: old content hash + old column values
         let changed_del_sql = format!(
             "INSERT INTO \"{change_schema}\".changes_pgt_{pgt_id} \
-             (lsn, action, pk_hash, {new_col_list}) \
+             (lsn, action, pk_hash, {flat_col_list}) \
              SELECT pg_current_wal_lsn(), 'D', {pre_pk_hash}, {pre_col_refs} \
              FROM __pgt_pre_{pgt_id} pre \
              JOIN {quoted_table} post ON post.__pgt_row_id = pre.__pgt_row_id \
@@ -1447,7 +1452,7 @@ pub(crate) fn capture_full_refresh_diff_to_st_buffer(
         // I event: new content hash + new column values
         let changed_ins_sql = format!(
             "INSERT INTO \"{change_schema}\".changes_pgt_{pgt_id} \
-             (lsn, action, pk_hash, {new_col_list}) \
+             (lsn, action, pk_hash, {flat_col_list}) \
              SELECT pg_current_wal_lsn(), 'I', {post_pk_hash}, {post_col_refs} \
              FROM {quoted_table} post \
              JOIN __pgt_pre_{pgt_id} pre ON post.__pgt_row_id = pre.__pgt_row_id \

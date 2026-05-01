@@ -4,7 +4,7 @@
 
 # GUC Reference — pg_trickle
 
-**125 configuration parameters** extracted from `src/config.rs`.
+**130 configuration parameters** extracted from `src/config.rs`.
 
 See [docs/CONFIGURATION.md](CONFIGURATION.md) for full descriptions and usage examples.
 
@@ -136,3 +136,8 @@ See [docs/CONFIGURATION.md](CONFIGURATION.md) for full descriptions and usage ex
 | `(registration pending — PGS_WAL_TRANSITION_TIMEOUT)` | `i32` | `300` | Maximum time (seconds) to wait for the WAL decoder to catch up during transition from triggers to WAL-based CDC before falling back to triggers. |
 | `(registration pending — PGS_WATERMARK_HOLDBACK_TIMEOUT)` | `i32` | `0` | Set to 0 to disable stuck-watermark detection (default). |
 | `(registration pending — PGS_WORKER_POOL_SIZE)` | `i32` | `0` | Set to 0 (default) to use the existing spawn-per-task model. |
+| `pg_trickle.enabled` | `i32` | `5` | Default: 5 (matches the previously hardcoded `PART3_MAX_SCAN_COUNT`). |
+| `pg_trickle.enabled` | `i32` | `4` | Default: 4 (matches the previously hardcoded `DEEP_JOIN_L0_SCAN_THRESHOLD`). |
+| `pg_trickle.enabled` | `i32` | `10000` | Default: 10 000. |
+| `pg_trickle.enabled` | `i32` | `65536` | Default: 65 536 (64 KiB). |
+| `pg_trickle.enabled` | `i32` | `256` | Default: 256. |
