@@ -60,6 +60,8 @@ psql postgresql://postgres:playground@localhost:5432/playground
 ```
 
 Or connect with any PostgreSQL client:
+
+```bash
 pgtrickle --url postgresql://postgres:playground@localhost:5432/playground
 ```
 
@@ -133,6 +135,7 @@ aggregates, window functions, multi-table joins, time-series, and EXISTS subquer
 - **PgBouncer / connection-pool compatible** — works behind PgBouncer in transaction-pool mode (Supabase, Railway, Neon, etc.); row-level locking replaces session locks; per-table `pooler_compatibility_mode` available.
 - **Crash-safe** — row-level locks prevent concurrent refreshes; in-flight refreshes are marked failed and resumed cleanly on recovery.
 - **Online ALTER QUERY** — schema changes are classified (same / compatible / incompatible), storage migrated, and the dependency graph updated without dropping and recreating the stream table.
+- **Self-healing repair** — `pgtrickle.repair_stream_table(name)` rebuilds any missing CDC triggers and change buffer tables, resets the refresh frontier, and clears fuse state — use after PITR restores or operator-level DDL.
 - **CNPG / Kubernetes ready** — purpose-built Docker images and CloudNativePG manifests included.
 
 ### Observability
@@ -143,6 +146,7 @@ aggregates, window functions, multi-table joins, time-series, and EXISTS subquer
 - `pgtrickle.change_buffer_sizes()` — pending CDC entries per source table.
 - `pgtrickle.dependency_tree()` — full DAG with topological order.
 - `pgtrickle.explain_st(name)` — the delta SQL pg_trickle will run on next refresh.
+- `pgtrickle.repair_stream_table(name)` — rebuild missing CDC triggers, recreate missing change buffers, and reset state after PITR or operator-level DDL.
 - `NOTIFY`-based alerting, SCC status, watermark status, trigger inventory, diamond groups, and more.
 
 ## SQL Support
@@ -356,7 +360,7 @@ CREATE EXTENSION pg_trickle;
 pg_trickle is distributed as a minimal OCI extension image for [CloudNativePG Image Volume Extensions](https://cloudnative-pg.io/docs/1.28/imagevolume_extensions/). The image is `scratch`-based (< 10 MB) and contains only the extension files — no PostgreSQL server, no OS.
 
 ```bash
-docker pull ghcr.io/grove/pg_trickle-ext:0.34.0
+docker pull ghcr.io/grove/pg_trickle-ext:0.42.0
 ```
 
 Deploy with the official CNPG PostgreSQL 18 operand image:
@@ -370,7 +374,7 @@ spec:
     extensions:
       - name: pg-trickle
         image:
-          reference: ghcr.io/grove/pg_trickle-ext:0.34.0
+          reference: ghcr.io/grove/pg_trickle-ext:0.42.0
 ```
 
 See [cnpg/cluster-example.yaml](cnpg/cluster-example.yaml) and [cnpg/database-example.yaml](cnpg/database-example.yaml) for complete examples. Requires Kubernetes 1.33+ and CNPG 1.28+.
@@ -436,6 +440,9 @@ SELECT * FROM pgtrickle.pg_stat_stream_tables;
 SELECT * FROM pgtrickle.dependency_tree();  -- ASCII DAG view
 SELECT * FROM pgtrickle.change_buffer_sizes();  -- CDC buffer health
 
+-- Repair after a PITR restore or out-of-band DDL
+SELECT pgtrickle.repair_stream_table('regional_totals');
+
 -- Drop when no longer needed
 SELECT pgtrickle.drop_stream_table('regional_totals');
 ```
@@ -476,7 +483,7 @@ The `dbt-pgtrickle` package provides a custom `stream_table` materialization for
 # packages.yml
 packages:
   - git: "https://github.com/grove/pg-trickle.git"
-    revision: v0.34.0
+    revision: v0.42.0
     subdirectory: "dbt-pgtrickle"
 ```
 
