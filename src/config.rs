@@ -1530,6 +1530,63 @@ pub fn normalize_columnar_backend(value: Option<String>) -> ColumnarBackend {
     }
 }
 
+// ── v0.43.0 GUCs ──────────────────────────────────────────────────────────
+
+/// A44-1 (v0.43.0): Maximum number of Scan nodes in the left child for which
+/// Part 3 correction term is emitted in inner-join differentiation.
+///
+/// Raising this value allows more complex join chains to use the algebraically
+/// correct correction path rather than falling back to L₁ + coarser correction.
+/// Lowering it reduces generated SQL complexity for deeply-nested queries.
+///
+/// Default: 5 (matches the previously hardcoded `PART3_MAX_SCAN_COUNT`).
+/// Range: 1–32.
+pub static PGS_PART3_MAX_SCAN_COUNT: GucSetting<i32> = GucSetting::<i32>::new(5);
+
+/// A44-1 (v0.43.0): Maximum number of Scan nodes in a join child before
+/// switching from per-leaf L₀/R₀ reconstruction to L₁/R₁ + Part 3 correction.
+///
+/// At depths above this threshold, per-leaf CTE snapshots generate excessive
+/// temp files at large scale factors. The correction path is cheaper and
+/// equally correct for pure inner-join chains.
+///
+/// Default: 4 (matches the previously hardcoded `DEEP_JOIN_L0_SCAN_THRESHOLD`).
+/// Range: 1–32.
+pub static PGS_DEEP_JOIN_L0_SCAN_THRESHOLD: GucSetting<i32> = GucSetting::<i32>::new(4);
+
+/// A44-3 (v0.43.0): Maximum number of changes fetched per WAL poll cycle.
+///
+/// Controls the `max_changes` parameter passed to
+/// `pg_logical_slot_get_changes()`. Increasing this value raises throughput
+/// at the cost of larger per-tick memory usage; decreasing it reduces latency
+/// for high-volume sources but increases poll overhead.
+///
+/// Default: 10 000. Range: 100–1 000 000.
+pub static PGS_WAL_MAX_CHANGES_PER_POLL: GucSetting<i32> = GucSetting::<i32>::new(10_000);
+
+/// A44-3 (v0.43.0): Maximum WAL lag bytes before emitting a warning.
+///
+/// When the decoded WAL lag (bytes between the slot's `restart_lsn` and the
+/// current write LSN) exceeds this threshold, a WARNING is emitted and the
+/// metric `wal_lag_bytes` is recorded. Set to 0 to disable the warning.
+///
+/// Default: 65 536 (64 KiB). Range: 0–2 147 483 647.
+pub static PGS_WAL_MAX_LAG_BYTES: GucSetting<i32> = GucSetting::<i32>::new(65_536);
+
+/// A44-4 (v0.43.0): Effective capacity of the shared cost-model cache.
+///
+/// The physical cache is allocated at startup with 256 slots (compile-time
+/// constant). This GUC controls the effective number of slots used at runtime
+/// by adjusting the modulo divisor in slot-address computation. Reducing it
+/// concentrates the cache on low pgt_id values and reduces hash-collision
+/// probability for small deployments.
+///
+/// Requires `shared_preload_libraries` restart to take effect on the
+/// allocation side; a runtime change adjusts only the effective divisor.
+///
+/// Default: 256. Range: 16–256.
+pub static PGS_COST_CACHE_CAPACITY: GucSetting<i32> = GucSetting::<i32>::new(256);
+
 /// Register all GUC variables. Called from `_PG_init()`.
 pub fn register_gucs() {
     GucRegistry::define_bool_guc(
@@ -3112,6 +3169,80 @@ pub fn register_gucs() {
         GucContext::Suset,
         GucFlags::default(),
     );
+
+    // ── v0.43.0: Performance tunability GUCs ──────────────────────────────
+
+    // A44-1: Deep-join threshold GUCs.
+    GucRegistry::define_int_guc(
+        c"pg_trickle.part3_max_scan_count",
+        c"A44-1: Max scan nodes in left join child for Part 3 correction term.",
+        c"Controls the maximum number of Scan nodes in the left child of an inner \
+          join for which the Part 3 correction term is emitted during differential \
+          refresh. Lower values reduce SQL complexity; higher values improve \
+          correctness for deep join chains. Default: 5.",
+        &PGS_PART3_MAX_SCAN_COUNT,
+        1,  // min
+        32, // max
+        GucContext::Suset,
+        GucFlags::default(),
+    );
+
+    GucRegistry::define_int_guc(
+        c"pg_trickle.deep_join_l0_scan_threshold",
+        c"A44-1: Scan node depth threshold before switching to L1+Part3 strategy.",
+        c"When a join child has more Scan nodes than this threshold, pg_trickle \
+          switches from per-leaf L0/R0 reconstruction to L1/R1 with correction \
+          (Part 3). This avoids excessive temp-file generation for deep join chains. \
+          Default: 4.",
+        &PGS_DEEP_JOIN_L0_SCAN_THRESHOLD,
+        1,  // min
+        32, // max
+        GucContext::Suset,
+        GucFlags::default(),
+    );
+
+    // A44-3: WAL poll tuning GUCs.
+    GucRegistry::define_int_guc(
+        c"pg_trickle.wal_max_changes_per_poll",
+        c"A44-3: Maximum WAL changes fetched per poll cycle.",
+        c"Controls the max_changes argument to pg_logical_slot_get_changes(). \
+          Higher values increase throughput at the cost of larger per-tick memory \
+          usage. Lower values reduce per-change latency for high-volume sources. \
+          Default: 10000.",
+        &PGS_WAL_MAX_CHANGES_PER_POLL,
+        100,       // min
+        1_000_000, // max
+        GucContext::Suset,
+        GucFlags::default(),
+    );
+
+    GucRegistry::define_int_guc(
+        c"pg_trickle.wal_max_lag_bytes",
+        c"A44-3: WAL lag bytes threshold for lag warnings.",
+        c"When the WAL slot lag (bytes behind the write LSN) exceeds this value, \
+          a WARNING is emitted and the wal_lag_bytes metric is recorded. \
+          Set to 0 to disable. Default: 65536 (64 KiB).",
+        &PGS_WAL_MAX_LAG_BYTES,
+        0,        // min (0 = disabled)
+        i32::MAX, // max
+        GucContext::Suset,
+        GucFlags::default(),
+    );
+
+    // A44-4: Cost-cache capacity GUC.
+    GucRegistry::define_int_guc(
+        c"pg_trickle.cost_cache_capacity",
+        c"A44-4: Effective number of slots in the shared cost-model cache.",
+        c"The physical cache is allocated with 256 slots at startup. This GUC \
+          controls the effective number of slots used at runtime by adjusting the \
+          modulo divisor. Reducing it focuses the cache on low pgt_id values. \
+          Requires restart to change physical allocation. Default: 256.",
+        &PGS_COST_CACHE_CAPACITY,
+        16,  // min
+        256, // max (matches compile-time COST_CACHE_CAPACITY)
+        GucContext::Suset,
+        GucFlags::default(),
+    );
 }
 
 // ── Convenience accessors ──────────────────────────────────────────────────
@@ -3124,6 +3255,68 @@ pub fn pg_trickle_algebraic_drift_reset_cycles() -> i32 {
 /// Returns whether automatic schedule backoff is enabled for falling-behind STs.
 pub fn pg_trickle_auto_backoff() -> bool {
     PGS_AUTO_BACKOFF.get()
+}
+
+// ── v0.43.0 convenience accessors ─────────────────────────────────────────
+
+/// A44-1: Returns the max scan count for Part 3 correction term generation.
+pub fn pg_trickle_part3_max_scan_count() -> usize {
+    #[cfg(test)]
+    {
+        5usize
+    }
+    #[cfg(not(test))]
+    {
+        PGS_PART3_MAX_SCAN_COUNT.get().max(1) as usize
+    }
+}
+
+/// A44-1: Returns the deep-join L0 scan threshold for snapshot strategy selection.
+pub fn pg_trickle_deep_join_l0_scan_threshold() -> usize {
+    #[cfg(test)]
+    {
+        4usize
+    }
+    #[cfg(not(test))]
+    {
+        PGS_DEEP_JOIN_L0_SCAN_THRESHOLD.get().max(1) as usize
+    }
+}
+
+/// A44-3: Returns the maximum WAL changes per poll as i64.
+pub fn pg_trickle_wal_max_changes_per_poll() -> i64 {
+    #[cfg(test)]
+    {
+        10_000i64
+    }
+    #[cfg(not(test))]
+    {
+        PGS_WAL_MAX_CHANGES_PER_POLL.get().max(100) as i64
+    }
+}
+
+/// A44-3: Returns the WAL max lag bytes threshold as i64.
+pub fn pg_trickle_wal_max_lag_bytes() -> i64 {
+    #[cfg(test)]
+    {
+        65_536i64
+    }
+    #[cfg(not(test))]
+    {
+        PGS_WAL_MAX_LAG_BYTES.get() as i64
+    }
+}
+
+/// A44-4: Returns the effective cost-cache capacity (capped to 256).
+pub fn pg_trickle_cost_cache_capacity() -> usize {
+    #[cfg(test)]
+    {
+        256usize
+    }
+    #[cfg(not(test))]
+    {
+        (PGS_COST_CACHE_CAPACITY.get().clamp(16, 256)) as usize
+    }
 }
 
 /// Returns the delta-to-ST ratio threshold for disabling seqscan before MERGE.

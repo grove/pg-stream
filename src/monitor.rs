@@ -3377,6 +3377,136 @@ pub fn check_change_buffer_sizes() -> Vec<(u32, i64)> {
     over_threshold
 }
 
+// ── A44-9: wal_source_status() per-source WAL CDC diagnostics ────────────
+
+/// A44-9 (v0.43.0): Return per-source WAL CDC status for all stream tables.
+///
+/// Exposes per-source information including:
+/// - cdc_mode (trigger/wal/transitioning)
+/// - blocked_reason if not WAL-eligible
+/// - Slot name and lag bytes
+/// - Publication state
+/// - Last decoder error (if any)
+///
+/// Exposed as `pgtrickle.wal_source_status()`.
+#[pg_extern(schema = "pgtrickle", name = "wal_source_status")]
+#[allow(clippy::type_complexity)]
+fn wal_source_status() -> TableIterator<
+    'static,
+    (
+        name!(source_relid, i64),
+        name!(source_name, String),
+        name!(cdc_mode, String),
+        name!(slot_name, Option<String>),
+        name!(slot_lag_bytes, i64),
+        name!(publication_name, Option<String>),
+        name!(blocked_reason, Option<String>),
+        name!(transition_started_at, Option<String>),
+        name!(decoder_confirmed_lsn, Option<String>),
+    ),
+> {
+    let rows = collect_wal_source_status_rows();
+    TableIterator::new(rows)
+}
+
+/// Row type for `wal_source_status()`: (source_relid, source_name, cdc_mode,
+/// slot_name, slot_lag_bytes, publication_name, blocked_reason,
+/// transition_started_at, decoder_confirmed_lsn).
+#[allow(clippy::type_complexity)]
+fn collect_wal_source_status_rows() -> Vec<(
+    i64,
+    String,
+    String,
+    Option<String>,
+    i64,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+)> {
+    let all_deps = StDependency::get_all().unwrap_or_default();
+
+    // Deduplicate by source_relid.
+    let mut seen_sources: std::collections::HashMap<u32, StDependency> =
+        std::collections::HashMap::new();
+    for dep in all_deps {
+        seen_sources.entry(dep.source_relid.to_u32()).or_insert(dep);
+    }
+
+    let mut rows = Vec::new();
+
+    for (oid_u32, dep) in seen_sources {
+        let source_relid = oid_u32 as i64;
+
+        // Get the source table's qualified name.
+        let source_name = Spi::connect(|client| {
+            let result = client
+                .select(
+                    "SELECT n.nspname::text || '.' || c.relname::text
+                     FROM pg_catalog.pg_class c
+                     JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+                     WHERE c.oid = $1::oid",
+                    None,
+                    &[(source_relid).into()],
+                )
+                .ok();
+            result
+                .and_then(|r| r.first().get::<String>(1).ok().flatten())
+                .unwrap_or_else(|| format!("oid:{oid_u32}"))
+        });
+
+        // Get slot lag for WAL sources.
+        let (slot_lag, slot_name_opt) = match dep.cdc_mode {
+            CdcMode::Wal | CdcMode::Transitioning => {
+                let slot = dep
+                    .slot_name
+                    .as_deref()
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| {
+                        wal_decoder::slot_name_for_source(pg_sys::Oid::from(oid_u32))
+                    });
+                let lag = wal_decoder::get_slot_lag_bytes(&slot).unwrap_or(0);
+                (lag, Some(slot))
+            }
+            _ => (0i64, dep.slot_name.clone()),
+        };
+
+        // Build publication name from slot name convention.
+        let publication_name = slot_name_opt.as_deref().map(|s| {
+            // Publication names follow the pattern: pgtrickle_cdc_<stable_name>
+            // where slot follows: pgtrickle_<stable_name>
+            if let Some(suffix) = s.strip_prefix("pgtrickle_") {
+                format!("pgtrickle_cdc_{suffix}")
+            } else {
+                s.to_string()
+            }
+        });
+
+        // Determine blocked_reason for non-WAL sources.
+        let blocked_reason: Option<String> = match dep.cdc_mode {
+            CdcMode::Trigger => {
+                Some("Using trigger-based CDC; WAL CDC not yet activated".to_string())
+            }
+            CdcMode::Transitioning => Some("WAL CDC transition in progress".to_string()),
+            _ => None,
+        };
+
+        rows.push((
+            source_relid,
+            source_name,
+            dep.cdc_mode.as_str().to_string(),
+            slot_name_opt,
+            slot_lag,
+            publication_name,
+            blocked_reason,
+            dep.transition_started_at.clone(),
+            dep.decoder_confirmed_lsn.clone(),
+        ));
+    }
+
+    rows
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
