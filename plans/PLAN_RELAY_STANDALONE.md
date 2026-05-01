@@ -640,7 +640,7 @@ target audience here is concrete and large:
 | User | What they need today | What `pg_tide` would give them |
 |---|---|---|
 | Microservices teams adopting the textbook outbox pattern (Richardson, Kleppmann) | Hand-rolled outbox table + a custom poller in their app, or a Debezium cluster | A 5-minute install of one extension + one binary, six backends out of the box |
-| Teams already on Debezium who want to cut JVM ops | Maintain a Kafka Connect cluster | Replace with a single Rust binary that reads a Postgres table |
+| Teams already on Debezium who want to cut JVM ops | Maintain a Kafka Connect cluster | Replace with a single Rust binary that reads a Postgres table *(once `WireFormat` phase 2 ships — see §7.10)* |
 | Postgres-first stacks (Supabase, Crunchy, Neon, plain self-hosted) wanting "publish-to-Kafka" | Roll their own | Install one extension |
 | Anyone needing the inbox pattern (idempotent receive + DLQ) | Hand-roll | Built-in |
 | `pg_trickle` users who also want to publish change events | Today: `enable_outbox()` | Same UX via `attach_outbox()`, plus the option to use the same outbox infrastructure for non-stream-table events |
@@ -661,7 +661,7 @@ people would actually install for its own sake.
 | Standalone usefulness without `pg_trickle` | None | Marginal (relay needs an outbox to poll) | None | **High — full outbox/inbox primitive** |
 | Core LOC removed from this repo | ~3,650 Rust | ~3,890 (3,650 + 240 SQL) | ~6,150 (3,890 + 2,260) | **~6,150 + ~2,500 SQL** |
 | `pg_trickle` API churn | Zero | One SQL function rename | `enable_outbox` → wrapper | `enable_outbox` → `attach_outbox` (clean break, no users) |
-| Effort | 1 day | 3–5 days | ~1 week + ADR | **~1 week** (revised down: no users to migrate) |
+| Effort | 1 day | 3–5 days | ~1 week + ADR | **~1 week** to extract; in-flight relay roadmap (§7.10) is months on top either way |
 | Refresh hot-path risk | None | None | Medium (new hook API) | Low (SPI call inside same txn — no new abstraction) |
 | Justifies the term "standalone extension" | No | Barely | No | **Yes** |
 | Useful to users who don't know what IVM is | No | No | No | **Yes** |
@@ -751,7 +751,47 @@ Roughly **one week** end to end — down from the original two-week estimate
 because the migration tooling and deprecation shim work disappear (see §7.7).
 The result is two cleanly-scoped products instead of one entangled one.
 
-### 7.10 Open questions specific to option C
+### 7.10 In-flight relay roadmap that travels with the cut
+
+The relay is **not** feature-complete today. There is a non-trivial
+roadmap of planned work that lives in [plans/relay/](plans/relay/) and
+must move to the new `pg-tide` repo as part of the extraction — not be
+left orphaned in `pg_trickle`. Reviewers should treat the inheritance of
+this roadmap as part of the scope decision, not an afterthought.
+
+| Doc | Scope | Status | Inheritance plan |
+|---|---|---|---|
+| [PLAN_RELAY_WIRE_FORMATS.md](plans/relay/PLAN_RELAY_WIRE_FORMATS.md) | Pluggable `WireFormat` trait + Debezium (both directions), Avro/Confluent SR, Maxwell, Canal, custom CDC JSON. Phased over relay 0.30→0.34. | In-flight design | `git mv plans/relay/PLAN_RELAY_WIRE_FORMATS.md` → `pg-tide/plans/`. Renumber relay versions to `pg-tide` versioning. The Debezium-encoder claim in §7.4 of *this* plan ("replace Kafka Connect with a single Rust binary") only becomes credible once Phase 2 of this doc ships. |
+| [PLAN_RELAY_CLI.md](plans/relay/PLAN_RELAY_CLI.md) | Phase 1 CLI: `pg-tide pipelines`, `pg-tide tail`, `pg-tide doctor`, etc. | In-flight design | Move verbatim. Rename binary references `pgtrickle-relay` → `pg-tide` (the binary already needs renaming for §7.2 anyway). |
+| [PLAN_RELAY_CLI_PHASE_2.md](plans/relay/PLAN_RELAY_CLI_PHASE_2.md) | Phase 2 CLI: schema registry, transforms, dead-letter inspection, replay UX. | In-flight design | Move verbatim. The Schema Registry parts overlap with WIRE_FORMATS phase 3 — flag for de-duplication during the move. |
+| [PLAN_RELAY_GAPS_FROM_FELDERA_RISINGWAVE.md](plans/relay/PLAN_RELAY_GAPS_FROM_FELDERA_RISINGWAVE.md) | Competitive analysis: features the relay lacks vs Feldera and RisingWave. | Reference / backlog | Move verbatim. This doc is most of the long-term roadmap argument *for* `pg_tide`'s independent value — closing these gaps is exactly what makes the standalone extension worth installing. |
+
+**Implication for the §7.9 work plan:** Day 1–2 of the extraction must
+include `git mv plans/relay/* pg-tide/plans/` and a sweep replacing
+`pgtrickle-relay` with `pg-tide` / `pg_tide` in those docs. Day 5 docs
+work needs to add a top-level `pg-tide/plans/README.md` that orients
+contributors at the inherited roadmap rather than the now-stale design
+docs in this repo's `plans/` tree.
+
+**Implication for the §7.5 comparison table:** the "Effort: ~1 week"
+row is the *extraction* effort. Delivering the inherited roadmap (wire
+formats, CLI phase 2, closing the Feldera/RisingWave gaps) is months of
+work on top — but that work was always going to happen *somewhere*; the
+question is whether it lands in `pg_trickle`'s repo or in the new
+standalone one. Option C-revised is the only option that puts it in the
+right place.
+
+**Implication for §7.4 ("realistic for non-`pg_trickle` users"):** the
+"replace Debezium" framing depends on
+[PLAN_RELAY_WIRE_FORMATS.md](plans/relay/PLAN_RELAY_WIRE_FORMATS.md)
+phase 2 actually shipping. Until it does, `pg_tide`'s outbox source
+speaks the native envelope only and the Debezium story is aspirational.
+This is fine — the *outbox/inbox primitive* alone has independent value
+(see the other rows in the §7.4 audience table) — but the Debezium
+audience comes online with relay 0.31+ rather than at the moment of
+extraction.
+
+### 7.11 Open questions specific to option C
 
 1. **License.** `pg_trickle` is Apache-2.0; `pg_tide` should match so
    the integration story is frictionless.
