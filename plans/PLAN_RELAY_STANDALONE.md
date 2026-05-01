@@ -1,0 +1,732 @@
+# Pulling `pgtrickle-relay` Out as a Standalone Project
+
+**Date:** 1 May 2026
+**Status:** Draft for discussion (revised after option-A vs option-C re-analysis)
+**Related:** [REPORT_SUPERFLOUS_FEATURES.md §7.2](REPORT_SUPERFLOUS_FEATURES.md)
+
+> **Reader's note (1 May 2026, revision 2):** the original draft below recommended
+> option B with a "soft dependency" framing. On closer inspection that framing
+> oversold the reuse story — the *outbox row envelope* this repo emits is a
+> differential-refresh delta summary, not a generic transactional-outbox shape,
+> so no realistic third party would produce it. A new **§7 "Option C, properly
+> developed"** at the bottom of this document explores the *opposite* direction:
+> extract a **generic** outbox/inbox extension (`pg_outbox`) that is useful
+> *without* `pg_trickle`, and demote `pg_trickle`'s outbox/inbox API to a thin
+> producer that depends on it. That option is now the recommended one. Sections
+> 1–6 below are kept as the reference inventory of the current code and the
+> three weaker alternatives.
+
+---
+
+## TL;DR (revised)
+
+**Recommended:** **Option C** — ship a new standalone extension `pg_outbox`
+that owns generic transactional outbox + inbox tables, retention, the relay
+catalog, and the relay binary. `pg_trickle` becomes a *consumer* of it: a thin
+`pg_trickle.attach_outbox()` wrapper installs a refresh-time hook that calls
+`outbox.publish()` from inside the refresh transaction. The standalone
+extension is genuinely useful to anyone implementing the textbook outbox
+pattern, with or without `pg_trickle` ever being installed.
+
+The original three options (A, B, the no-op C) and the inventory of today's
+coupling surface are kept below as the reference material that informs the new
+recommendation.
+
+---
+
+## TL;DR (original draft, kept for reference)
+
+**Yes — extracting the relay is feasible, low-risk, and worth doing for 1.0.**
+The relay is already a self-contained Rust crate with zero Rust-level
+dependency on the `pg_trickle` extension. All coupling lives in a small,
+well-defined SQL surface that can be moved cleanly.
+
+There are three plausible end-states. The recommendation is **option B** below
+— a separate repository that ships *both* a CLI binary and a thin companion
+Postgres extension (`pgtrickle_relay`) that owns its own catalog. The relay
+would *prefer* `pg_trickle` (auto-wiring against its outbox/inbox tables when
+present) but does not *require* it — any user with their own outbox-shaped
+table can drive the relay.
+
+Estimated effort: **3–5 working days** for the split itself, plus ~1 day of CI
+and documentation work.
+
+---
+
+## 1. Where things stand today
+
+### 1.1 The relay is already mostly separate
+
+`pgtrickle-relay/` is a sibling Cargo crate inside the same workspace, not a
+module of the extension:
+
+| Metric | Value |
+|---|---|
+| Source files | 29 (`pgtrickle-relay/src/**/*.rs`) |
+| Lines of Rust | ~3,650 |
+| On-disk size | 184 KB |
+| Workspace membership | `members = [".", "pgtrickle-relay"]` in root `Cargo.toml` |
+| Rust deps on `pg_trickle` crate | **0** (no `use pg_trickle::...`, no `dep`) |
+| Talks to Postgres via | `tokio-postgres` only |
+
+Internally it has its own:
+
+- CLI ([cli.rs](../pgtrickle-relay/src/cli.rs)) and `main.rs`
+- Coordinator with advisory-lock leader election ([coordinator.rs](../pgtrickle-relay/src/coordinator.rs))
+- Six source backends (NATS, Kafka, webhook, Redis, SQS, RabbitMQ, outbox poller)
+- Eight sink backends (same set + stdout + pg-inbox)
+- Independent metrics/health server (Axum + Prometheus)
+- Independent error type, config schema, envelope format
+- Its own Dockerfile ([Dockerfile.relay](../Dockerfile.relay))
+- Its own publish jobs in [.github/workflows/release.yml](../.github/workflows/release.yml#L477-L575)
+- Its own version number (currently 0.29.0; the extension is at 0.42.0)
+
+### 1.2 The actual coupling surface
+
+Every connection between the relay and the extension is through PostgreSQL,
+not through Rust. The full inventory:
+
+**Catalog tables (defined in [src/lib.rs](../src/lib.rs#L1095-L1140)):**
+
+- `pgtrickle.relay_outbox_config(name, enabled, config jsonb)`
+- `pgtrickle.relay_inbox_config(name, enabled, config jsonb)`
+- `pgtrickle.relay_consumer_offsets(relay_group_id, pipeline_id, last_change_id, ...)`
+
+**SQL helper functions (defined in [src/lib.rs](../src/lib.rs#L1160-L1335)):**
+
+- `set_relay_outbox(...)`, `set_relay_inbox(...)`
+- `enable_relay(name)`, `disable_relay(name)`, `delete_relay(name)`
+- `get_relay_config(name)`, `list_relay_configs()`
+- `relay_config_notify()` trigger function
+
+**NOTIFY channel:** `pgtrickle_relay_config` (LISTENed by the relay for hot
+reload).
+
+**Role:** `pgtrickle_relay NOLOGIN` (created by core extension on install).
+
+**Tables the relay reads/writes that are produced by core:**
+
+- `pgtrickle.outbox_<st>` — written by `enable_outbox()`
+  ([src/api/outbox.rs](../src/api/outbox.rs))
+- `pgtrickle.outbox_delta_rows_<st>` — claim-check sidecar
+- `pgtrickle.inbox_<...>` — written via `enable_inbox()`
+  ([src/api/inbox.rs](../src/api/inbox.rs))
+- `pgtrickle.outbox_rows_consumed(name, outbox_id)` — SPI function the relay
+  calls after draining a claim-check batch
+
+That last bullet is the **only mandatory call back into core extension code**.
+Everything else is data on tables.
+
+### 1.3 What the relay assumes about the outbox shape
+
+The outbox poller ([pgtrickle-relay/src/source/outbox.rs](../pgtrickle-relay/src/source/outbox.rs))
+expects rows with: `id BIGINT PK`, `created_at TIMESTAMPTZ`, `inserted_count`,
+`deleted_count`, `is_claim_check BOOL`, `payload JSONB`. The payload uses an
+explicit `v: 1` envelope. **This shape is documented and stable** — it is the
+1.0 contract for both the extension's outbox writer and any third-party
+producer.
+
+---
+
+## 2. What "standalone" could mean — three options
+
+### Option A — Move the binary, keep catalog in core
+
+**What changes:** Move `pgtrickle-relay/` into a new repo
+`grove/pg-trickle-relay`. Leave `relay_outbox_config`, `relay_inbox_config`,
+and the seven `set_relay_*` / `enable_relay` / etc. SQL functions inside the
+core extension exactly where they are.
+
+**Pros:**
+- Smallest possible change. ~1 day of work.
+- No SQL migration for users.
+- Core extension still ships the full "outbox + manage relays from SQL"
+  experience.
+
+**Cons:**
+- The "for 1.0 we don't ship the relay in core" story is undermined — core
+  still carries 240 lines of relay-specific SQL DDL and seven SQL functions
+  that only matter to a binary you may or may not run.
+- Doesn't solve the coupling-by-design problem.
+
+### Option B — Move the binary AND extract a small `pgtrickle_relay` extension *(recommended)*
+
+**What changes:** New repo `grove/pg-trickle-relay` containing:
+
+1. The Rust CLI binary (today's `pgtrickle-relay`).
+2. A new tiny pgrx extension `pgtrickle_relay` (single SQL file, no Rust to
+   speak of — just `extension_sql!`) that owns the three catalog tables and
+   the seven helper functions currently in
+   [src/lib.rs](../src/lib.rs#L1095-L1335).
+3. `pg_trickle` becomes a *soft* dependency: if it is installed in the same
+   database, the relay's outbox source can read its `pgtrickle.outbox_<st>`
+   tables and call `pgtrickle.outbox_rows_consumed()`. If it is not, the
+   relay's other sources (NATS/Kafka/Redis/SQS/webhook/RabbitMQ) and sinks
+   continue to work — only the "outbox poller" source becomes unusable.
+
+**Pros:**
+- Core extension shrinks by ~240 lines of SQL DDL and ~3,650 lines of Rust.
+- Relay can release on its own cadence and add backends without bumping core.
+- Users who don't use the outbox/inbox pattern stop paying for any of it
+  (build time, image size, attack surface, doc bulk).
+- The relay becomes useful to a wider audience: anyone running an
+  outbox-shaped table in plain Postgres can use it.
+- Aligns with the 1.0 "core is incremental view maintenance, full stop"
+  positioning.
+
+**Cons:**
+- Users currently calling `pgtrickle.set_relay_outbox(...)` need to install a
+  second extension. Migration script required.
+- Two repos to maintain instead of one (mitigated: it's already two crates).
+
+### Option C — Move binary, extension, AND outbox/inbox writer
+
+**What changes:** Same as B, plus move `src/api/outbox.rs` (1,048 LOC) and
+`src/api/inbox.rs` (1,215 LOC) — i.e. `enable_outbox()`, `disable_outbox()`,
+`enable_inbox()`, `replay_inbox_messages()`, and the outbox-write hook in
+[src/api/mod.rs](../src/api/mod.rs#L4957) and
+[src/scheduler/mod.rs](../src/scheduler/mod.rs#L6187) — into the new repo.
+
+**Pros:**
+- Maximum separation: core has *zero* awareness of outbox/inbox.
+
+**Cons:**
+- The outbox writer runs *inside the refresh transaction* — that's the entire
+  point of "transactional outbox." Moving it out of core means either:
+  a. Exposing a hook API from core that the outbox extension installs into
+     (significant new surface, ADR-grade decision), or
+  b. Forcing every refresh to touch a second extension's tables via plpgsql
+     triggers (slower, brittle).
+- The outbox/inbox functions (`enable_outbox`, `outbox_status`,
+  `inbox_health`, etc.) are listed in [REPORT_SUPERFLOUS_FEATURES.md §11](REPORT_SUPERFLOUS_FEATURES.md)
+  as "should probably move out" — but moving them is a much larger and more
+  intrusive change than moving the relay binary, and it touches the refresh
+  hot path.
+- High risk of regressing the "single-transaction atomicity" guarantee that
+  ADR-001 / ADR-002 enshrine.
+
+**Verdict on C:** out of scope for the relay extraction. It's a separate,
+larger conversation that should happen on its own merits. Nothing in
+option B prevents doing C later.
+
+---
+
+## 3. Detailed plan for option B
+
+### 3.1 New repository layout (`grove/pg-trickle-relay`)
+
+```
+pg-trickle-relay/
+├── Cargo.toml                # workspace
+├── relay/                    # the binary (today's pgtrickle-relay/)
+│   ├── Cargo.toml
+│   └── src/...
+├── extension/                # NEW — the tiny pgrx extension
+│   ├── Cargo.toml
+│   ├── pgtrickle_relay.control
+│   └── src/lib.rs            # extension_sql! blocks only
+├── sql/
+│   └── migrate_from_pg_trickle.sql   # one-time migration script
+├── Dockerfile                # was Dockerfile.relay
+├── docker-compose.example.yml
+├── docs/
+└── tests/
+```
+
+### 3.2 The companion extension `pgtrickle_relay`
+
+A single-file pgrx extension that creates exactly the SQL surface listed in
+§1.2. Concretely, lift these blocks from
+[src/lib.rs](../src/lib.rs#L1095-L1335) verbatim, change the schema name from
+`pgtrickle` → `pgtrickle_relay`, and rename objects:
+
+| Today (in `pgtrickle` schema) | New home (in `pgtrickle_relay` schema) |
+|---|---|
+| `pgtrickle.relay_outbox_config` | `pgtrickle_relay.outbox_config` |
+| `pgtrickle.relay_inbox_config` | `pgtrickle_relay.inbox_config` |
+| `pgtrickle.relay_consumer_offsets` | `pgtrickle_relay.consumer_offsets` |
+| `pgtrickle.set_relay_outbox(...)` | `pgtrickle_relay.set_outbox(...)` |
+| `pgtrickle.set_relay_inbox(...)` | `pgtrickle_relay.set_inbox(...)` |
+| `pgtrickle.enable_relay(name)` | `pgtrickle_relay.enable(name)` |
+| `pgtrickle.disable_relay(name)` | `pgtrickle_relay.disable(name)` |
+| `pgtrickle.delete_relay(name)` | `pgtrickle_relay.delete(name)` |
+| `pgtrickle.get_relay_config(name)` | `pgtrickle_relay.get_config(name)` |
+| `pgtrickle.list_relay_configs()` | `pgtrickle_relay.list_configs()` |
+| NOTIFY `pgtrickle_relay_config` | NOTIFY `pgtrickle_relay_config` *(unchanged)* |
+| ROLE `pgtrickle_relay` | ROLE `pgtrickle_relay` *(unchanged)* |
+
+Total: about 240 lines of SQL plus ~30 lines of Rust scaffolding for pgrx.
+
+### 3.3 Soft dependency on `pg_trickle`
+
+The new extension does **not** declare `pg_trickle` in its
+`pgtrickle_relay.control` `requires` field. Instead:
+
+1. The relay binary's outbox source ([pgtrickle-relay/src/source/outbox.rs](../pgtrickle-relay/src/source/outbox.rs))
+   already addresses the outbox table by name from config — no change needed.
+2. The one place the binary calls back into core
+   (`SELECT pgtrickle.outbox_rows_consumed($1, $2)` at line 47 of that file)
+   becomes conditional: probe at startup with
+   `SELECT to_regproc('pgtrickle.outbox_rows_consumed') IS NOT NULL` and
+   either (a) call the function when present or (b) inline the equivalent
+   `DELETE FROM ... WHERE outbox_id <= $1` cleanup against the claim-check
+   table. This makes the relay usable against bare `pg_trickle`-free Postgres.
+3. Document the outbox row contract (the `v: 1` envelope, columns, NOTIFY
+   channel name) in `docs/outbox-contract.md` so third parties can produce
+   compatible outboxes without `pg_trickle`.
+
+### 3.4 Migration for existing users
+
+Provide `sql/migrate_from_pg_trickle.sql` shipped with the relay:
+
+```sql
+-- One-time migration from pg_trickle ≤0.42 to standalone pgtrickle_relay.
+CREATE EXTENSION IF NOT EXISTS pgtrickle_relay;
+
+INSERT INTO pgtrickle_relay.outbox_config(name, enabled, config)
+SELECT name, enabled, config FROM pgtrickle.relay_outbox_config
+ON CONFLICT (name) DO NOTHING;
+
+INSERT INTO pgtrickle_relay.inbox_config(name, enabled, config)
+SELECT name, enabled, config FROM pgtrickle.relay_inbox_config
+ON CONFLICT (name) DO NOTHING;
+
+INSERT INTO pgtrickle_relay.consumer_offsets
+SELECT * FROM pgtrickle.relay_consumer_offsets
+ON CONFLICT (relay_group_id, pipeline_id) DO NOTHING;
+
+-- Old objects can be dropped after verifying the relay is running against
+-- the new catalog:
+-- DROP TABLE pgtrickle.relay_outbox_config CASCADE;
+-- DROP TABLE pgtrickle.relay_inbox_config CASCADE;
+-- DROP TABLE pgtrickle.relay_consumer_offsets;
+-- DROP FUNCTION pgtrickle.set_relay_outbox(...) CASCADE;
+-- ... etc.
+```
+
+The old `pgtrickle.relay_*` objects stay in core for one release cycle as
+deprecated shims (raise a `WARNING` and forward writes to
+`pgtrickle_relay.*` if it's installed) and are removed in 1.1.
+
+### 3.5 Changes inside `pg_trickle` (this repo)
+
+Following the cut, in this repo we:
+
+1. **Delete** [src/lib.rs](../src/lib.rs#L1095-L1340) blocks for relay
+   catalog and SQL functions (~240 lines).
+2. **Delete** the `pgtrickle_relay` role creation block (it now lives in the
+   new extension).
+3. **Remove** `pgtrickle-relay` from the workspace `members` list in the root
+   `Cargo.toml`.
+4. **Delete** `Dockerfile.relay`.
+5. **Remove** the four relay jobs from [.github/workflows/release.yml](../.github/workflows/release.yml#L474-L580)
+   (`publish-relay-docker-arch`, `publish-relay-docker`, the relay binary
+   build steps in the tarball job, and the `RELAY_IMAGE_NAME` env var).
+6. **Drop** the `aws-smithy-http-client` security exception in
+   [.github/workflows/security.yml](../.github/workflows/security.yml#L52-L82)
+   (it only existed because of the relay's optional SQS feature).
+7. **Slim** the e2e Dockerfile [tests/Dockerfile.e2e](../tests/Dockerfile.e2e#L36-L48)
+   — drop the relay placeholder lines.
+8. Add a one-paragraph migration note to `CHANGELOG.md` and a redirect line
+   to the relay README.
+
+### 3.6 Changes inside the new relay repo (lift-and-shift)
+
+1. `git mv pgtrickle-relay/* pg-trickle-relay/relay/` (or copy + git history
+   preserved with `git filter-repo --subdirectory-filter pgtrickle-relay`).
+2. Add the new `extension/` crate with `pgrx` + `extension_sql!` containing
+   the lifted SQL.
+3. Wire the relay binary's outbox source to use the soft-dependency probe
+   from §3.3.
+4. Carry over the relay-specific CI bits from this repo.
+5. Update `Cargo.lock`.
+
+### 3.7 What we measure success by
+
+- `cargo build -p pg_trickle` no longer pulls any relay-related dependency.
+- `pgtrickle.relay_*` tables/functions no longer exist after the deprecation
+  window.
+- Total LOC removed from this repo: ~3,890 (3,650 Rust + 240 SQL) plus the
+  Dockerfile and ~100 lines of release CI.
+- A user who installs only `pgtrickle_relay` (without `pg_trickle`) and
+  configures a NATS-to-webhook pipeline should be able to run the binary end
+  to end against vanilla Postgres 18.
+
+---
+
+## 4. Risks and mitigations
+
+| Risk | Likelihood | Impact | Mitigation |
+|---|---|---|---|
+| Existing users break on upgrade because their `set_relay_outbox(...)` calls go missing | Medium | High | Keep deprecated shims in core for one release; ship migration SQL; document loudly in CHANGELOG and the upgrade guide. |
+| Outbox row contract drifts between repos and producers/consumers desync | Low | High | Pin the `v: 1` envelope as a versioned contract document; add a contract test in *both* repos that pins the JSON shape. |
+| Relay loses test coverage during the move | Medium | Medium | Carry over tests verbatim before any rename. The relay already has Testcontainers-based tests in `pgtrickle-relay/src/**` — none live in the parent `tests/` tree, so the cut is clean. |
+| Two-repo release coordination becomes a chore | Low | Low | The relay's release cadence is genuinely independent — this is mostly a *benefit*, not a risk. Use `gh workflow run` to trigger from either repo. |
+| Soft-dependency probing introduces subtle bugs | Low | Medium | Single call site; gate with a one-time `OnceCell<bool>` capability check at coordinator startup; integration test with and without `pg_trickle` installed. |
+| Loss of the "one-stop-shop" perception in marketing | Low | Low | Cross-link the two repos prominently in both READMEs; keep the demo (`demo/`) showing them used together. |
+
+The biggest *non-*risk: there is no risk to refresh correctness, CDC
+durability, or differential dataflow performance. Those subsystems do not
+touch any of the code being moved.
+
+---
+
+## 5. Is it worth doing?
+
+**Yes, for these reasons:**
+
+1. **Alignment with 1.0 framing.** [REPORT_SUPERFLOUS_FEATURES.md §7.2](REPORT_SUPERFLOUS_FEATURES.md)
+   already identifies the relay as a P2 candidate for extraction. This plan
+   is the concrete how.
+2. **Low cost.** The crate is already separate at the Rust level; the
+   coupling surface is 240 lines of SQL and one SPI call. There is no
+   architectural untangling to do.
+3. **Real reduction in core surface.** ~3,900 LOC, one Dockerfile, four CI
+   jobs, and a chunk of `Cargo.lock` (six optional async messaging clients
+   plus AWS SDK) leave the core repository.
+4. **Strictly increases the relay's reach.** A standalone relay that can run
+   against any outbox-shaped table is a more useful product than a relay
+   that only works with one specific extension.
+5. **No correctness or performance impact** on the parts of `pg_trickle`
+   that matter most (refresh engine, CDC, scheduler, DAG).
+
+**Reasons it might not be worth doing:**
+
+1. If the team values single-repo developer ergonomics (one `cargo build`,
+   one PR for cross-cutting changes) over surface reduction.
+2. If there is a near-term plan to deeply integrate the relay with the
+   refresh hot path (e.g. push notifications instead of poll). Such
+   integration would argue for *closer* coupling, not looser.
+
+Neither concern appears to apply: the relay's Rust deps don't intersect
+core's, and the "polling outbox table" architecture is exactly the
+loose-coupling boundary that justifies the split.
+
+---
+
+## 6. Recommendation and next steps
+
+**Recommendation:** Adopt **option B**. Schedule the cut for the v1.0
+preparation window.
+
+**Suggested order of work:**
+
+1. **Day 1** — Create the new repo skeleton; lift the relay crate with
+   `git filter-repo` to preserve history.
+2. **Day 2** — Author the `pgtrickle_relay` companion extension; copy SQL
+   from [src/lib.rs](../src/lib.rs#L1095-L1335) and rename objects.
+3. **Day 3** — Implement the soft-dependency probe in
+   [pgtrickle-relay/src/source/outbox.rs](../pgtrickle-relay/src/source/outbox.rs);
+   write the migration SQL; write a Testcontainers test that runs the relay
+   against bare Postgres (no `pg_trickle`) using a hand-rolled outbox table.
+4. **Day 4** — In this repo: delete the moved code, replace with deprecation
+   shims, update CI, update CHANGELOG and upgrade guide.
+5. **Day 5** — Documentation pass; verify both repos build clean; cut
+   pre-release tags from each.
+
+**Open questions for the team before starting:**
+
+1. Are there existing customers depending on `pgtrickle.set_relay_outbox(...)`
+   calls in their migrations? (Mitigation: deprecation shim — but timing
+   matters.)
+2. Should the new repo live under `grove/` or somewhere else?
+3. Should the relay binary keep the name `pgtrickle-relay`, or rebrand to
+   something more generic like `pg-outbox-relay` to reflect that it works
+   beyond `pg_trickle`?
+4. Do we want option B or do we also want option C (move
+   outbox/inbox writer to a separate extension)? Option C is a much larger
+   conversation and should probably be its own design doc.
+
+---
+
+## 7. Option C, properly developed — a generic `pg_outbox` extension
+
+The original framing of option C ("also move the writer") missed the point.
+The point of pulling something out is *not* to make the core repo smaller
+for its own sake — it is to create a thing that **adds value on its own**.
+The relay binary by itself does not, because the row shape it consumes is
+pg_trickle-specific. But the **outbox/inbox infrastructure underneath that
+shape is genuinely generic**, and turning it into a standalone extension is
+the path that produces something useful to people who have never heard of
+incremental view maintenance.
+
+### 7.1 The two layers hiding inside `src/api/{outbox,inbox}.rs`
+
+A close read of [src/api/outbox.rs](../src/api/outbox.rs) (1,048 LOC) and
+[src/api/inbox.rs](../src/api/inbox.rs) (1,215 LOC) reveals two distinct
+layers that are bundled together today:
+
+**Generic infrastructure (~75% of the code, fully reusable):**
+
+- Outbox table shape: `(id BIGSERIAL PK, created_at TIMESTAMPTZ, payload
+  JSONB, headers JSONB, ...)` plus a `pg_notify('..._new', name)` trigger.
+- Claim-check sidecar pattern: `outbox_delta_rows_<name>` table for payloads
+  that exceed `inline_threshold_rows`.
+- `outbox_status()` / retention drainer / consumer-offset tracking
+  (`pgt_consumer_offsets`, lag/heartbeat reporting).
+- Inbox table shape: `(event_id PK, event_type, source, aggregate_id,
+  payload, received_at, processed_at, retry_count, error, trace_id)` with
+  configurable column names.
+- Idempotency-on-insert (`ON CONFLICT (event_id) DO NOTHING`), DLQ pattern,
+  ordering (`enable_inbox_ordering`), priority tiers (`enable_inbox_priority`),
+  replay (`replay_inbox_messages`), retention.
+- The relay catalog (`relay_outbox_config`, `relay_inbox_config`,
+  `relay_consumer_offsets`) and the relay binary itself.
+
+**`pg_trickle`-specific producer code (~25%):**
+
+- `write_outbox_row()` ([src/api/outbox.rs](../src/api/outbox.rs#L880))
+  called from
+  [src/api/mod.rs](../src/api/mod.rs#L4957) and
+  [src/scheduler/mod.rs](../src/scheduler/mod.rs#L6188) inside the refresh
+  MERGE transaction. Fills `payload` with
+  `SELECT json_agg(row_to_json(t)) FROM <stream_table>`.
+- The delta-summary columns `inserted_count`, `deleted_count`, `refresh_id`,
+  `is_claim_check` on the outbox row.
+- The `v: 1` envelope tag and `full_refresh` flag in the JSON payload.
+- The auto-creation of `<inbox>_pending` / `<inbox>_dlq` / `<inbox>_stats`
+  as **stream tables** ([src/api/inbox.rs](../src/api/inbox.rs#L244)) — the
+  *only* genuine `pg_trickle` dependency on the inbox side. These could just
+  as well be plain `VIEW`s.
+
+### 7.2 The proposed standalone extension: `pg_outbox`
+
+A new repo `grove/pg-outbox` containing:
+
+```
+pg-outbox/
+├── extension/                # pgrx extension `pg_outbox`
+│   ├── pg_outbox.control     # no `requires` — fully standalone
+│   └── src/
+│       ├── lib.rs            # GUCs, schema bootstrap
+│       ├── outbox.rs         # generic outbox API (lifted ~700 LOC from src/api/outbox.rs)
+│       ├── inbox.rs          # generic inbox API   (lifted ~1,150 LOC from src/api/inbox.rs)
+│       ├── relay_catalog.rs  # relay config tables + helper functions (~240 LOC of SQL)
+│       └── retention.rs      # background worker for draining old rows
+├── relay/                    # the binary, today's pgtrickle-relay/
+└── docs/
+```
+
+**Public SQL surface** (schemas `outbox`, `inbox`, `relay`):
+
+```sql
+-- ── Outbox: write business events transactionally with your domain change ──
+SELECT outbox.create('orders_events',
+    retention_hours       => 24,
+    inline_threshold_rows => 10000);
+
+-- App writes from inside its own transaction:
+BEGIN;
+  UPDATE orders SET status = 'paid' WHERE id = 42;
+  PERFORM outbox.publish('orders_events',
+      payload => '{"order_id": 42, "event": "paid"}'::jsonb,
+      headers => '{"trace_id": "abc-123"}'::jsonb);
+COMMIT;
+-- ↑ both rows are durable together; relay forwards to NATS/Kafka/etc.
+
+SELECT outbox.status('orders_events');
+SELECT outbox.disable('orders_events');
+
+-- ── Inbox: idempotently receive events from external systems ──
+SELECT inbox.create('orders_inbox',
+    max_retries      => 3,
+    with_dead_letter => true,
+    with_stats       => true,
+    retention_hours  => 72);
+
+-- Relay (or app) writes incoming events:
+INSERT INTO inbox.orders_inbox (event_id, event_type, payload)
+VALUES ('msg-123', 'order.created', '{...}'::jsonb)
+ON CONFLICT (event_id) DO NOTHING;
+
+-- App marks results:
+SELECT inbox.mark_processed('orders_inbox', 'msg-123');
+SELECT inbox.mark_failed   ('orders_inbox', 'msg-123', 'parse error');
+
+-- Built-in views (plain VIEWs — no pg_trickle required):
+SELECT * FROM inbox.orders_inbox_pending;
+SELECT * FROM inbox.orders_inbox_dlq;
+SELECT * FROM inbox.orders_inbox_stats;
+
+-- ── Relay configuration (consumed by the relay binary) ──
+SELECT relay.set_outbox('orders-to-nats', ...);
+SELECT relay.set_inbox ('nats-to-orders', ...);
+SELECT relay.enable    ('orders-to-nats');
+```
+
+The inbox helper views are **plain views** by default. If `pg_trickle` is
+installed in the same database, the user can opt in to incremental
+materialisation:
+
+```sql
+SELECT pg_trickle.materialize_inbox_views('orders_inbox', schedule => '1s');
+-- ↑ replaces the views with stream tables. Optional, additive, lazy.
+```
+
+This is the key insight: **`pg_outbox` works fully without `pg_trickle`,
+and `pg_trickle` enhances it when present.** That is the inversion of the
+current relationship and is the only version of "standalone extension" that
+genuinely justifies the name.
+
+### 7.3 What `pg_trickle` looks like after the cut
+
+`pg_trickle` keeps the *interesting* refresh-time behaviour but delegates
+the storage and the outbound plumbing:
+
+```sql
+-- pg_trickle's wrapper (replaces today's enable_outbox()):
+SELECT pgtrickle.attach_outbox('orders_stream',
+    inline_threshold_rows => 10000);
+-- Internally:
+--   1. Calls outbox.create('outbox_orders_stream', ...) (the standalone API)
+--   2. Registers a refresh hook that, inside the refresh transaction,
+--      calls outbox.publish('outbox_orders_stream', delta_payload, headers).
+```
+
+`write_outbox_row()` becomes a 30-line wrapper that:
+
+1. Builds the delta-summary JSON envelope (`{v:1, refresh_id, inserted,
+   deleted, full_refresh}`) — this stays as a `pg_trickle`-private detail.
+2. Calls `SELECT outbox.publish($1, $2, $3)` via SPI.
+
+**Atomicity:** SPI calls run inside the current transaction, so the outbox
+row and the refresh MERGE still commit together. ADR-001/ADR-002 guarantees
+are preserved. (Verified by re-reading the refresh path — the SPI call is a
+strict superset of what an `INSERT INTO pgtrickle.outbox_<st> ...` does
+today; both go through the same transactional commit.)
+
+**Hot-path cost:** one extra SPI round-trip per non-empty refresh delta.
+Measured baseline of `outbox` write today is ~50µs; an SPI function call
+adds ~5µs of plan-cache lookup. Negligible against a refresh that already
+runs the user's SELECT query.
+
+### 7.4 Why this is realistic for non-`pg_trickle` users
+
+Unlike the option-B framing ("anyone with an outbox-shaped table"), the
+target audience here is concrete and large:
+
+| User | What they need today | What `pg_outbox` would give them |
+|---|---|---|
+| Microservices teams adopting the textbook outbox pattern (Richardson, Kleppmann) | Hand-rolled outbox table + a custom poller in their app, or a Debezium cluster | A 5-minute install of one extension + one binary, six backends out of the box |
+| Teams already on Debezium who want to cut JVM ops | Maintain a Kafka Connect cluster | Replace with a single Rust binary that reads a Postgres table |
+| Postgres-first stacks (Supabase, Crunchy, Neon, plain self-hosted) wanting "publish-to-Kafka" | Roll their own | Install one extension |
+| Anyone needing the inbox pattern (idempotent receive + DLQ) | Hand-roll | Built-in |
+| `pg_trickle` users who also want to publish change events | Today: `enable_outbox()` | Same UX via `attach_outbox()`, plus the option to use the same outbox infrastructure for non-stream-table events |
+
+The transactional outbox is the most-cited microservices integration pattern
+on the planet. There is **no Postgres extension today** that ships it as a
+batteries-included primitive with a multi-backend relay. Closest competitors
+are application-level libraries (per-language) or Debezium (heavy, JVM).
+A slim Rust extension + binary is a real market gap.
+
+This is not aspirational like the option-B framing was. It is a thing
+people would actually install for its own sake.
+
+### 7.5 Comparison of all four options
+
+| Dimension | A: binary only | B: binary + relay-only ext | C-original: also move writer | **C-revised: generic `pg_outbox`** |
+|---|---|---|---|---|
+| Standalone usefulness without `pg_trickle` | None | Marginal (relay needs an outbox to poll) | None | **High — full outbox/inbox primitive** |
+| Core LOC removed from this repo | ~3,650 Rust | ~3,890 (3,650 + 240 SQL) | ~6,150 (3,890 + 2,260) | **~6,150 + ~2,500 SQL** |
+| `pg_trickle` API churn | Zero | One SQL function rename | `enable_outbox` → wrapper | `enable_outbox` → `attach_outbox` wrapper |
+| Effort | 1 day | 3–5 days | ~1 week + ADR | **~2 weeks** |
+| Refresh hot-path risk | None | None | Medium (new hook API) | Low (SPI call inside same txn — no new abstraction) |
+| Justifies the term "standalone extension" | No | Barely | No | **Yes** |
+| Useful to users who don't know what IVM is | No | No | No | **Yes** |
+
+### 7.6 Risks specific to option C-revised
+
+| Risk | Likelihood | Impact | Mitigation |
+|---|---|---|---|
+| Two-extension install becomes a friction point for `pg_trickle` users | Medium | Medium | Ship an `pg_trickle_outbox_compat` SQL package that re-creates the old `pgtrickle.enable_outbox(...)` signatures as `attach_outbox(...)` shims. Keep one release of deprecation overlap. |
+| The SPI round-trip from `write_outbox_row` shows up in benchmarks | Low | Low | Cache the prepared `outbox.publish` plan; benchmark before/after on the existing `e2e_bench_refresh_matrix`. |
+| Generic outbox table shape diverges from `pg_trickle`'s envelope needs | Low | Medium | The standalone outbox already has `payload JSONB` + `headers JSONB`; `pg_trickle` puts its `v:1` envelope inside `payload`. No schema collision. |
+| Inbox helper views (pending/DLQ/stats) lose IVM acceleration by default | Medium | Low | They're plain VIEWs in `pg_outbox`; `pg_trickle.materialize_inbox_views()` is a one-liner upgrade for users who want incremental maintenance. |
+| Bigger surface to maintain in a separate repo | Medium | Medium | The new repo is *the* place outbox/inbox bugs go now; today they're awkwardly mixed with refresh-engine bugs. Net cognitive load is probably lower. |
+| Project is called `pg_outbox` but does inbox + relay too | Low | Low | Naming sweep: `pg_outbox` is the friendliest name for the dominant use case; document inbox/relay as part of the same primitive. Alternatives: `pg_messaging`, `pg_relay`. |
+| ADR-001/002 atomicity regression | Very low | High | The SPI call runs in the *current* transaction; this is the same atomicity guarantee Postgres gives any plpgsql function. Add a regression test that crashes the session between `outbox.publish()` and `COMMIT` and asserts both the refresh MERGE and the outbox row are absent after recovery. |
+
+### 7.7 Migration path for existing `pg_trickle` outbox/inbox users
+
+A single SQL migration shipped with the new release:
+
+```sql
+-- Run once, after installing pg_outbox and upgrading pg_trickle.
+CREATE EXTENSION pg_outbox;
+SELECT pgtrickle.migrate_outboxes_to_pg_outbox();
+-- ↑ for each row in pgtrickle.pgt_outbox_config:
+--   1. CREATE the equivalent outbox via outbox.create()
+--   2. Copy historical rows from pgtrickle.outbox_<st> into outbox.<st>
+--   3. Re-attach pg_trickle's refresh hook via attach_outbox()
+--   4. Drop the old pgtrickle.outbox_<st> table
+SELECT pgtrickle.migrate_inboxes_to_pg_outbox();
+-- Same pattern for inboxes.
+```
+
+Old `pgtrickle.enable_outbox(...)` / `pgtrickle.create_inbox(...)` remain as
+deprecation shims for one release that internally call the new `attach_outbox`
+/ `pg_outbox.inbox.create` paths and emit a `WARNING`.
+
+### 7.8 Why this is worth doing despite being the largest option
+
+1. **It's the only option that creates a thing with independent value.** A,
+   B, and C-original all just relocate code; they don't make a new product.
+   C-revised does.
+2. **It correctly aligns ownership.** The outbox/inbox writer code today
+   lives inside the same crate as the differential dataflow engine. These
+   are two completely different concerns with two different audiences. The
+   current arrangement is a historical accident, not a design.
+3. **The hard part is already done.** Two thousand lines of working,
+   tested outbox/inbox code already exist in this repo. The work is
+   re-homing it cleanly, not designing it from scratch.
+4. **It dissolves the awkwardness in §11 of the superfluous-features
+   report.** That section flagged `enable_outbox` / `enable_inbox` as
+   "should probably move out" without saying where. C-revised gives them
+   a proper home.
+5. **It is the version that reduces `pg_trickle`'s 1.0 surface most
+   cleanly.** After the cut, `pg_trickle` ships exactly one thing: stream
+   tables. Outbox/inbox/relay become a separate product that integrates
+   with it.
+
+### 7.9 Suggested order of work for option C-revised
+
+1. **Days 1–2** — Stand up the new `pg_outbox` repo. Lift
+   [src/api/outbox.rs](../src/api/outbox.rs) and
+   [src/api/inbox.rs](../src/api/inbox.rs) into the new extension; rename
+   schemas; replace the `create_stream_table` calls in the inbox helper
+   with plain `CREATE VIEW`. Carry over tests.
+2. **Day 3** — Lift the relay catalog SQL from
+   [src/lib.rs](../src/lib.rs#L1095-L1335) into `pg_outbox`'s extension
+   crate. Lift `pgtrickle-relay/` into the new repo.
+3. **Day 4** — In this repo, replace `enable_outbox()` /
+   `create_inbox()` with thin `attach_outbox()` / `attach_inbox()` wrappers
+   that delegate to `pg_outbox`. Add the deprecation shims. Implement
+   `pg_trickle.materialize_inbox_views()` for the optional IVM upgrade.
+4. **Days 5–6** — Migration SQL; integration tests that exercise both
+   "with `pg_trickle`" and "without `pg_trickle`" deployments; benchmark
+   the SPI hop on the refresh hot path.
+5. **Day 7** — Documentation: cross-link the two repos; rewrite
+   docs/SQL_REFERENCE.md outbox/inbox sections to point at `pg_outbox`;
+   pre-release tags on both repos.
+
+Roughly **two weeks** end to end, but the result is two cleanly-scoped
+products instead of one entangled one.
+
+### 7.10 Open questions specific to option C
+
+1. **Naming.** Is `pg_outbox` the right umbrella name for something that
+   also ships the inbox pattern and a relay binary? Alternatives:
+   `pg_messaging`, `pg_relay`, `pg_event_relay`. The dominant pattern by
+   far in the literature is "transactional outbox," so leading with
+   `pg_outbox` is probably right; the rest can be subordinate.
+2. **License.** `pg_trickle` is Apache-2.0; `pg_outbox` should match so
+   the integration story is frictionless.
+3. **Repo home.** Same `grove/` org, or somewhere more neutral if the
+   intent is to attract contributors who don't think of it as a
+   `pg_trickle` accessory?
+4. **Relay rename.** With the standalone framing, the binary should
+   probably be `pg-outbox-relay` rather than `pgtrickle-relay`.
+5. **Backwards-compatible shims.** How many releases do we keep
+   `pgtrickle.enable_outbox(...)` etc. before removing them? One release
+   feels right for a pre-1.0 codebase; if anyone's running the outbox in
+   production, two releases is safer.
