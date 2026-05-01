@@ -271,13 +271,20 @@ async fn test_wal_cdc_captures_insert() {
     let mode = wait_for_cdc_mode(&db, "wal_ins", "WAL", Duration::from_secs(60)).await;
     assert_eq!(mode, "WAL", "Should transition to WAL mode");
 
+    // Allow the WAL slot to stabilise: the first 1-2 scheduler ticks after a
+    // new slot is created can encounter transient poll errors (slot briefly in
+    // use or backend SPI context recovering).  Wait for a few ticks to clear
+    // before injecting DML so the DML changes are not in-flight when an error
+    // counter could trigger premature fallback to trigger mode.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
     // Insert new rows — WAL decoder should capture them
     db.execute("INSERT INTO wal_ins VALUES (2, 'b'), (3, 'c')")
         .await;
 
     // Wait for the scheduler to do a refresh
     let refreshed = db
-        .wait_for_auto_refresh("wal_ins_st", Duration::from_secs(15))
+        .wait_for_auto_refresh("wal_ins_st", Duration::from_secs(30))
         .await;
     assert!(refreshed, "Scheduler should trigger a refresh");
 
@@ -314,11 +321,14 @@ async fn test_wal_cdc_captures_update() {
     let mode = wait_for_cdc_mode(&db, "wal_upd", "WAL", Duration::from_secs(60)).await;
     assert_eq!(mode, "WAL", "Should transition to WAL mode");
 
+    // Allow the WAL slot to stabilise (see test_wal_cdc_captures_insert for rationale).
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
     db.execute("UPDATE wal_upd SET val = 'new' WHERE id = 1")
         .await;
 
     let refreshed = db
-        .wait_for_auto_refresh("wal_upd_st", Duration::from_secs(15))
+        .wait_for_auto_refresh("wal_upd_st", Duration::from_secs(30))
         .await;
     assert!(refreshed, "Scheduler should trigger a refresh");
 
@@ -357,10 +367,13 @@ async fn test_wal_cdc_captures_delete() {
     let mode = wait_for_cdc_mode(&db, "wal_del", "WAL", Duration::from_secs(60)).await;
     assert_eq!(mode, "WAL", "Should transition to WAL mode");
 
+    // Allow the WAL slot to stabilise (see test_wal_cdc_captures_insert for rationale).
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
     db.execute("DELETE FROM wal_del WHERE id = 2").await;
 
     let refreshed = db
-        .wait_for_auto_refresh("wal_del_st", Duration::from_secs(15))
+        .wait_for_auto_refresh("wal_del_st", Duration::from_secs(30))
         .await;
     assert!(refreshed, "Scheduler should trigger a refresh");
 

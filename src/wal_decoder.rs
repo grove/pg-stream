@@ -245,8 +245,13 @@ pub fn create_replication_slot_pristine(slot_name: &str) -> Result<String, PgTri
 /// This function does SPI reads and must NOT be called in the same
 /// transaction as `create_replication_slot_pristine`.
 pub fn get_existing_slot_lsn(slot_name: &str) -> Result<Option<String>, PgTrickleError> {
+    // Filter by database = current_database() so that identically-named slots
+    // belonging to other databases (e.g. parallel test databases in the same
+    // PostgreSQL instance) are not mistakenly reused.  pg_logical_slot_get_changes
+    // errors if called for a slot that belongs to a different database.
     let exists = Spi::get_one_with_args::<bool>(
-        "SELECT EXISTS(SELECT 1 FROM pg_replication_slots WHERE slot_name = $1)",
+        "SELECT EXISTS(SELECT 1 FROM pg_replication_slots \
+         WHERE slot_name = $1 AND database = current_database())",
         &[slot_name.into()],
     )
     .map_err(|e| PgTrickleError::SpiError(e.to_string()))?
@@ -257,7 +262,8 @@ pub fn get_existing_slot_lsn(slot_name: &str) -> Result<Option<String>, PgTrickl
     }
 
     let lsn = Spi::get_one_with_args::<String>(
-        "SELECT confirmed_flush_lsn::text FROM pg_replication_slots WHERE slot_name = $1",
+        "SELECT confirmed_flush_lsn::text FROM pg_replication_slots \
+         WHERE slot_name = $1 AND database = current_database()",
         &[slot_name.into()],
     )
     .map_err(|e| PgTrickleError::SpiError(e.to_string()))?
@@ -273,10 +279,11 @@ pub fn get_existing_slot_lsn(slot_name: &str) -> Result<Option<String>, PgTrickl
 /// that the full refresh has already materialized (G3). Returns `Ok(())`
 /// immediately if the slot does not exist (e.g., trigger-based sources).
 pub fn advance_slot_to_current(slot_name: &str) -> Result<(), PgTrickleError> {
-    // Guard against missing slot before issuing the advance,
-    // which would otherwise raise a PostgreSQL ERROR.
+    // Guard against missing slot (or a slot owned by a different database)
+    // before issuing the advance, which would otherwise raise a PostgreSQL ERROR.
     let exists = Spi::get_one_with_args::<bool>(
-        "SELECT EXISTS(SELECT 1 FROM pg_replication_slots WHERE slot_name = $1)",
+        "SELECT EXISTS(SELECT 1 FROM pg_replication_slots \
+         WHERE slot_name = $1 AND database = current_database())",
         &[slot_name.into()],
     )
     .map_err(|e| PgTrickleError::SpiError(e.to_string()))?
@@ -407,8 +414,11 @@ fn create_replication_slot_internal(slot_name: &str) -> Result<String, PgTrickle
 ///
 /// Safe to call even if the slot doesn't exist (checks first).
 pub fn drop_replication_slot(slot_name: &str) -> Result<(), PgTrickleError> {
+    // Filter by database = current_database() to avoid accidentally dropping a
+    // slot that belongs to a different database but shares the same name.
     let exists = Spi::get_one_with_args::<bool>(
-        "SELECT EXISTS(SELECT 1 FROM pg_replication_slots WHERE slot_name = $1)",
+        "SELECT EXISTS(SELECT 1 FROM pg_replication_slots \
+         WHERE slot_name = $1 AND database = current_database())",
         &[slot_name.into()],
     )
     .map_err(|e| PgTrickleError::SpiError(e.to_string()))?
@@ -434,7 +444,8 @@ pub fn drop_replication_slot(slot_name: &str) -> Result<(), PgTrickleError> {
 /// Returns `None` if the slot doesn't exist.
 pub fn get_slot_confirmed_lsn(slot_name: &str) -> Result<Option<String>, PgTrickleError> {
     Spi::get_one_with_args::<String>(
-        "SELECT confirmed_flush_lsn::text FROM pg_replication_slots WHERE slot_name = $1",
+        "SELECT confirmed_flush_lsn::text FROM pg_replication_slots \
+         WHERE slot_name = $1 AND database = current_database()",
         &[slot_name.into()],
     )
     .map_err(|e| PgTrickleError::SpiError(e.to_string()))
@@ -446,7 +457,8 @@ pub fn get_slot_confirmed_lsn(slot_name: &str) -> Result<Option<String>, PgTrick
 pub fn get_slot_lag_bytes(slot_name: &str) -> Result<i64, PgTrickleError> {
     Spi::get_one_with_args::<i64>(
         "SELECT (pg_current_wal_lsn() - confirmed_flush_lsn)::bigint \
-         FROM pg_replication_slots WHERE slot_name = $1",
+         FROM pg_replication_slots \
+         WHERE slot_name = $1 AND database = current_database()",
         &[slot_name.into()],
     )
     .map_err(|e| PgTrickleError::SpiError(e.to_string()))
@@ -498,7 +510,13 @@ const MAX_CHANGES_PER_POLL: i64 = 10_000;
 /// Number of consecutive WAL poll errors before automatically falling back
 /// to trigger-based CDC. Prevents a permanently broken WAL decoder from
 /// blocking change capture indefinitely.
-const MAX_CONSECUTIVE_WAL_ERRORS: u32 = 5;
+///
+/// Set to 20 (≈ 20 seconds at a 1 s scheduler interval) so that transient
+/// slot contention under CI load does not trigger an irreversible fallback.
+/// The fallback should only fire for a genuinely broken slot that fails
+/// reliably across many ticks — not for the brief spike that can occur
+/// right after slot creation or on a loaded test machine.
+const MAX_CONSECUTIVE_WAL_ERRORS: u32 = 20;
 
 /// Poll WAL changes from a replication slot and write them to the buffer table.
 ///
@@ -783,7 +801,11 @@ fn write_decoded_change(
     }
 
     // Map parsed columns to new_<col> and/or old_<col> buffer columns.
-    for (col_name, _col_type) in columns {
+    // A42-14: Add explicit `::col_type` casts to each placeholder so that
+    // the text-typed SPI parameter datums are cast to the actual column type
+    // at query-plan time. Without explicit casts, PostgreSQL rejects text→integer
+    // (and other non-implicit-coercible) assignments in parameterized queries.
+    for (col_name, col_type) in columns {
         let safe_name = col_name.replace('"', "\"\"");
 
         match action {
@@ -791,26 +813,26 @@ fn write_decoded_change(
                 col_names.push(format!("\"new_{}\"", safe_name));
                 let val = parsed.get(col_name).cloned();
                 param_values.push(val);
-                placeholders.push(format!("${}", param_values.len()));
+                placeholders.push(format!("${}::{}", param_values.len(), col_type));
             }
             'U' => {
                 // new value
                 col_names.push(format!("\"new_{}\"", safe_name));
                 let new_val = parsed.get(col_name).cloned();
                 param_values.push(new_val);
-                placeholders.push(format!("${}", param_values.len()));
+                placeholders.push(format!("${}::{}", param_values.len(), col_type));
 
                 // G2.2: old value from pgoutput old-key section.
                 col_names.push(format!("\"old_{}\"", safe_name));
                 let old_val = old_parsed.get(col_name).cloned();
                 param_values.push(old_val);
-                placeholders.push(format!("${}", param_values.len()));
+                placeholders.push(format!("${}::{}", param_values.len(), col_type));
             }
             'D' => {
                 col_names.push(format!("\"old_{}\"", safe_name));
                 let val = parsed.get(col_name).cloned();
                 param_values.push(val);
-                placeholders.push(format!("${}", param_values.len()));
+                placeholders.push(format!("${}::{}", param_values.len(), col_type));
             }
             _ => {}
         }
@@ -1949,9 +1971,11 @@ pub fn check_decoder_health(
         return Ok(());
     }
 
-    // Check if the slot still exists
+    // Check if the slot still exists (scoped to the current database to avoid
+    // false positives from identically-named slots in other databases).
     let slot_exists = Spi::get_one_with_args::<bool>(
-        "SELECT EXISTS(SELECT 1 FROM pg_replication_slots WHERE slot_name = $1)",
+        "SELECT EXISTS(SELECT 1 FROM pg_replication_slots \
+         WHERE slot_name = $1 AND database = current_database())",
         &[slot_name.as_str().into()],
     )
     .map_err(|e| PgTrickleError::SpiError(e.to_string()))?

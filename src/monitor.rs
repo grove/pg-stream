@@ -1688,7 +1688,8 @@ fn check_cdc_health() -> TableIterator<
                 let lsn = dep.decoder_confirmed_lsn.clone();
 
                 let slot_exists = Spi::get_one_with_args::<bool>(
-                    "SELECT EXISTS(SELECT 1 FROM pg_replication_slots WHERE slot_name = $1)",
+                    "SELECT EXISTS(SELECT 1 FROM pg_replication_slots \
+                     WHERE slot_name = $1 AND database = current_database())",
                     &[slot.as_str().into()],
                 )
                 .unwrap_or(Some(false))
@@ -1958,9 +1959,10 @@ fn check_wal_slot_existence() {
             None => crate::wal_decoder::slot_name_for_source(dep.source_relid),
         };
 
-        // Check if the replication slot exists
+        // Check if the replication slot exists (scoped to current database)
         let slot_exists = Spi::get_one_with_args::<bool>(
-            "SELECT EXISTS(SELECT 1 FROM pg_replication_slots WHERE slot_name = $1)",
+            "SELECT EXISTS(SELECT 1 FROM pg_replication_slots \
+             WHERE slot_name = $1 AND database = current_database())",
             &[slot_name.as_str().into()],
         )
         .unwrap_or(Some(false))
