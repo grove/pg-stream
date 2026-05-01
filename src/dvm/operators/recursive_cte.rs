@@ -256,7 +256,7 @@ fn check_for_delete_changes(
         let check_sql = format!(
             "SELECT EXISTS(\
                 SELECT 1 FROM {change_table} \
-                WHERE (action = 'D' OR action = 'U') \
+                WHERE action = 'D' \
                 AND lsn > '{prev_lsn}'::pg_lsn\
             )"
         );
@@ -1858,7 +1858,7 @@ fn generate_change_buffer_from(
                 ));
             }
 
-            // ── DIFFERENTIAL mode: read INSERT + UPDATE NEW rows ─────────
+            // ── DIFFERENTIAL mode: read INSERT rows ─────────────────
             let buf_name = ctx
                 .source_buffer_names
                 .get(table_oid)
@@ -1867,23 +1867,17 @@ fn generate_change_buffer_from(
             let change_table = format!("{}.{}", quote_ident(&ctx.change_buffer_schema), buf_name);
             let prev_lsn = ctx.get_prev_lsn(*table_oid);
 
-            // Use typed columns from the change buffer (new_* for INSERT
-            // events). The CDC trigger writes each column individually as
-            // c."new_{col}" with proper PostgreSQL types.
+            // A44-10 (D+I schema): flat column names — c."col" for I-rows (new values).
+            // D-rows (old values) are excluded — only new/surviving rows contribute
+            // to the recursive expansion.
             let col_refs: Vec<String> = columns
                 .iter()
-                .map(|c| {
-                    format!(
-                        "c.{} AS {}",
-                        quote_ident(&format!("new_{}", c.name)),
-                        quote_ident(&c.name),
-                    )
-                })
+                .map(|c| format!("c.{} AS {}", quote_ident(&c.name), quote_ident(&c.name),))
                 .collect();
 
             Ok(format!(
                 "(SELECT {cols} FROM {change_table} c \
-                 WHERE c.action IN ('I', 'U') AND c.lsn > '{prev_lsn}'::pg_lsn) AS {alias_q}",
+                 WHERE c.action = 'I' AND c.lsn > '{prev_lsn}'::pg_lsn) AS {alias_q}",
                 cols = col_refs.join(", "),
                 alias_q = quote_ident(alias),
             ))
@@ -1994,17 +1988,14 @@ fn generate_old_change_buffer_from(
             let col_refs: Vec<String> = columns
                 .iter()
                 .map(|c| {
-                    format!(
-                        "c.{} AS {}",
-                        quote_ident(&format!("old_{}", c.name)),
-                        quote_ident(&c.name),
-                    )
+                    // A44-10 (D+I schema): D-rows carry old values in flat c."col"
+                    format!("c.{} AS {}", quote_ident(&c.name), quote_ident(&c.name),)
                 })
                 .collect();
 
             Ok(format!(
                 "(SELECT {cols} FROM {change_table} c \
-                 WHERE c.action IN ('D', 'U') AND c.lsn > '{prev_lsn}'::pg_lsn) AS {alias_q}",
+                 WHERE c.action = 'D' AND c.lsn > '{prev_lsn}'::pg_lsn) AS {alias_q}",
                 cols = col_refs.join(", "),
                 alias_q = quote_ident(alias),
             ))
@@ -3542,30 +3533,48 @@ mod tests {
 
     #[test]
     fn test_generate_change_buffer_from_includes_update_new_rows() {
+        // A44-10 (D+I schema): I-rows carry new values; no action='U' in CB
         let scan = make_scan(100, "nodes", "public", "n", &["id", "parent_id", "name"]);
         let ctx = test_ctx();
 
         let sql = generate_change_buffer_from(&ctx, &scan, "\"public\".\"st\"").unwrap();
 
         assert!(
-            sql.contains("c.action IN ('I', 'U')"),
-            "Recursive insert seed should treat UPDATE new rows like inserts"
+            sql.contains("c.action = 'I'"),
+            "Recursive insert seed should read I-rows only (D+I schema): {sql}"
         );
-        assert!(sql.contains("c.\"new_name\" AS \"name\""));
+        assert!(
+            !sql.contains("action = 'U'"),
+            "No action='U' in D+I schema: {sql}"
+        );
+        // Flat column ref — no new_ prefix
+        assert!(
+            sql.contains("c.\"name\" AS \"name\""),
+            "flat column ref: {sql}"
+        );
     }
 
     #[test]
     fn test_generate_old_change_buffer_from_includes_update_old_rows() {
+        // A44-10 (D+I schema): D-rows carry old values; no action='U' in CB
         let scan = make_scan(100, "nodes", "public", "n", &["id", "parent_id", "name"]);
         let ctx = test_ctx();
 
         let sql = generate_old_change_buffer_from(&ctx, &scan, "\"public\".\"st\"").unwrap();
 
         assert!(
-            sql.contains("c.action IN ('D', 'U')"),
-            "Recursive delete seed should read DELETEs and UPDATE old rows"
+            sql.contains("c.action = 'D'"),
+            "Recursive delete seed should read D-rows only (D+I schema): {sql}"
         );
-        assert!(sql.contains("c.\"old_name\" AS \"name\""));
+        assert!(
+            !sql.contains("action = 'U'"),
+            "No action='U' in D+I schema: {sql}"
+        );
+        // Flat column ref — no old_ prefix
+        assert!(
+            sql.contains("c.\"name\" AS \"name\""),
+            "flat column ref: {sql}"
+        );
     }
 
     #[test]
@@ -3607,7 +3616,12 @@ mod tests {
             .unwrap()
             .expect("Should produce SQL for old-row Project-over-InnerJoin");
 
-        assert!(sql.contains("c.\"old_label\" AS \"label\""));
+        // A44-10 (D+I schema): flat c."col" references, no old_ prefix
+        assert!(
+            sql.contains("c.\"label\" AS \"label\""),
+            "flat column ref: {sql}"
+        );
+        assert!(!sql.contains("c.\"old_label\""), "no old_ prefix: {sql}");
         assert!(sql.contains("\"public\".\"st\" AS \"t\""));
         assert!(sql.contains("JOIN"));
         assert!(!sql.contains("__p"));

@@ -10,7 +10,7 @@
 //! - Changes value → UPDATE (emitted as DELETE + INSERT pair)
 
 use crate::dvm::diff::{DeltaSource, DiffContext, DiffResult, quote_ident};
-use crate::dvm::operators::scan::{build_hash_expr, compute_varbit_key_cols_mask};
+use crate::dvm::operators::scan::build_hash_expr;
 use crate::dvm::parser::{AggExpr, AggFunc, CteRegistry, Expr, OpTree};
 use crate::error::PgTrickleError;
 
@@ -1174,10 +1174,40 @@ fn is_direct_agg_eligible(
         if agg.filter.is_some() {
             return false;
         }
-        if let Some(arg) = &agg.argument
-            && !matches!(arg, Expr::ColumnRef { .. })
-        {
-            return false;
+        if let Some(arg) = &agg.argument {
+            match arg {
+                Expr::ColumnRef { .. } => {
+                    // Simple column ref — always P5-eligible.
+                }
+                Expr::Raw(case_sql)
+                    if matches!(agg.function, AggFunc::Sum) && expr_contains_case(arg) =>
+                {
+                    // A44-2 (v0.43.0): SUM(CASE ...) is P5-eligible when the
+                    // CASE expression references only simple column identifiers
+                    // that are present in the CDC change buffer for this table.
+                    // Verified here (with CDC column access) rather than deferred
+                    // to generate_direct_agg_delta, so an empty-column fallback
+                    // never produces invalid SQL.
+                    let cdc_cols = match child {
+                        OpTree::Scan { table_oid, .. } => ctx.source_cdc_columns.get(table_oid),
+                        _ => return false,
+                    };
+                    if let Some(cols) = cdc_cols {
+                        let extracted = extract_case_columns(case_sql, cols);
+                        if extracted.is_empty() {
+                            return false;
+                        }
+                        // At least one column found — P5-eligible.
+                    } else {
+                        // No CDC column metadata — cannot verify; fall back to
+                        // the standard scan path (GROUP_RESCAN).
+                        return false;
+                    }
+                }
+                _ => {
+                    return false;
+                }
+            }
         }
     }
     for expr in group_by {
@@ -1186,6 +1216,89 @@ fn is_direct_agg_eligible(
         }
     }
     true
+}
+
+// ── A44-2 (v0.43.0): DI-2 CASE expression helpers ─────────────────────────
+
+/// A44-2: Extract simple identifier (column) names from a CASE SQL expression.
+///
+/// Returns the list of identifiers that are NOT SQL keywords and are likely
+/// column references. Used to include the necessary columns in the LATERAL
+/// VALUES construction for the DI-2 UPDATE split path.
+///
+/// Only returns identifiers that appear in `available_cols` to avoid
+/// including SQL constants, operators, and keywords.
+fn extract_case_columns<'a>(case_sql: &str, available_cols: &'a [String]) -> Vec<&'a String> {
+    // Collect word tokens from the CASE expression (alphanumeric + underscore).
+    // Exclude common SQL keywords.
+    const SQL_KEYWORDS: &[&str] = &[
+        "CASE", "WHEN", "THEN", "ELSE", "END", "AND", "OR", "NOT", "IN", "IS", "NULL", "TRUE",
+        "FALSE", "BETWEEN", "LIKE", "ILIKE", "CAST", "AS", "ON", "AT", "TIME", "ZONE",
+    ];
+    let upper = case_sql.to_uppercase();
+    let words: Vec<&str> = upper
+        .split(|c: char| !c.is_alphanumeric() && c != '_')
+        .filter(|s| !s.is_empty())
+        .filter(|s| !SQL_KEYWORDS.contains(s))
+        .filter(|s| !s.chars().all(|c| c.is_ascii_digit()))
+        .collect();
+
+    available_cols
+        .iter()
+        .filter(|col| words.contains(&col.to_uppercase().as_str()))
+        .collect()
+}
+
+/// A44-2: Rewrite a CASE SQL expression so all column references are
+/// prefixed with `v."val_"`, making it suitable for the LATERAL VALUES path.
+///
+/// For each column in `cols`, replaces the bare identifier with the
+/// Rewrite a CASE SQL expression to use direct CB column references `c."col"`.
+///
+/// A44-10 (D+I schema): Previously used `v."val_{col}"` LATERAL VALUES aliases;
+/// with D+I flat schema we reference `c.{col}` directly since the CB already
+/// has separate I-rows and D-rows with flat column values.
+///
+/// Uses word-boundary replacement to avoid partial matches
+/// (e.g. `status` vs `order_status`).
+fn rewrite_case_for_lateral(case_sql: &str, cols: &[&String]) -> String {
+    let mut result = case_sql.to_string();
+    for col in cols {
+        // A44-10: direct CB column reference instead of LATERAL VALUES alias
+        let replacement = format!("c.{}", quote_ident(col));
+        // Word-boundary replacement: only replace `col` when it's a standalone word.
+        // We match it as a word (preceded and followed by non-word chars or start/end).
+        let col_upper = col.to_uppercase();
+        let result_upper = result.to_uppercase();
+        // Find all occurrences of the column name as a complete word in the SQL.
+        let mut out = String::with_capacity(result.len());
+        let mut pos = 0usize;
+        while pos < result_upper.len() {
+            if let Some(idx) = result_upper[pos..].find(col_upper.as_str()) {
+                let abs_idx = pos + idx;
+                let before_ok = abs_idx == 0
+                    || !result_upper.as_bytes()[abs_idx - 1].is_ascii_alphanumeric()
+                        && result_upper.as_bytes()[abs_idx - 1] != b'_';
+                let after_ok = abs_idx + col_upper.len() >= result_upper.len()
+                    || (!result_upper.as_bytes()[abs_idx + col_upper.len()]
+                        .is_ascii_alphanumeric()
+                        && result_upper.as_bytes()[abs_idx + col_upper.len()] != b'_');
+                if before_ok && after_ok {
+                    out.push_str(&result[pos..abs_idx]);
+                    out.push_str(&replacement);
+                    pos = abs_idx + col.len();
+                } else {
+                    out.push_str(&result[pos..abs_idx + 1]);
+                    pos = abs_idx + 1;
+                }
+            } else {
+                out.push_str(&result[pos..]);
+                break;
+            }
+        }
+        result = out;
+    }
+    result
 }
 
 /// P5 + P7 — Generate a direct aggregate delta CTE from the change buffer.
@@ -1199,6 +1312,12 @@ fn is_direct_agg_eligible(
 /// For UPDATE rows, the LATERAL VALUES expansion splits each change into
 /// an INSERT side (from `new_*` columns) and a DELETE side (from `old_*`
 /// columns), correctly handling group-key changes.
+///
+/// A44-2 (v0.43.0): SUM(CASE WHEN ...) is handled via the DI-2 UPDATE split:
+/// the CASE expression is rewritten to reference LATERAL VALUES aliases, and
+/// all referenced column names are included in the LATERAL Values construction
+/// (with old_* for D-rows and new_* for I-rows). This makes SUM(CASE) O(Δ)
+/// rather than O(group_size) via GROUP_RESCAN.
 ///
 /// Returns `(delta_cte_name, group_output_names)`.
 fn generate_direct_agg_delta(
@@ -1230,105 +1349,120 @@ fn generate_direct_agg_delta(
     // Collect group-by column names
     let group_output: Vec<String> = group_by.iter().map(|e| e.output_name()).collect();
 
-    // Collect unique aggregate argument column names
+    // A44-2 (v0.43.0): Gather CDC columns for DI-2 CASE-expression rewrite.
+    let cdc_cols_for_case = ctx
+        .source_cdc_columns
+        .get(table_oid)
+        .cloned()
+        .unwrap_or_default();
+
+    // Collect unique aggregate argument column names.
+    // A44-2: For SUM(CASE ...) aggregates, extract the column names referenced
+    // inside the CASE expression and include them individually in arg_cols, then
+    // record the rewritten CASE for use in the SELECT expressions.
     let mut arg_cols: Vec<String> = Vec::new();
+    // Maps aggregate alias -> rewritten CASE expression using v.val_{col} refs.
+    let mut case_rewrites: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+    // Track whether any aggregate has a CASE argument (was used by V-row optimization,
+    // now only kept for case_rewrites population).
+    let mut _has_case_aggregate = false;
+
     for agg in aggregates {
         if let Some(arg) = &agg.argument {
-            let name = arg.output_name();
-            if !arg_cols.contains(&name) {
-                arg_cols.push(name);
+            match arg {
+                Expr::ColumnRef { .. } => {
+                    let name = arg.output_name();
+                    if !arg_cols.contains(&name) {
+                        arg_cols.push(name);
+                    }
+                }
+                Expr::Raw(case_sql)
+                    if matches!(agg.function, AggFunc::Sum) && expr_contains_case(arg) =>
+                {
+                    // A44-2: DI-2 UPDATE split for SUM(CASE ...).
+                    // Extract column refs from the CASE expression and
+                    // rewrite it to use LATERAL VALUES aliases.
+                    let case_cols = extract_case_columns(case_sql, &cdc_cols_for_case);
+                    if !case_cols.is_empty() {
+                        for col in &case_cols {
+                            if !arg_cols.contains(*col) {
+                                arg_cols.push((*col).clone());
+                            }
+                        }
+                        let rewritten = rewrite_case_for_lateral(case_sql, &case_cols);
+                        case_rewrites.insert(agg.alias.clone(), rewritten);
+                        _has_case_aggregate = true;
+                    } else {
+                        // is_direct_agg_eligible guards this path: if it returned
+                        // true, CDC columns were verified to be non-empty.  If we
+                        // somehow reach here with no columns extracted, it is an
+                        // internal invariant violation.
+                        return Err(PgTrickleError::InternalError(format!(
+                            "A44-2: generate_direct_agg_delta reached with CASE aggregate \
+                             '{}' but no CASE columns could be extracted — CDC column \
+                             metadata missing. This should have been caught by \
+                             is_direct_agg_eligible.",
+                            agg.alias
+                        )));
+                    }
+                }
+                _ => {
+                    let name = arg.output_name();
+                    if !arg_cols.contains(&name) {
+                        arg_cols.push(name);
+                    }
+                }
             }
         }
     }
 
-    // ── Build LATERAL VALUES using typed columns ──────────────────────
-    let mut val_aliases = vec!["side".to_string()];
-    let mut val_i_parts = vec!["'I'".to_string()];
-    let mut val_d_parts = vec!["'D'".to_string()];
-
-    for name in &group_output {
-        val_aliases.push(quote_ident(&format!("grp_{name}")));
-        val_i_parts.push(format!("c.{}", quote_ident(&format!("new_{name}"))));
-        val_d_parts.push(format!("c.{}", quote_ident(&format!("old_{name}"))));
-    }
-
-    for name in &arg_cols {
-        val_aliases.push(quote_ident(&format!("val_{name}")));
-        val_i_parts.push(format!("c.{}", quote_ident(&format!("new_{name}"))));
-        val_d_parts.push(format!("c.{}", quote_ident(&format!("old_{name}"))));
-    }
-
-    // ── A-2: Value-only UPDATE optimization ──────────────────────────
+    // ── A44-10 (D+I schema): Build SELECT expressions directly from CB ──
     //
-    // When a key mask is available, value-only UPDATEs (where only aggregate
-    // argument columns changed, not GROUP BY keys) can be handled as a single
-    // net-correction row ('V') instead of the standard I+D pair. This halves
-    // row volume entering the GROUP BY for value-only updates.
+    // With D+I, the CB has separate I-rows (action='I') and D-rows (action='D'),
+    // each with flat column values. No LATERAL VALUES needed — just filter on
+    // c.action directly. This eliminates the 5-CTE UNION ALL scan pipeline and
+    // the 'V' (value-only) net-correction optimization (which is now unnecessary
+    // since I/D rows naturally cancel in COUNT and aggregate correctly in SUM).
     //
-    // The 'V' side carries: group columns from new_* (unchanged since keys
-    // didn't change), and for each value column: (new_val - old_val) as the
-    // net correction. Counts don't change (no 'I' or 'D' contribution).
-    let cdc_cols = ctx.source_cdc_columns.get(table_oid);
-    let key_cols = ctx.source_key_columns.get(table_oid);
-    let key_mask_info = match (key_cols, cdc_cols) {
-        (Some(kc), Some(cc)) => compute_varbit_key_cols_mask(kc, cc),
-        _ => None,
-    };
-
-    let has_value_only = key_mask_info.is_some();
-    let (val_v_row, value_only_pred) = if let Some((ref mask, ref zero)) = key_mask_info {
-        // Build the 'V' (value-only) LATERAL VALUES row.
-        let mut val_v_parts = vec!["'V'".to_string()];
-        // Group columns: use new_* (key didn't change, so new = old).
-        for name in &group_output {
-            val_v_parts.push(format!("c.{}", quote_ident(&format!("new_{name}"))));
-        }
-        // Value columns: net correction = new - old.
-        for name in &arg_cols {
-            let new_col = format!("c.{}", quote_ident(&format!("new_{name}")));
-            let old_col = format!("c.{}", quote_ident(&format!("old_{name}")));
-            val_v_parts.push(format!("({new_col} - {old_col})"));
-        }
-        // Use a CASE expression to guarantee evaluation order: the bit AND
-        // only runs when the widths match, preventing "cannot AND bit strings
-        // of different sizes" when a stale cached template has a different
-        // bitmask width than the current CDC trigger.
-        let mask_len = mask.len();
-        let pred = format!(
-            "c.action = 'U' AND c.changed_cols IS NOT NULL \
-             AND CASE WHEN bit_length(c.changed_cols) = {mask_len} \
-                      THEN (c.changed_cols & B'{mask}') = B'{zero}' \
-                      ELSE FALSE END"
-        );
-        (Some(val_v_parts.join(", ")), Some(pred))
-    } else {
-        (None, None)
-    };
+    // The LATERAL VALUES structure is kept for A44-2 (SUM(CASE ...)) compatibility
+    // since the rewritten CASE expression references v.val_{col} aliases. For
+    // simple column-ref aggregates, we use direct c.action-based filtering.
+    //
+    // A44-2 CASE rewrite: the case_rewrites map has rewritten CASE expressions
+    // using v.val_{col} references. These still need LATERAL VALUES.
+    // For non-CASE aggregates, use direct c.{col} references.
+    let has_value_only = false; // V-row optimization dropped in D+I schema.
 
     // ── Build SELECT expressions ──────────────────────────────────────
     let delta_cte = ctx.next_cte_name("agg_delta");
     let mut select_exprs = Vec::new();
 
-    // Group columns: v."grp_region" AS "region"
+    // Group columns: c."region" AS "region"
+    // A44-10: direct CB reference — same value on both I and D rows within a group
     for name in &group_output {
-        select_exprs.push(format!(
-            "v.{} AS {}",
-            quote_ident(&format!("grp_{name}")),
-            quote_ident(name),
-        ));
+        select_exprs.push(format!("c.{} AS {}", quote_ident(name), quote_ident(name),));
     }
 
     // __ins_count, __del_count (total row counts per group)
-    // A-2: 'V' (value-only) rows don't contribute to counts since the row
-    // stays in the same group — the D+I pair would cancel out anyway.
     select_exprs
-        .push("SUM(CASE WHEN v.side = 'I' THEN 1 ELSE 0 END)::bigint AS __ins_count".to_string());
+        .push("SUM(CASE WHEN c.action = 'I' THEN 1 ELSE 0 END)::bigint AS __ins_count".to_string());
     select_exprs
-        .push("SUM(CASE WHEN v.side = 'D' THEN 1 ELSE 0 END)::bigint AS __del_count".to_string());
+        .push("SUM(CASE WHEN c.action = 'D' THEN 1 ELSE 0 END)::bigint AS __del_count".to_string());
 
     // Per-aggregate delta expressions
     for agg in aggregates {
-        let (ins_expr, del_expr) = direct_agg_delta_exprs(agg, has_value_only);
+        // A44-2: If this aggregate has a rewritten CASE expression, use it
+        // directly with I/D action filtering instead of the generic helper.
+        let (ins_expr, del_expr) = if let Some(rewritten) = case_rewrites.get(&agg.alias) {
+            // DI-2 UPDATE split for SUM(CASE ...): the rewritten CASE references
+            // c."col" CB column aliases (after A44-10 update of rewrite_case_for_lateral).
+            let ins = format!("SUM(CASE WHEN c.action = 'I' THEN ({rewritten}) ELSE 0 END)");
+            let del = format!("SUM(CASE WHEN c.action = 'D' THEN ({rewritten}) ELSE 0 END)");
+            (ins, del)
+        } else {
+            direct_agg_delta_exprs(agg, has_value_only)
+        };
         select_exprs.push(format!(
             "{ins_expr} AS {}",
             quote_ident(&format!("__ins_{}", agg.alias)),
@@ -1339,58 +1473,29 @@ fn generate_direct_agg_delta(
         ));
     }
 
-    // GROUP BY
+    // GROUP BY — use c."col" directly (A44-10: no v.grp_* aliases needed)
     let group_by_clause = if group_output.is_empty() {
         String::new()
     } else {
         let refs: Vec<String> = group_output
             .iter()
-            .map(|name| format!("v.{}", quote_ident(&format!("grp_{name}"))))
+            .map(|name| format!("c.{}", quote_ident(name)))
             .collect();
         format!("\nGROUP BY {}", refs.join(", "))
     };
 
-    // A-2: Build LATERAL VALUES rows and WHERE clause.
-    // Standard: 2 rows (I, D). Value-only optimized: 3 rows (I, D, V) with
-    // routing so value-only UPDATEs only emit the V (net correction) row.
-    let (lateral_values, where_clause) = if let (Some(v_row), Some(vo_pred)) =
-        (&val_v_row, &value_only_pred)
-    {
-        let vals = format!(
-            "LATERAL (VALUES\n    ({val_i}),\n    ({val_d}),\n    ({v_row})\n) v({val_aliases})",
-            val_i = val_i_parts.join(", "),
-            val_d = val_d_parts.join(", "),
-            val_aliases = val_aliases.join(", "),
-        );
-        // Route value-only UPDATEs to 'V' only; key-changing UPDATEs and
-        // pure inserts/deletes get the standard I/D expansion.
-        let whr = format!(
-            "WHERE c.lsn > '{prev_lsn}'::pg_lsn AND c.lsn <= '{new_lsn}'::pg_lsn\n  \
-             AND ((v.side = 'I' AND c.action != 'D' AND NOT ({vo_pred}))\n    \
-             OR (v.side = 'D' AND c.action != 'I' AND NOT ({vo_pred}))\n    \
-             OR (v.side = 'V' AND ({vo_pred})))"
-        );
-        (vals, whr)
-    } else {
-        let vals = format!(
-            "LATERAL (VALUES\n    ({val_i}),\n    ({val_d})\n) v({val_aliases})",
-            val_i = val_i_parts.join(", "),
-            val_d = val_d_parts.join(", "),
-            val_aliases = val_aliases.join(", "),
-        );
-        let whr = format!(
-            "WHERE c.lsn > '{prev_lsn}'::pg_lsn AND c.lsn <= '{new_lsn}'::pg_lsn\n  \
-             AND ((v.side = 'I' AND c.action != 'D')\n    \
-             OR (v.side = 'D' AND c.action != 'I'))"
-        );
-        (vals, whr)
-    };
+    // A44-10 (D+I schema): Simple WHERE — all CB rows are already I or D.
+    // No LATERAL VALUES needed. UNION ALL approach is replaced by direct
+    // c.action filtering in the SELECT expressions.
+    let where_clause = format!(
+        "WHERE c.lsn > '{prev_lsn}'::pg_lsn AND c.lsn <= '{new_lsn}'::pg_lsn\n  \
+         AND c.action IN ('I', 'D')"
+    );
 
     let delta_sql = format!(
         "\
 SELECT {selects}
-FROM {change_table} c,
-{lateral_values}
+FROM {change_table} c
 {where_clause}{group_by}",
         selects = select_exprs.join(",\n       "),
         group_by = group_by_clause,
@@ -1403,59 +1508,48 @@ FROM {change_table} c,
 
 /// Generate per-aggregate delta expressions for the P5 direct bypass CTE.
 ///
-/// References VALUES alias columns `v."val_{col}"` and `v.side`.
-///
-/// When `has_value_only` is true, the 'V' (value-only net correction) row
-/// is present in the LATERAL VALUES. For SUM, the 'V' row's net correction
-/// (`new - old`) is accumulated on the insert side; for COUNT/COUNT(*),
-/// 'V' rows contribute zero (no membership change).
-fn direct_agg_delta_exprs(agg: &AggExpr, has_value_only: bool) -> (String, String) {
+/// A44-10 (D+I schema): References flat `c."col"` columns and `c.action`
+/// directly. No LATERAL VALUES needed — D-rows have old values, I-rows
+/// have new values. The `has_value_only` parameter is always false with
+/// D+I schema (V-row optimization dropped).
+fn direct_agg_delta_exprs(agg: &AggExpr, _has_value_only: bool) -> (String, String) {
     if agg.is_distinct {
         unreachable!("P5 bypass does not support DISTINCT aggregates")
     }
 
     match &agg.function {
         AggFunc::CountStar => (
-            // 'V' rows don't contribute to counts (side is neither 'I' nor 'D').
-            "SUM(CASE WHEN v.side = 'I' THEN 1 ELSE 0 END)::bigint".to_string(),
-            "SUM(CASE WHEN v.side = 'D' THEN 1 ELSE 0 END)::bigint".to_string(),
+            "SUM(CASE WHEN c.action = 'I' THEN 1 ELSE 0 END)::bigint".to_string(),
+            "SUM(CASE WHEN c.action = 'D' THEN 1 ELSE 0 END)::bigint".to_string(),
         ),
         AggFunc::Count => {
+            // A44-10: flat column reference — c."col" for both I and D rows
             let col = agg
                 .argument
                 .as_ref()
-                .map(|e| format!("v.{}", quote_ident(&format!("val_{}", e.output_name()))))
+                .map(|e| format!("c.{}", quote_ident(&e.output_name())))
                 .unwrap_or_else(|| "1".to_string());
-            // 'V' rows don't contribute to counts.
             (
                 format!(
-                    "SUM(CASE WHEN v.side = 'I' AND {col} IS NOT NULL THEN 1 ELSE 0 END)::bigint"
+                    "SUM(CASE WHEN c.action = 'I' AND {col} IS NOT NULL THEN 1 ELSE 0 END)::bigint"
                 ),
                 format!(
-                    "SUM(CASE WHEN v.side = 'D' AND {col} IS NOT NULL THEN 1 ELSE 0 END)::bigint"
+                    "SUM(CASE WHEN c.action = 'D' AND {col} IS NOT NULL THEN 1 ELSE 0 END)::bigint"
                 ),
             )
         }
         AggFunc::Sum => {
+            // A44-10: flat column reference — c."col" for both I and D rows.
+            // D-rows carry old values (−1), I-rows carry new values (+1).
             let col = agg
                 .argument
                 .as_ref()
-                .map(|e| format!("v.{}", quote_ident(&format!("val_{}", e.output_name()))))
+                .map(|e| format!("c.{}", quote_ident(&e.output_name())))
                 .unwrap_or_else(|| "0".to_string());
-            if has_value_only {
-                // A-2: 'V' rows carry net correction (new - old) on the insert side.
-                // The merge formula `old + ins - del` then computes:
-                // old + (net_correction) - 0 = old + (new - old) = new ✓
-                (
-                    format!("SUM(CASE WHEN v.side IN ('I', 'V') THEN {col} ELSE 0 END)"),
-                    format!("SUM(CASE WHEN v.side = 'D' THEN {col} ELSE 0 END)"),
-                )
-            } else {
-                (
-                    format!("SUM(CASE WHEN v.side = 'I' THEN {col} ELSE 0 END)"),
-                    format!("SUM(CASE WHEN v.side = 'D' THEN {col} ELSE 0 END)"),
-                )
-            }
+            (
+                format!("SUM(CASE WHEN c.action = 'I' THEN {col} ELSE 0 END)"),
+                format!("SUM(CASE WHEN c.action = 'D' THEN {col} ELSE 0 END)"),
+            )
         }
         AggFunc::Min | AggFunc::Max => {
             // Should never be reached — eligibility check excludes MIN/MAX
@@ -2936,8 +3030,10 @@ mod tests {
         assert!(result.columns.contains(&"cnt".to_string()));
 
         // Should use direct bypass (P5) since it's Scan → Aggregate with COUNT(*)
+        // A44-10 (D+I schema): P5 uses c.action directly, no LATERAL VALUES
         assert_sql_contains(&sql, "changes_1");
-        assert_sql_contains(&sql, "LATERAL");
+        assert_sql_contains(&sql, "c.action = 'I'");
+        assert_sql_contains(&sql, "c.action = 'D'");
     }
 
     #[test]
@@ -2953,8 +3049,10 @@ mod tests {
         let sql = ctx.build_with_query(&result.cte_name);
 
         assert!(result.columns.contains(&"total".to_string()));
-        // Uses P5 direct bypass
-        assert_sql_contains(&sql, "LATERAL");
+        // A44-10 (D+I schema): P5 direct bypass uses c.action filtering, no LATERAL VALUES
+        assert_sql_contains(&sql, "c.action = 'I'");
+        assert_sql_contains(&sql, "c.action = 'D'");
+        assert_sql_not_contains(&sql, "LATERAL");
     }
 
     #[test]
@@ -5319,37 +5417,41 @@ mod tests {
 
     #[test]
     fn test_direct_agg_delta_exprs_sum_without_value_only() {
+        // A44-10 (D+I schema): flat c.action filtering, no LATERAL VALUES
         let agg = sum_col("amount", "total");
         let (ins, del) = direct_agg_delta_exprs(&agg, false);
         assert!(
-            ins.contains("v.side = 'I'"),
-            "SUM insert expr should match 'I': {ins}"
+            ins.contains("c.action = 'I'"),
+            "SUM insert expr should use c.action = 'I': {ins}"
         );
         assert!(
-            !ins.contains("'V'"),
-            "SUM insert expr should NOT include 'V' without value-only: {ins}"
+            ins.contains("c.\"amount\""),
+            "SUM insert expr should reference flat c.\"amount\": {ins}"
         );
         assert!(
-            del.contains("v.side = 'D'"),
-            "SUM delete expr should match 'D': {del}"
+            del.contains("c.action = 'D'"),
+            "SUM delete expr should use c.action = 'D': {del}"
         );
     }
 
     #[test]
     fn test_direct_agg_delta_exprs_sum_with_value_only() {
+        // A44-10 (D+I schema): has_value_only is always false; V-row optimization
+        // dropped. Behaviour is same as without value-only — c.action filtering.
         let agg = sum_col("amount", "total");
         let (ins, del) = direct_agg_delta_exprs(&agg, true);
         assert!(
-            ins.contains("('I', 'V')"),
-            "SUM insert expr should include 'V' with value-only: {ins}"
+            ins.contains("c.action = 'I'"),
+            "SUM insert expr should use c.action = 'I' (D+I schema): {ins}"
         );
         assert!(
-            del.contains("v.side = 'D'"),
-            "SUM delete expr should only match 'D': {del}"
+            del.contains("c.action = 'D'"),
+            "SUM delete expr should use c.action = 'D' (D+I schema): {del}"
         );
+        // V-row optimization is dropped in D+I schema
         assert!(
-            !del.contains("'V'"),
-            "SUM delete expr should NOT include 'V': {del}"
+            !ins.contains("'V'"),
+            "SUM insert expr should NOT include 'V' in D+I schema: {ins}"
         );
     }
 
@@ -5393,8 +5495,8 @@ mod tests {
 
     #[test]
     fn test_a2_p5_value_only_generates_v_row() {
-        // Full integration: generate_direct_agg_delta with key columns set
-        // should produce LATERAL VALUES with a 'V' row and routing logic.
+        // A44-10 (D+I schema): V-row optimization dropped. generate_direct_agg_delta
+        // should produce direct c.action filtering even when key columns are set.
         let child = scan(1, "t", "public", "t", &["id", "region", "amount"]);
         let group_by = vec![colref("region")];
         let aggs = vec![sum_col("amount", "total")];
@@ -5402,7 +5504,6 @@ mod tests {
             crate::version::Frontier::default(),
             crate::version::Frontier::default(),
         );
-        // Set up key columns (region is a GROUP BY key) and CDC columns.
         ctx.source_key_columns.insert(1, vec!["region".to_string()]);
         ctx.source_cdc_columns.insert(
             1,
@@ -5411,19 +5512,19 @@ mod tests {
         let result = generate_direct_agg_delta(&mut ctx, &child, &group_by, &aggs);
         assert!(result.is_ok());
         let (cte_name, _group_out) = result.unwrap();
-        // Find the generated CTE SQL
         let sql = ctx.cte_sql(&cte_name).expect("CTE should exist");
+        // D+I schema: no LATERAL VALUES, no 'V' rows, use c.action directly
         assert!(
-            sql.contains("'V'"),
-            "P5 SQL should contain 'V' value-only row when key mask is set: {sql}"
+            !sql.contains("'V'"),
+            "P5 SQL should NOT contain 'V' in D+I schema: {sql}"
         );
         assert!(
-            sql.contains("changed_cols"),
-            "P5 SQL should reference changed_cols for value-only detection: {sql}"
+            sql.contains("c.action = 'I'"),
+            "P5 SQL should use c.action = 'I' for insert side: {sql}"
         );
         assert!(
-            sql.contains("v.side IN ('I', 'V')"),
-            "P5 SUM should include 'V' in insert side accumulation: {sql}"
+            sql.contains("c.action = 'D'"),
+            "P5 SQL should use c.action = 'D' for delete side: {sql}"
         );
     }
 
@@ -5470,6 +5571,190 @@ mod tests {
         assert!(
             !sql.contains("'V'"),
             "All columns are keys — no value-only optimization: {sql}"
+        );
+    }
+
+    // ── A44-2 (v0.43.0): DI-2 CASE expression tests ─────────────────
+
+    #[test]
+    fn test_a44_2_extract_case_columns_simple() {
+        let case_sql = "CASE WHEN status = 'active' THEN amount ELSE 0 END";
+        let cdc_cols = vec![
+            "id".to_string(),
+            "status".to_string(),
+            "amount".to_string(),
+            "region".to_string(),
+        ];
+        let extracted = extract_case_columns(case_sql, &cdc_cols);
+        let names: Vec<&str> = extracted.iter().map(|s| s.as_str()).collect();
+        assert!(
+            names.contains(&"status"),
+            "should extract 'status': {names:?}"
+        );
+        assert!(
+            names.contains(&"amount"),
+            "should extract 'amount': {names:?}"
+        );
+        assert!(!names.contains(&"id"), "should not extract 'id': {names:?}");
+    }
+
+    #[test]
+    fn test_a44_2_extract_case_columns_no_match() {
+        let case_sql = "CASE WHEN 1 = 1 THEN 42 ELSE 0 END";
+        let cdc_cols = vec!["status".to_string(), "amount".to_string()];
+        let extracted = extract_case_columns(case_sql, &cdc_cols);
+        assert!(
+            extracted.is_empty(),
+            "No columns should be extracted from all-literal CASE: {extracted:?}"
+        );
+    }
+
+    #[test]
+    fn test_a44_2_rewrite_case_for_lateral_simple() {
+        // A44-10 (D+I schema): rewrite_case_for_lateral now produces c."col" direct
+        // references instead of v."val_col" LATERAL VALUES aliases.
+        let case_sql = "CASE WHEN status = 'active' THEN amount ELSE 0 END";
+        let cols: Vec<String> = vec!["status".to_string(), "amount".to_string()];
+        let col_refs: Vec<&String> = cols.iter().collect();
+        let rewritten = rewrite_case_for_lateral(case_sql, &col_refs);
+        assert!(
+            rewritten.contains(r#"c."status""#),
+            "status should be rewritten to c.\"status\": {rewritten}"
+        );
+        assert!(
+            rewritten.contains(r#"c."amount""#),
+            "amount should be rewritten to c.\"amount\": {rewritten}"
+        );
+        assert!(
+            !rewritten.contains("= status"),
+            "bare 'status' should be gone: {rewritten}"
+        );
+    }
+
+    #[test]
+    fn test_a44_2_sum_case_eligible_for_p5_with_cdc_cols() {
+        // SUM(CASE ...) should be P5-eligible when CDC columns are set.
+        let child = scan(1, "t", "public", "t", &["id", "status", "amount", "region"]);
+        let group_by = vec![colref("region")];
+        let aggs = vec![AggExpr {
+            function: AggFunc::Sum,
+            argument: Some(Expr::Raw(
+                "CASE WHEN status = 'active' THEN amount ELSE 0 END".to_string(),
+            )),
+            alias: "active_total".to_string(),
+            is_distinct: false,
+            filter: None,
+            second_arg: None,
+            order_within_group: None,
+        }];
+        let mut ctx = crate::dvm::diff::DiffContext::new_standalone(
+            crate::version::Frontier::default(),
+            crate::version::Frontier::default(),
+        );
+        ctx.source_cdc_columns.insert(
+            1,
+            vec![
+                "id".to_string(),
+                "status".to_string(),
+                "amount".to_string(),
+                "region".to_string(),
+            ],
+        );
+        assert!(
+            super::is_direct_agg_eligible(&child, &group_by, &aggs, &ctx),
+            "SUM(CASE ...) with CDC cols should be P5-eligible"
+        );
+    }
+
+    #[test]
+    fn test_a44_2_sum_case_not_eligible_without_cdc_cols() {
+        // SUM(CASE ...) should NOT be P5-eligible when CDC columns are missing.
+        let child = scan(1, "t", "public", "t", &["id", "status", "amount"]);
+        let group_by = vec![colref("region")];
+        let aggs = vec![AggExpr {
+            function: AggFunc::Sum,
+            argument: Some(Expr::Raw(
+                "CASE WHEN status = 'active' THEN amount ELSE 0 END".to_string(),
+            )),
+            alias: "active_total".to_string(),
+            is_distinct: false,
+            filter: None,
+            second_arg: None,
+            order_within_group: None,
+        }];
+        // Use local wrapper (empty ctx — no CDC cols).
+        assert!(
+            !is_direct_agg_eligible(&child, &group_by, &aggs),
+            "SUM(CASE ...) without CDC cols should NOT be P5-eligible"
+        );
+    }
+
+    #[test]
+    fn test_a44_2_sum_case_di2_generates_correct_sql() {
+        // The P5 path for SUM(CASE ...) should produce SQL with:
+        // 1. LATERAL VALUES containing old_*/new_* for each CASE column
+        // 2. A rewritten CASE expression using v.val_* references
+        // 3. No 'V' (value-only) row (disabled for CASE aggregates)
+        let child = scan(1, "t", "public", "t", &["id", "status", "amount", "region"]);
+        let group_by = vec![colref("region")];
+        let aggs = vec![AggExpr {
+            function: AggFunc::Sum,
+            argument: Some(Expr::Raw(
+                "CASE WHEN status = 'active' THEN amount ELSE 0 END".to_string(),
+            )),
+            alias: "active_total".to_string(),
+            is_distinct: false,
+            filter: None,
+            second_arg: None,
+            order_within_group: None,
+        }];
+        let mut ctx = crate::dvm::diff::DiffContext::new_standalone(
+            crate::version::Frontier::default(),
+            crate::version::Frontier::default(),
+        );
+        ctx.source_cdc_columns.insert(
+            1,
+            vec![
+                "id".to_string(),
+                "status".to_string(),
+                "amount".to_string(),
+                "region".to_string(),
+            ],
+        );
+        // Key columns set to trigger potential V-row (but should be disabled for CASE).
+        ctx.source_key_columns.insert(1, vec!["id".to_string()]);
+
+        let result = generate_direct_agg_delta(&mut ctx, &child, &group_by, &aggs);
+        assert!(
+            result.is_ok(),
+            "SUM(CASE ...) P5 should succeed: {result:?}"
+        );
+        let (cte_name, _group_out) = result.unwrap();
+        let sql = ctx.cte_sql(&cte_name).expect("CTE should exist");
+
+        // A44-10 (D+I schema): rewritten CASE uses c."col" references.
+        // No LATERAL VALUES, no v.side — use c.action directly.
+        assert!(
+            sql.contains(r#"c."status""#),
+            "SQL should contain c.\"status\" reference: {sql}"
+        );
+        assert!(
+            sql.contains(r#"c."amount""#),
+            "SQL should contain c.\"amount\" reference: {sql}"
+        );
+        // V-row should not be present in D+I schema.
+        assert!(
+            !sql.contains("'V'"),
+            "V-row should be absent in D+I schema: {sql}"
+        );
+        // Should use c.action = 'I'/'D' directly.
+        assert!(
+            sql.contains("c.action = 'I'"),
+            "SQL should filter on c.action = 'I': {sql}"
+        );
+        assert!(
+            sql.contains("c.action = 'D'"),
+            "SQL should filter on c.action = 'D': {sql}"
         );
     }
 }

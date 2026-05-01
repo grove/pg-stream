@@ -204,7 +204,7 @@ fn diff_scan_change_buffer(
     // ST-ST-4: Use `changes_pgt_{pgt_id}` for ST sources, `changes_{stable_name}` for base tables.
     // DAG-4: When a bypass table is registered (fused-chain), read from it instead.
     // CITUS-4: Base table buffers use the stable hash name (v0.32.0+), not the OID.
-    let is_st_source = ctx.st_source_pgt_ids.contains_key(&table_oid);
+    let _is_st_source = ctx.st_source_pgt_ids.contains_key(&table_oid);
     let change_table = if let Some(&pgt_id) = ctx.st_source_pgt_ids.get(&table_oid) {
         if let Some(bypass) = ctx.st_bypass_tables.get(&pgt_id) {
             bypass.clone()
@@ -269,78 +269,35 @@ fn diff_scan_change_buffer(
     // Always use the pre-computed pk_hash from the trigger (G-J1 optimization).
     let pk_hash_expr = "c.pk_hash".to_string();
 
-    // For the DELETE part of an UPDATE split, the __pgt_row_id must match
-    // the existing ST row, which was computed from the OLD column values.
-    // The trigger stores pk_hash from NEW values for UPDATEs, so we
-    // recompute an old-value-based hash for the DELETE branch.
-    //
-    // For PK-based tables, this is equivalent to c.pk_hash because PK
-    // columns don't typically change on UPDATE. For keyless tables, the
-    // hash includes ALL columns, which differ between OLD and NEW.
-    let hash_cols: Vec<&str> = if pk_columns.is_empty() {
-        columns.iter().map(|c| c.name.as_str()).collect()
-    } else {
-        pk_columns.iter().map(|s| s.as_str()).collect()
-    };
-    // ST-ST-4: ST change buffers have no old_* columns. For ST sources,
-    // the "old" pk hash is the same as the new pk hash (no UPDATEs in
-    // ST deltas — only I/D pairs), so we use new_* columns for old hash.
-    let old_col_prefix = if is_st_source { "new" } else { "old" };
-    let old_hash_args: Vec<String> = hash_cols
-        .iter()
-        .map(|c| format!("c.{}::TEXT", quote_ident(&format!("{old_col_prefix}_{c}"))))
-        .collect();
-    let old_pk_hash_expr = if old_hash_args.len() == 1 {
-        format!("pgtrickle.pg_trickle_hash({})", old_hash_args[0])
-    } else {
-        format!(
-            "pgtrickle.pg_trickle_hash_multi(ARRAY[{}])",
-            old_hash_args.join(", "),
-        )
-    };
+    // A44-10 (D+I schema): In the D+I schema, both D-rows and I-rows have the
+    // same pre-computed pk_hash (OLD pk_hash for D-rows, NEW pk_hash for I-rows).
+    // The __pgt_row_id for a D-row must match the existing ST row (computed from
+    // OLD column values). The trigger/WAL-decoder sets pk_hash appropriately:
+    //   - D-row from UPDATE: pk_hash from OLD values
+    //   - I-row from UPDATE: pk_hash from NEW values
+    //   - Genuine INSERT: pk_hash from NEW values
+    //   - Genuine DELETE: pk_hash from OLD values
+    // For D-rows, c.pk_hash IS the old pk_hash — no separate old_pk_hash_expr needed.
+    let old_pk_hash_expr = "c.pk_hash".to_string();
 
-    // Build typed column references for the raw CTE.
-    // ST-ST-4: ST buffers only have new_* columns; emit new_* twice
-    // (aliased as old_*) so downstream CTEs can reference both uniformly.
-    let mut typed_col_refs = Vec::new();
-    for c in columns {
-        typed_col_refs.push(format!("c.{}", quote_ident(&format!("new_{}", c.name))));
-        if is_st_source {
-            // Alias new_* as old_* since ST buffers lack old_* columns
-            typed_col_refs.push(format!(
-                "c.{} AS {}",
-                quote_ident(&format!("new_{}", c.name)),
-                quote_ident(&format!("old_{}", c.name)),
-            ));
-        } else {
-            typed_col_refs.push(format!("c.{}", quote_ident(&format!("old_{}", c.name))));
-        }
-    }
-    let typed_col_refs_str = typed_col_refs.join(",\n       ");
+    // A44-10 (D+I schema): Flat column references — no new_/old_ prefix.
+    // D-rows carry old values in c."col"; I-rows carry new values.
+    // The ST-source (is_st_source) distinction is gone — both base and ST
+    // change buffers use the same flat schema.
+    let col_refs: Vec<String> = columns
+        .iter()
+        .map(|c| format!("c.{}", quote_ident(&c.name)))
+        .collect();
+    let typed_col_refs_str = col_refs.join(",\n       ");
 
-    // Build output column references: old_* for DELETE, new_* for INSERT.
-    // Each is aliased to the original column name for downstream CTEs.
-    // For ST sources, old_* columns are already aliased from new_* above.
-    let old_col_refs: Vec<String> = columns
+    // Output column references: both DELETE and INSERT use flat c."col".
+    // The alias is the original column name for downstream CTE compatibility.
+    let col_ref_aliased: Vec<String> = columns
         .iter()
-        .map(|c| {
-            format!(
-                "c.{} AS {}",
-                quote_ident(&format!("old_{}", c.name)),
-                quote_ident(&c.name),
-            )
-        })
+        .map(|c| format!("c.{} AS {}", quote_ident(&c.name), quote_ident(&c.name),))
         .collect();
-    let new_col_refs: Vec<String> = columns
-        .iter()
-        .map(|c| {
-            format!(
-                "c.{} AS {}",
-                quote_ident(&format!("new_{}", c.name)),
-                quote_ident(&c.name),
-            )
-        })
-        .collect();
+    let old_col_refs: Vec<String> = col_ref_aliased.clone();
+    let new_col_refs: Vec<String> = col_ref_aliased;
 
     // ## Net-effect scan delta (split fast-path approach)
     //
@@ -450,32 +407,15 @@ fn diff_scan_change_buffer(
     // hash), causing the DISTINCT ON logic to collapse independent events.
     // Instead, we decompose all changes into atomic +1 (INSERT) / -1
     // (DELETE) operations per content hash, sum to get a net count, and
-    // expand using generate_series. UPDATEs are split into their DELETE
-    // (old hash) + INSERT (new hash) components.
+    // expand using generate_series.
+    //
+    // A44-10 (D+I schema): UPDATEs are already decomposed at write time
+    // (D-row + I-row), so no UNION ALL for 'U' rows is needed here.
     if is_keyless {
-        // Build column references aliased to original names.
-        let new_col_refs_raw: Vec<String> = columns
+        // A44-10: Flat column references (no new_/old_ prefix).
+        let col_refs_raw: Vec<String> = columns
             .iter()
-            .map(|c| {
-                format!(
-                    "c.{} AS {}",
-                    quote_ident(&format!("new_{}", c.name)),
-                    quote_ident(&c.name),
-                )
-            })
-            .collect();
-        let old_col_refs_raw: Vec<String> = columns
-            .iter()
-            .map(|c| {
-                // ST-ST-4: ST change buffers have no old_* columns.
-                // Use new_* columns for DELETE refs (ST deltas are I/D only).
-                let prefix = if is_st_source { "new" } else { "old" };
-                format!(
-                    "c.{} AS {}",
-                    quote_ident(&format!("{prefix}_{}", c.name)),
-                    quote_ident(&c.name),
-                )
-            })
+            .map(|c| format!("c.{} AS {}", quote_ident(&c.name), quote_ident(&c.name),))
             .collect();
         // Use array_agg(col)[1] instead of MAX(col) so that types without a
         // comparison operator (e.g. jsonb, json, arrays, composites) are handled
@@ -498,34 +438,14 @@ fn diff_scan_change_buffer(
             .collect();
 
         // CTE: Decompose all events into atomic +1/-1 per content hash.
-        // ST-ST-4: ST change buffers only emit I/D actions (no UPDATEs).
-        // Skip the UPDATE UNION ALL branches for ST sources.
+        // A44-10 (D+I schema): No UPDATE UNION ALL branches needed —
+        // UPDATEs arrive as D-row + I-row pairs from the trigger/WAL decoder.
         let decomp_cte = ctx.next_cte_name(&format!("kl_decomp_{alias}"));
-        let update_branches = if is_st_source {
-            String::new()
-        } else {
-            format!(
-                "\n\nUNION ALL\n\n\
--- UPDATE INSERT side: +1 per new content hash\n\
-SELECT {pk_hash_expr} AS content_hash, 1 AS delta_sign,\n\
-       {new_refs}\n\
-FROM {change_table} c\n\
-WHERE {lsn_filter} AND c.action = 'U'\n\n\
-UNION ALL\n\n\
--- UPDATE DELETE side: -1 per old content hash\n\
-SELECT {old_pk_hash_expr} AS content_hash, -1 AS delta_sign,\n\
-       {old_refs}\n\
-FROM {change_table} c\n\
-WHERE {lsn_filter} AND c.action = 'U'",
-                new_refs = new_col_refs_raw.join(",\n       "),
-                old_refs = old_col_refs_raw.join(",\n       "),
-            )
-        };
         let decomp_sql = format!(
             "\
 -- INSERT events: +1 per content hash
 SELECT {pk_hash_expr} AS content_hash, 1 AS delta_sign,
-       {new_refs}
+       {col_refs}
 FROM {change_table} c
 WHERE {lsn_filter} AND c.action = 'I'
 
@@ -533,11 +453,10 @@ UNION ALL
 
 -- DELETE events: -1 per content hash
 SELECT {pk_hash_expr} AS content_hash, -1 AS delta_sign,
-       {old_refs}
+       {col_refs}
 FROM {change_table} c
-WHERE {lsn_filter} AND c.action = 'D'{update_branches}",
-            new_refs = new_col_refs_raw.join(",\n       "),
-            old_refs = old_col_refs_raw.join(",\n       "),
+WHERE {lsn_filter} AND c.action = 'D'",
+            col_refs = col_refs_raw.join(",\n       "),
         );
         ctx.add_cte(decomp_cte.clone(), decomp_sql);
 
@@ -680,11 +599,12 @@ SELECT * FROM {multi_cte}",
     //
     // When a Filter was pushed into this Scan (via DiffContext), inject
     // the rewritten predicate into the final scan CTE's output branches.
-    // DELETE branch uses `old_` column prefixes, INSERT uses `new_`.
+    // A44-10 (D+I schema): both branches use the same flat column name
+    // (no old_/new_ prefix). D-rows have old values, I-rows have new values.
     let (del_pushed_filter, ins_pushed_filter) =
         if let Some(ref predicate) = ctx.scan_pushed_predicate {
-            let del = rewrite_predicate_for_scan(predicate, "old_");
-            let ins = rewrite_predicate_for_scan(predicate, "new_");
+            let del = rewrite_predicate_for_scan(predicate, "");
+            let ins = rewrite_predicate_for_scan(predicate, "");
             (format!("\nWHERE {del}"), format!("\nWHERE {ins}"))
         } else {
             (String::new(), String::new())
@@ -937,6 +857,7 @@ pub fn is_predicate_pushable_to_scan(
 pub fn rewrite_predicate_for_scan(expr: &Expr, prefix: &str) -> String {
     match expr {
         Expr::ColumnRef { column_name, .. } => {
+            // A44-10 (D+I schema): prefix is "" — just use the flat column name.
             format!("c.\"{}{}\"", prefix, column_name.replace('"', "\"\""))
         }
         Expr::Literal(val) => val.clone(),
@@ -1051,16 +972,18 @@ mod tests {
 
     #[test]
     fn test_diff_scan_typed_column_refs() {
+        // A44-10 (D+I schema): flat column refs, no new_/old_ prefix
         let mut ctx = test_ctx();
         let tree = scan(100, "orders", "public", "o", &["id", "amount"]);
         let result = diff_scan(&mut ctx, &tree).unwrap();
         let sql = ctx.build_with_query(&result.cte_name);
 
-        // Should reference typed columns
-        assert_sql_contains(&sql, "c.\"new_id\"");
-        assert_sql_contains(&sql, "c.\"old_id\"");
-        assert_sql_contains(&sql, "c.\"new_amount\"");
-        assert_sql_contains(&sql, "c.\"old_amount\"");
+        // Should reference flat typed columns
+        assert_sql_contains(&sql, "c.\"id\"");
+        assert_sql_contains(&sql, "c.\"amount\"");
+        // No new_/old_ prefixed columns
+        assert_sql_not_contains(&sql, "c.\"new_id\"");
+        assert_sql_not_contains(&sql, "c.\"old_id\"");
     }
 
     #[test]
@@ -1348,17 +1271,23 @@ mod tests {
 
     #[test]
     fn test_diff_scan_keyless_decomposes_updates() {
+        // A44-10 (D+I schema): UPDATEs are pre-decomposed at write time.
+        // The keyless scan path should NOT contain c.action = 'U' branches.
         let mut ctx = test_ctx();
         let tree = scan(100, "orders", "public", "o", &["id", "amount"]);
         let result = diff_scan(&mut ctx, &tree).unwrap();
         let sql = ctx.build_with_query(&result.cte_name);
 
-        // Should handle UPDATE events by decomposing into +1 and -1
-        assert_sql_contains(&sql, "c.action = 'U'");
-        // Should have separate branches for UPDATE INSERT side and DELETE side
-        // The DELETE side uses old_* columns to compute the content hash
-        assert_sql_contains(&sql, "old_id");
-        assert_sql_contains(&sql, "old_amount");
+        // D+I schema: no action='U' branches
+        assert_sql_not_contains(&sql, "c.action = 'U'");
+        // Should have INSERT and DELETE branches only
+        assert_sql_contains(&sql, "c.action = 'I'");
+        assert_sql_contains(&sql, "c.action = 'D'");
+        // Flat column references (no old_/new_ prefix)
+        assert_sql_contains(&sql, "c.\"id\"");
+        assert_sql_contains(&sql, "c.\"amount\"");
+        assert_sql_not_contains(&sql, "old_id");
+        assert_sql_not_contains(&sql, "old_amount");
     }
 
     #[test]
@@ -1631,8 +1560,7 @@ mod tests {
 
     #[test]
     fn test_p2_7_pushed_filter_in_sql() {
-        // When a predicate is pushed, the scan CTE should contain
-        // old_/new_ column filters.
+        // A44-10 (D+I schema): pushed filter uses flat c."col" (no old_/new_ prefix)
         let mut ctx = test_ctx();
         ctx.scan_pushed_predicate = Some(Expr::BinaryOp {
             op: "=".into(),
@@ -1646,10 +1574,11 @@ mod tests {
         let result = diff_scan(&mut ctx, &tree).unwrap();
         let sql = ctx.build_with_query(&result.cte_name);
 
-        // DELETE branch should filter on old_status
-        assert_sql_contains(&sql, "c.\"old_status\" = 'shipped'");
-        // INSERT branch should filter on new_status
-        assert_sql_contains(&sql, "c.\"new_status\" = 'shipped'");
+        // Both DELETE and INSERT branches use flat c."status"
+        assert_sql_contains(&sql, "c.\"status\" = 'shipped'");
+        // No old_/new_ prefixed column refs
+        assert_sql_not_contains(&sql, "c.\"old_status\"");
+        assert_sql_not_contains(&sql, "c.\"new_status\"");
     }
 
     #[test]
