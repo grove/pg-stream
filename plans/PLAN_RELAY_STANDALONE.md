@@ -4,6 +4,14 @@
 **Status:** Draft for discussion (revised after option-A vs option-C re-analysis)
 **Related:** [REPORT_SUPERFLOUS_FEATURES.md §7.2](REPORT_SUPERFLOUS_FEATURES.md)
 
+> **Reader's note (1 May 2026, revision 4):** the relay binary, outbox, and
+> inbox features have no known users yet — no bug reports, no support
+> threads, no production deployments we are aware of. This means the
+> extraction can be done as a **clean break**: no deprecation shims, no
+> backwards-compatible SQL surface, no migration tooling. The plan below has
+> been simplified accordingly. Effort drops from ~2 weeks to **~1 week** and
+> the "Two-extension install becomes a friction point" risk class disappears.
+>
 > **Reader's note (1 May 2026, revision 3):** the original draft below recommended
 > option B with a "soft dependency" framing. On closer inspection that framing
 > oversold the reuse story — the *outbox row envelope* this repo emits is a
@@ -34,6 +42,12 @@ catalog, and the relay binary. `pg_trickle` becomes a *consumer* of it: a thin
 `tide.outbox_publish()` from inside the refresh transaction. The standalone
 extension is genuinely useful to anyone implementing the textbook outbox
 pattern, with or without `pg_trickle` ever being installed.
+
+**Effort: ~1 week** as a clean break (no shims, no migration tooling) since
+the relay/outbox/inbox features have no known users today. Send a one-line
+"is anyone using these?" check to the discussions board before merging — if
+real users surface, the migration plan from revision 3 gets restored and the
+estimate goes back to ~2 weeks.
 
 The original three options (A, B, the no-op C) and the inventory of today's
 coupling surface are kept below as the reference material that informs the new
@@ -637,8 +651,8 @@ people would actually install for its own sake.
 |---|---|---|---|---|
 | Standalone usefulness without `pg_trickle` | None | Marginal (relay needs an outbox to poll) | None | **High — full outbox/inbox primitive** |
 | Core LOC removed from this repo | ~3,650 Rust | ~3,890 (3,650 + 240 SQL) | ~6,150 (3,890 + 2,260) | **~6,150 + ~2,500 SQL** |
-| `pg_trickle` API churn | Zero | One SQL function rename | `enable_outbox` → wrapper | `enable_outbox` → `attach_outbox` wrapper |
-| Effort | 1 day | 3–5 days | ~1 week + ADR | **~2 weeks** |
+| `pg_trickle` API churn | Zero | One SQL function rename | `enable_outbox` → wrapper | `enable_outbox` → `attach_outbox` (clean break, no users) |
+| Effort | 1 day | 3–5 days | ~1 week + ADR | **~1 week** (revised down: no users to migrate) |
 | Refresh hot-path risk | None | None | Medium (new hook API) | Low (SPI call inside same txn — no new abstraction) |
 | Justifies the term "standalone extension" | No | Barely | No | **Yes** |
 | Useful to users who don't know what IVM is | No | No | No | **Yes** |
@@ -647,34 +661,37 @@ people would actually install for its own sake.
 
 | Risk | Likelihood | Impact | Mitigation |
 |---|---|---|---|
-| Two-extension install becomes a friction point for `pg_trickle` users | Medium | Medium | Ship an `pg_trickle_outbox_compat` SQL package that re-creates the old `pgtrickle.enable_outbox(...)` signatures as `attach_outbox(...)` shims. Keep one release of deprecation overlap. |
-| The SPI round-trip from `write_outbox_row` shows up in benchmarks | Low | Low | Cache the prepared `outbox.publish` plan; benchmark before/after on the existing `e2e_bench_refresh_matrix`. |
+| The SPI round-trip from `write_outbox_row` shows up in benchmarks | Low | Low | Cache the prepared `tide.outbox_publish` plan; benchmark before/after on the existing `e2e_bench_refresh_matrix`. |
 | Generic outbox table shape diverges from `pg_trickle`'s envelope needs | Low | Medium | `pg_tide`'s outbox row already has `payload JSONB` + `headers JSONB`; `pg_trickle` puts its `v:1` envelope inside `payload`. No schema collision. |
 | Inbox helper views (pending/DLQ/stats) lose IVM acceleration by default | Medium | Low | They're plain VIEWs in `pg_tide`; `pg_trickle.materialize_inbox_views()` is a one-liner upgrade for users who want incremental maintenance. |
 | Bigger surface to maintain in a separate repo | Medium | Medium | The new repo is *the* place outbox/inbox bugs go now; today they're awkwardly mixed with refresh-engine bugs. Net cognitive load is probably lower. |
 | Project name `pg_tide` is metaphorical, not literal | Low | Low | Continues the established water-motion lineage (`pg_trickle`, `pg_ripple`); the metaphor honestly covers both directions (tides go in *and* out) where `pg_outbox` would have undersold the inbox half. README leads with "transactional outbox + inbox + multi-backend relay for PostgreSQL" so SEO works. |
-| ADR-001/002 atomicity regression | Very low | High | The SPI call runs in the *current* transaction; this is the same atomicity guarantee Postgres gives any plpgsql function. Add a regression test that crashes the session between `outbox.publish()` and `COMMIT` and asserts both the refresh MERGE and the outbox row are absent after recovery. |
+| ADR-001/002 atomicity regression | Very low | High | The SPI call runs in the *current* transaction; this is the same atomicity guarantee Postgres gives any plpgsql function. Add a regression test that crashes the session between `tide.outbox_publish()` and `COMMIT` and asserts both the refresh MERGE and the outbox row are absent after recovery. |
 
-### 7.7 Migration path for existing `pg_trickle` outbox/inbox users
+*Dropped from this risk register (revision 4):* "Two-extension install becomes
+a friction point for `pg_trickle` users." The relay/outbox/inbox features have
+no known users today, so there is no friction to mitigate — the new layout
+is simply the only layout these features have ever had.
 
-A single SQL migration shipped with the new release:
+### 7.7 No migration path required
 
-```sql
--- Run once, after installing pg_tide and upgrading pg_trickle.
-CREATE EXTENSION pg_tide;
-SELECT pgtrickle.migrate_outboxes_to_pg_tide();
--- ↑ for each row in pgtrickle.pgt_outbox_config:
---   1. CREATE the equivalent outbox via tide.outbox_create()
---   2. Copy historical rows from pgtrickle.outbox_<st> into tide.<st>
---   3. Re-attach pg_trickle's refresh hook via attach_outbox()
---   4. Drop the old pgtrickle.outbox_<st> table
-SELECT pgtrickle.migrate_inboxes_to_pg_tide();
--- Same pattern for inboxes.
-```
+Revision 4 removes the migration section that previously lived here. The
+rationale: the outbox/inbox/relay features have no known users — no bug
+reports, no support threads, no production deployments. A clean break is
+cheaper, safer, and clearer than backwards-compatible shims:
 
-Old `pgtrickle.enable_outbox(...)` / `pgtrickle.create_inbox(...)` remain as
-deprecation shims for one release that internally call the new `attach_outbox`
-/ `tide.inbox_create` paths and emit a `WARNING`.
+- **No migration SQL.** No need for `pgtrickle.migrate_outboxes_to_pg_tide()`
+  or its inbox counterpart.
+- **No deprecation shims.** `pgtrickle.enable_outbox(...)` /
+  `pgtrickle.create_inbox(...)` are simply *removed* in the same release that
+  introduces `pg_trickle.attach_outbox(...)`. The CHANGELOG entry calls out
+  the rename as a breaking change, with a one-line equivalence table for
+  anyone who picks the feature up later.
+- **No two-release overlap window.** Single release, single coherent surface.
+
+If user reports surface between now and the cut, this section gets restored
+with a real migration plan. Until then, treat outbox/inbox/relay as
+undocumented internal API that gets restructured before 1.0.
 
 ### 7.8 Why this is worth doing despite being the largest option
 
@@ -708,19 +725,21 @@ deprecation shims for one release that internally call the new `attach_outbox`
    [src/lib.rs](../src/lib.rs#L1095-L1335) into `pg_tide`'s extension
    crate. Lift `pgtrickle-relay/` into the new repo as the `pg-tide`
    binary.
-3. **Day 4** — In this repo, replace `enable_outbox()` /
-   `create_inbox()` with thin `attach_outbox()` / `attach_inbox()` wrappers
-   that delegate to `pg_tide`. Add the deprecation shims. Implement
-   `pg_trickle.materialize_inbox_views()` for the optional IVM upgrade.
-4. **Days 5–6** — Migration SQL; integration tests that exercise both
-   "with `pg_trickle`" and "without `pg_trickle`" deployments; benchmark
-   the SPI hop on the refresh hot path.
-5. **Day 7** — Documentation: cross-link the two repos; rewrite
-   docs/SQL_REFERENCE.md outbox/inbox sections to point at `pg_tide`;
-   pre-release tags on both repos.
+3. **Day 4** — In this repo, *delete* `enable_outbox()` / `create_inbox()`
+   and the relay catalog SQL outright (no shims — see §7.7). Add the new
+   thin `attach_outbox()` / `attach_inbox()` wrappers that delegate to
+   `pg_tide`. Implement `pg_trickle.materialize_inbox_views()` for the
+   optional IVM upgrade.
+4. **Day 5** — Integration tests that exercise both "with `pg_trickle`"
+   and "without `pg_trickle`" deployments; benchmark the SPI hop on the
+   refresh hot path. Documentation: cross-link the two repos; rewrite
+   docs/SQL_REFERENCE.md outbox/inbox sections to point at `pg_tide`.
+   CHANGELOG entry calls out the rename as a breaking change with a
+   one-line equivalence table. Pre-release tags on both repos.
 
-Roughly **two weeks** end to end, but the result is two cleanly-scoped
-products instead of one entangled one.
+Roughly **one week** end to end — down from the original two-week estimate
+because the migration tooling and deprecation shim work disappear (see §7.7).
+The result is two cleanly-scoped products instead of one entangled one.
 
 ### 7.10 Open questions specific to option C
 
@@ -729,17 +748,22 @@ products instead of one entangled one.
 2. **Repo home.** Same `grove/` org, or somewhere more neutral if the
    intent is to attract contributors who don't think of it as a
    `pg_trickle` accessory?
-3. **Backwards-compatible shims.** How many releases do we keep
-   `pgtrickle.enable_outbox(...)` etc. before removing them? One release
-   feels right for a pre-1.0 codebase; if anyone's running the outbox in
-   production, two releases is safer.
-4. **Schema layout.** Single `tide` schema (with `outbox_*` / `inbox_*` /
+3. **Schema layout.** Single `tide` schema (with `outbox_*` / `inbox_*` /
    `relay_*` function prefixes), or three sibling schemas (`tide_outbox`,
    `tide_inbox`, `tide_relay`)? The plan currently assumes the single
    schema for ergonomics, but the three-schema layout would let users
    `SET search_path = tide_outbox, public` and drop the prefix.
-5. **Naming the lineage.** Should the README explicitly call out the
+4. **Naming the lineage.** Should the README explicitly call out the
    `pg_trickle` / `pg_ripple` / `pg_tide` family? Helps with
    recognisability if multiple extensions are deployed together; risks
    tying `pg_tide`'s identity to `pg_trickle` more tightly than option C
    intends.
+5. **User check before the cut.** Before merging the breaking change,
+   send a one-line announcement to the `pg_trickle` discussions / issue
+   tracker asking "is anyone using `enable_outbox()` /
+   `enable_inbox()` / the relay binary today?" If the answer is
+   non-empty, revision 4's no-shims simplification has to be reverted in
+   favour of the original migration plan from revision 3.
+
+*Dropped from this list (revision 4):* the backwards-compatibility window
+question. With no known users, there is nothing to be compatible with.
