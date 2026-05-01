@@ -661,7 +661,7 @@ people would actually install for its own sake.
 | Standalone usefulness without `pg_trickle` | None | Marginal (relay needs an outbox to poll) | None | **High — full outbox/inbox primitive** |
 | Core LOC removed from this repo | ~3,650 Rust | ~3,890 (3,650 + 240 SQL) | ~6,150 (3,890 + 2,260) | **~6,150 + ~2,500 SQL** |
 | `pg_trickle` API churn | Zero | One SQL function rename | `enable_outbox` → wrapper | `enable_outbox` → `attach_outbox` (clean break, no users) |
-| Effort | 1 day | 3–5 days | ~1 week + ADR | **~1 week** to extract; in-flight relay roadmap (§7.10) is months on top either way |
+| Effort | 1 day | 3–5 days | ~1 week + ADR | **~1 week** to extract; ancillary assets (§7.10) push to ~6 days; in-flight relay roadmap (§7.11) is months on top either way |
 | Refresh hot-path risk | None | None | Medium (new hook API) | Low (SPI call inside same txn — no new abstraction) |
 | Justifies the term "standalone extension" | No | Barely | No | **Yes** |
 | Useful to users who don't know what IVM is | No | No | No | **Yes** |
@@ -747,11 +747,159 @@ undocumented internal API that gets restructured before 1.0.
    CHANGELOG entry calls out the rename as a breaking change with a
    one-line equivalence table. Pre-release tags on both repos.
 
-Roughly **one week** end to end — down from the original two-week estimate
-because the migration tooling and deprecation shim work disappear (see §7.7).
-The result is two cleanly-scoped products instead of one entangled one.
+### 7.10 Ancillary assets that need to move, be rewritten, or be deleted
 
-### 7.10 In-flight relay roadmap that travels with the cut
+The plan so far focuses on Rust source, SQL DDL, and design docs. There
+is a long tail of *other* assets in this repo that also reference the
+relay/outbox/inbox surface and need explicit handling. Reviewers should
+not assume any of these "just work" after the cut.
+
+#### User-facing documentation (move to `pg-tide` repo, rewrite to drop `pg_trickle` framing)
+
+| Asset | Today's framing | Action |
+|---|---|---|
+| [docs/OUTBOX.md](docs/OUTBOX.md) | "pg_trickle outbox pattern" | Move to `pg-tide/docs/OUTBOX.md`; rewrite to lead with the generic outbox pattern. Add an "If you're using `pg_trickle`" appendix linking to `attach_outbox()`. |
+| [docs/INBOX.md](docs/INBOX.md) | "pg_trickle inbox pattern" | Move to `pg-tide/docs/INBOX.md`; rewrite as above (no `pg_trickle` integration appendix needed — the inbox has no integration point per §7.2). |
+| [docs/RELAY.md](docs/RELAY.md) | Architecture deep-dive | Move to `pg-tide/docs/RELAY.md`; rebrand `pgtrickle-relay` → `pg-tide`. |
+| [docs/RELAY_GUIDE.md](docs/RELAY_GUIDE.md) | Operator guide | Move + rebrand. |
+| Sections of [docs/SQL_REFERENCE.md](docs/SQL_REFERENCE.md), [docs/SQL_API_CATALOG.md](docs/SQL_API_CATALOG.md), [docs/CONFIGURATION.md](docs/CONFIGURATION.md), [docs/GUC_CATALOG.md](docs/GUC_CATALOG.md), [docs/SECURITY_GUIDE.md](docs/SECURITY_GUIDE.md), [docs/SECURITY_MODEL.md](docs/SECURITY_MODEL.md), [docs/USE_CASES.md](docs/USE_CASES.md), [docs/PATTERNS.md](docs/PATTERNS.md) | Mention outbox/inbox/relay alongside other features | In `pg_trickle` repo: trim outbox/inbox/relay sections to a one-paragraph "see [pg-tide](https://…)" pointer. |
+| [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md), [docs/GLOSSARY.md](docs/GLOSSARY.md) | Reference outbox/inbox tables in architectural diagrams | Trim or annotate; keep the conceptual mention but mark them as `pg_tide`-provided. |
+| [docs/WHATS_NEW.md](docs/WHATS_NEW.md), [docs/UPGRADING.md](docs/UPGRADING.md) | History of v0.28/v0.29 features | Add a 1.0 entry: "outbox/inbox/relay extracted to `pg-tide`; see migration note." |
+
+#### Roadmap entries (rewrite or relocate)
+
+| Asset | Action |
+|---|---|
+| [roadmap/v0.28.0.md](roadmap/v0.28.0.md), [roadmap/v0.28.0.md-full.md](roadmap/v0.28.0.md-full.md) | Already-released history. Add a footnote: "Superseded in 1.0 by `pg_tide`." |
+| [roadmap/v0.29.0.md](roadmap/v0.29.0.md), [roadmap/v0.29.0.md-full.md](roadmap/v0.29.0.md-full.md) | Same footnote. |
+| [ROADMAP.md](ROADMAP.md) line ~130 ("v0.28–29 ─── Reliable event messaging…"), line 200 (test coverage), line 223 (embedding outbox) | Annotate each line: outbox/inbox/relay history now lives at `pg-tide`. The v0.47.0 "embedding outbox" item (line 100) needs a decision: stays in `pg_trickle` as a `pg_tide.attach_outbox()` consumer, or moves to `pg-tide`? Recommend keeping in `pg_trickle` since it's an embedding-pipeline feature that *uses* the outbox primitive. |
+
+#### Blog posts (move to `pg-tide` repo's blog)
+
+The four most directly relay/outbox/inbox-centric posts move:
+
+- [blog/built-in-outbox.md](blog/built-in-outbox.md)
+- [blog/outbox-pattern-turbocharged.md](blog/outbox-pattern-turbocharged.md)
+- [blog/inbox-pattern-kafka.md](blog/inbox-pattern-kafka.md)
+- [blog/relay-deep-dive.md](blog/relay-deep-dive.md)
+
+Other blog posts mention outbox/inbox tangentially
+([blog/self-monitoring.md](blog/self-monitoring.md),
+[blog/cqrs-without-second-database.md](blog/cqrs-without-second-database.md))
+— update those in place to phrase the integration as "use `pg_tide` for
+the outbox plumbing."
+
+#### Tests (relocate)
+
+- [tests/e2e_outbox_tests.rs](tests/e2e_outbox_tests.rs) — move to `pg-tide/tests/`
+- [tests/e2e_inbox_tests.rs](tests/e2e_inbox_tests.rs) — move to `pg-tide/tests/`
+- Any other `tests/*.rs` that exercises `enable_outbox` / `create_inbox`
+  needs to be rewritten as a *consumer* test calling
+  `pg_trickle.attach_outbox()` — these become the regression coverage
+  for the SPI bridge introduced in §7.3.
+- `pgtrickle-relay/tests/` and `pgtrickle-relay/src/**/tests/` — move
+  with the relay crate.
+
+#### SQL upgrade scripts (the messy part)
+
+The relevant upgrade files are:
+
+- [sql/pg_trickle--0.27.0--0.28.0.sql](sql/pg_trickle--0.27.0--0.28.0.sql)
+  (introduces outbox/inbox tables)
+- [sql/pg_trickle--0.28.0--0.29.0.sql](sql/pg_trickle--0.28.0--0.29.0.sql)
+  (introduces relay catalog)
+- [sql/pg_trickle--0.38.0--0.39.0.sql](sql/pg_trickle--0.38.0--0.39.0.sql)
+  and [sql/pg_trickle--0.39.0--0.40.0.sql](sql/pg_trickle--0.39.0--0.40.0.sql)
+  (subsequent inbox/relay refinements)
+
+These are *historical* upgrade scripts — they cannot be deleted, because
+existing installs upgrading from 0.27 → 1.0 will still run them as part
+of the chain. The 1.0 upgrade script (`pg_trickle--0.42.0--1.0.0.sql`)
+is the one that *removes* the old objects:
+
+```sql
+-- pg_trickle 0.42.0 → 1.0.0
+DROP TABLE IF EXISTS pgtrickle.relay_outbox_config CASCADE;
+DROP TABLE IF EXISTS pgtrickle.relay_inbox_config CASCADE;
+DROP TABLE IF EXISTS pgtrickle.relay_consumer_offsets CASCADE;
+DROP FUNCTION IF EXISTS pgtrickle.set_relay_outbox(text, jsonb);
+-- … etc. (all 7 helper functions + relay_config_notify trigger)
+DROP ROLE IF EXISTS pgtrickle_relay;
+DROP FUNCTION IF EXISTS pgtrickle.enable_outbox(text);
+DROP FUNCTION IF EXISTS pgtrickle.disable_outbox(text);
+DROP FUNCTION IF EXISTS pgtrickle.outbox_status(text);
+DROP FUNCTION IF EXISTS pgtrickle.outbox_rows_consumed(text, bigint);
+DROP FUNCTION IF EXISTS pgtrickle.create_inbox(text, integer, boolean, boolean, integer);
+-- … etc.
+-- Outbox/inbox base tables (pgtrickle.outbox_<st>, pgtrickle.inbox_<…>) are
+-- left as-is — they hold user data. Document that users must DROP them
+-- manually after re-creating in the tide schema if migrating data.
+```
+
+This is invasive — `DROP TABLE … CASCADE` on the outbox base tables
+would lose data, so the 1.0 upgrade script *does not* drop those. The
+CHANGELOG must explicitly tell anyone who has put data into the relay
+catalog that 1.0 will erase their pipeline configuration. Per §7.7,
+this is acceptable because there are no known users.
+
+#### Build / CI / packaging artefacts to delete from this repo
+
+- [Dockerfile.relay](Dockerfile.relay) — delete
+- Lines 474–580 of [.github/workflows/release.yml](.github/workflows/release.yml)
+  — delete the four relay publish jobs and the `RELAY_IMAGE_NAME` env var
+- Lines 52–82 of [.github/workflows/security.yml](.github/workflows/security.yml)
+  — drop the `aws-smithy-http-client` exception (only existed for the
+  relay's optional SQS feature)
+- [tests/Dockerfile.e2e](tests/Dockerfile.e2e) lines 36–48 — drop relay
+  placeholder
+- [Cargo.toml](Cargo.toml): drop `pgtrickle-relay` from the workspace
+  `members` list
+- [deny.toml](deny.toml) lines 44–45 — drop the SQS-feature license
+  exception (now lives in `pg-tide`)
+- [README.md](README.md) lines 526, 556–558 — trim outbox/inbox/relay
+  rows from the docs index, replace with a single "Event messaging:
+  see [pg-tide](https://…)" line
+- [META.json](META.json) — review and drop relay-related description
+  text if any (the outbox-poller backend specifically)
+
+#### Demo / playground / monitoring (update in place)
+
+- [demo/](demo/) — currently shows `pg_trickle` end-to-end including
+  outbox publishing. Update `docker-compose.yml` to add a `pg-tide`
+  service and pull the relay binary from its new image. The demo's
+  point is "see them work together," so keeping it cross-extension is
+  the right move.
+- [monitoring/](monitoring/) — update Prometheus scrape config to add
+  the `pg-tide` relay endpoint alongside `pg_trickle`'s; carry over the
+  Grafana panels that visualise outbox lag.
+- [examples/](examples/) — none of the visible examples
+  (`dbt_getting_started`, `non-differential.sql`) reference the outbox,
+  so probably nothing to do here. Sanity-check during the cut.
+- [cnpg/](cnpg/) — the CloudNativePG manifests don't reference the
+  relay today (verified — empty grep). They will need a separate
+  `pg-tide` manifest set in the new repo, but the existing manifests
+  in this repo stay clean.
+
+#### What this means for the §7.9 work plan
+
+Day 5 ("docs pass") is doing a lot of heavy lifting under the surface.
+A more honest decomposition:
+
+- **Day 4** stays focused on code: delete moved code, add `attach_outbox()`,
+  write the 1.0 upgrade script.
+- **Day 5** splits into two:
+  - **Day 5a** — Move the four blog posts and four user-facing docs
+    files (OUTBOX.md, INBOX.md, RELAY.md, RELAY_GUIDE.md). Update
+    cross-references in the SQL_REFERENCE / ARCHITECTURE / WHATS_NEW
+    cluster (~12 docs total). Roadmap footnotes.
+  - **Day 5b** — CI / packaging cleanup (Dockerfiles, workflows,
+    deny.toml, Cargo.toml, README index). Verify both repos build
+    clean. Cut pre-release tags.
+
+This pushes the realistic estimate to **~6 working days** rather than 5,
+but it's still well under the original two-week estimate.
+
+### 7.11 In-flight relay roadmap that travels with the cut
 
 The relay is **not** feature-complete today. There is a non-trivial
 roadmap of planned work that lives in [plans/relay/](plans/relay/) and
@@ -791,7 +939,7 @@ This is fine — the *outbox/inbox primitive* alone has independent value
 audience comes online with relay 0.31+ rather than at the moment of
 extraction.
 
-### 7.11 Open questions specific to option C
+### 7.12 Open questions specific to option C
 
 1. **License.** `pg_trickle` is Apache-2.0; `pg_tide` should match so
    the integration story is frictionless.
