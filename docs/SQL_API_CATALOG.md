@@ -4,7 +4,7 @@
 
 # SQL API Reference — pg_trickle
 
-**98 SQL-callable functions** discovered via `#[pg_extern]` in `src/`.
+**99 SQL-callable functions** discovered via `#[pg_extern]` in `src/`.
 
 See [docs/SQL_REFERENCE.md](SQL_REFERENCE.md) for full signatures and examples.
 
@@ -103,6 +103,7 @@ See [docs/SQL_REFERENCE.md](SQL_REFERENCE.md) for full signatures and examples.
 | `pgtrickle.version()` | `pgtrickle` | `&'static str` |  |
 | `pgtrickle.version_check()` | `pgtrickle` | `String` | Returns a JSON string with library_version, extension_version, pg_version, and a boolean `version_match`. |
 | `pgtrickle.view_evolution_status()` | `pgtrickle` | `TableIterator<` | During a zero-downtime schema evolution (ALTER STREAM TABLE), pg_trickle builds the new definition in a shadow table. |
+| `pgtrickle.wal_source_status()` | `pgtrickle` | `TableIterator<` | Exposed as `pgtrickle.wal_source_status()`. |
 | `pgtrickle.watermark_groups_fn()` | `pgtrickle` | `TableIterator<` | Return all watermark group definitions. |
 | `pgtrickle.watermark_status_fn()` | `pgtrickle` | `TableIterator<` | Shows per-group lag, whether the group is currently aligned, and the effective minimum watermark. |
 | `pgtrickle.watermarks_fn()` | `pgtrickle` | `TableIterator<` | Return the current watermark state for all registered sources. |
