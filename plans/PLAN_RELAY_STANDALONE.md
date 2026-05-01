@@ -507,8 +507,12 @@ layers that are bundled together today:
 - The `v: 1` envelope tag and `full_refresh` flag in the JSON payload.
 - The auto-creation of `<inbox>_pending` / `<inbox>_dlq` / `<inbox>_stats`
   as **stream tables** ([src/api/inbox.rs](../src/api/inbox.rs#L244)) — the
-  *only* genuine `pg_trickle` dependency on the inbox side. These could just
-  as well be plain `VIEW`s.
+  *only* genuine `pg_trickle` dependency on the inbox side. In `pg_tide`
+  these become plain `VIEW`s; the working sets are bounded by definition
+  (`processed_at IS NULL`, `retry_count >= max_retries`) and queried by
+  humans/dashboards rather than tight loops, so IVM materialisation buys
+  nothing here. See §7.2 for why no `materialize_inbox_views()` hook is
+  exposed.
 
 ### 7.2 The proposed standalone extension: `pg_tide`
 
@@ -577,19 +581,24 @@ SELECT tide.relay_set_inbox ('nats-to-orders', ...);
 SELECT tide.relay_enable    ('orders-to-nats');
 ```
 
-The inbox helper views are **plain views** by default. If `pg_trickle` is
-installed in the same database, the user can opt in to incremental
-materialisation:
+The inbox helper views are **plain views**, full stop. Earlier drafts of
+this plan proposed a `pg_trickle.materialize_inbox_views()` hook that would
+swap them for stream tables; that idea has been dropped. The three views
+(`_pending`, `_dlq`, `_stats`) are queried by humans triaging failures and
+by dashboards on 10–60s refresh, never on a hot path. Their working sets
+are already bounded — `_pending` *is* the backlog, `_dlq` is naturally
+tiny, and `_stats` is a low-cardinality `GROUP BY` over an indexed
+column. Materialising them with CDC triggers would add per-INSERT overhead
+on the inbox hot path to accelerate queries that don't need it. If a user
+ever finds a real workload that needs IVM over inbox data, the inbox base
+table is a regular Postgres table and they can build a `pg_trickle` stream
+table over it themselves — no special API needed.
 
-```sql
-SELECT pg_trickle.materialize_inbox_views('orders_inbox', schedule => '1s');
--- ↑ replaces the views with stream tables. Optional, additive, lazy.
-```
-
-This is the key insight: **`pg_tide` works fully without `pg_trickle`,
-and `pg_trickle` enhances it when present.** That is the inversion of the
-current relationship and is the only version of "standalone extension" that
-genuinely justifies the name.
+So the relationship is simpler than earlier drafts suggested: **`pg_tide`
+works fully without `pg_trickle`, and `pg_trickle`'s only integration is
+`attach_outbox()` on the producer side** (§7.3). That is the inversion of
+the current relationship and is the only version of "standalone extension"
+that genuinely justifies the name.
 
 ### 7.3 What `pg_trickle` looks like after the cut
 
@@ -663,7 +672,6 @@ people would actually install for its own sake.
 |---|---|---|---|
 | The SPI round-trip from `write_outbox_row` shows up in benchmarks | Low | Low | Cache the prepared `tide.outbox_publish` plan; benchmark before/after on the existing `e2e_bench_refresh_matrix`. |
 | Generic outbox table shape diverges from `pg_trickle`'s envelope needs | Low | Medium | `pg_tide`'s outbox row already has `payload JSONB` + `headers JSONB`; `pg_trickle` puts its `v:1` envelope inside `payload`. No schema collision. |
-| Inbox helper views (pending/DLQ/stats) lose IVM acceleration by default | Medium | Low | They're plain VIEWs in `pg_tide`; `pg_trickle.materialize_inbox_views()` is a one-liner upgrade for users who want incremental maintenance. |
 | Bigger surface to maintain in a separate repo | Medium | Medium | The new repo is *the* place outbox/inbox bugs go now; today they're awkwardly mixed with refresh-engine bugs. Net cognitive load is probably lower. |
 | Project name `pg_tide` is metaphorical, not literal | Low | Low | Continues the established water-motion lineage (`pg_trickle`, `pg_ripple`); the metaphor honestly covers both directions (tides go in *and* out) where `pg_outbox` would have undersold the inbox half. README leads with "transactional outbox + inbox + multi-backend relay for PostgreSQL" so SEO works. |
 | ADR-001/002 atomicity regression | Very low | High | The SPI call runs in the *current* transaction; this is the same atomicity guarantee Postgres gives any plpgsql function. Add a regression test that crashes the session between `tide.outbox_publish()` and `COMMIT` and asserts both the refresh MERGE and the outbox row are absent after recovery. |
@@ -727,9 +735,11 @@ undocumented internal API that gets restructured before 1.0.
    binary.
 3. **Day 4** — In this repo, *delete* `enable_outbox()` / `create_inbox()`
    and the relay catalog SQL outright (no shims — see §7.7). Add the new
-   thin `attach_outbox()` / `attach_inbox()` wrappers that delegate to
-   `pg_tide`. Implement `pg_trickle.materialize_inbox_views()` for the
-   optional IVM upgrade.
+   thin `attach_outbox()` wrapper that delegates to `pg_tide` (refresh-time
+   publisher; this is the *only* integration point — see §7.2). No
+   `attach_inbox()` or `materialize_inbox_views()` is needed: inbox helper
+   views stay as plain VIEWs in `pg_tide` and `pg_trickle` does not wrap
+   the inbox API at all.
 4. **Day 5** — Integration tests that exercise both "with `pg_trickle`"
    and "without `pg_trickle`" deployments; benchmark the SPI hop on the
    refresh hot path. Documentation: cross-link the two repos; rewrite
