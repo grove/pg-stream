@@ -626,15 +626,16 @@ fn build_inner_change_branch(
                 )
             } else {
                 // Scoped: join change buffer on correlation column(s).
-                // Match on both new_<col> (for I/U) and old_<col> (for D/U).
+                // D+I flat schema (A44-10): each row carries the relevant
+                // value in the flat column — old value for D-rows, new value
+                // for I-rows. A single equality predicate covers both.
                 let corr_conditions: Vec<String> = corr_preds
                     .iter()
                     .map(|p| {
                         let outer_ref =
                             format!("{}.{}", quote_ident(outer_alias), quote_ident(&p.outer_col));
-                        let new_col = quote_ident(&format!("new_{}", p.inner_col));
-                        let old_col = quote_ident(&format!("old_{}", p.inner_col));
-                        format!("(c.{new_col} = {outer_ref} OR c.{old_col} = {outer_ref})")
+                        let col = quote_ident(&p.inner_col);
+                        format!("c.{col} = {outer_ref}")
                     })
                     .collect();
                 let corr_filter = corr_conditions.join(" AND ");
@@ -1093,9 +1094,16 @@ mod tests {
         let result = diff_lateral_subquery(&mut ctx, &tree).unwrap();
         let sql = ctx.build_with_query(&result.cte_name);
 
-        // Scoped EXISTS should reference the correlation columns
-        assert_sql_contains(&sql, "\"new_order_id\"");
-        assert_sql_contains(&sql, "\"old_order_id\"");
+        // Scoped EXISTS should reference the flat correlation column (D+I schema, A44-10)
+        assert_sql_contains(&sql, "\"order_id\"");
+        assert!(
+            !sql.contains("\"new_order_id\""),
+            "must not use new_order_id (old schema)"
+        );
+        assert!(
+            !sql.contains("\"old_order_id\""),
+            "must not use old_order_id (old schema)"
+        );
         // Should still have the full CTE chain
         assert_sql_contains(&sql, "lat_sq_changed");
         assert_sql_contains(&sql, "lat_sq_final");
@@ -1150,7 +1158,19 @@ mod tests {
         // The only place LIMIT could appear is in the subquery SQL itself
         let inner_branch = sql.split("lat_sq_changed").nth(1).unwrap_or("");
         // The inner-change EXISTS should use correlation, not LIMIT 1
-        assert!(inner_branch.contains("\"new_fk\"") || inner_branch.contains("\"old_fk\""));
+        // D+I flat schema: flat column "fk" is used, not "new_fk"/"old_fk"
+        assert!(
+            inner_branch.contains("\"fk\""),
+            "must reference flat column \"fk\""
+        );
+        assert!(
+            !inner_branch.contains("\"new_fk\""),
+            "must not use new_fk (old schema)"
+        );
+        assert!(
+            !inner_branch.contains("\"old_fk\""),
+            "must not use old_fk (old schema)"
+        );
     }
 
     // ── SF-8: Inner-change dummy row_id sentinel ────────────────────

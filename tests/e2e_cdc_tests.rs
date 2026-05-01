@@ -172,18 +172,23 @@ async fn test_trigger_captures_update() {
             buffer_table
         ))
         .await;
-    assert_eq!(action, "U", "Action should be 'U' for UPDATE");
+    // A44-10 D+I schema: UPDATE decomposes into D-row then I-row (no 'U').
+    // ORDER BY change_id DESC LIMIT 1 returns the last (I) row.
+    assert_eq!(
+        action, "I",
+        "Action should be 'I' for the I-row of a decomposed UPDATE"
+    );
 
-    // Verify typed column captures the new value
-    let new_val: String = db
+    // Verify flat column captures the new value (I-row carries NEW values).
+    let val: String = db
         .query_scalar(&format!(
-            "SELECT \"new_val\" FROM {} ORDER BY change_id DESC LIMIT 1",
+            "SELECT \"val\" FROM {} ORDER BY change_id DESC LIMIT 1",
             buffer_table
         ))
         .await;
     assert_eq!(
-        new_val, "new_val",
-        "new_val typed column should contain the new value"
+        val, "new_val",
+        "val column should contain the new value in the I-row"
     );
 }
 
@@ -221,16 +226,16 @@ async fn test_trigger_captures_delete() {
         .await;
     assert_eq!(action, "D", "Action should be 'D' for DELETE");
 
-    // Verify typed column captures the old value
-    let old_val: String = db
+    // A44-10: flat column `val` carries the OLD value in the D-row.
+    let val: String = db
         .query_scalar(&format!(
-            "SELECT \"old_val\" FROM {} ORDER BY change_id DESC LIMIT 1",
+            "SELECT \"val\" FROM {} ORDER BY change_id DESC LIMIT 1",
             buffer_table
         ))
         .await;
     assert_eq!(
-        old_val, "to_delete",
-        "old_val typed column should contain the deleted value"
+        val, "to_delete",
+        "val column should contain the deleted value in the D-row"
     );
 }
 
@@ -335,22 +340,22 @@ async fn test_trigger_typed_columns_captured() {
     db.execute("INSERT INTO cdc_typed VALUES (2, 'world')")
         .await;
 
-    // Verify typed columns are populated
-    let new_id: i32 = db
+    // Verify flat columns are populated (A44-10 D+I schema: column name is `id`, not `new_id`).
+    let id_val: i32 = db
         .query_scalar(&format!(
-            "SELECT \"new_id\" FROM {} ORDER BY change_id DESC LIMIT 1",
+            "SELECT \"id\" FROM {} ORDER BY change_id DESC LIMIT 1",
             buffer_table
         ))
         .await;
-    assert_eq!(new_id, 2, "new_id should match inserted id");
+    assert_eq!(id_val, 2, "id should match inserted id");
 
-    let new_val: String = db
+    let val: String = db
         .query_scalar(&format!(
-            "SELECT \"new_val\" FROM {} ORDER BY change_id DESC LIMIT 1",
+            "SELECT \"val\" FROM {} ORDER BY change_id DESC LIMIT 1",
             buffer_table
         ))
         .await;
-    assert_eq!(new_val, "world", "new_val should match inserted value");
+    assert_eq!(val, "world", "val should match inserted value");
 }
 
 #[tokio::test]
@@ -586,9 +591,8 @@ async fn test_full_refresh_partitioned_table() {
 /// the stream table's defining query plus PK columns.
 ///
 /// Source has 5 columns (id, name, status, score, notes). The ST only
-/// references id + name. The change buffer must contain new_id, old_id,
-/// new_name, old_name but NOT new_status, old_status, new_score, old_score,
-/// new_notes, old_notes.
+/// references id + name. The change buffer must contain `id` and `name`
+/// (flat D+I schema, A44-10) but NOT `status`, `score`, or `notes`.
 #[tokio::test]
 async fn test_f15_selective_cdc_buffer_has_only_referenced_columns() {
     let db = E2eDb::new().await.with_extension().await;
@@ -616,35 +620,35 @@ async fn test_f15_selective_cdc_buffer_has_only_referenced_columns() {
     let source_oid = db.table_oid("f15_src").await;
     let buffer_table = db.change_buffer_table(source_oid as i64).await;
 
-    // Buffer must have new_id / old_id (PK) and new_name / old_name (referenced).
-    let has_new_id: bool = db
+    // Buffer must have `id` (PK) and `name` (referenced) — flat D+I schema (A44-10).
+    let has_id: bool = db
         .query_scalar(&format!(
             "SELECT EXISTS (
                 SELECT 1 FROM pg_attribute
                 WHERE attrelid = '{buffer_table}'::regclass
-                  AND attname = 'new_id'
+                  AND attname = 'id'
                   AND attnum > 0
                   AND NOT attisdropped
             )"
         ))
         .await;
-    assert!(has_new_id, "new_id must be present in change buffer");
+    assert!(has_id, "id must be present in change buffer");
 
-    let has_new_name: bool = db
+    let has_name: bool = db
         .query_scalar(&format!(
             "SELECT EXISTS (
                 SELECT 1 FROM pg_attribute
                 WHERE attrelid = '{buffer_table}'::regclass
-                  AND attname = 'new_name'
+                  AND attname = 'name'
                   AND attnum > 0
                   AND NOT attisdropped
             )"
         ))
         .await;
-    assert!(has_new_name, "new_name must be present in change buffer");
+    assert!(has_name, "name must be present in change buffer");
 
     // Unreferenced columns must NOT be in the buffer.
-    for col in &["new_status", "new_score", "new_notes"] {
+    for col in &["status", "score", "notes"] {
         let present: bool = db
             .query_scalar(&format!(
                 "SELECT EXISTS (
@@ -704,13 +708,13 @@ async fn test_f15_selective_cdc_buffer_expands_for_second_stream_table() {
     let source_oid = db.table_oid("f15_exp").await;
     let buffer_table = db.change_buffer_table(source_oid as i64).await;
 
-    // After first ST: new_status must NOT be present
+    // After first ST: `status` must NOT be present
     let has_status_before: bool = db
         .query_scalar(&format!(
             "SELECT EXISTS (
                 SELECT 1 FROM pg_attribute
                 WHERE attrelid = '{buffer_table}'::regclass
-                  AND attname = 'new_status'
+                  AND attname = 'status'
                   AND attnum > 0
                   AND NOT attisdropped
             )"
@@ -718,7 +722,7 @@ async fn test_f15_selective_cdc_buffer_expands_for_second_stream_table() {
         .await;
     assert!(
         !has_status_before,
-        "new_status must not exist before second ST is added"
+        "status must not exist before second ST is added"
     );
 
     // Add a second ST that also references status
@@ -730,13 +734,13 @@ async fn test_f15_selective_cdc_buffer_expands_for_second_stream_table() {
     )
     .await;
 
-    // After second ST: new_status must now be present (buffer expanded)
+    // After second ST: `status` must now be present (buffer expanded)
     let has_status_after: bool = db
         .query_scalar(&format!(
             "SELECT EXISTS (
                 SELECT 1 FROM pg_attribute
                 WHERE attrelid = '{buffer_table}'::regclass
-                  AND attname = 'new_status'
+                  AND attname = 'status'
                   AND attnum > 0
                   AND NOT attisdropped
             )"
@@ -744,7 +748,7 @@ async fn test_f15_selective_cdc_buffer_expands_for_second_stream_table() {
         .await;
     assert!(
         has_status_after,
-        "new_status must be present after second ST requiring it is added"
+        "status must be present after second ST requiring it is added"
     );
 
     // extra column (not referenced by either ST) must still not be present
@@ -753,7 +757,7 @@ async fn test_f15_selective_cdc_buffer_expands_for_second_stream_table() {
             "SELECT EXISTS (
                 SELECT 1 FROM pg_attribute
                 WHERE attrelid = '{buffer_table}'::regclass
-                  AND attname = 'new_extra'
+                  AND attname = 'extra'
                   AND attnum > 0
                   AND NOT attisdropped
             )"
@@ -761,7 +765,7 @@ async fn test_f15_selective_cdc_buffer_expands_for_second_stream_table() {
         .await;
     assert!(
         !has_extra,
-        "new_extra must never be in buffer (no ST references it)"
+        "extra must never be in buffer (no ST references it)"
     );
 }
 
@@ -805,8 +809,8 @@ async fn test_f15_select_star_falls_back_to_full_capture() {
 
     let buffer_table = db.change_buffer_table(source_oid as i64).await;
 
-    // All columns must be present in buffer
-    for col in &["new_id", "new_name", "new_extra"] {
+    // All columns must be present in buffer (flat D+I schema, A44-10)
+    for col in &["id", "name", "extra"] {
         let present: bool = db
             .query_scalar(&format!(
                 "SELECT EXISTS (
