@@ -899,6 +899,44 @@ A more honest decomposition:
 This pushes the realistic estimate to **~6 working days** rather than 5,
 but it's still well under the original two-week estimate.
 
+#### Shared infrastructure to clone (not move) into the new repo
+
+Most of `pg_trickle`'s repo-level scaffolding has nothing to do with
+the relay but is well-honed and worth re-using. The new `pg-tide` repo
+should *copy* (not move) the patterns below; they stay in `pg_trickle`
+unchanged.
+
+| Asset | Location | Why clone it |
+|---|---|---|
+| **Reusable composite action** | [.github/actions/setup-pgrx](.github/actions/setup-pgrx) | `pg-tide` has a pgrx extension crate too; same setup story (cargo-pgrx install, pg18 toolchain, sccache). |
+| **Skill files for AI/agent workflows** | [.github/skills/create-pull-request/](.github/skills/create-pull-request/), [enrich-release-roadmap/](.github/skills/enrich-release-roadmap/), [implement-roadmap-version/](.github/skills/implement-roadmap-version/) | All three are repo-agnostic. The PR-creation skill (Unicode-safe `gh --body-file` workflow) is especially valuable. |
+| **Agent conventions** | [AGENTS.md](AGENTS.md) | Copy and trim: keep the workflow rules, error-handling rules, SPI conventions, code-review checklist; drop the pg_trickle-specific module-layout section and replace with `pg-tide`'s. |
+| **CI architecture** | [.github/workflows/](.github/workflows/) | Clone `lint.yml`, `ci.yml`, `coverage.yml`, `codeql.yml`, `secret-scan.yml`, `dependency-policy.yml`, `semgrep.yml`, `docs-drift.yml`, `unsafe-inventory.yml`. The light-e2e vs full-e2e split (stock postgres bind-mount vs custom Docker image) is the right pattern for `pg-tide` too. |
+| **Benchmark regression-gate workflow** | [scripts/criterion_regression_check.py](scripts/criterion_regression_check.py) + the `benchmarks.yml` workflow | The "save baseline on push to main, compare on PR" pattern is generic. Worth carrying over. |
+| **Just recipes** | [justfile](justfile) | Most recipes are about pgrx + Postgres setup, format/lint, test tiers — directly reusable. Drop pg_trickle-specific ones (`build-e2e-image`, `test-tpch`, etc.) and add `pg-tide` equivalents. |
+| **Config files** | [deny.toml](deny.toml), [codecov.yml](codecov.yml), [book.toml](book.toml), [.github/dependabot.yml](.github/dependabot.yml), [.github/CODEOWNERS](.github/CODEOWNERS), [.github/pull_request_template.md](.github/pull_request_template.md), [.github/ISSUE_TEMPLATE/](.github/ISSUE_TEMPLATE/) | All trivially adaptable. None mention relay/outbox/inbox today (verified via grep). |
+| **Convention scripts** | [scripts/check_version_sync.sh](scripts/check_version_sync.sh), [scripts/check_upgrade_completeness.sh](scripts/check_upgrade_completeness.sh) | Pattern for keeping `Cargo.toml` / `*.control` / `META.json` versions in lockstep is reusable; the upgrade-completeness check works for any pgrx extension that ships per-version SQL migrations. |
+| **Release scaffolding** | [.github/workflows/release.yml](.github/workflows/release.yml) (post-deletion of relay jobs), [.github/workflows/pgxn.yml](.github/workflows/pgxn.yml), [.github/workflows/ghcr.yml](.github/workflows/ghcr.yml), [.github/workflows/docker-hub.yml](.github/workflows/docker-hub.yml) | Adapt for `pg-tide`'s release flow. The relay-specific bits already get deleted from this repo per §7.10; the *non*-relay pieces are the scaffolding the new repo wants to clone. |
+| **Stability-test workflow** | [.github/workflows/stability-tests.yml](.github/workflows/stability-tests.yml) | Soak-test pattern is exactly what an outbox/inbox primitive needs (long-running write loops, claim-check pressure, retention drainer correctness). High-value clone. |
+| **Fuzz-smoke workflow** | [.github/workflows/fuzz-smoke.yml](.github/workflows/fuzz-smoke.yml) + [fuzz/](fuzz/) | The harness pattern is reusable; targets would change (`pg_tide`'s natural fuzz targets are envelope parsing and config validation). |
+
+**Things explicitly *not* worth cloning:**
+
+- `tpch-nightly.yml` / `tpch-explain-artifacts.yml` / `e2e-benchmarks.yml`
+  — TPC-H and the IVM-specific benchmark matrix are pg_trickle concerns.
+- `sqlancer.yml` — SQLancer targets a query engine; `pg_tide` has no
+  query rewriter to fuzz.
+- `cnpg/` smoke test — `pg-tide` will need its own when CNPG packaging
+  exists, but the existing one is too pg_trickle-specific to be worth
+  forking now.
+
+**Implication:** Day 5b's "CI / packaging cleanup" expands a little.
+The right framing is "in `pg_trickle`: delete the relay-specific
+workflow jobs and config exceptions; in `pg-tide`: bootstrap a
+parallel CI matrix from cloned templates." The cloning is mostly
+mechanical (the workflows reference Cargo crate names, image tags, and
+test paths) but worth budgeting half a day to get right.
+
 ### 7.11 In-flight relay roadmap that travels with the cut
 
 The relay is **not** feature-complete today. There is a non-trivial
