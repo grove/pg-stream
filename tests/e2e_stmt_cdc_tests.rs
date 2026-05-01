@@ -227,31 +227,40 @@ async fn test_stmt_cdc_bulk_update_keyed_table() {
         .await;
 
     let change_count: i64 = db.count(&buf).await;
+    // A44-10 D+I: keyed UPDATE of 50 rows → 50 D-rows + 50 I-rows = 100 total.
     assert_eq!(
-        change_count, 50,
-        "All 50 updated rows should appear in the change buffer"
+        change_count, 100,
+        "50 updated rows → 100 change rows (50 D + 50 I) in D+I schema"
     );
 
-    let action: String = db
-        .query_scalar(&format!("SELECT DISTINCT action FROM {buf}"))
+    let d_count: i64 = db
+        .query_scalar(&format!("SELECT COUNT(*) FROM {buf} WHERE action = 'D'"))
         .await;
-    assert_eq!(action, "U", "All change rows should have action='U'");
-
-    // Both new and old values should be captured for each row.
-    let new_val: String = db
-        .query_scalar(&format!("SELECT new_val FROM {buf} WHERE new_id = 25"))
+    let i_count: i64 = db
+        .query_scalar(&format!("SELECT COUNT(*) FROM {buf} WHERE action = 'I'"))
         .await;
-    assert_eq!(
-        new_val, "updated_25",
-        "new_val should reflect the updated value"
-    );
+    assert_eq!(d_count, 50, "50 D-rows from keyed bulk UPDATE");
+    assert_eq!(i_count, 50, "50 I-rows from keyed bulk UPDATE");
 
+    // D-row for id=25 carries the OLD value; I-row carries the NEW value.
     let old_val: String = db
-        .query_scalar(&format!("SELECT old_val FROM {buf} WHERE new_id = 25"))
+        .query_scalar(&format!(
+            "SELECT val FROM {buf} WHERE id = 25 AND action = 'D'"
+        ))
         .await;
     assert_eq!(
         old_val, "initial_25",
-        "old_val should reflect the pre-update value"
+        "D-row val should contain the pre-update value"
+    );
+
+    let new_val: String = db
+        .query_scalar(&format!(
+            "SELECT val FROM {buf} WHERE id = 25 AND action = 'I'"
+        ))
+        .await;
+    assert_eq!(
+        new_val, "updated_25",
+        "I-row val should reflect the updated value"
     );
 
     // Differential refresh must converge to the source.
@@ -548,22 +557,21 @@ async fn test_stmt_cdc_mixed_dml_in_transaction() {
         sqlx::query("COMMIT").execute(&mut *conn).await.unwrap();
     }
 
-    // 3 deletes + 2 updates + 2 inserts = 7 change rows.
+    // A44-10 D+I: 3 DEL + 2 UPD (→ 2 D + 2 I) + 2 INS = 9 change rows.
     let total: i64 = db.count(&buf).await;
-    assert_eq!(total, 7, "7 change rows expected: 3 D + 2 U + 2 I");
+    assert_eq!(
+        total, 9,
+        "9 change rows expected: 5 D + 4 I (UPDs decomposed)"
+    );
 
     let d_count: i64 = db
         .query_scalar(&format!("SELECT COUNT(*) FROM {buf} WHERE action = 'D'"))
         .await;
-    let u_count: i64 = db
-        .query_scalar(&format!("SELECT COUNT(*) FROM {buf} WHERE action = 'U'"))
-        .await;
     let i_count: i64 = db
         .query_scalar(&format!("SELECT COUNT(*) FROM {buf} WHERE action = 'I'"))
         .await;
-    assert_eq!(d_count, 3, "3 DELETE rows");
-    assert_eq!(u_count, 2, "2 UPDATE rows");
-    assert_eq!(i_count, 2, "2 INSERT rows");
+    assert_eq!(d_count, 5, "5 D-rows: 3 from DELETE + 2 from UPDATE D+I");
+    assert_eq!(i_count, 4, "4 I-rows: 2 from UPDATE D+I + 2 from INSERT");
 
     // Differential refresh must converge to the source.
     db.refresh_st("mixed_dml_st").await;
