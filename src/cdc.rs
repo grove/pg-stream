@@ -2927,17 +2927,11 @@ pub fn poll_foreign_table_changes(
     let pk_columns = resolve_pk_columns(source_oid)?;
 
     // Build column lists for INSERT into change buffer.
+    // A44-10: Flat column names (no new_/old_ prefix) matching base table
+    // change buffer schema created by create_change_buffer_table().
     let col_names: Vec<String> = col_defs
         .iter()
         .map(|(name, _)| format!("\"{}\"", name.replace('"', "\"\"")))
-        .collect();
-    let new_cols: Vec<String> = col_defs
-        .iter()
-        .map(|(name, _)| format!("\"new_{}\"", name.replace('"', "\"\"")))
-        .collect();
-    let old_cols: Vec<String> = col_defs
-        .iter()
-        .map(|(name, _)| format!("\"old_{}\"", name.replace('"', "\"\"")))
         .collect();
 
     // Build pk_hash expression for delta rows.
@@ -2961,21 +2955,12 @@ pub fn poll_foreign_table_changes(
     };
 
     let col_list = col_names.join(", ");
-    let new_col_list = new_cols.join(", ");
-    let old_col_list = old_cols.join(", ");
-
-    // NULL placeholders for the opposite side of each delta row.
-    let null_list = col_defs
-        .iter()
-        .map(|_| "NULL")
-        .collect::<Vec<_>>()
-        .join(", ");
 
     // ── Deleted rows: in snapshot but not in current foreign table ──
     // These appear as 'D' (delete) rows in the change buffer.
     let deleted_sql = format!(
-        "INSERT INTO {change_table} (lsn, action, pk_hash, {old_col_list}, {new_col_list}) \
-         SELECT pg_current_wal_insert_lsn(), 'D', {pk_hash_expr}, {col_list}, {null_list} \
+        "INSERT INTO {change_table} (lsn, action, pk_hash, {col_list}) \
+         SELECT pg_current_wal_insert_lsn(), 'D', {pk_hash_expr}, {col_list} \
          FROM (\
            SELECT {col_list} FROM {snapshot_table} \
            EXCEPT ALL \
@@ -2987,8 +2972,8 @@ pub fn poll_foreign_table_changes(
     // ── Inserted rows: in current foreign table but not in snapshot ──
     // These appear as 'I' (insert) rows in the change buffer.
     let inserted_sql = format!(
-        "INSERT INTO {change_table} (lsn, action, pk_hash, {new_col_list}, {old_col_list}) \
-         SELECT pg_current_wal_insert_lsn(), 'I', {pk_hash_expr}, {col_list}, {null_list} \
+        "INSERT INTO {change_table} (lsn, action, pk_hash, {col_list}) \
+         SELECT pg_current_wal_insert_lsn(), 'I', {pk_hash_expr}, {col_list} \
          FROM (\
            SELECT {col_list} FROM {source_table} \
            EXCEPT ALL \

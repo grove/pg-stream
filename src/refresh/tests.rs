@@ -1705,8 +1705,11 @@ fn test_build_bypass_capture_sql_basic() {
     );
     assert!(sql.contains("CREATE TEMP TABLE IF NOT EXISTS pg_temp.__pgt_bypass_42"));
     assert!(sql.contains("ON COMMIT DROP"));
-    assert!(sql.contains("\"new_id\""));
-    assert!(sql.contains("\"new_name\""));
+    // A44-10: flat D+I schema — no new_/old_ prefix
+    assert!(sql.contains("\"id\""));
+    assert!(sql.contains("\"name\""));
+    assert!(!sql.contains("\"new_id\""));
+    assert!(!sql.contains("\"new_name\""));
     assert!(sql.contains("FROM __pgt_delta_42 d"));
     assert!(sql.contains("d.__pgt_action IN ('I', 'D')"));
 }
@@ -1719,8 +1722,9 @@ fn test_build_bypass_capture_sql_quoted_columns() {
         "pg_temp.__pgt_bypass_7",
         None,
     );
-    // Column with quote should be properly escaped.
-    assert!(sql.contains(r#""new_col""name""#));
+    // A44-10: flat D+I schema — column with quote should be properly escaped.
+    assert!(sql.contains(r#""col""name""#));
+    assert!(!sql.contains(r#""new_col""name""#));
     assert!(sql.contains(r#"d."col""name""#));
 }
 
@@ -1736,11 +1740,14 @@ fn test_build_bypass_capture_sql_column_defs() {
         None,
     );
     // Verify the column definitions in CREATE TEMP TABLE.
+    // A44-10: flat D+I schema — no new_/old_ prefix
     assert!(sql.contains("lsn pg_lsn"));
     assert!(sql.contains("action \"char\""));
     assert!(sql.contains("pk_hash bigint"));
-    assert!(sql.contains("\"new_a\" bigint"));
-    assert!(sql.contains("\"new_b\" text"));
+    assert!(sql.contains("\"a\" bigint"));
+    assert!(sql.contains("\"b\" text"));
+    assert!(!sql.contains("\"new_a\""));
+    assert!(!sql.contains("\"new_b\""));
 }
 
 #[test]
