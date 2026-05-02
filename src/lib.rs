@@ -42,6 +42,7 @@ pub mod otel;
 mod refresh;
 pub mod scheduler;
 mod shmem;
+pub mod sql_builder;
 mod template_cache;
 pub mod version;
 mod wal_decoder;

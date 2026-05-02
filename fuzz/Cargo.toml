@@ -51,6 +51,13 @@ path = "fuzz_targets/dag_fuzz.rs"
 test = false
 doc = false
 
+# FUZZ-6 (v0.44.0 / A45-9): sql_builder + parser typed facade fuzz target.
+[[bin]]
+name = "sql_builder_fuzz"
+path = "fuzz_targets/sql_builder_fuzz.rs"
+test = false
+doc = false
+
 [dependencies]
 libfuzzer-sys = "0.4"
 pg_trickle = { path = "..", features = [] }

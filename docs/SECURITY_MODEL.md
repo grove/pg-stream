@@ -1,6 +1,6 @@
 # Security Model — pg_trickle
 
-> **Version:** v0.40.0  
+> **Version:** v0.44.0  
 > **Audience:** Database administrators, security engineers, and operators
 > deploying pg_trickle in production environments.
 
@@ -20,6 +20,69 @@ process. Its security surface spans:
    read from published stream tables and forward changes downstream
 5. **Secret handling** — credentials in configuration files, environment
    variables, and shell history
+
+---
+
+## Superuser Requirement (A45-6)
+
+### Why pg_trickle requires a superuser at install time
+
+pg_trickle uses `superuser = true` and `trusted = false` in its
+`pg_trickle.control` file. This means:
+
+- The extension can **only be installed by a superuser** (`CREATE EXTENSION`
+  requires `pg_catalog.pg_extension_config_dump()` access and the right to
+  create background workers).
+- The extension is **not trusted**, so it cannot be installed by a database
+  owner in a database where the installer is not also a superuser.
+
+**Exact privileges needed at install time:**
+
+| Privilege | Reason |
+|-----------|--------|
+| `SUPERUSER` | Register dynamic background workers; set GUCs at function creation |
+| `CREATE` on extension schemas | Create `pgtrickle` and `pgtrickle_changes` schemas |
+| `CREATE TRIGGER` on source tables | Install CDC triggers when creating stream tables |
+| Read access to `pg_catalog.*` | Resolve OIDs, inspect RLS flags, check relkind |
+
+**Runtime privileges (background worker):**
+
+The scheduler background worker runs as the PostgreSQL superuser. It uses
+this privilege only for:
+
+- Reading the `pgtrickle.*` catalog tables.
+- Writing delta results via MERGE/INSERT/DELETE/UPDATE on stream tables.
+- Managing logical replication slots for WAL-based CDC.
+- Calling `pg_cancel_backend()` when a stale worker must be interrupted.
+
+### Why trusted install is not currently supported
+
+PostgreSQL's trusted extension model allows a database owner (non-superuser)
+to install an extension if it is marked `trusted = true`. pg_trickle cannot
+use this model because:
+
+1. **Background worker registration** (`BackgroundWorkerBuilder`) requires
+   superuser privilege at worker startup. A trusted install context does not
+   provide this.
+2. **Event triggers** (`CREATE EVENT TRIGGER`) require superuser privilege.
+3. **Schema-level REVOKE on `pgtrickle_changes`** requires ownership, which
+   means the extension owner must be the superuser at install time.
+
+### Guidance for managed / hosted environments
+
+In cloud environments (RDS, AlloyDB, Cloud SQL, Neon, Supabase, etc.) where
+you do not have full superuser access:
+
+1. Verify that your provider supports extensions with `trusted = false`
+   (most managed providers have an approved extension allowlist).
+2. Request or verify that `pg_trickle` is on the allowlist.
+3. Use the provider's superuser-equivalent role (e.g., `rds_superuser` on RDS)
+   to install the extension: `CREATE EXTENSION pg_trickle;`
+4. After installation, non-superuser roles can **use** `pgtrickle.*` functions
+   if granted `EXECUTE` permission (the functions are `SECURITY DEFINER`,
+   so they run as the owner regardless of the caller's privileges).
+
+See [INSTALL.md](../INSTALL.md) for distribution-specific instructions.
 
 ---
 

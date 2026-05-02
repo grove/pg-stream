@@ -25,18 +25,20 @@ services:
       context: ..
       dockerfile: Dockerfile.hub
     environment:
-      POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: postgres
-      POSTGRES_DB: demo
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      # A45-4: Use ${POSTGRES_PASSWORD} from .env (see .env.example).
+      # NEVER use a hardcoded password in shared environments.
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      POSTGRES_DB: ${POSTGRES_DB:-demo}
       # Pre-load pg_trickle extension on startup
       POSTGRES_INITDB_ARGS: "--locale=C --encoding=UTF8"
     volumes:
       - pgdata:/var/lib/postgresql
       - ./init:/docker-entrypoint-initdb.d:ro
     ports:
-      - "5432:5432"
+      - "127.0.0.1:5432:5432"
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres -d demo"]
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres} -d ${POSTGRES_DB:-demo}"]
       interval: 5s
       timeout: 5s
       retries: 10
@@ -46,7 +48,7 @@ services:
   postgres-exporter:
     image: prometheuscommunity/postgres-exporter:v0.15.0
     environment:
-      DATA_SOURCE_NAME: "postgresql://postgres:postgres@postgres:5432/demo?sslmode=disable"
+      DATA_SOURCE_NAME: "postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres:5432/${POSTGRES_DB:-demo}?sslmode=disable"
       PG_EXPORTER_EXTEND_QUERY_PATH: /etc/postgres_exporter/pg_trickle_queries.yml
       # Disable default built-in collectors that require superuser if not needed:
       # PG_EXPORTER_DISABLE_DEFAULT_METRICS: "true"
@@ -82,8 +84,10 @@ services:
   grafana:
     image: grafana/grafana-oss:10.4.0
     environment:
-      GF_SECURITY_ADMIN_USER: admin
-      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_SECURITY_ADMIN_USER: ${GF_ADMIN_USER:-admin}
+      # A45-4: Use ${GF_ADMIN_PASSWORD} from .env (see .env.example).
+      # NEVER use the default admin/admin password in shared environments.
+      GF_SECURITY_ADMIN_PASSWORD: ${GF_ADMIN_PASSWORD:-admin}
       GF_USERS_ALLOW_SIGN_UP: "false"
       GF_ANALYTICS_REPORTING_ENABLED: "false"
     volumes:
