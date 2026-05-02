@@ -21,11 +21,16 @@ use e2e::E2eDb;
 async fn test_t_a44_1_part3_max_scan_count_guc_settable() {
     let db = E2eDb::new().await.with_extension().await;
 
-    // Set the GUC to a small value and confirm it sticks
-    db.execute("SET pg_trickle.part3_max_scan_count = 100")
+    // Use set_and_show_setting so both statements share a single connection.
+    // Session-level SET is only visible on the connection that ran it.
+    // part3_max_scan_count valid range is 1..32; use 20 as a mid-range value.
+    let val = db
+        .set_and_show_setting(
+            "SET pg_trickle.part3_max_scan_count = 20",
+            "pg_trickle.part3_max_scan_count",
+        )
         .await;
-    let val = db.show_setting("pg_trickle.part3_max_scan_count").await;
-    assert_eq!(val, "100", "GUC should be 100 after SET");
+    assert_eq!(val, "20", "GUC should be 20 after SET");
 }
 
 /// T-A44-1b: Setting pg_trickle.deep_join_l0_scan_threshold to a small
@@ -34,12 +39,14 @@ async fn test_t_a44_1_part3_max_scan_count_guc_settable() {
 async fn test_t_a44_1_deep_join_l0_scan_threshold_guc_settable() {
     let db = E2eDb::new().await.with_extension().await;
 
-    db.execute("SET pg_trickle.deep_join_l0_scan_threshold = 50")
-        .await;
+    // deep_join_l0_scan_threshold valid range is 1..32; use 16 as a mid-range value.
     let val = db
-        .show_setting("pg_trickle.deep_join_l0_scan_threshold")
+        .set_and_show_setting(
+            "SET pg_trickle.deep_join_l0_scan_threshold = 16",
+            "pg_trickle.deep_join_l0_scan_threshold",
+        )
         .await;
-    assert_eq!(val, "50", "GUC should be 50 after SET");
+    assert_eq!(val, "16", "GUC should be 16 after SET");
 }
 
 /// T-A44-1c: WAL GUCs are settable (pg_trickle.wal_max_changes_per_poll).
@@ -47,9 +54,12 @@ async fn test_t_a44_1_deep_join_l0_scan_threshold_guc_settable() {
 async fn test_t_a44_1_wal_max_changes_per_poll_guc_settable() {
     let db = E2eDb::new().await.with_extension().await;
 
-    db.execute("SET pg_trickle.wal_max_changes_per_poll = 5000")
+    let val = db
+        .set_and_show_setting(
+            "SET pg_trickle.wal_max_changes_per_poll = 5000",
+            "pg_trickle.wal_max_changes_per_poll",
+        )
         .await;
-    let val = db.show_setting("pg_trickle.wal_max_changes_per_poll").await;
     assert_eq!(val, "5000", "wal_max_changes_per_poll GUC should be 5000");
 }
 

@@ -2556,9 +2556,13 @@ fn sync_change_buffer_columns(
     }
 
     // Build the set of expected flat column names from current source columns.
+    // A44-10: apply cb_col_name() so reserved source columns (e.g. "action") are
+    // tracked as their CB-mapped names (e.g. "__usr_action") — otherwise the
+    // orphan-drop loop would drop "__usr_action" because "action" is in
+    // expected_data_cols but "__usr_action" is not.
     let expected_data_cols: std::collections::HashSet<String> = columns
         .iter()
-        .map(|(col_name, _)| col_name.clone())
+        .map(|(col_name, _)| cb_col_name(col_name))
         .collect();
 
     // System columns: never dropped, not tracked as data columns.
@@ -2627,40 +2631,44 @@ fn sync_change_buffer_columns(
         }
     }
 
-    // For each source column, add flat "col" if missing or widen if type changed.
+    // For each source column, add flat "cb_col" if missing or widen if type changed.
+    // A44-10: apply cb_col_name() so reserved source columns (e.g. "action") are
+    // stored under their CB-mapped names (e.g. "__usr_action").
     for (col_name, col_type) in columns {
-        match existing_cols.get(col_name.as_str()) {
+        let cb_col = cb_col_name(col_name);
+        match existing_cols.get(cb_col.as_str()) {
             None => {
+                let qcol = cb_col.replace('"', "\"\"");
                 let sql = format!(
-                    "ALTER TABLE {buffer_table} ADD COLUMN IF NOT EXISTS \"{col_name}\" {col_type}"
+                    "ALTER TABLE {buffer_table} ADD COLUMN IF NOT EXISTS \"{qcol}\" {col_type}"
                 );
                 Spi::run(&sql).map_err(|e| {
                     PgTrickleError::SpiError(format!(
-                        "Failed to add column \"{col_name}\" to change buffer: {e}"
+                        "Failed to add column \"{cb_col}\" to change buffer: {e}"
                     ))
                 })?;
                 pgrx::debug1!(
                     "pg_trickle_cdc: added column \"{}\" to {}",
-                    col_name,
+                    cb_col,
                     buffer_table
                 );
             }
             Some(existing_type) if existing_type != col_type => {
                 // Type widening (e.g. VARCHAR(50) → VARCHAR(200)).
-                let sql = format!(
-                    "ALTER TABLE {buffer_table} ALTER COLUMN \"{col_name}\" TYPE {col_type}"
-                );
+                let qcol = cb_col.replace('"', "\"\"");
+                let sql =
+                    format!("ALTER TABLE {buffer_table} ALTER COLUMN \"{qcol}\" TYPE {col_type}");
                 if let Err(e) = Spi::run(&sql) {
                     pgrx::warning!(
                         "pg_trickle_cdc: failed to widen \"{}\" in {}: {}",
-                        col_name,
+                        cb_col,
                         buffer_table,
                         e
                     );
                 } else {
                     pgrx::debug1!(
                         "pg_trickle_cdc: widened column \"{}\" to {} in {}",
-                        col_name,
+                        cb_col,
                         col_type,
                         buffer_table
                     );

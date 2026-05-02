@@ -611,11 +611,15 @@ pub(super) fn shared_buffer_stats_impl()
                 let buf_base =
                     crate::cdc::buffer_base_name_for_oid(pg_sys::Oid::from(source_oid as u32));
 
+                // A44-10 (D+I schema): columns are now flat (no new_/old_ prefix).
+                // Count user data columns by excluding the fixed system columns.
                 let columns_tracked: i32 = Spi::get_one::<i64>(&format!(
                     "SELECT count(*)::bigint FROM information_schema.columns \
                      WHERE table_schema = '{change_schema}' \
                        AND table_name = '{buf_base}' \
-                       AND column_name LIKE 'new\\_%'",
+                       AND column_name NOT IN (\
+                         'change_id','lsn','action','pk_hash','changed_cols',\
+                         '__pgt_trace_context')",
                 ))
                 .unwrap_or(None)
                 .unwrap_or(0) as i32;
