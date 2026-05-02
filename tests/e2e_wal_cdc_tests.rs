@@ -327,8 +327,11 @@ async fn test_wal_cdc_captures_update() {
     db.execute("UPDATE wal_upd SET val = 'new' WHERE id = 1")
         .await;
 
+    // Use a generous 60s timeout: on emulated environments (e.g. x86_64 container
+    // on Apple Silicon via Rosetta) the WAL poll → change-buffer → differential
+    // refresh cycle can take longer than the original 30s budget.
     let refreshed = db
-        .wait_for_auto_refresh("wal_upd_st", Duration::from_secs(30))
+        .wait_for_auto_refresh("wal_upd_st", Duration::from_secs(60))
         .await;
     assert!(refreshed, "Scheduler should trigger a refresh");
 

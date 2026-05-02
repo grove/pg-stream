@@ -813,123 +813,64 @@ fn write_decoded_change(
     // emitted as a single multi-row VALUES INSERT for atomicity (single SPI call,
     // single heap operation). This avoids the risk of a crash between D and I rows.
     if *action == 'U' {
-        // Build D-row and I-row in a UNION VALUES insert.
-        // D-row: pk_hash from OLD values, flat columns with OLD values.
-        // I-row: pk_hash from NEW values, flat columns with NEW values.
-        let mut d_params: Vec<Option<String>> = Vec::new();
-        let mut i_params: Vec<Option<String>> = Vec::new();
-        let mut flat_col_names: Vec<String> = Vec::new();
-        let mut d_placeholders: Vec<String> = Vec::new();
-        let mut i_placeholders: Vec<String> = Vec::new();
-
-        // lsn: same for both rows.
-        flat_col_names.push("lsn".to_string());
-        d_params.push(Some(lsn.to_string()));
-        i_params.push(Some(lsn.to_string()));
-        d_placeholders.push(format!("${}::pg_lsn", 1));
-        i_placeholders.push(format!("${}::pg_lsn", 1));
-
-        // action: 'D' for the first row, 'I' for the second.
-        flat_col_names.push("action".to_string());
-        // These will be literal values, not params, to avoid duplicate param handling.
-
-        // pk_hash.
-        if has_pk {
-            flat_col_names.push("pk_hash".to_string());
-            // D-row pk_hash: from OLD values (old_parsed).
-            // I-row pk_hash: from NEW values (parsed).
-        }
-
-        for (col_name, col_type) in columns {
-            let cb_name = crate::cdc::cb_col_name(col_name);
-            let safe_cb_name = cb_name.replace('"', "\"\"");
-            flat_col_names.push(format!("\"{}\"", safe_cb_name));
-            d_params.push(old_parsed.get(col_name).cloned());
-            i_params.push(parsed.get(col_name).cloned());
-            let d_idx = d_params.len();
-            let i_idx = i_params.len();
-            d_placeholders.push(format!("${}::{}", d_idx, col_type));
-            i_placeholders.push(format!("${}::{}", i_idx, col_type));
-        }
+        // A44-10 atomicity: single multi-row INSERT for D+I pair.
+        // D-row: OLD values with action='D'. I-row: NEW values with action='I'.
+        // D-row must appear before I-row (change_id ordering invariant).
+        //
+        // Build column list and value lists as Vecs to avoid comma-joining bugs.
+        // $1 is shared for lsn; D-row data starts at $2; I-row data is offset
+        // by the number of D-row params.
 
         let buf_name = cdc::buffer_base_name_for_oid(pg_sys::Oid::from(source_oid));
         assert_valid_identifier(&buf_name, "change buffer name")?;
         assert_valid_identifier(change_schema, "change schema")?;
 
-        // Build the pk_hash expressions using the OLD-value and NEW-value parsers.
-        // We use inline literal expressions (via build_pk_hash_from_values) because
-        // pk values come from PostgreSQL's WAL pgoutput and are properly encoded.
-        // build_pk_hash_from_values uses single-quote escaping for the literals.
         let d_pk_hash_expr = build_pk_hash_from_values(pk_columns, &old_parsed);
         let i_pk_hash_expr = build_pk_hash_from_values(pk_columns, &parsed);
 
-        // Build col list (excluding lsn, action, pk_hash — handled separately).
-        let data_col_names: Vec<String> = columns
-            .iter()
-            .map(|(n, _)| {
-                let cb_name = crate::cdc::cb_col_name(n);
-                format!("\"{}\"", cb_name.replace('"', "\"\""))
-            })
-            .collect();
-        let data_col_str = if data_col_names.is_empty() {
-            String::new()
-        } else {
-            format!(", {}", data_col_names.join(", "))
-        };
+        // col_names: INSERT column list (shared for both rows).
+        let mut col_names_u: Vec<String> = vec!["lsn".to_string(), "action".to_string()];
+        if has_pk {
+            col_names_u.push("pk_hash".to_string());
+        }
+        for (col_name, _) in columns {
+            let cb_name = crate::cdc::cb_col_name(col_name);
+            col_names_u.push(format!("\"{}\"", cb_name.replace('"', "\"\"")));
+        }
 
-        // D-row params (1-indexed): lsn=1 + data cols start at 2.
+        // D-row params: $1=lsn, $2..=old column values.
         let mut d_all_params: Vec<Option<String>> = vec![Some(lsn.to_string())];
-        let mut d_data_placeholders: Vec<String> = Vec::new();
+        // D-row value expressions.
+        let mut d_vals: Vec<String> = vec!["$1::pg_lsn".to_string(), "'D'".to_string()];
+        if has_pk {
+            d_vals.push(d_pk_hash_expr);
+        }
         for (col_name, col_type) in columns {
             d_all_params.push(old_parsed.get(col_name).cloned());
-            d_data_placeholders.push(format!("${}::{}", d_all_params.len(), col_type));
+            d_vals.push(format!("${}::{}", d_all_params.len(), col_type));
         }
 
-        // I-row params: offset all by d_all_params.len() since they go in the same VALUES list.
+        // I-row params: offset by d_all_params.len() (they follow D params in the SPI args).
         let d_len = d_all_params.len();
         let mut i_all_params: Vec<Option<String>> = Vec::new();
-        let mut i_data_placeholders: Vec<String> = Vec::new();
+        // I-row value expressions.
+        let mut i_vals: Vec<String> = vec!["$1::pg_lsn".to_string(), "'I'".to_string()];
+        if has_pk {
+            i_vals.push(i_pk_hash_expr);
+        }
         for (col_name, col_type) in columns {
             i_all_params.push(parsed.get(col_name).cloned());
-            i_data_placeholders.push(format!("${}::{}", d_len + i_all_params.len(), col_type));
+            i_vals.push(format!("${}::{}", d_len + i_all_params.len(), col_type));
         }
 
-        let pk_col_clause = if has_pk { ", pk_hash" } else { "" };
-        let d_data_str = if d_data_placeholders.is_empty() {
-            String::new()
-        } else {
-            format!(", {}", d_data_placeholders.join(", "))
-        };
-        let i_data_str = if i_data_placeholders.is_empty() {
-            String::new()
-        } else {
-            format!(", {}", i_data_placeholders.join(", "))
-        };
-
-        // A44-10 atomicity: single multi-row INSERT for D+I pair.
-        // D-row must appear before I-row (change_id ordering invariant).
         let sql = format!(
             // nosemgrep: rust.spi.query.dynamic-format
-            "INSERT INTO {schema}.{buf_name} \
-             (lsn, action{pk_col_clause}{data_col_str}) VALUES \
-             ($1::pg_lsn, 'D', {d_pk}{d_data}), \
-             ($1::pg_lsn, 'I', {i_pk}{i_data})",
+            "INSERT INTO {schema}.{buf_name} ({cols}) VALUES ({d_vals}), ({i_vals})",
             schema = change_schema,
             buf_name = buf_name,
-            pk_col_clause = pk_col_clause,
-            data_col_str = data_col_str,
-            d_pk = if has_pk {
-                format!("{}, ", d_pk_hash_expr)
-            } else {
-                String::new()
-            },
-            d_data = d_data_str,
-            i_pk = if has_pk {
-                format!("{}, ", i_pk_hash_expr)
-            } else {
-                String::new()
-            },
-            i_data = i_data_str,
+            cols = col_names_u.join(", "),
+            d_vals = d_vals.join(", "),
+            i_vals = i_vals.join(", "),
         );
 
         let mut all_params = d_all_params;
