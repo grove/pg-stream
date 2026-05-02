@@ -226,6 +226,73 @@ fn safe_deparse_from_item_to_sql(node: *mut pg_sys::Node) -> Result<String, PgTr
     unsafe { deparse_from_item_to_sql(node) }
 }
 
+/// Safe wrapper for `deparse_sort_clause`.
+///
+/// Precondition: `list` must be a valid `PgList<Node>` of `SortGroupClause`
+/// nodes allocated by `raw_parser()`.
+fn safe_deparse_sort_clause(list: &pgrx::PgList<pg_sys::Node>) -> Result<String, PgTrickleError> {
+    // SAFETY: list elements are parse-tree node pointers from raw_parser();
+    // valid for the current PostgreSQL memory context.
+    unsafe { deparse_sort_clause(list) }
+}
+
+/// Safe wrapper for `deparse_target_list`.
+///
+/// Precondition: `list` must be a valid `*mut pg_sys::List` of `TargetEntry`
+/// nodes allocated by `raw_parser()`.
+fn safe_deparse_target_list(list: *mut pg_sys::List) -> Result<String, PgTrickleError> {
+    // SAFETY: list is a parse-tree pointer from raw_parser(); valid for the
+    // current PostgreSQL memory context.
+    unsafe { deparse_target_list(list) }
+}
+
+/// Safe wrapper for `node_contains_window_func`.
+///
+/// Precondition: `node` must be a valid `*mut pg_sys::Node` from a
+/// parse tree allocated by `raw_parser()`.
+fn safe_node_contains_window_func(node: *mut pg_sys::Node) -> bool {
+    if node.is_null() {
+        return false;
+    }
+    // SAFETY: node is a non-null parse-tree pointer from raw_parser(); valid
+    // for the current PostgreSQL memory context.
+    unsafe { node_contains_window_func(node) }
+}
+
+/// Safe wrapper for `collect_all_window_func_nodes`.
+///
+/// Precondition: `node` must be a valid `*mut pg_sys::Node` from a
+/// parse tree allocated by `raw_parser()`.
+fn safe_collect_all_window_func_nodes(
+    node: *mut pg_sys::Node,
+    result: &mut Vec<*mut pg_sys::Node>,
+) {
+    if node.is_null() {
+        return;
+    }
+    // SAFETY: node is a non-null parse-tree pointer from raw_parser(); valid
+    // for the current PostgreSQL memory context.
+    unsafe { collect_all_window_func_nodes(node, result) }
+}
+
+/// Safe wrapper for `extract_func_name`.
+///
+/// Precondition: `name_list` must be a valid `*mut pg_sys::List` of `String`
+/// name nodes allocated by `raw_parser()`.
+fn safe_extract_func_name(name_list: *mut pg_sys::List) -> Result<String, PgTrickleError> {
+    // SAFETY: List pointer from raw_parser(); valid for the current memory context.
+    unsafe { extract_func_name(name_list) }
+}
+
+/// Safe wrapper for `extract_operator_name`.
+///
+/// Precondition: `name_list` must be a valid `*mut pg_sys::List` of `String`
+/// name nodes allocated by `raw_parser()`.
+fn safe_extract_operator_name(name_list: *mut pg_sys::List) -> Result<String, PgTrickleError> {
+    // SAFETY: List pointer from raw_parser(); valid for the current memory context.
+    unsafe { extract_operator_name(name_list) }
+}
+
 // ── Query Parsing ──────────────────────────────────────────────────────────
 
 /// Context threaded through the parser for CTE handling.

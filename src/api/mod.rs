@@ -684,24 +684,24 @@ fn create_stream_table(
     // CORR-2/UX-3 (v0.36.0): columnar storage backend
     storage_backend: default!(Option<&str>, "NULL"),
 ) {
-    let result = create_stream_table_impl(
+    let result = create_stream_table_impl(CreateStreamTableOptions {
         name,
         query,
         schedule,
-        refresh_mode,
+        refresh_mode_str: refresh_mode,
         initialize,
         diamond_consistency,
         diamond_schedule_policy,
-        cdc_mode,
+        requested_cdc_mode: cdc_mode,
         append_only,
         pooler_compatibility_mode,
         partition_by,
         max_differential_joins,
         max_delta_fraction,
         output_distribution_column,
-        temporal,
+        temporal_mode: temporal,
         storage_backend,
-    );
+    });
     if let Err(e) = result {
         raise_error_with_context(e);
     }
@@ -736,24 +736,24 @@ fn create_stream_table_if_not_exists(
     // CORR-2/UX-3 (v0.36.0): columnar storage backend
     storage_backend: default!(Option<&str>, "NULL"),
 ) {
-    let result = create_stream_table_if_not_exists_impl(
+    let result = create_stream_table_if_not_exists_impl(CreateStreamTableOptions {
         name,
         query,
         schedule,
-        refresh_mode,
+        refresh_mode_str: refresh_mode,
         initialize,
         diamond_consistency,
         diamond_schedule_policy,
-        cdc_mode,
+        requested_cdc_mode: cdc_mode,
         append_only,
         pooler_compatibility_mode,
         partition_by,
         max_differential_joins,
         max_delta_fraction,
         output_distribution_column,
-        temporal,
+        temporal_mode: temporal,
         storage_backend,
-    );
+    });
     if let Err(e) = result {
         raise_error_with_context(e);
     }
@@ -761,27 +761,9 @@ fn create_stream_table_if_not_exists(
 
 #[allow(clippy::too_many_arguments)]
 fn create_stream_table_if_not_exists_impl(
-    name: &str,
-    query: &str,
-    schedule: Option<&str>,
-    refresh_mode: &str,
-    initialize: bool,
-    diamond_consistency: Option<&str>,
-    diamond_schedule_policy: Option<&str>,
-    cdc_mode: Option<&str>,
-    append_only: bool,
-    pooler_compatibility_mode: bool,
-    partition_by: Option<&str>,
-    max_differential_joins: Option<i32>,
-    max_delta_fraction: Option<f64>,
-    // CITUS-7: Distribution column for the output (stream table storage) table.
-    output_distribution_column: Option<&str>,
-    // CORR-1/UX-1 (v0.36.0)
-    temporal: bool,
-    // CORR-2/UX-3 (v0.36.0)
-    storage_backend: Option<&str>,
+    opts: CreateStreamTableOptions<'_>,
 ) -> Result<(), PgTrickleError> {
-    let (schema, table_name) = parse_qualified_name(name)?;
+    let (schema, table_name) = parse_qualified_name(opts.name)?;
 
     match StreamTableMeta::get_by_name(&schema, &table_name) {
         Ok(_) => {
@@ -792,24 +774,7 @@ fn create_stream_table_if_not_exists_impl(
             );
             Ok(())
         }
-        Err(PgTrickleError::NotFound(_)) => create_stream_table_impl(
-            name,
-            query,
-            schedule,
-            refresh_mode,
-            initialize,
-            diamond_consistency,
-            diamond_schedule_policy,
-            cdc_mode,
-            append_only,
-            pooler_compatibility_mode,
-            partition_by,
-            max_differential_joins,
-            max_delta_fraction,
-            output_distribution_column,
-            temporal,
-            storage_backend,
-        ),
+        Err(PgTrickleError::NotFound(_)) => create_stream_table_impl(opts),
         Err(e) => Err(e),
     }
 }
@@ -914,24 +879,24 @@ fn bulk_create_impl(definitions: serde_json::Value) -> Result<serde_json::Value,
         // CORR-2/UX-3 (v0.36.0): columnar storage backend
         let storage_backend = obj.get("storage_backend").and_then(|v| v.as_str());
 
-        match create_stream_table_impl(
+        match create_stream_table_impl(CreateStreamTableOptions {
             name,
             query,
             schedule,
-            refresh_mode,
+            refresh_mode_str: refresh_mode,
             initialize,
             diamond_consistency,
             diamond_schedule_policy,
-            cdc_mode,
+            requested_cdc_mode: cdc_mode,
             append_only,
             pooler_compatibility_mode,
             partition_by,
             max_differential_joins,
             max_delta_fraction,
             output_distribution_column,
-            temporal,
+            temporal_mode: temporal,
             storage_backend,
-        ) {
+        }) {
             Ok(()) => {
                 // Look up pgt_id for the result
                 let (schema, table_name) =
@@ -1225,7 +1190,7 @@ fn create_or_replace_stream_table_impl(
         }
         Err(PgTrickleError::NotFound(_)) => {
             // Does not exist — create from scratch.
-            create_stream_table_impl(
+            create_stream_table_impl(CreateStreamTableOptions {
                 name,
                 query,
                 schedule,
@@ -1233,16 +1198,16 @@ fn create_or_replace_stream_table_impl(
                 initialize,
                 diamond_consistency,
                 diamond_schedule_policy,
-                cdc_mode,
+                requested_cdc_mode: cdc_mode,
                 append_only,
                 pooler_compatibility_mode,
                 partition_by,
                 max_differential_joins,
                 max_delta_fraction,
                 output_distribution_column,
-                false, // temporal: default off for create_or_replace
-                None,  // storage_backend: default
-            )
+                temporal_mode: false, // default off for create_or_replace
+                storage_backend: None,
+            })
         }
         Err(e) => Err(e),
     }
@@ -3215,29 +3180,68 @@ fn get_storage_table_columns(
     })
 }
 
-#[allow(clippy::too_many_arguments)]
-fn create_stream_table_impl(
-    name: &str,
-    query: &str,
-    schedule: Option<&str>,
-    refresh_mode_str: &str,
+// A45-8: Centralized options struct for all create_stream_table variants.
+/// All `create_stream_table` entry points construct this struct first and then
+/// call [`create_stream_table_impl`], which takes ownership of it.  This
+/// centralises defaults, validation, and documentation in one place.
+#[derive(Debug, Default)]
+struct CreateStreamTableOptions<'a> {
+    name: &'a str,
+    query: &'a str,
+    schedule: Option<&'a str>,
+    /// Raw refresh-mode string as passed by the caller (e.g. `"AUTO"`,
+    /// `"DIFFERENTIAL"`, `"FULL"`).  Parsed inside `create_stream_table_impl`.
+    refresh_mode_str: &'a str,
     initialize: bool,
-    diamond_consistency: Option<&str>,
-    diamond_schedule_policy: Option<&str>,
-    requested_cdc_mode: Option<&str>,
+    diamond_consistency: Option<&'a str>,
+    diamond_schedule_policy: Option<&'a str>,
+    requested_cdc_mode: Option<&'a str>,
     append_only: bool,
     pooler_compatibility_mode: bool,
-    partition_by: Option<&str>,
+    partition_by: Option<&'a str>,
     max_differential_joins: Option<i32>,
     max_delta_fraction: Option<f64>,
-    // CITUS-7: If set and Citus is loaded, convert the storage table to a
-    // Citus distributed table using this column as the distribution key.
-    output_distribution_column: Option<&str>,
-    // CORR-1/UX-1 (v0.36.0): temporal IVM mode
+    /// CITUS-7: If set and Citus is loaded, convert the storage table to a
+    /// Citus distributed table using this column as the distribution key.
+    output_distribution_column: Option<&'a str>,
+    /// CORR-1/UX-1 (v0.36.0): temporal IVM mode.
     temporal_mode: bool,
-    // CORR-2/UX-3 (v0.36.0): columnar storage backend ("heap", "citus", "pg_mooncake", or "none")
-    storage_backend: Option<&str>,
-) -> Result<(), PgTrickleError> {
+    /// CORR-2/UX-3 (v0.36.0): columnar storage backend
+    /// (`"heap"`, `"citus"`, `"pg_mooncake"`, or `"none"`).
+    storage_backend: Option<&'a str>,
+}
+
+impl<'a> CreateStreamTableOptions<'a> {
+    fn new(name: &'a str, query: &'a str) -> Self {
+        Self {
+            name,
+            query,
+            refresh_mode_str: "AUTO",
+            initialize: true,
+            ..Default::default()
+        }
+    }
+}
+
+fn create_stream_table_impl(opts: CreateStreamTableOptions<'_>) -> Result<(), PgTrickleError> {
+    let CreateStreamTableOptions {
+        name,
+        query,
+        schedule,
+        refresh_mode_str,
+        initialize,
+        diamond_consistency,
+        diamond_schedule_policy,
+        requested_cdc_mode,
+        append_only,
+        pooler_compatibility_mode,
+        partition_by,
+        max_differential_joins,
+        max_delta_fraction,
+        output_distribution_column,
+        temporal_mode,
+        storage_backend,
+    } = opts;
     let is_auto = RefreshMode::is_auto_str(refresh_mode_str);
     let mut refresh_mode = RefreshMode::from_str(refresh_mode_str)?;
 

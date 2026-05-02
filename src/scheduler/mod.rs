@@ -554,9 +554,24 @@ pub extern "C-unwind" fn pg_trickle_refresh_worker_main(_arg: pg_sys::Datum) {
 
     // Get our own PID for logging and job claiming.
     let my_pid = BackgroundWorker::transaction(AssertUnwindSafe(|| -> i32 {
-        Spi::get_one::<i32>("SELECT pg_backend_pid()")
-            .unwrap_or(Some(0))
-            .unwrap_or(0)
+        match Spi::get_one::<i32>("SELECT pg_backend_pid()") {
+            Ok(Some(pid)) => pid,
+            Ok(None) => {
+                pgrx::warning!(
+                    "pg_trickle scheduler: pg_backend_pid() returned NULL (db='{}')",
+                    db_name
+                );
+                0
+            }
+            Err(e) => {
+                pgrx::warning!(
+                    "pg_trickle scheduler: could not fetch backend pid (db='{}'): {}",
+                    db_name,
+                    e
+                );
+                0
+            }
+        }
     }));
 
     log!(
@@ -568,7 +583,19 @@ pub extern "C-unwind" fn pg_trickle_refresh_worker_main(_arg: pg_sys::Datum) {
 
     // Claim the job: QUEUED → RUNNING
     let claimed = BackgroundWorker::transaction(AssertUnwindSafe(|| -> bool {
-        SchedulerJob::claim(job_id, my_pid).unwrap_or(false)
+        match SchedulerJob::claim(job_id, my_pid) {
+            Ok(v) => v,
+            Err(e) => {
+                pgrx::warning!(
+                    "pg_trickle scheduler: failed to claim job {} (db='{}', pid={}): {}",
+                    job_id,
+                    db_name,
+                    my_pid,
+                    e
+                );
+                false
+            }
+        }
     }));
 
     if !claimed {
@@ -797,7 +824,16 @@ fn compute_coordinator_tick_watermark(
 
     match mode {
         config::FrontierHoldbackMode::None => {
-            let lsn = Spi::get_one::<String>("SELECT pg_current_wal_lsn()::text").unwrap_or(None);
+            let lsn = match Spi::get_one::<String>("SELECT pg_current_wal_lsn()::text") {
+                Ok(v) => v,
+                Err(e) => {
+                    pgrx::warning!(
+                        "pg_trickle scheduler: failed to fetch pg_current_wal_lsn (mode=None): {}",
+                        e
+                    );
+                    None
+                }
+            };
             // Store raw write LSN for workers.
             if let Some(ref l) = lsn {
                 shmem::set_last_tick_safe_lsn(version::lsn_to_u64(l));
@@ -810,8 +846,16 @@ fn compute_coordinator_tick_watermark(
             // Skip the probe when CDC mode is WAL -- commit-LSN ordering
             // is already safe in logical-replication mode.
             if config::pg_trickle_cdc_mode() == "wal" {
-                let lsn =
-                    Spi::get_one::<String>("SELECT pg_current_wal_lsn()::text").unwrap_or(None);
+                let lsn = match Spi::get_one::<String>("SELECT pg_current_wal_lsn()::text") {
+                    Ok(v) => v,
+                    Err(e) => {
+                        pgrx::warning!(
+                            "pg_trickle scheduler: failed to fetch pg_current_wal_lsn (mode=wal): {}",
+                            e
+                        );
+                        None
+                    }
+                };
                 if let Some(ref l) = lsn {
                     shmem::set_last_tick_safe_lsn(version::lsn_to_u64(l));
                 }
@@ -906,7 +950,16 @@ fn compute_worker_tick_watermark() -> Option<String> {
 
     match mode {
         config::FrontierHoldbackMode::None => {
-            Spi::get_one::<String>("SELECT pg_current_wal_lsn()::text").unwrap_or(None)
+            match Spi::get_one::<String>("SELECT pg_current_wal_lsn()::text") {
+                Ok(v) => v,
+                Err(e) => {
+                    pgrx::warning!(
+                        "pg_trickle scheduler: failed to fetch pg_current_wal_lsn (worker/None): {}",
+                        e
+                    );
+                    None
+                }
+            }
         }
 
         config::FrontierHoldbackMode::Xmin
@@ -917,13 +970,30 @@ fn compute_worker_tick_watermark() -> Option<String> {
 
             if safe_lsn_u64 == 0 {
                 // No coordinator value yet — fall back to raw write LSN.
-                return Spi::get_one::<String>("SELECT pg_current_wal_lsn()::text").unwrap_or(None);
+                return match Spi::get_one::<String>("SELECT pg_current_wal_lsn()::text") {
+                    Ok(v) => v,
+                    Err(e) => {
+                        pgrx::warning!(
+                            "pg_trickle scheduler: failed to fetch pg_current_wal_lsn (worker/fallback): {}",
+                            e
+                        );
+                        None
+                    }
+                };
             }
 
             // Cap with current write LSN: don't advance past what's available now.
-            let write_lsn_str = Spi::get_one::<String>("SELECT pg_current_wal_lsn()::text")
-                .unwrap_or(None)
-                .unwrap_or_else(|| "0/0".to_string());
+            let write_lsn_str = match Spi::get_one::<String>("SELECT pg_current_wal_lsn()::text") {
+                Ok(Some(v)) => v,
+                Ok(None) => "0/0".to_string(),
+                Err(e) => {
+                    pgrx::warning!(
+                        "pg_trickle scheduler: failed to fetch pg_current_wal_lsn (worker/cap): {}",
+                        e
+                    );
+                    "0/0".to_string()
+                }
+            };
             let write_u64 = version::lsn_to_u64(&write_lsn_str);
             let effective_u64 = safe_lsn_u64.min(write_u64);
             Some(version::u64_to_lsn(effective_u64))
