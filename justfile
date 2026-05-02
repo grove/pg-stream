@@ -57,7 +57,13 @@ clippy:
 
 # Check formatting and run clippy
 [group: "lint"]
-lint: fmt-check clippy
+lint: fmt-check clippy security-definer-check
+
+# A45-5: SECURITY DEFINER CI check — validate search_path on all SECURITY
+# DEFINER functions in Rust sources and SQL migration files.
+[group: "lint"]
+security-definer-check:
+    bash scripts/check_security_definer.sh
 
 # A42-4: Docs linter — check for stale/retired GUC names and doc drift.
 # Fails if any docs/**/*.md references deprecated GUC names as if they are
