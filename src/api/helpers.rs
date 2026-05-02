@@ -1117,7 +1117,7 @@ pub(super) fn warn_source_table_properties(source_relids: &[(pg_sys::Oid, String
 
         // A45-3: RLS bypass warning — if the source table has RLS enabled,
         // warn that source-table RLS does NOT protect stream-table contents.
-        // The refresh query runs as the superuser (SECURITY DEFINER), which
+        // The refresh query runs as the superuser (SECURITY DEFINER), which // nosemgrep: semgrep.sql.security-definer.present
         // bypasses RLS by default. To protect the stream table contents,
         // apply RLS directly on the stream table itself.
         let rls_enabled = Spi::get_one_with_args::<bool>(

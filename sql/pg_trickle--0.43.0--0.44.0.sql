@@ -15,7 +15,7 @@
 --             no SQL schema changes.
 --   A45-4:  Monitoring docker-compose credentials hardened — ops-only,
 --             no SQL schema changes.
---   A45-5:  SECURITY DEFINER CI check in scripts/check_security_definer.sh
+--   A45-5:  SECURITY DEFINER CI check in scripts/check_security_definer.sh -- nosemgrep: semgrep.sql.security-definer.present
 --             — CI change only, no SQL schema changes.
 --   A45-6:  docs/SECURITY_MODEL.md updated — docs change only.
 --   A45-7:  CDC module decomposed into rebuild + polling submodules —
