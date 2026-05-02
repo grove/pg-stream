@@ -7,6 +7,7 @@ For future plans and upcoming features, see [ROADMAP.md](ROADMAP.md).
 ## Table of Contents
 
 <!-- TOC start -->
+- [0.44.0 — Security Hardening & Code Quality](#0440--security-hardening--code-quality)
 - [0.43.0 — D+I Change-Buffer Schema, GUC Tuning & WAL Diagnostics](#0430--di-change-buffer-schema-guc-tuning--wal-diagnostics)
 - [0.42.0 — Repair API, Docs Overhaul & Test Infrastructure](#0420--repair-api-docs-overhaul--test-infrastructure)
 - [0.41.0 — DVM Correctness: Structural Cache Keys, Placeholder Safety & WAL Transition Guards](#0410--dvm-correctness-structural-cache-keys-placeholder-safety--wal-transition-guards)
@@ -57,6 +58,64 @@ For future plans and upcoming features, see [ROADMAP.md](ROADMAP.md).
 - [0.1.1 — CloudNativePG Image & Test Hardening](#011--cloudnativepg-image--test-hardening)
 - [0.1.0 — Initial Release](#010--initial-release)
 <!-- TOC end -->
+
+---
+
+## [0.44.0] — Security Hardening & Code Quality
+
+v0.44.0 is a security and code-quality sprint. It hardens SECURITY DEFINER
+paths, centralizes dynamic SQL construction, adds RLS bypass warnings,
+decomposes large modules, consolidates API options, and strengthens the
+parser's unsafe FFI façade.
+
+### Security
+
+- **A45-1**: IVM trigger function `SET search_path` hardened. BEFORE trigger
+  functions (advisory lock only) now use a restricted path with no `public`,
+  preventing search_path shadowing of extension internals. AFTER trigger
+  functions retain `public` so that user delta SQL can resolve unqualified
+  source-table references; their PLPGSQL bodies call only schema-qualified
+  `pgtrickle.*` functions, so the security boundary is maintained.
+- **A45-3**: A `WARNING` is now emitted when a stream table is created over a
+  source table that has Row-Level Security (RLS) enabled, clarifying that
+  source-table RLS does not protect stream-table contents.
+- **A45-4**: Monitoring `docker-compose.yml` credentials are now driven by
+  environment variables with a `monitoring/.env.example` template. PostgreSQL
+  and Grafana services bind to `127.0.0.1` by default.
+- **A45-5**: New `scripts/check_security_definer.sh` CI check validates that
+  every `SECURITY DEFINER` occurrence in Rust and SQL files has a corresponding
+  `SET search_path` and does not include `public` without justification. Added
+  to `just lint` pipeline.
+- **A45-6**: `docs/SECURITY_MODEL.md` now documents why `superuser = true` and
+  `trusted = false` are required, with a privilege table and guidance for
+  managed environments (RDS, AlloyDB, CNPG).
+
+### Code Quality
+
+- **A45-2**: New `src/sql_builder.rs` module provides safe helpers for all
+  dynamic SQL construction: `ident`, `qualified`, `literal`, `regclass`,
+  `spi_param`, `list_idents`. Includes unit tests and a new fuzz target
+  (`FUZZ-6`).
+- **A45-7**: `src/cdc.rs` split into three files — trigger-rebuild logic
+  extracted to `src/cdc/rebuild.rs` and polling CDC extracted to
+  `src/cdc/polling.rs`, reducing the main file from 4,259 to 3,386 lines.
+- **A45-8**: `CreateStreamTableOptions` struct introduced in `src/api/mod.rs`
+  to centralize all `create_stream_table` parameters. All four create paths
+  (`create_stream_table`, `create_stream_table_if_not_exists`, `bulk_create`,
+  `create_or_replace_stream_table`) now construct this struct before calling
+  the implementation.
+- **A45-9**: Extended the SAF-2 typed unsafe façade in `src/dvm/parser/mod.rs`
+  with six additional safe wrapper functions (`safe_deparse_sort_clause`,
+  `safe_deparse_target_list`, `safe_node_contains_window_func`,
+  `safe_collect_all_window_func_nodes`, `safe_extract_func_name`,
+  `safe_extract_operator_name`). Added `FUZZ-6` fuzz target for sql_builder
+  and parser volatility helpers.
+- **A45-10**: Scheduler background worker now emits structured `pgrx::warning!()`
+  calls instead of silently discarding errors from `pg_backend_pid()`,
+  `SchedulerJob::claim()`, and `pg_current_wal_lsn()` SPI calls.
+- **A45-11**: All milestone-ID comments audited; each ID is now accompanied by
+  a human-readable invariant description and links to a live design document
+  in `plans/`.
 
 ---
 
