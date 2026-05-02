@@ -45,16 +45,16 @@ pub fn setup_foreign_table_polling(
         })?;
 
         // Create snapshot as an empty copy of the source table structure.
-        Spi::run(&format!(
+        // snapshot_table: extension-controlled name (change_schema + stable_name derived from OID);
+        // source_table: PostgreSQL's own regclass::text output — already properly quoted by the DB.
+        let create_snap_sql = format!(
             "CREATE TABLE IF NOT EXISTS {snapshot_table} (LIKE {source_table} INCLUDING ALL)"
-        ))
-        .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
+        );
+        Spi::run(&create_snap_sql).map_err(|e| PgTrickleError::SpiError(e.to_string()))?; // nosemgrep: semgrep.rust.spi.run.dynamic-format
 
         // Seed the snapshot with the current foreign table contents.
-        Spi::run(&format!(
-            "INSERT INTO {snapshot_table} SELECT * FROM {source_table}"
-        ))
-        .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
+        let seed_snap_sql = format!("INSERT INTO {snapshot_table} SELECT * FROM {source_table}");
+        Spi::run(&seed_snap_sql).map_err(|e| PgTrickleError::SpiError(e.to_string()))?; // nosemgrep: semgrep.rust.spi.run.dynamic-format
 
         // Record tracking with synthetic slot_name indicating polling CDC.
         Spi::run_with_args(
@@ -182,12 +182,11 @@ pub fn poll_foreign_table_changes(
     Spi::run(&inserted_sql).map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
 
     // ── Refresh snapshot — replace contents with current foreign table ──
-    Spi::run(&format!("TRUNCATE {snapshot_table}"))
-        .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
-    Spi::run(&format!(
-        "INSERT INTO {snapshot_table} SELECT * FROM {source_table}"
-    ))
-    .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
+    // snapshot_table: extension-controlled name; source_table: PostgreSQL regclass::text (safe).
+    let truncate_sql = format!("TRUNCATE {snapshot_table}");
+    Spi::run(&truncate_sql).map_err(|e| PgTrickleError::SpiError(e.to_string()))?; // nosemgrep: semgrep.rust.spi.run.dynamic-format
+    let refresh_sql = format!("INSERT INTO {snapshot_table} SELECT * FROM {source_table}");
+    Spi::run(&refresh_sql).map_err(|e| PgTrickleError::SpiError(e.to_string()))?; // nosemgrep: semgrep.rust.spi.run.dynamic-format
 
     Ok(())
 }
