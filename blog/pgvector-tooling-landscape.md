@@ -1,4 +1,4 @@
-[← Back to Blog Index](README.md)
+[← Back to Blog Index](https://grove.github.io/pg-trickle/blog/) | [Documentation](https://grove.github.io/pg-trickle/)
 
 # The pgvector Tooling Landscape in 2026
 

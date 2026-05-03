@@ -1,3 +1,5 @@
+[← Back to Blog Index](https://grove.github.io/pg-trickle/blog/) | [Documentation](https://grove.github.io/pg-trickle/)
+
 # Why Your Materialized Views Are Always Stale
 
 ## (And How to Fix It in 5 Lines of SQL)
