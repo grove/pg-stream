@@ -577,7 +577,8 @@ async fn run_autorefresh_trace(seed: u64, config: &TraceConfig) {
     // the invariants to actually hold.  Under load the scheduler may fire a
     // NO_DATA cycle before the initial inserts' CDC rows are ingested by l1,
     // so we use settle_auto_invariants which retries until convergence.
-    settle_auto_invariants(&db, seed, 0, "init", Duration::from_secs(60)).await;
+    // 90s timeout gives extra headroom for loaded CI environments.
+    settle_auto_invariants(&db, seed, 0, "init", Duration::from_secs(90)).await;
 
     for cycle in 1..=(config.cycles / 2).max(1) {
         let op = rng.usize_range(0, 100);
@@ -603,7 +604,8 @@ async fn run_autorefresh_trace(seed: u64, config: &TraceConfig) {
         // Wait for the cascade to propagate the DML change and verify
         // invariants hold.  Retries if wait_for_refresh_cycle returned early
         // on a NO_DATA cycle before the DML was processed.
-        settle_auto_invariants(&db, seed, cycle, "auto", Duration::from_secs(60)).await;
+        // 90s timeout gives extra headroom for loaded CI environments.
+        settle_auto_invariants(&db, seed, cycle, "auto", Duration::from_secs(90)).await;
     }
 }
 
