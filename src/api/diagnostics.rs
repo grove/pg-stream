@@ -1667,9 +1667,9 @@ pub(super) fn preflight() -> String {
     let wal_level_val = Spi::get_one::<String>("SELECT current_setting('wal_level', true)")
         .unwrap_or(None)
         .unwrap_or_else(|| "unknown".to_string());
-    // pgt_change_tracking.cdc_mode stores the active CDC mechanism per source
+    // pgt_dependencies.cdc_mode stores the active CDC mechanism per source edge
     let wal_source_count: i64 = Spi::get_one::<i64>(
-        "SELECT COUNT(*) FROM pgtrickle.pgt_change_tracking WHERE cdc_mode = 'WAL'",
+        "SELECT COUNT(DISTINCT source_relid) FROM pgtrickle.pgt_dependencies WHERE cdc_mode = 'WAL'",
     )
     .unwrap_or(None)
     .unwrap_or(0);
