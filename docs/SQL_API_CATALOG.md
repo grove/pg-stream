@@ -4,7 +4,7 @@
 
 # SQL API Reference — pg_trickle
 
-**100 SQL-callable functions** discovered via `#[pg_extern]` in `src/`.
+**86 SQL-callable functions** discovered via `#[pg_extern]` in `src/`.
 
 See [docs/SQL_REFERENCE.md](SQL_REFERENCE.md) for full signatures and examples.
 
@@ -22,25 +22,17 @@ See [docs/SQL_REFERENCE.md](SQL_REFERENCE.md) for full signatures and examples.
 | `pgtrickle.check_cdc_health()` | `pgtrickle` | `TableIterator<` | Exposed as `pgtrickle.check_cdc_health()`. |
 | `pgtrickle.clear_caches()` | `pgtrickle` | `i64` | Use during debugging, emergency migration rollback, or after a query definition change that was not captured by the normal DDL invalidation path. |
 | `pgtrickle.cluster_worker_summary()` | `pgtrickle` | `TableIterator<` | Reads from `pg_stat_activity` (shared catalog) so the calling role needs `pg_monitor` or superuser privilege. |
-| `pgtrickle.commit_offset()` | `pgtrickle` | `` | OUTBOX-B4 (v0.28.0): Commit the consumer's offset after successful processing. |
-| `pgtrickle.consumer_heartbeat()` | `pgtrickle` | `` | OUTBOX-B5 (v0.28.0): Send a heartbeat from a consumer to signal liveness. |
 | `pgtrickle.convert_buffers_to_unlogged()` | `pgtrickle` | `Result<i64, PgTrickleError>` | **Warning:** After conversion, buffer contents will be lost on crash recovery. |
 | `pgtrickle.dedup_stats_fn()` | `pgtrickle` | `TableIterator<` | Example: ```sql SELECT * FROM pgtrickle.dedup_stats(); ```. |
 | `pgtrickle.dependency_tree()` | `pgtrickle` | `TableIterator<` | Exposed as `pgtrickle.dependency_tree()`. |
+| `pgtrickle.detach_outbox()` | `pgtrickle` | `` | Removes the entry from `pgtrickle.pgt_outbox_config`. |
 | `pgtrickle.diamond_groups()` | `pgtrickle` | `TableIterator<` | Returns one row per group member, indicating which group it belongs to, whether it is a convergence (fan-in) node, the group's current epoch, and the effective schedule policy. |
-| `pgtrickle.disable_inbox_ordering()` | `pgtrickle` | `` | INBOX-B1 (v0.28.0): Disable per-aggregate ordering for an inbox. |
-| `pgtrickle.disable_inbox_priority()` | `pgtrickle` | `` | INBOX-B2 (v0.28.0): Disable priority-tier processing for an inbox. |
-| `pgtrickle.disable_outbox()` | `pgtrickle` | `` | Drops the outbox table, delta-rows table, and latest view, and removes the catalog entry. |
 | `pgtrickle.drain()` | `pgtrickle` | `` | # Example ```sql -- Quiesce before pg_upgrade or rolling restart: SELECT pgtrickle.drain(); -- Confirm drained: SELECT pgtrickle.is_drained(); -- Resume normal operation after maintenance: UPDATE pgtrickle.pgt_stream_tables SET status = status; -- noop, scheduler picks up ```. |
-| `pgtrickle.drop_consumer_group()` | `pgtrickle` | `` | OUTBOX-B2 (v0.28.0): Drop a consumer group and all associated offsets/leases. |
-| `pgtrickle.drop_inbox_impl()` | `pgtrickle` | `Result<(), PgTrickleError>` | If `p_cascade` is true, also drops the underlying inbox table. |
 | `pgtrickle.drop_refresh_group()` | `pgtrickle` | `Result<(), PgTrickleError>` | Drop a refresh group by name. |
 | `pgtrickle.drop_snapshot()` | `pgtrickle` | `` | Removes the snapshot table and its catalog row from `pgtrickle.pgt_snapshots`. |
 | `pgtrickle.drop_stream_table()` | `pgtrickle` | `` | Changed in v0.19.0 (UX-6): default flipped from `true` to `false` to prevent accidental cascading drops. |
 | `pgtrickle.drop_stream_table_publication()` | `pgtrickle` | `` | CDC-PUB-2: Drop the logical replication publication for a stream table. |
 | `pgtrickle.drop_watermark_group()` | `pgtrickle` | `Result<(), PgTrickleError>` | Drop a watermark group by name. |
-| `pgtrickle.enable_inbox_ordering()` | `pgtrickle` | `` | Creates a `next_<inbox>` stream table using DISTINCT ON to surface only the next unprocessed message per aggregate, ordered by the sequence column. |
-| `pgtrickle.enable_outbox()` | `pgtrickle` | `` | # Errors - `OutboxAlreadyEnabled` if outbox is already active for this ST. |
 | `pgtrickle.exec_stream_ddl()` | `pgtrickle` | `bool` | # Example ```sql SELECT pgtrickle.exec_stream_ddl(   'CREATE STREAM TABLE revenue AS SELECT SUM(amount) FROM orders' ); ```. |
 | `pgtrickle.explain_dag()` | `pgtrickle` | `` | Node colours: user STs = blue, self-monitoring STs = green, suspended = red, fused = orange. |
 | `pgtrickle.explain_diff_sql()` | `pgtrickle` | `Option<String>` | Exposed as `pgtrickle.explain_diff_sql(name)`. |
@@ -51,14 +43,10 @@ See [docs/SQL_REFERENCE.md](SQL_REFERENCE.md) for full signatures and examples.
 | `pgtrickle.get_staleness()` | `pgtrickle` | `Option<f64>` |  |
 | `pgtrickle.health_check()` | `pgtrickle` | `TableIterator<` | Exposed as `pgtrickle.health_check()`. |
 | `pgtrickle.health_summary()` | `pgtrickle` | `TableIterator<` | Exposed as `pgtrickle.health_summary()`. |
-| `pgtrickle.inbox_health()` | `pgtrickle` | `pgrx::JsonB` | INBOX-4 (v0.28.0): Return a JSONB health summary for an inbox. |
-| `pgtrickle.inbox_is_my_partition()` | `pgtrickle` | `bool` | Returns true when `aggregate_id` belongs to `worker_id`'s partition out of `total_workers`. |
 | `pgtrickle.is_drained()` | `pgtrickle` | `bool` | A scheduler is considered drained when `DRAIN_COMPLETED >= DRAIN_REQUESTED` in shared memory. |
 | `pgtrickle.list_subscriptions()` | `pgtrickle` | `TableIterator<` | Returns a table with columns (stream_table TEXT, channel TEXT, created_at TIMESTAMPTZ). |
 | `pgtrickle.metrics_summary()` | `pgtrickle` | `TableIterator<` | v0.31.0 (PERF-3): Added `ivm_lock_parse_error_count` — cumulative count of IMMEDIATE-mode lock-mode downgrades due to query parse failures. |
 | `pgtrickle.migrate()` | `pgtrickle` | `String` | This is a convenience function for users who upgrade the extension without using `ALTER EXTENSION pg_trickle UPDATE` — it ensures the catalog schema matches the library expectations. |
-| `pgtrickle.outbox_rows_consumed()` | `pgtrickle` | `` | This updates `last_drained_at` and `last_drained_count` in the catalog and deletes old claim-check delta rows to free storage. |
-| `pgtrickle.outbox_status()` | `pgtrickle` | `pgrx::JsonB` | Includes: `enabled`, `outbox_table`, `row_count`, `oldest_row`, `newest_row`, `retention_hours`, `last_drained_at`, `last_drained_count`. |
 | `pgtrickle.parse_duration_seconds()` | `pgtrickle` | `Option<i64>` | Used by SQL views to compare schedule. |
 | `pgtrickle.pg_trickle_hash()` | `pgtrickle` | `i64` | NULL input is mapped to a deterministic sentinel (`\x00NULL\x00`) — the same encoding used by [`pg_trickle_hash_multi`] — so that rows with NULL-valued group keys receive a non-NULL `__pgt_row_id`. |
 | `pgtrickle.pg_trickle_hash_multi()` | `pgtrickle` | `i64` | The hash output is identical to the previous xxh64-based implementation **except** that it now uses xxh3 which produces different numeric values. |
@@ -75,14 +63,12 @@ See [docs/SQL_REFERENCE.md](SQL_REFERENCE.md) for full signatures and examples.
 | `pgtrickle.refresh_groups_fn()` | `pgtrickle` | `TableIterator<` | Return all user-declared refresh groups with member details. |
 | `pgtrickle.refresh_stream_table()` | `pgtrickle` | `` | Manually trigger a synchronous refresh of a stream table. |
 | `pgtrickle.repair_stream_table()` | `pgtrickle` | `String` | Steps performed (actions taken are summarized in the return text): 1. |
-| `pgtrickle.replay_inbox_messages()` | `pgtrickle` | `i64` | Returns the number of messages reset. |
 | `pgtrickle.reset_fuse()` | `pgtrickle` | `` | Returns nothing on success; raises an ERROR if the stream table does not exist or the fuse is not blown. |
 | `pgtrickle.restore_from_snapshot()` | `pgtrickle` | `` | The stream table must already be registered. |
 | `pgtrickle.restore_stream_tables()` | `pgtrickle` | `Result<(), crate::error::PgTrickleError>` | During a `pg_restore`, `pg_dump` will restore the base storage tables and the `pgtrickle.pgt_stream_tables` catalog, but the necessary CDC triggers and internal wiring will be missing. |
 | `pgtrickle.resume_stream_table()` | `pgtrickle` | `` | Resume a suspended stream table, clearing its consecutive error count and re-enabling automated and manual refreshes. |
 | `pgtrickle.schedule_recommendations()` | `pgtrickle` | `TableIterator<` | PLAN-2 (v0.27.0): Return one schedule recommendation row per registered stream table, sortable by `delta_pct DESC`. |
 | `pgtrickle.scheduler_overhead()` | `pgtrickle` | `TableIterator<` | Computes busy-time ratio, queue depth, avg dispatch latency, and the fraction of CPU spent on self-monitoring STs vs user STs from refresh history. |
-| `pgtrickle.seek_offset()` | `pgtrickle` | `` | OUTBOX-B4 (v0.28.0): Seek a consumer to a specific offset. |
 | `pgtrickle.self_monitoring_status()` | `pgtrickle` | `TableIterator<` | For each of the five expected DF stream tables, reports whether it exists, its current status, refresh mode, and last refresh time. |
 | `pgtrickle.set_stream_table_sla()` | `pgtrickle` | `` | Accepts an interval and stores it as `freshness_deadline_ms`. |
 | `pgtrickle.setup_self_monitoring()` | `pgtrickle` | `` | UX-2: Emits a warm-up hint if `pgt_refresh_history` has fewer than 50 rows. |
