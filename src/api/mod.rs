@@ -961,6 +961,10 @@ fn create_or_replace_stream_table(
     max_delta_fraction: default!(Option<f64>, "NULL"),
     // CITUS-7: Distribution column for the output (stream table storage) table.
     output_distribution_column: default!(Option<&str>, "NULL"),
+    // CORR-1/UX-1 (v0.36.0): temporal IVM mode
+    temporal: default!(bool, false),
+    // CORR-2/UX-3 (v0.36.0): columnar storage backend
+    storage_backend: default!(Option<&str>, "NULL"),
 ) {
     let result = create_or_replace_stream_table_impl(
         name,
@@ -977,6 +981,8 @@ fn create_or_replace_stream_table(
         max_differential_joins,
         max_delta_fraction,
         output_distribution_column,
+        temporal,
+        storage_backend,
     );
     if let Err(e) = result {
         raise_error_with_context(e);
@@ -1113,6 +1119,10 @@ fn create_or_replace_stream_table_impl(
     max_delta_fraction: Option<f64>,
     // CITUS-7: Distribution column for the output table (used only on first creation).
     output_distribution_column: Option<&str>,
+    // CORR-1/UX-1 (v0.36.0): temporal IVM mode (used only on first creation).
+    temporal_mode: bool,
+    // CORR-2/UX-3 (v0.36.0): columnar storage backend (used only on first creation).
+    storage_backend: Option<&str>,
 ) -> Result<(), PgTrickleError> {
     let (schema, table_name) = parse_qualified_name(name)?;
 
@@ -1205,8 +1215,8 @@ fn create_or_replace_stream_table_impl(
                 max_differential_joins,
                 max_delta_fraction,
                 output_distribution_column,
-                temporal_mode: false, // default off for create_or_replace
-                storage_backend: None,
+                temporal_mode,   // passed through from caller
+                storage_backend, // passed through from caller
             })
         }
         Err(e) => Err(e),
