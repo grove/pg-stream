@@ -265,6 +265,7 @@ jobs:
       - name: Run E2E smoke tests (DVM, CDC, scheduler)
         run: |
           cargo nextest run --profile ci \
+            --test 'e2e_*' \
             -E "test(smoke) | test(basic) | test(create_stream_table) | test(health_check)" \
             --test-threads 4
 
