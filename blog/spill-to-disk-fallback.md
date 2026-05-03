@@ -1,4 +1,4 @@
-[← Back to Blog Index](README.md)
+[← Back to Blog Index](https://grove.github.io/pg-trickle/blog/) | [Documentation](https://grove.github.io/pg-trickle/)
 
 # Spill-to-Disk and the Auto-Fallback Safety Net
 

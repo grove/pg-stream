@@ -1,4 +1,4 @@
-[← Back to Blog Index](README.md)
+[← Back to Blog Index](https://grove.github.io/pg-trickle/blog/) | [Documentation](https://grove.github.io/pg-trickle/)
 
 # Migrating from pg_ivm to pg_trickle
 

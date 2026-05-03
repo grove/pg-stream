@@ -1,4 +1,4 @@
-[← Back to Blog Index](README.md)
+[← Back to Blog Index](https://grove.github.io/pg-trickle/blog/) | [Documentation](https://grove.github.io/pg-trickle/)
 
 # The Cost Model: How pg_trickle Decides Whether to Refresh Differentially
 
