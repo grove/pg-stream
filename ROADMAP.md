@@ -92,12 +92,18 @@
 | [v0.44.0](roadmap/v0.44.0.md) | Security hardening: IVM search_path fix, centralized SQL builder, RLS warnings, module decomposition | ✅ Released | Large | [Full details](roadmap/v0.44.0.md-full.md) |
 | [v0.45.0](roadmap/v0.45.0.md) | Operational readiness: preflight functions, scalability infrastructure, CI completeness, CNPG production examples | ✅ Released | Large | [Full details](roadmap/v0.45.0.md-full.md) |
 
-### Embedding & AI Programme (v0.46.x – v0.47.x)
+### `pg_tide` Extraction (v0.46.0)
 
 | Version | Theme | Status | Scope | Full details |
 |---------|-------|--------|------- |---------- |
-| [v0.46.0](roadmap/v0.46.0.md) | Embedding pipeline infrastructure: post-refresh hooks, drift-based reindex, vector monitoring | Planned | Medium | [Full details](roadmap/v0.46.0.md-full.md) |
-| [v0.47.0](roadmap/v0.47.0.md) | Complete embedding programme: sparse/half-precision vector aggregates, hybrid search, embedding_stream_table() API, per-tenant ANN, embedding outbox | Planned | Large | [Full details](roadmap/v0.47.0.md-full.md) |
+| [v0.46.0](roadmap/v0.46.0.md) | Extract `pg_tide`: standalone transactional outbox, inbox, and relay into `trickle-labs/pg-tide` | Planned | Large | [Full details](roadmap/v0.46.0.md-full.md) |
+
+### Embedding & AI Programme (v0.47.x – v0.48.x)
+
+| Version | Theme | Status | Scope | Full details |
+|---------|-------|--------|------- |---------- |
+| [v0.47.0](roadmap/v0.47.0.md) | Embedding pipeline infrastructure: post-refresh hooks, drift-based reindex, vector monitoring | Planned | Medium | [Full details](roadmap/v0.47.0.md-full.md) |
+| [v0.48.0](roadmap/v0.48.0.md) | Complete embedding programme: sparse/half-precision vector aggregates, hybrid search, embedding_stream_table() API, per-tenant ANN, embedding outbox | Planned | Large | [Full details](roadmap/v0.48.0.md-full.md) |
 
 ### Beyond v1.0
 
@@ -159,9 +165,11 @@ v0.44    ─── Security hardening: IVM search_path, SQL builder, RLS warning
     │
 v0.45    ─── Operational readiness: preflight, scalability, CI completeness, CNPG production
     │
-v0.46    ─── Embedding infrastructure: post-refresh actions, drift-based reindex, vector monitoring
+v0.46    ─── Extract pg_tide: standalone outbox/inbox/relay → trickle-labs/pg-tide; attach_outbox() integration
     │
-v0.47    ─── Complete embedding programme: sparse vectors, hybrid search, embedding_stream_table(), per-tenant ANN
+v0.47    ─── Embedding infrastructure: post-refresh actions, drift-based reindex, vector monitoring
+    │
+v0.48    ─── Complete embedding programme: sparse vectors, hybrid search, embedding_stream_table(), per-tenant ANN
     │
 v1.0.0   ─── Stable release, PostgreSQL 19, package registries, signed artifacts, SBOMs
 ```
@@ -213,11 +221,13 @@ correctness (P0 cache-key and placeholder fixes), documentation truthfulness
 tunability (GUC-exposed thresholds, explain diagnostics), security
 (search_path hardening, centralized SQL building), and operational readiness
 (preflight functions, scalability infrastructure, CI completeness). Only after
-this arc does the roadmap resume the embedding programme in v0.46.0–v0.47.0,
+this arc does the roadmap resume the embedding programme in v0.47.0–v0.48.0,
 preserving the pgvector work while aligning the release order with the
 assessment's conclusion that closing correctness and operational gaps matters
 more than adding new surface area. The embedding programme itself is
-consolidated into two releases: v0.46.0 for infrastructure and ANN maintenance,
-and v0.47.0 completing the full feature set (sparse/half-precision aggregates,
+consolidated into two releases: v0.47.0 for infrastructure and ANN maintenance,
+and v0.48.0 completing the full feature set (sparse/half-precision aggregates,
 hybrid search, the ergonomic `embedding_stream_table()` API, per-tenant ANN
-patterns, and outbox-emitted embedding events).
+patterns, and outbox-emitted embedding events). v0.46.0 precedes this arc
+with the extraction of `pg_tide` — moving the outbox, inbox, and relay
+subsystems into a standalone extension at `trickle-labs/pg-tide`.
