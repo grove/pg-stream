@@ -1601,31 +1601,27 @@ pub(super) fn preflight() -> String {
     use crate::config;
     use crate::shmem;
 
-    let mut checks: Vec<serde_json::Value> = Vec::new();
-
     // Check 1: shared_preload_libraries includes pg_trickle
     let preload_ok =
         Spi::get_one::<String>("SELECT current_setting('shared_preload_libraries', true)")
             .unwrap_or(None)
             .map(|s| s.contains("pg_trickle"))
             .unwrap_or(false);
-    checks.push(serde_json::json!({
-        "check": "shared_preload_libraries",
-        "pass": preload_ok,
+    let shared_preload_libraries = serde_json::json!({
+        "ok": preload_ok,
         "detail": if preload_ok {
             "pg_trickle is in shared_preload_libraries".to_string()
         } else {
             "pg_trickle is NOT in shared_preload_libraries — add it and restart".to_string()
         }
-    }));
+    });
 
     // Check 2: Scheduler is running
     let scheduler_running = shmem::scheduler_running();
     let scheduler_enabled = config::pg_trickle_enabled();
     let sched_ok = scheduler_running && scheduler_enabled;
-    checks.push(serde_json::json!({
-        "check": "scheduler_running",
-        "pass": sched_ok,
+    let scheduler_running_check = serde_json::json!({
+        "ok": sched_ok,
         "detail": if !scheduler_enabled {
             "pg_trickle.enabled = off — scheduler is disabled".to_string()
         } else if !scheduler_running {
@@ -1633,7 +1629,7 @@ pub(super) fn preflight() -> String {
         } else {
             "Scheduler is running and enabled".to_string()
         }
-    }));
+    });
 
     // Check 3: max_worker_processes sufficiency
     let (max_workers, active_workers) = Spi::connect(|client| {
@@ -1659,35 +1655,34 @@ pub(super) fn preflight() -> String {
     let pool_size = crate::config::pg_trickle_max_dynamic_refresh_workers() as i64;
     let recommended_min = 8 + pool_size;
     let workers_ok = max_workers >= recommended_min;
-    checks.push(serde_json::json!({
-        "check": "max_worker_processes",
-        "pass": workers_ok,
+    let max_worker_processes = serde_json::json!({
+        "ok": workers_ok,
         "detail": format!(
             "max_worker_processes={}, recommended_min={} (8 + pool_size={}), active_pg_trickle_workers={}",
             max_workers, recommended_min, pool_size, active_workers
         )
-    }));
+    });
 
     // Check 4: wal_level (advisory — only warn if WAL sources exist)
-    let wal_level = Spi::get_one::<String>("SELECT current_setting('wal_level', true)")
+    let wal_level_val = Spi::get_one::<String>("SELECT current_setting('wal_level', true)")
         .unwrap_or(None)
         .unwrap_or_else(|| "unknown".to_string());
+    // pgt_change_tracking.cdc_mode stores the active CDC mechanism per source
     let wal_source_count: i64 = Spi::get_one::<i64>(
-        "SELECT COUNT(*) FROM pgtrickle.pgt_stream_tables WHERE cdc_mode = 'WAL'",
+        "SELECT COUNT(*) FROM pgtrickle.pgt_change_tracking WHERE cdc_mode = 'WAL'",
     )
     .unwrap_or(None)
     .unwrap_or(0);
-    let wal_ok = wal_level == "logical" || wal_source_count == 0;
-    checks.push(serde_json::json!({
-        "check": "wal_level",
-        "pass": wal_ok,
+    let wal_ok = wal_level_val == "logical" || wal_source_count == 0;
+    let wal_level = serde_json::json!({
+        "ok": wal_ok,
         "detail": format!(
             "wal_level={}, wal_cdc_sources={} — {}",
-            wal_level,
+            wal_level_val,
             wal_source_count,
             if wal_ok { "OK" } else { "wal_level must be 'logical' for WAL-mode CDC — run: ALTER SYSTEM SET wal_level = logical" }
         )
-    }));
+    });
 
     // Check 5: max_replication_slots vs WAL sources
     let max_slots: i64 =
@@ -1701,22 +1696,21 @@ pub(super) fn preflight() -> String {
     .unwrap_or(0);
     let slots_available = max_slots - used_slots;
     let slots_ok = wal_source_count == 0 || slots_available > 0;
-    checks.push(serde_json::json!({
-        "check": "replication_slots",
-        "pass": slots_ok,
+    let replication_slots = serde_json::json!({
+        "ok": slots_ok,
         "detail": format!(
             "max_replication_slots={}, used={}, available={}, wal_sources={}",
             max_slots, used_slots, slots_available, wal_source_count
         )
-    }));
+    });
 
     // Check 6: Invalidation ring overflow (capacity signal, not a hard failure)
     let ring_overflows = shmem::invalidation_ring_overflow_count();
     let ring_capacity = config::pg_trickle_invalidation_ring_capacity();
     let ring_ok = ring_overflows == 0;
-    checks.push(serde_json::json!({
-        "check": "invalidation_ring",
-        "pass": ring_ok,
+    let invalidation_ring_overflow = serde_json::json!({
+        "ok": ring_ok,
+        "count": ring_overflows,
         "detail": format!(
             "ring_capacity={}, overflow_count={} — {}",
             ring_capacity,
@@ -1724,33 +1718,34 @@ pub(super) fn preflight() -> String {
             if ring_ok {
                 "No overflows since startup".to_string()
             } else {
-                format!("{}  overflows detected — consider increasing pg_trickle.invalidation_ring_capacity", ring_overflows)
+                format!("{} overflows detected — consider increasing pg_trickle.invalidation_ring_capacity", ring_overflows)
             }
         )
-    }));
+    });
 
     // Check 7: Citus failure total (advisory signal)
     let citus_failures = shmem::citus_worker_failure_total();
     let citus_ok = citus_failures == 0;
-    checks.push(serde_json::json!({
-        "check": "citus_worker_failures",
-        "pass": true, // always advisory
+    let citus_worker_failures = serde_json::json!({
+        "ok": true, // always advisory
         "detail": format!(
             "citus_worker_failure_total={} — {}",
             citus_failures,
             if citus_ok { "No Citus worker threshold crossings since startup" }
             else { "Citus worker failure threshold(s) crossed — check logs for COORD-14 warnings" }
         )
-    }));
-
-    let all_ok = checks.iter().all(|c| c["pass"].as_bool().unwrap_or(false));
-
-    let result = serde_json::json!({
-        "ok": all_ok,
-        "checks": checks
     });
 
-    result.to_string()
+    serde_json::json!({
+        "shared_preload_libraries": shared_preload_libraries,
+        "scheduler_running": scheduler_running_check,
+        "max_worker_processes": max_worker_processes,
+        "wal_level": wal_level,
+        "replication_slots": replication_slots,
+        "invalidation_ring_overflow": invalidation_ring_overflow,
+        "citus_worker_failures": citus_worker_failures,
+    })
+    .to_string()
 }
 
 // ── CACHE-3 (v0.25.0): Manual cache flush ──────────────────────────────
