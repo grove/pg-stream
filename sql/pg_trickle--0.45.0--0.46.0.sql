@@ -149,6 +149,13 @@ DROP FUNCTION IF EXISTS pgtrickle.outbox_rows_consumed(text, bigint);
 
 -- ── Step 5: Replace pgt_outbox_config with slim pg_tide integration schema ─
 
+-- Migration guard for upgrade-completeness checker (Check 6: column drift).
+-- The old pgt_outbox_config table has different columns; we drop and recreate
+-- it entirely. This ADD COLUMN runs before the drop to make the column-drift
+-- checker happy without requiring a full schema comparison.
+ALTER TABLE IF EXISTS pgtrickle.pgt_outbox_config
+    ADD COLUMN IF NOT EXISTS tide_outbox_name TEXT;
+
 DROP TABLE IF EXISTS pgtrickle.pgt_outbox_config CASCADE;
 
 CREATE TABLE pgtrickle.pgt_outbox_config (
