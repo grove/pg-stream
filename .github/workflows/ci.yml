@@ -266,8 +266,7 @@ jobs:
         run: |
           cargo nextest run --profile ci \
             -E "test(smoke) | test(basic) | test(create_stream_table) | test(health_check)" \
-            --test-threads 4 \
-            --features pg18
+            --test-threads 4
 
   # ── E2E tests (full extension in Docker, Linux only) ────────────────────
   # Skipped on PRs (takes ~20 min to build the Docker image). Runs on
