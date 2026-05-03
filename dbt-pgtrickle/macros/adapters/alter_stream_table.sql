@@ -1,5 +1,7 @@
 {#
-  pgtrickle_alter_stream_table(name, schedule, refresh_mode, status, current_info, query, cdc_mode, fuse, fuse_ceiling, fuse_sensitivity)
+  pgtrickle_alter_stream_table(name, schedule, refresh_mode, status, current_info, query, cdc_mode,
+                               fuse, fuse_ceiling, fuse_sensitivity, append_only,
+                               max_differential_joins, max_delta_fraction)
 
   Alters an existing stream table via pgtrickle.alter_stream_table().
   Only sends changes — parameters that match the current state are passed as NULL
@@ -17,8 +19,11 @@
     fuse (str|none): New fuse mode ('off', 'on', 'auto'), or none to keep current
     fuse_ceiling (int|none): New fuse change-count ceiling, or none to keep current
     fuse_sensitivity (int|none): New fuse sensitivity (consecutive observations), or none to keep current
+    append_only (bool|none): Append-only flag, or none to keep current
+    max_differential_joins (int|none): Cap on join count in DIFFERENTIAL mode
+    max_delta_fraction (float|none): Delta/full fallback threshold (0.0–1.0)
 #}
-{% macro pgtrickle_alter_stream_table(name, schedule, refresh_mode, status=none, current_info=none, query=none, cdc_mode=none, fuse=none, fuse_ceiling=none, fuse_sensitivity=none) %}
+{% macro pgtrickle_alter_stream_table(name, schedule, refresh_mode, status=none, current_info=none, query=none, cdc_mode=none, fuse=none, fuse_ceiling=none, fuse_sensitivity=none, append_only=none, max_differential_joins=none, max_delta_fraction=none) %}
   {# Use pre-fetched metadata if available, otherwise look it up #}
   {% set current = current_info if current_info else dbt_pgtrickle.pgtrickle_get_stream_table_info(name) %}
   {% if current %}
@@ -56,6 +61,17 @@
       {% set needs_alter = true %}
     {% endif %}
 
+    {# A46-17: change detection for new options #}
+    {% if append_only is not none %}
+      {% set needs_alter = true %}
+    {% endif %}
+    {% if max_differential_joins is not none %}
+      {% set needs_alter = true %}
+    {% endif %}
+    {% if max_delta_fraction is not none %}
+      {% set needs_alter = true %}
+    {% endif %}
+
     {% if needs_alter %}
       {% call statement('pgtrickle_alter', auto_begin=False, fetch_result=False) %}
         BEGIN;
@@ -68,7 +84,10 @@
           cdc_mode => {% if current.requested_cdc_mode != cdc_mode %}{% if cdc_mode is none %}NULL{% else %}{{ dbt.string_literal(cdc_mode) }}{% endif %}{% else %}NULL{% endif %},
           fuse => {% if fuse is not none and current.fuse_mode != fuse %}{{ dbt.string_literal(fuse) }}{% else %}NULL{% endif %},
           fuse_ceiling => {% if fuse_ceiling is not none and current.fuse_ceiling | string != fuse_ceiling | string %}{{ fuse_ceiling }}{% else %}NULL{% endif %},
-          fuse_sensitivity => {% if fuse_sensitivity is not none and current.fuse_sensitivity | string != fuse_sensitivity | string %}{{ fuse_sensitivity }}{% else %}NULL{% endif %}
+          fuse_sensitivity => {% if fuse_sensitivity is not none and current.fuse_sensitivity | string != fuse_sensitivity | string %}{{ fuse_sensitivity }}{% else %}NULL{% endif %},
+          append_only => {% if append_only is not none %}{{ append_only }}{% else %}NULL{% endif %},
+          max_differential_joins => {% if max_differential_joins is not none %}{{ max_differential_joins }}{% else %}NULL{% endif %},
+          max_delta_fraction => {% if max_delta_fraction is not none %}{{ max_delta_fraction }}{% else %}NULL{% endif %}
         );
         COMMIT;
       {% endcall %}

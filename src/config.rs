@@ -1587,6 +1587,31 @@ pub static PGS_WAL_MAX_LAG_BYTES: GucSetting<i32> = GucSetting::<i32>::new(65_53
 /// Default: 256. Range: 16–256.
 pub static PGS_COST_CACHE_CAPACITY: GucSetting<i32> = GucSetting::<i32>::new(256);
 
+/// A46-7 (v0.45.0): Effective capacity of the invalidation ring buffer.
+///
+/// Controls how many stream-table pgt_ids can be queued for incremental DAG
+/// re-evaluation between scheduler ticks. When the ring overflows, the scheduler
+/// falls back to a full O(V+E) DAG rebuild. The compile-time maximum is 1024;
+/// this GUC can be tuned up to that limit for clusters with high DDL rates.
+///
+/// Must be set in `postgresql.conf` or via `ALTER SYSTEM` before loading
+/// `shared_preload_libraries` (preload-time). Runtime changes have no effect
+/// until restart.
+///
+/// Default: 128. Range: 1–1024.
+pub static PGS_INVALIDATION_RING_CAPACITY: GucSetting<i32> = GucSetting::<i32>::new(128);
+
+/// A46-10 (v0.45.0): Enable lag-aware cross-database worker quota adjustment.
+///
+/// When `on`, the per-database worker quota is boosted proportionally to the
+/// maximum observed stream table lag in the current database. Databases with
+/// more stale stream tables receive a higher quota, allowing lag to recover
+/// faster at the cost of temporarily reducing other databases' entitlements.
+///
+/// Off by default — use static quotas. Enable when running many databases
+/// with heterogeneous workloads where some routinely fall behind.
+pub static PGS_LAG_AWARE_SCHEDULING: GucSetting<bool> = GucSetting::<bool>::new(false);
+
 /// Register all GUC variables. Called from `_PG_init()`.
 pub fn register_gucs() {
     GucRegistry::define_bool_guc(
@@ -3243,6 +3268,33 @@ pub fn register_gucs() {
         GucContext::Suset,
         GucFlags::default(),
     );
+
+    // A46-7: Invalidation ring capacity GUC.
+    GucRegistry::define_int_guc(
+        c"pg_trickle.invalidation_ring_capacity",
+        c"A46-7: Effective capacity of the invalidation ring buffer.",
+        c"Controls how many stream-table pgt_ids can be queued for incremental DAG \
+          re-evaluation between scheduler ticks. When the ring overflows, the scheduler \
+          falls back to a full O(V+E) DAG rebuild. Compile-time maximum is 1024. \
+          Set in postgresql.conf (preload-time). Default: 128.",
+        &PGS_INVALIDATION_RING_CAPACITY,
+        1,    // min
+        1024, // max (matches INVALIDATION_RING_MAX_CAPACITY)
+        GucContext::Postmaster,
+        GucFlags::default(),
+    );
+
+    // A46-10: Lag-aware cross-database scheduling.
+    GucRegistry::define_bool_guc(
+        c"pg_trickle.lag_aware_scheduling",
+        c"A46-10: Enable lag-aware per-database worker quota adjustment.",
+        c"When on, the per-database worker quota is boosted proportionally to observed \
+          stream table lag, so databases with higher staleness receive more refresh capacity. \
+          Off by default (use static quotas).",
+        &PGS_LAG_AWARE_SCHEDULING,
+        GucContext::Suset,
+        GucFlags::default(),
+    );
 }
 
 // ── Convenience accessors ──────────────────────────────────────────────────
@@ -3316,6 +3368,30 @@ pub fn pg_trickle_cost_cache_capacity() -> usize {
     #[cfg(not(test))]
     {
         (PGS_COST_CACHE_CAPACITY.get().clamp(16, 256)) as usize
+    }
+}
+
+/// A46-7: Returns the effective invalidation ring capacity (clamped to 1–1024).
+pub fn pg_trickle_invalidation_ring_capacity() -> usize {
+    #[cfg(test)]
+    {
+        128usize
+    }
+    #[cfg(not(test))]
+    {
+        (PGS_INVALIDATION_RING_CAPACITY.get().clamp(1, 1024)) as usize
+    }
+}
+
+/// A46-10: Returns whether lag-aware cross-database scheduling is enabled.
+pub fn pg_trickle_lag_aware_scheduling() -> bool {
+    #[cfg(test)]
+    {
+        false
+    }
+    #[cfg(not(test))]
+    {
+        PGS_LAG_AWARE_SCHEDULING.get()
     }
 }
 

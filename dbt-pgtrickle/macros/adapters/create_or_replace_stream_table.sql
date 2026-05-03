@@ -1,5 +1,5 @@
 {#
-  pgtrickle_create_or_replace_stream_table(name, query, schedule, refresh_mode, initialize, cdc_mode, partition_by)
+  pgtrickle_create_or_replace_stream_table(name, query, schedule, refresh_mode, initialize, cdc_mode, ...)
 
   Creates or replaces a stream table via pgtrickle.create_or_replace_stream_table().
   Idempotent: creates if absent, no-ops if identical, alters if config/query changed.
@@ -14,8 +14,17 @@
     cdc_mode (str|none): Optional CDC mode override ('auto', 'trigger', 'wal')
     partition_by (str|none): Optional column name to partition the storage table by (RANGE).
                              Only applied on creation; ignored if the stream table already exists.
+    append_only (bool): Skip delete bookkeeping for insert-only sources (default false)
+    temporal (bool): Enable temporal IVM mode (default false)
+    storage_backend (str|none): Columnar backend ('heap','citus','pg_mooncake','unlogged')
+    diamond_consistency (str|none): Diamond dependency consistency ('STRICT','RELAXED')
+    diamond_schedule_policy (str|none): Diamond scheduling policy ('ATOMIC','INDEPENDENT')
+    pooler_compatibility_mode (bool): pgBouncer/Odyssey compatibility (default false)
+    max_differential_joins (int|none): Cap on join count in DIFFERENTIAL mode
+    max_delta_fraction (float|none): Delta/full fallback threshold (0.0–1.0)
+    output_distribution_column (str|none): Citus distribution column for storage table
 #}
-{% macro pgtrickle_create_or_replace_stream_table(name, query, schedule, refresh_mode, initialize, cdc_mode=none, partition_by=none) %}
+{% macro pgtrickle_create_or_replace_stream_table(name, query, schedule, refresh_mode, initialize, cdc_mode=none, partition_by=none, append_only=false, temporal=false, storage_backend=none, diamond_consistency=none, diamond_schedule_policy=none, pooler_compatibility_mode=false, max_differential_joins=none, max_delta_fraction=none, output_distribution_column=none) %}
   {#
     Run create_or_replace_stream_table() outside of dbt's model transaction.
     dbt wraps the model's main statement in BEGIN...ROLLBACK (for testing /
@@ -31,12 +40,17 @@
       {% if schedule is none %}'calculated'{% else %}{{ dbt.string_literal(schedule) }}{% endif %},
       {{ dbt.string_literal(refresh_mode) }},
       {{ initialize }},
-      NULL,
-      NULL,
+      {% if diamond_consistency is none %}NULL{% else %}{{ dbt.string_literal(diamond_consistency) }}{% endif %},
+      {% if diamond_schedule_policy is none %}NULL{% else %}{{ dbt.string_literal(diamond_schedule_policy) }}{% endif %},
       {% if cdc_mode is none %}NULL{% else %}{{ dbt.string_literal(cdc_mode) }}{% endif %},
-      false,
-      false,
-      {% if partition_by is none %}NULL{% else %}{{ dbt.string_literal(partition_by) }}{% endif %}
+      {{ append_only }},
+      {{ pooler_compatibility_mode }},
+      {% if partition_by is none %}NULL{% else %}{{ dbt.string_literal(partition_by) }}{% endif %},
+      {% if max_differential_joins is none %}NULL{% else %}{{ max_differential_joins }}{% endif %},
+      {% if max_delta_fraction is none %}NULL{% else %}{{ max_delta_fraction }}{% endif %},
+      {% if output_distribution_column is none %}NULL{% else %}{{ dbt.string_literal(output_distribution_column) }}{% endif %},
+      {{ temporal }},
+      {% if storage_backend is none %}NULL{% else %}{{ dbt.string_literal(storage_backend) }}{% endif %}
     );
     COMMIT;
   {% endcall %}

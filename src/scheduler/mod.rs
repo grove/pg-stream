@@ -61,6 +61,7 @@ pub mod tier;
 
 use citus::drive_distributed_cdc;
 pub use cost::compute_per_db_quota;
+pub use cost::{compute_per_db_quota_with_lag, lag_aware_quota_boost};
 pub use tier::RefreshTier;
 
 // ── SCAL-1 (v0.25.0): Per-backend catalog snapshot cache ─────────────────

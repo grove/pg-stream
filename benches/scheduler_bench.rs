@@ -112,11 +112,82 @@ fn bench_dag_construction(c: &mut Criterion) {
     group.finish();
 }
 
+/// T-A46-4: Large-DAG incremental rebuild benchmark (1000+ nodes).
+///
+/// Measures incremental rebuild time vs full rebuild time for a DAG with
+/// 1000 stream tables when a small number of nodes change. Validates that
+/// the A46-9 optimization delivers meaningful speedup on large DAGs.
+fn bench_a46_9_incremental_dag_rebuild(c: &mut Criterion) {
+    const LARGE_DAG_SIZE: i64 = 1000;
+
+    // Build a 1000-node DAG with chain structure (some CALCULATED nodes).
+    let mut dag = StDag::new();
+    for pgt_id in 1..=LARGE_DAG_SIZE {
+        // Every 10th node is CALCULATED (no explicit schedule).
+        let schedule = if pgt_id % 10 == 0 {
+            None
+        } else {
+            Some(Duration::from_secs(60))
+        };
+        let node = DagNode {
+            id: NodeId::StreamTable(pgt_id),
+            schedule,
+            effective_schedule: Duration::from_secs(60),
+            name: format!("st_{pgt_id}"),
+            status: StStatus::Active,
+            schedule_raw: if schedule.is_some() {
+                Some("1m".to_string())
+            } else {
+                None
+            },
+        };
+        dag.add_st_node(node);
+        let base_oid = ((pgt_id as u32 - 1) % 100) + 16384;
+        dag.add_edge(NodeId::BaseTable(base_oid), NodeId::StreamTable(pgt_id));
+    }
+    // Initial schedule resolution
+    dag.resolve_calculated_schedule(60);
+
+    let mut group = c.benchmark_group("a46_9_dag_rebuild");
+
+    // Baseline: full O(V) schedule resolution.
+    group.bench_function("full_resolve_1000_nodes", |b| {
+        let mut d = dag.clone();
+        b.iter(|| {
+            d.resolve_calculated_schedule(60);
+            black_box(());
+        });
+    });
+
+    // Incremental: re-resolve only 5 affected nodes.
+    group.bench_function("incremental_resolve_5_of_1000", |b| {
+        let mut d = dag.clone();
+        let affected: Vec<i64> = (1..=5).collect();
+        b.iter(|| {
+            d.resolve_calculated_schedule_incremental(&affected, 60);
+            black_box(());
+        });
+    });
+
+    // Incremental: re-resolve 50 affected nodes (5% of DAG).
+    group.bench_function("incremental_resolve_50_of_1000", |b| {
+        let mut d = dag.clone();
+        let affected: Vec<i64> = (1..=50).collect();
+        b.iter(|| {
+            d.resolve_calculated_schedule_incremental(&affected, 60);
+            black_box(());
+        });
+    });
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_unit_by_id,
     bench_dag_construction,
     bench_a44_5_pool_vs_spawn,
+    bench_a46_9_incremental_dag_rebuild,
 );
 criterion_main!(benches);
 
