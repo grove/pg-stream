@@ -1,7 +1,7 @@
-# Pulling `pgtrickle-relay` Out as a Standalone Project
+# Extracting `pg_tide` — Outbox, Inbox, and Relay as a Standalone Extension
 
 **Date:** 1 May 2026
-**Status:** Draft for discussion (revised after option-A vs option-C re-analysis)
+**Status:** ✅ DECIDED — Option C: extract `pg_tide` into a new repository `trickle-labs/pg-tide`
 **Related:** [REPORT_SUPERFLOUS_FEATURES.md §7.2](REPORT_SUPERFLOUS_FEATURES.md)
 
 > **Reader's note (1 May 2026, revision 4):** the relay binary, outbox, and
@@ -33,29 +33,36 @@
 
 ---
 
-## TL;DR (revised)
+## TL;DR — Decision
 
-**Recommended:** **Option C** — ship a new standalone extension `pg_tide`
-that owns generic transactional outbox + inbox tables, retention, the relay
-catalog, and the relay binary. `pg_trickle` becomes a *consumer* of it: a thin
+> **We are going with Option C.**
+> Extract `pg_tide` into a new repository `trickle-labs/pg-tide`.
+
+**Decision: Option C** — ship a new standalone extension `pg_tide` that owns
+generic transactional outbox + inbox tables, retention, the relay catalog, and
+the relay binary. `pg_trickle` becomes a *consumer* of it: a thin
 `pg_trickle.attach_outbox()` wrapper installs a refresh-time hook that calls
 `tide.outbox_publish()` from inside the refresh transaction. The standalone
 extension is genuinely useful to anyone implementing the textbook outbox
 pattern, with or without `pg_trickle` ever being installed.
 
-**Effort: ~1 week** as a clean break (no shims, no migration tooling) since
-the relay/outbox/inbox features have no known users today. Send a one-line
-"is anyone using these?" check to the discussions board before merging — if
-real users surface, the migration plan from revision 3 gets restored and the
-estimate goes back to ~2 weeks.
+**Effort: ~6 working days** as a clean break (no shims, no migration tooling)
+since the relay/outbox/inbox features have no known users today. Send a
+one-line "is anyone using these?" check to the discussions board before
+merging — if real users surface, the migration plan from revision 3 gets
+restored and the estimate goes back to ~2 weeks.
 
-The original three options (A, B, the no-op C) and the inventory of today's
-coupling surface are kept below as the reference material that informs the new
-recommendation.
+**The active plan is §7 below.** The original three options (A, B, C-original)
+and the inventory of today's coupling surface are kept in §§1–6 as the
+reference material that led to this decision.
 
 ---
 
-## TL;DR (original draft, kept for reference)
+## ~~TL;DR~~ (original draft, superseded — Option B no longer recommended)
+
+> **Kept for reference only.** The recommendation below (Option B) was
+> superseded in revision 3. The project is going with Option C — see the
+> "TL;DR — Decision" section above.
 
 **Yes — extracting the relay is feasible, low-risk, and worth doing for 1.0.**
 The relay is already a self-contained Rust crate with zero Rust-level
@@ -232,7 +239,7 @@ option B prevents doing C later.
 
 ---
 
-## 3. Detailed plan for option B
+## 3. ~~Detailed plan for option B~~ (superseded — see §7 for the active plan)
 
 ### 3.1 New repository layout (`grove/pg-trickle-relay`)
 
@@ -425,10 +432,14 @@ loose-coupling boundary that justifies the split.
 
 ---
 
-## 6. Recommendation and next steps
+## 6. ~~Recommendation and next steps~~ (superseded by Option C — see §7)
 
-**Recommendation:** Adopt **option B**. Schedule the cut for the v1.0
-preparation window.
+> ⚠️ **This section recommended Option B. That recommendation has been
+> superseded. The project is going with Option C (`pg_tide` standalone
+> extension). See §7 for the active plan.**
+
+**Original recommendation (now superseded):** Adopt **option B**. Schedule the
+cut for the v1.0 preparation window.
 
 **Suggested order of work:**
 
@@ -460,7 +471,14 @@ preparation window.
 
 ---
 
-## 7. Option C, properly developed — a generic `pg_tide` extension
+## 7. The plan — Option C: a standalone `pg_tide` extension
+
+> **This is the active plan.** Sections 1–6 above are historical context;
+> this section is what we are actually building.
+
+**Repository:** https://github.com/trickle-labs/pg-tide
+**Local checkout:** `../pg-tide` (relative to this repo)
+**Status:** Repository created ✅ — ready for implementation
 
 The original framing of option C ("also move the writer") missed the point.
 The point of pulling something out is *not* to make the core repo smaller
@@ -516,7 +534,7 @@ layers that are bundled together today:
 
 ### 7.2 The proposed standalone extension: `pg_tide`
 
-A new repo `grove/pg-tide` containing:
+A new repo `trickle-labs/pg-tide` containing:
 
 ```
 pg-tide/
@@ -647,7 +665,7 @@ soft-depending on `pg_tide`. Concretely:
   IF to_regproc('tide.outbox_create(...)') IS NULL THEN
       RAISE EXCEPTION 'pg_trickle.attach_outbox() requires the pg_tide
                        extension. Install it with: CREATE EXTENSION pg_tide;'
-          USING HINT = 'See https://github.com/grove/pg-tide';
+          USING HINT = 'See https://github.com/trickle-labs/pg-tide';
   END IF;
   ```
   Clear actionable error rather than a `function does not exist` cryptic
@@ -761,30 +779,55 @@ undocumented internal API that gets restructured before 1.0.
    tables. Outbox/inbox/relay become a separate product that integrates
    with it.
 
-### 7.9 Suggested order of work for option C-revised
+### 7.9 Work plan
 
-1. **Days 1–2** — Stand up the new `pg-tide` repo. Lift
-   [src/api/outbox.rs](../src/api/outbox.rs) and
-   [src/api/inbox.rs](../src/api/inbox.rs) into the new extension; collapse
-   into a single `tide` schema; replace the `create_stream_table` calls in
-   the inbox helper with plain `CREATE VIEW`. Carry over tests.
-2. **Day 3** — Lift the relay catalog SQL from
-   [src/lib.rs](../src/lib.rs#L1095-L1335) into `pg_tide`'s extension
-   crate. Lift `pgtrickle-relay/` into the new repo as the `pg-tide`
-   binary.
-3. **Day 4** — In this repo, *delete* `enable_outbox()` / `create_inbox()`
-   and the relay catalog SQL outright (no shims — see §7.7). Add the new
-   thin `attach_outbox()` wrapper that delegates to `pg_tide` (refresh-time
-   publisher; this is the *only* integration point — see §7.2). No
-   `attach_inbox()` or `materialize_inbox_views()` is needed: inbox helper
-   views stay as plain VIEWs in `pg_tide` and `pg_trickle` does not wrap
-   the inbox API at all.
-4. **Day 5** — Integration tests that exercise both "with `pg_trickle`"
-   and "without `pg_trickle`" deployments; benchmark the SPI hop on the
-   refresh hot path. Documentation: cross-link the two repos; rewrite
-   docs/SQL_REFERENCE.md outbox/inbox sections to point at `pg_tide`.
-   CHANGELOG entry calls out the rename as a breaking change with a
-   one-line equivalence table. Pre-release tags on both repos.
+> **Starting point:** `https://github.com/trickle-labs/pg-tide` has been
+> created and checked out at `../pg-tide`. It currently contains only a
+> LICENSE file. The repo skeleton step is done; begin at step 1 below.
+
+1. **Days 1–2 — Bootstrap the extension in `../pg-tide`**
+   - Initialise the workspace: add `Cargo.toml`, `extension/` and `relay/`
+     crates, `pg_tide.control`, `justfile`.
+   - Lift [src/api/outbox.rs](../src/api/outbox.rs) and
+     [src/api/inbox.rs](../src/api/inbox.rs) into the new extension;
+     collapse into a single `tide` schema; replace the
+     `create_stream_table` calls in the inbox helpers with plain
+     `CREATE VIEW`. Carry over tests.
+   - `git mv plans/relay/*` into `../pg-tide/plans/`; sweep
+     `pgtrickle-relay` → `pg-tide` in those docs.
+2. **Day 3 — Complete the relay lift**
+   - Lift the relay catalog SQL from
+     [src/lib.rs](../src/lib.rs#L1095-L1335) into `pg_tide`'s extension
+     crate.
+   - Move `pgtrickle-relay/` into `../pg-tide/relay/` using
+     `git filter-repo --subdirectory-filter pgtrickle-relay` to preserve
+     history.
+3. **Day 4 — Cut from this repo**
+   - *Delete* `enable_outbox()` / `create_inbox()` and the relay catalog
+     SQL outright (no shims — see §7.7).
+   - Add the thin `attach_outbox()` wrapper that delegates to
+     `tide.outbox_publish()` via SPI (the only integration point — §7.2).
+     No `attach_inbox()` or `materialize_inbox_views()` needed.
+   - Write `sql/pg_trickle--0.42.0--1.0.0.sql` dropping all old objects.
+   - Remove `pgtrickle-relay` from workspace `members` in
+     [Cargo.toml](../Cargo.toml), delete [Dockerfile.relay](../Dockerfile.relay),
+     remove the 4 relay CI jobs from
+     [.github/workflows/release.yml](../.github/workflows/release.yml),
+     drop the SQS security exception from
+     [.github/workflows/security.yml](../.github/workflows/security.yml).
+4. **Day 5a — Documentation**
+   - Move `docs/OUTBOX.md`, `docs/INBOX.md`, `docs/RELAY.md`,
+     `docs/RELAY_GUIDE.md` to `../pg-tide/docs/`; rewrite to lead with
+     the generic pattern.
+   - Trim ~12 docs in this repo (SQL_REFERENCE, ARCHITECTURE, WHATS_NEW,
+     etc.) to a "see pg-tide" pointer.
+   - CHANGELOG entry: call the rename a breaking change with a one-line
+     equivalence table.
+5. **Day 5b — CI / packaging**
+   - Clone CI templates into `../pg-tide` (lint, test, coverage, benchmarks,
+     release — see §7.10 for the full list).
+   - Verify both repos build clean; cut pre-release tags on both.
+
 
 ### 7.10 Ancillary assets that need to move, be rewritten, or be deleted
 
