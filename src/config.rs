@@ -3276,11 +3276,11 @@ pub fn register_gucs() {
         c"Controls how many stream-table pgt_ids can be queued for incremental DAG \
           re-evaluation between scheduler ticks. When the ring overflows, the scheduler \
           falls back to a full O(V+E) DAG rebuild. Compile-time maximum is 1024. \
-          Set in postgresql.conf (preload-time). Default: 128.",
+          Can be set in postgresql.conf or with SIGHUP (no restart needed). Default: 128.",
         &PGS_INVALIDATION_RING_CAPACITY,
         1,    // min
         1024, // max (matches INVALIDATION_RING_MAX_CAPACITY)
-        GucContext::Postmaster,
+        GucContext::Sighup,
         GucFlags::default(),
     );
 
