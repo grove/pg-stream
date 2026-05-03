@@ -4,7 +4,7 @@
 
 # SQL API Reference — pg_trickle
 
-**99 SQL-callable functions** discovered via `#[pg_extern]` in `src/`.
+**100 SQL-callable functions** discovered via `#[pg_extern]` in `src/`.
 
 See [docs/SQL_REFERENCE.md](SQL_REFERENCE.md) for full signatures and examples.
 
@@ -68,6 +68,7 @@ See [docs/SQL_REFERENCE.md](SQL_REFERENCE.md) for full signatures and examples.
 | `pgtrickle.pgt_scc_status()` | `pgtrickle` | `TableIterator<` | Returns one row per SCC, summarising its members, most recent fixpoint iteration count, and last convergence time. |
 | `pgtrickle.pgt_status()` | `pgtrickle` | `TableIterator<` | Returns a summary row per stream table including schedule configuration, data timestamp, and computed staleness interval. |
 | `pgtrickle.pgtrickle_refresh_stats()` | `pgtrickle` | `TableIterator<` | Exposed as `pgtrickle.pgtrickle_refresh_stats()`. |
+| `pgtrickle.preflight()` | `pgtrickle` | `String` | Returns a JSON string with one entry per check: `pass` (bool), `check` (name), `detail` (human-readable message). |
 | `pgtrickle.rebuild_cdc_triggers()` | `pgtrickle` | `&'static str` | Returns `'done'` on success. |
 | `pgtrickle.recommend_schedule()` | `pgtrickle` | `pgrx::JsonB` | PLAN-1 (v0.27.0): Return a schedule recommendation for the given stream table as a JSONB object with keys: `recommended_interval_seconds`, `peak_window_cron`, `confidence` (0–1), `reasoning`. |
 | `pgtrickle.refresh_efficiency()` | `pgtrickle` | `Result<` | Returns operational metrics for each stream table: FULL vs DIFFERENTIAL timing, change ratios, speedup factor, and refresh counts. |

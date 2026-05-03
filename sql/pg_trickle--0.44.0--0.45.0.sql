@@ -49,10 +49,26 @@
 -- for the new ring size to take effect.
 
 -- ── Drop existing worker_pool_status (return type changed) ──────────────
--- The return type changed (4 new columns), so we must DROP and let the
--- shared library install the new version.
+-- The return type changed (4 new columns), so we must DROP and CREATE NEW.
 DROP FUNCTION IF EXISTS pgtrickle.worker_pool_status();
 
--- The shared library update installs the new definitions for both
--- worker_pool_status() and preflight() automatically when the extension
--- is updated via ALTER EXTENSION pg_trickle UPDATE.
+-- ── Create new worker_pool_status with extended return type ──────────────
+CREATE FUNCTION pgtrickle."worker_pool_status"() RETURNS TABLE (
+        "active_workers" INT,
+        "max_workers" INT,
+        "per_db_cap" INT,
+        "parallel_mode" TEXT,
+        "idle_workers" INT,
+        "last_scheduler_tick_unix" bigint,
+        "ring_overflow_count" bigint,
+        "citus_failure_total" bigint
+)
+STRICT
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'worker_pool_status_wrapper';
+
+-- ── Create new preflight() function ─────────────────────────────────────
+CREATE FUNCTION pgtrickle."preflight"() RETURNS TEXT
+STRICT
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'preflight_wrapper';

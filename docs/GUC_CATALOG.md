@@ -4,7 +4,7 @@
 
 # GUC Reference — pg_trickle
 
-**130 configuration parameters** extracted from `src/config.rs`.
+**132 configuration parameters** extracted from `src/config.rs`.
 
 See [docs/CONFIGURATION.md](CONFIGURATION.md) for full descriptions and usage examples.
 
@@ -40,6 +40,7 @@ See [docs/CONFIGURATION.md](CONFIGURATION.md) for full descriptions and usage ex
 | `(registration pending — PGS_CONSUMER_DEAD_THRESHOLD_HOURS)` | `i32` | `24` | OUTBOX-B5 (v0.28.0): Hours of no heartbeat after which a consumer is considered dead. |
 | `(registration pending — PGS_CONSUMER_STALE_OFFSET_THRESHOLD_DAYS)` | `i32` | `7` | OUTBOX-B5 (v0.28.0): Days of no progress after which a consumer offset is considered stale. |
 | `(registration pending — PGS_COST_MODEL_SAFETY_MARGIN)` | `f64` | `0.8` | Default 0.8 — DIFFERENTIAL is chosen unless it's estimated to cost more than 80% of FULL. |
+| `(registration pending — PGS_DEEP_JOIN_L0_SCAN_THRESHOLD)` | `i32` | `4` | Default: 4 (matches the previously hardcoded `DEEP_JOIN_L0_SCAN_THRESHOLD`). |
 | `(registration pending — PGS_DEFAULT_SCHEDULE_SECONDS)` | `i32` | `1` | Default effective schedule (in seconds) for isolated CALCULATED stream tables that have no downstream dependents. |
 | `(registration pending — PGS_DELTA_AMPLIFICATION_THRESHOLD)` | `f64` | `100.0` | Set to 0.0 to disable amplification detection. |
 | `(registration pending — PGS_DELTA_ENABLE_NESTLOOP)` | `bool` | `true` | When enabled, `SET LOCAL enable_nestloop = off` is applied inside `execute_delta_sql` before running the generated delta SQL. |
@@ -105,6 +106,7 @@ See [docs/CONFIGURATION.md](CONFIGURATION.md) for full descriptions and usage ex
 | `(registration pending — PGS_OUTBOX_SKIP_EMPTY_DELTA)` | `bool` | `true` | OUTBOX-3 (v0.28.0): When true, skip writing an outbox row for empty-delta refreshes. |
 | `(registration pending — PGS_OUTBOX_STORAGE_CRITICAL_MB)` | `i32` | `1024` | OUTBOX-5 (v0.28.0): Storage threshold (MB) at which outbox is considered critical. |
 | `(registration pending — PGS_PARALLEL_REFRESH_MODE)` | `Option\<std::ffi::CString` | `"on"` | - `"on"` (default as of v0.11.0): Enable true parallel refresh via   dynamic workers. |
+| `(registration pending — PGS_PART3_MAX_SCAN_COUNT)` | `i32` | `5` | Default: 5 (matches the previously hardcoded `PART3_MAX_SCAN_COUNT`). |
 | `(registration pending — PGS_PER_DATABASE_WORKER_QUOTA)` | `i32` | `0` | Set to 0 (default) to disable per-database quotas — all databases share `max_dynamic_refresh_workers` on a first-come-first-served basis, bounded per coordinator by `max_concurrent_refreshes`. |
 | `(registration pending — PGS_PLANNER_AGGRESSIVE)` | `bool` | `true` | Replaces the old `merge_planner_hints` and `merge_work_mem_mb` GUCs (both still accepted but emit deprecation warnings). |
 | `(registration pending — PGS_PREDICTION_MIN_SAMPLES)` | `i32` | `5` | When fewer than this many data points exist, the predictor falls back to the existing fixed-threshold logic. |
@@ -133,11 +135,11 @@ See [docs/CONFIGURATION.md](CONFIGURATION.md) for full descriptions and usage ex
 | `(registration pending — PGS_USE_SQLSTATE_CLASSIFICATION)` | `bool` | `true` | The SQLSTATE-based classification is locale-safe: it works correctly regardless of `lc_messages`. |
 | `(registration pending — PGS_VOLATILE_FUNCTION_POLICY)` | `Option\<std::ffi::CString` | `"reject"` | Controls how volatile functions in defining queries are handled: - `"reject"` (default): Error — volatile functions are rejected. |
 | `(registration pending — PGS_WAKE_DEBOUNCE_MS)` | `i32` | `10` | **Note:** `pg_trickle.event_driven_wake` is deprecated and has no effect. |
+| `(registration pending — PGS_WAL_MAX_CHANGES_PER_POLL)` | `i32` | `10000` | Default: 10 000. |
 | `(registration pending — PGS_WAL_TRANSITION_TIMEOUT)` | `i32` | `300` | Maximum time (seconds) to wait for the WAL decoder to catch up during transition from triggers to WAL-based CDC before falling back to triggers. |
 | `(registration pending — PGS_WATERMARK_HOLDBACK_TIMEOUT)` | `i32` | `0` | Set to 0 to disable stuck-watermark detection (default). |
 | `(registration pending — PGS_WORKER_POOL_SIZE)` | `i32` | `0` | Set to 0 (default) to use the existing spawn-per-task model. |
-| `pg_trickle.enabled` | `i32` | `5` | Default: 5 (matches the previously hardcoded `PART3_MAX_SCAN_COUNT`). |
-| `pg_trickle.enabled` | `i32` | `4` | Default: 4 (matches the previously hardcoded `DEEP_JOIN_L0_SCAN_THRESHOLD`). |
-| `pg_trickle.enabled` | `i32` | `10000` | Default: 10 000. |
 | `pg_trickle.enabled` | `i32` | `65536` | Default: 65 536 (64 KiB). |
 | `pg_trickle.enabled` | `i32` | `256` | Default: 256. |
+| `pg_trickle.enabled` | `i32` | `128` | Default: 128. |
+| `pg_trickle.enabled` | `bool` | `false` | Off by default — use static quotas. |
