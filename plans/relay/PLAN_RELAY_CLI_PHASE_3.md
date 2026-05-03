@@ -458,18 +458,108 @@ via Fivetran's PostgreSQL connector (reads from stream tables directly).
 
 ### B.1 Apache Pulsar
 
-Source + Sink. Growing alternative to Kafka with superior multi-tenancy
-and geo-replication. See Phase 2 § A.5 for full design.
+**Why:** Growing alternative to Kafka with superior multi-tenancy,
+geo-replication, and tiered storage. Adopted by Splunk, Yahoo, Tencent,
+and Verizon Media. Offers both streaming and queuing semantics.
 
-**Crate:** `pulsar`  
+**Crate:** `pulsar` (official Rust client)
+
+**Direction:** Source + Sink (bidirectional)
+
+#### Sink Configuration
+
+```toml
+[sink.pulsar]
+url = "pulsar://localhost:6650"
+topic = "persistent://public/default/pgtrickle-events"
+# topic_template = "persistent://public/default/pgtrickle.{stream_table}"
+# producer_name = "pgtrickle-relay"
+# send_timeout_ms = 30000
+# batch_enabled = true
+# batch_max_messages = 1000
+# compression = "lz4"                      # none | lz4 | zlib | zstd | snappy
+# auth_token = "eyJhbGci..."
+# tls_cert_file = "/etc/pulsar/cert.pem"
+# tls_key_file = "/etc/pulsar/key.pem"
+```
+
+**Dedup:** Uses Pulsar's built-in message deduplication (producer-side).
+The dedup key is set as the `sequence_id` on the producer.
+
+#### Source Configuration
+
+```toml
+[source.pulsar]
+url = "pulsar://localhost:6650"
+topic = "persistent://public/default/external-events"
+subscription = "pgtrickle-inbox"
+# subscription_type = "Shared"             # Exclusive | Shared | Failover | Key_Shared
+# initial_position = "Earliest"            # Earliest | Latest
+# ack_timeout_ms = 30000
+# negative_ack_redelivery_delay_ms = 1000
+# dead_letter_topic = "persistent://public/default/pgtrickle-dlq"
+# max_redeliver_count = 5
+```
+
+**Consumption model:** Creates a Pulsar consumer with the specified
+subscription type. Messages are acknowledged individually after successful
+inbox write. Supports automatic DLQ routing.
+
 **Effort:** 2d
 
 ### B.2 Apache Arrow Flight / gRPC
 
-Source + Sink. High-performance columnar data exchange. Emerging standard
-for zero-copy data movement. See Phase 2 § A.10 for full design.
+**Why:** Language-agnostic, high-performance columnar data exchange.
+Emerging standard for data movement between systems. Used by Dremio,
+Databricks, DuckDB, and Ballista. Enables pg-trickle to feed any
+Arrow Flight-compatible consumer without serialisation overhead.
 
-**Crate:** `arrow-flight` + `tonic`  
+**Crate:** `arrow-flight` + `tonic`
+
+**Direction:** Sink (server or client mode) + Source (client mode)
+
+#### Sink Configuration (Client Mode — Push to Flight Server)
+
+```toml
+[sink.arrow-flight]
+url = "grpc://localhost:50051"
+# tls = false
+# auth_token = "Bearer ..."
+# metadata:
+#   x-custom-header = "value"
+
+# Batching
+batch_size = 10000                         # rows per RecordBatch
+# compression = "zstd"                     # none | lz4 | zstd
+```
+
+#### Sink Configuration (Server Mode — Serve to Flight Clients)
+
+```toml
+[sink.arrow-flight-server]
+listen_addr = "0.0.0.0:50051"
+# tls_cert = "/etc/flight/cert.pem"
+# tls_key = "/etc/flight/key.pem"
+# max_batch_age_seconds = 5               # buffer window before serving
+```
+
+**Server mode** turns the relay into an Arrow Flight server that downstream
+consumers connect to. Useful for feeding Spark, DuckDB, or custom analytics
+pipelines without intermediate storage.
+
+#### Source Configuration
+
+```toml
+[source.arrow-flight]
+url = "grpc://upstream:50051"
+# ticket = "my-stream-ticket"
+# auth_token = "Bearer ..."
+```
+
+**Schema handling:** Arrow schemas are derived from the JSON payload
+structure. For stable schemas, a user-provided `.arrow` schema file is
+supported.
+
 **Effort:** 2.5d
 
 ### B.3 AMQP 1.0
@@ -568,23 +658,108 @@ on Snowflake or BigQuery. Uses bulk loading APIs for efficiency.
 
 ### C.1 Relay Dashboard
 
-Terminal-based dashboard using `ratatui` for monitoring pipeline health,
-throughput, latency, and errors in real-time. See Phase 2 § B.11 for design.
+**Problem:** A dashboard for the relay would help operators monitor pipeline
+health, throughput, and errors in real-time. The `pgtrickle-tui` crate that
+previously provided a stream-table dashboard has been removed from the project.
+
+**Design:** Add a `pgtrickle-relay dashboard` subcommand backed by ratatui.
+
+**Dashboard panels:**
+- Pipeline overview (mode, source, sink, status)
+- Throughput graph (messages/sec, bytes/sec)
+- Latency graph (p50, p95, p99 poll-to-publish)
+- Consumer lag gauge
+- Error rate and recent errors
+- DLQ status (if enabled)
+- Circuit breaker state
+- Active connections health
+
+**Implementation:** Use the `ratatui` crate directly in `pgtrickle-relay`.
+Read metrics from the relay's Prometheus endpoint (scrape `/metrics`).
 
 **Effort:** 2d
 
 ### C.2 Plugin System (WASM Backends)
 
-WASM-based plugin system using `wasmtime` for dynamic backend loading.
-Enables proprietary messaging systems without rebuilding the relay binary.
-See Phase 2 § B.12 for the WIT interface design.
+**Problem:** The compiled-in backend approach requires users to rebuild
+the relay binary to add custom backends. Some organisations have
+proprietary messaging systems or custom protocols.
+
+**Design:** A WASM-based plugin system using `wasmtime` for dynamic
+backend loading.
+
+```toml
+[plugins]
+[[plugins.sinks]]
+name = "custom-crm"
+path = "/opt/plugins/crm-sink.wasm"
+config = { api_url = "https://crm.internal/events", api_key = "..." }
+
+[[plugins.sources]]
+name = "proprietary-mq"
+path = "/opt/plugins/pmq-source.wasm"
+config = { broker = "pmq://internal:9999" }
+```
+
+**Plugin interface:** A WASM component model interface that mirrors the
+Source/Sink traits:
+
+```wit
+interface sink {
+    record relay-message {
+        dedup-key: string,
+        subject: string,
+        payload: string,
+        op: string,
+    }
+
+    resource sink-instance {
+        constructor(config: string);
+        connect: func() -> result<_, string>;
+        publish: func(batch: list<relay-message>) -> result<u32, string>;
+        is-healthy: func() -> bool;
+        close: func() -> result<_, string>;
+    }
+}
+```
 
 **Effort:** 5d
 
 ### C.3 Encryption Envelope (KMS)
 
-Optional envelope encryption (AES-256-GCM) with KMS integration (AWS KMS,
-GCP KMS, Azure Key Vault). See Phase 2 § B.13 for the envelope format.
+**Problem:** Some compliance regimes (HIPAA, PCI-DSS, GDPR) require
+payload encryption in transit even when TLS is in use (defence in depth).
+
+**Design:** Optional envelope encryption before publishing to sink.
+Messages are encrypted with a data encryption key (DEK), and the DEK
+is encrypted with a key encryption key (KEK) from a KMS.
+
+```toml
+[encryption]
+enabled = true
+provider = "aws-kms"                      # aws-kms | gcp-kms | azure-keyvault | local
+# key_id = "arn:aws:kms:us-east-1:123456789012:key/..."
+# local_key_file = "/etc/relay/encryption.key"   # 256-bit AES key
+algorithm = "aes-256-gcm"
+# encrypt_fields = ["payload"]            # default: encrypt entire message
+# key_rotation_interval_hours = 24
+```
+
+**Envelope format:**
+
+```json
+{
+  "v": 1,
+  "enc": "aes-256-gcm",
+  "dek": "<base64-encrypted-DEK>",
+  "iv": "<base64-IV>",
+  "ct": "<base64-ciphertext>",
+  "tag": "<base64-auth-tag>"
+}
+```
+
+Consumers decrypt using the KMS to unwrap the DEK, then AES-GCM decrypt
+the ciphertext.
 
 **Effort:** 2d
 

@@ -15,12 +15,10 @@
   - [A.2 Amazon Kinesis Data Streams](#a2-amazon-kinesis-data-streams)
   - [A.3 Azure Service Bus](#a3-azure-service-bus)
   - [A.4 Azure Event Hubs](#a4-azure-event-hubs)
-  - [A.5 Apache Pulsar](#a5-apache-pulsar)
   - [A.6 MQTT (v5)](#a6-mqtt-v5)
   - [A.7 Elasticsearch / OpenSearch](#a7-elasticsearch--opensearch)
   - [A.8 Object Storage (S3 / GCS / Azure Blob)](#a8-object-storage-s3--gcs--azure-blob)
   - [A.9 ClickHouse](#a9-clickhouse)
-  - [A.10 Apache Arrow Flight / gRPC](#a10-apache-arrow-flight--grpc)
   - [A.11 Singer Protocol (Meltano SDK)](#a11-singer-protocol-meltano-sdk)
   - [A.12 Webhook Flavors (n8n / Zapier)](#a12-webhook-flavors-n8n--zapier)
   - [Backend Priority Matrix](#backend-priority-matrix)
@@ -35,9 +33,9 @@
   - [B.8 SIGHUP Reload (extends Phase 1 hot-reload)](#b8-sighup-reload)
   - [B.9 Dry-Run & Replay Mode](#b9-dry-run--replay-mode)
   - [B.10 OpenTelemetry Tracing](#b10-opentelemetry-tracing)
-  - [B.11 Relay Dashboard](#b11-relay-dashboard)
-  - [B.12 Plugin System (Dynamic Backends)](#b12-plugin-system-dynamic-backends)
-  - [B.13 Encryption Envelope](#b13-encryption-envelope)
+  - [B.11 Relay Dashboard](#b11-relay-dashboard) *(Phase 3)*
+  - [B.12 Plugin System (Dynamic Backends)](#b12-plugin-system-dynamic-backends) *(Phase 3)*
+  - [B.13 Encryption Envelope](#b13-encryption-envelope) *(Phase 3)*
   - [B.14 Webhook Signature Verification](#b14-webhook-signature-verification)
 - [Part E — Connector Ecosystem Integration (Phase 3)](#part-e--connector-ecosystem-integration-phase-3)
 - [Part C — Testing Strategy](#part-c--testing-strategy)
@@ -64,11 +62,11 @@ backends (same minus stdout, plus stdin). Phase 2 adds **10 new backends**
 covering all three major cloud providers, the IoT ecosystem, analytics
 databases, and data lake storage.
 
-Beyond backends, Phase 2 introduces **13 operational improvements**: dead-letter
+Beyond backends, Phase 2 introduces **10 operational improvements**: dead-letter
 queues, schema registry integration, message transforms, content-based routing,
 rate limiting, circuit breakers, SIGHUP config reload, dry-run/replay mode,
-OpenTelemetry tracing, a relay dashboard, a plugin system, payload encryption,
-and webhook signature verification.
+OpenTelemetry tracing, and webhook signature verification. The relay dashboard,
+plugin system, and payload encryption are deferred to Phase 3.
 
 > **Note:** Multi-pipeline support and database-driven hot-reload are already
 > part of Phase 1 (v0.25.0) — the relay natively runs multiple independent
@@ -274,52 +272,7 @@ checkpointing. Checkpoints stored in PostgreSQL or Azure Blob Storage.
 
 ### A.5 Apache Pulsar
 
-**Why:** Growing alternative to Kafka with superior multi-tenancy,
-geo-replication, and tiered storage. Adopted by Splunk, Yahoo, Tencent,
-and Verizon Media. Offers both streaming and queuing semantics.
-
-**Crate:** `pulsar` (official Rust client)
-
-**Direction:** Source + Sink (bidirectional)
-
-#### Sink Configuration
-
-```toml
-[sink.pulsar]
-url = "pulsar://localhost:6650"
-topic = "persistent://public/default/pgtrickle-events"
-# topic_template = "persistent://public/default/pgtrickle.{stream_table}"
-# producer_name = "pgtrickle-relay"
-# send_timeout_ms = 30000
-# batch_enabled = true
-# batch_max_messages = 1000
-# compression = "lz4"                      # none | lz4 | zlib | zstd | snappy
-# auth_token = "eyJhbGci..."
-# tls_cert_file = "/etc/pulsar/cert.pem"
-# tls_key_file = "/etc/pulsar/key.pem"
-```
-
-**Dedup:** Uses Pulsar's built-in message deduplication (producer-side).
-The dedup key is set as the `sequence_id` on the producer.
-
-#### Source Configuration
-
-```toml
-[source.pulsar]
-url = "pulsar://localhost:6650"
-topic = "persistent://public/default/external-events"
-subscription = "pgtrickle-inbox"
-# subscription_type = "Shared"             # Exclusive | Shared | Failover | Key_Shared
-# initial_position = "Earliest"            # Earliest | Latest
-# ack_timeout_ms = 30000
-# negative_ack_redelivery_delay_ms = 1000
-# dead_letter_topic = "persistent://public/default/pgtrickle-dlq"
-# max_redeliver_count = 5
-```
-
-**Consumption model:** Creates a Pulsar consumer with the specified
-subscription type. Messages are acknowledged individually after successful
-inbox write. Supports automatic DLQ routing.
+> **Deferred to Phase 3.** Full design: [PLAN_RELAY_CLI_PHASE_3.md § B.1](./PLAN_RELAY_CLI_PHASE_3.md#b1-apache-pulsar)
 
 ### A.6 MQTT (v5)
 
@@ -543,56 +496,7 @@ throughput. The relay supports this via the `async_insert` setting.
 
 ### A.10 Apache Arrow Flight / gRPC
 
-**Why:** Language-agnostic, high-performance columnar data exchange.
-Emerging standard for data movement between systems. Used by Dremio,
-Databricks, DuckDB, and Ballista. Enables pg-trickle to feed any
-Arrow Flight-compatible consumer without serialisation overhead.
-
-**Crate:** `arrow-flight` + `tonic`
-
-**Direction:** Sink (server or client mode) + Source (client mode)
-
-#### Sink Configuration (Client Mode — Push to Flight Server)
-
-```toml
-[sink.arrow-flight]
-url = "grpc://localhost:50051"
-# tls = false
-# auth_token = "Bearer ..."
-# metadata:
-#   x-custom-header = "value"
-
-# Batching
-batch_size = 10000                         # rows per RecordBatch
-# compression = "zstd"                     # none | lz4 | zstd
-```
-
-#### Sink Configuration (Server Mode — Serve to Flight Clients)
-
-```toml
-[sink.arrow-flight-server]
-listen_addr = "0.0.0.0:50051"
-# tls_cert = "/etc/flight/cert.pem"
-# tls_key = "/etc/flight/key.pem"
-# max_batch_age_seconds = 5               # buffer window before serving
-```
-
-**Server mode** turns the relay into an Arrow Flight server that downstream
-consumers connect to. Useful for feeding Spark, DuckDB, or custom analytics
-pipelines without intermediate storage.
-
-#### Source Configuration
-
-```toml
-[source.arrow-flight]
-url = "grpc://upstream:50051"
-# ticket = "my-stream-ticket"
-# auth_token = "Bearer ..."
-```
-
-**Schema handling:** Arrow schemas are derived from the JSON payload
-structure. For stable schemas, a user-provided `.arrow` schema file is
-supported.
+> **Deferred to Phase 3.** Full design: [PLAN_RELAY_CLI_PHASE_3.md § B.2](./PLAN_RELAY_CLI_PHASE_3.md#b2-apache-arrow-flight--grpc)
 
 ### A.11 Singer Protocol (Meltano SDK)
 
@@ -775,15 +679,15 @@ effort.
 | **ClickHouse** | Sink | Analytics | ★★★★☆ | 1.5d | **P2** |
 | **Singer Protocol** | Source + Sink | Data Eng. | ★★★★★ | 2d | **P1** |
 | **Webhook Flavors (n8n/Zapier)** | Sink | Automation | ★★★★☆ | 1d | **P2** |
-| **Apache Pulsar** | Source + Sink | Streaming | ★★★☆☆ | 2d | **P3** |
-| **Arrow Flight / gRPC** | Source + Sink | Emerging | ★★☆☆☆ | 2.5d | **P3** |
+| **Apache Pulsar** | Source + Sink | Streaming | ★★★☆☆ | 2d | **P3** — [Phase 3 § B.1](./PLAN_RELAY_CLI_PHASE_3.md#b1-apache-pulsar) |
+| **Arrow Flight / gRPC** | Source + Sink | Emerging | ★★☆☆☆ | 2.5d | **P3** — [Phase 3 § B.2](./PLAN_RELAY_CLI_PHASE_3.md#b2-apache-arrow-flight--grpc) |
 
 **Priority key:**
 - **P1** — Must-have. Covers cloud platform parity (GCP, AWS streaming,
   Azure), the most-requested analytics use-case (Elasticsearch), and the
   widest connector ecosystem (Singer/Meltano).
 - **P2** — High-value. Covers IoT, data lake, and OLAP analytics.
-- **P3** — Forward-looking. Emerging standards with growing adoption.
+- **P3** — Deferred to Phase 3. Full designs in [PLAN_RELAY_CLI_PHASE_3.md](./PLAN_RELAY_CLI_PHASE_3.md).
 
 ---
 
@@ -1164,113 +1068,15 @@ on Kafka records. For NATS, uses `traceparent` NATS header.
 
 ### B.11 Relay Dashboard
 
-**Problem:** A dashboard for the relay would help operators monitor pipeline
-health, throughput, and errors in real-time. The `pgtrickle-tui` crate that
-previously provided a stream-table dashboard has been removed from the project.
-
-**Design:** Add a `pgtrickle-relay dashboard` subcommand backed by ratatui.
-
-**Dashboard panels:**
-- Pipeline overview (mode, source, sink, status)
-- Throughput graph (messages/sec, bytes/sec)
-- Latency graph (p50, p95, p99 poll-to-publish)
-- Consumer lag gauge
-- Error rate and recent errors
-- DLQ status (if enabled)
-- Circuit breaker state
-- Active connections health
-
-**Implementation:** Use the `ratatui` crate directly in `pgtrickle-relay`.
-Read metrics from the relay's Prometheus endpoint (scrape `/metrics`).
-
-**Effort:** 2d
+> **Deferred to Phase 3.** Full design: [PLAN_RELAY_CLI_PHASE_3.md § C.1](./PLAN_RELAY_CLI_PHASE_3.md#c1-relay-dashboard)
 
 ### B.12 Plugin System (Dynamic Backends)
 
-**Problem:** The compiled-in backend approach requires users to rebuild
-the relay binary to add custom backends. Some organisations have
-proprietary messaging systems or custom protocols.
-
-**Design:** A WASM-based plugin system using `wasmtime` for dynamic
-backend loading.
-
-```toml
-[plugins]
-[[plugins.sinks]]
-name = "custom-crm"
-path = "/opt/plugins/crm-sink.wasm"
-config = { api_url = "https://crm.internal/events", api_key = "..." }
-
-[[plugins.sources]]
-name = "proprietary-mq"
-path = "/opt/plugins/pmq-source.wasm"
-config = { broker = "pmq://internal:9999" }
-```
-
-**Plugin interface:** A WASM component model interface that mirrors the
-Source/Sink traits:
-
-```wit
-interface sink {
-    record relay-message {
-        dedup-key: string,
-        subject: string,
-        payload: string,
-        op: string,
-    }
-
-    resource sink-instance {
-        constructor(config: string);
-        connect: func() -> result<_, string>;
-        publish: func(batch: list<relay-message>) -> result<u32, string>;
-        is-healthy: func() -> bool;
-        close: func() -> result<_, string>;
-    }
-}
-```
-
-**Trade-off:** This is the most complex feature. Consider deferring to
-Phase 3 unless there is clear demand.
-
-**Effort:** 5d
+> **Deferred to Phase 3.** Full design: [PLAN_RELAY_CLI_PHASE_3.md § C.2](./PLAN_RELAY_CLI_PHASE_3.md#c2-plugin-system-wasm-backends)
 
 ### B.13 Encryption Envelope
 
-**Problem:** Some compliance regimes (HIPAA, PCI-DSS, GDPR) require
-payload encryption in transit even when TLS is in use (defence in depth).
-
-**Design:** Optional envelope encryption before publishing to sink.
-Messages are encrypted with a data encryption key (DEK), and the DEK
-is encrypted with a key encryption key (KEK) from a KMS.
-
-```toml
-[encryption]
-enabled = true
-provider = "aws-kms"                      # aws-kms | gcp-kms | azure-keyvault | local
-# key_id = "arn:aws:kms:us-east-1:123456789012:key/..."
-# local_key_file = "/etc/relay/encryption.key"   # 256-bit AES key
-algorithm = "aes-256-gcm"
-# encrypt_fields = ["payload"]            # default: encrypt entire message
-# key_rotation_interval_hours = 24
-```
-
-**Envelope format:**
-
-```json
-{
-  "v": 1,
-  "enc": "aes-256-gcm",
-  "dek": "<base64-encrypted-DEK>",
-  "iv": "<base64-IV>",
-  "ct": "<base64-ciphertext>",
-  "tag": "<base64-auth-tag>"
-}
-```
-
-Consumers decrypt using the KMS to unwrap the DEK, then AES-GCM decrypt
-the ciphertext.
-
-**Effort:** 2d
+> **Deferred to Phase 3.** Full design: [PLAN_RELAY_CLI_PHASE_3.md § C.3](./PLAN_RELAY_CLI_PHASE_3.md#c3-encryption-envelope-kms)
 
 ### B.14 Webhook Signature Verification
 
@@ -1428,7 +1234,7 @@ state checkpointing) and benefit from being implemented together.
 | Item | Description | Effort |
 |------|-------------|--------|
 | RELAY-P2-23 | Backend integration tests (Pub/Sub, Kinesis, Service Bus, ES, MQTT, ClickHouse, S3) | 3d |
-| RELAY-P2-24 | Extension integration tests (DLQ, schema registry, transforms, routing, rate limit, circuit breaker, SIGHUP reload, dry-run, replay, OTel, encryption, webhook sig) | 2d |
+| RELAY-P2-24 | Extension integration tests (DLQ, schema registry, transforms, routing, rate limit, circuit breaker, SIGHUP reload, dry-run, replay, OTel, webhook sig) | 2d |
 | RELAY-P2-25 | Benchmarks (new backends + extensions overhead) | 1d |
 
 ### Phase 2e — Documentation & Distribution (2 days)
