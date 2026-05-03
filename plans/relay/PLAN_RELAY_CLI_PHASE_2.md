@@ -15,12 +15,12 @@
   - [A.2 Amazon Kinesis Data Streams](#a2-amazon-kinesis-data-streams)
   - [A.3 Azure Service Bus](#a3-azure-service-bus)
   - [A.4 Azure Event Hubs](#a4-azure-event-hubs)
-  - [A.5 Apache Pulsar](#a5-apache-pulsar)
   - [A.6 MQTT (v5)](#a6-mqtt-v5)
   - [A.7 Elasticsearch / OpenSearch](#a7-elasticsearch--opensearch)
   - [A.8 Object Storage (S3 / GCS / Azure Blob)](#a8-object-storage-s3--gcs--azure-blob)
   - [A.9 ClickHouse](#a9-clickhouse)
-  - [A.10 Apache Arrow Flight / gRPC](#a10-apache-arrow-flight--grpc)
+  - [A.11 Singer Protocol (Meltano SDK)](#a11-singer-protocol-meltano-sdk)
+  - [A.12 Webhook Flavors (n8n / Zapier)](#a12-webhook-flavors-n8n--zapier)
   - [Backend Priority Matrix](#backend-priority-matrix)
 - [Part B — CLI Extensions & Improvements](#part-b--cli-extensions--improvements)
   - [B.1 Dead-Letter Queue (DLQ)](#b1-dead-letter-queue-dlq)
@@ -33,10 +33,11 @@
   - [B.8 SIGHUP Reload (extends Phase 1 hot-reload)](#b8-sighup-reload)
   - [B.9 Dry-Run & Replay Mode](#b9-dry-run--replay-mode)
   - [B.10 OpenTelemetry Tracing](#b10-opentelemetry-tracing)
-  - [B.11 Relay Dashboard](#b11-relay-dashboard)
-  - [B.12 Plugin System (Dynamic Backends)](#b12-plugin-system-dynamic-backends)
-  - [B.13 Encryption Envelope](#b13-encryption-envelope)
+  - [B.11 Relay Dashboard](#b11-relay-dashboard) *(Phase 3)*
+  - [B.12 Plugin System (Dynamic Backends)](#b12-plugin-system-dynamic-backends) *(Phase 3)*
+  - [B.13 Encryption Envelope](#b13-encryption-envelope) *(Phase 3)*
   - [B.14 Webhook Signature Verification](#b14-webhook-signature-verification)
+- [Part E — Connector Ecosystem Integration (Phase 3)](#part-e--connector-ecosystem-integration-phase-3)
 - [Part C — Testing Strategy](#part-c--testing-strategy)
 - [Part D — Implementation Roadmap](#part-d--implementation-roadmap)
 - [Open Questions](#open-questions)
@@ -49,17 +50,23 @@ Phase 2 of the `pgtrickle-relay` CLI extends the v0.25.0 foundation with
 additional backends for major cloud platforms and analytics systems, plus
 operational improvements that make the relay production-grade at scale.
 
+Phase 2 also introduces **Singer protocol support** — the single highest-value
+connector integration. One Singer adapter unlocks hundreds of community-maintained
+taps and targets via the Meltano SDK ecosystem. Lightweight **n8n and Zapier
+webhook flavors** are included as thin formatting layers over the existing
+webhook backend.
+
 **Phase 1 (v0.25.0)** ships with 8 sink backends (NATS, Kafka, HTTP webhook,
 Redis Streams, SQS, RabbitMQ, PostgreSQL inbox, stdout/file) and 7 source
 backends (same minus stdout, plus stdin). Phase 2 adds **10 new backends**
 covering all three major cloud providers, the IoT ecosystem, analytics
 databases, and data lake storage.
 
-Beyond backends, Phase 2 introduces **13 operational improvements**: dead-letter
+Beyond backends, Phase 2 introduces **10 operational improvements**: dead-letter
 queues, schema registry integration, message transforms, content-based routing,
 rate limiting, circuit breakers, SIGHUP config reload, dry-run/replay mode,
-OpenTelemetry tracing, a relay dashboard, a plugin system, payload encryption,
-and webhook signature verification.
+OpenTelemetry tracing, and webhook signature verification. The relay dashboard,
+plugin system, and payload encryption are deferred to Phase 3.
 
 > **Note:** Multi-pipeline support and database-driven hot-reload are already
 > part of Phase 1 (v0.25.0) — the relay natively runs multiple independent
@@ -265,52 +272,7 @@ checkpointing. Checkpoints stored in PostgreSQL or Azure Blob Storage.
 
 ### A.5 Apache Pulsar
 
-**Why:** Growing alternative to Kafka with superior multi-tenancy,
-geo-replication, and tiered storage. Adopted by Splunk, Yahoo, Tencent,
-and Verizon Media. Offers both streaming and queuing semantics.
-
-**Crate:** `pulsar` (official Rust client)
-
-**Direction:** Source + Sink (bidirectional)
-
-#### Sink Configuration
-
-```toml
-[sink.pulsar]
-url = "pulsar://localhost:6650"
-topic = "persistent://public/default/pgtrickle-events"
-# topic_template = "persistent://public/default/pgtrickle.{stream_table}"
-# producer_name = "pgtrickle-relay"
-# send_timeout_ms = 30000
-# batch_enabled = true
-# batch_max_messages = 1000
-# compression = "lz4"                      # none | lz4 | zlib | zstd | snappy
-# auth_token = "eyJhbGci..."
-# tls_cert_file = "/etc/pulsar/cert.pem"
-# tls_key_file = "/etc/pulsar/key.pem"
-```
-
-**Dedup:** Uses Pulsar's built-in message deduplication (producer-side).
-The dedup key is set as the `sequence_id` on the producer.
-
-#### Source Configuration
-
-```toml
-[source.pulsar]
-url = "pulsar://localhost:6650"
-topic = "persistent://public/default/external-events"
-subscription = "pgtrickle-inbox"
-# subscription_type = "Shared"             # Exclusive | Shared | Failover | Key_Shared
-# initial_position = "Earliest"            # Earliest | Latest
-# ack_timeout_ms = 30000
-# negative_ack_redelivery_delay_ms = 1000
-# dead_letter_topic = "persistent://public/default/pgtrickle-dlq"
-# max_redeliver_count = 5
-```
-
-**Consumption model:** Creates a Pulsar consumer with the specified
-subscription type. Messages are acknowledged individually after successful
-inbox write. Supports automatic DLQ routing.
+> **Deferred to Phase 3.** Full design: [PLAN_RELAY_CLI_PHASE_3.md § B.1](./PLAN_RELAY_CLI_PHASE_3.md#b1-apache-pulsar)
 
 ### A.6 MQTT (v5)
 
@@ -534,56 +496,169 @@ throughput. The relay supports this via the `async_insert` setting.
 
 ### A.10 Apache Arrow Flight / gRPC
 
-**Why:** Language-agnostic, high-performance columnar data exchange.
-Emerging standard for data movement between systems. Used by Dremio,
-Databricks, DuckDB, and Ballista. Enables pg-trickle to feed any
-Arrow Flight-compatible consumer without serialisation overhead.
+> **Deferred to Phase 3.** Full design: [PLAN_RELAY_CLI_PHASE_3.md § B.2](./PLAN_RELAY_CLI_PHASE_3.md#b2-apache-arrow-flight--grpc)
 
-**Crate:** `arrow-flight` + `tonic`
+### A.11 Singer Protocol (Meltano SDK)
 
-**Direction:** Sink (server or client mode) + Source (client mode)
+**Why:** Singer is the widest connector ecosystem in data engineering — hundreds
+of community-maintained taps (sources) and targets (destinations) covering
+SaaS APIs, databases, data warehouses, and file formats. One Singer adapter
+unlocks the entire [Meltano Hub](https://hub.meltano.com) catalog. The wire
+protocol is trivial: newline-delimited JSON messages (SCHEMA → RECORD → STATE)
+over stdin/stdout.
 
-#### Sink Configuration (Client Mode — Push to Flight Server)
+**Protocol:** [Singer Spec](https://github.com/singer-io/getting-started/blob/master/docs/SPEC.md)
+— no SDK dependency in Rust, just the JSON-lines wire format.
 
-```toml
-[sink.arrow-flight]
-url = "grpc://localhost:50051"
-# tls = false
-# auth_token = "Bearer ..."
-# metadata:
-#   x-custom-header = "value"
+**Crate:** None required — `serde_json` + `tokio::process` for subprocess I/O.
 
-# Batching
-batch_size = 10000                         # rows per RecordBatch
-# compression = "zstd"                     # none | lz4 | zstd
+**Direction:** Source + Sink (bidirectional)
+
+#### Sink Configuration (Forward: outbox → Singer Target)
+
+The relay spawns a Singer target subprocess and pipes pg-trickle delta
+envelopes as Singer RECORD messages to its stdin.
+
+```json
+{
+  "sink_type": "singer",
+  "sink": {
+    "target_command": "target-bigquery",
+    "target_config": {
+      "project_id": "my-project",
+      "dataset_id": "pgtrickle"
+    },
+    "stream_name_template": "{stream_table}",
+    "batch_size": 1000,
+    "state_checkpoint_interval": 100,
+    "target_args": ["--config", "/etc/singer/target-config.json"]
+  }
+}
 ```
 
-#### Sink Configuration (Server Mode — Serve to Flight Clients)
+**Message mapping:**
+- On first batch or schema change → emit Singer `SCHEMA` message with
+  JSON Schema inferred from the delta payload columns.
+- Each delta row → Singer `RECORD` message with `stream`, `record`,
+  and `time_extracted` fields.
+- After each batch → emit Singer `STATE` message with the relay's
+  consumer group offset. The target writes state to stdout, which the
+  relay captures for crash-recovery checkpointing.
 
-```toml
-[sink.arrow-flight-server]
-listen_addr = "0.0.0.0:50051"
-# tls_cert = "/etc/flight/cert.pem"
-# tls_key = "/etc/flight/key.pem"
-# max_batch_age_seconds = 5               # buffer window before serving
+**Operations mapping:**
+- `op = "insert"` → RECORD with `_sdc_extracted_at` and `_sdc_batched_at`
+- `op = "delete"` → RECORD with `_sdc_deleted_at` set (soft-delete convention)
+- `is_full_refresh = true` → Singer `ACTIVATE_VERSION` message (Meltano SDK
+  extension) to signal full-refresh semantics to the target.
+
+#### Source Configuration (Reverse: Singer Tap → inbox)
+
+The relay spawns a Singer tap subprocess and reads RECORD messages from
+its stdout, converting each to an inbox row.
+
+```json
+{
+  "source_type": "singer",
+  "source": {
+    "tap_command": "tap-salesforce",
+    "tap_config": {
+      "client_id": "...",
+      "client_secret": "...",
+      "refresh_token": "..."
+    },
+    "tap_args": ["--config", "/etc/singer/tap-config.json", "--catalog", "/etc/singer/catalog.json"],
+    "state_file": "/var/lib/pgtrickle-relay/singer-state.json"
+  }
+}
 ```
 
-**Server mode** turns the relay into an Arrow Flight server that downstream
-consumers connect to. Useful for feeding Spark, DuckDB, or custom analytics
-pipelines without intermediate storage.
+**Consumption model:**
+1. Relay spawns the tap subprocess.
+2. Reads stdout line-by-line, parsing JSON messages.
+3. `SCHEMA` messages → stored in memory for validation.
+4. `RECORD` messages → converted to inbox rows and batch-inserted.
+5. `STATE` messages → checkpointed to PostgreSQL. On restart, the
+   saved state is passed to the tap via `--state`.
 
-#### Source Configuration
+**State management:** STATE messages are stored in a
+`pgtrickle.relay_singer_state` table keyed by pipeline name. On crash
+recovery, the relay writes the last state to a temp file and passes
+it to the tap's `--state` argument.
 
-```toml
-[source.arrow-flight]
-url = "grpc://upstream:50051"
-# ticket = "my-stream-ticket"
-# auth_token = "Bearer ..."
+**Error handling:**
+- Tap crash → relay logs error, waits `restart_delay_seconds` (default: 30),
+  restarts from last checkpoint.
+- Target crash → messages are routed to DLQ (if enabled).
+- Malformed JSON lines → logged and skipped (or DLQ'd).
+
+### A.12 Webhook Flavors (n8n / Zapier)
+
+**Why:** The existing webhook backend already supports n8n's "Webhook" trigger
+node and Zapier's "Webhooks by Zapier" trigger. These flavors add
+platform-specific envelope formatting so payloads arrive in the expected
+shape without user-side transforms.
+
+**Implementation:** Thin formatting layer over the existing `webhook` sink —
+no new crate dependencies.
+
+#### n8n Flavor
+
+```json
+{
+  "sink_type": "webhook",
+  "sink": {
+    "url": "https://n8n.example.com/webhook/abc-123",
+    "flavor": "n8n",
+    "n8n_workflow_id": "42",
+    "include_metadata": true
+  }
+}
 ```
 
-**Schema handling:** Arrow schemas are derived from the JSON payload
-structure. For stable schemas, a user-provided `.arrow` schema file is
-supported.
+**Payload shape:** Wraps the delta payload in n8n's expected structure:
+
+```json
+{
+  "body": {
+    "stream_table": "orders_stream",
+    "op": "insert",
+    "data": { /* delta columns */ },
+    "metadata": {
+      "dedup_key": "...",
+      "timestamp": "...",
+      "workflow_id": "42"
+    }
+  }
+}
+```
+
+#### Zapier Flavor
+
+```json
+{
+  "sink_type": "webhook",
+  "sink": {
+    "url": "https://hooks.zapier.com/hooks/catch/12345/abcdef/",
+    "flavor": "zapier"
+  }
+}
+```
+
+**Payload shape:** Flat key-value structure (Zapier prefers flat objects):
+
+```json
+{
+  "stream_table": "orders_stream",
+  "op": "insert",
+  "dedup_key": "...",
+  "timestamp": "...",
+  "order_id": 42,
+  "customer_name": "Alice",
+  "amount": 99.95
+}
+```
+
+**Effort:** 0.5d each (1d total for both flavors)
 
 ---
 
@@ -602,14 +677,17 @@ effort.
 | **Azure Event Hubs** | Source + Sink | Azure | ★★★☆☆ | 1.5d | **P2** |
 | **Object Storage (S3/GCS/Blob)** | Sink | Data Lake | ★★★★☆ | 3d | **P2** |
 | **ClickHouse** | Sink | Analytics | ★★★★☆ | 1.5d | **P2** |
-| **Apache Pulsar** | Source + Sink | Streaming | ★★★☆☆ | 2d | **P3** |
-| **Arrow Flight / gRPC** | Source + Sink | Emerging | ★★☆☆☆ | 2.5d | **P3** |
+| **Singer Protocol** | Source + Sink | Data Eng. | ★★★★★ | 2d | **P1** |
+| **Webhook Flavors (n8n/Zapier)** | Sink | Automation | ★★★★☆ | 1d | **P2** |
+| **Apache Pulsar** | Source + Sink | Streaming | ★★★☆☆ | 2d | **P3** — [Phase 3 § B.1](./PLAN_RELAY_CLI_PHASE_3.md#b1-apache-pulsar) |
+| **Arrow Flight / gRPC** | Source + Sink | Emerging | ★★☆☆☆ | 2.5d | **P3** — [Phase 3 § B.2](./PLAN_RELAY_CLI_PHASE_3.md#b2-apache-arrow-flight--grpc) |
 
 **Priority key:**
 - **P1** — Must-have. Covers cloud platform parity (GCP, AWS streaming,
-  Azure) and the most-requested analytics use-case (Elasticsearch).
+  Azure), the most-requested analytics use-case (Elasticsearch), and the
+  widest connector ecosystem (Singer/Meltano).
 - **P2** — High-value. Covers IoT, data lake, and OLAP analytics.
-- **P3** — Forward-looking. Emerging standards with growing adoption.
+- **P3** — Deferred to Phase 3. Full designs in [PLAN_RELAY_CLI_PHASE_3.md](./PLAN_RELAY_CLI_PHASE_3.md).
 
 ---
 
@@ -990,113 +1068,15 @@ on Kafka records. For NATS, uses `traceparent` NATS header.
 
 ### B.11 Relay Dashboard
 
-**Problem:** A dashboard for the relay would help operators monitor pipeline
-health, throughput, and errors in real-time. The `pgtrickle-tui` crate that
-previously provided a stream-table dashboard has been removed from the project.
-
-**Design:** Add a `pgtrickle-relay dashboard` subcommand backed by ratatui.
-
-**Dashboard panels:**
-- Pipeline overview (mode, source, sink, status)
-- Throughput graph (messages/sec, bytes/sec)
-- Latency graph (p50, p95, p99 poll-to-publish)
-- Consumer lag gauge
-- Error rate and recent errors
-- DLQ status (if enabled)
-- Circuit breaker state
-- Active connections health
-
-**Implementation:** Use the `ratatui` crate directly in `pgtrickle-relay`.
-Read metrics from the relay's Prometheus endpoint (scrape `/metrics`).
-
-**Effort:** 2d
+> **Deferred to Phase 3.** Full design: [PLAN_RELAY_CLI_PHASE_3.md § C.1](./PLAN_RELAY_CLI_PHASE_3.md#c1-relay-dashboard)
 
 ### B.12 Plugin System (Dynamic Backends)
 
-**Problem:** The compiled-in backend approach requires users to rebuild
-the relay binary to add custom backends. Some organisations have
-proprietary messaging systems or custom protocols.
-
-**Design:** A WASM-based plugin system using `wasmtime` for dynamic
-backend loading.
-
-```toml
-[plugins]
-[[plugins.sinks]]
-name = "custom-crm"
-path = "/opt/plugins/crm-sink.wasm"
-config = { api_url = "https://crm.internal/events", api_key = "..." }
-
-[[plugins.sources]]
-name = "proprietary-mq"
-path = "/opt/plugins/pmq-source.wasm"
-config = { broker = "pmq://internal:9999" }
-```
-
-**Plugin interface:** A WASM component model interface that mirrors the
-Source/Sink traits:
-
-```wit
-interface sink {
-    record relay-message {
-        dedup-key: string,
-        subject: string,
-        payload: string,
-        op: string,
-    }
-
-    resource sink-instance {
-        constructor(config: string);
-        connect: func() -> result<_, string>;
-        publish: func(batch: list<relay-message>) -> result<u32, string>;
-        is-healthy: func() -> bool;
-        close: func() -> result<_, string>;
-    }
-}
-```
-
-**Trade-off:** This is the most complex feature. Consider deferring to
-Phase 3 unless there is clear demand.
-
-**Effort:** 5d
+> **Deferred to Phase 3.** Full design: [PLAN_RELAY_CLI_PHASE_3.md § C.2](./PLAN_RELAY_CLI_PHASE_3.md#c2-plugin-system-wasm-backends)
 
 ### B.13 Encryption Envelope
 
-**Problem:** Some compliance regimes (HIPAA, PCI-DSS, GDPR) require
-payload encryption in transit even when TLS is in use (defence in depth).
-
-**Design:** Optional envelope encryption before publishing to sink.
-Messages are encrypted with a data encryption key (DEK), and the DEK
-is encrypted with a key encryption key (KEK) from a KMS.
-
-```toml
-[encryption]
-enabled = true
-provider = "aws-kms"                      # aws-kms | gcp-kms | azure-keyvault | local
-# key_id = "arn:aws:kms:us-east-1:123456789012:key/..."
-# local_key_file = "/etc/relay/encryption.key"   # 256-bit AES key
-algorithm = "aes-256-gcm"
-# encrypt_fields = ["payload"]            # default: encrypt entire message
-# key_rotation_interval_hours = 24
-```
-
-**Envelope format:**
-
-```json
-{
-  "v": 1,
-  "enc": "aes-256-gcm",
-  "dek": "<base64-encrypted-DEK>",
-  "iv": "<base64-IV>",
-  "ct": "<base64-ciphertext>",
-  "tag": "<base64-auth-tag>"
-}
-```
-
-Consumers decrypt using the KMS to unwrap the DEK, then AES-GCM decrypt
-the ciphertext.
-
-**Effort:** 2d
+> **Deferred to Phase 3.** Full design: [PLAN_RELAY_CLI_PHASE_3.md § C.3](./PLAN_RELAY_CLI_PHASE_3.md#c3-encryption-envelope-kms)
 
 ### B.14 Webhook Signature Verification
 
@@ -1129,6 +1109,26 @@ header = "X-Webhook-Signature"            # header containing the signature
 
 ---
 
+## Part E — Connector Ecosystem Integration (Phase 3)
+
+> **Full details:** See [PLAN_RELAY_CLI_PHASE_3.md](./PLAN_RELAY_CLI_PHASE_3.md)
+
+Phase 2 ships the **Singer protocol** adapter (A.11) because its low effort
+and massive ecosystem make it the highest-value connector integration. The
+remaining connector ecosystems are planned for Phase 3:
+
+| Ecosystem | Protocol | Direction | Effort | Rationale |
+|-----------|----------|-----------|--------|-----------|
+| **Airbyte** | JSON-lines (AirbyteRecordMessage) | Source + Sink | 2.5d | ~95% overlap with Singer adapter; thin translation layer. Second-largest open-source EL ecosystem. |
+| **dlt** | Python streaming / REST API | Source + Sink | 2d | Fast-growing Python-first EL tool; strong dbt synergy (complements `dbt-pgtrickle`). |
+| **Redpanda Connect (Benthos)** | YAML-config, NDJSON | Source + Sink | 1.5d | Hundreds of built-in connectors; relay emits/consumes Benthos-compatible NDJSON or HTTP input. |
+| **Fivetran** | HTTP sync API + HVR callbacks | Source (webhook) | 1d | Proprietary; webhook source can act as Fivetran connector endpoint. |
+
+These build on the Singer infrastructure (subprocess I/O, JSON-lines parsing,
+state checkpointing) and benefit from being implemented together.
+
+---
+
 ## Part C — Testing Strategy
 
 ### C.1 New Backend Tests (Testcontainers)
@@ -1144,6 +1144,11 @@ header = "X-Webhook-Signature"            # header containing the signature
 | Object Storage E2E | postgres + minio (S3-compat) | Forward: outbox → Parquet/JSONL files; verify partitioning |
 | Pulsar E2E | postgres + pulsar-standalone | Forward: outbox → topic; Reverse: subscription → inbox |
 | Arrow Flight E2E | postgres + test flight server | Forward: outbox → Flight stream; verify RecordBatch |
+| Singer sink E2E | postgres + mock Singer target | Forward: outbox → SCHEMA + RECORD messages; verify STATE checkpointing |
+| Singer source E2E | postgres + mock Singer tap | Reverse: RECORD messages → inbox; verify STATE persistence |
+| Singer crash recovery | postgres + flaky mock tap | Tap crash → restart from checkpoint → no data loss |
+| n8n webhook E2E | postgres + mock webhook | Forward: outbox → n8n-flavored payload; verify metadata fields |
+| Zapier webhook E2E | postgres + mock webhook | Forward: outbox → flat key-value payload; verify structure |
 
 ### C.2 Extension Tests
 
@@ -1177,6 +1182,8 @@ header = "X-Webhook-Signature"            # header containing the signature
 | Elasticsearch bulk indexing | 20K+ docs/sec via _bulk API |
 | ClickHouse insert throughput | 100K+ rows/sec via native protocol |
 | Object Storage write | 10K+ events/sec with Parquet batching |
+| Singer sink throughput | 20K+ RECORD messages/sec to subprocess stdin |
+| Singer source throughput | 20K+ RECORD messages/sec from subprocess stdout |
 | Multi-pipeline overhead | <5% throughput degradation vs single pipeline |
 | Rate limiter accuracy | ±5% of configured limit |
 | Transform overhead | <1ms per message for simple JMESPath |
@@ -1194,7 +1201,7 @@ header = "X-Webhook-Signature"            # header containing the signature
 | RELAY-P2-3 | Sink + Source: Azure Service Bus | 2d |
 | RELAY-P2-4 | Sink: Elasticsearch / OpenSearch (bulk API + full-refresh alias swap) | 2.5d |
 
-### Phase 2b — IoT, Analytics & Data Lake (8 days)
+### Phase 2b — IoT, Analytics, Data Lake & Connectors (10.5 days)
 
 | Item | Description | Effort |
 |------|-------------|--------|
@@ -1202,6 +1209,8 @@ header = "X-Webhook-Signature"            # header containing the signature
 | RELAY-P2-6 | Sink + Source: Azure Event Hubs (native SDK) | 1.5d |
 | RELAY-P2-7 | Sink: Object Storage (S3/GCS/Azure Blob) with JSONL + Parquet | 3d |
 | RELAY-P2-8 | Sink: ClickHouse (native protocol, ReplacingMergeTree support) | 1.5d |
+| RELAY-P2-8a | Sink + Source: Singer Protocol (Meltano SDK) | 2d |
+| RELAY-P2-8b | Sink: Webhook Flavors (n8n + Zapier formatting) | 1d |
 | RELAY-P2-9 | Sink + Source: Apache Pulsar | *deferred — P3* |
 | RELAY-P2-10 | Sink + Source: Arrow Flight / gRPC | *deferred — P3* |
 
@@ -1225,7 +1234,7 @@ header = "X-Webhook-Signature"            # header containing the signature
 | Item | Description | Effort |
 |------|-------------|--------|
 | RELAY-P2-23 | Backend integration tests (Pub/Sub, Kinesis, Service Bus, ES, MQTT, ClickHouse, S3) | 3d |
-| RELAY-P2-24 | Extension integration tests (DLQ, schema registry, transforms, routing, rate limit, circuit breaker, SIGHUP reload, dry-run, replay, OTel, encryption, webhook sig) | 2d |
+| RELAY-P2-24 | Extension integration tests (DLQ, schema registry, transforms, routing, rate limit, circuit breaker, SIGHUP reload, dry-run, replay, OTel, webhook sig) | 2d |
 | RELAY-P2-25 | Benchmarks (new backends + extensions overhead) | 1d |
 
 ### Phase 2e — Documentation & Distribution (2 days)
@@ -1247,6 +1256,10 @@ header = "X-Webhook-Signature"            # header containing the signature
 | RELAY-P3-6 | AMQP 1.0 backend (Azure Service Bus, Qpid, etc.) | Unlocks additional brokers; requires separate SDK from RabbitMQ AMQP 0-9-1 |
 | RELAY-P3-7 | MongoDB sink | Lower priority than streaming/analytics backends |
 | RELAY-P3-8 | Snowflake / BigQuery sink | Cloud data warehouse integration |
+| RELAY-P3-9 | Airbyte protocol adapter (Source + Sink) | ~95% Singer overlap; translation layer on top of Singer adapter |
+| RELAY-P3-10 | dlt integration (Source + Sink) | Python-first EL with dbt synergy; REST API or subprocess |
+| RELAY-P3-11 | Redpanda Connect / Benthos (Source + Sink) | NDJSON/HTTP integration with Benthos connector ecosystem |
+| RELAY-P3-12 | Fivetran HVR endpoint (Source) | Webhook-based connector endpoint for Fivetran Hybrid Deployment |
 
 ---
 
@@ -1255,11 +1268,11 @@ header = "X-Webhook-Signature"            # header containing the signature
 | Phase | Effort |
 |-------|--------|
 | Phase 2a — Cloud Provider Parity | 9d |
-| Phase 2b — IoT, Analytics & Data Lake | 7.5d |
+| Phase 2b — IoT, Analytics, Data Lake & Connectors | 10.5d |
 | Phase 2c — Operational Excellence | 13d |
 | Phase 2d — Testing & Polish | 6d |
 | Phase 2e — Documentation & Distribution | 2d |
-| **Total** | **~37.5 days solo / ~24 days with two developers** |
+| **Total** | **~40.5 days solo / ~26 days with two developers** |
 
 Phases 2a and 2b (backends) can be parallelised with Phase 2c (extensions).
 With two developers, one focuses on backends while the other builds
