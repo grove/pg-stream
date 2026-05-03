@@ -126,7 +126,7 @@ test-integration:
 # Only needed once, or when upgrading the Rust toolchain or pgrx version.
 [group: "test"]
 build-builder-image:
-    docker build -t pg_trickle_builder:pg18 -f tests/Dockerfile.builder .
+    docker build --provenance=false -t pg_trickle_builder:pg18 -f tests/Dockerfile.builder .
 
 # Build the E2E Docker test image (auto-builds builder image if absent)
 [group: "test"]
