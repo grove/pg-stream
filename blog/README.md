@@ -4,7 +4,11 @@
 > AI assistance (GitHub Copilot / Claude) as a way to explore how well
 > LLM-generated technical writing holds up for a niche systems engineering
 > topic. The technical content has been reviewed for accuracy, but treat the
-> posts as drafts — not as officially reviewed documentation.
+> posts as drafts — not as officially reviewed documentation. The blog is meant
+> for informative purposes — to learn about interesting topics in the context of
+> pg_trickle. It is a showcase for use-cases rather than a definitive
+> reference; for authoritative documentation see the
+> [pg_trickle documentation](https://grove.github.io/pg-trickle/).
 
 ---
 
