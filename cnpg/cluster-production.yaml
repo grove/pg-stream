@@ -1,0 +1,154 @@
+# =============================================================================
+# CloudNativePG Cluster — Production Configuration for pg_trickle
+#
+# High-availability 3-node cluster with explicit worker budgets, resource
+# limits, WAL archiving, monitoring hooks, and storage class guidance.
+#
+# Worker Budget Formula:
+#   max_worker_processes = 8 + (2 * num_databases) + worker_pool_size
+#   Example: 8 + (2 * 3) + 4 = 18 for 3 databases with pool size 4
+#
+# Prerequisites:
+#   1. Kubernetes 1.33+ with ImageVolume feature gate enabled
+#   2. CNPG operator 1.28+ installed
+#   3. pg_trickle-ext image available in your registry
+#   4. S3-compatible backup storage configured (update the barmanObjectStore section)
+#   5. Prometheus operator installed (for ServiceMonitor)
+#
+# Deploy:
+#   kubectl apply -f cnpg/cluster-production.yaml
+#   kubectl apply -f cnpg/database-example.yaml
+#
+# Connect:
+#   kubectl exec -it pg-trickle-prod-1 -- psql -U postgres -d app
+#
+# Health Check:
+#   SELECT * FROM pgtrickle.preflight();
+#   SELECT * FROM pgtrickle.worker_pool_status();
+#
+# See also: monitoring/production/README.md for Prometheus/Grafana setup
+# =============================================================================
+apiVersion: postgresql.cnpg.io/v1
+kind: Cluster
+metadata:
+  name: pg-trickle-prod
+  labels:
+    app.kubernetes.io/name: pg-trickle
+    app.kubernetes.io/component: database
+    app.kubernetes.io/environment: production
+spec:
+  # 3 instances: 1 primary + 2 replicas for HA
+  instances: 3
+
+  imageName: ghcr.io/cloudnative-pg/postgresql:18
+
+  postgresql:
+    shared_preload_libraries:
+      - pg_trickle
+
+    extensions:
+      - name: pg-trickle
+        image:
+          reference: ghcr.io/<owner>/pg_trickle-ext:0.45.0
+
+    parameters:
+      # ── Worker Budget ─────────────────────────────────────────────────────
+      # Formula: 8 (base) + 2 * num_databases + worker_pool_size
+      # Adjust num_databases and pg_trickle.worker_pool_size to match your load.
+      # Example below: 8 + 2*3 + 4 = 18 for 3 databases, pool size 4
+      max_worker_processes: "18"
+
+      # pg_trickle worker pool size (must be <= max_worker_processes - 8 - 2*DBs)
+      pg_trickle.worker_pool_size: "4"
+
+      # ── Invalidation Ring ─────────────────────────────────────────────────
+      # Default is 128; increase for clusters with 200+ stream tables
+      pg_trickle.invalidation_ring_capacity: "256"
+
+      # ── WAL Configuration ─────────────────────────────────────────────────
+      wal_level: "logical"
+      max_replication_slots: "20"
+      max_wal_senders: "10"
+      wal_keep_size: "512"
+
+      # ── Logging ───────────────────────────────────────────────────────────
+      log_min_duration_statement: "200"
+      log_checkpoints: "on"
+      log_connections: "on"
+      log_disconnections: "on"
+
+  bootstrap:
+    initdb:
+      database: app
+      owner: app
+
+  # ── Probe Configuration ──────────────────────────────────────────────────
+  probes:
+    startup:
+      periodSeconds: 10
+      failureThreshold: 60   # 10 minutes max startup
+    liveness:
+      periodSeconds: 10
+      failureThreshold: 6    # 60 seconds before restart
+      timeoutSeconds: 5
+    readiness:
+      type: streaming
+      maximumLag: 64Mi
+      periodSeconds: 10
+      failureThreshold: 3
+
+  # ── Storage ───────────────────────────────────────────────────────────────
+  storage:
+    size: 100Gi
+    # Use a high-performance storage class in production (SSD-backed).
+    # Examples:
+    #   GKE:   premium-rwo
+    #   EKS:   gp3
+    #   AKS:   managed-premium
+    #   Local: local-path (not for HA)
+    storageClass: premium-rwo
+
+  walStorage:
+    size: 20Gi
+    storageClass: premium-rwo
+
+  # ── Resource Limits ───────────────────────────────────────────────────────
+  # Size based on your workload. pg_trickle refresh workers share CPU/memory
+  # with PostgreSQL. Minimum 4 GB RAM for 4+ stream tables with differentials.
+  resources:
+    requests:
+      memory: "4Gi"
+      cpu: "2000m"
+    limits:
+      memory: "8Gi"
+      cpu: "4000m"
+
+  # ── Backup Configuration ─────────────────────────────────────────────────
+  # Required for production. Replace with your S3-compatible storage details.
+  backup:
+    retentionPolicy: "7d"
+    barmanObjectStore:
+      destinationPath: s3://your-bucket/cnpg-backups/pg-trickle-prod
+      s3Credentials:
+        accessKeyId:
+          name: cnpg-s3-creds
+          key: ACCESS_KEY_ID
+        secretAccessKey:
+          name: cnpg-s3-creds
+          key: ACCESS_SECRET_KEY
+      wal:
+        compression: gzip
+        maxParallel: 4
+      data:
+        compression: gzip
+        immediateCheckpoint: false
+        jobs: 4
+
+  # ── Monitoring ────────────────────────────────────────────────────────────
+  # Exposes PostgreSQL metrics to Prometheus via the CNPG metrics endpoint.
+  # Pair with the ServiceMonitor in monitoring/production/service-monitor.yaml.
+  monitoring:
+    enablePodMonitor: true
+    customQueriesConfigMap:
+      - name: pg-trickle-metrics
+        key: queries.yaml

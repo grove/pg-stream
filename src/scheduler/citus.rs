@@ -249,6 +249,9 @@ pub(super) fn record_worker_failure(pgt_id: i64, worker_key: &str, threshold: i3
                 current,
                 pgt_id
             );
+            // A46-11: Persist the threshold-crossing to shared memory so it
+            // survives scheduler restarts and is visible through preflight().
+            crate::shmem::increment_citus_worker_failure_total();
         }
     });
 }

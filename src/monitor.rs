@@ -3209,10 +3209,15 @@ fn trigger_inventory() -> TableIterator<
 /// - active workers (from shared memory),
 /// - cluster-wide worker budget (from GUC),
 /// - per-database dispatch cap (from GUC),
-/// - current parallel refresh mode (from GUC).
+/// - current parallel refresh mode (from GUC),
+/// - idle workers (pool_size - active),
+/// - last scheduler tick time (unix seconds),
+/// - invalidation ring overflow count,
+/// - Citus worker failure total.
 ///
 /// Exposed as `pgtrickle.worker_pool_status()`.
 #[pg_extern(schema = "pgtrickle", name = "worker_pool_status")]
+#[allow(clippy::type_complexity)]
 fn worker_pool_status() -> TableIterator<
     'static,
     (
@@ -3220,14 +3225,31 @@ fn worker_pool_status() -> TableIterator<
         name!(max_workers, i32),
         name!(per_db_cap, i32),
         name!(parallel_mode, String),
+        name!(idle_workers, i32),
+        name!(last_scheduler_tick_unix, i64),
+        name!(ring_overflow_count, i64),
+        name!(citus_failure_total, i64),
     ),
 > {
     let active = shmem::active_worker_count() as i32;
     let max_workers = config::pg_trickle_max_dynamic_refresh_workers();
     let per_db = config::pg_trickle_max_concurrent_refreshes();
     let mode = config::pg_trickle_parallel_refresh_mode().to_string();
+    let idle = (max_workers - active).max(0);
+    let last_tick = shmem::last_scheduler_wake();
+    let ring_overflows = shmem::invalidation_ring_overflow_count() as i64;
+    let citus_failures = shmem::citus_worker_failure_total() as i64;
 
-    TableIterator::new(vec![(active, max_workers, per_db, mode)])
+    TableIterator::new(vec![(
+        active,
+        max_workers,
+        per_db,
+        mode,
+        idle,
+        last_tick,
+        ring_overflows,
+        citus_failures,
+    )])
 }
 
 /// Active and recent scheduler jobs.

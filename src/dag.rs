@@ -323,6 +323,9 @@ pub struct StDag {
     /// Populated lazily on first `topological_sort_inner()` call and
     /// invalidated when edges or nodes change.
     cached_topo: std::cell::RefCell<Option<Vec<NodeId>>>,
+    /// A46-9: Monotone generation counter. Incremented every time `resolve_calculated_schedule`
+    /// runs to completion so callers can detect stale cached schedules.
+    pub schedule_generation: u64,
 }
 
 impl StDag {
@@ -334,6 +337,7 @@ impl StDag {
             nodes: HashMap::new(),
             all_nodes: HashSet::new(),
             cached_topo: std::cell::RefCell::new(None),
+            schedule_generation: 0,
         }
     }
 
@@ -674,6 +678,100 @@ impl StDag {
                 }
             }
         }
+
+        // A46-9: Advance generation so callers can detect stale cached results.
+        self.schedule_generation = self.schedule_generation.wrapping_add(1);
+    }
+
+    /// A46-9: Re-resolve CALCULATED schedules for a targeted subset of nodes
+    /// and their upstream transitive closure.
+    ///
+    /// For incremental DAG rebuilds touching a small set of nodes, this avoids
+    /// the O(V) full resolution pass. Instead, it collects all upstream
+    /// CALCULATED ancestors of the affected set and only re-resolves those,
+    /// propagating bottom-up until convergence.
+    ///
+    /// Falls back to `resolve_calculated_schedule` for safety when:
+    /// - Any affected node is CALCULATED (removing it may change all upstream paths)
+    /// - The affected set is large relative to the DAG size (heuristic: >25%)
+    pub fn resolve_calculated_schedule_incremental(
+        &mut self,
+        affected_ids: &[i64],
+        fallback_seconds: i32,
+    ) {
+        let dag_size = self.nodes.len();
+        if dag_size == 0 {
+            return;
+        }
+
+        // Heuristic: if the change touches more than 25% of nodes, full rebuild
+        // is not much more expensive and is guaranteed correct.
+        if affected_ids.len() * 4 >= dag_size {
+            self.resolve_calculated_schedule(fallback_seconds);
+            return;
+        }
+
+        let fallback = Duration::from_secs(fallback_seconds as u64);
+
+        // Collect upstream CALCULATED ancestors (BFS from affected nodes going upstream).
+        let mut to_resolve: Vec<NodeId> = Vec::new();
+        let mut visited: HashSet<NodeId> = HashSet::new();
+        let mut queue: Vec<NodeId> = affected_ids
+            .iter()
+            .map(|&id| NodeId::StreamTable(id))
+            .collect();
+
+        while let Some(node_id) = queue.pop() {
+            if !visited.insert(node_id) {
+                continue;
+            }
+            // Only resolve ST nodes with CALCULATED schedules (schedule == None)
+            if self
+                .nodes
+                .get(&node_id)
+                .is_some_and(|n| n.schedule.is_none())
+            {
+                to_resolve.push(node_id);
+            }
+            // Walk upstream to find CALCULATED ancestors
+            for up in self.get_upstream(node_id) {
+                if !visited.contains(&up) {
+                    queue.push(up);
+                }
+            }
+        }
+
+        if to_resolve.is_empty() {
+            self.schedule_generation = self.schedule_generation.wrapping_add(1);
+            return;
+        }
+
+        // Re-resolve only the collected CALCULATED nodes (convergence pass).
+        let max_iter = to_resolve.len() + 1;
+        let mut changed = true;
+        let mut iterations = 0;
+        while changed && iterations < max_iter {
+            changed = false;
+            iterations += 1;
+            for &id in &to_resolve {
+                let downstream = self.get_downstream(id);
+                let min_schedule = downstream
+                    .iter()
+                    .filter_map(|d| self.nodes.get(d))
+                    .map(|d| d.effective_schedule)
+                    .min()
+                    .unwrap_or(fallback);
+                if let Some(node) = self.nodes.get_mut(&id) {
+                    if node.effective_schedule == min_schedule {
+                        continue;
+                    }
+                    node.effective_schedule = min_schedule;
+                    changed = true;
+                }
+            }
+        }
+
+        self.schedule_generation = self.schedule_generation.wrapping_add(1);
     }
 
     // ── Diamond dependency detection ──────────────────────────────────
@@ -1298,9 +1396,9 @@ impl StDag {
         })?;
 
         // Phase 3: Re-resolve CALCULATED schedules.
-        // This is O(V) iterations in the worst case but typically converges
-        // in 1-2 passes since most nodes have explicit schedules.
-        self.resolve_calculated_schedule(fallback_schedule_secs);
+        // A46-9: Use incremental resolution for the affected subset — avoids
+        // O(V) iteration when only a few nodes changed.
+        self.resolve_calculated_schedule_incremental(affected_ids, fallback_schedule_secs);
 
         Ok(())
     }

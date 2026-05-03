@@ -97,7 +97,8 @@ jobs:
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: windows-2022
     timeout-minutes: 15
-    continue-on-error: true
+    # A46-13: Windows compile failures are now BLOCKING on scheduled/manual runs.
+    # continue-on-error removed intentionally.
     steps:
       - uses: actions/checkout@v5
 
@@ -106,6 +107,23 @@ jobs:
 
       - name: Compile-check unit tests (Windows)
         run: cargo test --lib --features pg18 --no-run
+
+  # ── A46-13: Windows compile gate on PRs ─────────────────────────────────
+  # Lightweight compile-only check for pure Rust modules on every PR.
+  # Does not require PostgreSQL — just verifies the Rust code compiles on Windows.
+  windows-compile-gate:
+    name: Windows compile check (PR gate)
+    if: github.event_name == 'pull_request'
+    runs-on: windows-2022
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Setup pgrx environment
+        uses: ./.github/actions/setup-pgrx
+
+      - name: Compile-check Rust library (Windows)
+        run: cargo check --lib --features pg18
 
   # ── Integration tests (testcontainers, Linux only) ──────────────────────
   integration-tests:
@@ -201,6 +219,55 @@ jobs:
             --package \
             --shard-index ${{ matrix.shard_index }} \
             --shard-count ${{ matrix.shard_count }}
+
+  # ── A46-14: Full-image PR smoke test ────────────────────────────────────
+  # Runs on PR and push-to-main. Builds the E2E Docker image and runs a
+  # representative subset (DVM, CDC, scheduler) in under 5 minutes.
+  # This catches extension packaging/install regressions earlier than the
+  # full E2E run (which is schedule/manual only).
+  e2e-smoke:
+    name: E2E smoke test (PR gate)
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request' || github.event_name == 'push'
+    timeout-minutes: 30
+    steps:
+      - name: Free up disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+               "/usr/local/share/boost" "$AGENT_TOOLSDIRECTORY"
+          docker system prune -af
+
+      - uses: actions/checkout@v5
+
+      - name: Setup pgrx environment
+        uses: ./.github/actions/setup-pgrx
+
+      - name: Restore Docker image cache (postgres:18.3)
+        uses: actions/cache@v5
+        id: cache-docker-postgres-smoke
+        with:
+          path: /tmp/docker-images/postgres-18.3.tar
+          key: docker-postgres-18.3
+
+      - name: Load or pull postgres:18.3
+        run: |
+          if [ -f /tmp/docker-images/postgres-18.3.tar ]; then
+            docker load --input /tmp/docker-images/postgres-18.3.tar
+          else
+            docker pull postgres:18.3
+            mkdir -p /tmp/docker-images
+            docker save postgres:18.3 --output /tmp/docker-images/postgres-18.3.tar
+          fi
+
+      - name: Build E2E Docker image
+        run: ./tests/build_e2e_image.sh
+
+      - name: Run E2E smoke tests (DVM, CDC, scheduler)
+        run: |
+          cargo nextest run --profile ci \
+            --test 'e2e_*' \
+            -E "test(smoke) | test(basic) | test(create_stream_table) | test(health_check)" \
+            --test-threads 4
 
   # ── E2E tests (full extension in Docker, Linux only) ────────────────────
   # Skipped on PRs (takes ~20 min to build the Docker image). Runs on

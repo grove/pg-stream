@@ -84,6 +84,21 @@ else
     PASS=false
 fi
 
+# 8. Dockerfile VERSION ARG defaults must match Cargo.toml
+for DFILE in Dockerfile.hub Dockerfile.ghcr; do
+    if [[ -f "$DFILE" ]]; then
+        BAD_DF=$(grep 'ARG VERSION=' "$DFILE" | grep -v "=${VERSION}$" || true)
+        if [[ -z "$BAD_DF" ]]; then
+            echo "  OK  $DFILE ARG VERSION defaults = $VERSION"
+        else
+            echo "  FAIL $DFILE has stale ARG VERSION default(s):"
+            echo "$BAD_DF" | sed 's/^/       /'
+            echo "       Update to: ARG VERSION=${VERSION}"
+            PASS=false
+        fi
+    fi
+done
+
 if $PASS; then
     echo ""
     echo "All version checks passed for v${VERSION}."

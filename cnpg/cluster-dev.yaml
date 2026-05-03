@@ -1,0 +1,56 @@
+# =============================================================================
+# CloudNativePG Cluster — Development Configuration for pg_trickle
+#
+# Lightweight single-instance cluster for local development and testing.
+# Not for production use: no HA, no backup, no resource limits enforced.
+#
+# Prerequisites:
+#   1. Kubernetes 1.33+ with ImageVolume feature gate enabled
+#   2. CNPG operator 1.28+ installed
+#   3. pg_trickle-ext image available in the cluster registry
+#
+# Deploy:
+#   kubectl apply -f cnpg/cluster-dev.yaml
+#   kubectl apply -f cnpg/database-example.yaml
+#
+# Connect:
+#   kubectl exec -it pg-trickle-dev-1 -- psql -U postgres -d app
+# =============================================================================
+apiVersion: postgresql.cnpg.io/v1
+kind: Cluster
+metadata:
+  name: pg-trickle-dev
+  labels:
+    app.kubernetes.io/name: pg-trickle
+    app.kubernetes.io/component: database
+    app.kubernetes.io/environment: development
+spec:
+  instances: 1
+
+  imageName: ghcr.io/cloudnative-pg/postgresql:18
+
+  postgresql:
+    shared_preload_libraries:
+      - pg_trickle
+
+    extensions:
+      - name: pg-trickle
+        image:
+          reference: ghcr.io/<owner>/pg_trickle-ext:0.45.0
+
+    parameters:
+      # Minimal worker budget for dev: 1 scheduler + 2 refresh workers
+      max_worker_processes: "8"
+      # Disable WAL archiving in dev
+      archive_mode: "off"
+      # Reduce logging noise in dev
+      log_min_duration_statement: "1000"
+
+  bootstrap:
+    initdb:
+      database: app
+      owner: app
+
+  storage:
+    size: 5Gi
+    storageClass: standard

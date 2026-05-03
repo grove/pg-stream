@@ -1580,6 +1580,179 @@ pub(super) fn worker_allocation_status_fn() -> TableIterator<
     )])
 }
 
+// ── A46-4/A46-5 (v0.45.0): Preflight and worker pool status ──────────────
+
+/// A46-4: Run a pre-deployment readiness check for pg_trickle.
+///
+/// Checks and reports:
+/// - `max_worker_processes` vs required slots
+/// - `max_replication_slots` vs WAL-eligible sources
+/// - `wal_level` is `logical` (if WAL CDC sources exist)
+/// - `shared_preload_libraries` includes `pg_trickle`
+/// - Scheduler is running and enabled
+/// - Invalidation ring overflow count (capacity planning signal)
+/// - Citus worker failure total (operational signal)
+///
+/// Returns a JSON string with one entry per check: `pass` (bool), `check` (name),
+/// `detail` (human-readable message). An overall `ok` field is `true` only when
+/// all checks pass.
+#[pg_extern(schema = "pgtrickle")]
+pub(super) fn preflight() -> String {
+    use crate::config;
+    use crate::shmem;
+
+    let mut checks: Vec<serde_json::Value> = Vec::new();
+
+    // Check 1: shared_preload_libraries includes pg_trickle
+    let preload_ok =
+        Spi::get_one::<String>("SELECT current_setting('shared_preload_libraries', true)")
+            .unwrap_or(None)
+            .map(|s| s.contains("pg_trickle"))
+            .unwrap_or(false);
+    checks.push(serde_json::json!({
+        "check": "shared_preload_libraries",
+        "pass": preload_ok,
+        "detail": if preload_ok {
+            "pg_trickle is in shared_preload_libraries".to_string()
+        } else {
+            "pg_trickle is NOT in shared_preload_libraries — add it and restart".to_string()
+        }
+    }));
+
+    // Check 2: Scheduler is running
+    let scheduler_running = shmem::scheduler_running();
+    let scheduler_enabled = config::pg_trickle_enabled();
+    let sched_ok = scheduler_running && scheduler_enabled;
+    checks.push(serde_json::json!({
+        "check": "scheduler_running",
+        "pass": sched_ok,
+        "detail": if !scheduler_enabled {
+            "pg_trickle.enabled = off — scheduler is disabled".to_string()
+        } else if !scheduler_running {
+            "Scheduler background worker is not running — check PostgreSQL logs".to_string()
+        } else {
+            "Scheduler is running and enabled".to_string()
+        }
+    }));
+
+    // Check 3: max_worker_processes sufficiency
+    let (max_workers, active_workers) = Spi::connect(|client| {
+        let max: i64 = client
+            .select(
+                "SELECT current_setting('max_worker_processes')::int",
+                None,
+                &[],
+            )
+            .ok()
+            .and_then(|r| {
+                if r.is_empty() {
+                    None
+                } else {
+                    r.first().get::<i64>(1).ok().flatten()
+                }
+            })
+            .unwrap_or(8);
+        let active: i64 = shmem::active_worker_count() as i64;
+        (max, active)
+    });
+    // Recommended minimum: 8 base + worker pool size
+    let pool_size = crate::config::pg_trickle_max_dynamic_refresh_workers() as i64;
+    let recommended_min = 8 + pool_size;
+    let workers_ok = max_workers >= recommended_min;
+    checks.push(serde_json::json!({
+        "check": "max_worker_processes",
+        "pass": workers_ok,
+        "detail": format!(
+            "max_worker_processes={}, recommended_min={} (8 + pool_size={}), active_pg_trickle_workers={}",
+            max_workers, recommended_min, pool_size, active_workers
+        )
+    }));
+
+    // Check 4: wal_level (advisory — only warn if WAL sources exist)
+    let wal_level = Spi::get_one::<String>("SELECT current_setting('wal_level', true)")
+        .unwrap_or(None)
+        .unwrap_or_else(|| "unknown".to_string());
+    let wal_source_count: i64 = Spi::get_one::<i64>(
+        "SELECT COUNT(*) FROM pgtrickle.pgt_stream_tables WHERE cdc_mode = 'WAL'",
+    )
+    .unwrap_or(None)
+    .unwrap_or(0);
+    let wal_ok = wal_level == "logical" || wal_source_count == 0;
+    checks.push(serde_json::json!({
+        "check": "wal_level",
+        "pass": wal_ok,
+        "detail": format!(
+            "wal_level={}, wal_cdc_sources={} — {}",
+            wal_level,
+            wal_source_count,
+            if wal_ok { "OK" } else { "wal_level must be 'logical' for WAL-mode CDC — run: ALTER SYSTEM SET wal_level = logical" }
+        )
+    }));
+
+    // Check 5: max_replication_slots vs WAL sources
+    let max_slots: i64 =
+        Spi::get_one::<i64>("SELECT current_setting('max_replication_slots')::int")
+            .unwrap_or(None)
+            .unwrap_or(0);
+    let used_slots: i64 = Spi::get_one::<i64>(
+        "SELECT COUNT(*) FROM pg_catalog.pg_replication_slots WHERE plugin IS NOT NULL",
+    )
+    .unwrap_or(None)
+    .unwrap_or(0);
+    let slots_available = max_slots - used_slots;
+    let slots_ok = wal_source_count == 0 || slots_available > 0;
+    checks.push(serde_json::json!({
+        "check": "replication_slots",
+        "pass": slots_ok,
+        "detail": format!(
+            "max_replication_slots={}, used={}, available={}, wal_sources={}",
+            max_slots, used_slots, slots_available, wal_source_count
+        )
+    }));
+
+    // Check 6: Invalidation ring overflow (capacity signal, not a hard failure)
+    let ring_overflows = shmem::invalidation_ring_overflow_count();
+    let ring_capacity = config::pg_trickle_invalidation_ring_capacity();
+    let ring_ok = ring_overflows == 0;
+    checks.push(serde_json::json!({
+        "check": "invalidation_ring",
+        "pass": ring_ok,
+        "detail": format!(
+            "ring_capacity={}, overflow_count={} — {}",
+            ring_capacity,
+            ring_overflows,
+            if ring_ok {
+                "No overflows since startup".to_string()
+            } else {
+                format!("{}  overflows detected — consider increasing pg_trickle.invalidation_ring_capacity", ring_overflows)
+            }
+        )
+    }));
+
+    // Check 7: Citus failure total (advisory signal)
+    let citus_failures = shmem::citus_worker_failure_total();
+    let citus_ok = citus_failures == 0;
+    checks.push(serde_json::json!({
+        "check": "citus_worker_failures",
+        "pass": true, // always advisory
+        "detail": format!(
+            "citus_worker_failure_total={} — {}",
+            citus_failures,
+            if citus_ok { "No Citus worker threshold crossings since startup" }
+            else { "Citus worker failure threshold(s) crossed — check logs for COORD-14 warnings" }
+        )
+    }));
+
+    let all_ok = checks.iter().all(|c| c["pass"].as_bool().unwrap_or(false));
+
+    let result = serde_json::json!({
+        "ok": all_ok,
+        "checks": checks
+    });
+
+    result.to_string()
+}
+
 // ── CACHE-3 (v0.25.0): Manual cache flush ──────────────────────────────
 
 /// CACHE-3: Flush all delta-template cache levels in the current database.

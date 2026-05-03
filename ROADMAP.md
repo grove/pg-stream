@@ -86,11 +86,11 @@
 | [v0.38.0](roadmap/v0.38.0.md) | EC-01 Correctness Sprint (Hard Gate): join phantom rows, property-test convergence proof — BLOCKING release gate | ✅ Released | Medium | [Full details](roadmap/v0.38.0.md-full.md) |
 | [v0.39.0](roadmap/v0.39.0.md) | Operational Truthfulness & Distributed Hardening: backpressure/wake fix, generated docs, Citus chaos, SQLSTATE rollout, diagnostics | ✅ Released | Large | [Full details](roadmap/v0.39.0.md-full.md) |
 | [v0.40.0](roadmap/v0.40.0.md) | Operator trust and maintainability: generated references, alerting, drain-mode proof, secret hygiene, unsafe gating | ✅ Released | Large | [Full details](roadmap/v0.40.0.md-full.md) |
-| [v0.41.0](roadmap/v0.41.0.md) | DVM correctness: structural cache keys, placeholder safety, WAL transition guards | Released | Medium | [Full details](roadmap/v0.41.0.md-full.md) |
-| [v0.42.0](roadmap/v0.42.0.md) | Documentation truthfulness + test quality: repair_stream_table, catalog generator, SQL reference, sleep removal, fuzz CI | Released | Large | [Full details](roadmap/v0.42.0.md-full.md) |
+| [v0.41.0](roadmap/v0.41.0.md) | DVM correctness: structural cache keys, placeholder safety, WAL transition guards | ✅ Released | Medium | [Full details](roadmap/v0.41.0.md-full.md) |
+| [v0.42.0](roadmap/v0.42.0.md) | Documentation truthfulness + test quality: repair_stream_table, catalog generator, SQL reference, sleep removal, fuzz CI | ✅ Released | Large | [Full details](roadmap/v0.42.0.md-full.md) |
 | [v0.43.0](roadmap/v0.43.0.md) | Performance tunability: deep-join GUCs, GROUP_RESCAN improvement, explain_stream_table diagnostics, D+I change buffer refactor | ✅ Released | Large | [Full details](roadmap/v0.43.0.md-full.md) |
-| [v0.44.0](roadmap/v0.44.0.md) | Security hardening: IVM search_path fix, centralized SQL builder, RLS warnings, module decomposition | Released | Large | [Full details](roadmap/v0.44.0.md-full.md) |
-| [v0.45.0](roadmap/v0.45.0.md) | Operational readiness: preflight functions, scalability infrastructure, CI completeness, CNPG production examples | Planned | Large | [Full details](roadmap/v0.45.0.md-full.md) |
+| [v0.44.0](roadmap/v0.44.0.md) | Security hardening: IVM search_path fix, centralized SQL builder, RLS warnings, module decomposition | ✅ Released | Large | [Full details](roadmap/v0.44.0.md-full.md) |
+| [v0.45.0](roadmap/v0.45.0.md) | Operational readiness: preflight functions, scalability infrastructure, CI completeness, CNPG production examples | ✅ Released | Large | [Full details](roadmap/v0.45.0.md-full.md) |
 
 ### Embedding & AI Programme (v0.46.x – v0.47.x)
 

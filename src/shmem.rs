@@ -9,11 +9,15 @@ use std::sync::atomic::{AtomicU32, AtomicU64};
 
 /// C2-1 / DEF-4: Maximum number of pgt_ids the invalidation ring buffer can hold.
 ///
-/// When more DDL changes arrive between scheduler ticks than this capacity,
+/// This is the **compile-time maximum** allocated in shared memory. The effective
+/// capacity is controlled at preload-time by the `pg_trickle.invalidation_ring_capacity`
+/// GUC (default 128, range 1–1024). Increasing the GUC above the default allows
+/// clusters with many concurrent DDL events to avoid full DAG rebuilds.
+///
+/// When more DDL changes arrive between scheduler ticks than the effective capacity,
 /// the overflow flag is set and the scheduler falls back to a full O(V+E) DAG
-/// rebuild. Raised to 128 in v0.11.0 to handle CI pipelines, dbt model rebuilds,
-/// and schema-migration workloads that can produce dozens of DDL events per tick.
-const INVALIDATION_RING_CAPACITY: usize = 128;
+/// rebuild. Raised to 1024 max in v0.45.0 to support `pg_trickle.invalidation_ring_capacity`.
+const INVALIDATION_RING_MAX_CAPACITY: usize = 1024;
 
 /// Shared state visible to both the scheduler and user backends.
 ///
@@ -30,8 +34,8 @@ pub struct PgTrickleSharedState {
     // ── C2-1: Invalidation ring buffer ───────────────────────────────
     /// Bounded ring buffer of pgt_ids that need DAG re-evaluation.
     /// DDL hooks push affected pgt_ids here; the scheduler drains them.
-    inv_ring: [i64; INVALIDATION_RING_CAPACITY],
-    /// Number of valid entries in the ring buffer (0..=CAPACITY).
+    inv_ring: [i64; INVALIDATION_RING_MAX_CAPACITY],
+    /// Number of valid entries in the ring buffer (0..=effective_capacity).
     inv_count: u16,
     /// When true, more DDL events arrived than the ring can hold.
     /// The scheduler must do a full O(V+E) DAG rebuild.
@@ -42,7 +46,7 @@ impl Default for PgTrickleSharedState {
     fn default() -> Self {
         Self {
             dag_version: 0,
-            inv_ring: [0; INVALIDATION_RING_CAPACITY],
+            inv_ring: [0; INVALIDATION_RING_MAX_CAPACITY],
             inv_count: 0,
             inv_overflow: false,
         }
@@ -141,6 +145,15 @@ pub static CACHE_GENERATION: PgAtomic<AtomicU64> =
 pub static ACTIVE_REFRESH_WORKERS: PgAtomic<AtomicU32> =
     unsafe { PgAtomic::new(c"pg_trickle_active_workers") };
 
+// ── A46-7 (v0.45.0): Invalidation ring overflow counter ──────────────────
+/// Counts the number of times the invalidation ring overflowed since startup.
+/// Incremented each time a DDL event cannot fit in the ring (capacity exceeded).
+/// Exposed through diagnostics and Prometheus for capacity planning.
+///
+// SAFETY: PgAtomic::new requires a static CStr name.
+pub static INVALIDATION_RING_OVERFLOWS: PgAtomic<AtomicU64> =
+    unsafe { PgAtomic::new(c"pg_trickle_ring_overflows") };
+
 /// Epoch counter incremented each time worker tokens are reconciled after a
 /// crash or abnormal exit. Allows coordinators to detect that reconciliation
 /// happened and re-check their in-flight job state.
@@ -236,6 +249,17 @@ pub static DRAIN_REQUESTED: PgAtomic<AtomicU64> =
 pub static DRAIN_COMPLETED: PgAtomic<AtomicU64> =
     unsafe { PgAtomic::new(c"pg_trickle_drain_completed") };
 
+/// A46-11 (v0.45.0): Cumulative Citus worker failure counter.
+///
+/// Counts the total number of consecutive-failure threshold crossings across
+/// all Citus workers since startup. Unlike the thread-local per-worker counters
+/// in `scheduler/citus.rs`, this counter persists across scheduler restarts
+/// and is exposed through `pgtrickle.preflight()` and diagnostics for
+/// operational visibility.
+// SAFETY: PgAtomic::new requires a static CStr name.
+pub static CITUS_WORKER_FAILURE_TOTAL: PgAtomic<AtomicU64> =
+    unsafe { PgAtomic::new(c"pg_trickle_citus_fail_total") };
+
 /// Register shared memory allocations. Called from `_PG_init()`.
 pub fn init_shared_memory() {
     pg_shmem_init!(PGS_STATE);
@@ -245,6 +269,7 @@ pub fn init_shared_memory() {
     pg_shmem_init!(DAG_REBUILD_SIGNAL);
     pg_shmem_init!(CACHE_GENERATION);
     pg_shmem_init!(ACTIVE_REFRESH_WORKERS);
+    pg_shmem_init!(INVALIDATION_RING_OVERFLOWS);
     pg_shmem_init!(RECONCILE_EPOCH);
     pg_shmem_init!(TOTAL_DIFF_REFRESHES);
     pg_shmem_init!(DEDUP_NEEDED_REFRESHES);
@@ -263,6 +288,7 @@ pub fn init_shared_memory() {
     // A35 (v0.36.0): Drain mode epoch counters.
     pg_shmem_init!(DRAIN_REQUESTED);
     pg_shmem_init!(DRAIN_COMPLETED);
+    pg_shmem_init!(CITUS_WORKER_FAILURE_TOTAL);
     SHMEM_INITIALIZED.store(true, std::sync::atomic::Ordering::Relaxed);
 }
 
@@ -372,8 +398,11 @@ pub fn signal_dag_invalidation(pgt_id: i64) {
 /// Pure logic extracted for unit-testability. Deduplicates entries and
 /// sets the overflow flag when the ring is full.
 fn push_invalidation(state: &mut PgTrickleSharedState, pgt_id: i64) {
+    // A46-7: Use the configurable effective capacity (GUC-controlled, default 128).
+    let effective_capacity =
+        crate::config::pg_trickle_invalidation_ring_capacity().min(INVALIDATION_RING_MAX_CAPACITY);
     let count = state.inv_count as usize;
-    if count < INVALIDATION_RING_CAPACITY {
+    if count < effective_capacity {
         // Deduplicate: skip if this pgt_id is already in the ring.
         if !state.inv_ring[..count].contains(&pgt_id) {
             state.inv_ring[count] = pgt_id;
@@ -381,6 +410,13 @@ fn push_invalidation(state: &mut PgTrickleSharedState, pgt_id: i64) {
         }
     } else {
         state.inv_overflow = true;
+        // A46-7: Increment the persistent overflow counter for capacity planning.
+        // Guard against uninitialized atomics in unit tests.
+        if is_shmem_available() {
+            INVALIDATION_RING_OVERFLOWS
+                .get()
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
     }
 }
 
@@ -636,6 +672,43 @@ pub fn active_worker_count() -> u32 {
         return 0;
     }
     ACTIVE_REFRESH_WORKERS
+        .get()
+        .load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// A46-7: Returns the total number of invalidation ring overflow events since startup.
+///
+/// Each overflow means a DDL event exceeded the ring capacity and forced a full
+/// DAG rebuild. Use this for capacity planning: if the count is increasing,
+/// consider raising `pg_trickle.invalidation_ring_capacity`.
+pub fn invalidation_ring_overflow_count() -> u64 {
+    if !is_shmem_available() {
+        return 0;
+    }
+    INVALIDATION_RING_OVERFLOWS
+        .get()
+        .load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// A46-11: Increment the Citus worker failure total counter.
+///
+/// Called from the scheduler when a Citus worker consecutive-failure threshold
+/// is crossed. The counter persists across scheduler restarts.
+pub fn increment_citus_worker_failure_total() {
+    if !is_shmem_available() {
+        return;
+    }
+    CITUS_WORKER_FAILURE_TOTAL
+        .get()
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// A46-11: Returns the total number of Citus worker failure events since startup.
+pub fn citus_worker_failure_total() -> u64 {
+    if !is_shmem_available() {
+        return 0;
+    }
+    CITUS_WORKER_FAILURE_TOTAL
         .get()
         .load(std::sync::atomic::Ordering::Relaxed)
 }
@@ -1043,8 +1116,8 @@ static SHMEM_INITIALIZED: std::sync::atomic::AtomicBool = std::sync::atomic::Ato
 #[cfg(test)]
 mod tests {
     use super::{
-        INVALIDATION_RING_CAPACITY, PgTrickleSharedState, drain_ring, increment_epoch,
-        push_invalidation, saturating_decrement_counter, try_increment_bounded_counter,
+        PgTrickleSharedState, drain_ring, increment_epoch, push_invalidation,
+        saturating_decrement_counter, try_increment_bounded_counter,
     };
     use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
@@ -1204,11 +1277,11 @@ mod tests {
     #[test]
     fn test_ring_overflow_at_capacity() {
         let mut s = new_state();
-        // Fill to capacity
-        for id in 0..INVALIDATION_RING_CAPACITY as i64 {
+        // Fill to the default effective capacity (128 in test mode)
+        for id in 0..128_i64 {
             push_invalidation(&mut s, id);
         }
-        assert_eq!(s.inv_count as usize, INVALIDATION_RING_CAPACITY);
+        assert_eq!(s.inv_count as usize, 128);
         assert!(!s.inv_overflow);
 
         // One more triggers overflow
@@ -1241,8 +1314,8 @@ mod tests {
     #[test]
     fn test_drain_overflow_returns_none() {
         let mut s = new_state();
-        // Fill up and overflow
-        for id in 0..=(INVALIDATION_RING_CAPACITY as i64) {
+        // Fill up and overflow (default capacity 128 in test mode)
+        for id in 0..=128_i64 {
             push_invalidation(&mut s, id);
         }
         assert!(s.inv_overflow);

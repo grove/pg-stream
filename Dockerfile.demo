@@ -45,3 +45,7 @@ RUN apt-get update && apt-get install -y \
 # cargo pgrx package outputs to target/release/pg_trickle-pg18/
 COPY --from=builder /build/target/release/pg_trickle-pg18/usr/share/postgresql/18/extension/* /usr/share/postgresql/18/extension/
 COPY --from=builder /build/target/release/pg_trickle-pg18/usr/lib/postgresql/18/lib/*.so /usr/lib/postgresql/18/lib/
+
+EXPOSE 5432
+HEALTHCHECK --interval=10s --timeout=5s --start-period=30s --retries=5 \
+    CMD pg_isready -U postgres || exit 1

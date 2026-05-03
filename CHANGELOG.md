@@ -7,6 +7,7 @@ For future plans and upcoming features, see [ROADMAP.md](ROADMAP.md).
 ## Table of Contents
 
 <!-- TOC start -->
+- [0.45.0 — Operational Readiness, Scalability & CI Completeness](#0450--operational-readiness-scalability--ci-completeness)
 - [0.44.0 — Security Hardening & Code Quality](#0440--security-hardening--code-quality)
 - [0.43.0 — D+I Change-Buffer Schema, GUC Tuning & WAL Diagnostics](#0430--di-change-buffer-schema-guc-tuning--wal-diagnostics)
 - [0.42.0 — Repair API, Docs Overhaul & Test Infrastructure](#0420--repair-api-docs-overhaul--test-infrastructure)
@@ -58,6 +59,112 @@ For future plans and upcoming features, see [ROADMAP.md](ROADMAP.md).
 - [0.1.1 — CloudNativePG Image & Test Hardening](#011--cloudnativepg-image--test-hardening)
 - [0.1.0 — Initial Release](#010--initial-release)
 <!-- TOC end -->
+
+---
+
+## [0.45.0] — Operational Readiness, Scalability & CI Completeness
+
+v0.45.0 is an operational and CI maturity release. It adds a first-class
+`preflight()` health-check function, enhances the worker pool status view,
+makes the invalidation ring capacity configurable, adds lag-aware scheduling,
+introduces incremental DAG rebuild for faster event propagation, completes
+dbt macro option parity, and substantially tightens CI coverage.
+
+### New SQL Functions
+
+- **A46-4**: `pgtrickle.preflight()` — returns a JSON health report with 7
+  system checks: `shared_preload_libraries` presence, scheduler running,
+  `max_worker_processes` sufficiency, `wal_level` for WAL-CDC, replication
+  slots availability, invalidation ring overflow count, and Citus worker
+  failure total. Run this after install or after configuration changes to
+  verify the environment is ready.
+
+### Enhanced SQL Functions
+
+- **A46-5**: `pgtrickle.worker_pool_status()` gains four new columns:
+  `idle_workers` (free slots), `last_scheduler_tick_unix` (Unix timestamp
+  of last scheduler wake), `ring_overflow_count` (invalidation ring overflows
+  since startup), and `citus_failure_total` (Citus worker failures logged).
+
+### Configuration (GUCs)
+
+- **A46-7**: New GUC `pg_trickle.invalidation_ring_capacity` (integer, default
+  128, max 1024, postmaster scope). Configures the in-memory invalidation ring
+  used for cross-backend event propagation. Requires a PostgreSQL restart when
+  changed.
+- **A46-10**: New GUC `pg_trickle.lag_aware_scheduling` (boolean, default
+  false, superuser scope). When enabled, the per-database refresh quota is
+  boosted proportionally to refresh lag (up to 2×), accelerating catch-up
+  without starving other databases.
+
+### Performance
+
+- **A46-9**: Incremental DAG schedule re-resolution — when upstream CDC events
+  affect a subset of stream tables, the scheduler now recomputes only the
+  affected CALCULATED-schedule nodes (O(affected)) instead of the full DAG
+  (O(V)). Falls back to full resolution if more than 25% of the DAG is
+  affected. The new `resolve_calculated_schedule_incremental()` method is
+  benchmarked in `benches/scheduler_bench.rs`.
+- **A46-11**: Citus worker failure counter persisted in shared memory
+  (`pg_trickle_citus_fail_total`), visible via `worker_pool_status()`. The
+  counter increments when a Citus worker crosses the failure threshold,
+  enabling operational dashboards to track distribution health over time.
+
+### Observability & Deployment
+
+- **A46-1/A46-2**: `Dockerfile.hub`, `Dockerfile.ghcr`, and `Dockerfile.demo`
+  now carry the correct default `ARG VERSION=0.45.0` and a `HEALTHCHECK`
+  directive (`pg_isready`) for Docker Compose and Kubernetes readiness probes.
+- **A46-3**: `cnpg/cluster-dev.yaml` (single-instance) and
+  `cnpg/cluster-production.yaml` (3-node HA) added as ready-to-use
+  CloudNativePG cluster manifests, including the worker budget formula
+  `max_worker_processes = 8 + (2 × num_databases) + worker_pool_size`.
+- **A46-6**: `monitoring/production/README.md` documents least-privilege role
+  setup, TLS Prometheus scrape config, Kubernetes ServiceMonitor, and
+  recommended alert thresholds for production deployments.
+- **A46-16**: `docs/STORAGE_BACKENDS.md` — reference page covering Heap,
+  Unlogged, Citus columnar, and pg_mooncake backends with migration guidance.
+
+### CI & Developer Experience
+
+- **A46-13**: Windows compile failures are now **blocking** on scheduled CI
+  runs (removed `continue-on-error: true`). A lightweight
+  `windows-compile-gate` job also runs on every PR to catch Windows-specific
+  compile errors early.
+- **A46-14**: New `e2e-smoke` CI job runs on every PR and push to main. It
+  builds the full E2E Docker image and runs a representative subset of tests
+  (DVM, CDC, scheduler), catching packaging/install regressions faster than
+  the full E2E run (schedule/manual only).
+- **A46-15**: The Coverage workflow now runs on a weekly Monday schedule in
+  addition to push-to-main and manual dispatch, providing consistent
+  module-level coverage trend data.
+- **A46-17**: dbt macros fully synced with `CreateStreamTableOptions` —
+  `storage_backend`, `temporal`, `append_only`, `diamond_consistency`,
+  `diamond_schedule_policy`, `pooler_compatibility_mode`,
+  `max_differential_joins`, `max_delta_fraction`, and
+  `output_distribution_column` are now configurable from dbt model configs and
+  are correctly passed to the underlying SQL functions.
+
+### Schema Changes
+
+```sql
+-- New function
+pgtrickle.preflight() RETURNS text
+
+-- worker_pool_status() return type extended (4 new columns):
+--   idle_workers             integer
+--   last_scheduler_tick_unix bigint
+--   ring_overflow_count      bigint
+--   citus_failure_total      bigint
+
+-- New GUCs (set in postgresql.conf):
+--   pg_trickle.invalidation_ring_capacity = 128  -- postmaster scope
+--   pg_trickle.lag_aware_scheduling = false       -- superuser scope
+```
+
+> **Upgrade note:** `ALTER EXTENSION pg_trickle UPDATE` will DROP and
+> re-create `worker_pool_status()` automatically (return type changed).
+> The migration script `pg_trickle--0.44.0--0.45.0.sql` handles this.
 
 ---
 
