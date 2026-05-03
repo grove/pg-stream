@@ -29,40 +29,24 @@ PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 # Pass through any extra args (e.g. --no-cache)
 EXTRA_ARGS="${*:-}"
 
-# ── Auto-detect build platform ───────────────────────────────────────────────
-# Used only for comparison: if the existing builder image was built for a
-# different architecture (e.g. a stale linux/amd64 image on Apple Silicon)
-# we force a rebuild.  The build itself has NO --platform flag so Docker
-# defaults to the native OS/arch and stores images in the Docker daemon's
-# classic image store (required by docker run and testcontainers via bollard).
-# Passing --platform on Docker Desktop 4.60+ with the containerd image store
-# causes images to land in the containerd namespace, invisible to docker run.
-# Override this detection by setting DOCKER_PLATFORM in the environment.
-PLATFORM="${DOCKER_PLATFORM:-linux/$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/')}"
-
 # ── Ensure the builder base image is available ───────────────────────────────
 # Skip this check when --no-cache is given (the caller wants a full scratch
 # build, so we don't want to rebuild the builder separately first).
 if [[ "${EXTRA_ARGS}" != *"--no-cache"* ]]; then
-    # Check both presence and platform match; force rebuild on mismatch so a
-    # stale amd64 builder on an arm64 host doesn't silently fail at build time.
-    BUILDER_PLATFORM=$(docker image inspect "${BUILDER_IMAGE}" \
+    BUILDER_EXISTS=$(docker image inspect "${BUILDER_IMAGE}" \
         --format='{{.Os}}/{{.Architecture}}' 2>/dev/null || echo "")
-    if [[ "${BUILDER_PLATFORM}" != "${PLATFORM}" ]]; then
+    if [[ -z "${BUILDER_EXISTS}" ]]; then
         echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-        if [[ -z "${BUILDER_PLATFORM}" ]]; then
-            echo "  Builder image not found: ${BUILDER_IMAGE}"
-        else
-            echo "  Builder image platform mismatch: got ${BUILDER_PLATFORM}, need ${PLATFORM}"
-        fi
+        echo "  Builder image not found: ${BUILDER_IMAGE}"
         echo "  Building it now (one-time, ~7 min) …"
         echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
         docker build \
+            --provenance=false \
             -t "${BUILDER_IMAGE}" \
             -f "${SCRIPT_DIR}/Dockerfile.builder" \
             "${PROJECT_ROOT}"
     else
-        echo "  Builder image present (${BUILDER_PLATFORM}): ${BUILDER_IMAGE}"
+        echo "  Builder image present (${BUILDER_EXISTS}): ${BUILDER_IMAGE}"
     fi
 fi
 
