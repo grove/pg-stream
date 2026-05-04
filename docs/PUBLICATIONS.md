@@ -262,5 +262,4 @@ changes from source tables.
 
 - [SQL Reference: stream\_table\_to\_publication](SQL_REFERENCE.md#pgtricklestreamtabletopublication)
 - [CDC Modes](CDC_MODES.md) — WAL-based change capture for source tables
-- [Relay Service](RELAY_GUIDE.md) — alternative integration path without requiring `wal_level = logical`
 - [Prometheus & Grafana integration](integrations/prometheus.md) — monitor replication lag

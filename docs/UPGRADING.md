@@ -644,17 +644,10 @@ No breaking changes.
 
 ### 0.28.0 → 0.29.0
 
-**New catalog tables:** `pgtrickle.relay_outbox_config`,
-`pgtrickle.relay_inbox_config`, `pgtrickle.relay_consumer_offsets` for the
-relay CLI binary.
-
-**New SQL functions:** `pgtrickle.set_relay_outbox(...)`,
-`pgtrickle.set_relay_inbox(...)`, `pgtrickle.enable_relay(name)`,
-`pgtrickle.disable_relay(name)`, `pgtrickle.delete_relay(name)`,
-`pgtrickle.get_relay_config(name)`, `pgtrickle.list_relay_configs()`.
-
-**New binary:** `pgtrickle-relay` — standalone relay CLI. No PostgreSQL
-configuration changes required to use the extension itself.
+Added relay catalog tables and SQL functions (`set_relay_outbox`, `set_relay_inbox`,
+`enable_relay`, `disable_relay`, `delete_relay`, `get_relay_config`,
+`list_relay_configs`) and the standalone `pgtrickle-relay` binary. These were
+later extracted to [`pg_tide`](https://github.com/trickle-labs/pg-tide) in v0.46.0.
 
 No breaking changes.
 

@@ -96,7 +96,7 @@
 
 | Version | Theme | Status | Scope | Full details |
 |---------|-------|--------|------- |---------- |
-| [v0.46.0](roadmap/v0.46.0.md) | Extract `pg_tide`: standalone transactional outbox, inbox, and relay into `trickle-labs/pg-tide` | Planned | Large | [Full details](roadmap/v0.46.0.md-full.md) |
+| [v0.46.0](roadmap/v0.46.0.md) | Extract `pg_tide`: standalone transactional outbox, inbox, and relay into `trickle-labs/pg-tide` | ✅ Released | Large | [Full details](roadmap/v0.46.0.md-full.md) |
 
 ### Embedding & AI Programme (v0.47.x – v0.48.x)
 

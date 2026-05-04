@@ -16,9 +16,7 @@ process. Its security surface spans:
    buffer, which lives in the `pgtrickle_changes` schema
 3. **Background worker** — a scheduler process that runs as the PostgreSQL
    superuser
-4. **Relay credentials** — connection strings used by `pgtrickle-relay` to
-   read from published stream tables and forward changes downstream
-5. **Secret handling** — credentials in configuration files, environment
+4. **Secret handling** — credentials in configuration files, environment
    variables, and shell history
 
 ---
@@ -187,54 +185,6 @@ since changes that arrived during the pause were discarded.
 
 ---
 
-## Relay Credentials
-
-`pgtrickle-relay` connects to PostgreSQL to read from published stream tables.
-It requires a connection string with `replication = database`.
-
-### Recommended credential storage (most secure first)
-
-1. **`.pgpass` file** — `~/.pgpass` (mode 0600) or the path set by `PGPASSFILE`.
-   The relay reads libpq environment variables automatically.
-   ```
-   # ~/.pgpass
-   hostname:5432:dbname:relay_user:s3cr3t
-   ```
-
-2. **`pg_service.conf`** — define a named service:
-   ```ini
-   # ~/.pg_service.conf (or /etc/pg_service.conf)
-   [pgtrickle_relay]
-   host=hostname
-   port=5432
-   dbname=mydb
-   user=relay_user
-   password=s3cr3t
-   ```
-   Then set `PGSERVICEFILE` and use `service=pgtrickle_relay` in the relay config.
-
-3. **Environment variable** — `PGPASSWORD` is read by libpq if set. Do not
-   persist this in systemd unit files or shell scripts where it would be
-   world-readable. Use a secrets manager (Vault, AWS Secrets Manager, etc.)
-   to inject it at runtime.
-
-4. **Relay config file** — only as a last resort. If you must store credentials
-   in `relay.toml`:
-   - Set file permissions to `0600` (`chmod 600 relay.toml`).
-   - Ensure the file is excluded from version control (`.gitignore`).
-   - Document the rotation procedure.
-
-### What to avoid
-
-- Passing credentials on the command line (`--password=...`): they appear in
-  `ps aux` output and shell history.
-- Storing credentials in world-readable files or environment files with
-  permissions wider than `0640`.
-- Using superuser credentials for the relay. Create a dedicated replication
-  role: `CREATE ROLE relay_user WITH LOGIN REPLICATION`.
-
----
-
 ## Background Worker Privilege
 
 The scheduler background worker runs with full superuser privilege because
@@ -282,6 +232,5 @@ The following supply-chain controls are staged for v1.0 (tracked by O40-9):
 
 - [docs/CONFIGURATION.md](CONFIGURATION.md) — GUC reference
 - [docs/RUNBOOK_DRAIN.md](RUNBOOK_DRAIN.md) — drain-mode operational guide
-- [docs/RELAY_GUIDE.md](RELAY_GUIDE.md) — relay deployment guide
 - [docs/GUC_CATALOG.md](GUC_CATALOG.md) — generated GUC catalog
 - [docs/SQL_API_CATALOG.md](SQL_API_CATALOG.md) — generated SQL API catalog

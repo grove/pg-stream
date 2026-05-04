@@ -335,7 +335,6 @@ requires DIFFERENTIAL or FULL refresh mode to detect which rows changed.
 ## See also
 
 - [Transactional Inbox](INBOX.md) — receive events from external systems
-- [Relay Service](RELAY_GUIDE.md) — bridge the outbox to NATS, Kafka, webhooks, and more
 - [SQL Reference: Transactional Outbox](SQL_REFERENCE.md#transactional-outbox--consumer-groups-v0280)
 - [Configuration](CONFIGURATION.md#transactional-outbox-v0280)
 - [Pattern 7: Transactional Outbox](PATTERNS.md#pattern-7-transactional-outbox-v0280)

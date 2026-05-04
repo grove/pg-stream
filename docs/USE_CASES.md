@@ -24,7 +24,7 @@ you a minimal SQL example, and links to a deeper guide.
 | [Leaderboards & TopK](#4-leaderboards--topk) | DIFFERENTIAL or IMMEDIATE | [SQL Reference – TopK](SQL_REFERENCE.md) |
 | [Bronze / Silver / Gold (medallion)](#5-bronze--silver--gold) | DIFFERENTIAL with chained STs | [Patterns §1](PATTERNS.md#pattern-1-bronze--silver--gold-materialization) |
 | [Event-driven services (outbox / inbox)](#6-event-driven-services) | IMMEDIATE for the table; DIFFERENTIAL for the views | [Outbox](OUTBOX.md) · [Inbox](INBOX.md) |
-| [Cross-system replication](#7-cross-system-replication) | DIFFERENTIAL | [Publications](PUBLICATIONS.md) · [Relay](RELAY_GUIDE.md) |
+| [Cross-system replication](#7-cross-system-replication) | DIFFERENTIAL | [Publications](PUBLICATIONS.md) |
 | [Slowly-changing dimensions](#8-slowly-changing-dimensions-scd) | DIFFERENTIAL | [Patterns §3](PATTERNS.md#pattern-3-slowly-changing-dimensions-scd) |
 | [Multi-tenant analytics](#9-multi-tenant-analytics) | DIFFERENTIAL with RLS | [Multi-tenant](integrations/multi-tenant.md) |
 | [Citus distributed analytics](#10-citus-distributed-analytics) | DIFFERENTIAL | [Citus](CITUS.md) |
@@ -148,7 +148,7 @@ See [Patterns §1](PATTERNS.md#pattern-1-bronze--silver--gold-materialization).
 The transactional outbox/inbox pattern, native to PostgreSQL:
 
 - **Outbox** — write events in the same transaction as your business
-  data; an external system or the [relay](RELAY_GUIDE.md) drains them
+  data; an external system drains them
   to Kafka / NATS / SQS / a webhook.
 - **Inbox** — receive events idempotently from an external system;
   stream tables give you live views of pending work, retries, and a

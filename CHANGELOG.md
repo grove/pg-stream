@@ -7,6 +7,7 @@ For future plans and upcoming features, see [ROADMAP.md](ROADMAP.md).
 ## Table of Contents
 
 <!-- TOC start -->
+- [0.46.0 — Extract `pg_tide`: Standalone Outbox, Inbox & Relay](#0460--extract-pg_tide-standalone-outbox-inbox--relay)
 - [0.45.0 — Operational Readiness, Scalability & CI Completeness](#0450--operational-readiness-scalability--ci-completeness)
 - [0.44.0 — Security Hardening & Code Quality](#0440--security-hardening--code-quality)
 - [0.43.0 — D+I Change-Buffer Schema, GUC Tuning & WAL Diagnostics](#0430--di-change-buffer-schema-guc-tuning--wal-diagnostics)
@@ -59,6 +60,88 @@ For future plans and upcoming features, see [ROADMAP.md](ROADMAP.md).
 - [0.1.1 — CloudNativePG Image & Test Hardening](#011--cloudnativepg-image--test-hardening)
 - [0.1.0 — Initial Release](#010--initial-release)
 <!-- TOC end -->
+
+---
+
+## [0.46.0] — Extract `pg_tide`: Standalone Outbox, Inbox & Relay
+
+v0.46.0 is a focused extraction release. The full transactional outbox, inbox,
+and relay subsystem (~6,150 Rust LOC + ~2,500 SQL LOC) has been moved to the
+new standalone `pg_tide` extension (`trickle-labs/pg-tide`). `pg_trickle` now
+ships exactly one thing: incremental view maintenance.
+
+The only remaining integration point is `attach_outbox()`, which registers a
+`pg_tide` outbox for a stream table. After attachment, every non-empty refresh
+calls `tide.outbox_publish()` inside the same transaction — preserving the
+ADR-001/ADR-002 single-transaction atomicity guarantee.
+
+### New SQL Functions
+
+- **TIDE-7**: `pgtrickle.attach_outbox(stream_table, retention_hours=>24, inline_threshold_rows=>10000)` —
+  requires `pg_tide` to be installed; calls `tide.outbox_create()` and
+  registers the mapping in `pgtrickle.pgt_outbox_config`. Every subsequent
+  non-empty refresh writes a delta-summary row to the `pg_tide` outbox inside
+  the same transaction.
+
+- **TIDE-7**: `pgtrickle.detach_outbox(stream_table, if_exists=>false)` —
+  removes the `pgt_outbox_config` entry. The `pg_tide` outbox table itself is
+  NOT dropped; use `tide.outbox_drop()` in `pg_tide` after detaching to also
+  remove the outbox data.
+
+### Removed SQL Functions
+
+The following functions were moved to `pg_tide` (`trickle-labs/pg-tide`):
+
+**Outbox & Consumer Groups:**
+`enable_outbox`, `disable_outbox`, `outbox_status`, `outbox_rows_consumed`,
+`create_consumer_group`, `drop_consumer_group`, `poll_outbox`, `commit_offset`,
+`extend_lease`, `seek_offset`, `consumer_heartbeat`, `consumer_lag`
+
+**Inbox:**
+`create_inbox`, `drop_inbox`, `enable_inbox_tracking`, `inbox_health`,
+`inbox_status`, `replay_inbox_messages`, `enable_inbox_ordering`,
+`disable_inbox_ordering`, `enable_inbox_priority`, `disable_inbox_priority`,
+`inbox_ordering_gaps`, `inbox_is_my_partition`
+
+**Relay:**
+`set_relay_outbox`, `set_relay_inbox`, `enable_relay`, `disable_relay`,
+`delete_relay`, `get_relay_config`, `list_relay_configs`
+
+### Removed Catalog Tables
+
+Dropped as part of the extraction: `relay_outbox_config`, `relay_inbox_config`,
+`relay_consumer_offsets`, `pgt_inbox_config`, `pgt_inbox_ordering_config`,
+`pgt_inbox_priority_config`, `pgt_consumer_groups`, `pgt_consumer_offsets`,
+`pgt_consumer_leases`. The `pgtrickle_relay` role is also dropped.
+`pgtrickle.pgt_outbox_config` is replaced with a slim integration schema.
+
+### GUC Changes
+
+The following GUCs are removed (all moved to `pg_tide`):
+`pg_trickle.outbox_enabled`, `pg_trickle.outbox_retention_hours`,
+`pg_trickle.outbox_drain_batch_size`, `pg_trickle.outbox_inline_threshold_rows`,
+`pg_trickle.outbox_drain_interval_seconds`, `pg_trickle.outbox_storage_critical_mb`,
+`pg_trickle.outbox_skip_empty_delta`, `pg_trickle.outbox_force_retention`,
+`pg_trickle.inbox_enabled`, `pg_trickle.inbox_processed_retention_hours`,
+`pg_trickle.inbox_dlq_retention_hours`, `pg_trickle.inbox_drain_batch_size`,
+`pg_trickle.inbox_drain_interval_seconds`, `pg_trickle.inbox_dlq_alert_max_per_refresh`,
+`pg_trickle.consumer_dead_threshold_hours`
+
+### Upgrade Notes
+
+Run `pg_trickle--0.45.0--0.46.0.sql` to drop all removed objects and migrate
+`pgt_outbox_config` to the new schema. Base outbox payload tables
+(`pgtrickle.outbox_<st>`) are **not** dropped — they remain for manual data
+migration to `pg_tide`. See the `pg_tide` repository for migration guidance.
+
+### New: `pg_tide` Extension
+
+The extracted functionality is now available as `pg_tide`, a standalone
+PostgreSQL extension at `https://github.com/trickle-labs/pg-tide`. It includes:
+- Transactional outbox with claim-check mode
+- Idempotent inbox with DLQ, priority, and ordering
+- The `pg-tide` relay binary (NATS, Kafka, SQS, webhooks, stdout)
+- Consumer group API (poll, commit, heartbeat, lag)
 
 ---
 

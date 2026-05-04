@@ -261,9 +261,10 @@ Spark, etc. subscribe to stream-table changes without an extra pipeline.
 See [Downstream Publications](PUBLICATIONS.md).
 
 ### Relay
-A standalone Rust binary (`pgtrickle-relay`) that bridges outbox/inbox
+A standalone Rust binary (`pg-tide-relay`) that bridges outbox/inbox
 tables with external messaging systems (NATS, Kafka, Redis Streams,
-SQS, RabbitMQ, webhooks). See [Relay Service](RELAY_GUIDE.md).
+SQS, RabbitMQ, webhooks). Extracted to the
+[`pg_tide`](https://github.com/trickle-labs/pg-tide) project in v0.46.0.
 
 ### TopK
 Stream tables of the form `SELECT … ORDER BY x LIMIT N` (optionally with

@@ -21,7 +21,6 @@ anti-patterns to avoid, and refresh mode recommendations.
 - [Replica Bootstrap & PITR Alignment (v0.27.0)](#replica-bootstrap--pitr-alignment-v0270)
 - [Pattern 7: Transactional Outbox (v0.28.0)](#pattern-7-transactional-outbox-v0280)
 - [Pattern 8: Transactional Inbox (v0.28.0)](#pattern-8-transactional-inbox-v0280)
-- [Pattern 9: Bidirectional Event Pipeline with Relay (v0.29.0)](#pattern-9-bidirectional-event-pipeline-with-relay-v0290)
 
 ---
 
@@ -708,7 +707,7 @@ and processed messages — all updated incrementally.
 ### Architecture
 
 ```
-external producer (Kafka / webhook / pg_trickle relay)
+external producer (Kafka / webhook / custom application)
   └─→ pgtrickle.orders_inbox (raw event table)
         ├─→ orders_inbox_pending  (stream table: awaiting processing)
         ├─→ orders_inbox_dlq      (stream table: failed messages)
@@ -811,128 +810,10 @@ pg_trickle.inbox_dlq_alert_max_per_refresh = 10   # alert on DLQ growth
 
 ---
 
-## Pattern 9: Bidirectional Event Pipeline with Relay (v0.29.0)
-
-> **Requires:** v0.29.0+ and the `pgtrickle-relay` binary
-
-The **relay** connects pg_trickle outboxes and inboxes to external messaging
-systems (NATS, Kafka, HTTP webhooks, Redis Streams, SQS, RabbitMQ) without
-any custom application code. You configure pipelines in SQL; the relay binary
-handles polling, publishing, and idempotent delivery.
-
-**Use this pattern when:**
-- You want stream table deltas to flow automatically to Kafka / NATS / etc.
-- You receive external events from a message queue and need them in PostgreSQL
-- You need high-availability relay with automatic failover (advisory-lock coordination)
-- You want hot-reload — pipeline config changes apply without restarting the relay
-
-### Architecture
-
-```
-                         ┌──────────────────────┐
-Stream table A ──outbox──→  pgtrickle-relay       ──→  NATS JetStream
-Stream table B ──outbox──→  (forward pipeline)    ──→  Kafka topic
-                         │                        │
-Kafka topic    ──────────→  (reverse pipeline)    ──→  inbox table → stream table
-                         └──────────────────────┘
-```
-
-### SQL Example — Forward Pipeline (outbox → NATS)
-
-```sql
--- 1. Enable outbox on your stream table
-SELECT pgtrickle.enable_outbox('public.orders_agg');
-
--- 2. Create a consumer group for the relay
-SELECT pgtrickle.create_consumer_group('relay_group', 'public.orders_agg');
-
--- 3. Configure the relay pipeline (SQL-only, no YAML)
-SELECT pgtrickle.set_relay_outbox(
-    'orders-to-nats',
-    outbox  => 'public.orders_agg',
-    group   => 'relay_group',
-    sink    => '{"type": "nats", "url": "nats://nats:4222", "subject": "orders.deltas"}'::jsonb,
-    retention_hours => 24
-);
-```
-
-### SQL Example — Reverse Pipeline (Kafka → inbox)
-
-```sql
--- 1. Create an inbox for incoming events
-SELECT pgtrickle.create_inbox('payment_events');
-
--- 2. Configure the reverse relay pipeline
-SELECT pgtrickle.set_relay_inbox(
-    'payments-from-kafka',
-    inbox  => 'pgtrickle.payment_events',
-    source => '{"type": "kafka", "brokers": ["kafka:9092"], "topic": "payments", "group_id": "relay"}'::jsonb,
-    max_retries => 3
-);
-```
-
-### Managing Pipelines
-
-```sql
--- Pause a pipeline
-SELECT pgtrickle.disable_relay('orders-to-nats');
-
--- Resume it
-SELECT pgtrickle.enable_relay('orders-to-nats');
-
--- List all pipelines and their status
-SELECT * FROM pgtrickle.list_relay_configs();
-
--- Delete a pipeline permanently
-SELECT pgtrickle.delete_relay('orders-to-nats');
-```
-
-### Running the Relay
-
-```bash
-# Set the connection string (only config needed)
-export PGTRICKLE_RELAY_POSTGRES_URL=postgres://relay_user:pass@localhost:5432/mydb
-
-# Start the relay — it discovers pipelines from the catalog automatically
-pgtrickle-relay
-
-# With HA (run 2–3 instances; advisory locks prevent duplicate processing)
-pgtrickle-relay --relay-group-id prod
-pgtrickle-relay --relay-group-id prod  # second instance — auto-failover
-```
-
-### Observability
-
-The relay exposes Prometheus metrics at `:9090/metrics` and a health endpoint
-at `:9090/health`.
-
-| Metric | Description |
-|--------|-------------|
-| `pgtrickle_relay_messages_published_total` | Messages successfully published |
-| `pgtrickle_relay_messages_consumed_total` | Messages consumed from sources |
-| `pgtrickle_relay_lag_seconds` | Estimated relay lag per pipeline |
-| `pgtrickle_relay_pipelines_owned` | Pipelines owned by this instance |
-
-See [RELAY.md](RELAY.md) for the full deployment guide.
-
-### When NOT to use this pattern
-
-- Your consumers run inside the same PostgreSQL database — use the outbox
-  pattern (Pattern 7) directly instead of adding a relay binary.
-- You only have one external system to integrate — a simple application
-  polling `poll_outbox()` is easier to operate than a standalone relay
-  process.
-- Your team does not want to operate an additional binary — the relay is
-  a Rust process with its own monitoring requirements; if that's a
-  burden, consider a managed connector (e.g. Debezium + publications).
-
----
-
 **See also:**
 [Use Cases](USE_CASES.md) ·
 [Performance Cookbook](PERFORMANCE_COOKBOOK.md) ·
 [SQL Reference](SQL_REFERENCE.md) ·
 [Tutorials: What Happens on INSERT](tutorials/WHAT_HAPPENS_ON_INSERT.md) ·
 [Outbox Pattern](OUTBOX.md) ·
-[Inbox Pattern](INBOX.md) ·
-[Relay Guide](RELAY_GUIDE.md)
+[Inbox Pattern](INBOX.md)

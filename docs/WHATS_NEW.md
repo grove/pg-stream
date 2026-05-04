@@ -32,13 +32,6 @@ sources.
 - `output_distribution_column` produces co-located distributed
   stream tables
 
-## v0.29 — Bidirectional Relay
-
-- The standalone `pgtrickle-relay` binary added forward (outbox →
-  external) and reverse (external → inbox) pipelines for NATS,
-  Kafka, Redis Streams, SQS, RabbitMQ, and webhooks
-  ([RELAY_GUIDE](RELAY_GUIDE.md))
-
 ## v0.28 — Transactional Outbox & Inbox
 
 - First-class outbox and inbox patterns built on stream tables

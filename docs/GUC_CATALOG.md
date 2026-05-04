@@ -4,7 +4,7 @@
 
 # GUC Reference — pg_trickle
 
-**132 configuration parameters** extracted from `src/config.rs`.
+**114 configuration parameters** extracted from `src/config.rs`.
 
 See [docs/CONFIGURATION.md](CONFIGURATION.md) for full descriptions and usage examples.
 
@@ -36,9 +36,6 @@ See [docs/CONFIGURATION.md](CONFIGURATION.md) for full descriptions and usage ex
 | `(registration pending — PGS_COLUMNAR_BACKEND)` | `Option\<std::ffi::CString` | `"none"` | When set, `create_stream_table()` uses the specified columnar backend and routes differential refresh to the `delete_insert` strategy (columnar backends are append-only). |
 | `(registration pending — PGS_COMPACT_THRESHOLD)` | `i32` | `100000` | Set to 0 to disable compaction. |
 | `(registration pending — PGS_CONNECTION_POOLER_MODE)` | `Option\<std::ffi::CString` | `"off"` | Overrides the per-ST `pooler_compatibility_mode` for all stream tables. |
-| `(registration pending — PGS_CONSUMER_CLEANUP_ENABLED)` | `bool` | `true` | OUTBOX-B5 (v0.28.0): Enable/disable automatic cleanup of dead/stale consumers. |
-| `(registration pending — PGS_CONSUMER_DEAD_THRESHOLD_HOURS)` | `i32` | `24` | OUTBOX-B5 (v0.28.0): Hours of no heartbeat after which a consumer is considered dead. |
-| `(registration pending — PGS_CONSUMER_STALE_OFFSET_THRESHOLD_DAYS)` | `i32` | `7` | OUTBOX-B5 (v0.28.0): Days of no progress after which a consumer offset is considered stale. |
 | `(registration pending — PGS_COST_MODEL_SAFETY_MARGIN)` | `f64` | `0.8` | Default 0.8 — DIFFERENTIAL is chosen unless it's estimated to cost more than 80% of FULL. |
 | `(registration pending — PGS_DEEP_JOIN_L0_SCAN_THRESHOLD)` | `i32` | `4` | Default: 4 (matches the previously hardcoded `DEEP_JOIN_L0_SCAN_THRESHOLD`). |
 | `(registration pending — PGS_DEFAULT_SCHEDULE_SECONDS)` | `i32` | `1` | Default effective schedule (in seconds) for isolated CALCULATED stream tables that have no downstream dependents. |
@@ -60,12 +57,6 @@ See [docs/CONFIGURATION.md](CONFIGURATION.md) for full descriptions and usage ex
 | `(registration pending — PGS_FUSE_DEFAULT_CEILING)` | `i32` | `0` | Set to 0 to disable the global default ceiling (per-ST ceiling only). |
 | `(registration pending — PGS_HISTORY_PRUNE_INTERVAL_SECONDS)` | `i32` | `60` | Default: 60 seconds. |
 | `(registration pending — PGS_HISTORY_RETENTION_DAYS)` | `i32` | `90` | The scheduler runs a daily cleanup that deletes rows from `pgtrickle.pgt_refresh_history` older than this many days. |
-| `(registration pending — PGS_INBOX_DLQ_ALERT_MAX_PER_REFRESH)` | `i32` | `10` | INBOX-7 (v0.28.0): Maximum DLQ alerts raised per refresh cycle (0 = disabled). |
-| `(registration pending — PGS_INBOX_DLQ_RETENTION_HOURS)` | `i32` | `0` | INBOX-1 (v0.28.0): Default retention (hours) for dead-letter queue rows (0 = keep forever). |
-| `(registration pending — PGS_INBOX_DRAIN_BATCH_SIZE)` | `i32` | `500` | INBOX-1 (v0.28.0): Batch size for inbox drain operations. |
-| `(registration pending — PGS_INBOX_DRAIN_INTERVAL_SECONDS)` | `i32` | `60` | INBOX-1 (v0.28.0): Seconds between inbox background drain sweeps (0 = disabled). |
-| `(registration pending — PGS_INBOX_ENABLED)` | `bool` | `true` | INBOX-1 (v0.28.0): Master enable/disable for the transactional inbox feature. |
-| `(registration pending — PGS_INBOX_PROCESSED_RETENTION_HOURS)` | `i32` | `72` | INBOX-1 (v0.28.0): Default retention (hours) for successfully processed inbox messages. |
 | `(registration pending — PGS_IVM_RECURSIVE_MAX_DEPTH)` | `i32` | `100` | Set to 0 to disable the depth guard (allow unlimited recursion). |
 | `(registration pending — PGS_IVM_TOPK_MAX_LIMIT)` | `i32` | `1000` | TopK queries with `LIMIT > threshold` are rejected in IMMEDIATE mode because inline recomputation of large result sets adds unacceptable latency to the trigger path. |
 | `(registration pending — PGS_IVM_USE_ENR)` | `bool` | `false` | When false, the legacy temp-table copy behaviour is used. |
@@ -96,15 +87,6 @@ See [docs/CONFIGURATION.md](CONFIGURATION.md) for full descriptions and usage ex
 | `(registration pending — PGS_NOTIFY_COALESCE_MS)` | `i32` | `250` | Default: 250 ms. |
 | `(registration pending — PGS_ONLINE_SCHEMA_EVOLUTION)` | `bool` | `false` | Default: `false` (standard ALTER QUERY reinit behaviour). |
 | `(registration pending — PGS_OTEL_ENDPOINT)` | `Option\<std::ffi::CString` | `None` | F10 (v0.37.0): OTLP/gRPC endpoint for OpenTelemetry span export. |
-| `(registration pending — PGS_OUTBOX_CLAIM_CHECK_BATCH_SIZE)` | `i32` | `1000` | OUTBOX-4 (v0.28.0): Batch size for claim-check acknowledgement processing. |
-| `(registration pending — PGS_OUTBOX_DRAIN_BATCH_SIZE)` | `i32` | `500` | OUTBOX-1 (v0.28.0): Batch size for outbox drain operations. |
-| `(registration pending — PGS_OUTBOX_DRAIN_INTERVAL_SECONDS)` | `i32` | `60` | OUTBOX-1 (v0.28.0): Seconds between background outbox drain sweeps (0 = disabled). |
-| `(registration pending — PGS_OUTBOX_ENABLED)` | `bool` | `true` | OUTBOX-1 (v0.28.0): Master enable/disable for the transactional outbox feature. |
-| `(registration pending — PGS_OUTBOX_FORCE_RETENTION)` | `bool` | `false` | OUTBOX-1 (v0.28.0): When true, the outbox retains rows beyond retention_hours if any consumer group has not yet consumed them. |
-| `(registration pending — PGS_OUTBOX_INLINE_THRESHOLD_ROWS)` | `i32` | `10000` | OUTBOX-3 (v0.28.0): Maximum delta rows before switching to claim-check mode. |
-| `(registration pending — PGS_OUTBOX_RETENTION_HOURS)` | `i32` | `24` | OUTBOX-1 (v0.28.0): Default outbox row retention in hours. |
-| `(registration pending — PGS_OUTBOX_SKIP_EMPTY_DELTA)` | `bool` | `true` | OUTBOX-3 (v0.28.0): When true, skip writing an outbox row for empty-delta refreshes. |
-| `(registration pending — PGS_OUTBOX_STORAGE_CRITICAL_MB)` | `i32` | `1024` | OUTBOX-5 (v0.28.0): Storage threshold (MB) at which outbox is considered critical. |
 | `(registration pending — PGS_PARALLEL_REFRESH_MODE)` | `Option\<std::ffi::CString` | `"on"` | - `"on"` (default as of v0.11.0): Enable true parallel refresh via   dynamic workers. |
 | `(registration pending — PGS_PART3_MAX_SCAN_COUNT)` | `i32` | `5` | Default: 5 (matches the previously hardcoded `PART3_MAX_SCAN_COUNT`). |
 | `(registration pending — PGS_PER_DATABASE_WORKER_QUOTA)` | `i32` | `0` | Set to 0 (default) to disable per-database quotas — all databases share `max_dynamic_refresh_workers` on a first-come-first-served basis, bounded per coordinator by `max_concurrent_refreshes`. |
