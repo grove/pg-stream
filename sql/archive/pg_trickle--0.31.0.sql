@@ -693,9 +693,7 @@ CREATE  FUNCTION pgtrickle."enable_inbox_tracking"(
 	"p_max_retries" INT DEFAULT 3, /* i32 */
 	"p_schedule" TEXT DEFAULT '1s' /* & str */
 ) RETURNS void
-STRICT 
-LANGUAGE c /* Rust */
-AS 'MODULE_PATHNAME', 'enable_inbox_tracking_wrapper';
+LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'pg_trickle: this function was removed in v0.46.0 (inbox/outbox/consumer features are no longer supported)'; END; $$;
 /* </end connected objects> */
 
 /* <begin connected objects> */
@@ -851,9 +849,7 @@ CREATE  FUNCTION pgtrickle."create_inbox"(
 	"with_stats" bool DEFAULT true, /* bool */
 	"p_retention_hours" INT DEFAULT 72 /* i32 */
 ) RETURNS void
-STRICT 
-LANGUAGE c /* Rust */
-AS 'MODULE_PATHNAME', 'create_inbox_wrapper';
+LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'pg_trickle: this function was removed in v0.46.0 (inbox/outbox/consumer features are no longer supported)'; END; $$;
 /* </end connected objects> */
 
 /* <begin connected objects> */
@@ -952,9 +948,7 @@ CREATE  FUNCTION pgtrickle."consumer_heartbeat"(
 	"p_group" TEXT, /* & str */
 	"p_consumer" TEXT /* & str */
 ) RETURNS void
-STRICT 
-LANGUAGE c /* Rust */
-AS 'MODULE_PATHNAME', 'consumer_heartbeat_wrapper';
+LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'pg_trickle: this function was removed in v0.46.0 (inbox/outbox/consumer features are no longer supported)'; END; $$;
 /* </end connected objects> */
 
 /* <begin connected objects> */
@@ -970,9 +964,7 @@ CREATE  FUNCTION pgtrickle."consumer_lag"(
 	"last_heartbeat_at" timestamp with time zone,  /* Option < TimestampWithTimeZone > */
 	"is_alive" bool  /* bool */
 )
-STRICT 
-LANGUAGE c /* Rust */
-AS 'MODULE_PATHNAME', 'consumer_lag_wrapper';
+LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'pg_trickle: this function was removed in v0.46.0 (inbox/outbox/consumer features are no longer supported)'; END; $$;
 /* </end connected objects> */
 
 /* <begin connected objects> */
@@ -1069,9 +1061,7 @@ CREATE  FUNCTION pgtrickle."enable_inbox_ordering"(
 	"p_aggregate_id_col" TEXT, /* & str */
 	"p_sequence_num_col" TEXT /* & str */
 ) RETURNS void
-STRICT 
-LANGUAGE c /* Rust */
-AS 'MODULE_PATHNAME', 'enable_inbox_ordering_wrapper';
+LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'pg_trickle: this function was removed in v0.46.0 (inbox/outbox/consumer features are no longer supported)'; END; $$;
 /* </end connected objects> */
 
 /* <begin connected objects> */
@@ -1230,9 +1220,7 @@ CREATE  FUNCTION pgtrickle."inbox_ordering_gaps"(
 	"expected_seq" bigint,  /* i64 */
 	"found_seq" bigint  /* i64 */
 )
-STRICT 
-LANGUAGE c /* Rust */
-AS 'MODULE_PATHNAME', 'inbox_ordering_gaps_wrapper';
+LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'pg_trickle: this function was removed in v0.46.0 (inbox/outbox/consumer features are no longer supported)'; END; $$;
 /* </end connected objects> */
 
 /* <begin connected objects> */
@@ -1279,9 +1267,7 @@ CREATE  FUNCTION pgtrickle."enable_outbox"(
 	"p_name" TEXT, /* & str */
 	"p_retention_hours" INT DEFAULT 24 /* i32 */
 ) RETURNS void
-STRICT 
-LANGUAGE c /* Rust */
-AS 'MODULE_PATHNAME', 'enable_outbox_wrapper';
+LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'pg_trickle: this function was removed in v0.46.0 (inbox/outbox/consumer features are no longer supported)'; END; $$;
 /* </end connected objects> */
 
 /* <begin connected objects> */
@@ -1331,9 +1317,7 @@ CREATE  FUNCTION pgtrickle."drop_inbox"(
 	"p_if_exists" bool DEFAULT false, /* bool */
 	"p_cascade" bool DEFAULT false /* bool */
 ) RETURNS void
-STRICT 
-LANGUAGE c /* Rust */
-AS 'MODULE_PATHNAME', 'drop_inbox_wrapper';
+LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'pg_trickle: this function was removed in v0.46.0 (inbox/outbox/consumer features are no longer supported)'; END; $$;
 /* </end connected objects> */
 
 /* <begin connected objects> */
@@ -1360,9 +1344,7 @@ CREATE  FUNCTION pgtrickle."replay_inbox_messages"(
 	"p_name" TEXT, /* & str */
 	"p_event_ids" TEXT[] /* Vec < String > */
 ) RETURNS bigint /* i64 */
-STRICT 
-LANGUAGE c /* Rust */
-AS 'MODULE_PATHNAME', 'replay_inbox_messages_wrapper';
+LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'pg_trickle: this function was removed in v0.46.0 (inbox/outbox/consumer features are no longer supported)'; END; $$;
 /* </end connected objects> */
 
 /* <begin connected objects> */
@@ -1399,9 +1381,7 @@ CREATE  FUNCTION pgtrickle."outbox_rows_consumed"(
 	"p_stream_table" TEXT, /* & str */
 	"p_outbox_id" bigint /* i64 */
 ) RETURNS void
-STRICT 
-LANGUAGE c /* Rust */
-AS 'MODULE_PATHNAME', 'outbox_rows_consumed_wrapper';
+LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'pg_trickle: this function was removed in v0.46.0 (inbox/outbox/consumer features are no longer supported)'; END; $$;
 /* </end connected objects> */
 
 /* <begin connected objects> */
@@ -1419,9 +1399,7 @@ AS 'MODULE_PATHNAME', 'teardown_self_monitoring_wrapper';
 CREATE  FUNCTION pgtrickle."inbox_health"(
 	"p_name" TEXT /* & str */
 ) RETURNS jsonb /* pgrx :: JsonB */
-STRICT 
-LANGUAGE c /* Rust */
-AS 'MODULE_PATHNAME', 'inbox_health_wrapper';
+LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'pg_trickle: this function was removed in v0.46.0 (inbox/outbox/consumer features are no longer supported)'; END; $$;
 /* </end connected objects> */
 
 /* <begin connected objects> */
@@ -1621,9 +1599,7 @@ CREATE  FUNCTION pgtrickle."create_consumer_group"(
 	"p_outbox" TEXT, /* & str */
 	"p_auto_offset_reset" TEXT DEFAULT 'latest' /* & str */
 ) RETURNS void
-STRICT 
-LANGUAGE c /* Rust */
-AS 'MODULE_PATHNAME', 'create_consumer_group_wrapper';
+LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'pg_trickle: this function was removed in v0.46.0 (inbox/outbox/consumer features are no longer supported)'; END; $$;
 /* </end connected objects> */
 
 /* <begin connected objects> */
@@ -1742,9 +1718,7 @@ CREATE  FUNCTION pgtrickle."poll_outbox"(
 	"is_claim_check" bool,  /* bool */
 	"payload" jsonb  /* Option < pgrx :: JsonB > */
 )
-STRICT 
-LANGUAGE c /* Rust */
-AS 'MODULE_PATHNAME', 'poll_outbox_wrapper';
+LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'pg_trickle: this function was removed in v0.46.0 (inbox/outbox/consumer features are no longer supported)'; END; $$;
 /* </end connected objects> */
 
 /* <begin connected objects> */
@@ -1754,9 +1728,7 @@ CREATE  FUNCTION pgtrickle."disable_inbox_ordering"(
 	"p_inbox" TEXT, /* & str */
 	"p_if_exists" bool DEFAULT false /* bool */
 ) RETURNS void
-STRICT 
-LANGUAGE c /* Rust */
-AS 'MODULE_PATHNAME', 'disable_inbox_ordering_wrapper';
+LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'pg_trickle: this function was removed in v0.46.0 (inbox/outbox/consumer features are no longer supported)'; END; $$;
 /* </end connected objects> */
 
 /* <begin connected objects> */
@@ -1937,9 +1909,7 @@ CREATE  FUNCTION pgtrickle."disable_inbox_priority"(
 	"p_inbox" TEXT, /* & str */
 	"p_if_exists" bool DEFAULT false /* bool */
 ) RETURNS void
-STRICT 
-LANGUAGE c /* Rust */
-AS 'MODULE_PATHNAME', 'disable_inbox_priority_wrapper';
+LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'pg_trickle: this function was removed in v0.46.0 (inbox/outbox/consumer features are no longer supported)'; END; $$;
 /* </end connected objects> */
 
 /* <begin connected objects> */
@@ -1965,9 +1935,7 @@ CREATE  FUNCTION pgtrickle."disable_outbox"(
 	"p_name" TEXT, /* & str */
 	"p_if_exists" bool DEFAULT false /* bool */
 ) RETURNS void
-STRICT 
-LANGUAGE c /* Rust */
-AS 'MODULE_PATHNAME', 'disable_outbox_wrapper';
+LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'pg_trickle: this function was removed in v0.46.0 (inbox/outbox/consumer features are no longer supported)'; END; $$;
 /* </end connected objects> */
 
 /* <begin connected objects> */
@@ -2042,9 +2010,7 @@ AS 'MODULE_PATHNAME', 'pgt_ivm_apply_delta_wrapper';
 CREATE  FUNCTION pgtrickle."outbox_status"(
 	"p_name" TEXT /* & str */
 ) RETURNS jsonb /* pgrx :: JsonB */
-STRICT 
-LANGUAGE c /* Rust */
-AS 'MODULE_PATHNAME', 'outbox_status_wrapper';
+LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'pg_trickle: this function was removed in v0.46.0 (inbox/outbox/consumer features are no longer supported)'; END; $$;
 /* </end connected objects> */
 
 /* <begin connected objects> */
@@ -2134,9 +2100,7 @@ CREATE  FUNCTION pgtrickle."commit_offset"(
 	"p_consumer" TEXT, /* & str */
 	"p_last_offset" bigint /* i64 */
 ) RETURNS void
-STRICT 
-LANGUAGE c /* Rust */
-AS 'MODULE_PATHNAME', 'commit_offset_wrapper';
+LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'pg_trickle: this function was removed in v0.46.0 (inbox/outbox/consumer features are no longer supported)'; END; $$;
 /* </end connected objects> */
 
 /* <begin connected objects> */
@@ -2161,9 +2125,7 @@ CREATE  FUNCTION pgtrickle."drop_consumer_group"(
 	"p_name" TEXT, /* & str */
 	"p_if_exists" bool DEFAULT false /* bool */
 ) RETURNS void
-STRICT 
-LANGUAGE c /* Rust */
-AS 'MODULE_PATHNAME', 'drop_consumer_group_wrapper';
+LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'pg_trickle: this function was removed in v0.46.0 (inbox/outbox/consumer features are no longer supported)'; END; $$;
 /* </end connected objects> */
 
 /* <begin connected objects> */
@@ -2245,9 +2207,7 @@ CREATE  FUNCTION pgtrickle."inbox_is_my_partition"(
 	"p_worker_id" INT, /* i32 */
 	"p_total_workers" INT /* i32 */
 ) RETURNS bool /* bool */
-IMMUTABLE STRICT 
-LANGUAGE c /* Rust */
-AS 'MODULE_PATHNAME', 'inbox_is_my_partition_wrapper';
+IMMUTABLE LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'pg_trickle: this function was removed in v0.46.0 (inbox/outbox/consumer features are no longer supported)'; END; $$;
 /* </end connected objects> */
 
 /* <begin connected objects> */
@@ -2357,9 +2317,7 @@ CREATE  FUNCTION pgtrickle."seek_offset"(
 	"p_consumer" TEXT, /* & str */
 	"p_new_offset" bigint /* i64 */
 ) RETURNS void
-STRICT 
-LANGUAGE c /* Rust */
-AS 'MODULE_PATHNAME', 'seek_offset_wrapper';
+LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'pg_trickle: this function was removed in v0.46.0 (inbox/outbox/consumer features are no longer supported)'; END; $$;
 /* </end connected objects> */
 
 /* <begin connected objects> */
@@ -2586,9 +2544,7 @@ CREATE  FUNCTION pgtrickle."extend_lease"(
 	"p_consumer" TEXT, /* & str */
 	"p_extension_seconds" INT DEFAULT 30 /* i32 */
 ) RETURNS timestamp with time zone /* Option < TimestampWithTimeZone > */
-STRICT 
-LANGUAGE c /* Rust */
-AS 'MODULE_PATHNAME', 'extend_lease_wrapper';
+LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'pg_trickle: this function was removed in v0.46.0 (inbox/outbox/consumer features are no longer supported)'; END; $$;
 /* </end connected objects> */
 
 /* <begin connected objects> */
@@ -2631,8 +2587,7 @@ CREATE  FUNCTION pgtrickle."inbox_status"(
 	"created_at" timestamp with time zone  /* Option < TimestampWithTimeZone > */
 )
 
-LANGUAGE c /* Rust */
-AS 'MODULE_PATHNAME', 'inbox_status_wrapper';
+LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'pg_trickle: this function was removed in v0.46.0 (inbox/outbox/consumer features are no longer supported)'; END; $$;
 /* </end connected objects> */
 
 /* <begin connected objects> */
@@ -2664,8 +2619,7 @@ CREATE  FUNCTION pgtrickle."enable_inbox_priority"(
 	"p_tiers" jsonb DEFAULT NULL /* Option < pgrx :: JsonB > */
 ) RETURNS void
 
-LANGUAGE c /* Rust */
-AS 'MODULE_PATHNAME', 'enable_inbox_priority_wrapper';
+LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'pg_trickle: this function was removed in v0.46.0 (inbox/outbox/consumer features are no longer supported)'; END; $$;
 /* </end connected objects> */
 
 /* <begin connected objects> */
