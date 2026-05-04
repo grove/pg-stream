@@ -53,23 +53,23 @@
 --     pgtrickle.disable_outbox(text, boolean)
 --     pgtrickle.outbox_status(text)
 --     pgtrickle.outbox_rows_consumed(text, bigint)
---     pgtrickle.create_consumer_group(text, text, text, boolean)
+--     pgtrickle.create_consumer_group(text, text, text)
 --     pgtrickle.drop_consumer_group(text, boolean)
 --     pgtrickle.poll_outbox(text, text, integer, integer)
 --     pgtrickle.commit_offset(text, text, bigint)
---     pgtrickle.extend_lease(text, text, interval)
+--     pgtrickle.extend_lease(text, text, integer)
 --     pgtrickle.seek_offset(text, text, bigint)
 --     pgtrickle.consumer_heartbeat(text, text)
 --     pgtrickle.consumer_lag(text)
---     pgtrickle.create_inbox(text, ...)
---     pgtrickle.drop_inbox(text, boolean)
---     pgtrickle.enable_inbox_tracking(text, ...)
+--     pgtrickle.create_inbox(text, text, integer, text, boolean, boolean, integer)
+--     pgtrickle.drop_inbox(text, boolean, boolean)
+--     pgtrickle.enable_inbox_tracking(text, text, text, text, text, text, text, text, integer, text)
 --     pgtrickle.inbox_health(text)
 --     pgtrickle.inbox_status(text)
 --     pgtrickle.replay_inbox_messages(text, text[])
 --     pgtrickle.enable_inbox_ordering(text, text, text)
 --     pgtrickle.disable_inbox_ordering(text, boolean)
---     pgtrickle.enable_inbox_priority(text, text, text[])
+--     pgtrickle.enable_inbox_priority(text, text, jsonb)
 --     pgtrickle.disable_inbox_priority(text, boolean)
 --     pgtrickle.inbox_ordering_gaps(text)
 --     pgtrickle.inbox_is_my_partition(text, integer, integer)
@@ -112,15 +112,15 @@ DROP TABLE IF EXISTS pgtrickle.pgt_inbox_priority_config CASCADE;
 DROP TABLE IF EXISTS pgtrickle.pgt_inbox_ordering_config  CASCADE;
 DROP TABLE IF EXISTS pgtrickle.pgt_inbox_config           CASCADE;
 
-DROP FUNCTION IF EXISTS pgtrickle.create_inbox(text, text, text, boolean, integer, integer, integer, integer, integer);
-DROP FUNCTION IF EXISTS pgtrickle.drop_inbox(text, boolean);
-DROP FUNCTION IF EXISTS pgtrickle.enable_inbox_tracking(text, text, text, text, boolean, integer, boolean, integer);
+DROP FUNCTION IF EXISTS pgtrickle."create_inbox"(text, text, integer, text, boolean, boolean, integer);
+DROP FUNCTION IF EXISTS pgtrickle."drop_inbox"(text, boolean, boolean);
+DROP FUNCTION IF EXISTS pgtrickle."enable_inbox_tracking"(text, text, text, text, text, text, text, text, integer, text);
 DROP FUNCTION IF EXISTS pgtrickle.inbox_health(text);
 DROP FUNCTION IF EXISTS pgtrickle.inbox_status(text);
 DROP FUNCTION IF EXISTS pgtrickle.replay_inbox_messages(text, text[]);
 DROP FUNCTION IF EXISTS pgtrickle.enable_inbox_ordering(text, text, text);
 DROP FUNCTION IF EXISTS pgtrickle.disable_inbox_ordering(text, boolean);
-DROP FUNCTION IF EXISTS pgtrickle.enable_inbox_priority(text, text, text[]);
+DROP FUNCTION IF EXISTS pgtrickle."enable_inbox_priority"(text, text, jsonb);
 DROP FUNCTION IF EXISTS pgtrickle.disable_inbox_priority(text, boolean);
 DROP FUNCTION IF EXISTS pgtrickle.inbox_ordering_gaps(text);
 DROP FUNCTION IF EXISTS pgtrickle.inbox_is_my_partition(text, integer, integer);
@@ -131,11 +131,11 @@ DROP TABLE IF EXISTS pgtrickle.pgt_consumer_leases  CASCADE;
 DROP TABLE IF EXISTS pgtrickle.pgt_consumer_offsets CASCADE;
 DROP TABLE IF EXISTS pgtrickle.pgt_consumer_groups  CASCADE;
 
-DROP FUNCTION IF EXISTS pgtrickle.create_consumer_group(text, text, text, boolean);
+DROP FUNCTION IF EXISTS pgtrickle."create_consumer_group"(text, text, text);
 DROP FUNCTION IF EXISTS pgtrickle.drop_consumer_group(text, boolean);
 DROP FUNCTION IF EXISTS pgtrickle.poll_outbox(text, text, integer, integer);
 DROP FUNCTION IF EXISTS pgtrickle.commit_offset(text, text, bigint);
-DROP FUNCTION IF EXISTS pgtrickle.extend_lease(text, text, interval);
+DROP FUNCTION IF EXISTS pgtrickle."extend_lease"(text, text, integer);
 DROP FUNCTION IF EXISTS pgtrickle.seek_offset(text, text, bigint);
 DROP FUNCTION IF EXISTS pgtrickle.consumer_heartbeat(text, text);
 DROP FUNCTION IF EXISTS pgtrickle.consumer_lag(text);
