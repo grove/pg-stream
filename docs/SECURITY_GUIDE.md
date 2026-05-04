@@ -4,8 +4,7 @@ This page is the practical security reference for operators of
 pg_trickle. It covers roles and grants, what privileges the
 extension needs, how stream tables interact with PostgreSQL Row-Level
 Security (RLS), how triggers behave under SECURITY DEFINER vs
-INVOKER, what to lock down in production, and how to handle secrets
-when running the relay.
+INVOKER, and what to lock down in production.
 
 > **Reporting a vulnerability?** See
 > [SECURITY.md](https://github.com/grove/pg-trickle/blob/main/SECURITY.md)
@@ -182,23 +181,6 @@ includes recommended Prometheus alerts.
 
 ---
 
-## Secrets in the relay
-
-[`pgtrickle-relay`](RELAY_GUIDE.md) connects to PostgreSQL and to
-external messaging systems (NATS, Kafka, Redis, SQS, RabbitMQ,
-webhooks). It reads credentials from environment variables and from
-its config file, never from PostgreSQL.
-
-Recommendations:
-
-- Run the relay under its **own** PostgreSQL role, with `SELECT`
-  and `UPDATE` only on the inbox/outbox tables it touches — not as
-  a superuser.
-- Inject external-system credentials via the platform's secret
-  manager (Kubernetes Secrets, HashiCorp Vault, AWS Secrets Manager).
-- Enable TLS for every external endpoint — the relay supports it
-  for all backends.
-
 ---
 
 ## Hardening checklist
@@ -210,10 +192,6 @@ Recommendations:
 - [ ] RLS policies applied to stream tables that present per-tenant
       data.
 - [ ] Audit logging in place for `pgtrickle.pgt_refresh_history`.
-- [ ] Relay running under a dedicated, least-privilege role.
-- [ ] External-system credentials managed by a secret store, not
-      committed to the relay config file.
-- [ ] TLS enabled on all relay endpoints.
 - [ ] `pg_trickle.enabled = on` only in environments that should
       run refreshes (you can disable extension behaviour without
       uninstalling it).
@@ -224,5 +202,4 @@ Recommendations:
 [Row-Level Security tutorial](tutorials/ROW_LEVEL_SECURITY.md) ·
 [Pre-Deployment Checklist](PRE_DEPLOYMENT.md) ·
 [Configuration](CONFIGURATION.md) ·
-[Relay Service](RELAY_GUIDE.md) ·
 [SECURITY policy](https://github.com/grove/pg-trickle/blob/main/SECURITY.md)

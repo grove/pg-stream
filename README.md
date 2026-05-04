@@ -555,7 +555,6 @@ the plain-language overview, or jump straight to a topic below.
 | [Downstream Publications](docs/PUBLICATIONS.md) | Replicate stream tables to Debezium, Kafka, … |
 | [Transactional Outbox](docs/OUTBOX.md) | Reliable event emission |
 | [Transactional Inbox](docs/INBOX.md) | Idempotent event consumption |
-| [Relay Service](docs/RELAY_GUIDE.md) | Standalone bridge to NATS, Kafka, Redis, SQS, RabbitMQ, webhooks |
 
 ### Tutorials & deep dives
 

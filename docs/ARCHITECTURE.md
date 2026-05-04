@@ -817,58 +817,7 @@ target's `share/extension/` directory alongside the SQL migration scripts.
 
 ---
 
-## pgtrickle-relay (v0.29.0)
-
-`pgtrickle-relay` is a standalone Rust binary (a separate Cargo workspace member
-at `pgtrickle-relay/`) that bridges pg_trickle outbox and inbox tables with
-external messaging systems. It is distributed and deployed independently from
-the PostgreSQL extension.
-
-### Design Goals
-
-- **SQL-only configuration**: all pipeline config lives in PostgreSQL catalog
-  tables (`relay_outbox_config`, `relay_inbox_config`). No YAML, no config files.
-- **Hot-reload**: config changes trigger `NOTIFY pgtrickle_relay_config`; running
-  relay instances reload their pipelines without restart.
-- **Advisory-lock HA**: multiple relay instances distribute pipelines via
-  `pg_try_advisory_lock`. Each pipeline runs on exactly one instance; if an
-  instance dies, others claim its locks on the next poll cycle.
-- **Idempotent delivery**: every backend uses source-specific dedup keys to
-  provide at-least-once delivery with server-side deduplication where supported.
-
-### Architecture
-
-```
-PostgreSQL (pg_trickle extension)
-  ├─ outbox tables ──→ [OutboxPollerSource] ──→ Sink (NATS / Kafka / webhook / …)
-  └─ inbox tables  ←── [InboxSink]         ←── Source (NATS / Kafka / webhook / …)
-```
-
-### Key Modules (`pgtrickle-relay/src/`)
-
-| Module | Purpose |
-|--------|---------|
-| `main.rs` | CLI entry point, tracing init, coordinator startup |
-| `cli.rs` | clap argument definitions |
-| `config.rs` | `RelayConfig` (global) and `PipelineConfig` (per-pipeline) |
-| `coordinator.rs` | Advisory lock acquisition, hot-reload via LISTEN/NOTIFY |
-| `envelope.rs` | `RelayMessage` envelope and `AckToken` |
-| `metrics.rs` | Prometheus metrics and `/health` axum server |
-| `source/` | Source trait + implementations (outbox, NATS, Kafka, Redis, SQS, RabbitMQ, webhook, stdin) |
-| `sink/` | Sink trait + implementations (inbox, NATS, Kafka, Redis, SQS, RabbitMQ, webhook, stdout, pg-inbox) |
-
-### Supported Backends
-
-| Backend | Direction | Feature flag |
-|---------|-----------|-------------|
-| pg_trickle outbox | source (forward) | always |
-| pg_trickle inbox | sink (reverse) | always |
-| NATS JetStream | both | `nats` |
-| Apache Kafka | both | `kafka` |
-| HTTP webhook | both | `webhook` |
-| Redis Streams | both | `redis` |
-| AWS SQS | both | `sqs` |
-| RabbitMQ | both | `rabbitmq` |
-| stdout / JSONL | sink | `stdout` |
-
-See [RELAY.md](RELAY.md) for the full operations guide and deployment examples.
+> **Note:** The relay binary (`pgtrickle-relay`), outbox, and inbox subsystems
+> were extracted to the standalone [`pg_tide`](https://github.com/trickle-labs/pg-tide)
+> extension in v0.46.0. See the `pg_tide` repository for the relay architecture
+> and deployment guide.

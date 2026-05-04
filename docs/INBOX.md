@@ -18,7 +18,7 @@ in a single transaction — making the entire operation atomic.
 ## How it works
 
 ```
-External system (Kafka / NATS / webhook / relay)
+External system (Kafka / NATS / webhook / custom consumer)
         │
         ▼
   INSERT into pgtrickle.<inbox_name>
@@ -364,7 +364,6 @@ cleanup. Manual deletes can confuse the stream table refresh cycle.
 ## See also
 
 - [Transactional Outbox](OUTBOX.md) — publish events from your database to external systems
-- [Relay Service](RELAY_GUIDE.md) — bridge external brokers directly to the inbox
 - [SQL Reference: Transactional Inbox](SQL_REFERENCE.md#transactional-inbox-v0280)
 - [Configuration](CONFIGURATION.md#transactional-inbox-v0280)
 - [Pattern 8: Transactional Inbox](PATTERNS.md#pattern-8-transactional-inbox-v0280)

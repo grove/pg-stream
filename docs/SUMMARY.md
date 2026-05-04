@@ -57,8 +57,6 @@
 - [Downstream Publications](PUBLICATIONS.md)
 - [Transactional Outbox](OUTBOX.md)
 - [Transactional Inbox](INBOX.md)
-- [Relay Service](RELAY_GUIDE.md)
-- [Relay Architecture & Operations](RELAY.md)
 
 ---
 
