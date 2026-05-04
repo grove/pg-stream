@@ -98,8 +98,9 @@ fn attach_outbox_impl(
     let meta = StreamTableMeta::get_by_name(&schema, &st_name)?;
 
     // Check that pg_tide is installed.
+    // `to_regprocedure` accepts argument-type lists; `to_regproc` does not.
     let pg_tide_present = Spi::get_one::<bool>(
-        "SELECT to_regproc('tide.outbox_create(text,integer,integer)') IS NOT NULL",
+        "SELECT to_regprocedure('tide.outbox_create(text,integer,integer)') IS NOT NULL",
     )
     .unwrap_or(None)
     .unwrap_or(false);
