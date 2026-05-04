@@ -888,6 +888,7 @@ async fn test_upgrade_schema_additions_from_sql() {
     // Pre-collect all functions explicitly DROPped anywhere in the upgrade
     // chain.  A function created in step N and then dropped in step M > N
     // will not exist in the final state, so we must skip those assertions.
+    // Pattern handles both unquoted (schema.func) and quoted (schema."func") identifiers.
     let dropped_functions: std::collections::HashSet<(String, String)> = sql_files
         .iter()
         .flat_map(|p| {
@@ -897,7 +898,35 @@ async fn test_upgrade_schema_additions_from_sql() {
                 .filter(|l| !l.trim_start().starts_with("--"))
                 .collect::<Vec<_>>()
                 .join("\n");
-            regex_lite::Regex::new(r#"(?i)DROP\s+FUNCTION\s+(?:IF\s+EXISTS\s+)?(\w+)\."(\w+)""#)
+            regex_lite::Regex::new(
+                r#"(?i)DROP\s+FUNCTION\s+(?:IF\s+EXISTS\s+)?"?(\w+)"?\."?(\w+)"?"#,
+            )
+            .unwrap()
+            .captures_iter(&content)
+            .map(|c| {
+                (
+                    c.get(1).unwrap().as_str().to_lowercase(),
+                    c.get(2).unwrap().as_str().to_lowercase(),
+                )
+            })
+            .collect::<Vec<_>>()
+        })
+        .collect();
+
+    // Pre-collect all tables explicitly DROPped anywhere in the upgrade chain.
+    // A table created in step N and then dropped in step M > N will not exist
+    // in the final state, so we must skip those assertions.
+    // Pattern handles both unquoted (schema.table) and quoted (schema."table") identifiers.
+    let dropped_tables: std::collections::HashSet<(String, String)> = sql_files
+        .iter()
+        .flat_map(|p| {
+            let raw = std::fs::read_to_string(p).unwrap_or_default();
+            let content: String = raw
+                .lines()
+                .filter(|l| !l.trim_start().starts_with("--"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            regex_lite::Regex::new(r#"(?i)DROP\s+TABLE\s+(?:IF\s+EXISTS\s+)?"?(\w+)"?\."?(\w+)"?"#)
                 .unwrap()
                 .captures_iter(&content)
                 .map(|c| {
@@ -925,13 +954,19 @@ async fn test_upgrade_schema_additions_from_sql() {
         let sql_lower = sql_content.to_lowercase();
 
         // Extract CREATE TABLE declarations (schema.table)
-        for cap in
-            regex_lite::Regex::new(r"(?i)CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?(\w+)\.(\w+)")
-                .unwrap()
-                .captures_iter(&sql_content)
+        // Pattern handles both unquoted (schema.table) and quoted (schema."table") identifiers.
+        for cap in regex_lite::Regex::new(
+            r#"(?i)CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?"?(\w+)"?\."?(\w+)"?"#,
+        )
+        .unwrap()
+        .captures_iter(&sql_content)
         {
             let schema = cap.get(1).unwrap().as_str().to_lowercase();
             let table = cap.get(2).unwrap().as_str().to_lowercase();
+            // Skip tables explicitly dropped later in the same upgrade chain
+            if dropped_tables.contains(&(schema.clone(), table.clone())) {
+                continue;
+            }
             let exists: bool = db
                 .query_scalar(&format!(
                     "SELECT EXISTS( \
@@ -956,11 +991,12 @@ async fn test_upgrade_schema_additions_from_sql() {
             // Find the nearest preceding ALTER TABLE to get the table name
             let col_pos = cap.get(0).unwrap().start();
             let preceding = &sql_lower[..col_pos];
-            if let Some(table_cap) =
-                regex_lite::Regex::new(r"(?i)alter\s+table\s+(?:if\s+exists\s+)?(\w+)\.(\w+)")
-                    .unwrap()
-                    .captures_iter(preceding)
-                    .last()
+            if let Some(table_cap) = regex_lite::Regex::new(
+                r#"(?i)alter\s+table\s+(?:if\s+exists\s+)?"?(\w+)"?\."?(\w+)"?"#,
+            )
+            .unwrap()
+            .captures_iter(preceding)
+            .last()
             {
                 let schema = table_cap.get(1).unwrap().as_str();
                 let table = table_cap.get(2).unwrap().as_str();
@@ -983,10 +1019,12 @@ async fn test_upgrade_schema_additions_from_sql() {
         }
 
         // Extract CREATE [OR REPLACE] FUNCTION declarations
-        for cap in
-            regex_lite::Regex::new(r#"(?i)CREATE\s+(?:OR\s+REPLACE\s+)?FUNCTION\s+(\w+)\."(\w+)""#)
-                .unwrap()
-                .captures_iter(&sql_content)
+        // Pattern handles both unquoted (schema.func) and quoted (schema."func") identifiers.
+        for cap in regex_lite::Regex::new(
+            r#"(?i)CREATE\s+(?:OR\s+REPLACE\s+)?FUNCTION\s+"?(\w+)"?\."?(\w+)"?"#,
+        )
+        .unwrap()
+        .captures_iter(&sql_content)
         {
             let schema = cap.get(1).unwrap().as_str().to_lowercase();
             let func = cap.get(2).unwrap().as_str().to_lowercase();
@@ -1011,9 +1049,12 @@ async fn test_upgrade_schema_additions_from_sql() {
         }
 
         // Extract CREATE [OR REPLACE] VIEW declarations
-        for cap in regex_lite::Regex::new(r"(?i)CREATE\s+(?:OR\s+REPLACE\s+)?VIEW\s+(\w+)\.(\w+)")
-            .unwrap()
-            .captures_iter(&sql_content)
+        // Pattern handles both unquoted (schema.view) and quoted (schema."view") identifiers.
+        for cap in regex_lite::Regex::new(
+            r#"(?i)CREATE\s+(?:OR\s+REPLACE\s+)?VIEW\s+"?(\w+)"?\."?(\w+)"?"#,
+        )
+        .unwrap()
+        .captures_iter(&sql_content)
         {
             let schema = cap.get(1).unwrap().as_str().to_lowercase();
             let view = cap.get(2).unwrap().as_str().to_lowercase();
