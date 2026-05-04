@@ -51,7 +51,7 @@ jobs:
             fuzz-${{ runner.os }}-
 
       - name: Install cargo-fuzz
-        run: cargo install cargo-fuzz --locked
+        run: cargo install cargo-fuzz
 
       - name: Replay corpus (PR smoke — fast, no new findings)
         env:
