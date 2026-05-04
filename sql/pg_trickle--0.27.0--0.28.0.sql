@@ -167,8 +167,7 @@ CREATE OR REPLACE FUNCTION pgtrickle."enable_outbox"(
     p_name            text,
     p_retention_hours integer DEFAULT 24
 ) RETURNS void
-LANGUAGE c /* Rust */
-AS 'MODULE_PATHNAME', 'enable_outbox_wrapper';
+LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'pg_trickle: this function was removed in v0.46.0 (inbox/outbox/consumer features are no longer supported)'; END; $$;
 
 COMMENT ON FUNCTION pgtrickle.enable_outbox(text, integer) IS
 'OUTBOX-1 (v0.28.0): Enable the transactional outbox pattern for a stream table.
@@ -181,8 +180,7 @@ CREATE OR REPLACE FUNCTION pgtrickle."disable_outbox"(
     p_name       text,
     p_if_exists  boolean DEFAULT false
 ) RETURNS void
-LANGUAGE c /* Rust */
-AS 'MODULE_PATHNAME', 'disable_outbox_wrapper';
+LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'pg_trickle: this function was removed in v0.46.0 (inbox/outbox/consumer features are no longer supported)'; END; $$;
 
 COMMENT ON FUNCTION pgtrickle.disable_outbox(text, boolean) IS
 'OUTBOX-2 (v0.28.0): Disable the transactional outbox pattern for a stream table.
@@ -193,8 +191,7 @@ CREATE OR REPLACE FUNCTION pgtrickle."outbox_status"(
     p_name  text
 ) RETURNS jsonb
 STRICT
-LANGUAGE c /* Rust */
-AS 'MODULE_PATHNAME', 'outbox_status_wrapper';
+LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'pg_trickle: this function was removed in v0.46.0 (inbox/outbox/consumer features are no longer supported)'; END; $$;
 
 COMMENT ON FUNCTION pgtrickle.outbox_status(text) IS
 'OUTBOX-3 (v0.28.0): Return a JSONB summary of the outbox state for a stream table.
@@ -207,8 +204,7 @@ CREATE OR REPLACE FUNCTION pgtrickle."outbox_rows_consumed"(
     p_outbox_id     bigint
 ) RETURNS void
 STRICT
-LANGUAGE c /* Rust */
-AS 'MODULE_PATHNAME', 'outbox_rows_consumed_wrapper';
+LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'pg_trickle: this function was removed in v0.46.0 (inbox/outbox/consumer features are no longer supported)'; END; $$;
 
 COMMENT ON FUNCTION pgtrickle.outbox_rows_consumed(text, bigint) IS
 'OUTBOX-6 (v0.28.0): Mark outbox rows up to p_outbox_id as consumed.
@@ -221,8 +217,7 @@ CREATE OR REPLACE FUNCTION pgtrickle."create_consumer_group"(
     p_outbox            text,
     p_auto_offset_reset text DEFAULT 'latest'
 ) RETURNS void
-LANGUAGE c /* Rust */
-AS 'MODULE_PATHNAME', 'create_consumer_group_wrapper';
+LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'pg_trickle: this function was removed in v0.46.0 (inbox/outbox/consumer features are no longer supported)'; END; $$;
 
 COMMENT ON FUNCTION pgtrickle.create_consumer_group(text, text, text) IS
 'OUTBOX-B1 (v0.28.0): Create a named consumer group for an outbox.
@@ -233,8 +228,7 @@ CREATE OR REPLACE FUNCTION pgtrickle."drop_consumer_group"(
     p_name       text,
     p_if_exists  boolean DEFAULT false
 ) RETURNS void
-LANGUAGE c /* Rust */
-AS 'MODULE_PATHNAME', 'drop_consumer_group_wrapper';
+LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'pg_trickle: this function was removed in v0.46.0 (inbox/outbox/consumer features are no longer supported)'; END; $$;
 
 COMMENT ON FUNCTION pgtrickle.drop_consumer_group(text, boolean) IS
 'OUTBOX-B2 (v0.28.0): Drop a consumer group and all associated offsets/leases.';
@@ -254,8 +248,7 @@ CREATE OR REPLACE FUNCTION pgtrickle."poll_outbox"(
     is_claim_check  boolean,
     payload         jsonb
 )
-LANGUAGE c /* Rust */
-AS 'MODULE_PATHNAME', 'poll_outbox_wrapper';
+LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'pg_trickle: this function was removed in v0.46.0 (inbox/outbox/consumer features are no longer supported)'; END; $$;
 
 COMMENT ON FUNCTION pgtrickle.poll_outbox(text, text, integer, integer) IS
 'OUTBOX-B3 (v0.28.0): Poll the outbox for new messages as a consumer.
@@ -269,8 +262,7 @@ CREATE OR REPLACE FUNCTION pgtrickle."commit_offset"(
     p_last_offset  bigint
 ) RETURNS void
 STRICT
-LANGUAGE c /* Rust */
-AS 'MODULE_PATHNAME', 'commit_offset_wrapper';
+LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'pg_trickle: this function was removed in v0.46.0 (inbox/outbox/consumer features are no longer supported)'; END; $$;
 
 COMMENT ON FUNCTION pgtrickle.commit_offset(text, text, bigint) IS
 'OUTBOX-B4 (v0.28.0): Commit the consumed offset for a consumer in a group.
@@ -282,8 +274,7 @@ CREATE OR REPLACE FUNCTION pgtrickle."extend_lease"(
     p_consumer           text,
     p_extension_seconds  integer DEFAULT 30
 ) RETURNS timestamptz
-LANGUAGE c /* Rust */
-AS 'MODULE_PATHNAME', 'extend_lease_wrapper';
+LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'pg_trickle: this function was removed in v0.46.0 (inbox/outbox/consumer features are no longer supported)'; END; $$;
 
 COMMENT ON FUNCTION pgtrickle.extend_lease(text, text, integer) IS
 'OUTBOX-B4 (v0.28.0): Extend the visibility lease for an in-flight batch.
@@ -296,8 +287,7 @@ CREATE OR REPLACE FUNCTION pgtrickle."seek_offset"(
     p_new_offset  bigint
 ) RETURNS void
 STRICT
-LANGUAGE c /* Rust */
-AS 'MODULE_PATHNAME', 'seek_offset_wrapper';
+LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'pg_trickle: this function was removed in v0.46.0 (inbox/outbox/consumer features are no longer supported)'; END; $$;
 
 COMMENT ON FUNCTION pgtrickle.seek_offset(text, text, bigint) IS
 'OUTBOX-B4 (v0.28.0): Seek a consumer to a specific offset (for replay/reset).';
@@ -308,8 +298,7 @@ CREATE OR REPLACE FUNCTION pgtrickle."consumer_heartbeat"(
     p_consumer  text
 ) RETURNS void
 STRICT
-LANGUAGE c /* Rust */
-AS 'MODULE_PATHNAME', 'consumer_heartbeat_wrapper';
+LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'pg_trickle: this function was removed in v0.46.0 (inbox/outbox/consumer features are no longer supported)'; END; $$;
 
 COMMENT ON FUNCTION pgtrickle.consumer_heartbeat(text, text) IS
 'OUTBOX-B5 (v0.28.0): Send a heartbeat from a consumer to signal liveness.';
@@ -326,8 +315,7 @@ CREATE OR REPLACE FUNCTION pgtrickle."consumer_lag"(
     is_alive          boolean
 )
 STRICT
-LANGUAGE c /* Rust */
-AS 'MODULE_PATHNAME', 'consumer_lag_wrapper';
+LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'pg_trickle: this function was removed in v0.46.0 (inbox/outbox/consumer features are no longer supported)'; END; $$;
 
 COMMENT ON FUNCTION pgtrickle.consumer_lag(text) IS
 'OUTBOX-B6 (v0.28.0): Return per-consumer lag metrics for a consumer group.';
@@ -342,8 +330,7 @@ CREATE OR REPLACE FUNCTION pgtrickle."create_inbox"(
     with_stats         boolean DEFAULT true,
     p_retention_hours  integer DEFAULT 72
 ) RETURNS void
-LANGUAGE c /* Rust */
-AS 'MODULE_PATHNAME', 'create_inbox_wrapper';
+LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'pg_trickle: this function was removed in v0.46.0 (inbox/outbox/consumer features are no longer supported)'; END; $$;
 
 COMMENT ON FUNCTION pgtrickle.create_inbox(text, text, integer, text, boolean, boolean, integer) IS
 'INBOX-1 (v0.28.0): Create a named transactional inbox with managed stream tables.
@@ -355,8 +342,7 @@ CREATE OR REPLACE FUNCTION pgtrickle."drop_inbox"(
     p_if_exists  boolean DEFAULT false,
     p_cascade    boolean DEFAULT false
 ) RETURNS void
-LANGUAGE c /* Rust */
-AS 'MODULE_PATHNAME', 'drop_inbox_wrapper';
+LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'pg_trickle: this function was removed in v0.46.0 (inbox/outbox/consumer features are no longer supported)'; END; $$;
 
 COMMENT ON FUNCTION pgtrickle.drop_inbox(text, boolean, boolean) IS
 'INBOX-2 (v0.28.0): Drop a named inbox and its associated stream tables.
@@ -375,8 +361,7 @@ CREATE OR REPLACE FUNCTION pgtrickle."enable_inbox_tracking"(
     p_max_retries          integer DEFAULT 3,
     p_schedule             text    DEFAULT '1s'
 ) RETURNS void
-LANGUAGE c /* Rust */
-AS 'MODULE_PATHNAME', 'enable_inbox_tracking_wrapper';
+LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'pg_trickle: this function was removed in v0.46.0 (inbox/outbox/consumer features are no longer supported)'; END; $$;
 
 COMMENT ON FUNCTION pgtrickle.enable_inbox_tracking(text, text, text, text, text, text, text, text, integer, text) IS
 'INBOX-3 (v0.28.0): Bring-your-own-table inbox tracking mode.
@@ -387,8 +372,7 @@ CREATE OR REPLACE FUNCTION pgtrickle."inbox_health"(
     p_name  text
 ) RETURNS jsonb
 STRICT
-LANGUAGE c /* Rust */
-AS 'MODULE_PATHNAME', 'inbox_health_wrapper';
+LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'pg_trickle: this function was removed in v0.46.0 (inbox/outbox/consumer features are no longer supported)'; END; $$;
 
 COMMENT ON FUNCTION pgtrickle.inbox_health(text) IS
 'INBOX-4 (v0.28.0): Return a JSONB health summary for an inbox.
@@ -406,8 +390,7 @@ CREATE OR REPLACE FUNCTION pgtrickle."inbox_status"(
     with_stats     boolean,
     created_at     timestamptz
 )
-LANGUAGE c /* Rust */
-AS 'MODULE_PATHNAME', 'inbox_status_wrapper';
+LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'pg_trickle: this function was removed in v0.46.0 (inbox/outbox/consumer features are no longer supported)'; END; $$;
 
 COMMENT ON FUNCTION pgtrickle.inbox_status(text) IS
 'INBOX-5 (v0.28.0): Return a table row summary for one or all inboxes.
@@ -419,8 +402,7 @@ CREATE OR REPLACE FUNCTION pgtrickle."replay_inbox_messages"(
     p_event_ids  text[]
 ) RETURNS bigint
 STRICT
-LANGUAGE c /* Rust */
-AS 'MODULE_PATHNAME', 'replay_inbox_messages_wrapper';
+LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'pg_trickle: this function was removed in v0.46.0 (inbox/outbox/consumer features are no longer supported)'; END; $$;
 
 COMMENT ON FUNCTION pgtrickle.replay_inbox_messages(text, text[]) IS
 'INBOX-6 (v0.28.0): Reset message state to re-queue them for processing.
@@ -433,8 +415,7 @@ CREATE OR REPLACE FUNCTION pgtrickle."enable_inbox_ordering"(
     p_sequence_num_col    text
 ) RETURNS void
 STRICT
-LANGUAGE c /* Rust */
-AS 'MODULE_PATHNAME', 'enable_inbox_ordering_wrapper';
+LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'pg_trickle: this function was removed in v0.46.0 (inbox/outbox/consumer features are no longer supported)'; END; $$;
 
 COMMENT ON FUNCTION pgtrickle.enable_inbox_ordering(text, text, text) IS
 'INBOX-B1 (v0.28.0): Enable per-aggregate ordering for an inbox.
@@ -446,8 +427,7 @@ CREATE OR REPLACE FUNCTION pgtrickle."disable_inbox_ordering"(
     p_inbox      text,
     p_if_exists  boolean DEFAULT false
 ) RETURNS void
-LANGUAGE c /* Rust */
-AS 'MODULE_PATHNAME', 'disable_inbox_ordering_wrapper';
+LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'pg_trickle: this function was removed in v0.46.0 (inbox/outbox/consumer features are no longer supported)'; END; $$;
 
 COMMENT ON FUNCTION pgtrickle.disable_inbox_ordering(text, boolean) IS
 'INBOX-B1 (v0.28.0): Disable per-aggregate ordering for an inbox.
@@ -459,8 +439,7 @@ CREATE OR REPLACE FUNCTION pgtrickle."enable_inbox_priority"(
     p_priority_col text,
     p_tiers        jsonb DEFAULT NULL
 ) RETURNS void
-LANGUAGE c /* Rust */
-AS 'MODULE_PATHNAME', 'enable_inbox_priority_wrapper';
+LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'pg_trickle: this function was removed in v0.46.0 (inbox/outbox/consumer features are no longer supported)'; END; $$;
 
 COMMENT ON FUNCTION pgtrickle.enable_inbox_priority(text, text, jsonb) IS
 'INBOX-B2 (v0.28.0): Enable priority-tier processing for an inbox.
@@ -471,8 +450,7 @@ CREATE OR REPLACE FUNCTION pgtrickle."disable_inbox_priority"(
     p_inbox      text,
     p_if_exists  boolean DEFAULT false
 ) RETURNS void
-LANGUAGE c /* Rust */
-AS 'MODULE_PATHNAME', 'disable_inbox_priority_wrapper';
+LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'pg_trickle: this function was removed in v0.46.0 (inbox/outbox/consumer features are no longer supported)'; END; $$;
 
 COMMENT ON FUNCTION pgtrickle.disable_inbox_priority(text, boolean) IS
 'INBOX-B2 (v0.28.0): Disable priority-tier processing for an inbox.';
@@ -486,8 +464,7 @@ CREATE OR REPLACE FUNCTION pgtrickle."inbox_ordering_gaps"(
     found_seq     bigint
 )
 STRICT
-LANGUAGE c /* Rust */
-AS 'MODULE_PATHNAME', 'inbox_ordering_gaps_wrapper';
+LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'pg_trickle: this function was removed in v0.46.0 (inbox/outbox/consumer features are no longer supported)'; END; $$;
 
 COMMENT ON FUNCTION pgtrickle.inbox_ordering_gaps(text) IS
 'INBOX-B3 (v0.28.0): Return sequence gaps for each aggregate in an ordered inbox.
@@ -500,8 +477,7 @@ CREATE OR REPLACE FUNCTION pgtrickle."inbox_is_my_partition"(
     p_total_workers  integer
 ) RETURNS boolean
 IMMUTABLE STRICT
-LANGUAGE c /* Rust */
-AS 'MODULE_PATHNAME', 'inbox_is_my_partition_wrapper';
+LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'pg_trickle: this function was removed in v0.46.0 (inbox/outbox/consumer features are no longer supported)'; END; $$;
 
 COMMENT ON FUNCTION pgtrickle.inbox_is_my_partition(text, integer, integer) IS
 'INBOX-B4 (v0.28.0): Consistent-hash partition check for horizontal inbox scaling.
