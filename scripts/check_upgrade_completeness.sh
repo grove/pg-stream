@@ -41,16 +41,16 @@ find_full_sql() {
         [[ -f "$candidate" ]] && echo "$candidate" && return
     fi
 
-    # 2. Search target/ for the generated SQL
-    local found
-    found=$(find target/ -name "pg_trickle--${version}.sql" -type f 2>/dev/null | head -1)
-    if [[ -n "$found" ]]; then echo "$found"; return; fi
-
-    # 3. Check sql/archive/
+    # 2. Check sql/archive/ before searching target/ (target/ can be very large)
     if [[ -f "sql/archive/pg_trickle--${version}.sql" ]]; then
         echo "sql/archive/pg_trickle--${version}.sql"
         return
     fi
+
+    # 3. Search target/ for the generated SQL (fallback for non-archived versions)
+    local found
+    found=$(find target/ -name "pg_trickle--${version}.sql" -type f 2>/dev/null | head -1)
+    if [[ -n "$found" ]]; then echo "$found"; return; fi
 
     return 1
 }
