@@ -66,6 +66,24 @@ For future plans and upcoming features, see [ROADMAP.md](ROADMAP.md).
 
 ## [0.47.0] — Embedding Pipeline Infrastructure & ANN Maintenance
 
+> **⚠ Upgrade support policy change (v0.47.0+)**
+>
+> Starting from v0.47.0, pg_trickle provides direct upgrade scripts only for
+> **v0.40.0 and later**. If you are running v0.39.0 or older, you must first
+> upgrade to v0.40.0 before upgrading to v0.47.0 or later:
+>
+> ```sql
+> -- Users on v0.39.x or older: upgrade to v0.40.0 first
+> ALTER EXTENSION pg_trickle UPDATE TO '0.40.0';
+> -- Then upgrade to the latest version
+> ALTER EXTENSION pg_trickle UPDATE;
+> ```
+>
+> Both steps can be issued in the same session. PostgreSQL handles the
+> intermediate chain automatically. Users already on v0.40.0 or later are
+> unaffected — a single `ALTER EXTENSION pg_trickle UPDATE` is all that is
+> needed.
+
 v0.47.0 resumes the deferred embedding programme with post-refresh action
 hooks, drift-based HNSW reindex scheduling, vector-aware monitoring, and the
 pgvector RAG cookbook.
