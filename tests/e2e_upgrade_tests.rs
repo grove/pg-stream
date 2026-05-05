@@ -857,26 +857,32 @@ async fn test_upgrade_schema_additions_from_sql() {
     let mut current = from_version.clone();
     let mut sql_files: Vec<String> = Vec::new();
     while current != to_version {
-        // Find the next step from `current`
-        let pattern = format!("sql/pg_trickle--{}--", current);
-        let mut found = false;
-        for entry in std::fs::read_dir("sql").expect("sql/ directory") {
-            let entry = entry.unwrap();
+        // Find the next step from `current`.
+        // Collect all candidates sorted by name so that when multiple scripts
+        // start from the same version (e.g. 0.41.0→0.47.0 and 0.41.0→0.48.0)
+        // the traversal is deterministic: prefer the smallest next-version hop.
+        let prefix = format!("pg_trickle--{}--", current);
+        let pattern = format!("sql/{prefix}");
+        let mut candidates: Vec<std::fs::DirEntry> = std::fs::read_dir("sql")
+            .expect("sql/ directory")
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                let name = e.file_name().to_string_lossy().to_string();
+                name.starts_with(&prefix) && name.ends_with(".sql")
+            })
+            .collect();
+        candidates.sort_by_key(|e| e.file_name());
+        if let Some(entry) = candidates.into_iter().next() {
             let name = entry.file_name().to_string_lossy().to_string();
-            if name.starts_with(&format!("pg_trickle--{}--", current)) && name.ends_with(".sql") {
-                let next = name
-                    .strip_prefix(&format!("pg_trickle--{}--", current))
-                    .unwrap()
-                    .strip_suffix(".sql")
-                    .unwrap()
-                    .to_string();
-                sql_files.push(entry.path().to_string_lossy().to_string());
-                current = next;
-                found = true;
-                break;
-            }
-        }
-        if !found {
+            let next = name
+                .strip_prefix(&prefix)
+                .unwrap()
+                .strip_suffix(".sql")
+                .unwrap()
+                .to_string();
+            sql_files.push(entry.path().to_string_lossy().to_string());
+            current = next;
+        } else {
             panic!(
                 "No upgrade script found for {pattern}*.sql — cannot reach {to_version} from {from_version}"
             );
