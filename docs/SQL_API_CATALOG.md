@@ -4,7 +4,7 @@
 
 # SQL API Reference — pg_trickle
 
-**89 SQL-callable functions** discovered via `#[pg_extern]` in `src/`.
+**116 SQL-callable functions** discovered via `#[pg_extern]` in `src/`.
 
 See [docs/SQL_REFERENCE.md](SQL_REFERENCE.md) for full signatures and examples.
 
@@ -12,7 +12,11 @@ See [docs/SQL_REFERENCE.md](SQL_REFERENCE.md) for full signatures and examples.
 | Function | Schema | Returns | Description |
 |----------|--------|---------|-------------|
 | `pgtrickle._signal_launcher_rescan()` | `pgtrickle` | `` | Also safe to call manually if the launcher needs a nudge. |
+| `pgtrickle.advance_watermark()` | `pgtrickle` | `Result<(), PgTrickleError>` | - **Monotonic:** rejects watermarks that go backward. |
+| `pgtrickle.alter_stream_table()` | `pgtrickle` | `` | Alter properties of an existing stream table. |
+| `pgtrickle.attach_outbox()` | `pgtrickle` | `` | Requires `pg_tide` to be installed. |
 | `pgtrickle.bootstrap_gate_status_fn()` | `pgtrickle` | `TableIterator<` | BOOT-F3: Designed for debugging "why isn't my stream table refreshing?" situations by showing the full gate lifecycle at a glance. |
+| `pgtrickle.build_init_decision()` | `pgtrickle` | `InitDecision` |  |
 | `pgtrickle.bulk_alter_stream_tables()` | `pgtrickle` | `i32` | # Example ```sql SELECT pgtrickle.bulk_alter_stream_tables(     ARRAY['public.orders_summary', 'public.daily_revenue'],     '{"schedule": "5m", "tier": "warm"}'::jsonb ); ```. |
 | `pgtrickle.bulk_create()` | `pgtrickle` | `pgrx::JsonB` | On any error, the entire transaction is rolled back (standard PostgreSQL transactional semantics). |
 | `pgtrickle.bulk_drop_stream_tables()` | `pgtrickle` | `i32` | # Example ```sql SELECT pgtrickle.bulk_drop_stream_tables(     ARRAY['public.orders_summary', 'public.stale_view'] ); ```. |
@@ -23,9 +27,15 @@ See [docs/SQL_REFERENCE.md](SQL_REFERENCE.md) for full signatures and examples.
 | `pgtrickle.clear_caches()` | `pgtrickle` | `i64` | Use during debugging, emergency migration rollback, or after a query definition change that was not captured by the normal DDL invalidation path. |
 | `pgtrickle.cluster_worker_summary()` | `pgtrickle` | `TableIterator<` | Reads from `pg_stat_activity` (shared catalog) so the calling role needs `pg_monitor` or superuser privilege. |
 | `pgtrickle.convert_buffers_to_unlogged()` | `pgtrickle` | `Result<i64, PgTrickleError>` | **Warning:** After conversion, buffer contents will be lost on crash recovery. |
+| `pgtrickle.create_or_replace_stream_table()` | `pgtrickle` | `` | This is the declarative API for idempotent deployments (dbt, migrations, GitOps). |
+| `pgtrickle.create_refresh_group()` | `pgtrickle` | `` | # Arguments - `group_name`: Unique human-readable name for the group. |
+| `pgtrickle.create_stream_table()` | `pgtrickle` | `` | # Arguments - `name`: Schema-qualified name (`'schema.table'`) or unqualified (`'table'`). |
+| `pgtrickle.create_stream_table_if_not_exists()` | `pgtrickle` | `` | This is useful for migration scripts that should be safe to re-run. |
+| `pgtrickle.create_watermark_group()` | `pgtrickle` | `` | - `group_name`: unique name for this group. |
 | `pgtrickle.dedup_stats_fn()` | `pgtrickle` | `TableIterator<` | Example: ```sql SELECT * FROM pgtrickle.dedup_stats(); ```. |
 | `pgtrickle.dependency_tree()` | `pgtrickle` | `TableIterator<` | Exposed as `pgtrickle.dependency_tree()`. |
 | `pgtrickle.detach_outbox()` | `pgtrickle` | `` | Removes the entry from `pgtrickle.pgt_outbox_config`. |
+| `pgtrickle.diagnose_errors()` | `pgtrickle` | `TableIterator<` | # SQL usage ```sql SELECT * FROM pgtrickle.diagnose_errors('my_stream_table'); ```. |
 | `pgtrickle.diamond_groups()` | `pgtrickle` | `TableIterator<` | Returns one row per group member, indicating which group it belongs to, whether it is a convergence (fan-in) node, the group's current epoch, and the effective schedule policy. |
 | `pgtrickle.drain()` | `pgtrickle` | `` | # Example ```sql -- Quiesce before pg_upgrade or rolling restart: SELECT pgtrickle.drain(); -- Confirm drained: SELECT pgtrickle.is_drained(); -- Resume normal operation after maintenance: UPDATE pgtrickle.pgt_stream_tables SET status = status; -- noop, scheduler picks up ```. |
 | `pgtrickle.drop_refresh_group()` | `pgtrickle` | `Result<(), PgTrickleError>` | Drop a refresh group by name. |
@@ -33,36 +43,50 @@ See [docs/SQL_REFERENCE.md](SQL_REFERENCE.md) for full signatures and examples.
 | `pgtrickle.drop_stream_table()` | `pgtrickle` | `` | Changed in v0.19.0 (UX-6): default flipped from `true` to `false` to prevent accidental cascading drops. |
 | `pgtrickle.drop_stream_table_publication()` | `pgtrickle` | `` | CDC-PUB-2: Drop the logical replication publication for a stream table. |
 | `pgtrickle.drop_watermark_group()` | `pgtrickle` | `Result<(), PgTrickleError>` | Drop a watermark group by name. |
+| `pgtrickle.embedding_stream_table()` | `pgtrickle` | `` | # Returns A single-column table with one row per action taken (or SQL line for dry_run). |
 | `pgtrickle.exec_stream_ddl()` | `pgtrickle` | `bool` | # Example ```sql SELECT pgtrickle.exec_stream_ddl(   'CREATE STREAM TABLE revenue AS SELECT SUM(amount) FROM orders' ); ```. |
 | `pgtrickle.explain_dag()` | `pgtrickle` | `` | Node colours: user STs = blue, self-monitoring STs = green, suspended = red, fused = orange. |
+| `pgtrickle.explain_delta_text()` | `pgtrickle` | `` | Example: ```sql SELECT line FROM pgtrickle.explain_delta('public.orders_summary'); SELECT line FROM pgtrickle.explain_delta('public.orders_summary', 'json'); ```. |
 | `pgtrickle.explain_diff_sql()` | `pgtrickle` | `Option<String>` | Exposed as `pgtrickle.explain_diff_sql(name)`. |
+| `pgtrickle.explain_query_rewrite()` | `pgtrickle` | `TableIterator<` | # SQL usage ```sql SELECT * FROM pgtrickle.explain_query_rewrite(   'SELECT customer_id, SUM(amount) FROM orders GROUP BY customer_id' ); ```. |
+| `pgtrickle.explain_refresh_mode()` | `pgtrickle` | `TableIterator<` | Example: ```sql SELECT * FROM pgtrickle.explain_refresh_mode('public.orders_summary'); ```. |
+| `pgtrickle.explain_st()` | `pgtrickle` | `` | PERF-3: When `with_analyze` is true, the defining query is EXPLAINed with ANALYZE to show actual row counts, timings, and buffer usage. |
 | `pgtrickle.explain_stream_table()` | `pgtrickle` | `Result<String, PgTrickleError>` | v0.39.0 extends the output to include: - Explicit DIFF/FULL fallback reason from the stream table catalog - Whether `force_full_refresh` GUC is overriding the mode - The effective refresh mode from the last completed refresh cycle - Whether the backpressure or CDC-pause state is active. |
 | `pgtrickle.export_definition()` | `pgtrickle` | `Result<String, PgTrickleError>` | Returns a `DROP STREAM TABLE IF EXISTS` + `CREATE STREAM TABLE . |
 | `pgtrickle.fuse_status()` | `pgtrickle` | `TableIterator<` | Returns one row per stream table with fuse configuration and state. |
 | `pgtrickle.gate_source()` | `pgtrickle` | `Result<(), PgTrickleError>` | `source` is the source table name, optionally schema-qualified. |
+| `pgtrickle.get_refresh_history()` | `pgtrickle` | `` | Exposed as `pgtrickle.get_refresh_history(name, limit)`. |
 | `pgtrickle.get_staleness()` | `pgtrickle` | `Option<f64>` |  |
 | `pgtrickle.health_check()` | `pgtrickle` | `TableIterator<` | Exposed as `pgtrickle.health_check()`. |
 | `pgtrickle.health_summary()` | `pgtrickle` | `TableIterator<` | Exposed as `pgtrickle.health_summary()`. |
 | `pgtrickle.is_drained()` | `pgtrickle` | `bool` | A scheduler is considered drained when `DRAIN_COMPLETED >= DRAIN_REQUESTED` in shared memory. |
-| `pgtrickle.list_distance_subscriptions()` | `pgtrickle` | `TableIterator<` | VH-2 (v0.48.0): List all active distance-predicate subscriptions. |
+| `pgtrickle.list_auxiliary_columns()` | `pgtrickle` | `TableIterator<` | # SQL usage ```sql SELECT * FROM pgtrickle.list_auxiliary_columns('my_stream_table'); ```. |
+| `pgtrickle.list_distance_subscriptions()` | `pgtrickle` | `` | When `p_stream_table` is provided (e.g. |
+| `pgtrickle.list_snapshots()` | `pgtrickle` | `TableIterator<` | Returns one row per snapshot ordered by creation time descending. |
+| `pgtrickle.list_sources()` | `pgtrickle` | `TableIterator<` | Exposed as `pgtrickle.list_sources(name)`. |
 | `pgtrickle.list_subscriptions()` | `pgtrickle` | `TableIterator<` | Returns a table with columns (stream_table TEXT, channel TEXT, created_at TIMESTAMPTZ). |
 | `pgtrickle.metrics_summary()` | `pgtrickle` | `TableIterator<` | v0.31.0 (PERF-3): Added `ivm_lock_parse_error_count` — cumulative count of IMMEDIATE-mode lock-mode downgrades due to query parse failures. |
 | `pgtrickle.migrate()` | `pgtrickle` | `String` | This is a convenience function for users who upgrade the extension without using `ALTER EXTENSION pg_trickle UPDATE` — it ensures the catalog schema matches the library expectations. |
+| `pgtrickle.parallel_job_status()` | `pgtrickle` | `` | Exposed as `pgtrickle.parallel_job_status(max_age_seconds)`. |
 | `pgtrickle.parse_duration_seconds()` | `pgtrickle` | `Option<i64>` | Used by SQL views to compare schedule. |
 | `pgtrickle.pg_trickle_hash()` | `pgtrickle` | `i64` | NULL input is mapped to a deterministic sentinel (`\x00NULL\x00`) — the same encoding used by [`pg_trickle_hash_multi`] — so that rows with NULL-valued group keys receive a non-NULL `__pgt_row_id`. |
 | `pgtrickle.pg_trickle_hash_multi()` | `pgtrickle` | `i64` | The hash output is identical to the previous xxh64-based implementation **except** that it now uses xxh3 which produces different numeric values. |
 | `pgtrickle.pg_trickle_on_ddl_end()` | `pgtrickle` | `` | Registered via `extension_sql!()` in lib.rs as: ```sql CREATE FUNCTION pgtrickle._on_ddl_end() RETURNS event_trigger . |
 | `pgtrickle.pg_trickle_on_sql_drop()` | `pgtrickle` | `` | Detects when upstream source tables or ST storage tables themselves are dropped and reacts accordingly. |
+| `pgtrickle.pgt_ivm_apply_delta()` | `pgtrickle` | `Result<(), PgTrickleError>` | Delta SQL templates are cached per (pgt_id, source_oid, has_new, has_old) to avoid re-parsing the defining query on every trigger invocation. |
+| `pgtrickle.pgt_ivm_apply_delta_enr()` | `pgtrickle` | `Result<(), PgTrickleError>` | Requires PostgreSQL 18+ which propagates ENRs to nested SPI calls within trigger execution contexts. |
 | `pgtrickle.pgt_ivm_handle_truncate()` | `pgtrickle` | `Result<(), PgTrickleError>` | Truncates the stream table (equivalent to a full refresh with empty base table for simple views). |
 | `pgtrickle.pgt_scc_status()` | `pgtrickle` | `TableIterator<` | Returns one row per SCC, summarising its members, most recent fixpoint iteration count, and last convergence time. |
 | `pgtrickle.pgt_status()` | `pgtrickle` | `TableIterator<` | Returns a summary row per stream table including schedule configuration, data timestamp, and computed staleness interval. |
 | `pgtrickle.pgtrickle_refresh_stats()` | `pgtrickle` | `TableIterator<` | Exposed as `pgtrickle.pgtrickle_refresh_stats()`. |
 | `pgtrickle.preflight()` | `pgtrickle` | `String` | Returns a JSON string with one entry per check: `pass` (bool), `check` (name), `detail` (human-readable message). |
 | `pgtrickle.rebuild_cdc_triggers()` | `pgtrickle` | `&'static str` | Returns `'done'` on success. |
+| `pgtrickle.recommend_refresh_mode()` | `pgtrickle` | `` | Read-only — no side effects. |
 | `pgtrickle.recommend_schedule()` | `pgtrickle` | `pgrx::JsonB` | PLAN-1 (v0.27.0): Return a schedule recommendation for the given stream table as a JSONB object with keys: `recommended_interval_seconds`, `peak_window_cron`, `confidence` (0–1), `reasoning`. |
 | `pgtrickle.refresh_efficiency()` | `pgtrickle` | `Result<` | Returns operational metrics for each stream table: FULL vs DIFFERENTIAL timing, change ratios, speedup factor, and refresh counts. |
 | `pgtrickle.refresh_groups_fn()` | `pgtrickle` | `TableIterator<` | Return all user-declared refresh groups with member details. |
 | `pgtrickle.refresh_stream_table()` | `pgtrickle` | `` | Manually trigger a synchronous refresh of a stream table. |
+| `pgtrickle.refresh_timeline()` | `pgtrickle` | `` | Exposed as `pgtrickle.refresh_timeline(limit)`. |
 | `pgtrickle.repair_stream_table()` | `pgtrickle` | `String` | Steps performed (actions taken are summarized in the return text): 1. |
 | `pgtrickle.reset_fuse()` | `pgtrickle` | `` | Returns nothing on success; raises an ERROR if the stream table does not exist or the fuse is not blown. |
 | `pgtrickle.restore_from_snapshot()` | `pgtrickle` | `` | The stream table must already be registered. |
@@ -82,13 +106,16 @@ See [docs/SQL_REFERENCE.md](SQL_REFERENCE.md) for full signatures and examples.
 | `pgtrickle.sql_stable_name_for_oid()` | `pgtrickle` | `Option<String>` | Returns `NULL` when the relation no longer exists (e.g. |
 | `pgtrickle.st_auto_threshold()` | `pgtrickle` | `Option<f64>` | Returns the per-ST `auto_threshold` if set, otherwise the global `pg_trickle.differential_max_change_ratio` GUC. |
 | `pgtrickle.st_refresh_stats()` | `pgtrickle` | `TableIterator<` | This is the primary monitoring function, exposed as `pgtrickle.st_refresh_stats()`. |
+| `pgtrickle.stream_table_lineage()` | `pgtrickle` | `TableIterator<` | # Example ```sql SELECT * FROM pgtrickle.stream_table_lineage('public.revenue_summary'); ```. |
 | `pgtrickle.stream_table_to_publication()` | `pgtrickle` | `` | Creates a PostgreSQL publication exposing the named stream table so that Kafka Connect, Debezium, and other logical replication subscribers can receive change events without a separate replication slot. |
 | `pgtrickle.subscribe()` | `pgtrickle` | `Result<(), PgTrickleError>` | The subscription is stored in `pgtrickle.pgt_subscriptions` and survives restarts. |
+| `pgtrickle.subscribe_distance()` | `pgtrickle` | `Result<(), PgTrickleError>` | The subscription is stored in `pgtrickle.pgt_distance_subscriptions` and survives restarts. |
 | `pgtrickle.teardown_self_monitoring()` | `pgtrickle` | `` | Safe with partial setups: each table is dropped individually, and missing tables are silently skipped (STAB-5). |
 | `pgtrickle.trigger_inventory()` | `pgtrickle` | `TableIterator<` | Exposed as `pgtrickle.trigger_inventory()`. |
 | `pgtrickle.ungate_source()` | `pgtrickle` | `Result<(), PgTrickleError>` | `source` is the source table name, optionally schema-qualified. |
 | `pgtrickle.unsubscribe()` | `pgtrickle` | `Result<(), PgTrickleError>` | UX-SUB: Remove a NOTIFY subscription for a stream table / channel pair. |
 | `pgtrickle.unsubscribe_distance()` | `pgtrickle` | `Result<(), PgTrickleError>` | VH-2 (v0.48.0): Remove a distance-predicate subscription. |
+| `pgtrickle.validate_query()` | `pgtrickle` | `TableIterator<` | # SQL usage ```sql SELECT * FROM pgtrickle.validate_query(   'SELECT customer_id, COUNT(*) FROM orders GROUP BY customer_id' ); ```. |
 | `pgtrickle.vector_status()` | `pgtrickle` | `TableIterator<` | Returns one row per stream table that has a `post_refresh_action` other than 'none', or that has any ANN-relevant index on its storage table. |
 | `pgtrickle.version()` | `pgtrickle` | `&'static str` |  |
 | `pgtrickle.version_check()` | `pgtrickle` | `String` | Returns a JSON string with library_version, extension_version, pg_version, and a boolean `version_match`. |
