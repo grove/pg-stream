@@ -102,7 +102,7 @@
 
 | Version | Theme | Status | Scope | Full details |
 |---------|-------|--------|------- |---------- |
-| [v0.47.0](roadmap/v0.47.0.md) | Embedding pipeline infrastructure: post-refresh hooks, drift-based reindex, vector monitoring | Planned | Medium | [Full details](roadmap/v0.47.0.md-full.md) |
+| [v0.47.0](roadmap/v0.47.0.md) | Embedding pipeline infrastructure: post-refresh hooks, drift-based reindex, vector monitoring | ✅ Released | Medium | [Full details](roadmap/v0.47.0.md-full.md) |
 | [v0.48.0](roadmap/v0.48.0.md) | Complete embedding programme: sparse/half-precision vector aggregates, hybrid search, embedding_stream_table() API, per-tenant ANN, embedding outbox | Planned | Large | [Full details](roadmap/v0.48.0.md-full.md) |
 
 ### Beyond v1.0
