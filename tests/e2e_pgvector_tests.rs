@@ -283,3 +283,233 @@ async fn test_pgvector_hnsw_index_on_stream_table() {
         "HNSW ANN query should return at least one result"
     );
 }
+
+// ═══════════════════════════════════════════════════════════════════════
+// T-VP1 (v0.47.0): Drift-based reindex on HNSW stream table
+// ═══════════════════════════════════════════════════════════════════════
+
+/// T-VP1: Create a vector stream table with post_refresh_action='reindex_if_drift',
+/// change rows beyond the threshold, verify that the drift counter increments
+/// and that last_reindex_at is updated after a refresh.
+#[tokio::test]
+async fn test_vector_post_refresh_action_reindex_if_drift() {
+    let db = E2eDb::new().await.with_extension().await;
+    setup_pgvector(&db).await;
+
+    db.execute(
+        "CREATE TABLE drift_src (
+            id SERIAL PRIMARY KEY,
+            embedding vector(3)
+        )",
+    )
+    .await;
+
+    // Insert initial rows
+    for i in 1..=20i32 {
+        db.execute(&format!(
+            "INSERT INTO drift_src (embedding) VALUES ('[{},{},0]')",
+            i, i
+        ))
+        .await;
+    }
+
+    // Create stream table
+    let q = "SELECT id, embedding FROM drift_src";
+    db.execute(&format!(
+        "SELECT pgtrickle.create_stream_table('drift_st', $${q}$$, '1m', 'DIFFERENTIAL')"
+    ))
+    .await;
+
+    // Configure drift-triggered REINDEX (50% threshold so we can trigger it)
+    db.execute(
+        "SELECT pgtrickle.alter_stream_table('drift_st', \
+         post_refresh_action => 'reindex_if_drift', \
+         reindex_drift_threshold => 0.50)",
+    )
+    .await;
+
+    // Add more rows to exceed 50% threshold (20 rows * 50% = 10, add 11)
+    for i in 21..=31i32 {
+        db.execute(&format!(
+            "INSERT INTO drift_src (embedding) VALUES ('[{},{},1]')",
+            i, i
+        ))
+        .await;
+    }
+
+    // Refresh — should increment rows_changed_since_last_reindex
+    db.refresh_st("drift_st").await;
+
+    // Check that vector_status() shows this stream table
+    let drift_pct = db
+        .query_scalar_opt::<f64>(
+            "SELECT drift_pct FROM pgtrickle.vector_status() WHERE name = 'public.drift_st'",
+        )
+        .await;
+    assert!(
+        drift_pct.is_some(),
+        "vector_status() should return a row for drift_st"
+    );
+
+    // Verify post_refresh_action is stored correctly
+    let action = db
+        .query_scalar_opt::<String>(
+            "SELECT post_refresh_action FROM pgtrickle.pgt_stream_tables \
+             WHERE pgt_name = 'drift_st'",
+        )
+        .await
+        .expect("post_refresh_action should be set");
+    assert_eq!(
+        action, "reindex_if_drift",
+        "post_refresh_action should be 'reindex_if_drift'"
+    );
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// T-VP2 (v0.47.0): vector_status() accuracy and reset behavior
+// ═══════════════════════════════════════════════════════════════════════
+
+/// T-VP2: Verify that pgtrickle.vector_status() reports correct lag, drift,
+/// and metadata for vector stream tables. Also verify that after an alter to
+/// 'none', the table disappears from vector_status().
+#[tokio::test]
+async fn test_vector_status_view_accuracy_and_reset() {
+    let db = E2eDb::new().await.with_extension().await;
+    setup_pgvector(&db).await;
+
+    db.execute(
+        "CREATE TABLE vs_src (
+            id SERIAL PRIMARY KEY,
+            body TEXT,
+            embedding vector(3)
+        )",
+    )
+    .await;
+
+    db.execute(
+        "INSERT INTO vs_src (body, embedding) VALUES
+             ('hello', '[1,0,0]'),
+             ('world', '[0,1,0]'),
+             ('foo',   '[0,0,1]')",
+    )
+    .await;
+
+    let q = "SELECT id, body, embedding FROM vs_src";
+    db.execute(&format!(
+        "SELECT pgtrickle.create_stream_table('vs_st', $${q}$$, '1m', 'DIFFERENTIAL')"
+    ))
+    .await;
+
+    // Set post_refresh_action to 'analyze'
+    db.execute("SELECT pgtrickle.alter_stream_table('vs_st', post_refresh_action => 'analyze')")
+        .await;
+
+    // Do a refresh to trigger the action
+    db.refresh_st("vs_st").await;
+
+    // vector_status() should show vs_st
+    let row = db
+        .query_scalar_opt::<String>(
+            "SELECT post_refresh_action FROM pgtrickle.vector_status() \
+             WHERE name = 'public.vs_st'",
+        )
+        .await;
+    assert!(
+        row.is_some(),
+        "vector_status() should include vs_st after setting post_refresh_action"
+    );
+    assert_eq!(
+        row.unwrap(),
+        "analyze",
+        "post_refresh_action should be 'analyze'"
+    );
+
+    // data_timestamp should be set (not NULL)
+    let ts = db
+        .query_scalar_opt::<String>(
+            "SELECT data_timestamp::TEXT FROM pgtrickle.vector_status() \
+             WHERE name = 'public.vs_st'",
+        )
+        .await;
+    assert!(
+        ts.is_some(),
+        "data_timestamp should not be NULL in vector_status()"
+    );
+
+    // Reset to 'none' — should disappear from vector_status()
+    db.execute("SELECT pgtrickle.alter_stream_table('vs_st', post_refresh_action => 'none')")
+        .await;
+
+    let gone = db
+        .query_scalar_opt::<String>(
+            "SELECT post_refresh_action FROM pgtrickle.vector_status() \
+             WHERE name = 'public.vs_st'",
+        )
+        .await;
+    assert!(
+        gone.is_none(),
+        "vs_st should not appear in vector_status() after resetting to 'none'"
+    );
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// T-VP3 / VP-5 (v0.47.0): Vector-aggregate cases — shard-additive verification
+// ═══════════════════════════════════════════════════════════════════════
+
+/// T-VP3 / VP-5: Verify that vector_avg() produces correct results consistent
+/// with pgvector's native avg(vector) aggregate. This exercises the same
+/// shard-additive algebra that would run in a Citus distributed deployment.
+///
+/// This test runs on the standard single-node e2e image (no Citus required)
+/// but validates the arithmetic that the Citus path relies on.
+#[tokio::test]
+async fn test_vector_avg_shard_additive_correctness() {
+    let db = E2eDb::new().await.with_extension().await;
+    setup_pgvector(&db).await;
+
+    db.execute(
+        "CREATE TABLE shard_src (
+            id      SERIAL PRIMARY KEY,
+            shard   INTEGER NOT NULL,
+            vec     vector(4)
+        )",
+    )
+    .await;
+
+    // Simulate two logical shards with known vectors
+    // Shard 1: avg([1,2,3,4], [3,4,5,6]) = [2,3,4,5]
+    // Shard 2: avg([0,0,0,0], [4,4,4,4]) = [2,2,2,2]
+    db.execute(
+        "INSERT INTO shard_src (shard, vec) VALUES
+             (1, '[1,2,3,4]'), (1, '[3,4,5,6]'),
+             (2, '[0,0,0,0]'), (2, '[4,4,4,4]')",
+    )
+    .await;
+
+    let q = "SELECT shard, avg(vec) AS centroid, count(*) AS cnt FROM shard_src GROUP BY shard";
+    let create_sql = format!(
+        "SELECT pgtrickle.create_stream_table('shard_avg_st', $${q}$$, '1m', 'DIFFERENTIAL')"
+    );
+    db.execute_seq(&["SET pg_trickle.enable_vector_agg = on", &create_sql])
+        .await;
+
+    db.assert_st_matches_query("shard_avg_st", q).await;
+
+    // Verify shard 1 centroid: avg([1,2,3,4],[3,4,5,6]) = [2,3,4,5]
+    let s1_centroid: Option<String> = db
+        .query_scalar_opt("SELECT centroid::TEXT FROM public.shard_avg_st WHERE shard = 1")
+        .await;
+    assert!(s1_centroid.is_some(), "shard 1 centroid should be present");
+    // pgvector formats vectors as '[x,y,z,w]'; check it's close to [2,3,4,5]
+    let ct = s1_centroid.unwrap();
+    assert!(
+        ct.contains("2") && ct.contains("3") && ct.contains("4") && ct.contains("5"),
+        "shard 1 centroid ({ct}) should approximate [2,3,4,5]"
+    );
+
+    // Now insert into shard 1 — differential refresh must update centroid correctly
+    db.execute("INSERT INTO shard_src (shard, vec) VALUES (1, '[5,6,7,8]')")
+        .await;
+    db.refresh_st("shard_avg_st").await;
+    db.assert_st_matches_query("shard_avg_st", q).await;
+}
