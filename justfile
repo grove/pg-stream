@@ -343,10 +343,15 @@ check-upgrade from to:
     scripts/check_upgrade_completeness.sh {{from}} {{to}}
 
 # Validate all upgrade scripts cover their new SQL objects (no Docker needed)
+# Only validates scripts from v0.40.0 onward (the supported upgrade window).
+# Pre-v0.40.0 scripts remain in sql/ for PostgreSQL chain compatibility but
+# are not actively re-validated (they are stable historical scripts).
 [group: "upgrade"]
 check-upgrade-all:
     #!/usr/bin/env bash
     set -euo pipefail
+    SUPPORT_CUTOFF="0.40.0"
+    version_ge() { printf '%s\n%s' "$2" "$1" | sort -V -C; }
     current_version=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
     pairs=()
     for f in sql/pg_trickle--*--*.sql; do
@@ -354,7 +359,9 @@ check-upgrade-all:
         from=${base#pg_trickle--}
         to=${from#*--}
         from=${from%%--*}
-        pairs+=("$from $to")
+        if version_ge "$from" "$SUPPORT_CUTOFF"; then
+            pairs+=("$from $to")
+        fi
     done
     # Verify the chain reaches the current Cargo.toml version
     last_to=$(printf '%s\n' "${pairs[@]}" | awk '{print $2}' | sort -V | tail -1)
@@ -363,13 +370,13 @@ check-upgrade-all:
         echo "       Did you forget to create sql/pg_trickle--${last_to}--${current_version}.sql?"
         exit 1
     fi
-    echo "Found ${#pairs[@]} upgrade step(s) ending at v${current_version}"
+    echo "Found ${#pairs[@]} upgrade step(s) from v${SUPPORT_CUTOFF}+ ending at v${current_version}"
     failed=0
     for pair in "${pairs[@]}"; do
         from=${pair%% *}
         to=${pair##* }
         echo ""
-        echo "━━━ Checking upgrade: ${from} → ${to} ━━━"
+        echo "--- Checking upgrade: ${from} -> ${to}"
         if ! scripts/check_upgrade_completeness.sh "$from" "$to"; then
             failed=1
         fi
@@ -384,12 +391,12 @@ check-upgrade-all:
 
 # Build the upgrade Docker image for testing FROM→TO migrations
 [group: "upgrade"]
-build-upgrade-image from="0.7.0" to="0.46.0": build-e2e-image
+build-upgrade-image from="0.40.0" to="0.47.0": build-e2e-image
     ./tests/build_e2e_upgrade_image.sh {{from}} {{to}}
 
 # Run upgrade E2E tests (builds base + upgrade Docker images first)
 [group: "upgrade"]
-test-upgrade from="0.7.0" to="0.46.0": (build-upgrade-image from to)
+test-upgrade from="0.7.0" to="0.47.0": (build-upgrade-image from to)
     PGS_E2E_IMAGE=pg_trickle_upgrade_e2e:latest \
     PGS_UPGRADE_FROM={{from}} PGS_UPGRADE_TO={{to}} \
         ./scripts/run_e2e_tests.sh --test e2e_upgrade_tests --run-ignored all --no-capture

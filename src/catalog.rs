@@ -133,6 +133,22 @@ pub struct StreamTableMeta {
     /// 'citus' = Citus columnar extension.
     /// 'pg_mooncake' = pg_mooncake columnar tables.
     pub storage_backend: String,
+    /// VP-1 (v0.47.0): Action to run after a successful refresh commit.
+    /// 'none' = no action (default), 'analyze' = run ANALYZE,
+    /// 'reindex' = always REINDEX, 'reindex_if_drift' = REINDEX only when
+    /// rows_changed_since_last_reindex exceeds reindex_drift_threshold.
+    pub post_refresh_action: String,
+    /// VP-2 (v0.47.0): Fraction (0.0–1.0) of rows in the storage table that
+    /// must change since the last REINDEX before a drift-triggered REINDEX
+    /// fires. Only used when post_refresh_action = 'reindex_if_drift'.
+    /// None means use the global pg_trickle.reindex_drift_threshold GUC.
+    pub reindex_drift_threshold: Option<f64>,
+    /// VP-2 (v0.47.0): Number of rows changed since the last REINDEX.
+    /// Reset to 0 after each REINDEX completes.
+    pub rows_changed_since_last_reindex: i64,
+    /// VP-2 (v0.47.0): Timestamp of the last REINDEX on this stream table.
+    /// None means the stream table has never been REINDEXed.
+    pub last_reindex_at: Option<TimestampWithTimeZone>,
 }
 
 /// CDC mode for a source dependency — tracks whether change capture uses
@@ -322,7 +338,11 @@ impl StreamTableMeta {
                      last_error_message, last_error_at, downstream_publication_name, freshness_deadline_ms, \
                      COALESCE(st_placement, 'local') AS st_placement, \
                      COALESCE(temporal_mode, FALSE) AS temporal_mode, \
-                     COALESCE(storage_backend, 'heap') AS storage_backend \
+                     COALESCE(storage_backend, 'heap') AS storage_backend, \
+                     COALESCE(post_refresh_action, 'none') AS post_refresh_action, \
+                     reindex_drift_threshold, \
+                     COALESCE(rows_changed_since_last_reindex, 0) AS rows_changed_since_last_reindex, \
+                     last_reindex_at \
                      FROM pgtrickle.pgt_stream_tables \
                      WHERE pgt_schema = $1 AND pgt_name = $2",
                     None,
@@ -358,7 +378,11 @@ impl StreamTableMeta {
                      last_error_message, last_error_at, downstream_publication_name, freshness_deadline_ms, \
                      COALESCE(st_placement, 'local') AS st_placement, \
                      COALESCE(temporal_mode, FALSE) AS temporal_mode, \
-                     COALESCE(storage_backend, 'heap') AS storage_backend \
+                     COALESCE(storage_backend, 'heap') AS storage_backend, \
+                     COALESCE(post_refresh_action, 'none') AS post_refresh_action, \
+                     reindex_drift_threshold, \
+                     COALESCE(rows_changed_since_last_reindex, 0) AS rows_changed_since_last_reindex, \
+                     last_reindex_at \
                      FROM pgtrickle.pgt_stream_tables \
                      WHERE pgt_relid = $1",
                     None,
@@ -399,7 +423,11 @@ impl StreamTableMeta {
                      last_error_message, last_error_at, downstream_publication_name, freshness_deadline_ms, \
                      COALESCE(st_placement, 'local') AS st_placement, \
                      COALESCE(temporal_mode, FALSE) AS temporal_mode, \
-                     COALESCE(storage_backend, 'heap') AS storage_backend \
+                     COALESCE(storage_backend, 'heap') AS storage_backend, \
+                     COALESCE(post_refresh_action, 'none') AS post_refresh_action, \
+                     reindex_drift_threshold, \
+                     COALESCE(rows_changed_since_last_reindex, 0) AS rows_changed_since_last_reindex, \
+                     last_reindex_at \
                      FROM pgtrickle.pgt_stream_tables \
                      WHERE pgt_id = $1",
                     None,
@@ -435,7 +463,11 @@ impl StreamTableMeta {
                      last_error_message, last_error_at, downstream_publication_name, freshness_deadline_ms, \
                      COALESCE(st_placement, 'local') AS st_placement, \
                      COALESCE(temporal_mode, FALSE) AS temporal_mode, \
-                     COALESCE(storage_backend, 'heap') AS storage_backend \
+                     COALESCE(storage_backend, 'heap') AS storage_backend, \
+                     COALESCE(post_refresh_action, 'none') AS post_refresh_action, \
+                     reindex_drift_threshold, \
+                     COALESCE(rows_changed_since_last_reindex, 0) AS rows_changed_since_last_reindex, \
+                     last_reindex_at \
                      FROM pgtrickle.pgt_stream_tables",
                     None,
                     &[],
@@ -475,7 +507,11 @@ impl StreamTableMeta {
                      last_error_message, last_error_at, downstream_publication_name, freshness_deadline_ms, \
                      COALESCE(st_placement, 'local') AS st_placement, \
                      COALESCE(temporal_mode, FALSE) AS temporal_mode, \
-                     COALESCE(storage_backend, 'heap') AS storage_backend \
+                     COALESCE(storage_backend, 'heap') AS storage_backend, \
+                     COALESCE(post_refresh_action, 'none') AS post_refresh_action, \
+                     reindex_drift_threshold, \
+                     COALESCE(rows_changed_since_last_reindex, 0) AS rows_changed_since_last_reindex, \
+                     last_reindex_at \
                      FROM pgtrickle.pgt_stream_tables \
                      WHERE status = 'ACTIVE'",
                     None,
@@ -1094,6 +1130,53 @@ impl StreamTableMeta {
         .map_err(|e: pgrx::spi::SpiError| PgTrickleError::SpiError(e.to_string()))
     }
 
+    /// VP-1/VP-2 (v0.47.0): Update post_refresh_action and reindex_drift_threshold.
+    pub fn update_post_refresh_options(
+        pgt_id: i64,
+        post_refresh_action: &str,
+        reindex_drift_threshold: Option<f64>,
+    ) -> Result<(), PgTrickleError> {
+        Spi::run_with_args(
+            "UPDATE pgtrickle.pgt_stream_tables \
+             SET post_refresh_action = $1, reindex_drift_threshold = $2, updated_at = now() \
+             WHERE pgt_id = $3",
+            &[
+                post_refresh_action.into(),
+                reindex_drift_threshold.into(),
+                pgt_id.into(),
+            ],
+        )
+        .map_err(|e: pgrx::spi::SpiError| PgTrickleError::SpiError(e.to_string()))
+    }
+
+    /// VP-2 (v0.47.0): Increment rows_changed_since_last_reindex by delta.
+    pub fn increment_rows_changed_for_reindex(
+        pgt_id: i64,
+        delta: i64,
+    ) -> Result<(), PgTrickleError> {
+        Spi::run_with_args(
+            "UPDATE pgtrickle.pgt_stream_tables \
+             SET rows_changed_since_last_reindex = \
+               COALESCE(rows_changed_since_last_reindex, 0) + $1, \
+             updated_at = now() \
+             WHERE pgt_id = $2",
+            &[delta.into(), pgt_id.into()],
+        )
+        .map_err(|e: pgrx::spi::SpiError| PgTrickleError::SpiError(e.to_string()))
+    }
+
+    /// VP-2 (v0.47.0): Reset rows_changed_since_last_reindex to 0 and set last_reindex_at.
+    pub fn reset_reindex_drift_counter(pgt_id: i64) -> Result<(), PgTrickleError> {
+        Spi::run_with_args(
+            "UPDATE pgtrickle.pgt_stream_tables \
+             SET rows_changed_since_last_reindex = 0, \
+             last_reindex_at = now(), updated_at = now() \
+             WHERE pgt_id = $1",
+            &[pgt_id.into()],
+        )
+        .map_err(|e: pgrx::spi::SpiError| PgTrickleError::SpiError(e.to_string()))
+    }
+
     // ── Private helpers ────────────────────────────────────────────────
 
     /// Extract a StreamTableMeta from a positioned SpiTupleTable (after first()).
@@ -1211,6 +1294,13 @@ impl StreamTableMeta {
             .get::<String>(46)
             .map_err(map_spi)?
             .unwrap_or_else(|| "heap".into());
+        let post_refresh_action = table
+            .get::<String>(47)
+            .map_err(map_spi)?
+            .unwrap_or_else(|| "none".into());
+        let reindex_drift_threshold = table.get::<f64>(48).map_err(map_spi)?;
+        let rows_changed_since_last_reindex = table.get::<i64>(49).map_err(map_spi)?.unwrap_or(0);
+        let last_reindex_at = table.get::<TimestampWithTimeZone>(50).map_err(map_spi)?;
 
         Ok(StreamTableMeta {
             pgt_id,
@@ -1259,6 +1349,10 @@ impl StreamTableMeta {
             st_placement,
             temporal_mode,
             storage_backend,
+            post_refresh_action,
+            reindex_drift_threshold,
+            rows_changed_since_last_reindex,
+            last_reindex_at,
         })
     }
 
@@ -1377,6 +1471,13 @@ impl StreamTableMeta {
             .get::<String>(46)
             .map_err(map_spi)?
             .unwrap_or_else(|| "heap".into());
+        let post_refresh_action = row
+            .get::<String>(47)
+            .map_err(map_spi)?
+            .unwrap_or_else(|| "none".into());
+        let reindex_drift_threshold = row.get::<f64>(48).map_err(map_spi)?;
+        let rows_changed_since_last_reindex = row.get::<i64>(49).map_err(map_spi)?.unwrap_or(0);
+        let last_reindex_at = row.get::<TimestampWithTimeZone>(50).map_err(map_spi)?;
 
         Ok(StreamTableMeta {
             pgt_id,
@@ -1425,6 +1526,10 @@ impl StreamTableMeta {
             st_placement,
             temporal_mode,
             storage_backend,
+            post_refresh_action,
+            reindex_drift_threshold,
+            rows_changed_since_last_reindex,
+            last_reindex_at,
         })
     }
 }

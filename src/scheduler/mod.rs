@@ -4283,6 +4283,137 @@ fn is_falling_behind(elapsed_ms: i64, schedule_ms: i64, threshold: f64) -> Optio
     }
 }
 
+/// VP-1/VP-2 (v0.47.0): Execute the post-refresh action for a stream table
+/// after a successful refresh that produced changed rows.
+///
+/// Runs outside the refresh transaction (fire-and-forget after commit).
+/// Errors are logged but never propagated — post-refresh actions must not
+/// interrupt the refresh pipeline.
+fn execute_post_refresh_action(st: &StreamTableMeta, rows_changed: i64) {
+    let action = st.post_refresh_action.as_str();
+
+    // Increment the drift counter first (regardless of action type).
+    if action == "reindex_if_drift" || action == "reindex" || action == "analyze" {
+        let _ = crate::catalog::StreamTableMeta::increment_rows_changed_for_reindex(
+            st.pgt_id,
+            rows_changed,
+        );
+    }
+
+    match action {
+        "none" => {
+            // No post-refresh action requested.
+        }
+        "analyze" => {
+            let quoted = format!(
+                "\"{}\".\"{}\"",
+                st.pgt_schema.replace('"', "\"\""),
+                st.pgt_name.replace('"', "\"\""),
+            );
+            // nosemgrep: rust.spi.run.dynamic-format — ANALYZE target is a PostgreSQL-quoted identifier
+            if let Err(e) = pgrx::Spi::run(&format!("ANALYZE {quoted}")) {
+                pgrx::log!(
+                    "pg_trickle: post-refresh ANALYZE failed for {}.{}: {}",
+                    st.pgt_schema,
+                    st.pgt_name,
+                    e
+                );
+            } else {
+                pgrx::log!(
+                    "pg_trickle: post-refresh ANALYZE completed for {}.{}",
+                    st.pgt_schema,
+                    st.pgt_name,
+                );
+            }
+        }
+        "reindex" => {
+            run_post_refresh_reindex(st);
+        }
+        "reindex_if_drift" => {
+            // Check drift: reload from catalog to get the latest counter.
+            let threshold = st
+                .reindex_drift_threshold
+                .unwrap_or(crate::config::pg_trickle_reindex_drift_threshold());
+            // Estimate row count for the storage table.
+            let estimated_rows: i64 = pgrx::Spi::get_one_with_args::<i64>(
+                "SELECT reltuples::BIGINT \
+                 FROM pg_class c \
+                 JOIN pg_namespace n ON n.oid = c.relnamespace \
+                 WHERE n.nspname = $1 AND c.relname = $2",
+                &[st.pgt_schema.as_str().into(), st.pgt_name.as_str().into()],
+            )
+            .unwrap_or(None)
+            .unwrap_or(0);
+
+            if estimated_rows > 0 {
+                // Reload from catalog to get the freshest drift counter.
+                let current_changed = crate::catalog::StreamTableMeta::get_by_id(st.pgt_id)
+                    .ok()
+                    .flatten()
+                    .map(|m| m.rows_changed_since_last_reindex)
+                    .unwrap_or(rows_changed);
+                let drift = current_changed as f64 / estimated_rows as f64;
+                if drift >= threshold {
+                    pgrx::log!(
+                        "pg_trickle: drift {:.1}% >= threshold {:.1}% for {}.{} — triggering REINDEX",
+                        drift * 100.0,
+                        threshold * 100.0,
+                        st.pgt_schema,
+                        st.pgt_name,
+                    );
+                    run_post_refresh_reindex(st);
+                }
+            }
+        }
+        other => {
+            pgrx::log!(
+                "pg_trickle: unknown post_refresh_action '{}' for {}.{} — ignoring",
+                other,
+                st.pgt_schema,
+                st.pgt_name,
+            );
+        }
+    }
+}
+
+/// VP-2 (v0.47.0): Run REINDEX on a stream table's storage table and reset
+/// the drift counter.
+fn run_post_refresh_reindex(st: &StreamTableMeta) {
+    let quoted = format!(
+        "\"{}\".\"{}\"",
+        st.pgt_schema.replace('"', "\"\""),
+        st.pgt_name.replace('"', "\"\""),
+    );
+    // nosemgrep: rust.spi.run.dynamic-format — REINDEX target is a PostgreSQL-quoted identifier
+    match pgrx::Spi::run(&format!("REINDEX TABLE {quoted}")) {
+        Ok(()) => {
+            pgrx::log!(
+                "pg_trickle: post-refresh REINDEX completed for {}.{}",
+                st.pgt_schema,
+                st.pgt_name,
+            );
+            // Reset the drift counter.
+            if let Err(e) = crate::catalog::StreamTableMeta::reset_reindex_drift_counter(st.pgt_id)
+            {
+                pgrx::log!(
+                    "pg_trickle: failed to reset reindex drift counter for {}.{}: {}",
+                    st.pgt_schema,
+                    st.pgt_name,
+                    e
+                );
+            }
+        }
+        Err(e) => {
+            pgrx::log!(
+                "pg_trickle: post-refresh REINDEX failed for {}.{}: {}",
+                st.pgt_schema,
+                st.pgt_name,
+                e
+            );
+        }
+    }
+}
+
 /// P3-5: Update the auto-backoff factor for a stream table based on its
 /// last refresh timing. Doubles the factor when falling behind; resets to
 /// 1.0 on the first on-time cycle.
@@ -5951,6 +6082,12 @@ fn execute_scheduled_refresh(
                     st.pgt_name,
                     e
                 );
+            }
+
+            // VP-1/VP-2 (v0.47.0): Execute post-refresh action when rows changed.
+            let rows_changed = rows_inserted + rows_deleted;
+            if rows_changed > 0 && action != RefreshAction::NoData {
+                execute_post_refresh_action(st, rows_changed);
             }
 
             RefreshOutcome::Success

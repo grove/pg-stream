@@ -4,7 +4,7 @@
 
 # SQL API Reference — pg_trickle
 
-**86 SQL-callable functions** discovered via `#[pg_extern]` in `src/`.
+**87 SQL-callable functions** discovered via `#[pg_extern]` in `src/`.
 
 See [docs/SQL_REFERENCE.md](SQL_REFERENCE.md) for full signatures and examples.
 
@@ -87,6 +87,7 @@ See [docs/SQL_REFERENCE.md](SQL_REFERENCE.md) for full signatures and examples.
 | `pgtrickle.trigger_inventory()` | `pgtrickle` | `TableIterator<` | Exposed as `pgtrickle.trigger_inventory()`. |
 | `pgtrickle.ungate_source()` | `pgtrickle` | `Result<(), PgTrickleError>` | `source` is the source table name, optionally schema-qualified. |
 | `pgtrickle.unsubscribe()` | `pgtrickle` | `Result<(), PgTrickleError>` | UX-SUB: Remove a NOTIFY subscription for a stream table / channel pair. |
+| `pgtrickle.vector_status()` | `pgtrickle` | `TableIterator<` | Returns one row per stream table that has a `post_refresh_action` other than 'none', or that has any ANN-relevant index on its storage table. |
 | `pgtrickle.version()` | `pgtrickle` | `&'static str` |  |
 | `pgtrickle.version_check()` | `pgtrickle` | `String` | Returns a JSON string with library_version, extension_version, pg_version, and a boolean `version_match`. |
 | `pgtrickle.view_evolution_status()` | `pgtrickle` | `TableIterator<` | During a zero-downtime schema evolution (ALTER STREAM TABLE), pg_trickle builds the new definition in a shadow table. |

@@ -1793,6 +1793,91 @@ pub(super) fn clear_caches() -> i64 {
     l2_count
 }
 
+/// VP-3 (v0.47.0): Vector status view — embedding lag, ANN age, drift percentage.
+///
+/// Returns one row per stream table that has a `post_refresh_action` other than
+/// 'none', or that has any ANN-relevant index on its storage table. Operators
+/// can use this to monitor the health of vector/embedding stream tables.
+#[pg_extern(schema = "pgtrickle", name = "vector_status")]
+#[allow(clippy::type_complexity)]
+pub(super) fn vector_status() -> TableIterator<
+    'static,
+    (
+        name!(name, String),
+        name!(post_refresh_action, String),
+        name!(reindex_drift_threshold, Option<f64>),
+        name!(rows_changed_since_last_reindex, i64),
+        name!(last_reindex_at, Option<TimestampWithTimeZone>),
+        name!(data_timestamp, Option<TimestampWithTimeZone>),
+        name!(embedding_lag, Option<pgrx::datum::Interval>),
+        name!(estimated_rows, Option<i64>),
+        name!(drift_pct, Option<f64>),
+    ),
+> {
+    let rows: Vec<_> = Spi::connect(|client| {
+        let result = client
+            .select(
+                "SELECT \
+                   s.pgt_schema || '.' || s.pgt_name AS name, \
+                   COALESCE(s.post_refresh_action, 'none') AS post_refresh_action, \
+                   s.reindex_drift_threshold, \
+                   COALESCE(s.rows_changed_since_last_reindex, 0) AS rows_changed_since_last_reindex, \
+                   s.last_reindex_at, \
+                   s.data_timestamp, \
+                   now() - s.data_timestamp AS embedding_lag, \
+                   c.reltuples::BIGINT AS estimated_rows, \
+                   CASE \
+                     WHEN c.reltuples > 0 \
+                     THEN ROUND( \
+                       (COALESCE(s.rows_changed_since_last_reindex, 0)::float / c.reltuples) * 100.0, \
+                       2) \
+                     ELSE NULL \
+                   END AS drift_pct \
+                 FROM pgtrickle.pgt_stream_tables s \
+                 JOIN pg_class c ON c.oid = s.pgt_relid \
+                 WHERE COALESCE(s.post_refresh_action, 'none') <> 'none' \
+                 ORDER BY s.pgt_schema, s.pgt_name",
+                None,
+                &[],
+            )
+            .unwrap_or_else(|e| {
+                pgrx::error!(
+                    "{}",
+                    crate::error::PgTrickleError::DiagnosticError(format!(
+                        "vector_status: SPI select failed: {e}"
+                    ))
+                )
+            });
+
+        let mut out = Vec::new();
+        for row in result {
+            let name = row.get::<String>(1).unwrap_or(None).unwrap_or_default();
+            let post_refresh_action = row.get::<String>(2).unwrap_or(None).unwrap_or_default();
+            let reindex_drift_threshold = row.get::<f64>(3).unwrap_or(None);
+            let rows_changed = row.get::<i64>(4).unwrap_or(None).unwrap_or(0);
+            let last_reindex_at = row.get::<TimestampWithTimeZone>(5).unwrap_or(None);
+            let data_ts = row.get::<TimestampWithTimeZone>(6).unwrap_or(None);
+            let embedding_lag = row.get::<pgrx::datum::Interval>(7).unwrap_or(None);
+            let estimated_rows = row.get::<i64>(8).unwrap_or(None);
+            let drift_pct = row.get::<f64>(9).unwrap_or(None);
+            out.push((
+                name,
+                post_refresh_action,
+                reindex_drift_threshold,
+                rows_changed,
+                last_reindex_at,
+                data_ts,
+                embedding_lag,
+                estimated_rows,
+                drift_pct,
+            ));
+        }
+        out
+    });
+
+    TableIterator::new(rows)
+}
+
 // ── TEST-7 (v0.24.0): Unit tests for diagnostics pure-logic helpers ─────
 
 #[cfg(test)]

@@ -7,6 +7,7 @@ For future plans and upcoming features, see [ROADMAP.md](ROADMAP.md).
 ## Table of Contents
 
 <!-- TOC start -->
+- [0.47.0 — Embedding Pipeline Infrastructure & ANN Maintenance](#0470--embedding-pipeline-infrastructure--ann-maintenance)
 - [0.46.0 — Extract `pg_tide`: Standalone Outbox, Inbox & Relay](#0460--extract-pg_tide-standalone-outbox-inbox--relay)
 - [0.45.0 — Operational Readiness, Scalability & CI Completeness](#0450--operational-readiness-scalability--ci-completeness)
 - [0.44.0 — Security Hardening & Code Quality](#0440--security-hardening--code-quality)
@@ -60,6 +61,125 @@ For future plans and upcoming features, see [ROADMAP.md](ROADMAP.md).
 - [0.1.1 — CloudNativePG Image & Test Hardening](#011--cloudnativepg-image--test-hardening)
 - [0.1.0 — Initial Release](#010--initial-release)
 <!-- TOC end -->
+
+---
+
+## [0.47.0] — Embedding Pipeline Infrastructure & ANN Maintenance
+
+> **⚠ Upgrade support policy change (v0.47.0+)**
+>
+> Starting from v0.47.0, pg_trickle provides direct upgrade scripts only for
+> **v0.40.0 and later**. If you are running v0.39.0 or older, you must first
+> upgrade to v0.40.0 before upgrading to v0.47.0 or later:
+>
+> ```sql
+> -- Users on v0.39.x or older: upgrade to v0.40.0 first
+> ALTER EXTENSION pg_trickle UPDATE TO '0.40.0';
+> -- Then upgrade to the latest version
+> ALTER EXTENSION pg_trickle UPDATE;
+> ```
+>
+> Both steps can be issued in the same session. PostgreSQL handles the
+> intermediate chain automatically. Users already on v0.40.0 or later are
+> unaffected — a single `ALTER EXTENSION pg_trickle UPDATE` is all that is
+> needed.
+
+v0.47.0 resumes the deferred embedding programme with post-refresh action
+hooks, drift-based HNSW reindex scheduling, vector-aware monitoring, and the
+pgvector RAG cookbook.
+
+### Post-Refresh Actions (VP-1)
+
+Stream tables can now specify what happens after a successful refresh that
+produces changed rows:
+
+```sql
+-- Run ANALYZE after each refresh (keep statistics fresh)
+SELECT pgtrickle.alter_stream_table(
+    'embedding_store',
+    post_refresh_action => 'analyze'
+);
+
+-- Always REINDEX the storage table after each refresh
+SELECT pgtrickle.alter_stream_table(
+    'embedding_store',
+    post_refresh_action => 'reindex'
+);
+
+-- REINDEX only when the drift threshold is exceeded
+SELECT pgtrickle.alter_stream_table(
+    'embedding_store',
+    post_refresh_action     => 'reindex_if_drift',
+    reindex_drift_threshold => 0.20   -- 20% of rows changed
+);
+```
+
+The action runs **outside** the refresh transaction so it does not add latency
+to the critical refresh window. The four supported values are `none` (default),
+`analyze`, `reindex`, and `reindex_if_drift`.
+
+### Drift Detection (VP-2)
+
+Two new catalog columns track ANN index freshness:
+
+- `rows_changed_since_last_reindex` — running count of rows changed since the
+  last REINDEX, reset to 0 after each successful REINDEX.
+- `last_reindex_at` — timestamp of the last pg_trickle-triggered REINDEX.
+
+A new GUC `pg_trickle.reindex_drift_threshold` (default 0.20) sets the global
+default fraction; per-table overrides via `reindex_drift_threshold` take
+precedence.
+
+### Vector Status View (VP-3)
+
+```sql
+SELECT * FROM pgtrickle.vector_status();
+```
+
+Returns one row per stream table with a non-`none` `post_refresh_action`:
+
+| Column | Description |
+|--------|-------------|
+| `name` | Schema-qualified stream table name |
+| `post_refresh_action` | Configured action |
+| `reindex_drift_threshold` | Per-table threshold (NULL = global GUC) |
+| `rows_changed_since_last_reindex` | Rows changed since last REINDEX |
+| `last_reindex_at` | When the last REINDEX completed |
+| `data_timestamp` | When the stream table data was last updated |
+| `embedding_lag` | Interval since last refresh |
+| `estimated_rows` | PostgreSQL reltuples estimate |
+| `drift_pct` | Percentage of rows changed (NULL if no estimate available) |
+
+### pgvector RAG Cookbook (VP-4)
+
+`docs/tutorials/PGVECTOR_RAG_COOKBOOK.md` — copy-paste patterns for:
+- Pre-computed embeddings with always-fresh search corpus
+- Tenant-isolated embedding corpus with RLS
+- Drift-aware HNSW reindexing
+- Centroid maintenance for cluster-aware search
+- Operational sizing guidance and monitoring queries
+
+### New SQL Functions
+
+- `pgtrickle.vector_status()` — embedding lag, ANN age, drift percentage
+
+### New Catalog Columns
+
+`pgtrickle.pgt_stream_tables`:
+- `post_refresh_action TEXT NOT NULL DEFAULT 'none'`
+- `reindex_drift_threshold DOUBLE PRECISION`
+- `rows_changed_since_last_reindex BIGINT NOT NULL DEFAULT 0`
+- `last_reindex_at TIMESTAMPTZ`
+
+### New GUCs
+
+- `pg_trickle.reindex_drift_threshold` (default: `0.20`) — global default
+  drift fraction for drift-triggered REINDEX
+
+### Upgrade Notes
+
+Existing stream tables keep `post_refresh_action = 'none'` after upgrade —
+no behaviour change unless explicitly configured.
 
 ---
 

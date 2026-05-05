@@ -4,7 +4,7 @@
 
 # GUC Reference — pg_trickle
 
-**114 configuration parameters** extracted from `src/config.rs`.
+**115 configuration parameters** extracted from `src/config.rs`.
 
 See [docs/CONFIGURATION.md](CONFIGURATION.md) for full descriptions and usage examples.
 
@@ -118,10 +118,11 @@ See [docs/CONFIGURATION.md](CONFIGURATION.md) for full descriptions and usage ex
 | `(registration pending — PGS_VOLATILE_FUNCTION_POLICY)` | `Option\<std::ffi::CString` | `"reject"` | Controls how volatile functions in defining queries are handled: - `"reject"` (default): Error — volatile functions are rejected. |
 | `(registration pending — PGS_WAKE_DEBOUNCE_MS)` | `i32` | `10` | **Note:** `pg_trickle.event_driven_wake` is deprecated and has no effect. |
 | `(registration pending — PGS_WAL_MAX_CHANGES_PER_POLL)` | `i32` | `10000` | Default: 10 000. |
+| `(registration pending — PGS_WAL_MAX_LAG_BYTES)` | `i32` | `65536` | Default: 65 536 (64 KiB). |
 | `(registration pending — PGS_WAL_TRANSITION_TIMEOUT)` | `i32` | `300` | Maximum time (seconds) to wait for the WAL decoder to catch up during transition from triggers to WAL-based CDC before falling back to triggers. |
 | `(registration pending — PGS_WATERMARK_HOLDBACK_TIMEOUT)` | `i32` | `0` | Set to 0 to disable stuck-watermark detection (default). |
 | `(registration pending — PGS_WORKER_POOL_SIZE)` | `i32` | `0` | Set to 0 (default) to use the existing spawn-per-task model. |
-| `pg_trickle.enabled` | `i32` | `65536` | Default: 65 536 (64 KiB). |
 | `pg_trickle.enabled` | `i32` | `256` | Default: 256. |
 | `pg_trickle.enabled` | `i32` | `128` | Default: 128. |
 | `pg_trickle.enabled` | `bool` | `false` | Off by default — use static quotas. |
+| `pg_trickle.enabled` | `f64` | `0.20` | Default: 0.20. |

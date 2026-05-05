@@ -356,6 +356,12 @@ jobs:
         run: |
           # Auto-discovers all upgrade steps from sql/pg_trickle--X--Y.sql files.
           # Fails if the chain doesn't reach the current Cargo.toml version.
+          # Scripts with a from-version older than SUPPORT_CUTOFF are kept in
+          # sql/ for PostgreSQL chain compatibility but are not re-validated in
+          # CI (they are stable, fully-tested historical scripts).
+          SUPPORT_CUTOFF="0.40.0"
+          # Returns 0 if version $1 >= $2 (uses sort -V for correctness).
+          version_ge() { printf '%s\n%s' "$2" "$1" | sort -V -C; }
           current_version=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
           pairs=()
           for f in sql/pg_trickle--*--*.sql; do
@@ -363,18 +369,20 @@ jobs:
             from=${base#pg_trickle--}
             to=${from#*--}
             from=${from%%--*}
-            pairs+=("$from $to")
+            if version_ge "$from" "$SUPPORT_CUTOFF"; then
+              pairs+=("$from $to")
+            fi
           done
           last_to=$(printf '%s\n' "${pairs[@]}" | awk '{print $2}' | sort -V | tail -1)
           if [[ "$last_to" != "$current_version" ]]; then
             echo "ERROR: Latest upgrade script target ($last_to) != Cargo.toml ($current_version)"
             exit 1
           fi
-          echo "Checking ${#pairs[@]} upgrade step(s) ending at v${current_version}"
+          echo "Checking ${#pairs[@]} upgrade step(s) from v${SUPPORT_CUTOFF}+ ending at v${current_version}"
           for pair in "${pairs[@]}"; do
             from=${pair%% *}
             to=${pair##* }
-            echo "━━━ Checking: ${from} → ${to}"
+            echo "--- Checking: ${from} -> ${to}"
             scripts/check_upgrade_completeness.sh "$from" "$to"
           done
 
@@ -384,20 +392,14 @@ jobs:
   # A prepare job discovers all upgrade pairs from sql/pg_trickle--X--Y.sql
   # files plus the full oldest→current chain, then fans out to a matrix.
 
-  # ── O39-14 (v0.39.0): PR-scoped upgrade E2E slice ───────────────────────
-  # Runs a targeted subset of upgrade E2E tests on every PR that modifies SQL
-  # migration scripts, CDC logic, API functions, or config.
-  # Uses the stock postgres:18.3 container (no custom image build required).
-  # Tests the most recent N-1→N upgrade pair only to keep PR CI fast (~10 min).
+  # ── Upgrade E2E slice (nightly + manual only) ──────────────────────────
+  # Moved off PR CI in v0.47.0 (upgrade support policy: v0.40.0+ cutoff).
+  # The completeness check (above) still runs on every PR.
+  # Full upgrade E2E tests run on schedule/manual dispatch only.
   upgrade-e2e-pr-slice:
-    name: Upgrade E2E slice (PR gate)
+    name: Upgrade E2E slice (nightly/manual)
     runs-on: ubuntu-latest
-    if: >
-      github.event_name == 'pull_request' && (
-        contains(github.event.pull_request.changed_files, 'sql/') ||
-        startsWith(github.event.pull_request.title, 'upgrade') ||
-        true
-      )
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v5
