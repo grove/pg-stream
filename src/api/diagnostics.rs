@@ -1830,7 +1830,7 @@ pub(super) fn vector_status() -> TableIterator<
                      WHEN c.reltuples > 0 \
                      THEN ROUND( \
                        ((COALESCE(s.rows_changed_since_last_reindex, 0)::float / c.reltuples) * 100.0)::numeric, \
-                       2) \
+                       2)::float8 \
                      ELSE NULL \
                    END AS drift_pct \
                  FROM pgtrickle.pgt_stream_tables s \
