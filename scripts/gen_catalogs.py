@@ -166,16 +166,25 @@ def extract_sql_functions(src_dir: Path) -> list[dict]:
                 else:
                     break
 
-            # Find the fn signature in the next few lines
+            # Find the fn signature in the next few lines.
+            # Join up to 10 lines so that multi-line argument lists (e.g.
+            # when pgrx::default!() spans multiple lines) are handled by
+            # the single-line regex.
             fn_name = None
             args_str = ""
             ret_str = ""
             for scan in range(idx + 1, min(idx + 10, len(lines))):
-                fm = _FN_SIG_RE.search(lines[scan])
-                if fm:
-                    fn_name = fm.group(1)
-                    args_str = fm.group(2).strip()
-                    ret_str = (fm.group(3) or "").strip().rstrip("{").strip()
+                # Try matching the current line alone first (fast path), then
+                # with up to 9 subsequent lines joined (handles multi-line args).
+                for window in range(1, min(10, len(lines) - scan + 1)):
+                    joined = " ".join(lines[scan : scan + window])
+                    fm = _FN_SIG_RE.search(joined)
+                    if fm:
+                        fn_name = fm.group(1)
+                        args_str = fm.group(2).strip()
+                        ret_str = (fm.group(3) or "").strip().rstrip("{").strip()
+                        break
+                if fn_name:
                     break
 
             if not fn_name:

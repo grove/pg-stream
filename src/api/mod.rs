@@ -5500,9 +5500,14 @@ fn unsubscribe_distance(stream_table: &str, channel: &str) -> Result<(), PgTrick
 }
 
 /// VH-2 (v0.48.0): List all active distance-predicate subscriptions.
+///
+/// When `p_stream_table` is provided (e.g. `'public.ds3_st'`), only
+/// subscriptions for that stream table are returned.  Pass NULL to list all.
 #[allow(clippy::type_complexity)]
 #[pg_extern(schema = "pgtrickle")]
-fn list_distance_subscriptions() -> TableIterator<
+fn list_distance_subscriptions(
+    p_stream_table: pgrx::default!(Option<&str>, "NULL"),
+) -> TableIterator<
     'static,
     (
         name!(stream_table, Option<String>),
@@ -5514,13 +5519,24 @@ fn list_distance_subscriptions() -> TableIterator<
     ),
 > {
     let rows = Spi::connect(|client| {
-        let tup_table = client.select(
-            "SELECT stream_table, channel, vector_column, op, threshold, created_at \
-             FROM pgtrickle.pgt_distance_subscriptions \
-             ORDER BY stream_table, channel",
-            None,
-            &[],
-        )?;
+        let tup_table = if let Some(st) = p_stream_table {
+            client.select(
+                "SELECT stream_table, channel, vector_column, op, threshold, created_at \
+                 FROM pgtrickle.pgt_distance_subscriptions \
+                 WHERE stream_table = $1 \
+                 ORDER BY stream_table, channel",
+                None,
+                &[st.into()],
+            )?
+        } else {
+            client.select(
+                "SELECT stream_table, channel, vector_column, op, threshold, created_at \
+                 FROM pgtrickle.pgt_distance_subscriptions \
+                 ORDER BY stream_table, channel",
+                None,
+                &[],
+            )?
+        };
         let mut result: Vec<(
             Option<String>,
             Option<String>,
@@ -5798,15 +5814,46 @@ fn embedding_stream_table_impl(
         _ => "vector_l2_ops",
     };
 
+    // Look up the source column's format_type (e.g. "vector(2)") so we can
+    // build an explicit cast in the index expression.  pgvector HNSW/IVFFlat
+    // indexes require the column expression to have explicit dimensions; when
+    // pgtrickle creates the stream table it stores only the base type OID
+    // (without type modifier), so the stream table column ends up as `vector`
+    // (no dims).  Using `(col::vector(2))` in the index expression provides
+    // the required dimensions without altering the stream table schema.
+    let src_format_type: Option<String> = Spi::get_one_with_args::<String>(
+        "SELECT format_type(a.atttypid, a.atttypmod) \
+         FROM pg_attribute a \
+         JOIN pg_class c ON c.oid = a.attrelid \
+         JOIN pg_namespace n ON n.oid = c.relnamespace \
+         WHERE n.nspname = $1 AND c.relname = $2 AND a.attname = $3 \
+           AND a.attnum > 0 AND NOT a.attisdropped \
+         LIMIT 1",
+        &[
+            src_schema.as_str().into(),
+            src_tbl.as_str().into(),
+            vector_col.into(),
+        ],
+    )
+    .unwrap_or(None);
+
+    // Use an explicit cast when the source type carries dimension info
+    // (e.g. "vector(2)" — contains a parenthesised modifier).
+    let idx_col_expr = match &src_format_type {
+        Some(fmt) if fmt.contains('(') => {
+            format!("({}::{})", quote_identifier(vector_col), fmt)
+        }
+        _ => quote_identifier(vector_col).to_string(),
+    };
+
     let create_idx_sql = format!(
         "CREATE INDEX IF NOT EXISTS {}_{}_idx ON {}.{} \
-         USING {} ({} {opclass})",
+         USING {} ({idx_col_expr} {opclass})",
         dst_name,
         vector_col,
         quote_identifier(&dst_schema),
         quote_identifier(&dst_name),
         idx_access_method,
-        quote_identifier(vector_col),
     );
 
     let mut actions: Vec<String> = Vec::new();
