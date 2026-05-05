@@ -84,6 +84,11 @@ async fn test_upgrade_catalog_schema_stability() {
         ("topk_offset", "integer"),
         ("topk_order_by", "text"),
         ("updated_at", "timestamp with time zone"),
+        // v0.47.0: VP-1/VP-2 — post-refresh action hooks
+        ("post_refresh_action", "text"),
+        ("reindex_drift_threshold", "double precision"),
+        ("rows_changed_since_last_reindex", "bigint"),
+        ("last_reindex_at", "timestamp with time zone"),
     ];
 
     for (col_name, expected_type) in &expected_columns {
