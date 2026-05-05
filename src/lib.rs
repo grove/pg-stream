@@ -295,6 +295,13 @@ CREATE TABLE IF NOT EXISTS pgtrickle.pgt_stream_tables (
     temporal_mode   BOOLEAN NOT NULL DEFAULT FALSE,
     -- v0.36.0: columnar storage backend (CORR-2/UX-3)
     storage_backend TEXT NOT NULL DEFAULT 'heap',
+    -- v0.47.0: post-refresh action hooks (VP-1/VP-2)
+    post_refresh_action TEXT NOT NULL DEFAULT 'none'
+                     CHECK (post_refresh_action IN ('none', 'analyze', 'reindex', 'reindex_if_drift')),
+    reindex_drift_threshold DOUBLE PRECISION
+                     CHECK (reindex_drift_threshold IS NULL OR (reindex_drift_threshold > 0 AND reindex_drift_threshold <= 1.0)),
+    rows_changed_since_last_reindex BIGINT NOT NULL DEFAULT 0,
+    last_reindex_at TIMESTAMPTZ,
     -- v0.36.0: column lineage metadata (F12)
     column_lineage  JSONB,
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
