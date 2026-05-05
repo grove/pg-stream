@@ -296,7 +296,7 @@ fn attach_embedding_outbox_impl(
          SET embedding_vector_column = $1 \
          WHERE stream_table_oid = (\
            SELECT pgt_id::oid FROM pgtrickle.pgt_stream_tables \
-           WHERE schema_name = $2 AND stream_table_name = $3 \
+           WHERE pgt_schema = $2 AND pgt_name = $3 \
          )",
         &[
             vector_column.into(),

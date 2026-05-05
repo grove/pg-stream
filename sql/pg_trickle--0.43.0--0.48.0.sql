@@ -512,7 +512,7 @@ AS 'MODULE_PATHNAME', 'unsubscribe_distance_wrapper';
 COMMENT ON FUNCTION pgtrickle."unsubscribe_distance"(TEXT,TEXT) IS
     'VH-2 (v0.48.0): Remove a distance-predicate subscription.';
 
-CREATE FUNCTION pgtrickle."list_distance_subscriptions"()
+CREATE FUNCTION pgtrickle."list_distance_subscriptions"("p_stream_table" TEXT DEFAULT NULL)
 RETURNS TABLE(
     "stream_table"   TEXT,
     "channel"        TEXT,
@@ -524,7 +524,7 @@ RETURNS TABLE(
 LANGUAGE c /* Rust */
 AS 'MODULE_PATHNAME', 'list_distance_subscriptions_wrapper';
 
-COMMENT ON FUNCTION pgtrickle."list_distance_subscriptions"() IS
+COMMENT ON FUNCTION pgtrickle."list_distance_subscriptions"(TEXT) IS
     'VH-2 (v0.48.0): List all active distance-predicate subscriptions.';
 
 -- ── Step 4: Register VA-1 embedding_stream_table() ───────────────────────
