@@ -4,7 +4,7 @@
 
 # SQL API Reference — pg_trickle
 
-**87 SQL-callable functions** discovered via `#[pg_extern]` in `src/`.
+**89 SQL-callable functions** discovered via `#[pg_extern]` in `src/`.
 
 See [docs/SQL_REFERENCE.md](SQL_REFERENCE.md) for full signatures and examples.
 
@@ -44,6 +44,7 @@ See [docs/SQL_REFERENCE.md](SQL_REFERENCE.md) for full signatures and examples.
 | `pgtrickle.health_check()` | `pgtrickle` | `TableIterator<` | Exposed as `pgtrickle.health_check()`. |
 | `pgtrickle.health_summary()` | `pgtrickle` | `TableIterator<` | Exposed as `pgtrickle.health_summary()`. |
 | `pgtrickle.is_drained()` | `pgtrickle` | `bool` | A scheduler is considered drained when `DRAIN_COMPLETED >= DRAIN_REQUESTED` in shared memory. |
+| `pgtrickle.list_distance_subscriptions()` | `pgtrickle` | `TableIterator<` | VH-2 (v0.48.0): List all active distance-predicate subscriptions. |
 | `pgtrickle.list_subscriptions()` | `pgtrickle` | `TableIterator<` | Returns a table with columns (stream_table TEXT, channel TEXT, created_at TIMESTAMPTZ). |
 | `pgtrickle.metrics_summary()` | `pgtrickle` | `TableIterator<` | v0.31.0 (PERF-3): Added `ivm_lock_parse_error_count` — cumulative count of IMMEDIATE-mode lock-mode downgrades due to query parse failures. |
 | `pgtrickle.migrate()` | `pgtrickle` | `String` | This is a convenience function for users who upgrade the extension without using `ALTER EXTENSION pg_trickle UPDATE` — it ensures the catalog schema matches the library expectations. |
@@ -87,6 +88,7 @@ See [docs/SQL_REFERENCE.md](SQL_REFERENCE.md) for full signatures and examples.
 | `pgtrickle.trigger_inventory()` | `pgtrickle` | `TableIterator<` | Exposed as `pgtrickle.trigger_inventory()`. |
 | `pgtrickle.ungate_source()` | `pgtrickle` | `Result<(), PgTrickleError>` | `source` is the source table name, optionally schema-qualified. |
 | `pgtrickle.unsubscribe()` | `pgtrickle` | `Result<(), PgTrickleError>` | UX-SUB: Remove a NOTIFY subscription for a stream table / channel pair. |
+| `pgtrickle.unsubscribe_distance()` | `pgtrickle` | `Result<(), PgTrickleError>` | VH-2 (v0.48.0): Remove a distance-predicate subscription. |
 | `pgtrickle.vector_status()` | `pgtrickle` | `TableIterator<` | Returns one row per stream table that has a `post_refresh_action` other than 'none', or that has any ANN-relevant index on its storage table. |
 | `pgtrickle.version()` | `pgtrickle` | `&'static str` |  |
 | `pgtrickle.version_check()` | `pgtrickle` | `String` | Returns a JSON string with library_version, extension_version, pg_version, and a boolean `version_match`. |
