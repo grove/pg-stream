@@ -1104,6 +1104,8 @@ fn create_or_replace_stream_table_impl(
                 None, // partition_by: not changed via create_or_replace
                 max_differential_joins,
                 max_delta_fraction,
+                None, // post_refresh_action: not set via create_or_replace
+                None, // reindex_drift_threshold: not set via create_or_replace
             )?;
 
             pgrx::info!(
@@ -3641,6 +3643,9 @@ fn alter_stream_table(
     partition_by: default!(Option<&str>, "NULL"),
     max_differential_joins: default!(Option<i32>, "NULL"),
     max_delta_fraction: default!(Option<f64>, "NULL"),
+    // VP-1/VP-2 (v0.47.0): post-refresh action and drift threshold
+    post_refresh_action: default!(Option<&str>, "NULL"),
+    reindex_drift_threshold: default!(Option<f64>, "NULL"),
 ) {
     let result = alter_stream_table_impl(
         name,
@@ -3660,6 +3665,8 @@ fn alter_stream_table(
         partition_by,
         max_differential_joins,
         max_delta_fraction,
+        post_refresh_action,
+        reindex_drift_threshold,
     );
     if let Err(e) = result {
         raise_error_with_context(e);
@@ -3685,6 +3692,9 @@ fn alter_stream_table_impl(
     partition_by: Option<&str>,
     max_differential_joins: Option<i32>,
     max_delta_fraction: Option<f64>,
+    // VP-1/VP-2 (v0.47.0): post-refresh action and drift threshold
+    post_refresh_action: Option<&str>,
+    reindex_drift_threshold: Option<f64>,
 ) -> Result<(), PgTrickleError> {
     let (schema, table_name) = parse_qualified_name(name)?;
     let mut st = StreamTableMeta::get_by_name(&schema, &table_name)?;
@@ -4140,6 +4150,33 @@ fn alter_stream_table_impl(
             &[val.into(), st.pgt_id.into()],
         )
         .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
+    }
+
+    // VP-1/VP-2 (v0.47.0): Update post-refresh action and drift threshold if supplied.
+    if let Some(pra) = post_refresh_action {
+        let pra_lower = pra.to_lowercase();
+        match pra_lower.as_str() {
+            "none" | "analyze" | "reindex" | "reindex_if_drift" => {}
+            other => {
+                return Err(PgTrickleError::InvalidArgument(format!(
+                    "invalid post_refresh_action '{}': expected 'none', 'analyze', \
+                     'reindex', or 'reindex_if_drift'",
+                    other
+                )));
+            }
+        }
+        StreamTableMeta::update_post_refresh_options(
+            st.pgt_id,
+            &pra_lower,
+            reindex_drift_threshold,
+        )?;
+    } else if let Some(_threshold) = reindex_drift_threshold {
+        // Drift threshold can be updated independently.
+        StreamTableMeta::update_post_refresh_options(
+            st.pgt_id,
+            &st.post_refresh_action,
+            reindex_drift_threshold,
+        )?;
     }
 
     shmem::signal_dag_invalidation(st.pgt_id);
@@ -6800,6 +6837,10 @@ mod tests {
             st_placement: "local".to_string(),
             temporal_mode: false,
             storage_backend: "heap".to_string(),
+            post_refresh_action: "none".to_string(),
+            reindex_drift_threshold: None,
+            rows_changed_since_last_reindex: 0,
+            last_reindex_at: None,
         }
     }
 

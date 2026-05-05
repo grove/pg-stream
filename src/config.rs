@@ -1550,6 +1550,19 @@ pub static PGS_INVALIDATION_RING_CAPACITY: GucSetting<i32> = GucSetting::<i32>::
 /// with heterogeneous workloads where some routinely fall behind.
 pub static PGS_LAG_AWARE_SCHEDULING: GucSetting<bool> = GucSetting::<bool>::new(false);
 
+// ── v0.47.0 GUCs ──────────────────────────────────────────────────────────
+
+/// VP-2 (v0.47.0): Default drift threshold for drift-triggered REINDEX.
+///
+/// When a stream table has `post_refresh_action = 'reindex_if_drift'` and no
+/// per-table `reindex_drift_threshold` is set, this global GUC is used.
+///
+/// A drift of 0.20 means "REINDEX when 20% of estimated rows have changed since
+/// the last REINDEX".
+///
+/// Default: 0.20. Range: 0.01–1.0.
+pub static PGS_REINDEX_DRIFT_THRESHOLD: GucSetting<f64> = GucSetting::<f64>::new(0.20);
+
 /// Register all GUC variables. Called from `_PG_init()`.
 pub fn register_gucs() {
     GucRegistry::define_bool_guc(
@@ -3038,6 +3051,20 @@ pub fn register_gucs() {
         GucContext::Suset,
         GucFlags::default(),
     );
+
+    // VP-2: Global default drift threshold for reindex_if_drift post-refresh action.
+    GucRegistry::define_float_guc(
+        c"pg_trickle.reindex_drift_threshold",
+        c"VP-2: Default drift fraction for reindex_if_drift post-refresh action.",
+        c"When a stream table has post_refresh_action='reindex_if_drift' and no per-table \
+          reindex_drift_threshold is set, this global value is used. \
+          A value of 0.20 means REINDEX when 20% of estimated rows have changed.",
+        &PGS_REINDEX_DRIFT_THRESHOLD,
+        0.01,
+        1.0,
+        GucContext::Suset,
+        GucFlags::default(),
+    );
 }
 
 // ── Convenience accessors ──────────────────────────────────────────────────
@@ -3794,6 +3821,12 @@ pub fn pg_trickle_cdc_capture_mode() -> CdcCaptureMode {
     } else {
         mode
     }
+}
+
+/// VP-2 (v0.47.0): Returns the global default drift threshold for
+/// drift-triggered REINDEX operations.
+pub fn pg_trickle_reindex_drift_threshold() -> f64 {
+    PGS_REINDEX_DRIFT_THRESHOLD.get()
 }
 
 #[cfg(test)]
