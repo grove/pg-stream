@@ -4939,6 +4939,12 @@ fn execute_manual_refresh(
                     e
                 );
             }
+            // VP-1/VP-2 (v0.47.0): Execute post-refresh action for manual refreshes too,
+            // mirroring the scheduler path so vector_status() drift tracking works correctly.
+            let rows_changed = rows_inserted + rows_deleted;
+            if rows_changed > 0 {
+                crate::scheduler::execute_post_refresh_action(st, rows_changed);
+            }
         }
         Err(e) => {
             let _ = RefreshRecord::complete(

@@ -4289,7 +4289,7 @@ fn is_falling_behind(elapsed_ms: i64, schedule_ms: i64, threshold: f64) -> Optio
 /// Runs outside the refresh transaction (fire-and-forget after commit).
 /// Errors are logged but never propagated — post-refresh actions must not
 /// interrupt the refresh pipeline.
-fn execute_post_refresh_action(st: &StreamTableMeta, rows_changed: i64) {
+pub(crate) fn execute_post_refresh_action(st: &StreamTableMeta, rows_changed: i64) {
     let action = st.post_refresh_action.as_str();
 
     // Increment the drift counter first (regardless of action type).
