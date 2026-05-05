@@ -6089,7 +6089,27 @@ fn execute_scheduled_refresh(
             // and the refresh produced at least one changed row.
             if (rows_inserted > 0 || rows_deleted > 0)
                 && crate::api::outbox::is_outbox_enabled(st.pgt_id)
-                && let Err(e) = crate::api::outbox::write_outbox_row(
+            {
+                // VA-4 (v0.48.0): Use embedding-specific outbox event when an
+                // embedding vector column is configured.
+                if let Some(vec_col) = crate::api::outbox::get_embedding_vector_column(st.pgt_id) {
+                    if let Err(e) = crate::api::outbox::write_embedding_outbox_row(
+                        st.pgt_id,
+                        None,
+                        rows_inserted,
+                        rows_deleted,
+                        &st.pgt_schema,
+                        &st.pgt_name,
+                        &vec_col,
+                    ) {
+                        log!(
+                            "pg_trickle: embedding outbox write failed for {}.{}: {}",
+                            st.pgt_schema,
+                            st.pgt_name,
+                            e
+                        );
+                    }
+                } else if let Err(e) = crate::api::outbox::write_outbox_row(
                     st.pgt_id,
                     None, // refresh_id is a BIGINT in pgt_refresh_history; outbox uses UUID
                     rows_inserted,
@@ -6097,13 +6117,26 @@ fn execute_scheduled_refresh(
                     0_i32,
                     &st.pgt_schema,
                     &st.pgt_name,
-                )
-            {
-                log!(
-                    "pg_trickle: outbox write failed for {}.{}: {}",
-                    st.pgt_schema,
-                    st.pgt_name,
-                    e
+                ) {
+                    log!(
+                        "pg_trickle: outbox write failed for {}.{}: {}",
+                        st.pgt_schema,
+                        st.pgt_name,
+                        e
+                    );
+                }
+            }
+
+            // VH-2 (v0.48.0): Fire distance-predicate NOTIFY subscriptions after
+            // a successful refresh that produced changed rows.
+            if (rows_inserted > 0 || rows_deleted > 0) && action != RefreshAction::NoData {
+                // Derive storage table name (schema-qualified st_name by convention).
+                let storage_table = &st.pgt_name;
+                crate::api::fire_distance_subscriptions(
+                    &st.pgt_schema,
+                    &st.pgt_name,
+                    storage_table,
+                    st.pooler_compatibility_mode,
                 );
             }
 

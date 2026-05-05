@@ -32,7 +32,7 @@
 # ── Stage 1: Prepare build environment ──────────────────────────────────────
 FROM postgres:18.3-bookworm AS build-env
 
-ARG VERSION=0.47.0
+ARG VERSION=0.48.0
 
 # Install build dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -79,6 +79,7 @@ RUN mkdir -p src/bin src/dvm/operators benches pgtrickle-relay/src && \
     echo 'fn main() {}' > benches/refresh_bench.rs && \
     echo 'fn main() {}' > benches/diff_operators.rs && \
     echo 'fn main() {}' > benches/scheduler_bench.rs && \
+    echo 'fn main() {}' > benches/pgvector_bench.rs && \
     echo 'fn main() {}' > pgtrickle-relay/src/main.rs
 
 # Pre-fetch dependencies. Docker caches this layer independently.
@@ -106,7 +107,7 @@ RUN --mount=type=cache,target=/root/.cargo/registry \
 # ── Stage 4: Runtime image ───────────────────────────────────────────────────
 FROM postgres:18.3-bookworm
 
-ARG VERSION=0.47.0
+ARG VERSION=0.48.0
 ARG REPO_URL=https://github.com/grove/pg-trickle
 
 LABEL org.opencontainers.image.title="pg_trickle" \

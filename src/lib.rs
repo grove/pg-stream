@@ -989,19 +989,49 @@ extension_sql!(
 -- Maps stream tables to their pg_tide outbox names.
 -- The full outbox/inbox/relay stack lives in pg_tide (trickle-labs/pg-tide).
 CREATE TABLE IF NOT EXISTS pgtrickle.pgt_outbox_config (
-    stream_table_oid   OID         NOT NULL PRIMARY KEY,
-    stream_table_name  TEXT        NOT NULL,
-    tide_outbox_name   TEXT        NOT NULL,
-    created_at         TIMESTAMPTZ NOT NULL DEFAULT now()
+    stream_table_oid         OID         NOT NULL PRIMARY KEY,
+    stream_table_name        TEXT        NOT NULL,
+    tide_outbox_name         TEXT        NOT NULL,
+    -- VA-4 (v0.48.0): optional vector column name for embedding outbox events.
+    embedding_vector_column  TEXT,
+    created_at               TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
 CREATE INDEX IF NOT EXISTS idx_pgt_outbox_config_name
     ON pgtrickle.pgt_outbox_config (stream_table_name);
 
 COMMENT ON TABLE pgtrickle.pgt_outbox_config IS
-    'v0.46.0: Catalog of stream tables with a pg_tide outbox attached via attach_outbox().';
+    'v0.46.0: Catalog of stream tables with a pg_tide outbox attached via attach_outbox(). '
+    'v0.48.0: embedding_vector_column set when attached via attach_embedding_outbox().';
 "#,
     name = "pg_trickle_outbox_catalog",
+    requires = [],
+);
+
+// ── VH-2 (v0.48.0): Distance subscription catalog ─────────────────────────
+extension_sql!(
+    r#"
+-- VH-2 (v0.48.0): Distance-predicate subscription catalog.
+-- Stores per-(stream_table, channel) vector distance subscriptions.
+-- After each non-empty refresh the background worker evaluates the predicate
+-- and emits pg_notify(channel, payload) when matched_rows > 0.
+CREATE TABLE IF NOT EXISTS pgtrickle.pgt_distance_subscriptions (
+    stream_table    TEXT NOT NULL,
+    channel         TEXT NOT NULL,
+    vector_column   TEXT NOT NULL,
+    query_vector    TEXT NOT NULL,
+    op              TEXT NOT NULL
+        CHECK (op IN ('<->', '<=>', '<#>', '<+>', '<<->>', '<<%>>')),
+    threshold       DOUBLE PRECISION NOT NULL CHECK (threshold > 0),
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (stream_table, channel)
+);
+
+COMMENT ON TABLE pgtrickle.pgt_distance_subscriptions IS
+    'VH-2 (v0.48.0): Distance-predicate NOTIFY subscriptions per stream table. '
+    'Populated via pgtrickle.subscribe_distance() / pgtrickle.unsubscribe_distance().';
+"#,
+    name = "pg_trickle_distance_subscriptions_catalog",
     requires = [],
 );
 

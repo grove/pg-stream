@@ -513,3 +513,324 @@ async fn test_vector_avg_shard_additive_correctness() {
     db.refresh_st("shard_avg_st").await;
     db.assert_st_matches_query("shard_avg_st", q).await;
 }
+
+// ═══════════════════════════════════════════════════════════════════════
+// VH-1 (v0.48.0): halfvec/sparsevec aggregate type output correctness
+// ═══════════════════════════════════════════════════════════════════════
+
+/// VH-1a: avg(halfvec_col) output column should be typed halfvec(N), not vector(N).
+#[tokio::test]
+async fn test_pgvector_halfvec_avg_output_type() {
+    let db = E2eDb::new().await.with_extension().await;
+    setup_pgvector(&db).await;
+
+    db.execute(
+        "CREATE TABLE hv_src (
+            id     SERIAL PRIMARY KEY,
+            grp    INT,
+            emb    halfvec(4)
+        )",
+    )
+    .await;
+    db.execute(
+        "INSERT INTO hv_src (grp, emb) VALUES
+            (1, '[1,0,0,0]'),
+            (1, '[0,1,0,0]'),
+            (2, '[0,0,1,0]')",
+    )
+    .await;
+
+    let q = "SELECT grp, avg(emb) AS centroid FROM hv_src GROUP BY grp";
+    db.execute_seq(&[
+        "SET pg_trickle.enable_vector_agg = on",
+        &format!(
+            "SELECT pgtrickle.create_stream_table('hv_avg_st', $${q}$$, '1m', 'DIFFERENTIAL')"
+        ),
+    ])
+    .await;
+
+    // The output column 'centroid' must be typed halfvec(4), not vector(4).
+    let typname: Option<String> = db
+        .query_scalar_opt(
+            "SELECT pg_catalog.format_type(a.atttypid, a.atttypmod) \
+             FROM pg_attribute a \
+             JOIN pg_class c ON c.oid = a.attrelid \
+             WHERE c.relname = 'hv_avg_st' \
+               AND a.attname = 'centroid' \
+               AND a.attnum > 0",
+        )
+        .await;
+    assert!(
+        typname.is_some(),
+        "column 'centroid' must exist in hv_avg_st"
+    );
+    let tn = typname.unwrap();
+    assert!(
+        tn.starts_with("halfvec"),
+        "centroid column should be halfvec(4), got: {tn}"
+    );
+}
+
+/// VH-1b: avg(halfvec) values are correct after differential refresh.
+#[tokio::test]
+async fn test_pgvector_halfvec_avg_values_correct() {
+    let db = E2eDb::new().await.with_extension().await;
+    setup_pgvector(&db).await;
+
+    db.execute(
+        "CREATE TABLE hv_vals_src (
+            id  SERIAL PRIMARY KEY,
+            grp INT,
+            emb halfvec(2)
+        )",
+    )
+    .await;
+    db.execute("INSERT INTO hv_vals_src (grp, emb) VALUES (1, '[2,4]'), (1, '[4,2]')")
+        .await;
+
+    let q = "SELECT grp, avg(emb) AS centroid FROM hv_vals_src GROUP BY grp";
+    db.execute_seq(&[
+        "SET pg_trickle.enable_vector_agg = on",
+        &format!(
+            "SELECT pgtrickle.create_stream_table('hv_vals_st', $${q}$$, '1m', 'DIFFERENTIAL')"
+        ),
+    ])
+    .await;
+    db.assert_st_matches_query("hv_vals_st", q).await;
+
+    // INSERT — grp 1 centroid should become avg([2,4],[4,2],[6,0]) = [4,2]
+    db.execute("INSERT INTO hv_vals_src (grp, emb) VALUES (1, '[6,0]')")
+        .await;
+    db.refresh_st("hv_vals_st").await;
+    db.assert_st_matches_query("hv_vals_st", q).await;
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// VH-2 (v0.48.0): Distance subscription catalog operations
+// ═══════════════════════════════════════════════════════════════════════
+
+/// VH-2a: subscribe_distance() inserts into pgt_distance_subscriptions.
+#[tokio::test]
+async fn test_distance_subscription_catalog_insert() {
+    let db = E2eDb::new().await.with_extension().await;
+    setup_pgvector(&db).await;
+
+    db.execute("CREATE TABLE ds_src (id SERIAL PRIMARY KEY, grp INT, emb vector(3))")
+        .await;
+    db.execute("INSERT INTO ds_src (grp, emb) VALUES (1, '[1,0,0]'), (1, '[0,1,0]')")
+        .await;
+    db.create_st(
+        "ds_st",
+        "SELECT grp, avg(emb)::vector(3) AS centroid FROM ds_src GROUP BY grp",
+        "1m",
+        "DIFFERENTIAL",
+    )
+    .await;
+
+    db.execute(
+        "SELECT pgtrickle.subscribe_distance(\
+             'public.ds_st', 'near_centroid', 'centroid', '[1,0,0]', '<->', 0.5\
+         )",
+    )
+    .await;
+
+    let count: i64 = db
+        .query_scalar(
+            "SELECT COUNT(*) FROM pgtrickle.pgt_distance_subscriptions \
+             WHERE stream_table = 'public.ds_st' AND channel = 'near_centroid'",
+        )
+        .await;
+    assert_eq!(count, 1, "subscription should be registered in catalog");
+}
+
+/// VH-2b: unsubscribe_distance() removes the catalog entry.
+#[tokio::test]
+async fn test_distance_subscription_unsubscribe() {
+    let db = E2eDb::new().await.with_extension().await;
+    setup_pgvector(&db).await;
+
+    db.execute("CREATE TABLE ds2_src (id SERIAL PRIMARY KEY, emb vector(2))")
+        .await;
+    db.create_st(
+        "ds2_st",
+        "SELECT id, emb FROM ds2_src",
+        "1m",
+        "DIFFERENTIAL",
+    )
+    .await;
+
+    db.execute(
+        "SELECT pgtrickle.subscribe_distance(\
+             'public.ds2_st', 'ch_unsub', 'emb', '[1,0]', '<->', 0.3\
+         )",
+    )
+    .await;
+    db.execute("SELECT pgtrickle.unsubscribe_distance('public.ds2_st', 'ch_unsub')")
+        .await;
+
+    let count: i64 = db
+        .query_scalar(
+            "SELECT COUNT(*) FROM pgtrickle.pgt_distance_subscriptions \
+             WHERE stream_table = 'public.ds2_st' AND channel = 'ch_unsub'",
+        )
+        .await;
+    assert_eq!(count, 0, "subscription should be removed after unsubscribe");
+}
+
+/// VH-2c: list_distance_subscriptions() returns subscriptions for a stream table.
+#[tokio::test]
+async fn test_distance_subscription_list() {
+    let db = E2eDb::new().await.with_extension().await;
+    setup_pgvector(&db).await;
+
+    db.execute("CREATE TABLE ds3_src (id SERIAL PRIMARY KEY, emb vector(2))")
+        .await;
+    db.create_st(
+        "ds3_st",
+        "SELECT id, emb FROM ds3_src",
+        "1m",
+        "DIFFERENTIAL",
+    )
+    .await;
+
+    db.execute_seq(&[
+        "SELECT pgtrickle.subscribe_distance('public.ds3_st', 'ch_a', 'emb', '[1,0]', '<->', 0.5)",
+        "SELECT pgtrickle.subscribe_distance('public.ds3_st', 'ch_b', 'emb', '[0,1]', '<->', 0.8)",
+    ])
+    .await;
+
+    let count: i64 = db
+        .query_scalar("SELECT COUNT(*) FROM pgtrickle.list_distance_subscriptions('public.ds3_st')")
+        .await;
+    assert_eq!(count, 2, "list_distance_subscriptions should return 2 rows");
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// VA-1 (v0.48.0): embedding_stream_table() ergonomic API
+// ═══════════════════════════════════════════════════════════════════════
+
+/// VA-1a: embedding_stream_table() creates a stream table with correct schema.
+#[tokio::test]
+async fn test_embedding_stream_table_creates_st() {
+    let db = E2eDb::new().await.with_extension().await;
+    setup_pgvector(&db).await;
+
+    db.execute(
+        "CREATE TABLE va1_src (
+            id        SERIAL PRIMARY KEY,
+            tenant_id INT,
+            content   TEXT,
+            embedding vector(3)
+        )",
+    )
+    .await;
+    db.execute(
+        "INSERT INTO va1_src (tenant_id, content, embedding) VALUES
+            (1, 'hello', '[1,0,0]'),
+            (1, 'world', '[0,1,0]'),
+            (2, 'foo',   '[0,0,1]')",
+    )
+    .await;
+
+    // dry_run=true: returns SQL actions without executing
+    let action_count: i64 = db
+        .query_scalar(
+            "SELECT COUNT(*) FROM pgtrickle.embedding_stream_table(\
+                 'va1_emb_st', 'public.va1_src', 'embedding', \
+                 NULL, '1m', 'hnsw', TRUE\
+             ) AS t(action)",
+        )
+        .await;
+    assert!(
+        action_count >= 1,
+        "dry_run should return at least one action, got: {action_count}"
+    );
+}
+
+/// VA-1b: embedding_stream_table() with dry_run=false creates a real stream table.
+#[tokio::test]
+async fn test_embedding_stream_table_creates_real_st() {
+    let db = E2eDb::new().await.with_extension().await;
+    setup_pgvector(&db).await;
+
+    db.execute(
+        "CREATE TABLE va1b_src (
+            id        SERIAL PRIMARY KEY,
+            embedding vector(2)
+        )",
+    )
+    .await;
+    db.execute("INSERT INTO va1b_src (embedding) VALUES ('[1,0]'), ('[0,1]')")
+        .await;
+
+    db.execute(
+        "SELECT pgtrickle.embedding_stream_table(\
+             'va1b_emb_st', 'public.va1b_src', 'embedding', \
+             NULL, '1m', 'hnsw', FALSE\
+         )",
+    )
+    .await;
+
+    // Stream table should exist
+    let exists: bool = db
+        .query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM pgtrickle.pgt_stream_tables \
+             WHERE pgt_name = 'va1b_emb_st')",
+        )
+        .await;
+    assert!(
+        exists,
+        "embedding_stream_table() should create pgt_stream_tables entry"
+    );
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// VA-4 (v0.48.0): attach_embedding_outbox() catalog registration
+// ═══════════════════════════════════════════════════════════════════════
+
+/// VA-4: attach_embedding_outbox() registers the embedding_vector_column.
+#[tokio::test]
+async fn test_attach_embedding_outbox_catalog_entry() {
+    let db = E2eDb::new().await.with_extension().await;
+    setup_pgvector(&db).await;
+
+    db.execute(
+        "CREATE TABLE va4_src (
+            id        SERIAL PRIMARY KEY,
+            embedding vector(3)
+        )",
+    )
+    .await;
+    db.execute("INSERT INTO va4_src (embedding) VALUES ('[1,0,0]'), ('[0,1,0]')")
+        .await;
+    db.create_st(
+        "va4_emb_st",
+        "SELECT id, embedding FROM va4_src",
+        "1m",
+        "DIFFERENTIAL",
+    )
+    .await;
+
+    // Install pg_tide stub (same as outbox tests).
+    db.execute_seq(&[
+        "CREATE SCHEMA IF NOT EXISTS tide",
+        "CREATE OR REPLACE FUNCTION tide.outbox_create(p_name text, p_retention_hours integer, p_inline_threshold integer) RETURNS void LANGUAGE sql AS 'SELECT 1'",
+        "CREATE OR REPLACE FUNCTION tide.outbox_publish(p_name text, p_payload jsonb, p_headers jsonb) RETURNS void LANGUAGE sql AS 'SELECT 1'",
+    ])
+    .await;
+
+    db.execute("SELECT pgtrickle.attach_embedding_outbox('va4_emb_st', 'embedding')")
+        .await;
+
+    let vec_col: Option<String> = db
+        .query_scalar_opt(
+            "SELECT embedding_vector_column FROM pgtrickle.pgt_outbox_config \
+             WHERE stream_table_name = 'public.va4_emb_st'",
+        )
+        .await;
+    assert_eq!(
+        vec_col,
+        Some("embedding".to_string()),
+        "attach_embedding_outbox should store embedding_vector_column"
+    );
+}

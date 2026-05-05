@@ -43,7 +43,8 @@ RUN mkdir -p src/bin src/dvm/operators benches && \
     echo '' > src/ivm.rs && \
     echo 'fn main() {}' > benches/refresh_bench.rs && \
     echo 'fn main() {}' > benches/diff_operators.rs && \
-    echo 'fn main() {}' > benches/scheduler_bench.rs
+    echo 'fn main() {}' > benches/scheduler_bench.rs && \
+    echo 'fn main() {}' > benches/pgvector_bench.rs
 
 # Pre-fetch all crates.  Cache mount keeps the registry between builds so
 # this becomes a no-op when Cargo.lock hasn't changed.
