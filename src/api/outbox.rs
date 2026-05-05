@@ -252,6 +252,139 @@ pub(crate) fn write_outbox_row(
     Ok(())
 }
 
+// -- attach_embedding_outbox (VA-4) ----------------------------------------
+
+/// VA-4 (v0.48.0): Attach a `pg_tide` outbox configured for embedding events.
+///
+/// Identical to `attach_outbox()` but adds an `event_type = 'embedding_change'`
+/// header to all outbox events, making it easy for downstream consumers to
+/// route embedding-delta messages separately from general stream table events.
+///
+/// The `vector_column` parameter documents which column carries the embedding —
+/// it is stored in the outbox headers so consumers can identify the embedding
+/// field without inspecting the payload.
+#[pgrx::pg_extern(schema = "pgtrickle")]
+pub fn attach_embedding_outbox(
+    p_name: &str,
+    p_vector_column: &str,
+    p_retention_hours: pgrx::default!(i32, 24),
+    p_inline_threshold_rows: pgrx::default!(i32, 10000),
+) {
+    attach_embedding_outbox_impl(
+        p_name,
+        p_vector_column,
+        p_retention_hours,
+        p_inline_threshold_rows,
+    )
+    .unwrap_or_else(|e| pgrx::error!("{}", e))
+}
+
+fn attach_embedding_outbox_impl(
+    name: &str,
+    vector_column: &str,
+    retention_hours: i32,
+    inline_threshold_rows: i32,
+) -> Result<(), PgTrickleError> {
+    // Re-use the standard attach_outbox mechanism.
+    attach_outbox_impl(name, retention_hours, inline_threshold_rows)?;
+
+    // Store the vector_column hint in the catalog so write_embedding_outbox_row
+    // can retrieve it.
+    let (schema, st_name) = resolve_st_name(name)?;
+    Spi::run_with_args(
+        "UPDATE pgtrickle.pgt_outbox_config \
+         SET embedding_vector_column = $1 \
+         WHERE stream_table_oid = (\
+           SELECT pgt_id::oid FROM pgtrickle.pgt_stream_tables \
+           WHERE schema_name = $2 AND stream_table_name = $3 \
+         )",
+        &[
+            vector_column.into(),
+            schema.as_str().into(),
+            st_name.as_str().into(),
+        ],
+    )
+    .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
+
+    pgrx::log!(
+        "[pg_trickle] attach_embedding_outbox: attached embedding outbox for '{}.{}' (vector_column='{}')",
+        schema,
+        st_name,
+        vector_column,
+    );
+    Ok(())
+}
+
+/// VA-4 (v0.48.0): Publish an embedding-change event to the attached pg_tide
+/// outbox.  Called from the refresh hot-path when the outbox is configured as
+/// an embedding outbox.
+///
+/// The payload extends the standard delta-summary envelope with an
+/// `event_type = "embedding_change"` marker and the `vector_column` name so
+/// consumers can route embedding updates without inspecting the payload.
+pub(crate) fn write_embedding_outbox_row(
+    pgt_id: i64,
+    refresh_id: Option<&str>,
+    inserted_count: i64,
+    deleted_count: i64,
+    st_schema: &str,
+    st_table: &str,
+    vector_column: &str,
+) -> Result<(), PgTrickleError> {
+    let outbox_name = match get_outbox_table_name(pgt_id) {
+        Some(n) => n,
+        None => return Ok(()),
+    };
+
+    let payload = serde_json::json!({
+        "v": 1,
+        "event_type": "embedding_change",
+        "refresh_id": refresh_id,
+        "inserted": inserted_count,
+        "deleted": deleted_count,
+        "source": format!("{}.{}", st_schema, st_table),
+        "vector_column": vector_column,
+    });
+    let payload_str = payload.to_string();
+
+    let headers = serde_json::json!({
+        "source": format!("{}.{}", st_schema, st_table),
+        "event_type": "embedding_change",
+        "vector_column": vector_column,
+        "version": 1,
+    });
+    let headers_str = headers.to_string();
+
+    Spi::run_with_args(
+        "SELECT tide.outbox_publish($1, $2::jsonb, $3::jsonb)",
+        &[
+            outbox_name.as_str().into(),
+            payload_str.as_str().into(),
+            headers_str.as_str().into(),
+        ],
+    )
+    .map_err(|e| {
+        PgTrickleError::SpiError(format!(
+            "tide.outbox_publish (embedding) failed for '{}': {}",
+            outbox_name, e
+        ))
+    })?;
+
+    Ok(())
+}
+
+/// VA-4: Return the embedding vector column for this stream table if an
+/// embedding outbox is attached, otherwise `None`.
+pub(crate) fn get_embedding_vector_column(pgt_id: i64) -> Option<String> {
+    Spi::get_one_with_args::<String>(
+        "SELECT embedding_vector_column FROM pgtrickle.pgt_outbox_config \
+         WHERE stream_table_oid = $1::oid \
+           AND embedding_vector_column IS NOT NULL",
+        &[pgrx::pg_sys::Oid::from(pgt_id as u32).into()],
+    )
+    .unwrap_or(None)
+}
+
 // -- Unit tests ------------------------------------------------------------
 
 #[cfg(test)]

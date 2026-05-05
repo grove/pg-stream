@@ -1741,32 +1741,36 @@ fn validate_and_parse_query(
 /// (undimensioned) at the PostgreSQL query-analysis level. HNSW / IVFFlat
 /// indexes require the column to have an explicit dimension. This function
 /// looks up each VectorAvg/VectorSum output column's source column typmod and
-/// runs `ALTER TABLE … ALTER COLUMN … TYPE vector(N)` when the dimension is
+/// runs `ALTER TABLE … ALTER COLUMN … TYPE <type>(N)` when the dimension is
 /// known.
+///
+/// VH-1 (v0.48.0): uses the actual pgvector type (`vector`, `halfvec`, or
+/// `sparsevec`) so that `halfvec_avg` and `sparsevec_avg` output columns are
+/// typed correctly (previously always used `vector(N)`).
 fn fix_vector_aggregate_column_types(
     schema: &str,
     table_name: &str,
     tree: &crate::dvm::parser::OpTree,
 ) -> Result<(), PgTrickleError> {
     let dims = crate::dvm::extract_vector_agg_output_dims(tree);
-    for (col_alias, typmod) in dims {
+    for (col_alias, typmod, typename) in dims {
         if typmod <= 0 {
             continue;
         }
-        // Look up the pgvector type name to build the correct type expression.
-        // We need the base type name (vector / halfvec / sparsevec) as well as
-        // the dimension. `format_type(oid, typmod)` handles this canonically.
+        // Use the actual pgvector base type name to build the correct type expression.
+        // typename is one of: "vector", "halfvec", "sparsevec".
         let alter_sql = format!(
-            "ALTER TABLE {}.{} ALTER COLUMN {} TYPE vector({})",
+            "ALTER TABLE {}.{} ALTER COLUMN {} TYPE {}({})",
             quote_identifier(schema),
             quote_identifier(table_name),
             quote_identifier(&col_alias),
+            typename, // VH-1: use actual type, not always "vector"
             typmod,
         );
         Spi::run(&alter_sql).map_err(|e| {
             PgTrickleError::SpiError(format!(
-                "F4: failed to set vector dimension for column '{}': {}",
-                col_alias, e
+                "F4: failed to set {} dimension for column '{}': {}",
+                typename, col_alias, e
             ))
         })?;
     }
@@ -5424,9 +5428,443 @@ fn list_subscriptions() -> TableIterator<
     TableIterator::new(rows)
 }
 
-// ── v0.35.0 SLA summary API (F17) ───────────────────────────────────────────
+// ── v0.48.0 reactive distance-subscription API (VH-2) ────────────────────────
 
-/// F17: SLA summary for stream tables over the configured SLA window.
+/// VH-2 (v0.48.0): Subscribe a NOTIFY channel to distance-predicate changes on
+/// a stream table.
+///
+/// After each non-empty refresh the background worker evaluates
+/// `<distance_col> <op> <threshold>` against the rows that changed and emits
+/// `pg_notify(channel, payload)` when at least one row newly satisfies or
+/// newly ceases to satisfy the predicate.  The payload is a JSON object with
+/// `stream_table`, `schema`, `op`, `threshold`, and `matched_rows` fields.
+///
+/// `op` must be one of `<->` (L2), `<=>` (cosine), `<#>` (inner product),
+/// `<+>` (L1), `<<->>` (Hamming), or `<<%>>` (Jaccard).
+///
+/// The subscription is stored in `pgtrickle.pgt_distance_subscriptions` and
+/// survives restarts.
+#[pg_extern(schema = "pgtrickle")]
+fn subscribe_distance(
+    stream_table: &str,
+    channel: &str,
+    vector_column: &str,
+    query_vector: &str,
+    op: &str,
+    threshold: f64,
+) -> Result<(), PgTrickleError> {
+    const VALID_OPS: &[&str] = &["<->", "<=>", "<#>", "<+>", "<<->>", "<<%>>"];
+    if !VALID_OPS.contains(&op) {
+        return Err(PgTrickleError::InvalidArgument(format!(
+            "subscribe_distance: invalid distance operator '{}'. \
+             Must be one of: {}",
+            op,
+            VALID_OPS.join(", ")
+        )));
+    }
+    if threshold <= 0.0 {
+        return Err(PgTrickleError::InvalidArgument(
+            "subscribe_distance: threshold must be positive".to_string(),
+        ));
+    }
+    Spi::run_with_args(
+        "INSERT INTO pgtrickle.pgt_distance_subscriptions \
+         (stream_table, channel, vector_column, query_vector, op, threshold) \
+         VALUES ($1, $2, $3, $4, $5, $6) \
+         ON CONFLICT (stream_table, channel) DO UPDATE \
+           SET vector_column = EXCLUDED.vector_column, \
+               query_vector  = EXCLUDED.query_vector, \
+               op            = EXCLUDED.op, \
+               threshold     = EXCLUDED.threshold",
+        &[
+            stream_table.into(),
+            channel.into(),
+            vector_column.into(),
+            query_vector.into(),
+            op.into(),
+            threshold.into_datum().into(),
+        ],
+    )
+    .map_err(|e| PgTrickleError::SpiError(e.to_string()))
+}
+
+/// VH-2 (v0.48.0): Remove a distance-predicate subscription.
+#[pg_extern(schema = "pgtrickle")]
+fn unsubscribe_distance(stream_table: &str, channel: &str) -> Result<(), PgTrickleError> {
+    Spi::run_with_args(
+        "DELETE FROM pgtrickle.pgt_distance_subscriptions \
+         WHERE stream_table = $1 AND channel = $2",
+        &[stream_table.into(), channel.into()],
+    )
+    .map_err(|e| PgTrickleError::SpiError(e.to_string()))
+}
+
+/// VH-2 (v0.48.0): List all active distance-predicate subscriptions.
+#[allow(clippy::type_complexity)]
+#[pg_extern(schema = "pgtrickle")]
+fn list_distance_subscriptions() -> TableIterator<
+    'static,
+    (
+        name!(stream_table, Option<String>),
+        name!(channel, Option<String>),
+        name!(vector_column, Option<String>),
+        name!(op, Option<String>),
+        name!(threshold, Option<f64>),
+        name!(created_at, Option<pgrx::datum::TimestampWithTimeZone>),
+    ),
+> {
+    let rows = Spi::connect(|client| {
+        let tup_table = client.select(
+            "SELECT stream_table, channel, vector_column, op, threshold, created_at \
+             FROM pgtrickle.pgt_distance_subscriptions \
+             ORDER BY stream_table, channel",
+            None,
+            &[],
+        )?;
+        let mut result: Vec<(
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<f64>,
+            Option<pgrx::datum::TimestampWithTimeZone>,
+        )> = Vec::new();
+        for row in tup_table {
+            result.push((
+                row["stream_table"].value::<String>()?,
+                row["channel"].value::<String>()?,
+                row["vector_column"].value::<String>()?,
+                row["op"].value::<String>()?,
+                row["threshold"].value::<f64>()?,
+                row["created_at"].value::<pgrx::datum::TimestampWithTimeZone>()?,
+            ));
+        }
+        Ok::<_, pgrx::spi::Error>(result)
+    })
+    .unwrap_or_default();
+    TableIterator::new(rows)
+}
+
+/// VH-2 (v0.48.0): Fire distance-predicate NOTIFY for a stream table after a
+/// successful refresh.
+///
+/// Evaluates each distance subscription for the given stream table:
+/// counts matching rows and emits `pg_notify(channel, payload)` when at
+/// least one row satisfies the predicate.  Errors are logged but never
+/// propagated \u2014 subscription notifications must not abort a refresh.
+pub(crate) fn fire_distance_subscriptions(
+    schema: &str,
+    st_name: &str,
+    storage_table: &str,
+    skip_notify: bool,
+) {
+    if skip_notify {
+        return;
+    }
+    // Load all distance subscriptions for this stream table.
+    let full_name = format!("{schema}.{st_name}");
+    let subs: Vec<(String, String, String, String, f64)> = Spi::connect(|client| {
+        let tup = client.select(
+            "SELECT channel, vector_column, query_vector, op, threshold \
+             FROM pgtrickle.pgt_distance_subscriptions \
+             WHERE stream_table = $1",
+            None,
+            &[full_name.as_str().into()],
+        )?;
+        let mut out: Vec<(String, String, String, String, f64)> = Vec::new();
+        for row in tup {
+            if let (Some(ch), Some(vc), Some(qv), Some(op), Some(thr)) = (
+                row.get::<String>(1).ok().flatten(),
+                row.get::<String>(2).ok().flatten(),
+                row.get::<String>(3).ok().flatten(),
+                row.get::<String>(4).ok().flatten(),
+                row.get::<f64>(5).ok().flatten(),
+            ) {
+                out.push((ch, vc, qv, op, thr));
+            }
+        }
+        Ok::<_, pgrx::spi::Error>(out)
+    })
+    .unwrap_or_default();
+
+    for (channel, vector_col, query_vector, op, threshold) in subs {
+        // Count rows that satisfy the distance predicate.
+        // The query_vector is a user-supplied literal; cast to ::vector for pgvector.
+        let quoted_storage = format!(
+            "{}.{}",
+            quote_identifier(schema),
+            quote_identifier(storage_table),
+        );
+        let count_sql = format!(
+            "SELECT COUNT(*)::bigint FROM {quoted_storage} \
+             WHERE {} {} $1::vector < $2",
+            quote_identifier(&vector_col),
+            op,
+        );
+        let matched: i64 = Spi::get_one_with_args::<i64>(
+            &count_sql,
+            &[query_vector.as_str().into(), threshold.into_datum().into()],
+        )
+        .unwrap_or(None)
+        .unwrap_or(0);
+
+        if matched > 0 {
+            let escaped_ch = channel.replace('\'', "''");
+            let escaped_name = st_name.replace('\'', "''");
+            let escaped_schema = schema.replace('\'', "''");
+            let payload = format!(
+                "{{\"stream_table\":\"{escaped_name}\",\"schema\":\"{escaped_schema}\",\
+                 \"op\":\"{op}\",\"threshold\":{threshold},\"matched_rows\":{matched}}}"
+            );
+            let escaped_payload = payload.replace('\'', "''");
+            let notify_sql = format!("NOTIFY {escaped_ch}, '{escaped_payload}'");
+            if let Err(e) = Spi::run(&notify_sql) {
+                pgrx::warning!(
+                    "pg_trickle: distance subscription NOTIFY failed for {}.{}: {}",
+                    schema,
+                    st_name,
+                    e
+                );
+            }
+        }
+    }
+}
+
+// ── v0.48.0 embedding_stream_table() ergonomic API (VA-1) ────────────────────
+
+/// VA-1 (v0.48.0): One-call RAG corpus setup.
+///
+/// Auto-generates a denormalisation query, creates the stream table, provisions
+/// HNSW indexes on vector/halfvec/sparsevec output columns, configures
+/// `post_refresh_action = 'reindex_if_drift'`, and returns a summary of what
+/// was created.
+///
+/// When `dry_run => true` the function returns the generated SQL without
+/// executing it — useful for expert users who want to audit or customise the
+/// generated definition before committing.
+///
+/// # Arguments
+/// * `name`            — Name for the new stream table (schema-qualified optional).
+/// * `source_table`    — Source table (schema-qualified optional).
+/// * `vector_column`   — Column holding the embedding vector.
+/// * `extra_columns`   — Comma-separated additional columns to include (default: all).
+/// * `refresh_interval`— Refresh schedule (default: `'1m'`).
+/// * `index_type`      — Index type: `'hnsw'` or `'ivfflat'` (default: `'hnsw'`).
+/// * `dry_run`         — If true, return the SQL instead of executing it.
+///
+/// # Returns
+/// A single-column table with one row per action taken (or SQL line for dry_run).
+#[pg_extern(schema = "pgtrickle")]
+fn embedding_stream_table(
+    name: &str,
+    source_table: &str,
+    vector_column: &str,
+    extra_columns: default!(Option<&str>, "NULL"),
+    refresh_interval: default!(&str, "'1m'"),
+    index_type: default!(&str, "'hnsw'"),
+    dry_run: default!(bool, false),
+) -> TableIterator<'static, (name!(action, Option<String>),)> {
+    match embedding_stream_table_impl(
+        name,
+        source_table,
+        vector_column,
+        extra_columns,
+        refresh_interval,
+        index_type,
+        dry_run,
+    ) {
+        Ok(rows) => TableIterator::new(rows.into_iter().map(|s| (Some(s),))),
+        Err(e) => pgrx::error!("embedding_stream_table: {}", e),
+    }
+}
+
+fn embedding_stream_table_impl(
+    name: &str,
+    source_table: &str,
+    vector_col: &str,
+    extra_columns: Option<&str>,
+    refresh_interval: &str,
+    index_type: &str,
+    dry_run: bool,
+) -> Result<Vec<String>, PgTrickleError> {
+    // Validate index type.
+    let idx_type_lc = index_type.trim_matches('\'').to_ascii_lowercase();
+    if idx_type_lc != "hnsw" && idx_type_lc != "ivfflat" {
+        return Err(PgTrickleError::InvalidArgument(format!(
+            "embedding_stream_table: index_type must be 'hnsw' or 'ivfflat', got '{index_type}'"
+        )));
+    }
+
+    // Resolve schema / table name for source.
+    let src_parts: Vec<&str> = source_table.splitn(2, '.').collect();
+    let (src_schema, src_tbl) = match src_parts.len() {
+        2 => (src_parts[0].to_string(), src_parts[1].to_string()),
+        _ => {
+            let schema = Spi::get_one::<String>("SELECT current_schema()::text")
+                .unwrap_or(None)
+                .unwrap_or_else(|| "public".to_string());
+            (schema, source_table.to_string())
+        }
+    };
+
+    // Resolve destination schema / name.
+    let dst_parts: Vec<&str> = name.splitn(2, '.').collect();
+    let (dst_schema, dst_name) = match dst_parts.len() {
+        2 => (dst_parts[0].to_string(), dst_parts[1].to_string()),
+        _ => {
+            let schema = Spi::get_one::<String>("SELECT current_schema()::text")
+                .unwrap_or(None)
+                .unwrap_or_else(|| "public".to_string());
+            (schema, name.to_string())
+        }
+    };
+
+    // Build SELECT list: extra columns + vector column.
+    let select_list = match extra_columns {
+        Some(cols) if !cols.trim().is_empty() => {
+            format!("{}, {}", cols.trim(), quote_identifier(vector_col))
+        }
+        _ => {
+            // Default: include all non-system columns from source.
+            let cols_sql = "SELECT string_agg(quote_ident(attname), ', ' ORDER BY attnum) \
+                 FROM pg_attribute pa \
+                 JOIN pg_class pc ON pc.oid = pa.attrelid \
+                 JOIN pg_namespace pn ON pn.oid = pc.relnamespace \
+                 WHERE pn.nspname = $1 AND pc.relname = $2 \
+                   AND pa.attnum > 0 AND NOT pa.attisdropped"
+                .to_string();
+            Spi::get_one_with_args::<String>(
+                &cols_sql,
+                &[src_schema.as_str().into(), src_tbl.as_str().into()],
+            )
+            .unwrap_or(None)
+            .unwrap_or_else(|| format!("*, {}", quote_identifier(vector_col)))
+        }
+    };
+
+    // Build the defining query.
+    let defining_query = format!(
+        "SELECT {} FROM {}.{}",
+        select_list,
+        quote_identifier(&src_schema),
+        quote_identifier(&src_tbl),
+    );
+
+    // Build index access method string.
+    let idx_access_method = idx_type_lc.as_str();
+
+    // Generate the statements.
+    let create_st_sql = format!(
+        "SELECT pgtrickle.create_stream_table({}, $${defining_query}$$, {}, 'DIFFERENTIAL')",
+        quote_literal(&format!("{}.{}", dst_schema, dst_name)),
+        quote_literal(refresh_interval.trim_matches('\'')),
+    );
+
+    let alter_pra_sql = format!(
+        "SELECT pgtrickle.alter_stream_table({}, post_refresh_action => 'reindex_if_drift')",
+        quote_literal(&format!("{}.{}", dst_schema, dst_name)),
+    );
+
+    // Infer vector column type for index operator class.
+    let type_sql = "SELECT t.typname::text FROM pg_attribute a \
+         JOIN pg_type t ON t.oid = a.atttypid \
+         JOIN pg_class c ON c.oid = a.attrelid \
+         JOIN pg_namespace n ON n.oid = c.relnamespace \
+         WHERE n.nspname = $1 AND c.relname = $2 AND a.attname = $3 \
+           AND a.attnum > 0 AND NOT a.attisdropped \
+         LIMIT 1"
+        .to_string();
+    let vec_typename = Spi::get_one_with_args::<String>(
+        &type_sql,
+        &[
+            src_schema.as_str().into(),
+            src_tbl.as_str().into(),
+            vector_col.into(),
+        ],
+    )
+    .unwrap_or(None)
+    .unwrap_or_else(|| "vector".to_string());
+
+    // Select operator class based on index type and vector type.
+    let opclass = match (idx_access_method, vec_typename.as_str()) {
+        ("hnsw", "halfvec") => "halfvec_l2_ops",
+        ("hnsw", "sparsevec") => "sparsevec_l2_ops",
+        ("ivfflat", "halfvec") => "halfvec_l2_ops",
+        ("ivfflat", "sparsevec") => {
+            return Err(PgTrickleError::InvalidArgument(
+                "embedding_stream_table: ivfflat does not support sparsevec; use hnsw".to_string(),
+            ));
+        }
+        _ => "vector_l2_ops",
+    };
+
+    let create_idx_sql = format!(
+        "CREATE INDEX IF NOT EXISTS {}_{}_idx ON {}.{} \
+         USING {} ({} {opclass})",
+        dst_name,
+        vector_col,
+        quote_identifier(&dst_schema),
+        quote_identifier(&dst_name),
+        idx_access_method,
+        quote_identifier(vector_col),
+    );
+
+    let mut actions: Vec<String> = Vec::new();
+
+    if dry_run {
+        actions.push(format!("-- 1. Create stream table\n{create_st_sql}"));
+        actions.push(format!("-- 2. Set post-refresh action\n{alter_pra_sql}"));
+        actions.push(format!(
+            "-- 3. Create {idx_access_method} index\n{create_idx_sql}"
+        ));
+        return Ok(actions);
+    }
+
+    // Execute statements.
+    Spi::run(&create_st_sql).map_err(|e| {
+        PgTrickleError::SpiError(format!(
+            "embedding_stream_table: failed to create stream table: {}",
+            e
+        ))
+    })?;
+    actions.push(format!("created stream table {}.{}", dst_schema, dst_name));
+
+    // Set post-refresh action.
+    if let Err(e) = Spi::run(&alter_pra_sql) {
+        pgrx::warning!(
+            "embedding_stream_table: failed to set post_refresh_action: {}",
+            e
+        );
+    } else {
+        actions.push("post_refresh_action = reindex_if_drift".to_string());
+    }
+
+    // Create vector index (best-effort — the ST may have no rows yet).
+    if let Err(e) = Spi::run(&create_idx_sql) {
+        pgrx::warning!(
+            "embedding_stream_table: {} index creation deferred: {}",
+            idx_access_method,
+            e
+        );
+        actions.push(format!(
+            "note: {} index creation deferred ({})",
+            idx_access_method, e
+        ));
+    } else {
+        actions.push(format!(
+            "created {} index on {}.{} ({})",
+            idx_access_method, dst_schema, dst_name, vector_col
+        ));
+    }
+
+    Ok(actions)
+}
+
+/// Quote a string as a SQL literal (single-quote escaped).
+fn quote_literal(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "''"))
+}
+
 ///
 /// Returns per-stream-table statistics: p50/p99 refresh latency, freshness
 /// lag, error rate, and remaining error budget.

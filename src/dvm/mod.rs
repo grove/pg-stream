@@ -972,30 +972,35 @@ pub(crate) fn reclassify_vector_aggregates(
     }
 }
 
-/// F4: Walk an OpTree and return `(output_alias, dimension)` for every
+/// F4: Walk an OpTree and return `(output_alias, dimension, typename)` for every
 /// `VectorAvg` / `VectorSum` aggregate whose source column has an explicit
-/// `vector(N)` / `halfvec(N)` dimension in `pg_attribute`.
+/// `vector(N)` / `halfvec(N)` / `sparsevec(N)` dimension in `pg_attribute`.
 ///
-/// This is used after stream-table creation to `ALTER COLUMN … TYPE vector(N)`
+/// This is used after stream-table creation to `ALTER COLUMN … TYPE <type>(N)`
 /// so that HNSW / IVFFlat indexes (which require explicit dimensions) can be
-/// built on the centroid column.
+/// built on the centroid column.  The returned typename is one of `vector`,
+/// `halfvec`, or `sparsevec` — callers must use the correct type expression.
+///
+/// VH-1 (v0.48.0): returns typename so halfvec/sparsevec output columns are
+/// correctly typed (previously always used `vector(N)`).
 #[cfg(feature = "pg18")]
-pub(crate) fn extract_vector_agg_output_dims(tree: &parser::OpTree) -> Vec<(String, i32)> {
+pub(crate) fn extract_vector_agg_output_dims(tree: &parser::OpTree) -> Vec<(String, i32, String)> {
     use parser::{AggFunc, Expr, OpTree};
     use pgrx::prelude::*;
 
-    fn lookup_typmod(source_oids: &[u32], col_name: &str) -> i32 {
+    /// Returns `(atttypmod, typname)` for the first matching vector-typed column.
+    fn lookup_typmod_and_name(source_oids: &[u32], col_name: &str) -> (i32, String) {
         if source_oids.is_empty() {
-            return -1;
+            return (-1, "vector".to_string());
         }
         let oid_list = source_oids
             .iter()
             .map(|o| o.to_string())
             .collect::<Vec<_>>()
             .join(",");
-        // Only consider vector/halfvec/sparsevec columns — others return -1.
+        // Only consider vector/halfvec/sparsevec columns — others return defaults.
         let sql = format!(
-            "SELECT a.atttypmod \
+            "SELECT a.atttypmod, t.typname::text \
              FROM pg_catalog.pg_attribute a \
              JOIN pg_catalog.pg_type t ON t.oid = a.atttypid \
              WHERE a.attrelid IN ({oid_list}) \
@@ -1005,12 +1010,23 @@ pub(crate) fn extract_vector_agg_output_dims(tree: &parser::OpTree) -> Vec<(Stri
                AND NOT a.attisdropped \
              LIMIT 1",
         );
-        Spi::get_one_with_args::<i32>(&sql, &[col_name.into()])
-            .unwrap_or(Some(-1))
-            .unwrap_or(-1)
+        // Execute via SPI and parse two columns.
+        Spi::connect(|client| {
+            let mut tup = client.select(&sql, None, &[col_name.into()])?;
+            if let Some(row) = tup.next() {
+                let typmod = row.get::<i32>(1).unwrap_or(None).unwrap_or(-1);
+                let typname = row
+                    .get::<String>(2)
+                    .unwrap_or(None)
+                    .unwrap_or_else(|| "vector".to_string());
+                return Ok::<_, pgrx::spi::Error>((typmod, typname));
+            }
+            Ok((-1, "vector".to_string()))
+        })
+        .unwrap_or((-1, "vector".to_string()))
     }
 
-    fn walk(tree: &OpTree, result: &mut Vec<(String, i32)>) {
+    fn walk(tree: &OpTree, result: &mut Vec<(String, i32, String)>) {
         match tree {
             OpTree::Aggregate {
                 aggregates, child, ..
@@ -1025,9 +1041,9 @@ pub(crate) fn extract_vector_agg_output_dims(tree: &parser::OpTree) -> Vec<(Stri
                         Some(Expr::ColumnRef { column_name, .. }) => column_name.as_str(),
                         _ => continue,
                     };
-                    let typmod = lookup_typmod(&child_oids, col_name);
+                    let (typmod, typname) = lookup_typmod_and_name(&child_oids, col_name);
                     if typmod > 0 {
-                        result.push((agg.alias.clone(), typmod));
+                        result.push((agg.alias.clone(), typmod, typname));
                     }
                 }
             }
@@ -1075,7 +1091,7 @@ pub(crate) fn extract_vector_agg_output_dims(tree: &parser::OpTree) -> Vec<(Stri
 }
 
 #[cfg(not(feature = "pg18"))]
-pub(crate) fn extract_vector_agg_output_dims(_tree: &parser::OpTree) -> Vec<(String, i32)> {
+pub(crate) fn extract_vector_agg_output_dims(_tree: &parser::OpTree) -> Vec<(String, i32, String)> {
     Vec::new()
 }
 

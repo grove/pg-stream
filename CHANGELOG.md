@@ -7,6 +7,7 @@ For future plans and upcoming features, see [ROADMAP.md](ROADMAP.md).
 ## Table of Contents
 
 <!-- TOC start -->
+- [0.48.0 — Complete Embedding Programme: Hybrid Search, Sparse Vectors & Ergonomic API](#0480--complete-embedding-programme-hybrid-search-sparse-vectors--ergonomic-api)
 - [0.47.0 — Embedding Pipeline Infrastructure & ANN Maintenance](#0470--embedding-pipeline-infrastructure--ann-maintenance)
 - [0.46.0 — Extract `pg_tide`: Standalone Outbox, Inbox & Relay](#0460--extract-pg_tide-standalone-outbox-inbox--relay)
 - [0.45.0 — Operational Readiness, Scalability & CI Completeness](#0450--operational-readiness-scalability--ci-completeness)
@@ -61,6 +62,64 @@ For future plans and upcoming features, see [ROADMAP.md](ROADMAP.md).
 - [0.1.1 — CloudNativePG Image & Test Hardening](#011--cloudnativepg-image--test-hardening)
 - [0.1.0 — Initial Release](#010--initial-release)
 <!-- TOC end -->
+
+---
+
+## [0.48.0] — Complete Embedding Programme: Hybrid Search, Sparse Vectors & Ergonomic API
+
+### What's New
+
+#### VH-1: Sparse and Half-Precision Vector Aggregates
+- `avg(halfvec_col)` and `avg(sparsevec_col)` stream tables now produce output
+  columns typed `halfvec(N)` and `sparsevec(N)` respectively — no silent coercion
+  to `vector` anymore.
+- The DVM engine correctly propagates vector type names through `extract_vector_agg_output_dims`.
+
+#### VH-2: Reactive Distance Subscriptions
+- New functions: `pgtrickle.subscribe_distance(stream_table, channel, vector_column, query_vector, op, threshold)`,
+  `pgtrickle.unsubscribe_distance(stream_table, channel)`, and
+  `pgtrickle.list_distance_subscriptions(stream_table)`.
+- After each refresh, the scheduler fires NOTIFY on registered channels when
+  rows in the storage table satisfy the distance predicate.
+
+#### VH-3: Hybrid-Search Cookbook
+- New doc: [docs/tutorials/HYBRID_SEARCH_PATTERNS.md](docs/tutorials/HYBRID_SEARCH_PATTERNS.md) —
+  three hybrid search patterns with worked SQL examples.
+
+#### VH-4: Vector Benchmark Suite
+- New benchmark: `benches/pgvector_bench.rs` — measures OpTree construction,
+  AggFunc dispatch, vector string encoding, and drift-detection overhead.
+
+#### VA-1: `embedding_stream_table()` Ergonomic API
+- New function: `pgtrickle.embedding_stream_table(name, source_table, vector_column, extra_columns, refresh_interval, index_type, dry_run)`.
+- Automatically generates a stream table, creates an HNSW or IVFFlat index,
+  and configures post-refresh drift monitoring.
+- `dry_run => true` returns the generated SQL without executing it.
+
+#### VA-2: Materialised k-NN Graph Research
+- New doc: [docs/research/KNN_GRAPH_TRADEOFFS.md](docs/research/KNN_GRAPH_TRADEOFFS.md) —
+  storage/latency/maintenance analysis for materialised k-NN graphs.
+
+#### VA-3: Multi-Tenant ANN Patterns
+- New doc: [docs/tutorials/PER_TENANT_ANN_PATTERNS.md](docs/tutorials/PER_TENANT_ANN_PATTERNS.md) —
+  per-tenant ANN stream tables with RLS, tenant isolation, and security checklist.
+
+#### VA-4: Embedding Outbox
+- New function: `pgtrickle.attach_embedding_outbox(stream_table, vector_column, retention_hours, inline_threshold_rows)`.
+- Extends outbox events with `event_type: "embedding_change"` and the
+  `vector_column` name in event headers.
+
+#### VA-5: Vector RAG Starter Guide
+- New doc: [docs/tutorials/VECTOR_RAG_STARTER.md](docs/tutorials/VECTOR_RAG_STARTER.md) —
+  quick-start guide for building a RAG pipeline with pg_trickle and pgvector.
+
+### SQL Upgrade
+
+```sql
+ALTER EXTENSION pg_trickle UPDATE TO '0.48.0';
+```
+
+Direct upgrade scripts are provided from **v0.40.0** onward.
 
 ---
 
