@@ -54,6 +54,7 @@ RUN mkdir -p src/bin src/dvm/operators benches pgtrickle-relay/src && \
     echo 'fn main() {}' > benches/refresh_bench.rs && \
     echo 'fn main() {}' > benches/diff_operators.rs && \
     echo 'fn main() {}' > benches/scheduler_bench.rs && \
+    echo 'fn main() {}' > benches/pgvector_bench.rs && \
     echo 'fn main() {}' > pgtrickle-relay/src/main.rs && \
     cargo generate-lockfile && \
     cargo fetch
