@@ -1,0 +1,63 @@
+# =============================================================================
+# Builder Image Workflow
+#
+# Builds and publishes the pg_trickle_builder:pg18 image to GHCR so that
+# E2E CI jobs can pull it instead of rebuilding from scratch each run.
+# Without this cache the builder step (Rust + cargo-pgrx + pgrx init) takes
+# ~30–60 min on a cold GitHub Actions runner, causing upgrade-e2e-tests to
+# time out at the 60-minute job limit.
+#
+# Triggers:
+#   - Push to main when Dockerfile.builder changes
+#   - Weekly on Sunday 02:00 UTC (keep base images fresh / catch bit-rot)
+#   - Manual dispatch
+#
+# The published image is pulled by CI jobs that call build_e2e_image.sh via
+# a "Pull builder image from GHCR" step added to e2e-smoke, e2e-tests, and
+# upgrade-e2e-tests jobs.  If the GHCR image is unavailable (e.g. on the
+# very first run), those jobs fall back to building the builder locally.
+# =============================================================================
+name: Builder Image
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'tests/Dockerfile.builder'
+      - '.github/workflows/builder-image.yml'
+  schedule:
+    - cron: '0 2 * * 0'  # Weekly Sunday 02:00 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  publish-builder-image:
+    name: Build and push builder image to GHCR
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push builder image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: tests/Dockerfile.builder
+          push: true
+          tags: ghcr.io/grove/pg-trickle/builder:pg18
+          # Registry-backed layer cache so repeated runs only rebuild changed layers.
+          cache-from: type=registry,ref=ghcr.io/grove/pg-trickle/builder:cache
+          cache-to: type=registry,ref=ghcr.io/grove/pg-trickle/builder:cache,mode=max

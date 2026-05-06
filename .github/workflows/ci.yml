@@ -259,6 +259,24 @@ jobs:
             docker save postgres:18.3 --output /tmp/docker-images/postgres-18.3.tar
           fi
 
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Pull builder image from GHCR
+        run: |
+          # Pull the pre-built builder image to avoid a ~30–60 min local build.
+          # Falls back to building locally if the GHCR image is unavailable.
+          if docker pull ghcr.io/grove/pg-trickle/builder:pg18 2>/dev/null; then
+            docker tag ghcr.io/grove/pg-trickle/builder:pg18 pg_trickle_builder:pg18
+            echo "Builder image pulled from GHCR — skipping local build"
+          else
+            echo "::warning::Builder image not in GHCR (first run?). Will build locally."
+          fi
+
       - name: Build E2E Docker image
         run: ./tests/build_e2e_image.sh
 
@@ -309,6 +327,24 @@ jobs:
             docker pull postgres:18.3
             mkdir -p /tmp/docker-images
             docker save postgres:18.3 --output /tmp/docker-images/postgres-18.3.tar
+          fi
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Pull builder image from GHCR
+        run: |
+          # Pull the pre-built builder image to avoid a ~30–60 min local build.
+          # Falls back to building locally if the GHCR image is unavailable.
+          if docker pull ghcr.io/grove/pg-trickle/builder:pg18 2>/dev/null; then
+            docker tag ghcr.io/grove/pg-trickle/builder:pg18 pg_trickle_builder:pg18
+            echo "Builder image pulled from GHCR — skipping local build"
+          else
+            echo "::warning::Builder image not in GHCR (first run?). Will build locally."
           fi
 
       - name: Build E2E Docker image
@@ -509,6 +545,13 @@ jobs:
       - uses: actions/checkout@v5
       - id: pairs
         run: |
+          # v0.47.0 upgrade support policy: only test upgrades from v0.40.0+.
+          # Scripts for older versions remain in sql/ for PostgreSQL chain
+          # compatibility but are no longer E2E tested. The archive
+          # oldest→current chain is omitted for the same reason.
+          SUPPORT_CUTOFF="0.40.0"
+          # Returns 0 if version $1 >= $2 (sort -V for correctness).
+          version_ge() { printf '%s\n%s' "$2" "$1" | sort -V -C; }
           current_version=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
           items='['
           first=true
@@ -517,14 +560,13 @@ jobs:
             from=${base#pg_trickle--}
             to=${from#*--}
             from=${from%%--*}
+            # Skip pairs whose from-version predates the support cutoff.
+            if ! version_ge "$from" "$SUPPORT_CUTOFF"; then
+              continue
+            fi
             if [ "$first" = true ]; then first=false; else items="$items,"; fi
             items="$items{\"from\":\"$from\",\"to\":\"$to\"}"
           done
-          # Add full chain: oldest archive → current version
-          oldest=$(ls sql/archive/pg_trickle--*.sql | sed 's/.*--\(.*\)\.sql/\1/' | sort -V | head -1)
-          if [ "$oldest" != "$current_version" ]; then
-            items="$items,{\"from\":\"$oldest\",\"to\":\"$current_version\"}"
-          fi
           items="$items]"
           echo "matrix={\"include\":$items}" >> "$GITHUB_OUTPUT"
           echo "Discovered upgrade pairs: $items"
@@ -543,6 +585,24 @@ jobs:
 
       - name: Setup pgrx environment
         uses: ./.github/actions/setup-pgrx
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Pull builder image from GHCR
+        run: |
+          # Pull the pre-built builder image to avoid a ~30–60 min local build.
+          # Falls back to building locally if the GHCR image is unavailable.
+          if docker pull ghcr.io/grove/pg-trickle/builder:pg18 2>/dev/null; then
+            docker tag ghcr.io/grove/pg-trickle/builder:pg18 pg_trickle_builder:pg18
+            echo "Builder image pulled from GHCR — skipping local build"
+          else
+            echo "::warning::Builder image not in GHCR (first run?). Will build locally."
+          fi
 
       - name: Build E2E Docker image
         run: ./tests/build_e2e_image.sh
