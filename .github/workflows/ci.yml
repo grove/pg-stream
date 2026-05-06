@@ -545,6 +545,13 @@ jobs:
       - uses: actions/checkout@v5
       - id: pairs
         run: |
+          # v0.47.0 upgrade support policy: only test upgrades from v0.40.0+.
+          # Scripts for older versions remain in sql/ for PostgreSQL chain
+          # compatibility but are no longer E2E tested. The archive
+          # oldest→current chain is omitted for the same reason.
+          SUPPORT_CUTOFF="0.40.0"
+          # Returns 0 if version $1 >= $2 (sort -V for correctness).
+          version_ge() { printf '%s\n%s' "$2" "$1" | sort -V -C; }
           current_version=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
           items='['
           first=true
@@ -553,14 +560,13 @@ jobs:
             from=${base#pg_trickle--}
             to=${from#*--}
             from=${from%%--*}
+            # Skip pairs whose from-version predates the support cutoff.
+            if ! version_ge "$from" "$SUPPORT_CUTOFF"; then
+              continue
+            fi
             if [ "$first" = true ]; then first=false; else items="$items,"; fi
             items="$items{\"from\":\"$from\",\"to\":\"$to\"}"
           done
-          # Add full chain: oldest archive → current version
-          oldest=$(ls sql/archive/pg_trickle--*.sql | sed 's/.*--\(.*\)\.sql/\1/' | sort -V | head -1)
-          if [ "$oldest" != "$current_version" ]; then
-            items="$items,{\"from\":\"$oldest\",\"to\":\"$current_version\"}"
-          fi
           items="$items]"
           echo "matrix={\"include\":$items}" >> "$GITHUB_OUTPUT"
           echo "Discovered upgrade pairs: $items"
