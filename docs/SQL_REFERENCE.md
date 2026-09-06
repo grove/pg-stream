@@ -31,6 +31,7 @@ Complete reference for all SQL functions, views, and catalog tables provided by 
     - [pgtrickle.integration\_capabilities](#pgtrickleintegration_capabilities)
     - [pgtrickle.stream\_table\_contract](#pgtricklestream_table_contract)
     - [pgtrickle.graph\_contract](#pgtricklegraph_contract)
+- [pgtrickle.refresh\_graph\_strict](#pgtricklerefresh_graph_strict)
   - [Status & Monitoring](#status--monitoring)
     - [pgtrickle.pgt\_status](#pgtricklepgt_status)
     - [pgtrickle.health\_check](#pgtricklehealth_check)
@@ -1638,9 +1639,9 @@ infrastructure, and schedules a protected full refresh.
 
 ## Integration Contracts
 
-The v0.93 contract APIs expose stable, typed metadata for integrations. Graph
-refresh execution and output-delta delivery remain disabled until later
-capability versions.
+The v0.94 contract APIs expose stable, typed metadata and strict transactional
+graph refresh for integrations. Output-delta delivery remains disabled until
+v0.95.
 
 ### pgtrickle.integration_capabilities
 
@@ -1688,8 +1689,25 @@ SELECT *
 FROM pgtrickle.graph_contract(ARRAY['public.orders_total'::regclass]);
 ```
 
-The `external_graph_refresh` capability is experimental and disabled in v0.93;
-`output_delta_consumer` is absent until v0.95.
+### pgtrickle.refresh_graph_strict
+
+Validate and refresh the complete upstream closure of `EXTERNAL` roots in
+topological order inside the caller's transaction.
+
+```sql
+SELECT * FROM pgtrickle.refresh_graph_strict(
+    ARRAY['public.orders_total'::regclass],
+    (SELECT graph_digest FROM pgtrickle.graph_contract(
+        ARRAY['public.orders_total'::regclass]))
+);
+```
+
+The expected digest is mandatory. The function rejects stale contracts,
+unsupported members, ownership failures, and busy or changed catalog state
+before executing any member. It does not commit.
+
+The `external_graph_refresh` capability is stable in v0.94;
+`output_delta_consumer` remains absent until v0.95.
 
 ---
 

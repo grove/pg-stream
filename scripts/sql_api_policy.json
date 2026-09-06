@@ -765,6 +765,13 @@
       "class": "owner_lifecycle",
       "execution_policy": "definer_owner_checked"
     },
+    "pgtrickle.refresh_graph_strict(regclass[], bytea, text)": {
+      "schema": "pgtrickle",
+      "name": "refresh_graph_strict",
+      "identity_arguments": "regclass[], bytea, text",
+      "class": "owner_lifecycle",
+      "execution_policy": "definer_owner_checked"
+    },
     "pgtrickle.refresh_timeline(integer)": {
       "schema": "pgtrickle",
       "name": "refresh_timeline",

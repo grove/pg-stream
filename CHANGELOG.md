@@ -37,6 +37,7 @@ The cutoff exists because:
 
 <!-- TOC start -->
 - [Unreleased](#unreleased)
+- [0.94.0 — Strict Transactional Graph Refresh](#0940--strict-transactional-graph-refresh)
 - [0.93.0 — Graph Contracts and External Ownership](#0930--graph-contracts-and-external-ownership)
 - [0.92.0 — Backup, Restore, Upgrade & CDC Recovery](#0920--backup-restore-upgrade--cdc-recovery)
 - [0.91.0 — Schema and Query Evolution](#0910--schema-and-query-evolution)
@@ -215,8 +216,15 @@ refresh.
 - Adds durable `MANAGED`/`EXTERNAL` ownership, owner-checked mode changes, and
   scheduler exclusion for externally coordinated tables.
 - Adds the 0.92.0 → 0.93.0 migration, full-install archive, and upgrade runbook.
-- Strict transactional refresh remains the v0.94.0 gate; output deltas remain
-  the v0.95.0 gate.
+- Output deltas remain the v0.95.0 gate.
+
+## [0.94.0] — Strict Transactional Graph Refresh
+
+v0.94.0 adds `pgtrickle.refresh_graph_strict()`, which validates an external
+graph, acquires canonical transaction-scoped member locks, captures one source
+boundary, and refreshes the complete closure synchronously in the caller's
+transaction. Contract mismatches, unsupported graph members, and ownership
+failures abort before member execution.
 
 See the [v0.93 roadmap](roadmap/v0.93.0.md) and [upgrade guide](docs/UPGRADING.md).
 
