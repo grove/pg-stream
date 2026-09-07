@@ -137,11 +137,13 @@ pub fn integration_capabilities() -> TableIterator<
             "external_graph_refresh".to_string(),
             1,
             0,
-            false,
+            true,
             JsonB(serde_json::json!({
-                "status": "experimental",
-                "phase": "v0.93_contracts",
-                "refresh_api": "not_enabled"
+                "status": "stable",
+                "phase": "v0.94_strict_transactional_refresh",
+                "refresh_api": "refresh_graph_strict",
+                "max_graph_members": 1024,
+                "source_boundary": "local_trigger_or_wal"
             })),
         ),
         (
@@ -726,6 +728,275 @@ pub fn graph_contract(
 > {
     match graph_contract_data(&roots) {
         Ok(row) => TableIterator::once(row),
+        Err(error) => raise(error),
+    }
+}
+
+fn build_source_boundary(
+    graph: &Value,
+    members: &[StreamTableMeta],
+    safe_bound: &str,
+    graph_refresh_id: i64,
+) -> Result<(Value, [u8; 32]), PgTrickleError> {
+    let mut table_oids = BTreeSet::new();
+    for member in members {
+        for dependency in StDependency::get_for_st(member.pgt_id)? {
+            if dependency.source_type == "TABLE" {
+                table_oids.insert(dependency.source_relid.to_u32());
+            }
+        }
+    }
+    let table_oids = table_oids
+        .into_iter()
+        .map(pg_sys::Oid::from)
+        .collect::<Vec<_>>();
+    let positions = crate::cdc::get_slot_positions_at_bound(&table_oids, safe_bound)?;
+    let members_by_relid = members
+        .iter()
+        .map(|member| (member.pgt_relid.to_u32(), member))
+        .collect::<BTreeMap<_, _>>();
+    let mut sources = Vec::new();
+    for source in graph["sources"].as_array().into_iter().flatten() {
+        let mut source = source.clone();
+        let relid = source["source_relid"].as_u64().ok_or_else(|| {
+            integration_error("PGT_EXT_BOUNDARY_UNAVAILABLE", "source identity is missing")
+        })? as u32;
+        let source_type = source["source_type"].as_str().unwrap_or_default();
+        let position = if source_type == "TABLE" {
+            let token = positions.get(&relid).ok_or_else(|| {
+                integration_error(
+                    "PGT_EXT_BOUNDARY_UNAVAILABLE",
+                    format!("no bounded CDC position exists for source OID {relid}"),
+                )
+            })?;
+            serde_json::json!({"version": 1, "kind": "CDC_BOUND", "token": token})
+        } else {
+            let member = members_by_relid.get(&relid).ok_or_else(|| {
+                integration_error(
+                    "PGT_EXT_BOUNDARY_UNAVAILABLE",
+                    format!("stream-table source OID {relid} is outside the graph"),
+                )
+            })?;
+            serde_json::json!({
+                "version": 1,
+                "kind": "UPSTREAM_STREAM_TABLE_STATE",
+                "contract_generation": member.contract_generation,
+                "is_populated": member.is_populated
+            })
+        };
+        source["capture_mode"] = source["cdc_mode"].clone();
+        source["position"] = position;
+        source["completeness"] = Value::String("PROVEN".to_string());
+        sources.push(source);
+    }
+    let boundary = serde_json::json!({
+        "manifest_version": 1,
+        "graph_refresh_id": graph_refresh_id,
+        "database_instance_id": graph["database_instance_id"],
+        "safe_bound": safe_bound,
+        "completeness": "PROVEN",
+        "sources": sources
+    });
+    let bytes = serde_json::to_vec(&boundary)
+        .map_err(|error| PgTrickleError::InternalError(error.to_string()))?;
+    Ok((boundary, sha256_digest(&bytes)))
+}
+
+/// Refresh an external graph synchronously inside the caller's transaction.
+///
+/// Admission and locking happen before the first member executes. The
+/// existing member refresh path owns query execution and transactional
+/// finalization; this function only supplies the graph-wide contract and lock
+/// boundary around it.
+#[pg_extern(
+    schema = "pgtrickle",
+    security_definer,
+    sql = "CREATE FUNCTION pgtrickle.\"refresh_graph_strict\"(\"roots\" regclass[], \"expected_graph_digest\" bytea, \"full_policy\" text DEFAULT 'ALLOW') RETURNS TABLE (\"contract_version\" smallint, \"graph_refresh_id\" bigint, \"graph_digest\" bytea, \"source_boundary\" jsonb, \"source_boundary_digest\" bytea, \"node_results\" jsonb) STRICT SECURITY DEFINER SET search_path TO pgtrickle, pg_catalog, pg_temp LANGUAGE c AS '@MODULE_PATHNAME@', 'refresh_graph_strict_wrapper';"
+)]
+#[search_path(pgtrickle, pg_catalog, pg_temp)]
+#[allow(clippy::type_complexity)]
+pub fn refresh_graph_strict(
+    roots: Vec<pg_sys::Oid>,
+    expected_graph_digest: Vec<u8>,
+    full_policy: default!(&str, "'ALLOW'"),
+) -> TableIterator<
+    'static,
+    (
+        name!(contract_version, i16),
+        name!(graph_refresh_id, i64),
+        name!(graph_digest, Vec<u8>),
+        name!(source_boundary, JsonB),
+        name!(source_boundary_digest, Vec<u8>),
+        name!(node_results, JsonB),
+    ),
+> {
+    let result = (|| -> Result<_, PgTrickleError> {
+        let policy = full_policy.trim().to_ascii_uppercase();
+        if !matches!(policy.as_str(), "ALLOW" | "ERROR") {
+            return Err(integration_error(
+                "PGT_EXT_GRAPH_INVALID",
+                "full_policy must be ALLOW or ERROR",
+            ));
+        }
+        crate::api::recovery::assert_capture_ready()?;
+        let (_, initial_digest, JsonB(initial_graph)) = graph_contract_data(&roots)?;
+        if expected_graph_digest != initial_digest {
+            return Err(integration_error(
+                "PGT_EXT_CONTRACT_MISMATCH",
+                "graph contract changed after it was compiled",
+            ));
+        }
+        let order = initial_graph["topological_order"]
+            .as_array()
+            .ok_or_else(|| {
+                integration_error(
+                    "PGT_EXT_GRAPH_INVALID",
+                    "graph contract has no topological order",
+                )
+            })?;
+        let mut member_ids = Vec::with_capacity(order.len());
+        for value in order {
+            let relid = value.as_u64().ok_or_else(|| {
+                integration_error("PGT_EXT_GRAPH_INVALID", "graph member identity is invalid")
+            })? as u32;
+            let meta = StreamTableMeta::get_by_relid(pg_sys::Oid::from(relid))?;
+            super::check_stream_table_ownership(meta.pgt_relid, &meta.pgt_schema, &meta.pgt_name)?;
+            member_ids.push((relid, meta));
+        }
+        let mut lock_ids = member_ids
+            .iter()
+            .map(|(relid, _)| *relid)
+            .collect::<Vec<_>>();
+        lock_ids.sort_unstable();
+        for relid in lock_ids {
+            let meta = member_ids
+                .iter()
+                .find(|(id, _)| *id == relid)
+                .ok_or_else(|| {
+                    integration_error("PGT_EXT_GRAPH_INVALID", "graph member identity disappeared")
+                })?;
+            let _ = Spi::get_one_with_args::<bool>(
+                "SELECT pg_advisory_xact_lock($1) IS NULL",
+                &[meta.1.pgt_id.into()],
+            )
+            .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
+            let _locked = Spi::get_one_with_args::<i64>(
+                "SELECT pgt_id FROM pgtrickle.pgt_stream_tables WHERE pgt_id = $1 FOR UPDATE",
+                &[meta.1.pgt_id.into()],
+            )
+            .map_err(|e| PgTrickleError::SpiError(e.to_string()))?
+            .ok_or_else(|| integration_error("PGT_EXT_GRAPH_BUSY", "graph member disappeared"))?;
+        }
+        let (_, graph_digest, JsonB(graph)) = graph_contract_data(&roots)?;
+        if expected_graph_digest != graph_digest {
+            return Err(integration_error(
+                "PGT_EXT_CONTRACT_MISMATCH",
+                "graph contract changed while the graph locks were acquired",
+            ));
+        }
+        member_ids = graph["topological_order"]
+            .as_array()
+            .ok_or_else(|| {
+                integration_error(
+                    "PGT_EXT_GRAPH_INVALID",
+                    "graph contract has no topological order",
+                )
+            })?
+            .iter()
+            .map(|value| {
+                let relid = value.as_u64().ok_or_else(|| {
+                    integration_error("PGT_EXT_GRAPH_INVALID", "graph member identity is invalid")
+                })? as u32;
+                Ok((
+                    relid,
+                    StreamTableMeta::get_by_relid(pg_sys::Oid::from(relid))?,
+                ))
+            })
+            .collect::<Result<Vec<_>, PgTrickleError>>()?;
+        let mut source_oids = BTreeSet::new();
+        for (_, meta) in &member_ids {
+            for dependency in StDependency::get_for_st(meta.pgt_id)? {
+                if matches!(dependency.source_type.as_str(), "TABLE" | "STREAM_TABLE") {
+                    source_oids.insert(dependency.source_relid.to_u32());
+                }
+            }
+        }
+        let source_oids = source_oids
+            .into_iter()
+            .map(pg_sys::Oid::from)
+            .collect::<Vec<_>>();
+        crate::cdc::lock_source_relations(&source_oids)?;
+        for (_, meta) in &member_ids {
+            crate::cdc::lock_stream_table_sources(
+                meta.pgt_id,
+                &StDependency::get_for_st(meta.pgt_id)?,
+            )?;
+        }
+        let safe_bound = crate::cdc::get_current_wal_lsn()?;
+        let graph_refresh_id =
+            Spi::get_one::<i64>("SELECT nextval('pgtrickle.pgt_graph_refresh_id_seq')::bigint")
+                .map_err(|e| PgTrickleError::SpiError(e.to_string()))?
+                .ok_or_else(|| {
+                    PgTrickleError::InternalError("graph refresh sequence returned NULL".into())
+                })?;
+        let members = member_ids
+            .iter()
+            .map(|(_, meta)| meta.clone())
+            .collect::<Vec<_>>();
+        let (boundary, boundary_digest) =
+            build_source_boundary(&graph, &members, &safe_bound, graph_refresh_id)?;
+        let mut node_results = serde_json::Map::new();
+        for (relid, meta) in member_ids {
+            if policy == "ERROR"
+                && (meta.refresh_mode != RefreshMode::Differential
+                    || meta.topk_limit.is_some()
+                    || meta.needs_reinit
+                    || meta
+                        .frontier
+                        .as_ref()
+                        .is_none_or(version::Frontier::is_empty))
+            {
+                return Err(integration_error(
+                    "PGT_EXT_FULL_POLICY",
+                    format!(
+                        "{}.{} requires a full refresh",
+                        meta.pgt_schema, meta.pgt_name
+                    ),
+                ));
+            }
+            let source_oids = super::refresh_ops::get_source_oids_for_manual_refresh(meta.pgt_id)?;
+            let refresh = super::refresh_ops::with_graph_safe_bound(&safe_bound, || {
+                super::refresh_ops::execute_manual_refresh(
+                    &meta,
+                    &meta.pgt_schema,
+                    &meta.pgt_name,
+                    &source_oids,
+                )
+            })?;
+            node_results.insert(
+                relid.to_string(),
+                serde_json::json!({
+                    "identity": format!("{}.{}", meta.pgt_schema, meta.pgt_name),
+                    "result_class": if refresh.rows_inserted == 0 && refresh.rows_deleted == 0 && refresh.rows_updated == 0 { "NO_DATA" } else { "COMPLETED" },
+                    "action": refresh.action,
+                    "rows_inserted": refresh.rows_inserted,
+                    "rows_updated": refresh.rows_updated,
+                    "rows_deleted": refresh.rows_deleted,
+                    "contract_generation": meta.contract_generation,
+                }),
+            );
+        }
+        Ok(TableIterator::once((
+            CONTRACT_VERSION,
+            graph_refresh_id,
+            graph_digest,
+            JsonB(boundary),
+            boundary_digest.to_vec(),
+            JsonB(serde_json::Value::Object(node_results)),
+        )))
+    })();
+    match result {
+        Ok(rows) => rows,
         Err(error) => raise(error),
     }
 }

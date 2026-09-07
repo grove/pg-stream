@@ -862,6 +862,9 @@ CREATE TABLE IF NOT EXISTS pgtrickle.pgt_schema_version (
     applied_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
     description TEXT
 );
+
+-- v0.94.0: monotonic identifiers for strict graph-refresh results.
+CREATE SEQUENCE IF NOT EXISTS pgtrickle.pgt_graph_refresh_id_seq;
 INSERT INTO pgtrickle.pgt_schema_version (version, description)
 VALUES ('0.19.0', 'Initial schema version tracking')
 ON CONFLICT (version) DO NOTHING;

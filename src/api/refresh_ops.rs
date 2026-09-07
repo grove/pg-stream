@@ -4,6 +4,41 @@
 
 use super::*;
 use crate::refresh::RefreshAction;
+use std::cell::RefCell;
+
+thread_local! {
+    static GRAPH_SAFE_BOUND: RefCell<Option<String>> = const { RefCell::new(None) };
+}
+
+/// Run one refresh with the immutable source bound selected by a strict graph.
+pub(crate) fn with_graph_safe_bound<T>(
+    bound: &str,
+    refresh: impl FnOnce() -> Result<T, PgTrickleError>,
+) -> Result<T, PgTrickleError> {
+    let previous = GRAPH_SAFE_BOUND.with(|value| value.replace(Some(bound.to_string())));
+    let result = refresh();
+    GRAPH_SAFE_BOUND.with(|value| value.replace(previous));
+    result
+}
+
+fn refresh_safe_bound() -> Result<String, PgTrickleError> {
+    GRAPH_SAFE_BOUND
+        .with(|value| value.borrow().clone())
+        .map(Ok)
+        .unwrap_or_else(crate::cdc::get_current_wal_lsn)
+}
+
+fn graph_bound_is_set() -> bool {
+    GRAPH_SAFE_BOUND.with(|value| value.borrow().is_some())
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ManualRefreshResult {
+    pub(crate) action: String,
+    pub(crate) rows_inserted: i64,
+    pub(crate) rows_updated: i64,
+    pub(crate) rows_deleted: i64,
+}
 
 /// Manually trigger a synchronous refresh of a stream table.
 #[pg_extern(schema = "pgtrickle", security_definer)]
@@ -164,7 +199,7 @@ fn refresh_stream_table_impl(
 
     // Transaction-level advisory lock is released automatically at
     // transaction end (commit or rollback); no explicit unlock needed.
-    execute_manual_refresh(&st, &schema, &table_name, &source_oids)
+    execute_manual_refresh(&st, &schema, &table_name, &source_oids).map(|_| ())
 }
 
 /// Inner function for manual refresh, called while advisory lock is held.
@@ -174,12 +209,12 @@ fn refresh_stream_table_impl(
 ///
 /// ERG-D: Records the refresh in `pgt_refresh_history` with
 /// `initiated_by = 'MANUAL'`.
-fn execute_manual_refresh(
+pub(crate) fn execute_manual_refresh(
     st: &StreamTableMeta,
     schema: &str,
     table_name: &str,
     source_oids: &[pg_sys::Oid],
-) -> Result<(), PgTrickleError> {
+) -> Result<ManualRefreshResult, PgTrickleError> {
     // EC-25/EC-26: Set the internal_refresh flag so DML guard triggers
     // allow the refresh executor to modify the storage table.
     Spi::run("SET LOCAL pg_trickle.internal_refresh = 'true'")
@@ -222,7 +257,7 @@ fn execute_manual_refresh(
     let now = Spi::get_one::<TimestampWithTimeZone>("SELECT now()")
         .map_err(|e| PgTrickleError::SpiError(e.to_string()))?
         .ok_or_else(|| PgTrickleError::InternalError("now() returned NULL".into()))?;
-    let manual_tick_watermark = cdc::get_current_wal_lsn()?;
+    let manual_tick_watermark = refresh_safe_bound()?;
 
     let refresh_id = RefreshRecord::insert(
         st.pgt_id,
@@ -305,9 +340,11 @@ fn execute_manual_refresh(
     };
 
     // ERG-D: Complete the refresh history record.
+    let mut rows_updated_for_result = 0;
     match &result {
         Ok((rows_inserted, rows_deleted)) => {
             let rows_updated = refresh::take_last_rows_updated();
+            rows_updated_for_result = rows_updated;
             let frontier = match StreamTableMeta::get_frontier(st.pgt_id)? {
                 Some(frontier) => frontier,
                 None => {
@@ -361,7 +398,12 @@ fn execute_manual_refresh(
         }
     }
 
-    result.map(|_| ())
+    result.map(|(rows_inserted, rows_deleted)| ManualRefreshResult {
+        action: action.to_string(),
+        rows_inserted,
+        rows_updated: rows_updated_for_result,
+        rows_deleted,
+    })
 }
 
 /// Execute a FULL manual refresh: truncate + repopulate from the defining query.
@@ -449,7 +491,7 @@ fn execute_manual_full_refresh_target(
     }
     crate::cdc::lock_source_relations(source_oids)?;
     crate::cdc::lock_stream_table_sources(st.pgt_id, &dependencies)?;
-    let safe_bound = crate::cdc::get_current_wal_lsn()?;
+    let safe_bound = refresh_safe_bound()?;
 
     // EC-25/EC-26: Ensure the internal_refresh flag is set so DML guard
     // triggers allow the refresh executor to modify the storage table.
@@ -804,19 +846,21 @@ fn execute_manual_differential_refresh(
     // The source lock is the visibility proof for this manual refresh: no
     // source transaction can add a change-buffer row after this bound.
     let change_schema = crate::config::pg_trickle_change_buffer_schema().replace('"', "\"\"");
-    let mut safe_bound = cdc::get_current_wal_lsn()?;
-    for source_oid in source_oids {
-        let buffer_name = cdc::buffer_base_name_for_oid(*source_oid);
-        // nosemgrep: rust.spi.get_one_with_args.dynamic-format — change_schema is a quoted config identifier and buffer_name is OID-derived.
-        safe_bound = Spi::get_one_with_args::<String>(
-            &format!(
-                "SELECT GREATEST($1::pg_lsn, COALESCE(MAX(lsn), '0/0'::pg_lsn))::text \
-                 FROM \"{change_schema}\".{buffer_name}"
-            ),
-            &[safe_bound.as_str().into()],
-        )
-        .map_err(|e| PgTrickleError::SpiError(e.to_string()))?
-        .unwrap_or(safe_bound);
+    let mut safe_bound = refresh_safe_bound()?;
+    if !graph_bound_is_set() {
+        for source_oid in source_oids {
+            let buffer_name = cdc::buffer_base_name_for_oid(*source_oid);
+            // nosemgrep: rust.spi.get_one_with_args.dynamic-format — change_schema is a quoted config identifier and buffer_name is OID-derived.
+            safe_bound = Spi::get_one_with_args::<String>(
+                &format!(
+                    "SELECT GREATEST($1::pg_lsn, COALESCE(MAX(lsn), '0/0'::pg_lsn))::text \
+                     FROM \"{change_schema}\".{buffer_name}"
+                ),
+                &[safe_bound.as_str().into()],
+            )
+            .map_err(|e| PgTrickleError::SpiError(e.to_string()))?
+            .unwrap_or(safe_bound);
+        }
     }
     let slot_positions = cdc::get_slot_positions_at_bound(source_oids, &safe_bound)?;
     let data_ts = get_data_timestamp_str();
@@ -884,7 +928,9 @@ fn execute_manual_differential_refresh(
 }
 
 /// Get source table OIDs for a stream table (used by manual refresh path).
-fn get_source_oids_for_manual_refresh(pgt_id: i64) -> Result<Vec<pg_sys::Oid>, PgTrickleError> {
+pub(crate) fn get_source_oids_for_manual_refresh(
+    pgt_id: i64,
+) -> Result<Vec<pg_sys::Oid>, PgTrickleError> {
     let deps = StDependency::get_for_st(pgt_id)?;
     Ok(deps
         .into_iter()
