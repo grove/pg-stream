@@ -227,7 +227,7 @@ async fn test_event_triggers_installed() {
 }
 
 #[tokio::test]
-async fn test_v093_capabilities_are_independent() {
+async fn test_v094_capabilities_are_independent() {
     let db = E2eDb::new().await.with_extension().await;
 
     let capability_count: i64 = db
@@ -247,7 +247,7 @@ async fn test_v093_capabilities_are_independent() {
              WHERE capability = 'output_delta_consumer'",
         )
         .await;
-    assert!(!graph_enabled);
+    assert!(graph_enabled);
     assert_eq!(delta_status, "absent");
 }
 
