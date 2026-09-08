@@ -104,14 +104,21 @@ def main() -> int:
                 errors.append("support manifest must be limited to PostgreSQL 18")
             if manifest.get("source_version_lower_bound") != "0.40.0":
                 errors.append("support manifest lower bound must be 0.40.0")
-            if manifest.get("source_version_upper_bound") != "0.98.x":
-                errors.append("support manifest upper bound must be 0.98.x")
-            if not versions or versions[0] != "0.40.0" or versions[-1] != VERSION:
-                errors.append("support manifest must cover released sources through 0.92.0")
+            if manifest.get("source_version_upper_bound") != "0.105.x":
+                errors.append("support manifest upper bound must be 0.105.x")
+            if (
+                not versions
+                or versions[0] != "0.40.0"
+                or versions[-1] != manifest.get("latest_released_source_version")
+            ):
+                errors.append("support manifest must cover every released source version")
             if len(versions) != len(set(versions)):
                 errors.append("support manifest contains duplicate source versions")
-            if any(not re.fullmatch(r"0\.(?:4[0-9]|[5-8][0-9]|9[0-8])(?:\.\d+)?", v) for v in versions):
-                errors.append("support manifest contains a source version outside the v0.40-v0.98 bound")
+            if any(
+                not re.fullmatch(r"0\.(?:[4-9][0-9]|10[0-5])(?:\.\d+)?", v)
+                for v in versions
+            ):
+                errors.append("support manifest contains a source version outside the v0.40-v0.105 bound")
 
     test_sources = "\n".join(
         path.read_text(encoding="utf-8")

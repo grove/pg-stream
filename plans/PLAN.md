@@ -9,6 +9,7 @@
 |---|---|
 | [ROADMAP.md](../ROADMAP.md) | Current release milestones and feature backlog |
 | [roadmap/](../roadmap/) | Per-version detailed roadmap files |
+| [pg-trickle assessment and pre-1.0 roadmap](pg-trickle-assessment-and-pre-1.0-roadmap.md) | September 2026 assessment that drives v0.99.0 through v0.105.x |
 | [docs/ARCHITECTURE.md](../docs/ARCHITECTURE.md) | System architecture and design overview |
 | [INDEX.md](INDEX.md) | Full index of all plans, assessments, and ADRs |
 | [adrs/](adrs/) | Architecture Decision Records |

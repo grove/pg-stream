@@ -391,7 +391,7 @@ and durability foundations that must be proven before v1.0.
 | [v0.79.0](roadmap/v0.79.0.md) | Code Quality, API Ergonomics & Security: remove unused-import suppressions in src/refresh/codegen.rs and src/refresh/merge/mod.rs module-by-module (Q-1), convert internal create/alter API implementations to typed parameter structs eliminating too-many-arguments in business logic (Q-2), replace global #![allow(dead_code)] with narrower per-module allowances on pgrx/export boundaries (Q-3), remove or #[deprecated] consume_slot_changes() replacing with clearly named status function (Q-4), add SQL convenience helpers create_stream_table_fast_append_only/set_stream_table_refresh_policy/set_stream_table_storage_policy (A-1), add first-class pause_stream_table/resume_stream_table wrappers (A-2), add/strengthen semgrep CI rules for dynamic SQL distinguishing identifier/literal/OID boundaries (S-1), emit runtime WARNING when source has RLS enabled at create_stream_table time (S-2), CI test inspecting SECURITY DEFINER trigger functions for SET search_path (S-3), cleanup chaos test forcing three consecutive DELETE failures with alert and status verification (D-3), dbt adapter compatibility matrix with alter/drop/rebuild flow and version matrix tests (T-5) | ✅ Released | Large | [Full details](roadmap/v0.79.0.md-full.md) |
 | [v0.80.0](roadmap/v0.80.0.md) | Operational Excellence, Documentation Completeness & Final v1.0 Gate: add DVM fallback/performance reason codes to refresh history and health output — CORRELATED_SUBQUERY_DELTA_QUADRATIC, CASE_IN_LIST_DVM_DRIFT_FULL_FALLBACK, REGEX_COMPLEXITY_CLASSIFIER_UNCERTAIN (O-1), add health_check() threshold alert when invalidation ring overflow count increases in recent time window (O-2), add cleanup backlog trend metrics integrated into pgt_metrics_summary (O-3), docs lint comparing #[pg_extern] exports with SQL_REFERENCE.md entries (DOC-1), create docs/DVM_SUPPORT_MATRIX.md with every query pattern, fallback behavior, IMMEDIATE restrictions, and known-unsupported forms including q12/q20 entries (DOC-2), operational rollback runbook (backup requirements, snapshot recommendation, restore path, why downgrades are unsafe) (U-1), document upgrade E2E cutoff policy prominently in CHANGELOG and release notes (U-2), CI gate documentation in CONTRIBUTING.md describing which workflows gate PRs (B-1), review-by dates on cargo-deny advisory suppressions and require cargo-deny in PR gates (B-2), fuzz test for DVM snapshot fingerprint cache stability under OpTree refactoring (P-5), document internal event trigger functions in ARCHITECTURE comments (A-3) | ✅ Released | Large | [Full details](roadmap/v0.80.0.md-full.md) |
 
-### Product Arc & Hardening Gate (v0.81.0 – v0.98.x)
+### Product Arc & Hardening Gate (v0.81.0 - v0.105.x)
 
 The core thing users are buying is not "distributed incremental computation".
 It is:
@@ -481,6 +481,14 @@ memory, WAL, CPU, and foreground write impact. Each feature defines its maximum
 acceptable worst-case regression. Every fallback has a stable reason code,
 diagnostics, and a support-matrix entry.
 
+A September 2026 assessment extends the pre-1.0 sequence beyond v0.98.x. The
+[assessment](plans/pg-trickle-assessment-and-pre-1.0-roadmap.md) keeps the
+PostgreSQL-native architecture and conservative fallbacks, but identifies
+remaining gaps in WAL receipt durability, graph conformance, refresh-path
+parity, product documentation, and release evidence. v0.98.x remains an
+interim stabilization series. v0.99.0 through v0.104.0 close those gaps and
+improve the core IVM engine. v0.105.x performs final qualification.
+
 | Version | Theme | User promise | Status | Scope | Full details |
 |---------|-------|--------------|--------|-------|--------------|
 | [v0.81.0](roadmap/v0.81.0.md) | Observability, Self-Tuning & Quick Wins: commit-to-visible latency metric using pg_xact_commit_timestamp (QW-1), configuration advisor function pgtrickle.tune_recommendations() (QW-2), preview/dry-run mode pgtrickle.preview_stream_table() (QW-3), OpenTelemetry trace spans on scheduler_tick/refresh_cycle/delta_execute/merge_apply with OTLP export (QW-4), bounded LRU eviction on thread-local L0/L1 template caches (QW-5), DeltaOperator trait for extensible operator dispatch (QW-6), split config.rs into config/scheduler.rs + config/cdc.rs + config/dvm.rs + config/monitoring.rs (QW-7), self-healing circuit breaker with auto-remediation for OOM/lock-timeout/sustained-lag (QW-8), chunked MERGE for large deltas with configurable merge_batch_size GUC (QW-9), stream table presets ('real-time'/'batch'/'cost-optimized') (QW-10) | — | ✅ Released | Large | [Full details](roadmap/v0.81.0.md) |
@@ -513,26 +521,35 @@ diagnostics, and a support-matrix entry.
 | [v0.91.0](roadmap/v0.91.0.md) | Schema & Query Evolution: conservative defining-query classification, shadow rebuild and atomic swap, deterministic source-DDL handling, and explicit suspension for unsafe changes | "Production schema and query changes fail safely." | ✅ Released | Large | [Full details](roadmap/v0.91.0.md) |
 | [v0.92.0](roadmap/v0.92.0.md) | Backup, Restore, Upgrade & CDC Recovery: tested logical and physical recovery, clone isolation, machine-readable upgrade preflight, major and extension upgrade coverage, and proof-based CDC recovery classes | "Backups, upgrades, clones, and capture failures preserve correctness." | ✅ Implemented | Large | [Full details](roadmap/v0.92.0.md) |
 | [v0.93.0](roadmap/v0.93.0.md) | Graph Contracts & External Ownership: capability discovery, canonical stream-table and graph contracts, durable `EXTERNAL` orchestration mode, and integration authorization | "Coordinating extensions can treat pg_trickle as a versioned incremental component." | ✅ Implemented | Large | [Full details](roadmap/v0.93.0.md) |
-| [v0.94.0](roadmap/v0.94.0.md) | Strict Transactional Graph Refresh: atomic graph-wide validation, immutable source-boundary manifest, transactional complete graph refresh, and structured node results | "Refresh a private graph atomically inside one transaction with exact boundaries." | Planned | Large | [Full details](roadmap/v0.94.0.md) |
-| [v0.95.0](roadmap/v0.95.0.md) | Durable Typed Output Deltas: typed output-delta relation, consumer registration and cursors, exact-or-invalidation batches, retention and backpressure, and resnapshot | "Consume output changes without private buffers or expensive full scans." | Planned | Large | [Full details](roadmap/v0.95.0.md) |
+| [v0.94.0](roadmap/v0.94.0.md) | Strict Transactional Graph Refresh: atomic graph-wide validation, immutable source-boundary manifest, transactional complete graph refresh, and structured node results | "Refresh a private graph atomically inside one transaction with exact boundaries." | ✅ Released | Large | [Full details](roadmap/v0.94.0.md) |
+| [v0.95.0](roadmap/v0.95.0.md) | Durable Typed Output Deltas: typed output-delta relation, consumer registration and cursors, exact-or-invalidation batches, retention and backpressure, and resnapshot | "Consume output changes without private buffers or expensive full scans." | ✅ Released | Large | [Full details](roadmap/v0.95.0.md) |
 | [v0.96.0](roadmap/v0.96.0.md) | Defaults, Bounds & Diagnosis: resource-based defaults, honest hard-bound, throttled, and forecast-and-react guarantees, progress reporting, stable operational error identifiers, and predefined roles | "I can run this for years without hidden resource or repair behavior." | Planned | Large | [Full details](roadmap/v0.96.0.md) |
-| [v0.97.0](roadmap/v0.97.0.md) | Monitoring, Assurance & Packaging: tested Grafana and OTel contracts, same-commit soak and upgrade matrix, performance gates, a longevity environment, reproducible package smoke tests, and the feature freeze | "I can monitor, verify, install, and upgrade the supported build." | Planned | Large | [Full details](roadmap/v0.97.0.md) |
-| [v0.98.x](roadmap/v0.98.x.md) | Stabilization: blockers, compatibility, tests, diagnostics, packaging, documentation, dependency cleanup, and removal or narrowing of unproven optimizer and controller behavior | "The release candidate contains less risk, not more scope." | Planned | Variable | [Full details](roadmap/v0.98.x.md) |
+| [v0.97.0](roadmap/v0.97.0.md) | Monitoring, Assurance & Packaging: tested Grafana and OTel contracts, same-commit soak and upgrade matrix, performance gates, a longevity environment, reproducible package smoke tests, and a release-evidence baseline | "I can monitor, verify, install, and upgrade the supported build." | Planned | Large | [Full details](roadmap/v0.97.0.md) |
+| [v0.98.x](roadmap/v0.98.x.md) | Interim Stabilization: blockers, compatibility, tests, diagnostics, packaging, documentation, dependency cleanup, and removal or narrowing of unproven optimizer and controller behavior | "The next development baseline contains less risk, not more scope." | Planned | Variable | [Full details](roadmap/v0.98.x.md) |
+| [v0.99.0](roadmap/v0.99.0.md) | Verified Capabilities and Product Truth: executable capability manifest, accurate documentation, graph conformance, and release evidence | "I can determine whether my query will work and how pg_trickle will maintain it." | Planned | Medium | [Full details](roadmap/v0.99.0.md) |
+| [v0.100.0](roadmap/v0.100.0.md) | Unified Transactional IVM Execution: one refresh contract across scheduled, manual, graph, and lifecycle paths | "A graph remains incremental when I refresh it manually or through a coordinator." | Planned | Large | [Full details](roadmap/v0.100.0.md) |
+| [v0.101.0](roadmap/v0.101.0.md) | Exact Relational State and Semantic Depth: incremental multiplicity state, narrow DISTINCT state, numeric fidelity, and deliberate identity coverage | "Ordinary SQL workloads remain incremental through duplicates, deletions, and repeated changes." | Planned | Large | [Full details](roadmap/v0.101.0.md) |
+| [v0.102.0](roadmap/v0.102.0.md) | Output-Sensitive Delta Performance: measured operator locality, better delta statistics, and evidence-gated rewrites | "Small relevant changes avoid unnecessary scans, and expensive refreshes explain their cost." | Planned | Large | [Full details](roadmap/v0.102.0.md) |
+| [v0.103.0](roadmap/v0.103.0.md) | Low-Interference Capture and Workload Control: economical capture, proven lock reductions, fair resource admission, and bounded controller authority | "IVM stays within a visible database budget while pursuing an achievable freshness target." | Planned | Large | [Full details](roadmap/v0.103.0.md) |
+| [v0.104.0](roadmap/v0.104.0.md) | Extension Conformance and Final Feature Freeze: packaged Graph V1 and Delta V1 suites, reference clients, and frozen public contracts | "Other PostgreSQL tools can build on a small, stable contract." | Planned | Medium | [Full details](roadmap/v0.104.0.md) |
+| [v0.105.x](roadmap/v0.105.x.md) | Qualification, Longevity, and 1.0 Candidates: candidate-bound evidence, upgrades, soak, package maintenance, and field validation | "The documented build has passed the documented release conditions." | Planned | Variable | [Full details](roadmap/v0.105.x.md) |
 
 ### Toward v1.0
 
 The mandatory lifecycle path is v0.87.17 → v0.88.0 → v0.91.0 → v0.92.0
 → v0.93.0 → v0.94.0 → v0.95.0 → v0.96.0 → v0.97.0 → v0.98.x
-→ release candidate → v1.0.0.
+→ v0.99.0 → v0.100.0 → v0.101.0 → v0.102.0 → v0.103.0 → v0.104.0
+→ v0.105.x → release candidate → v1.0.0.
 v0.89.0 and v0.90.0 form a parallel performance and product track after
 v0.88.0. Their research and unproven automation do not block lifecycle work.
 
-After v0.97.0 the project stops adding features. v0.98.x is a stabilization-only
-series for bugs, benchmarks, compatibility, upgrades, documentation, real-world
-workloads, and simplification. Unproven optimizer or controller behavior is
-narrowed, disabled, or removed rather than carried into the stable contract.
+v0.98.x is an interim stabilization-only series for bugs, benchmarks,
+compatibility, upgrades, documentation, real-world workloads, and
+simplification. v0.99.0 through v0.104.0 then execute the finite IVM program
+defined by the September 2026 assessment. The final feature freeze begins after
+v0.104.0. v0.105.x accepts only qualification work and release-blocking fixes.
 
-The release-candidate series follows v0.98.x. `v1.0.0-rc.N` ships first, and
+The release-candidate series follows v0.105.x. `v1.0.0-rc.N` ships first, and
 1.0.0 is tagged only after a candidate has been in the field without a new
 blocker. PostgreSQL 19 support is not a 1.0 blocker. PG 19 GA and pgrx support
 are outside this project's control and do not delay the finished PG 18 contract.
@@ -547,8 +564,11 @@ are outside this project's control and do not delay the finished PG 18 contract.
 > V2 encoding, engine integration, and intentional stream-table recreation
 > workflow before vectorized DVM changes begin. v0.91.0 and v0.92.0 split
 > schema evolution from recovery and upgrade work. v0.93.0 through v0.95.0
-> deliver separately gated Graph V1 and Delta V1 contracts; v0.97.0 and
-> v0.98.x separate the final assurance gate from the stabilization period.
+> deliver separately gated Graph V1 and Delta V1 contracts. v0.97.0 establishes
+> the first complete assurance baseline, and v0.98.x stabilizes it before the
+> final IVM program. v0.99.0 through v0.104.0 close the assessed contract,
+> execution, state, performance, workload-control, and extension gaps.
+> v0.105.x qualifies the frozen result.
 
 | Version | Theme | Status | Scope | Full details |
 |---------|-------|--------|------- |---------- |
@@ -725,9 +745,23 @@ v0.88    ─── Safe engine optimization: DiffContext split, narrow vector pa
     │   │
     │   v0.96    ─── Defaults, bounds & diagnosis: resource-based defaults, honest enforcement classes, progress, stable errors, roles
     │   │
-    │   v0.97    ─── Monitoring, assurance & packaging: Grafana/OTel, same-commit soak and upgrade matrix, longevity, package smoke tests, feature freeze
+    │   v0.97    ─── Monitoring, assurance & packaging: Grafana/OTel, same-commit soak and upgrade matrix, longevity, package smoke tests, evidence baseline
     │   │
-    │   v0.98.x  ─── Stabilization: blockers, compatibility, tests, docs, packaging, and removal or narrowing of unproven behavior
+    │   v0.98.x  ─── Interim stabilization: blockers, compatibility, tests, docs, packaging, and narrowing of unproven behavior
+    │   │
+    │   v0.99    ─── Verified capabilities: executable support contract, graph conformance, product and release truth
+    │   │
+    │   v0.100   ─── Unified IVM execution: refresh-path parity, incremental graph composition, strategy enforcement
+    │   │
+    │   v0.101   ─── Exact relational state: set multiplicity, narrow DISTINCT state, numeric fidelity, identity coverage
+    │   │
+    │   v0.102   ─── Output-sensitive performance: locality metrics, delta statistics, evidence-gated rewrites
+    │   │
+    │   v0.103   ─── Low-interference operation: durable WAL receipt, capture economics, lock proof, workload control
+    │   │
+    │   v0.104   ─── Extension conformance and final feature freeze
+    │   │
+    │   v0.105.x ─── Qualification: candidate-bound evidence, longevity, upgrades, packages, field validation
     │   │
     │   v1.0-rc  ─── Release candidates: blockers only, no new features
     │   │
@@ -1036,7 +1070,7 @@ Operational runbooks for upgrade rollback and the upgrade E2E cutoff policy,
 CI gate documentation for contributors, and cargo-deny advisory review-by
 dates complete the pre-v1.0 checklist.
 
-**v0.81.0 through v0.98.x form the Product Arc.** The engine is sound after 16
+**v0.81.0 through v0.105.x form the Product Arc.** The engine is sound after 16
 assessment arcs, though the post-v0.81.0 implementation audit found correctness
 and resilience gaps that require explicit closure first. What is missing beyond
 those gaps is not capability but product: the machinery is broad, and the
@@ -1118,8 +1152,11 @@ canonical contracts and durable external ownership; v0.94.0 completes Graph V1
 with strict transactional refresh. v0.95.0 independently gates durable typed
 output deltas. v0.96.0 defines defaults, resource guarantees, progress,
 diagnostics, and roles. v0.97.0 closes monitoring, soak, compatibility,
-regression, and package gates on one candidate commit, then freezes features.
-v0.98.x removes risk before the release-candidate series.
+regression, and package gates on one candidate commit. v0.98.x stabilizes that
+interim baseline. The September 2026 assessment then drives v0.99.0 through
+v0.105.x: align capabilities with public claims, unify refresh execution, close
+relational-state gaps, improve delta locality and workload coexistence, freeze
+the extension contracts, and qualify the exact release artifacts.
 
 **The distributed work has moved past 1.0.** External workers, external CDC
 consumers, Kubernetes operators, distributed delta computation, cross-cluster
