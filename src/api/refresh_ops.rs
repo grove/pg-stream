@@ -274,6 +274,7 @@ pub(crate) fn execute_manual_refresh(
         false,
         Some(&manual_tick_watermark),
     )?;
+    crate::api::output_delta::begin_capture(st.pgt_id)?;
 
     // TopK tables use the scoped-recomputation refresh path regardless of
     // refresh_mode (they always do ORDER BY … LIMIT N via MERGE).

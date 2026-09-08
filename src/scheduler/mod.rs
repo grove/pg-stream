@@ -3880,6 +3880,15 @@ fn execute_scheduled_refresh(
             return RefreshOutcome::RetryableFailure;
         }
     };
+    if let Err(e) = crate::api::output_delta::begin_capture(st.pgt_id) {
+        log!(
+            "pg_trickle: failed to start output-delta capture for {}.{}: {}",
+            st.pgt_schema,
+            st.pgt_name,
+            e
+        );
+        return RefreshOutcome::RetryableFailure;
+    }
 
     // Compute frontier information for this refresh. FULL-like work locks
     // sources before collecting positions so its baseline is protected.

@@ -1539,7 +1539,8 @@ pub fn count_downstream_st_consumers(pgt_id: i64) -> i64 {
            SELECT pgt_relid FROM pgtrickle.pgt_stream_tables WHERE pgt_id = {pgt_id}\
          ) AND source_type = 'STREAM_TABLE'"
     );
-    Spi::get_one::<i64>(&sql).unwrap_or(Some(0)).unwrap_or(0)
+    let graph_consumers = Spi::get_one::<i64>(&sql).unwrap_or(Some(0)).unwrap_or(0);
+    graph_consumers + i64::from(crate::api::output_delta::has_consumer(pgt_id))
 }
 
 // QUAL-3: CompactionResult moved to src/cdc/compact.rs.

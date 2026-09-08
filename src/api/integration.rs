@@ -150,8 +150,11 @@ pub fn integration_capabilities() -> TableIterator<
             "output_delta_consumer".to_string(),
             1,
             0,
-            false,
-            JsonB(serde_json::json!({"status": "absent", "phase": "v0.95"})),
+            true,
+            JsonB(serde_json::json!({
+                "status": "stable",
+                "phase": "v0.95_durable_typed_output_deltas"
+            })),
         ),
     ])
 }
@@ -492,6 +495,16 @@ fn build_stream_contract(meta: &StreamTableMeta) -> Result<BuiltContract, PgTric
         json,
         sources,
     })
+}
+
+pub(crate) fn stream_contract_digest(
+    meta: &StreamTableMeta,
+) -> Result<(Vec<u8>, i16), PgTrickleError> {
+    let contract = build_stream_contract(meta)?;
+    Ok((
+        contract.digest.to_vec(),
+        meta.row_identity_version.unwrap_or(0),
+    ))
 }
 
 /// Return the versioned semantic contract for one stream table.

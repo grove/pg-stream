@@ -4,7 +4,7 @@
 
 # SQL API Reference — pg_trickle
 
-**155 SQL-callable functions** discovered via `#[pg_extern]` in `src/`.
+**161 SQL-callable functions** discovered via `#[pg_extern]` in `src/`.
 
 See [docs/SQL_REFERENCE.md](SQL_REFERENCE.md) for full signatures and examples.
 
@@ -14,10 +14,13 @@ See [docs/SQL_REFERENCE.md](SQL_REFERENCE.md) for full signatures and examples.
 | `pgtrickle._on_ddl_end()` | `pgtrickle` | `` | > **Internal**: This function is called by PostgreSQL trigger machinery, > not directly by users. |
 | `pgtrickle._on_sql_drop()` | `pgtrickle` | `` | > **Internal**: This function is called by PostgreSQL trigger machinery, > not directly by users. |
 | `pgtrickle._signal_launcher_rescan()` | `pgtrickle` | `` | Also safe to call manually if the launcher needs a nudge. |
+| `pgtrickle.ack_output_delta()` | `pgtrickle` | `text` | Advance a consumer cursor transactionally. |
+| `pgtrickle.ack_output_delta_resnapshot()` | `pgtrickle` | `text` | Commit a resnapshot baseline and activate the consumer. |
 | `pgtrickle.advance_watermark()` | `pgtrickle` | `void` | - **Monotonic:** rejects watermarks that go backward. |
 | `pgtrickle.alter_stream_table()` | `pgtrickle` | `` | Alter properties of an existing stream table. |
 | `pgtrickle.attach_embedding_outbox()` | `pgtrickle` | `` | The `vector_column` parameter documents which column carries the embedding — it is stored in the outbox headers so consumers can identify the embedding field without inspecting the payload. |
 | `pgtrickle.attach_outbox()` | `pgtrickle` | `` | Requires `pg_tide` to be installed. |
+| `pgtrickle.begin_output_delta_resnapshot()` | `pgtrickle` | `SetOf row` | Begin a transaction-scoped full baseline for a consumer. |
 | `pgtrickle.bootstrap_gate_status()` | `pgtrickle` | `SetOf row` | BOOT-F3: Designed for debugging "why isn't my stream table refreshing?" situations by showing the full gate lifecycle at a glance. |
 | `pgtrickle.build_init_decision()` | `pgtrickle` | `(internal)` |  |
 | `pgtrickle.bulk_alter_stream_tables()` | `pgtrickle` | `integer` | # Example ```sql SELECT pgtrickle.bulk_alter_stream_tables(     ARRAY['public.orders_summary', 'public.daily_revenue'],     '{"schedule": "5m", "tier": "warm"}'::jsonb ); ```. |
@@ -86,6 +89,8 @@ See [docs/SQL_REFERENCE.md](SQL_REFERENCE.md) for full signatures and examples.
 | `pgtrickle.list_subscriptions()` | `pgtrickle` | `SetOf row` | Returns a table with columns (stream_table TEXT, channel TEXT, created_at TIMESTAMPTZ). |
 | `pgtrickle.metrics_summary()` | `pgtrickle` | `SetOf row` | v0.80.0 (O-3): Added `cleanup_backlog_count` and `cleanup_blocked_count` — total and blocked entries in `pgt_cleanup_status` for backlog trend monitoring. |
 | `pgtrickle.migrate()` | `pgtrickle` | `text` | This function performs no INSERT, UPDATE, DELETE, or DDL. |
+| `pgtrickle.output_delta_batches()` | `pgtrickle` | `` | Return pending batch metadata in token order. |
+| `pgtrickle.output_delta_consumer_status()` | `pgtrickle` | `SetOf row` | Inspect consumers visible to the current stream-table owner. |
 | `pgtrickle.parallel_job_status()` | `pgtrickle` | `` | Exposed as `pgtrickle.parallel_job_status(max_age_seconds)`. |
 | `pgtrickle.parse_duration_seconds()` | `pgtrickle` | `bigint (nullable)` | Used by SQL views to compare schedule. |
 | `pgtrickle.pause_all()` | `pgtrickle` | `boolean` | Backward-compatible alias for the upgrade boundary. |
@@ -113,6 +118,7 @@ See [docs/SQL_REFERENCE.md](SQL_REFERENCE.md) for full signatures and examples.
 | `pgtrickle.refresh_groups()` | `pgtrickle` | `SetOf row` | Return all user-declared refresh groups with member details. |
 | `pgtrickle.refresh_stream_table()` | `pgtrickle` | `` | Manually trigger a synchronous refresh of a stream table. |
 | `pgtrickle.refresh_timeline()` | `pgtrickle` | `` | Exposed as `pgtrickle.refresh_timeline(limit)`. |
+| `pgtrickle.register_output_delta_consumer()` | `pgtrickle` | `` | Register an owner-only cursor over one external stream table. |
 | `pgtrickle.reinitialize_stream_table()` | `pgtrickle` | `text` | Reinitialize a stream table after a source schema change. |
 | `pgtrickle.reliability_counters()` | `pgtrickle` | `SetOf row` | Exposed as `pgtrickle.reliability_counters()`. |
 | `pgtrickle.repair_stream_table()` | `pgtrickle` | `text` | Steps performed (actions taken are summarized in the return text): 1. |

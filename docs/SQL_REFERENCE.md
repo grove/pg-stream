@@ -1640,8 +1640,8 @@ infrastructure, and schedules a protected full refresh.
 ## Integration Contracts
 
 The v0.94 contract APIs expose stable, typed metadata and strict transactional
-graph refresh for integrations. Output-delta delivery remains disabled until
-v0.95.
+graph refresh for integrations. Durable output-delta delivery is available in
+v0.95.0.
 
 ### pgtrickle.integration_capabilities
 
@@ -1691,6 +1691,38 @@ FROM pgtrickle.graph_contract(ARRAY['public.orders_total'::regclass]);
 
 ### pgtrickle.refresh_graph_strict
 
+### pgtrickle.register_output_delta_consumer
+
+Registers an owner-scoped cursor for an `EXTERNAL` stream table. Pass the
+stream-table contract digest returned by `stream_table_contract`; new
+consumers start in `RESNAPSHOT_REQUIRED` unless the stream table is pristine
+and `CURRENT` is explicitly requested.
+
+### pgtrickle.output_delta_batches
+
+Returns contiguous output-delta batch metadata for a consumer. Exact batches
+are read from the typed relation named by `delta_relation`; invalidated batches
+require a resnapshot before acknowledgement.
+
+### pgtrickle.ack_output_delta
+
+Advances a consumer through a contiguous token range with `APPLIED` or
+`RESYNCHRONIZED` disposition.
+
+### pgtrickle.begin_output_delta_resnapshot
+
+Captures a transaction-scoped output-log head and returns a resnapshot token.
+
+### pgtrickle.ack_output_delta_resnapshot
+
+Commits the resnapshot token and activates the consumer at the captured log
+head.
+
+### pgtrickle.output_delta_consumer_status
+
+Lists the current owner-visible consumer state, cursor, lag, and contract
+metadata.
+
 Validate and refresh the complete upstream closure of `EXTERNAL` roots in
 topological order inside the caller's transaction.
 
@@ -1706,8 +1738,8 @@ The expected digest is mandatory. The function rejects stale contracts,
 unsupported members, ownership failures, and busy or changed catalog state
 before executing any member. It does not commit.
 
-The `external_graph_refresh` capability is stable in v0.94;
-`output_delta_consumer` remains absent until v0.95.
+The `external_graph_refresh` capability is stable in v0.94, and
+`output_delta_consumer` is stable in v0.95.
 
 ---
 

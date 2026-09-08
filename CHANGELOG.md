@@ -37,6 +37,7 @@ The cutoff exists because:
 
 <!-- TOC start -->
 - [Unreleased](#unreleased)
+- [0.95.0 — Durable Typed Output Deltas](#0950--durable-typed-output-deltas)
 - [0.94.0 — Strict Transactional Graph Refresh](#0940--strict-transactional-graph-refresh)
 - [0.93.0 — Graph Contracts and External Ownership](#0930--graph-contracts-and-external-ownership)
 - [0.92.0 — Backup, Restore, Upgrade & CDC Recovery](#0920--backup-restore-upgrade--cdc-recovery)
@@ -217,6 +218,13 @@ refresh.
   scheduler exclusion for externally coordinated tables.
 - Adds the 0.92.0 → 0.93.0 migration, full-install archive, and upgrade runbook.
 - Output deltas remain the v0.95.0 gate.
+
+## [0.95.0] — Durable Typed Output Deltas
+
+v0.95.0 adds durable, typed output-delta consumers for externally orchestrated
+stream tables. Consumers register against a contract digest, read contiguous
+transactional batches, acknowledge applied or resynchronized positions, and
+recover through an explicit resnapshot when exact deltas are unavailable.
 
 ## [0.94.0] — Strict Transactional Graph Refresh
 
