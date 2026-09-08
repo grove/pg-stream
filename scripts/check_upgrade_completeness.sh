@@ -87,9 +87,9 @@ ERRORS=0
 # with optional extra whitespace (pgrx generates double spaces sometimes)
 extract_functions() {
     local sqlfile="$1"
-    # Match: CREATE [OR REPLACE] FUNCTION pgtrickle."name"
-    grep -oE 'CREATE\s+(OR\s+REPLACE\s+)?FUNCTION\s+pgtrickle\."[^"]+"' "$sqlfile" 2>/dev/null \
-        | sed -E 's/.*pgtrickle\."([^"]+)".*/\1/' \
+    # Match pgrx's quoted names and hand-written SQL's unquoted names.
+    grep -oE 'CREATE\s+(OR\s+REPLACE\s+)?FUNCTION\s+pgtrickle\.("[^"]+"|[a-z_][a-z0-9_]*)' "$sqlfile" 2>/dev/null \
+        | sed -E 's/.*pgtrickle\."([^"]+)"/\1/; s/.*pgtrickle\.([a-z_][a-z0-9_]*)/\1/' \
         | sort -u
 }
 
