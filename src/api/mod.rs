@@ -23,6 +23,7 @@ use crate::wal_decoder;
 
 pub(crate) mod integration;
 pub(crate) mod outbox;
+pub(crate) mod output_delta;
 pub(crate) mod publication;
 pub(crate) mod scheduler_control;
 pub(crate) mod spec;
