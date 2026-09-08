@@ -3,8 +3,8 @@
   "purpose": "v1.0 upgrade E2E support boundary",
   "postgresql_majors": [18],
   "source_version_lower_bound": "0.40.0",
-  "source_version_upper_bound": "0.98.x",
-  "latest_released_source_version": "0.93.0",
+  "source_version_upper_bound": "0.105.x",
+  "latest_released_source_version": "0.95.0",
   "supported_source_versions": [
     "0.40.0",
     "0.41.0",
@@ -78,8 +78,10 @@
     "0.90.0",
     "0.91.0",
     "0.92.0",
-    "0.93.0"
+    "0.93.0",
+    "0.94.0",
+    "0.95.0"
   ],
   "pair_policy": "Every supported source version is tested against PostgreSQL 18 with active stream tables and pending deltas.",
-  "future_release_policy": "When a 0.98.x release exists, add it only after its migration and E2E path pass; versions outside the bounded range are unsupported."
+  "future_release_policy": "Add each release through 0.105.x only after its migration and E2E path pass; versions outside the bounded range are unsupported."
 }
