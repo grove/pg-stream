@@ -30,29 +30,34 @@ IMAGE_TAG="latest"
 BUILDER_IMAGE="${BUILDER_IMAGE:-pg_trickle_builder:pg18}"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+DOCKER_PLATFORM="${DOCKER_PLATFORM:-${DOCKER_DEFAULT_PLATFORM:-linux/$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/')}}"
 
 # Pass through any extra args (e.g. --no-cache)
 EXTRA_ARGS="${*:-}"
 
 # ── Ensure the builder base image is available ───────────────────────────────
-# Skip this check when --no-cache is given (the caller wants a full scratch
-# build, so we don't want to rebuild the builder separately first).
-if [[ "${EXTRA_ARGS}" != *"--no-cache"* ]]; then
-    BUILDER_EXISTS=$(docker image inspect "${BUILDER_IMAGE}" \
-        --format='{{.Os}}/{{.Architecture}}' 2>/dev/null || echo "")
+# Keep the compiler and runtime architectures identical. This also catches a
+# stale local builder when DOCKER_DEFAULT_PLATFORM selects another target.
+BUILDER_EXISTS=$(docker image inspect "${BUILDER_IMAGE}" \
+    --format='{{.Os}}/{{.Architecture}}' 2>/dev/null || echo "")
+if [[ "${BUILDER_EXISTS}" != "${DOCKER_PLATFORM}" ]]; then
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     if [[ -z "${BUILDER_EXISTS}" ]]; then
-        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
         echo "  Builder image not found: ${BUILDER_IMAGE}"
-        echo "  Building it now (one-time, ~7 min) …"
-        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-        docker build \
-            --provenance=false \
-            -t "${BUILDER_IMAGE}" \
-            -f "${SCRIPT_DIR}/Dockerfile.builder" \
-            "${PROJECT_ROOT}"
     else
-        echo "  Builder image present (${BUILDER_EXISTS}): ${BUILDER_IMAGE}"
+        echo "  Builder image platform mismatch: got ${BUILDER_EXISTS}, need ${DOCKER_PLATFORM}"
     fi
+    echo "  Building it now for ${DOCKER_PLATFORM} …"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    docker build \
+        --platform "${DOCKER_PLATFORM}" \
+        --load \
+        --provenance=false \
+        -t "${BUILDER_IMAGE}" \
+        -f "${SCRIPT_DIR}/Dockerfile.builder" \
+        "${PROJECT_ROOT}"
+else
+    echo "  Builder image present (${BUILDER_EXISTS}): ${BUILDER_IMAGE}"
 fi
 
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
@@ -63,6 +68,7 @@ echo "  Builder image: ${BUILDER_IMAGE}"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
 docker build \
+    --platform "${DOCKER_PLATFORM}" \
     -t "${IMAGE_NAME}:${IMAGE_TAG}" \
     -f "${SCRIPT_DIR}/Dockerfile.e2e" \
     --build-arg "BUILDER_IMAGE=${BUILDER_IMAGE}" \

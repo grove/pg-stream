@@ -526,7 +526,7 @@ freeze the core IVM engine. v0.105.x performs final qualification.
 | [v0.96.0](roadmap/v0.96.0.md) | Defaults, Bounds & Diagnosis: resource-based defaults, honest hard-bound, throttled, and forecast-and-react guarantees, progress reporting, stable operational error identifiers, and predefined roles | "I can run this for years without hidden resource or repair behavior." | ✅ Released | Large | [Full details](roadmap/v0.96.0.md) |
 | [v0.97.0](roadmap/v0.97.0.md) | Monitoring, Assurance & Packaging: tested Grafana and OTel contracts, same-commit soak and upgrade matrix, performance gates, a longevity environment, reproducible package smoke tests, and a release-evidence baseline | "I can monitor, verify, install, and upgrade the supported build." | ✅ Released | Large | [Full details](roadmap/v0.97.0.md) |
 | [v0.98.0](roadmap/v0.98.0.md) | Risk Containment and Contract Truth: safe capture defaults, fail-closed Graph V1 and Delta V1 admission, operational contract repair, and a fixed qualification contract | "Known correctness risks are fixed or unavailable in stable operation." | Planned | Medium | [Full details](roadmap/v0.98.0.md) |
-| [v0.98.1](roadmap/v0.98.1.md) | Qualified Interim Baseline: candidate-bound correctness, upgrades, packages, soak, longevity, performance gates, and release evidence | "The published build passed its required tests on the artifact that ships." | Planned | Large | [Full details](roadmap/v0.98.1.md) |
+| [v0.98.1](roadmap/v0.98.1.md) | Qualified Interim Baseline: candidate-bound correctness, upgrades, packages, longevity, performance gates, and release evidence | "The published build passed its required tests on the artifact that ships." | Planned | Large | [Full details](roadmap/v0.98.1.md) |
 | [v0.99.0](roadmap/v0.99.0.md) | Verified Capabilities and Product Truth: executable capability manifest, accurate documentation, verified Graph and Delta declarations, and release evidence | "I can determine whether my query will work and how pg_trickle will maintain it." | Planned | Medium | [Full details](roadmap/v0.99.0.md) |
 | [v0.100.0](roadmap/v0.100.0.md) | Unified Transactional IVM Execution: one refresh contract across scheduled, manual, graph, and lifecycle paths | "A graph remains incremental when I refresh it manually or through a coordinator." | Planned | Large | [Full details](roadmap/v0.100.0.md) |
 | [v0.101.0](roadmap/v0.101.0.md) | Exact Relational State and Semantic Depth: incremental multiplicity state, narrow DISTINCT state, numeric fidelity, and deliberate identity coverage | "Ordinary SQL workloads remain incremental through duplicates, deletions, and repeated changes." | Planned | Large | [Full details](roadmap/v0.101.0.md) |
@@ -752,7 +752,7 @@ v0.88    ─── Safe engine optimization: DiffContext split, narrow vector pa
     │   │
     │   v0.98.0  ─── Risk containment: safe capture defaults, contract truth, fail-closed Graph and Delta behavior, qualification contract
     │   │
-    │   v0.98.1  ─── Qualified baseline: exact-candidate qualification, upgrades, packages, 72-hour soak, performance, and evidence
+    │   v0.98.1  ─── Qualified baseline: exact-candidate qualification, upgrades, packages, longevity, performance, and evidence
     │   │
     │   v0.99    ─── Verified capabilities: executable support contract, truthful Graph and Delta declarations, product and release truth
     │   │
