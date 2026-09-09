@@ -4,7 +4,7 @@
 
 # SQL API Reference — pg_trickle
 
-**164 SQL-callable functions** discovered via `#[pg_extern]` in `src/`.
+**167 SQL-callable functions** discovered via `#[pg_extern]` in `src/`.
 
 See [docs/SQL_REFERENCE.md](SQL_REFERENCE.md) for full signatures and examples.
 
@@ -23,7 +23,6 @@ See [docs/SQL_REFERENCE.md](SQL_REFERENCE.md) for full signatures and examples.
 | `pgtrickle.attach_outbox()` | `pgtrickle` | `` | Requires `pg_tide` to be installed. |
 | `pgtrickle.begin_output_delta_resnapshot()` | `pgtrickle` | `SetOf row` | Begin a transaction-scoped full baseline for a consumer. |
 | `pgtrickle.bootstrap_gate_status()` | `pgtrickle` | `SetOf row` | BOOT-F3: Designed for debugging "why isn't my stream table refreshing?" situations by showing the full gate lifecycle at a glance. |
-| `pgtrickle.build_init_decision()` | `pgtrickle` | `(internal)` |  |
 | `pgtrickle.bulk_alter_stream_tables()` | `pgtrickle` | `integer` | # Example ```sql SELECT pgtrickle.bulk_alter_stream_tables(     ARRAY['public.orders_summary', 'public.daily_revenue'],     '{"schedule": "5m", "tier": "warm"}'::jsonb ); ```. |
 | `pgtrickle.bulk_create()` | `pgtrickle` | `jsonb` | On any error, the entire transaction is rolled back (standard PostgreSQL transactional semantics). |
 | `pgtrickle.bulk_drop_stream_tables()` | `pgtrickle` | `integer` | # Example ```sql SELECT pgtrickle.bulk_drop_stream_tables(     ARRAY['public.orders_summary', 'public.stale_view'] ); ```. |
@@ -78,6 +77,7 @@ See [docs/SQL_REFERENCE.md](SQL_REFERENCE.md) for full signatures and examples.
 | `pgtrickle.gate_source()` | `pgtrickle` | `void` | `source` is the source table name, optionally schema-qualified. |
 | `pgtrickle.get_refresh_history()` | `pgtrickle` | `` | Exposed as `pgtrickle.get_refresh_history(name, limit)`. |
 | `pgtrickle.get_staleness()` | `pgtrickle` | `double precision (nullable)` |  |
+| `pgtrickle.graph_contract()` | `pgtrickle` | `SetOf row` | Return a canonical contract for the complete upstream closure of roots. |
 | `pgtrickle.handle_vp_promoted()` | `pgtrickle` | `boolean` | Returns `true` if the payload was valid and a matching source was found; `false` if the payload was invalid or no source matched. |
 | `pgtrickle.health_check()` | `pgtrickle` | `SetOf row` | Exposed as `pgtrickle.health_check()`. |
 | `pgtrickle.health_summary()` | `pgtrickle` | `SetOf row` | Exposed as `pgtrickle.health_summary()`. |
@@ -118,6 +118,7 @@ See [docs/SQL_REFERENCE.md](SQL_REFERENCE.md) for full signatures and examples.
 | `pgtrickle.recommend_target_freshness()` | `pgtrickle` | `SetOf row` | v0.90.0: Recommend a target from exact settled p95 evidence without changing the stream table or collecting new cost data. |
 | `pgtrickle.recover_capture_instance()` | `pgtrickle` | `text` | Adopt the current database as a new capture owner after an explicit clone recovery. |
 | `pgtrickle.refresh_efficiency()` | `pgtrickle` | `SetOf row (failable)` | Returns operational metrics for each stream table: FULL vs DIFFERENTIAL timing, change ratios, speedup factor, and refresh counts. |
+| `pgtrickle.refresh_graph_strict()` | `pgtrickle` | `` | Admission and locking happen before the first member executes. |
 | `pgtrickle.refresh_groups()` | `pgtrickle` | `SetOf row` | Return all user-declared refresh groups with member details. |
 | `pgtrickle.refresh_stream_table()` | `pgtrickle` | `` | Manually trigger a synchronous refresh of a stream table. |
 | `pgtrickle.refresh_timeline()` | `pgtrickle` | `` | Exposed as `pgtrickle.refresh_timeline(limit)`. |
@@ -136,6 +137,7 @@ See [docs/SQL_REFERENCE.md](SQL_REFERENCE.md) for full signatures and examples.
 | `pgtrickle.schedule_recommendations()` | `pgtrickle` | `SetOf row` | PLAN-2 (v0.27.0): Return one schedule recommendation row per registered stream table, sortable by `delta_pct DESC`. |
 | `pgtrickle.scheduler_overhead()` | `pgtrickle` | `SetOf row` | Computes busy-time ratio, queue depth, avg dispatch latency, and the fraction of CPU spent on self-monitoring STs vs user STs from refresh history. |
 | `pgtrickle.self_monitoring_status()` | `pgtrickle` | `SetOf row` | For each of the five expected DF stream tables, reports whether it exists, its current status, refresh mode, and last refresh time. |
+| `pgtrickle.set_orchestration_mode()` | `pgtrickle` | `text` | Change durable refresh ownership for one stream table. |
 | `pgtrickle.set_stream_table_refresh_policy()` | `pgtrickle` | `` | # Example ```sql SELECT pgtrickle.set_stream_table_refresh_policy('my_schema.my_st', 'DIFFERENTIAL'); ```. |
 | `pgtrickle.set_stream_table_sla()` | `pgtrickle` | `` | Accepts an interval and stores it as `freshness_deadline_ms`. |
 | `pgtrickle.set_stream_table_storage_policy()` | `pgtrickle` | `` | # Example ```sql SELECT pgtrickle.set_stream_table_storage_policy('my_schema.my_st', true, 'hot'); ```. |
@@ -150,6 +152,7 @@ See [docs/SQL_REFERENCE.md](SQL_REFERENCE.md) for full signatures and examples.
 | `pgtrickle.st_refresh_stats()` | `pgtrickle` | `SetOf row` | This is the primary monitoring function, exposed as `pgtrickle.st_refresh_stats()`. |
 | `pgtrickle.stat_reset()` | `pgtrickle` | `` | Reset cumulative diagnostics for one owned stream table without deleting immutable refresh history or operational error state. |
 | `pgtrickle.stat_reset_all()` | `pgtrickle` | `` | Reset cumulative diagnostics for all stream tables. |
+| `pgtrickle.stream_table_contract()` | `pgtrickle` | `SetOf row` | Return the versioned semantic contract for one stream table. |
 | `pgtrickle.stream_table_lineage()` | `pgtrickle` | `SetOf row` | # Example ```sql SELECT * FROM pgtrickle.stream_table_lineage('public.revenue_summary'); ```. |
 | `pgtrickle.stream_table_spec()` | `pgtrickle` | `jsonb (nullable)` | Example: ```sql SELECT pgtrickle.stream_table_spec('public.my_view'::regclass); ```. |
 | `pgtrickle.stream_table_spec()` | `pgtrickle` | `jsonb (nullable)` | Example: ```sql SELECT pgtrickle.stream_table_spec('public.my_view'); ```. |

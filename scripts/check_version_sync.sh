@@ -208,12 +208,12 @@ else
     check_fail "META.json .provides.pg_trickle.version ($META_PROVIDES) != Cargo.toml ($VERSION)"
 fi
 
-# 9. The active v0.98 qualification contract must target this release.
-QUALIFICATION_VERSION="$(python3 -c 'import json; print(json.load(open("tests/release/v0.98-qualification.json", encoding="utf-8")).get("release_version", ""))')"
-if [[ "$QUALIFICATION_VERSION" == "$VERSION" ]]; then
-    check_pass "v0.98 qualification contract version = $QUALIFICATION_VERSION"
+# 9. The generated v0.99 capability manifest must target this release.
+CAPABILITY_MANIFEST_VERSION="$(python3 -c 'import json; print(json.load(open("docs/capability-manifest.json", encoding="utf-8")).get("release_version", ""))')"
+if [[ "$CAPABILITY_MANIFEST_VERSION" == "$VERSION" ]]; then
+    check_pass "capability manifest release version = $CAPABILITY_MANIFEST_VERSION"
 else
-    check_fail "v0.98 qualification contract version ($QUALIFICATION_VERSION) != $VERSION"
+    check_fail "capability manifest release version ($CAPABILITY_MANIFEST_VERSION) != $VERSION"
 fi
 
 # 10. Source control template must either use @CARGO_VERSION@ or match directly

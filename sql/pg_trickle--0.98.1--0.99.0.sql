@@ -1,0 +1,4 @@
+-- pg_trickle 0.98.1 -> 0.99.0 upgrade migration
+--
+-- v0.99.0 adds documentation and release-contract artifacts only. The SQL
+-- schema is unchanged, so no catalog migration is required.

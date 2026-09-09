@@ -1,5 +1,8 @@
 # Citus Distributed Tables
 
+Check the [capability manifest](../capability-manifest.json) before enabling
+integration paths; it records the current release's runnable admission state.
+
 pg_trickle supports Citus distributed tables as **sources** for incremental
 view maintenance and as **output targets** for stream tables.
 
