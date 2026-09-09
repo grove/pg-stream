@@ -1743,6 +1743,17 @@ fn recover_from_crash() {
 fn check_cdc_transition_health() {
     use crate::catalog::StDependency;
 
+    if crate::wal_decoder::wal_capture_is_disabled() {
+        let change_schema = crate::config::pg_trickle_change_buffer_schema();
+        if let Err(error) = crate::wal_decoder::reconcile_legacy_wal_sources(&change_schema) {
+            log!(
+                "pg_trickle: legacy WAL CDC reconciliation requires operator repair: {}",
+                error
+            );
+        }
+        return;
+    }
+
     let deps = match StDependency::get_all() {
         Ok(d) => d,
         Err(e) => {

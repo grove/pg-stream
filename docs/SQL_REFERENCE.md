@@ -255,7 +255,7 @@ pgtrickle.create_stream_table(
 | `initialize` | `bool` | `true` | If `true`, populates the table immediately via a full refresh. If `false`, creates the table empty. |
 | `diamond_consistency` | `text` | `NULL` (defaults to `'atomic'`) | Diamond dependency consistency mode: `'atomic'` (SAVEPOINT-based atomic group refresh) or `'none'` (independent refresh). |
 | `diamond_schedule_policy` | `text` | `NULL` (defaults to `'fastest'`) | Schedule policy for atomic diamond groups: `'fastest'` (fire when any member is due) or `'slowest'` (fire when all are due). Set on the convergence node. |
-| `cdc_mode` | `text` | `NULL` (use `pg_trickle.cdc_mode`) | Optional per-stream-table CDC override: `'auto'`, `'trigger'`, or `'wal'`. This affects all deferred TABLE sources of the stream table. |
+| `cdc_mode` | `text` | `NULL` (use `pg_trickle.cdc_mode`) | Optional per-stream-table CDC override: `'auto'`, `'trigger'`, or `'wal'`. In v0.98, `auto` aliases `trigger` and `wal` is rejected as unavailable. |
 | `append_only` | `bool` | `false` | When `true`, differential refreshes use a fast INSERT path instead of MERGE. Skips DELETE/UPDATE/IS DISTINCT FROM checks. If a DELETE or Update is later detected in the change buffer, the flag is automatically reverted to `false`. Not compatible with `FULL`, `IMMEDIATE`, or keyless sources. |
 | `pooler_compatibility_mode` | `bool` | `false` | When `true`, the refresh engine uses inline SQL instead of `PREPARE`/`EXECUTE` and suppresses all `NOTIFY` emissions for this stream table. Enable this when the stream table is accessed through a transaction-mode connection pooler (e.g. PgBouncer). |
 | `partition_by` | `text` | `NULL` | Partition key column. When set, the storage table is created with `PARTITION BY RANGE (column)`. Only effective at creation time. |
@@ -268,10 +268,8 @@ pgtrickle.create_stream_table(
 
 When `refresh_mode => 'IMMEDIATE'`, the cluster-wide `pg_trickle.cdc_mode`
 setting is ignored. IMMEDIATE mode always uses statement-level IVM triggers
-instead of CDC triggers or WAL replication slots. If you explicitly pass
-`cdc_mode => 'wal'` together with `refresh_mode => 'IMMEDIATE'`, pg_trickle
-rejects the call because WAL CDC is asynchronous and incompatible with
-in-transaction maintenance.
+instead of CDC triggers or WAL replication slots. If the effective or explicit
+CDC mode is `wal`, pg_trickle rejects the call with `PGT_EXT_CDC_UNAVAILABLE`.
 
 **Duration format:**
 
@@ -348,13 +346,13 @@ SELECT pgtrickle.create_stream_table(
     refresh_mode => 'IMMEDIATE'
 );
 
--- Force WAL CDC for this stream table even if the global GUC is 'trigger'
+-- WAL CDC is unavailable in v0.98; use trigger capture
 SELECT pgtrickle.create_stream_table(
-    name         => 'wal_orders',
+    name         => 'orders_capture',
     query        => 'SELECT id, amount FROM orders',
     schedule     => '1s',
     refresh_mode => 'DIFFERENTIAL',
-    cdc_mode     => 'wal'
+    cdc_mode     => 'trigger'
 );
 ```
 
@@ -1185,11 +1183,9 @@ pgtrickle.alter_stream_table(
 | `reindex_drift_threshold` | `float8` | `NULL` | Index drift ratio threshold (0.0–1.0) for `post_refresh_action = 'reindex'`. Pass `NULL` to leave unchanged. |
 
 If you switch a stream table to `refresh_mode => 'IMMEDIATE'` while the
-cluster-wide `pg_trickle.cdc_mode` GUC is set to `'wal'`, pg_trickle logs an
-INFO and proceeds with IVM triggers. WAL CDC does not apply to IMMEDIATE mode.
-If the stream table has an explicit `cdc_mode => 'wal'` override, switching to
-`IMMEDIATE` is rejected until you change the requested CDC mode back to
-`'auto'` or `'trigger'`.
+cluster-wide `pg_trickle.cdc_mode` GUC is set to `'wal'`, pg_trickle rejects the
+call with `PGT_EXT_CDC_UNAVAILABLE`. Change the setting to `'trigger'` (or the
+compatibility alias `'auto'`) before retrying.
 
 **Examples:**
 
@@ -1724,7 +1720,8 @@ Lists the current owner-visible consumer state, cursor, lag, and contract
 metadata.
 
 Validate and refresh the complete upstream closure of `EXTERNAL` roots in
-topological order inside the caller's transaction.
+topological order inside the caller's transaction. These integration APIs are
+discoverable but fail closed in v0.98 until their assigned conformance releases.
 
 ```sql
 SELECT * FROM pgtrickle.refresh_graph_strict(
@@ -1738,8 +1735,10 @@ The expected digest is mandatory. The function rejects stale contracts,
 unsupported members, ownership failures, and busy or changed catalog state
 before executing any member. It does not commit.
 
-The `external_graph_refresh` capability is stable in v0.94, and
-`output_delta_consumer` is stable in v0.95.
+The `external_graph_refresh` and `output_delta_consumer` capabilities report
+`experimental` and `enabled = false` in v0.98. Calls fail before locks,
+catalog mutation, cursor movement, or payload generation with
+`PGT_EXT_CAPABILITY_DISABLED`.
 
 ---
 
@@ -1813,8 +1812,8 @@ row.
 
 ### pgtrickle.active_profile
 
-Report the resource constraints detected by pg_trickle and the selected
-effective values.
+Report configured values, runtime recommendations, and effective values. An
+effective value is populated only when the runtime admission path uses it.
 
 ```sql
 pgtrickle.active_profile() → SETOF record(
@@ -1830,28 +1829,30 @@ pgtrickle.active_profile() → SETOF record(
 
 The profile reports cgroup/procfs memory when available, CPU parallelism, and
 PostgreSQL worker, connection, and shared-buffer settings. Extension-managed
-memory is a hard bound; worker admission is throttled; storage and WAL growth
-are forecast-and-react signals.
+memory is a hard bound; worker admission is throttled. Automatic memory is
+represented by the documented sentinel and the selected runtime value is
+reported separately.
 
 ### pgtrickle.disk_usage
 
 Report per-stream-table relation size, associated pending CDC storage, the
-projected footprint, and configured forecast headroom.
+accounted extension footprint, and configured headroom.
 
 ```sql
 pgtrickle.disk_usage() → SETOF record(
     stream_table text,
     relation_bytes bigint,
     change_buffer_bytes bigint,
-    projected_bytes bigint,
+    accounted_bytes bigint,
     headroom_bytes bigint,
     pressure_state text
 )
 ```
 
 `pressure_state` is `OK`, `WARN`, `OVER_HEADROOM`, or `DISABLED`. Configure
-the warning threshold with `pg_trickle.disk_headroom_mb`; this is not an
-absolute bound on PostgreSQL or continued source activity.
+the warning threshold with `pg_trickle.disk_headroom_mb`; this is an accounted
+footprint signal, not a forecast or an absolute bound on PostgreSQL or source
+activity.
 
 ### pgtrickle.error_catalog
 
@@ -3470,10 +3471,9 @@ marks affected stream tables for reinitialize. This ensures pre-existing rows
 in the newly attached partition are included on the next refresh. DETACH
 PARTITION is also detected and triggers reinitialization.
 
-**WAL mode:** When using WAL-based CDC (`cdc_mode = 'wal'`), publications for
-partitioned source tables are created with `publish_via_partition_root = true`.
-This ensures changes from child partitions are published under the parent
-table's identity, matching trigger-mode CDC behavior.
+**WAL mode:** unavailable in v0.98. `cdc_mode = 'wal'` is rejected with
+`PGT_EXT_CDC_UNAVAILABLE`; use trigger capture. Durable WAL receipt is planned
+for v0.103.0.
 
 > **Note:** pg_trickle targets PostgreSQL 18. On PostgreSQL 12 or earlier (not supported), parent triggers do **not** fire for partition-routed rows, which would cause silent data loss.
 
@@ -3561,7 +3561,7 @@ Tables that receive data via **logical replication** require special considerati
 pg_trickle emits a **WARNING** at stream table creation time if any source table is detected as a logical replication target (via `pg_subscription_rel`).
 
 **Workarounds:**
-- Use `cdc_mode = 'wal'` for WAL-based CDC that captures all changes regardless of origin.
+- WAL CDC is unavailable in v0.98; use `FULL` refresh mode for logical-replication targets.
 - Use `FULL` refresh mode, which recomputes entirely from the current table state.
 - Set a frequent refresh schedule with FULL mode to limit staleness.
 
@@ -3805,8 +3805,9 @@ SELECT * FROM pgtrickle.pg_stat_progress_pgtrickle;
 ```
 
 Each row has a stable `operation_id` (the refresh-history identifier), phase,
-processed and estimated rows, elapsed time, and the last progress timestamp.
-The view is empty when no refresh is currently running.
+processed and estimated rows, elapsed time, and `last_progress_at`. In v0.98
+the view does not emit a live heartbeat, so `last_progress_at` is `NULL` while
+an operation is running. The view is empty when no refresh is currently running.
 
 ### pgtrickle.pg_stat_stream_tables
 

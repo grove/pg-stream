@@ -63,8 +63,8 @@ jobs:
       - name: v0.96 defaults and diagnosis release gate
         run: python3 scripts/v0_96_release_gate.py
 
-      - name: v0.97 monitoring and assurance release gate
-        run: python3 scripts/v0_97_release_gate.py
+      - name: v0.98 qualification contract gate
+        run: python3 scripts/v0_98_qualification_gate.py
 
       - name: Validate monitoring contract
         run: python3 scripts/check_monitoring_contract.py
@@ -378,8 +378,7 @@ jobs:
             --suite version-sync=passed \
             --suite package-smoke=passed \
             --suite monitoring-contract=passed \
-            --skipped release-soak-72h=external-environment \
-            --skipped full-upgrade-matrix=scheduled-or-manual
+            --suite release-artifact-smoke=passed
 
       - name: Generate checksums
         run: |

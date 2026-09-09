@@ -110,6 +110,9 @@ pub(crate) fn set_orchestration_mode_for_meta(
 )]
 #[search_path(pgtrickle, pg_catalog, pg_temp)]
 pub fn set_orchestration_mode(stream_table: pg_sys::Oid, mode: &str) -> String {
+    if let Err(error) = super::require_v098_capability(super::GRAPH_V1_CAPABILITY) {
+        raise(error);
+    }
     let meta = match StreamTableMeta::get_by_relid(stream_table) {
         Ok(meta) => meta,
         Err(error) => raise(error),
@@ -134,26 +137,30 @@ pub fn integration_capabilities() -> TableIterator<
 > {
     TableIterator::new(vec![
         (
-            "external_graph_refresh".to_string(),
+            super::GRAPH_V1_CAPABILITY.to_string(),
             1,
             0,
-            true,
+            false,
             JsonB(serde_json::json!({
-                "status": "stable",
-                "phase": "v0.94_strict_transactional_refresh",
+                "status": "experimental",
+                "enabled": false,
+                "phase": "v0.98_fail_closed",
+                "unavailable_reason": "disabled until v0.100.0 Graph V1 implementation and conformance",
                 "refresh_api": "refresh_graph_strict",
                 "max_graph_members": 1024,
-                "source_boundary": "local_trigger_or_wal"
+                "source_boundary": "local_trigger"
             })),
         ),
         (
-            "output_delta_consumer".to_string(),
+            super::DELTA_V1_CAPABILITY.to_string(),
             1,
             0,
-            true,
+            false,
             JsonB(serde_json::json!({
-                "status": "stable",
-                "phase": "v0.95_durable_typed_output_deltas"
+                "status": "experimental",
+                "enabled": false,
+                "phase": "v0.98_fail_closed",
+                "unavailable_reason": "disabled until v0.104.0 Delta V1 implementation and conformance"
             })),
         ),
     ])
@@ -525,6 +532,9 @@ pub fn stream_table_contract(
         name!(contract, JsonB),
     ),
 > {
+    if let Err(error) = super::require_v098_capability(super::GRAPH_V1_CAPABILITY) {
+        raise(error);
+    }
     let meta = match StreamTableMeta::get_by_relid(stream_table) {
         Ok(meta) => meta,
         Err(error) => raise(integration_error(
@@ -739,6 +749,9 @@ pub fn graph_contract(
         name!(contract, JsonB),
     ),
 > {
+    if let Err(error) = super::require_v098_capability(super::GRAPH_V1_CAPABILITY) {
+        raise(error);
+    }
     match graph_contract_data(&roots) {
         Ok(row) => TableIterator::once(row),
         Err(error) => raise(error),
@@ -844,6 +857,7 @@ pub fn refresh_graph_strict(
     ),
 > {
     let result = (|| -> Result<_, PgTrickleError> {
+        super::require_v098_capability(super::GRAPH_V1_CAPABILITY)?;
         let policy = full_policy.trim().to_ascii_uppercase();
         if !matches!(policy.as_str(), "ALLOW" | "ERROR") {
             return Err(integration_error(

@@ -2056,17 +2056,15 @@ impl StDependency {
 
     /// Resolve the effective CDC request for a source across all deferred STs.
     ///
-    /// Precedence is conservative: if any dependent ST requests `trigger`, the
-    /// source remains trigger-based. Otherwise `wal` wins over `auto`.
+    /// v0.98 keeps trigger capture as the only stable mode. Legacy `auto` and
+    /// `wal` requests are mapped to trigger until durable WAL receipt lands.
     /// Returns `None` when no deferred TABLE dependencies exist.
     pub fn effective_requested_mode_for_source(
         source_relid: pg_sys::Oid,
     ) -> Result<Option<String>, PgTrickleError> {
         Spi::get_one_with_args::<String>(
             "SELECT CASE \
-                    WHEN bool_or(lower(COALESCE(st.requested_cdc_mode, current_setting('pg_trickle.cdc_mode'))) = 'trigger') THEN 'trigger' \
-                    WHEN bool_or(lower(COALESCE(st.requested_cdc_mode, current_setting('pg_trickle.cdc_mode'))) = 'wal') THEN 'wal' \
-                    WHEN bool_or(lower(COALESCE(st.requested_cdc_mode, current_setting('pg_trickle.cdc_mode'))) = 'auto') THEN 'auto' \
+                    WHEN bool_or(lower(COALESCE(st.requested_cdc_mode, current_setting('pg_trickle.cdc_mode'))) IN ('trigger', 'auto', 'wal')) THEN 'trigger' \
                     ELSE NULL \
                 END \
              FROM pgtrickle.pgt_dependencies d \

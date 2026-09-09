@@ -202,6 +202,7 @@ pub(crate) fn begin_capture(pgt_id: i64) -> Result<(), PgTrickleError> {
     if !has_consumer(pgt_id) {
         return Ok(());
     }
+    super::require_v098_capability(super::DELTA_V1_CAPABILITY)?;
     let schema = crate::config::pg_trickle_change_buffer_schema();
     let max_id = Spi::get_one::<i64>(&format!(
         "SELECT COALESCE(max(change_id), 0) FROM {}.changes_pgt_{pgt_id}",
@@ -231,6 +232,7 @@ pub(crate) fn finalize(
     if !has_consumer(meta.pgt_id) {
         return Ok(());
     }
+    super::require_v098_capability(super::DELTA_V1_CAPABILITY)?;
     let start = CAPTURE_STARTS
         .with(|starts| starts.borrow_mut().remove(&meta.pgt_id))
         .unwrap_or_else(|| {
@@ -390,6 +392,7 @@ pub fn register_output_delta_consumer(
     ),
 > {
     let result = (|| -> Result<_, PgTrickleError> {
+        super::require_v098_capability(super::DELTA_V1_CAPABILITY)?;
         let meta = StreamTableMeta::get_by_relid(stream_table)?;
         authorized_stream(&meta)?;
         if !meta.orchestration_mode.eq_ignore_ascii_case("EXTERNAL") {
@@ -540,6 +543,7 @@ pub fn output_delta_batches(
     ),
 > {
     let result = (|| -> Result<_, PgTrickleError> {
+        super::require_v098_capability(super::DELTA_V1_CAPABILITY)?;
         let (_, meta) = consumer_owner(consumer_id)?;
         let state = spi(Spi::get_one_with_args::<String>(
             "SELECT state FROM pgtrickle.pgt_output_delta_consumers WHERE consumer_id = $1",
@@ -619,6 +623,7 @@ pub fn output_delta_batches(
 #[search_path(pgtrickle, pg_catalog, pg_temp)]
 pub fn ack_output_delta(consumer_id: pgrx::Uuid, through_token: i64, disposition: &str) -> String {
     let result = (|| -> Result<String, PgTrickleError> {
+        super::require_v098_capability(super::DELTA_V1_CAPABILITY)?;
         let (_, meta) = consumer_owner(consumer_id)?;
         let state = spi(Spi::get_one_with_args::<String>(
             "SELECT state FROM pgtrickle.pgt_output_delta_consumers WHERE consumer_id = $1",
@@ -686,6 +691,7 @@ pub fn begin_output_delta_resnapshot(
     ),
 > {
     let result = (|| -> Result<_, PgTrickleError> {
+        super::require_v098_capability(super::DELTA_V1_CAPABILITY)?;
         let (_, meta) = consumer_owner(consumer_id)?;
         spi(Spi::get_one_with_args::<i64>(
             "SELECT pgt_id FROM pgtrickle.pgt_stream_tables WHERE pgt_id = $1 FOR UPDATE",
@@ -763,6 +769,7 @@ pub fn ack_output_delta_resnapshot(
     resnapshot_token: pgrx::Uuid,
 ) -> String {
     let result = (|| -> Result<String, PgTrickleError> {
+        super::require_v098_capability(super::DELTA_V1_CAPABILITY)?;
         let (_, meta) = consumer_owner(consumer_id)?;
         let head = spi(Spi::get_one_with_args::<i64>("SELECT log_head FROM pgtrickle.pgt_output_delta_resnapshots WHERE resnapshot_token = $1 AND consumer_id = $2 AND pgt_id = $3", &[resnapshot_token.into(), consumer_id.into(), meta.pgt_id.into()]))?.ok_or_else(|| delta_error("PGT_EXT_TOKEN_INVALID", "unknown or replayed resnapshot token"))?;
         spi(Spi::run_with_args(
@@ -803,6 +810,7 @@ pub fn output_delta_consumer_status() -> TableIterator<
     ),
 > {
     let result = (|| -> Result<_, PgTrickleError> {
+        super::require_v098_capability(super::DELTA_V1_CAPABILITY)?;
         let rows = Spi::connect(|client| -> Result<_, PgTrickleError> {
             let table = spi(client.select("SELECT c.consumer_id, format('%I.%I', st.pgt_schema, st.pgt_name), c.consumer_name, format('%I.%I', 'pgtrickle_changes', 'output_delta_' || c.pgt_id), c.state, c.state_reason, c.acknowledged_batch_token, l.log_head, l.output_contract_digest, c.row_identity_version FROM pgtrickle.pgt_output_delta_consumers c JOIN pgtrickle.pgt_stream_tables st ON st.pgt_id = c.pgt_id JOIN pgtrickle.pgt_output_delta_logs l ON l.pgt_id = c.pgt_id WHERE c.owner_oid = $1 OR EXISTS (SELECT 1 FROM pg_roles r WHERE r.oid = $1 AND r.rolsuper) ORDER BY c.consumer_name", None, &[outer_user_id().into()]))?;
             let mut out = Vec::new();

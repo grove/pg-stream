@@ -50,7 +50,7 @@ See [docs/SQL_REFERENCE.md](SQL_REFERENCE.md) for full signatures and examples.
 | `pgtrickle.detach_outbox()` | `pgtrickle` | `` | Removes the entry from `pgtrickle.pgt_outbox_config`. |
 | `pgtrickle.diagnose_errors()` | `pgtrickle` | `SetOf row` | # SQL usage ```sql SELECT * FROM pgtrickle.diagnose_errors('my_stream_table'); ```. |
 | `pgtrickle.diamond_groups()` | `pgtrickle` | `SetOf row` | Returns one row per group member, indicating which group it belongs to, whether it is a convergence (fan-in) node, the group's current epoch, and the effective schedule policy. |
-| `pgtrickle.disk_usage()` | `pgtrickle` | `SetOf row` | Report stream-table storage, pending CDC storage, and configured disk headroom. |
+| `pgtrickle.disk_usage()` | `pgtrickle` | `SetOf row` | Report the currently accounted stream-table and CDC storage footprint. |
 | `pgtrickle.drain()` | `pgtrickle` | `` | # Example ```sql -- Quiesce before pg_upgrade or rolling restart: SELECT pgtrickle.drain(); -- Confirm drained: SELECT pgtrickle.is_drained(); -- Resume normal operation after maintenance: SELECT pgtrickle.resume_after_drain(); ```. |
 | `pgtrickle.drop_refresh_group()` | `pgtrickle` | `void` | Drop a refresh group by name. |
 | `pgtrickle.drop_snapshot()` | `pgtrickle` | `` | Removes the snapshot table and its catalog row from `pgtrickle.pgt_snapshots`. |

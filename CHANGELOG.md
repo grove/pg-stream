@@ -38,6 +38,7 @@ The cutoff exists because:
 <!-- TOC start -->
 - [Unreleased](#unreleased)
 - [0.97.0 — Monitoring, Assurance & Packaging](#0970--monitoring-assurance--packaging)
+- [0.98.0 — Risk Containment and Contract Truth](#0980--risk-containment-and-contract-truth)
 - [0.96.0 — Defaults, Bounds & Diagnosis](#0960--defaults-bounds--diagnosis)
 - [0.95.0 — Durable Typed Output Deltas](#0950--durable-typed-output-deltas)
 - [0.94.0 — Strict Transactional Graph Refresh](#0940--strict-transactional-graph-refresh)
@@ -206,6 +207,23 @@ Run `ALTER EXTENSION pg_trickle UPDATE` after installing the 0.87.12 files.
 ## [Unreleased]
 
 Future changes will be listed here.
+
+## [0.98.0] — Risk Containment and Contract Truth
+
+v0.98.0 narrows stable operation to the paths that are currently qualified.
+
+- Makes trigger capture the only stable CDC path; `auto` is a trigger alias and
+  WAL capture fails closed with `PGT_EXT_CDC_UNAVAILABLE`.
+- Converts legacy WAL metadata during upgrade and marks affected stream tables
+  for rebuild when a complete handoff cannot be proven.
+- Reports Graph V1 and Delta V1 as experimental and disabled, with admission
+  rejected before catalog or consumer state changes.
+- Makes active resource profiles, disk accounting, and refresh progress match
+  the runtime behavior.
+- Adds the executable v0.98 qualification contract and structured release
+  evidence validation.
+
+See the [v0.98 roadmap](roadmap/v0.98.0.md) and [upgrade guide](docs/UPGRADING.md).
 
 ## [0.97.0] — Monitoring, Assurance & Packaging
 

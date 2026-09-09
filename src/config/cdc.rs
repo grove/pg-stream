@@ -51,12 +51,12 @@ pub static PGS_CLEANUP_USE_TRUNCATE: GucSetting<bool> = GucSetting::<bool>::new(
 
 /// CDC mechanism selection.
 ///
-/// - `"auto"` (default): Use triggers for creation, transition to WAL if
-///   `wal_level = logical` is available. Falls back to triggers automatically.
-/// - `"trigger"`: Always use row-level triggers for CDC.
-/// - `"wal"`: Require WAL-based CDC (fail if `wal_level != logical`).
+/// - `"trigger"` (default): Use trigger-based CDC.
+/// - `"auto"`: Compatibility spelling for trigger-based CDC in v0.98.x.
+/// - `"wal"`: Rejected as unavailable until durable WAL receipt is shipped in
+///   v0.103.0.
 pub static PGS_CDC_MODE: GucSetting<Option<std::ffi::CString>> =
-    GucSetting::<Option<std::ffi::CString>>::new(Some(c"auto"));
+    GucSetting::<Option<std::ffi::CString>>::new(Some(c"trigger"));
 
 /// Maximum time (seconds) to wait for the WAL decoder to catch up during
 /// transition from triggers to WAL-based CDC before falling back to triggers.

@@ -41,6 +41,19 @@ use crate::config;
 use crate::error::PgTrickleError;
 use crate::monitor;
 
+fn wal_capture_unavailable() -> PgTrickleError {
+    PgTrickleError::IntegrationError {
+        code: "PGT_EXT_CDC_UNAVAILABLE",
+        detail: "WAL-based CDC is unavailable in v0.98.x; trigger capture is the only stable mode. Durable WAL receipt is scheduled for v0.103.0".to_string(),
+    }
+}
+
+/// v0.98 keeps logical-decoding code for upgrade recognition, but no runtime
+/// path may create, consume, or advance a WAL slot.
+pub(crate) fn wal_capture_is_disabled() -> bool {
+    true
+}
+
 // ── Naming Conventions ─────────────────────────────────────────────────────
 
 /// Replication slot name for a source table: `pgtrickle_<oid>`.
@@ -67,6 +80,9 @@ pub fn publication_name_for_source(source_oid: pg_sys::Oid) -> String {
 /// Each tracked source gets its own publication for independent lifecycle
 /// management.
 pub fn create_publication(source_oid: pg_sys::Oid) -> Result<(), PgTrickleError> {
+    if wal_capture_is_disabled() {
+        return Err(wal_capture_unavailable());
+    }
     let pub_name = publication_name_for_source(source_oid);
 
     // Get the fully-qualified source table name
@@ -238,6 +254,9 @@ pub fn check_publication_health(source_oid: pg_sys::Oid) -> Result<(), PgTrickle
 /// they access the catalog (which could assign an XID); instead the caller
 /// must verify prerequisites before calling this function.
 pub fn create_replication_slot_pristine(slot_name: &str) -> Result<String, PgTrickleError> {
+    if wal_capture_is_disabled() {
+        return Err(wal_capture_unavailable());
+    }
     // COR-004 (v0.72.0): Guard against transactions that have already been
     // assigned a transaction ID.  `CreateInitDecodingContext` (called inside
     // `create_replication_slot_internal`) rejects XID-assigned transactions,
@@ -538,6 +557,9 @@ pub fn poll_wal_changes(
     pk_columns: &[String],
     columns: &[(String, String)],
 ) -> Result<(i64, Option<String>), PgTrickleError> {
+    if wal_capture_is_disabled() {
+        return Err(wal_capture_unavailable());
+    }
     let oid_u32 = source_oid.to_u32();
 
     // Poll changes from the logical replication slot.
@@ -1220,6 +1242,9 @@ pub fn check_and_complete_transition(
     dep: &StDependency,
     change_schema: &str,
 ) -> Result<(), PgTrickleError> {
+    if wal_capture_is_disabled() {
+        return Err(wal_capture_unavailable());
+    }
     // A41-3: Re-check eligibility (PK, replica identity FULL) before advancing
     // or completing the transition.  DDL executed concurrently during the
     // TRANSITIONING window must abort immediately rather than proceeding to WAL
@@ -1618,13 +1643,21 @@ pub fn force_source_to_trigger(
         })?;
     ensure_trigger_for_source(source_oid, change_schema)?;
 
-    let slot_name = slot_name_for_source(source_oid);
-    if let Err(e) = drop_replication_slot(&slot_name) {
-        warning!(
-            "pg_trickle: failed to drop replication slot {} while forcing trigger CDC: {}",
-            slot_name,
-            e
-        );
+    let mut slot_names: Vec<String> = source_deps
+        .iter()
+        .filter_map(|dep| dep.slot_name.clone())
+        .collect();
+    slot_names.push(slot_name_for_source(source_oid));
+    slot_names.sort_unstable();
+    slot_names.dedup();
+    for slot_name in slot_names {
+        if let Err(e) = drop_replication_slot(&slot_name) {
+            warning!(
+                "pg_trickle: failed to drop replication slot {} while forcing trigger CDC: {}",
+                slot_name,
+                e
+            );
+        }
     }
     if let Err(e) = drop_publication(source_oid) {
         warning!(
@@ -1636,6 +1669,20 @@ pub fn force_source_to_trigger(
 
     StDependency::update_cdc_mode_for_source(source_oid, CdcMode::Trigger, None, None)?;
     StDependency::set_cutover_for_source(source_oid, None, None)?;
+
+    // A WAL handoff boundary cannot be proven after v0.98 disables receipt.
+    // Force a rebuild before any converted legacy table resumes refresh.
+    if previous_mode.is_some() {
+        for dep in &source_deps {
+            Spi::run_with_args(
+                "UPDATE pgtrickle.pgt_stream_tables \
+                    SET needs_reinit = true, frontier = NULL, updated_at = now() \
+                  WHERE pgt_id = $1",
+                &[dep.pgt_id.into()],
+            )
+            .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
+        }
+    }
 
     if !cdc::trigger_exists(source_oid)? {
         let pk_columns = cdc::resolve_pk_columns(source_oid)?;
@@ -1660,6 +1707,47 @@ pub fn force_source_to_trigger(
     }
 
     Ok(())
+}
+
+/// Convert legacy WAL-backed dependencies before the scheduler can inspect a
+/// WAL frontier or call any decoder function. Failed conversions stay blocked
+/// behind `needs_reinit` and are retried after operator repair.
+pub fn reconcile_legacy_wal_sources(change_schema: &str) -> Result<(), PgTrickleError> {
+    let deps = StDependency::get_all()?;
+    let mut sources = Vec::new();
+    for dep in deps {
+        if dep.source_type == "TABLE"
+            && matches!(dep.cdc_mode, CdcMode::Wal | CdcMode::Transitioning)
+            && !sources.contains(&dep.source_relid)
+        {
+            sources.push(dep.source_relid);
+        }
+    }
+
+    let mut first_error = None;
+    for source_oid in sources {
+        if let Err(error) = force_source_to_trigger(source_oid, change_schema) {
+            warning!(
+                "pg_trickle: legacy WAL source OID {} requires rebuild before trigger CDC: {}",
+                source_oid.to_u32(),
+                error
+            );
+            if let Err(mark_error) = Spi::run_with_args(
+                "UPDATE pgtrickle.pgt_stream_tables st \
+                    SET needs_reinit = true, frontier = NULL, updated_at = now() \
+                  WHERE st.pgt_id IN (SELECT pgt_id FROM pgtrickle.pgt_dependencies WHERE source_relid = $1)",
+                &[source_oid.into()],
+            ) {
+                warning!(
+                    "pg_trickle: could not mark legacy WAL source OID {} for rebuild: {}",
+                    source_oid.to_u32(),
+                    mark_error
+                );
+            }
+            first_error.get_or_insert(error);
+        }
+    }
+    first_error.map_or(Ok(()), Err)
 }
 
 // ── Scheduler Integration ──────────────────────────────────────────────────
@@ -1696,6 +1784,13 @@ pub struct Phase1Result {
 /// separate transaction (because the SPI connection is broken after a
 /// caught panic).
 pub fn advance_wal_transitions_phase1(change_schema: &str) -> Result<Phase1Result, PgTrickleError> {
+    if wal_capture_is_disabled() {
+        reconcile_legacy_wal_sources(change_schema)?;
+        return Ok(Phase1Result {
+            pending_slots: Vec::new(),
+            pending_aborts: Vec::new(),
+        });
+    }
     let cdc_mode = config::pg_trickle_cdc_mode();
 
     // Get all dependencies to check their CDC mode
@@ -1920,6 +2015,9 @@ pub fn advance_wal_transitions_phase1(change_schema: &str) -> Result<Phase1Resul
 pub fn advance_wal_transitions_phase3(
     created_slots: &[(PendingSlotCreation, String)],
 ) -> Result<(), PgTrickleError> {
+    if wal_capture_is_disabled() {
+        return Err(wal_capture_unavailable());
+    }
     for (pending, slot_lsn) in created_slots {
         if let Err(e) = finish_wal_transition(
             pending.source_relid,
@@ -1980,6 +2078,9 @@ pub fn finish_wal_transition(
     slot_name: &str,
     slot_lsn: &str,
 ) -> Result<(), PgTrickleError> {
+    if wal_capture_is_disabled() {
+        return Err(wal_capture_unavailable());
+    }
     // A41-3: Eligibility recheck before committing the TRANSITIONING state.
     //
     // Between Phase 1 (eligibility check) and Phase 3 (this function), a
@@ -2208,6 +2309,9 @@ fn emit_auto_cdc_stuck_log(dep: &StDependency) {
 
 /// Poll WAL changes for a source that's in TRANSITIONING or WAL mode.
 fn poll_source_changes(dep: &StDependency, change_schema: &str) -> Result<(), PgTrickleError> {
+    if wal_capture_is_disabled() {
+        return Err(wal_capture_unavailable());
+    }
     let slot_name = match &dep.slot_name {
         Some(name) => name.clone(),
         None => slot_name_for_source(dep.source_relid),
@@ -2278,6 +2382,9 @@ pub fn check_decoder_health(
     pgt_id: i64,
     change_schema: &str,
 ) -> Result<(), PgTrickleError> {
+    if wal_capture_is_disabled() {
+        return Err(wal_capture_unavailable());
+    }
     let slot_name = slot_name_for_source(source_oid);
 
     // Check wal_level hasn't been changed (takes effect after restart)
@@ -2521,6 +2628,18 @@ pub fn write_worker_changes_to_buffer(
 mod tests {
     use super::*;
     use proptest::prelude::*;
+
+    #[test]
+    fn test_v098_wal_capture_is_disabled() {
+        assert!(wal_capture_is_disabled());
+        assert!(matches!(
+            wal_capture_unavailable(),
+            PgTrickleError::IntegrationError {
+                code: "PGT_EXT_CDC_UNAVAILABLE",
+                ..
+            }
+        ));
+    }
 
     // ── Naming convention tests ────────────────────────────────────
     // NOTE: slot_name_for_source and publication_name_for_source now use

@@ -12,6 +12,11 @@
 //! - `./tests/build_e2e_image.sh` (Docker image with wal_level=logical)
 //! - Docker with `wal_level = logical` and `max_replication_slots = 10`
 
+// Historical WAL behavior is retained below as reference, but v0.98 disables
+// the incomplete path before it can create a slot or consume WAL. The active
+// negative-admission coverage lives in e2e_v098_stability_tests.rs.
+#![cfg(any())]
+
 mod common;
 mod e2e;
 

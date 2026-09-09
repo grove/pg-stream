@@ -26,7 +26,7 @@ build-release:
 # Build the Docker Hub image (PostgreSQL 18 with pg_trickle pre-installed)
 [group: "build"]
 build-hub:
-    docker build -t pgtrickle/pg_trickle:0.97.0-pg18 -f Dockerfile.hub .
+    docker build -t pgtrickle/pg_trickle:0.98.0-pg18 -f Dockerfile.hub .
 
 # Build the Docker Hub image with 'latest' tag
 [group: "build"]
@@ -156,6 +156,9 @@ v0-96-release-gate:
 
 v0-97-release-gate:
     python3 scripts/v0_97_release_gate.py
+
+v0-98-qualification-gate:
+    python3 scripts/v0_98_qualification_gate.py
 
 monitoring-contract:
     python3 scripts/check_monitoring_contract.py
@@ -392,8 +395,26 @@ bench-tpch-sf1: build-e2e-image
 
 # G17-SOAK: Long-running stability soak test (default 10 min, rebuilds Docker image)
 [group: "test"]
-test-soak: build-e2e-image
-    ./scripts/run_e2e_tests.sh --test e2e_soak_tests --run-ignored all --no-capture
+test-soak duration_hours="1": build-e2e-image
+    SOAK_DURATION_SECS=$(({{ duration_hours }} * 3600)) ./scripts/run_e2e_tests.sh --test e2e_soak_tests --run-ignored all --no-capture
+
+# v0.98 negative-admission checks. Keep these as named contract commands so
+# the qualification manifest cannot silently replace them with a text marker.
+[group: "test"]
+test-capability-admission: test-unit
+    ./scripts/run_unit_tests.sh pg18 test_v098_capability_admission --nocapture
+
+[group: "test"]
+test-wal-negative-admission: test-unit
+    ./scripts/run_unit_tests.sh pg18 test_v098_wal_capture_is_disabled --nocapture
+
+[group: "test"]
+test-package-smoke:
+    ./scripts/check_version_sync.sh
+
+[group: "test"]
+test-longevity duration_days="7": build-e2e-image
+    SOAK_DURATION_SECS=$(({{ duration_days }} * 86400)) ./scripts/run_e2e_tests.sh --test e2e_soak_tests --run-ignored all --no-capture
 
 # G17-SOAK: Quick soak test (2 minutes, skip Docker rebuild)
 [group: "test"]
@@ -665,12 +686,12 @@ check-upgrade-all:
 
 # Build the upgrade Docker image for testing FROM→TO migrations
 [group: "upgrade"]
-build-upgrade-image from="0.40.0" to="0.97.0": build-e2e-image
+build-upgrade-image from="0.40.0" to="0.98.0": build-e2e-image
     ./tests/build_e2e_upgrade_image.sh {{from}} {{to}}
 
 # Run upgrade E2E tests (builds base + upgrade Docker images first)
 [group: "upgrade"]
-test-upgrade from="0.7.0" to="0.97.0": (build-upgrade-image from to)
+test-upgrade from="0.7.0" to="0.98.0": (build-upgrade-image from to)
     PGS_E2E_IMAGE=pg_trickle_upgrade_e2e:latest \
     PGS_UPGRADE_FROM={{from}} PGS_UPGRADE_TO={{to}} \
         ./scripts/run_e2e_tests.sh --test e2e_upgrade_tests --run-ignored all --no-capture

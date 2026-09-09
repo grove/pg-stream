@@ -88,7 +88,7 @@ All metrics are prefixed `pg_trickle_`.
 | `pg_trickle_sla_at_risk_tables` | gauge | Number of interval targets at risk or breaching |
 | `pg_trickle_sla_infeasible_tables` | gauge | Number of interval targets proven infeasible |
 | `pg_trickle_adaptive_worker_target` | gauge | Advisory worker target when adaptive workers are enabled |
-| `pg_trickle_disk_projected_bytes` | gauge | Projected stream-table and buffer footprint |
+| `pg_trickle_disk_accounted_bytes` | gauge | Accounted stream-table and buffer footprint |
 | `pg_trickle_full_fallbacks_1h` | gauge | FULL fallbacks in the last hour |
 | `pg_trickle_external_graph_failures_1h` | gauge | Failed external graph refreshes in the last hour |
 | `pg_trickle_output_delta_consumer_lag_batches` | gauge | Slowest output consumer lag in batches |
