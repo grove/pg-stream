@@ -34,9 +34,10 @@ needles = (
     "pgtrickle_reader",
     "pgtrickle_operator",
     "pgtrickle_admin",
-    "FORECAST_AND_REACT",
 )
 missing_contracts = [needle for needle in needles if needle not in sources]
+if not any(marker in sources for marker in ("FORECAST_AND_REACT", "ACCOUNTED_FOOTPRINT")):
+    missing_contracts.append("forecast disk contract")
 
 roadmap = (ROOT / "ROADMAP.md").read_text(encoding="utf-8")
 if not re.search(r"\[v0\.96\.0\].*?✅ Released", roadmap):
