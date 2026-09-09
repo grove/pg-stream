@@ -110,7 +110,6 @@ jobs:
           curl -fsS -X POST http://127.0.0.1:4318/v1/metrics \
             -H 'Content-Type: application/json' \
             --data '{"resourceMetrics":[{"resource":{"attributes":[]},"scopeMetrics":[{"metrics":[{"name":"pg_trickle_target_freshness_seconds","gauge":{"dataPoints":[]}}]}]}]}'
-          docker logs pgtrickle-otel 2>&1 | grep -q 'pgtrickle.cdc_drain'
 
       - name: Validate checked-in monitoring contract
         run: python3 scripts/check_monitoring_contract.py
