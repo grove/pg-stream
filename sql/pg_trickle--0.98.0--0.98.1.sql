@@ -1,0 +1,4 @@
+-- pg_trickle 0.98.0 -> 0.98.1 upgrade migration
+--
+-- v0.98.1 is a qualification and packaging release. It contains no SQL
+-- schema changes; the full install archive is retained for package checks.

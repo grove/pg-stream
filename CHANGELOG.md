@@ -37,6 +37,7 @@ The cutoff exists because:
 
 <!-- TOC start -->
 - [Unreleased](#unreleased)
+- [0.98.1 — Qualified interim baseline](#0981--qualified-interim-baseline)
 - [0.97.0 — Monitoring, Assurance & Packaging](#0970--monitoring-assurance--packaging)
 - [0.98.0 — Risk Containment and Contract Truth](#0980--risk-containment-and-contract-truth)
 - [0.96.0 — Defaults, Bounds & Diagnosis](#0960--defaults-bounds--diagnosis)
@@ -207,6 +208,19 @@ Run `ALTER EXTENSION pg_trickle UPDATE` after installing the 0.87.12 files.
 ## [Unreleased]
 
 Future changes will be listed here.
+
+## [0.98.1] — Qualified interim baseline
+
+v0.98.1 carries the v0.98.0 safety baseline through the release qualification
+boundary. It updates package, upgrade, and artifact metadata for the exact
+candidate and keeps the optional 72-hour soak outside the blocking gate.
+
+- Adds the 0.98.0 → 0.98.1 upgrade path and full-install archive.
+- Pins the qualification contract and release gate to v0.98.1.
+- Keeps seven-day longevity required while treating the 72-hour soak as
+  supplemental evidence.
+
+See the [v0.98.1 roadmap](roadmap/v0.98.1.md) and [upgrade guide](docs/UPGRADING.md).
 
 ## [0.98.0] — Risk Containment and Contract Truth
 
