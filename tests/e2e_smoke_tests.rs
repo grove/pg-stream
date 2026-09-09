@@ -248,7 +248,7 @@ async fn test_v094_capabilities_are_independent() {
         )
         .await;
     assert!(graph_enabled);
-    assert_eq!(delta_status, "absent");
+    assert_eq!(delta_status, "stable");
 }
 
 #[tokio::test]
