@@ -1811,6 +1811,63 @@ registry rows. A budget overflow removes all state and registry rows and
 persists a runtime-disabled plan, so it does not leave an `OVER_BUDGET` health
 row.
 
+### pgtrickle.active_profile
+
+Report the resource constraints detected by pg_trickle and the selected
+effective values.
+
+```sql
+pgtrickle.active_profile() → SETOF record(
+    constraint_name text,
+    detected_value text,
+    source text,
+    selected_value text,
+    overridden boolean,
+    available boolean,
+    detail text
+)
+```
+
+The profile reports cgroup/procfs memory when available, CPU parallelism, and
+PostgreSQL worker, connection, and shared-buffer settings. Extension-managed
+memory is a hard bound; worker admission is throttled; storage and WAL growth
+are forecast-and-react signals.
+
+### pgtrickle.disk_usage
+
+Report per-stream-table relation size, associated pending CDC storage, the
+projected footprint, and configured forecast headroom.
+
+```sql
+pgtrickle.disk_usage() → SETOF record(
+    stream_table text,
+    relation_bytes bigint,
+    change_buffer_bytes bigint,
+    projected_bytes bigint,
+    headroom_bytes bigint,
+    pressure_state text
+)
+```
+
+`pressure_state` is `OK`, `WARN`, `OVER_HEADROOM`, or `DISABLED`. Configure
+the warning threshold with `pg_trickle.disk_headroom_mb`; this is not an
+absolute bound on PostgreSQL or continued source activity.
+
+### pgtrickle.error_catalog
+
+Return stable operational identifiers, SQLSTATEs, details, and hints used by
+refresh diagnostics. Automation should use `error_id` or `sqlstate`, not
+localized message text.
+
+```sql
+pgtrickle.error_catalog() → SETOF record(
+    error_id text,
+    sqlstate text,
+    detail text,
+    hint text
+)
+```
+
 ---
 
 ### pgtrickle.health_summary
@@ -3737,6 +3794,19 @@ Columns include all `pgtrickle.pgt_stream_tables` columns plus:
 | `stale` | `bool` | `true` when the scheduler itself is behind (last_refresh_at age exceeds schedule); `false` when the scheduler is healthy even if source tables have had no writes |
 
 ---
+
+### pgtrickle.pg_stat_progress_pgtrickle
+
+A live view of long-running initial population, full refresh, differential
+refresh, and repair operations.
+
+```sql
+SELECT * FROM pgtrickle.pg_stat_progress_pgtrickle;
+```
+
+Each row has a stable `operation_id` (the refresh-history identifier), phase,
+processed and estimated rows, elapsed time, and the last progress timestamp.
+The view is empty when no refresh is currently running.
 
 ### pgtrickle.pg_stat_stream_tables
 

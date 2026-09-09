@@ -50,6 +50,7 @@ See [docs/CONFIGURATION.md](CONFIGURATION.md) for full descriptions and usage ex
 | `pg_trickle.delta_work_mem_cap_mb` | `int4` | `256` | PERF-004 (v0.70.0): Default changed from 0 (disabled) to 256 MB. |
 | `pg_trickle.diff_output_format` | `text` | `"split"` | Controls how the DI-2 aggregate UPDATE-split surfaces changes: - `"split"` (default): Emit DELETE+INSERT pairs for aggregate UPDATEs. |
 | `pg_trickle.differential_max_change_ratio` | `float8` | `0.15` | Set to 0.0 to disable adaptive fallback (always use DIFFERENTIAL). |
+| `pg_trickle.disk_headroom_mb` | `int4` | `1024` | This is a warning threshold, not a promise about PostgreSQL or source-table growth. |
 | `pg_trickle.drain_timeout` | `int4` | `60` | Default: 60 seconds. |
 | `pg_trickle.drain_timeout_max_seconds` | `int4` | `86400` | v0.85.0: Hard upper bound for explicit drain waits. |
 | `pg_trickle.dvm_decision_trace` | `bool` | `false` | When enabled, the DVM logs JSON events containing operator paths, output schemas, snapshot plans, and generated delta CTEs. |
@@ -94,7 +95,6 @@ See [docs/CONFIGURATION.md](CONFIGURATION.md) for full descriptions and usage ex
 | `pg_trickle.max_parallel_workers` | `int4` | `0` | Default 0 = serial mode (existing behavior preserved). |
 | `pg_trickle.max_parse_depth` | `int4` | `64` | Prevents stack-overflow crashes on pathological queries with deeply nested subqueries, CTEs, or set operations. |
 | `pg_trickle.max_parse_nodes` | `int4` | `100000` | Queries that exceed this limit are rejected with `QueryTooComplex` to prevent unbounded memory allocation in the parse advisory warnings cache and CTE registry. |
-| `pg_trickle.memory_budget_mb` | `int4` | `256` | Master budget for pg_trickle-owned in-process accumulations, in MiB. |
 | `pg_trickle.merge_join_strategy` | `text` | `"auto"` | Controls the join strategy hint applied via `SET LOCAL` during MERGE: - `"auto"` (default): delta-size heuristics choose the strategy. |
 | `pg_trickle.merge_planner_hints` | `bool` | `true` | Deprecated — use `pg_trickle.planner_aggressive` instead. |
 | `pg_trickle.merge_seqscan_threshold` | `float8` | `0.001` | Set to 0.0 to disable this optimization. |
