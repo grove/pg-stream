@@ -227,7 +227,7 @@ async fn test_event_triggers_installed() {
 }
 
 #[tokio::test]
-async fn test_v094_capabilities_are_independent() {
+async fn test_v098_capabilities_are_fail_closed() {
     let db = E2eDb::new().await.with_extension().await;
 
     let capability_count: i64 = db
@@ -241,18 +241,32 @@ async fn test_v094_capabilities_are_independent() {
              WHERE capability = 'external_graph_refresh'",
         )
         .await;
+    let graph_status: String = db
+        .query_scalar(
+            "SELECT details->>'status' FROM pgtrickle.integration_capabilities() \
+             WHERE capability = 'external_graph_refresh'",
+        )
+        .await;
+    let delta_enabled: bool = db
+        .query_scalar(
+            "SELECT enabled FROM pgtrickle.integration_capabilities() \
+             WHERE capability = 'output_delta_consumer'",
+        )
+        .await;
     let delta_status: String = db
         .query_scalar(
             "SELECT details->>'status' FROM pgtrickle.integration_capabilities() \
              WHERE capability = 'output_delta_consumer'",
         )
         .await;
-    assert!(graph_enabled);
-    assert_eq!(delta_status, "stable");
+    assert!(!graph_enabled);
+    assert_eq!(graph_status, "experimental");
+    assert!(!delta_enabled);
+    assert_eq!(delta_status, "experimental");
 }
 
 #[tokio::test]
-async fn test_v093_external_ownership_blocks_managed_refresh() {
+async fn test_v098_graph_admission_rejects_orchestration_mutation() {
     let db = E2eDb::new().await.with_extension().await;
 
     db.execute("CREATE TABLE v093_source (id INT PRIMARY KEY, val TEXT)")
@@ -285,16 +299,18 @@ async fn test_v093_external_ownership_blocks_managed_refresh() {
         "managed refresh must reject EXTERNAL tables"
     );
 
-    db.execute(
-        "SELECT pgtrickle.set_orchestration_mode(\
+    let mode_change = db
+        .try_execute(
+            "SELECT pgtrickle.set_orchestration_mode(\
              'public.v093_external'::regclass, 'MANAGED'\
          )",
-    )
-    .await;
+        )
+        .await;
+    assert!(mode_change.is_err());
 }
 
 #[tokio::test]
-async fn test_v093_contracts_include_digest_and_canonical_graph() {
+async fn test_v098_graph_contract_admission_rejects_before_work() {
     let db = E2eDb::new().await.with_extension().await;
 
     db.execute("CREATE TABLE v093_graph_source (id INT PRIMARY KEY, val TEXT)")
@@ -315,20 +331,21 @@ async fn test_v093_contracts_include_digest_and_canonical_graph() {
         .await;
     }
 
-    let digest_length: i64 = db
-        .query_scalar(
-            "SELECT octet_length(contract_digest)::bigint \
-             FROM pgtrickle.stream_table_contract('public.v093_graph_a'::regclass)",
+    let contract = db
+        .try_execute(
+            "SELECT * FROM pgtrickle.stream_table_contract(\
+                'public.v093_graph_a'::regclass)",
         )
         .await;
-    let member_count: i64 = db
-        .query_scalar(
-            "SELECT jsonb_array_length(contract->'members')::bigint \
-             FROM pgtrickle.graph_contract(ARRAY['public.v093_graph_b'::regclass])",
+    assert!(contract.is_err());
+
+    let graph = db
+        .try_execute(
+            "SELECT * FROM pgtrickle.graph_contract(ARRAY[\
+                 'public.v093_graph_b'::regclass])",
         )
         .await;
-    assert_eq!(digest_length, 32);
-    assert_eq!(member_count, 2);
+    assert!(graph.is_err());
 
     let duplicate_roots = db
         .try_execute(
@@ -337,5 +354,8 @@ async fn test_v093_contracts_include_digest_and_canonical_graph() {
              ])",
         )
         .await;
-    assert!(duplicate_roots.is_err(), "duplicate roots must be rejected");
+    assert!(
+        duplicate_roots.is_err(),
+        "disabled graph admission must reject"
+    );
 }

@@ -30,6 +30,29 @@ pub(crate) mod scheduler_control;
 pub(crate) mod spec;
 pub(crate) mod validation;
 
+pub(crate) const GRAPH_V1_CAPABILITY: &str = "external_graph_refresh";
+pub(crate) const DELTA_V1_CAPABILITY: &str = "output_delta_consumer";
+
+fn v098_capability_target(capability: &str) -> &'static str {
+    if capability == GRAPH_V1_CAPABILITY {
+        "v0.100.0"
+    } else {
+        "v0.104.0"
+    }
+}
+
+/// v0.98 keeps the incomplete external contracts discoverable but unavailable.
+/// Every public and internal Graph/Delta path uses this guard before doing work.
+pub(crate) fn require_v098_capability(capability: &str) -> Result<(), PgTrickleError> {
+    Err(PgTrickleError::IntegrationError {
+        code: "PGT_EXT_CAPABILITY_DISABLED",
+        detail: format!(
+            "{capability} is experimental and disabled in v0.98.x; implementation and conformance are scheduled for {}",
+            v098_capability_target(capability)
+        ),
+    })
+}
+
 // ── G13-EH: Enriched error reporting ────────────────────────────────────────
 
 /// UX-7: Resolve a relation OID to a human-readable `schema.table` name.
@@ -795,6 +818,12 @@ fn enforce_cdc_refresh_mode_interaction(
     requested_cdc_mode: &str,
     source: CdcModeRequestSource,
 ) -> Result<(), PgTrickleError> {
+    if requested_cdc_mode.eq_ignore_ascii_case("wal") {
+        return Err(PgTrickleError::IntegrationError {
+            code: "PGT_EXT_CDC_UNAVAILABLE",
+            detail: "WAL-based CDC is unavailable in v0.98.x; use trigger-based CDC. Durable WAL receipt is scheduled for v0.103.0".to_string(),
+        });
+    }
     match classify_cdc_refresh_mode_interaction(refresh_mode, requested_cdc_mode, source) {
         CdcRefreshModeInteraction::None => Ok(()),
         CdcRefreshModeInteraction::IgnoreWalForImmediate => {
@@ -870,15 +899,10 @@ fn validate_requested_cdc_mode_requirements(
     if requested_cdc_mode != "wal" {
         return Ok(());
     }
-
-    if !cdc::can_use_logical_replication_for_mode(requested_cdc_mode)? {
-        return Err(PgTrickleError::InvalidArgument(
-            "cdc_mode = 'wal' requires wal_level = logical and an available replication slot"
-                .to_string(),
-        ));
-    }
-
-    Ok(())
+    Err(PgTrickleError::IntegrationError {
+        code: "PGT_EXT_CDC_UNAVAILABLE",
+        detail: "WAL-based CDC is unavailable in v0.98.x; use trigger-based CDC. Durable WAL receipt is scheduled for v0.103.0".to_string(),
+    })
 }
 
 /// A warning produced by the shared create/preview analysis path.
@@ -3455,6 +3479,17 @@ mod tests {
     use super::create::{bulk_create_impl, compute_config_diff, normalize_sql_whitespace};
     use super::*;
     use proptest::prelude::*;
+
+    #[test]
+    fn test_v098_capability_admission() {
+        assert!(matches!(
+            require_v098_capability(GRAPH_V1_CAPABILITY),
+            Err(PgTrickleError::IntegrationError {
+                code: "PGT_EXT_CAPABILITY_DISABLED",
+                ..
+            })
+        ));
+    }
 
     #[test]
     fn test_inject_pgt_count_distinct_basic() {

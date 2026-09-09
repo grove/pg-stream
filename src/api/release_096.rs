@@ -107,11 +107,11 @@ pub fn active_profile() -> TableIterator<
     let auto_budget = memory_mb(host_memory)
         .map(|mb| (mb / 10).clamp(16, 1_048_576))
         .unwrap_or(configured_budget);
+    let memory_is_automatic = configured_budget == 256;
     let configured_workers = current
         .get("pg_trickle.max_concurrent_refreshes")
         .and_then(|setting| setting.value.parse::<i32>().ok())
         .unwrap_or(4);
-    let auto_worker_count = auto_workers(max_workers);
 
     let row = |name: &str,
                detected: Option<String>,
@@ -131,10 +131,14 @@ pub fn active_profile() -> TableIterator<
         )
     };
 
-    let memory_source = current
-        .get("pg_trickle.memory_budget_mb")
-        .map(|setting| setting.source.clone())
-        .unwrap_or_else(|| "default".to_string());
+    let memory_source = if memory_is_automatic {
+        "automatic".to_string()
+    } else {
+        current
+            .get("pg_trickle.memory_budget_mb")
+            .map(|setting| setting.source.clone())
+            .unwrap_or_else(|| "default".to_string())
+    };
     let worker_source = current
         .get("pg_trickle.max_concurrent_refreshes")
         .map(|setting| setting.source.clone())
@@ -150,13 +154,13 @@ pub fn active_profile() -> TableIterator<
                 .get("pg_trickle.memory_budget_mb")
                 .is_some_and(|setting| setting.source != "default"),
             host_memory.is_some(),
-            "The selected extension memory budget is capped at 10% of visible memory unless the GUC is overridden.",
+            "Configured value 256 MiB means automatic; the selected value is the runtime budget derived from visible memory.",
         ),
         row(
             "max_worker_processes",
             max_workers.map(|value| value.to_string()),
             "pg_settings",
-            auto_worker_count.to_string(),
+            configured_workers.to_string(),
             current
                 .get("max_worker_processes")
                 .is_some_and(|setting| setting.source != "default"),
@@ -169,12 +173,12 @@ pub fn active_profile() -> TableIterator<
                 .ok()
                 .map(|value| value.get().to_string()),
             "host",
-            auto_worker_count.to_string(),
+            configured_workers.to_string(),
             current
                 .get("pg_trickle.max_concurrent_refreshes")
                 .is_some_and(|setting| setting.source != "default"),
             std::thread::available_parallelism().is_ok(),
-            "CPU is used as an admission hint; committed changes are never discarded.",
+            "CPU is an admission hint; runtime admission uses the configured worker value.",
         ),
         row(
             "max_connections",
@@ -217,25 +221,24 @@ pub fn active_profile() -> TableIterator<
                 .get("pg_trickle.memory_budget_mb")
                 .is_some_and(|setting| setting.source != "default"),
             true,
-            "Hard bound for extension-managed in-process state; storage growth is reported separately.",
+            "256 means automatic; otherwise the configured value is the effective runtime memory bound.",
         ),
         row(
             "pg_trickle_max_concurrent_refreshes",
             Some(configured_workers.to_string()),
             &worker_source,
-            auto_worker_count.to_string(),
+            configured_workers.to_string(),
             current
                 .get("pg_trickle.max_concurrent_refreshes")
                 .is_some_and(|setting| setting.source != "default"),
             true,
-            "Throttled admission limit for per-database refresh concurrency.",
+            "Runtime admission uses the configured worker value; CPU remains a recommendation.",
         ),
     ])
 }
 
-/// Report stream-table storage, pending CDC storage, and configured disk
-/// headroom. A forecast is intentionally advisory: PostgreSQL and source
-/// activity can continue to grow beyond it.
+/// Report the currently accounted stream-table and CDC storage footprint.
+/// This is a measurement, not a forecast of future source activity.
 #[pg_extern(schema = "pgtrickle", name = "disk_usage")]
 #[allow(clippy::type_complexity)]
 pub fn disk_usage() -> TableIterator<
@@ -244,7 +247,7 @@ pub fn disk_usage() -> TableIterator<
         name!(stream_table, String),
         name!(relation_bytes, i64),
         name!(change_buffer_bytes, i64),
-        name!(projected_bytes, i64),
+        name!(accounted_bytes, i64),
         name!(headroom_bytes, i64),
         name!(pressure_state, String),
     ),
@@ -385,7 +388,7 @@ pub(crate) fn disk_health_rows() -> Vec<(String, String, String)> {
         "disk_forecast".to_string(),
         severity.to_string(),
         format!(
-            "maximum projected stream-table footprint={max_projected} bytes; configured headroom={headroom} bytes; enforcement=FORECAST_AND_REACT"
+            "maximum accounted stream-table footprint={max_projected} bytes; configured headroom={headroom} bytes; enforcement=ACCOUNTED_FOOTPRINT"
         ),
     )]
 }

@@ -135,6 +135,7 @@ LIGHT_E2E_TESTS=(
     e2e_row_id_v2_tests
     e2e_window_state_catalog_tests
     e2e_window_incremental_tests
+    e2e_v098_stability_tests
 )
 
 usage() {

@@ -4,7 +4,7 @@
 //! real, deterministic knob in the product:
 //!   - refresh mode: DIFFERENTIAL vs FULL (`execution.requested_refresh_mode`
 //!     / `expected_capability` on a `Scenario`)
-//!   - CDC mode: trigger vs wal (the `pg_trickle.cdc_mode` GUC)
+//!   - CDC mode: trigger (the only supported v0.98 `pg_trickle.cdc_mode` value)
 //!
 //! ponytail: "apply variant" (prepared vs per-call connection) and "cache
 //! variant" from COR-19's full item list are deliberately out of scope here
@@ -39,18 +39,15 @@ pub struct StrategyCase {
     pub cdc_mode: CdcModeVariant,
 }
 
-/// The 4 combinations of refresh mode x CDC mode, deterministic order.
+/// The supported v0.98 combinations of refresh mode x CDC mode.
 pub fn all_variants() -> Vec<StrategyCase> {
     let refresh_modes = [RefreshModeVariant::Differential, RefreshModeVariant::Full];
-    let cdc_modes = [CdcModeVariant::Trigger, CdcModeVariant::Wal];
-    let mut out = Vec::with_capacity(4);
+    let mut out = Vec::with_capacity(2);
     for &refresh_mode in &refresh_modes {
-        for &cdc_mode in &cdc_modes {
-            out.push(StrategyCase {
-                refresh_mode,
-                cdc_mode,
-            });
-        }
+        out.push(StrategyCase {
+            refresh_mode,
+            cdc_mode: CdcModeVariant::Trigger,
+        });
     }
     out
 }
@@ -92,9 +89,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn all_variants_has_4_combinations() {
+    fn all_variants_has_supported_combinations() {
         let variants = all_variants();
-        assert_eq!(variants.len(), 4);
+        assert_eq!(variants.len(), 2);
         for (i, a) in variants.iter().enumerate() {
             for b in &variants[i + 1..] {
                 assert_ne!(a, b, "all 4 combinations must be distinct");

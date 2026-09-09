@@ -71,7 +71,7 @@ async fn test_alter_refresh_mode() {
 }
 
 #[tokio::test]
-async fn test_alter_to_immediate_ignores_wal_cdc_guc() {
+async fn test_alter_to_immediate_rejects_wal_cdc_guc() {
     let db = E2eDb::new().await.with_extension().await;
 
     db.execute("CREATE TABLE al_mode_wal_src (id INT PRIMARY KEY, val TEXT)")
@@ -95,8 +95,9 @@ async fn test_alter_to_immediate_ignores_wal_cdc_guc() {
         "Deferred mode should start with CDC trigger infrastructure"
     );
 
-    db.execute(
-        "WITH wal_mode AS (\
+    let result = db
+        .try_execute(
+            "WITH wal_mode AS (\
             SELECT set_config('pg_trickle.cdc_mode', 'wal', true)\
          )\
          SELECT pgtrickle.alter_stream_table(\
@@ -104,38 +105,13 @@ async fn test_alter_to_immediate_ignores_wal_cdc_guc() {
             refresh_mode => 'IMMEDIATE'\
          )\
          FROM wal_mode",
-    )
-    .await;
-
-    let (_, mode_after, populated, errors) = db.pgt_status("al_mode_wal_st").await;
-    assert_eq!(mode_after, "IMMEDIATE");
-    assert!(populated, "ST should remain populated after mode switch");
-    assert_eq!(errors, 0);
-
-    let schedule_is_null: bool = db
-        .query_scalar(
-            "SELECT schedule IS NULL FROM pgtrickle.pgt_stream_tables WHERE pgt_name = 'al_mode_wal_st'",
         )
         .await;
-    assert!(schedule_is_null, "IMMEDIATE mode should clear the schedule");
 
-    let slot_exists: bool = db
-        .query_scalar(&format!(
-            "SELECT EXISTS(SELECT 1 FROM pg_replication_slots WHERE slot_name = 'pgtrickle_{}')",
-            source_oid
-        ))
-        .await;
+    let error = format!("{}", result.unwrap_err());
     assert!(
-        !slot_exists,
-        "Switching to IMMEDIATE should not leave WAL replication slots behind"
-    );
-
-    db.execute("INSERT INTO al_mode_wal_src VALUES (2, 'b')")
-        .await;
-    assert_eq!(
-        db.count("public.al_mode_wal_st").await,
-        2,
-        "After switching under cdc_mode='wal', IMMEDIATE mode should still propagate DML synchronously"
+        error.contains("PGT_EXT_CDC_UNAVAILABLE"),
+        "unexpected error: {error}"
     );
 }
 
@@ -173,8 +149,8 @@ async fn test_alter_to_immediate_rejects_explicit_wal_cdc_mode() {
 
     let error = format!("{}", result.unwrap_err());
     assert!(
-        error.contains("incompatible with cdc_mode = 'wal'"),
-        "Expected explicit IMMEDIATE+wal incompatibility error, got: {error}"
+        error.contains("PGT_EXT_CDC_UNAVAILABLE"),
+        "Expected WAL unavailable error, got: {error}"
     );
 }
 

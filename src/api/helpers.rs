@@ -234,9 +234,6 @@ pub(super) fn setup_cdc_for_source(
     pgt_id: i64,
     change_schema: &str,
 ) -> Result<(), PgTrickleError> {
-    let requested_cdc_mode = StDependency::effective_requested_mode_for_source(source_oid)?
-        .unwrap_or_else(|| "trigger".to_string());
-
     // Check if already tracked
     let already_tracked = Spi::get_one_with_args::<bool>(
         "SELECT EXISTS(SELECT 1 FROM pgtrickle.pgt_change_tracking WHERE source_relid = $1)",
@@ -245,41 +242,9 @@ pub(super) fn setup_cdc_for_source(
     .unwrap_or(Some(false))
     .unwrap_or(false);
 
-    if requested_cdc_mode == "wal" {
-        validate_requested_cdc_mode_requirements(&requested_cdc_mode)?;
-    }
-
     if !already_tracked {
         // Resolve PK columns for typed identity computation.
         let pk_columns = cdc::resolve_pk_columns(source_oid)?;
-
-        // EC-19: If CDC mode is "wal" or "auto" and the source table has no
-        // primary key, verify REPLICA IDENTITY FULL. Without it, WAL-based
-        // CDC cannot produce correct old-row values for UPDATE/DELETE, leading
-        // to silent data corruption.
-        if pk_columns.is_empty() && requested_cdc_mode == "wal" {
-            let identity = cdc::get_replica_identity_mode(source_oid)?;
-            if identity != "full" {
-                let table_name = Spi::get_one_with_args::<String>(
-                    "SELECT format('%I.%I', n.nspname, c.relname) \
-                     FROM pg_class c \
-                     JOIN pg_namespace n ON n.oid = c.relnamespace \
-                     WHERE c.oid = $1",
-                    &[source_oid.into()],
-                )
-                .unwrap_or(None)
-                .unwrap_or_else(|| format!("OID {}", source_oid.to_u32()));
-
-                return Err(PgTrickleError::InvalidArgument(format!(
-                    "Source table {} has no PRIMARY KEY and REPLICA IDENTITY is '{}'. \
-                     WAL-based CDC (cdc_mode = '{}') requires either a PRIMARY KEY \
-                     or REPLICA IDENTITY FULL on keyless tables. \
-                     Fix: ALTER TABLE {} REPLICA IDENTITY FULL; \
-                     or use cdc_mode = 'trigger'/'auto'.",
-                    table_name, identity, requested_cdc_mode, table_name
-                )));
-            }
-        }
 
         // F15: Resolve the minimal set of columns needed for CDC capture.
         let col_defs = cdc::resolve_referenced_column_defs(source_oid)?;
@@ -360,9 +325,9 @@ pub(super) fn setup_cdc_for_source(
         }
     }
 
-    if requested_cdc_mode == "trigger" {
-        wal_decoder::force_source_to_trigger(source_oid, change_schema)?;
-    }
+    // v0.98: `auto` is a compatibility spelling for trigger capture. The
+    // same reconciliation also drains legacy WAL metadata before refresh.
+    wal_decoder::force_source_to_trigger(source_oid, change_schema)?;
 
     Ok(())
 }

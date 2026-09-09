@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
-"""Write a compact, machine-readable release evidence manifest."""
+"""Write candidate-bound release evidence from structured suite results."""
+
+from __future__ import annotations
 
 import argparse
 import hashlib
@@ -8,43 +10,85 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 
+RESULT_STATES = {"passed", "failed", "skipped", "unavailable", "stale", "historical"}
+
+
+def parse_result(entry: str, *, default_status: str | None = None) -> dict[str, str]:
+    name, separator, value = entry.partition("=")
+    if not name or (not separator and default_status is None):
+        raise ValueError(f"suite result must be NAME=STATUS: {entry!r}")
+    status = default_status or value
+    if status not in RESULT_STATES:
+        raise ValueError(f"unknown suite status {status!r} for {name!r}")
+    result = {"name": name, "status": status}
+    if default_status is not None and separator and value:
+        result["reason"] = value
+    return result
+
+
+def required_suite_ids(qualification: Path | None) -> list[str]:
+    if qualification is None:
+        return []
+    contract = json.loads(qualification.read_text(encoding="utf-8"))
+    return [suite["id"] for suite in contract.get("required_suites", []) if suite.get("required")]
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--version", required=True)
     parser.add_argument("--candidate-commit", required=True)
+    parser.add_argument("--qualification", type=Path)
     parser.add_argument("--artifact", nargs="+", action="append", default=[])
     parser.add_argument("--suite", action="append", default=[])
     parser.add_argument("--skipped", action="append", default=[])
+    parser.add_argument("--required-suite", action="append", default=[])
     args = parser.parse_args()
 
-    artifacts = []
-    for path_string in (path for group in args.artifact for path in group):
-        path = Path(path_string)
-        digest = hashlib.sha256(path.read_bytes()).hexdigest()
-        artifacts.append(
-            {"path": path.as_posix(), "bytes": path.stat().st_size, "sha256": digest}
+    try:
+        artifacts = []
+        for path_string in (path for group in args.artifact for path in group):
+            path = Path(path_string)
+            digest = hashlib.sha256(path.read_bytes()).hexdigest()
+            artifacts.append(
+                {"path": path.as_posix(), "bytes": path.stat().st_size, "sha256": digest}
+            )
+
+        results = [parse_result(entry) for entry in args.suite]
+        results.extend(parse_result(entry, default_status="skipped") for entry in args.skipped)
+        names = [result["name"] for result in results]
+        if len(names) != len(set(names)):
+            raise ValueError("duplicate suite result identifier")
+
+        required = set(args.required_suite or required_suite_ids(args.qualification))
+        actual = {result["name"]: result for result in results}
+        missing = sorted(required - actual.keys())
+        incomplete = sorted(
+            name for name in required if name in actual and actual[name]["status"] != "passed"
         )
+        status = "passed" if not missing and not incomplete else "blocked"
 
-    def parse_entries(entries: list[str]) -> list[dict[str, str]]:
-        result = []
-        for entry in entries:
-            name, _, status = entry.partition("=")
-            result.append({"name": name, "status": status or "recorded"})
-        return result
-
-    evidence = {
-        "schema_version": 1,
-        "release_version": args.version,
-        "candidate_commit": args.candidate_commit,
-        "generated_at": datetime.now(timezone.utc).isoformat(),
-        "artifacts": sorted(artifacts, key=lambda item: item["path"]),
-        "executed_suites": parse_entries(args.suite),
-        "skipped_suites": parse_entries(args.skipped),
-        "status": "passed",
-    }
-    args.output.parent.mkdir(parents=True, exist_ok=True)
-    args.output.write_text(json.dumps(evidence, indent=2) + "\n", encoding="utf-8")
+        evidence = {
+            "schema_version": 2,
+            "release_version": args.version,
+            "candidate_commit": args.candidate_commit,
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "artifacts": sorted(artifacts, key=lambda item: item["path"]),
+            "executed_suites": sorted(results, key=lambda item: item["name"]),
+            "required_suites": sorted(required),
+            "missing_required_suites": missing,
+            "incomplete_required_suites": incomplete,
+            "status": status,
+        }
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+        args.output.write_text(json.dumps(evidence, indent=2) + "\n", encoding="utf-8")
+        if status != "passed":
+            raise ValueError(
+                "required release suites are incomplete: "
+                + ", ".join(missing + incomplete)
+            )
+    except (OSError, ValueError, json.JSONDecodeError) as error:
+        parser.error(str(error))
 
 
 if __name__ == "__main__":

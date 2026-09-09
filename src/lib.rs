@@ -91,7 +91,6 @@ mod pgtrickle {}
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum InitWarningKind {
     MissingSharedPreload,
-    AutoCdcWithoutLogicalWal,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -100,7 +99,7 @@ struct InitDecision {
     warning: Option<InitWarningKind>,
 }
 
-fn build_init_decision(in_shared_preload: bool, cdc_mode: &str, wal_level: i32) -> InitDecision {
+fn build_init_decision(in_shared_preload: bool, _cdc_mode: &str, _wal_level: i32) -> InitDecision {
     if !in_shared_preload {
         return InitDecision {
             should_init_runtime: false,
@@ -108,17 +107,9 @@ fn build_init_decision(in_shared_preload: bool, cdc_mode: &str, wal_level: i32) 
         };
     }
 
-    let warning = if cdc_mode.eq_ignore_ascii_case("auto")
-        && wal_level != pg_sys::WalLevel::WAL_LEVEL_LOGICAL as i32
-    {
-        Some(InitWarningKind::AutoCdcWithoutLogicalWal)
-    } else {
-        None
-    };
-
     InitDecision {
         should_init_runtime: true,
-        warning,
+        warning: None,
     }
 }
 
@@ -157,20 +148,6 @@ pub extern "C-unwind" fn _PG_init() {
         // spawns a per-database scheduler for each one with pg_trickle installed.
         scheduler::register_launcher_worker();
 
-        // ERG-B: Warn if cdc_mode='auto' but wal_level is not 'logical'.
-        // In this state the extension silently stays in TRIGGER-only CDC mode,
-        // which is correct but may surprise users who expect WAL-based CDC.
-        // SAFETY: `pg_sys::wal_level` is a PostgreSQL global written from
-        // postgresql.conf before shared_preload_libraries are processed.
-        if init_decision.warning == Some(InitWarningKind::AutoCdcWithoutLogicalWal) {
-            warning!(
-                "pg_trickle: cdc_mode='auto' but wal_level is not 'logical'. \
-                 WAL-based CDC will not activate until wal_level = logical is \
-                 set in postgresql.conf and PostgreSQL is restarted. \
-                 The extension will use trigger-based CDC in the meantime."
-            );
-        }
-
         log!("pg_trickle: initialized (shared_preload_libraries)");
     } else {
         warning!(
@@ -199,18 +176,18 @@ mod tests {
     }
 
     #[test]
-    fn test_build_init_decision_warns_for_auto_cdc_without_logical_wal() {
+    fn test_build_init_decision_uses_trigger_capture_for_auto_cdc() {
         assert_eq!(
             build_init_decision(true, "auto", pg_sys::WalLevel::WAL_LEVEL_REPLICA as i32),
             InitDecision {
                 should_init_runtime: true,
-                warning: Some(InitWarningKind::AutoCdcWithoutLogicalWal),
+                warning: None,
             }
         );
     }
 
     #[test]
-    fn test_build_init_decision_accepts_logical_wal_for_auto_cdc() {
+    fn test_build_init_decision_does_not_enable_wal_for_auto_cdc() {
         assert_eq!(
             build_init_decision(true, "AUTO", pg_sys::WalLevel::WAL_LEVEL_LOGICAL as i32),
             InitDecision {
@@ -908,6 +885,12 @@ INSERT INTO pgtrickle.pgt_schema_version (version, description)
 VALUES (
     '0.97.0',
     'Operational assurance, monitoring contracts, and release evidence'
+)
+ON CONFLICT (version) DO NOTHING;
+INSERT INTO pgtrickle.pgt_schema_version (version, description)
+VALUES (
+    '0.98.0',
+    'Risk containment, trigger-only capture, and fail-closed integration contracts'
 )
 ON CONFLICT (version) DO NOTHING;
 
@@ -1723,7 +1706,8 @@ LEFT JOIN pgtrickle.pgt_refresh_summary s ON s.pgt_id = st.pgt_id
 LEFT JOIN pgtrickle.pgt_cost_model_summary c ON c.pgt_id = st.pgt_id
 LEFT JOIN pgtrickle.pgt_freshness_controller_state f ON f.pgt_id = st.pgt_id;
 
--- v0.96.0: stable progress surface for long-running refresh lifecycle work.
+-- v0.98.0: expose only progress that the refresh history actually records.
+-- No live heartbeat is emitted, so last_progress_at is NULL while RUNNING.
 CREATE OR REPLACE VIEW pgtrickle.pg_stat_progress_pgtrickle AS
 SELECT
     h.refresh_id AS operation_id,
@@ -1740,7 +1724,7 @@ SELECT
     GREATEST(c.reltuples, 0)::bigint AS estimated_rows,
     EXTRACT(EPOCH FROM (clock_timestamp() - h.start_time))::double precision AS elapsed_seconds,
     h.start_time AS started_at,
-    h.start_time AS last_progress_at,
+    NULL::timestamptz AS last_progress_at,
     h.status
 FROM pgtrickle.pgt_refresh_history h
 JOIN pgtrickle.pgt_stream_tables st ON st.pgt_id = h.pgt_id

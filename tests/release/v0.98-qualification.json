@@ -1,0 +1,42 @@
+{
+  "contract_version": 1,
+  "release_version": "0.98.0",
+  "source_versions": ["0.97.0"],
+  "required_suites": [
+    {"id": "unit", "command": "just test-unit", "required": true, "enabled": true, "expected_status": "passed"},
+    {"id": "integration", "command": "just test-integration", "required": true, "enabled": true, "expected_status": "passed"},
+    {"id": "light-e2e", "command": "just test-light-e2e", "required": true, "enabled": true, "expected_status": "passed"},
+    {"id": "version-sync", "command": "just check-version-sync", "required": true, "enabled": true, "expected_status": "passed"},
+    {"id": "capability-admission", "command": "just test-capability-admission", "required": true, "enabled": true, "expected_status": "passed"},
+    {"id": "wal-negative-admission", "command": "just test-wal-negative-admission", "required": true, "enabled": true, "expected_status": "passed"},
+    {"id": "package-smoke", "command": "just test-package-smoke", "required": true, "enabled": true, "expected_status": "passed"},
+    {"id": "soak-72h", "command": "just test-soak duration_hours=72", "required": true, "enabled": true, "expected_status": "passed"},
+    {"id": "longevity-7d", "command": "just test-longevity duration_days=7", "required": true, "enabled": true, "expected_status": "passed"}
+  ],
+  "capabilities": [
+    {"id": "graph-v1", "capability": "external_graph_refresh", "major_version": 1, "minor_version": 0, "status": "experimental", "enabled": false},
+    {"id": "delta-v1", "capability": "output_delta_consumer", "major_version": 1, "minor_version": 0, "status": "experimental", "enabled": false},
+    {"id": "trigger-capture", "capability": "trigger_cdc", "major_version": 1, "minor_version": 0, "status": "stable", "enabled": true}
+  ],
+  "artifacts": [
+    {"id": "linux-amd64", "platform": "linux-amd64", "postgresql_major": 18, "version": "0.98.0"},
+    {"id": "linux-arm64", "platform": "linux-arm64", "postgresql_major": 18, "version": "0.98.0"},
+    {"id": "macos-arm64", "platform": "macos-arm64", "postgresql_major": 18, "version": "0.98.0"},
+    {"id": "windows-amd64", "platform": "windows-amd64", "postgresql_major": 18, "version": "0.98.0"}
+  ],
+  "performance_budgets": [
+    {"id": "trigger-write-overhead", "metric": "foreground DML overhead", "threshold": 15.0, "unit": "percent", "comparison": "max"},
+    {"id": "differential-refresh-regression", "metric": "differential refresh p95 regression", "threshold": 10.0, "unit": "percent", "comparison": "max"}
+  ],
+  "growth_budgets": [
+    {"id": "change-buffer-growth", "metric": "unaccounted change-buffer growth", "threshold": 0.0, "unit": "rows", "comparison": "max"},
+    {"id": "catalog-growth", "metric": "catalog growth slope", "threshold": 1.0, "unit": "rows/hour", "comparison": "max"}
+  ],
+  "soak": {"id": "soak-72h", "duration_hours": 72, "command": "just test-soak duration_hours=72", "required": true, "enabled": true},
+  "longevity": {"id": "longevity-7d", "duration_days": 7, "command": "just test-longevity duration_days=7", "required": true, "enabled": true},
+  "blockers": [
+    {"id": "wal-receipt-v103", "severity": "P2", "affected_stable_capability": "trigger-capture", "status": "closed", "verifying_suite": "wal-negative-admission"},
+    {"id": "graph-v1-v104", "severity": "P2", "affected_stable_capability": "none", "status": "closed", "verifying_suite": "capability-admission"},
+    {"id": "delta-v1-v104", "severity": "P2", "affected_stable_capability": "none", "status": "closed", "verifying_suite": "capability-admission"}
+  ]
+}

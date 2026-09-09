@@ -28,7 +28,7 @@ See [docs/CONFIGURATION.md](CONFIGURATION.md) for full descriptions and usage ex
 | `pg_trickle.buffer_alert_threshold` | `int4` | `1000000` | When any source table's change buffer exceeds this number of rows, a `BufferGrowthWarning` alert is emitted. |
 | `pg_trickle.buffer_partitioning` | `text` | `"off"` | Controls whether change buffer tables use `PARTITION BY RANGE (lsn)`: - `"off"` (default): Unpartitioned heap tables (current behaviour). |
 | `pg_trickle.cdc_capture_mode` | `text` | `"discard"` | Use `pgtrickle.cdc_capture_mode()` to inspect the active mode at runtime. |
-| `pg_trickle.cdc_mode` | `text` | `"auto"` | - `"auto"` (default): Use triggers for creation, transition to WAL if   `wal_level = logical` is available. |
+| `pg_trickle.cdc_mode` | `text` | `"trigger"` | - `"trigger"` (default): Use trigger-based CDC. |
 | `pg_trickle.cdc_paused` | `bool` | `false` | Default: `false` (CDC writes are enabled). |
 | `pg_trickle.cdc_trigger_mode` | `text` | `"statement"` | Changing this GUC takes effect for newly created stream tables. |
 | `pg_trickle.change_buffer_durability` | `ChangeBufferDurability` | `—` | This GUC supersedes `pg_trickle.unlogged_buffers` (which is now a compatibility alias: `true` maps to `"unlogged"`, `false` to `"logged"`). |
