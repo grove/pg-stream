@@ -1,0 +1,73 @@
+{
+  "annotations": {"list": []},
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "panels": [
+    {
+      "id": 1,
+      "title": "Freshness target and p95",
+      "type": "timeseries",
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 0},
+      "targets": [
+        {"expr": "pg_trickle_target_freshness_seconds", "legendFormat": "target {{schema}}.{{name}}"},
+        {"expr": "pg_trickle_freshness_p95_seconds", "legendFormat": "p95 {{schema}}.{{name}}"}
+      ]
+    },
+    {
+      "id": 2,
+      "title": "Suspended stream tables",
+      "type": "stat",
+      "gridPos": {"h": 8, "w": 6, "x": 12, "y": 0},
+      "targets": [{"expr": "sum(pg_trickle_status_counts_stream_tables_total{status=\"SUSPENDED\"})"}],
+      "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "red", "value": 1}]}
+    },
+    {
+      "id": 3,
+      "title": "CDC pending rows",
+      "type": "timeseries",
+      "gridPos": {"h": 8, "w": 6, "x": 18, "y": 0},
+      "targets": [{"expr": "sum by (stream_table) (pg_trickle_cdc_buffers_pending_rows)", "legendFormat": "{{stream_table}}"}]
+    },
+    {
+      "id": 4,
+      "title": "Projected disk footprint",
+      "type": "timeseries",
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 8},
+      "targets": [{"expr": "pg_trickle_disk_projected_bytes", "legendFormat": "{{stream_table}} ({{pressure_state}})"}]
+    },
+    {
+      "id": 5,
+      "title": "FULL fallbacks and external graph failures",
+      "type": "timeseries",
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 8},
+      "targets": [
+        {"expr": "pg_trickle_full_fallbacks_1h", "legendFormat": "FULL fallback {{schema}}.{{name}}"},
+        {"expr": "pg_trickle_external_graph_failures_1h", "legendFormat": "graph failure {{schema}}.{{name}}"}
+      ]
+    },
+    {
+      "id": 6,
+      "title": "Output consumer lag",
+      "type": "timeseries",
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 16},
+      "targets": [{"expr": "pg_trickle_output_delta_consumer_lag_batches", "legendFormat": "{{schema}}.{{name}}"}]
+    },
+    {
+      "id": 7,
+      "title": "Cleanup backlog",
+      "type": "timeseries",
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 16},
+      "targets": [{"expr": "pg_trickle_cleanup_backlog_rows", "legendFormat": "rows"}]
+    }
+  ],
+  "schemaVersion": 39,
+  "tags": ["pg_trickle", "assurance", "v0.97.0"],
+  "templating": {"list": []},
+  "time": {"from": "now-6h", "to": "now"},
+  "timepicker": {},
+  "timezone": "browser",
+  "title": "pg_trickle Assurance",
+  "uid": "pg-trickle-assurance",
+  "version": 1
+}

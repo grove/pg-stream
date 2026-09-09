@@ -63,6 +63,12 @@ jobs:
       - name: v0.96 defaults and diagnosis release gate
         run: python3 scripts/v0_96_release_gate.py
 
+      - name: v0.97 monitoring and assurance release gate
+        run: python3 scripts/v0_97_release_gate.py
+
+      - name: Validate monitoring contract
+        run: python3 scripts/check_monitoring_contract.py
+
   # ── Build release artifacts for each platform ───────────────────────────
   build-release:
     name: Build (${{ matrix.artifact_suffix }})
@@ -322,6 +328,17 @@ jobs:
           docker exec smoketest psql -U postgres -c "SHOW pg_trickle.enabled;"
           docker exec smoketest psql -U postgres -c "SELECT * FROM pgtrickle.pgt_status();"
 
+          docker exec smoketest psql -v ON_ERROR_STOP=1 -U postgres -c \
+            "CREATE TABLE release_smoke_src (id integer PRIMARY KEY, value text);"
+          docker exec smoketest psql -v ON_ERROR_STOP=1 -U postgres -c \
+            "SELECT pgtrickle.create_stream_table('release_smoke', 'SELECT id, value FROM release_smoke_src', schedule => '1h', refresh_mode => 'FULL');"
+          docker exec smoketest psql -v ON_ERROR_STOP=1 -U postgres -c \
+            "INSERT INTO release_smoke_src VALUES (1, 'smoke');"
+          docker exec smoketest psql -v ON_ERROR_STOP=1 -U postgres -c \
+            "SELECT pgtrickle.refresh_stream_table('release_smoke');"
+          docker exec smoketest psql -v ON_ERROR_STOP=1 -U postgres -tAc \
+            "SELECT count(*) FROM release_smoke;" | grep -qx 1
+
           echo "Release smoke test passed!"
 
       - name: Cleanup
@@ -350,6 +367,19 @@ jobs:
             -exec cp {} release-files/ \;
           echo "Release files:"
           ls -lh release-files/
+
+      - name: Write release evidence manifest
+        run: |
+          python3 scripts/release_evidence.py \
+            --output release-files/RELEASE-EVIDENCE.json \
+            --version "${GITHUB_REF_NAME#v}" \
+            --candidate-commit "$GITHUB_SHA" \
+            --artifact release-files/*.tar.gz release-files/*.zip \
+            --suite version-sync=passed \
+            --suite package-smoke=passed \
+            --suite monitoring-contract=passed \
+            --skipped release-soak-72h=external-environment \
+            --skipped full-upgrade-matrix=scheduled-or-manual
 
       - name: Generate checksums
         run: |

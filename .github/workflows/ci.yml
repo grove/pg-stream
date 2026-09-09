@@ -80,6 +80,45 @@ jobs:
           fail_ci_if_error: false
           token: ${{ secrets.CODECOV_TOKEN }}
 
+  # PP-5 (v0.97.0): exercise the OTLP/HTTP contract against a real collector.
+  otel-collector-contract:
+    name: OpenTelemetry Collector contract
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Start OpenTelemetry Collector
+        run: |
+          docker run -d --name pgtrickle-otel \
+            -p 4318:4318 \
+            -v "$GITHUB_WORKSPACE/monitoring/otel/collector-config.yml:/etc/otelcol-contrib/config.yaml:ro" \
+            otel/opentelemetry-collector-contrib:0.104.0 \
+            --config=/etc/otelcol-contrib/config.yaml
+
+      - name: Send trace and metric payloads
+        run: |
+          for attempt in $(seq 1 30); do
+            status=$(curl -sS -o /tmp/otel-response \
+              -w '%{http_code}' -X POST http://127.0.0.1:4318/v1/traces \
+              -H 'Content-Type: application/json' \
+              --data '{"resourceSpans":[{"resource":{"attributes":[]},"scopeSpans":[{"spans":[{"traceId":"4bf92f3577b34da6a3ce929d0e0e4736","spanId":"00f067aa0ba902b7","name":"pgtrickle.cdc_drain","kind":2,"startTimeUnixNano":"1","endTimeUnixNano":"2"}]}]}]}' || true)
+            if [ "$status" = 200 ]; then break; fi
+            sleep 1
+          done
+          test "$status" = 200
+          curl -fsS -X POST http://127.0.0.1:4318/v1/metrics \
+            -H 'Content-Type: application/json' \
+            --data '{"resourceMetrics":[{"resource":{"attributes":[]},"scopeMetrics":[{"metrics":[{"name":"pg_trickle_target_freshness_seconds","gauge":{"dataPoints":[]}}]}]}]}'
+          docker logs pgtrickle-otel 2>&1 | grep -q 'pgtrickle.cdc_drain'
+
+      - name: Validate checked-in monitoring contract
+        run: python3 scripts/check_monitoring_contract.py
+
+      - name: Cleanup collector
+        if: always()
+        run: docker rm -f pgtrickle-otel 2>/dev/null || true
+
   # ── Unit tests (extra platforms) ───────────────────────────────────────
   # Keep macOS/Windows coverage off the PR path; Linux remains the merge gate
   # while the wider platform matrix runs on schedule or manual dispatch.

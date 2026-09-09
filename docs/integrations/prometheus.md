@@ -12,7 +12,8 @@ docker compose up -d
 ```
 
 Open Grafana at <http://localhost:3000> (default: `admin` / `admin`).
-The **pg_trickle Overview** dashboard is pre-provisioned.
+The **pg_trickle Overview** and **pg_trickle Assurance** dashboards are
+pre-provisioned.
 
 ## Architecture
 
@@ -75,8 +76,8 @@ All metrics are prefixed `pg_trickle_`.
 | `pg_trickle_rows_inserted_total` | counter | Rows inserted per table |
 | `pg_trickle_rows_deleted_total` | counter | Rows deleted per table |
 | `pg_trickle_staleness_seconds` | gauge | Seconds since last successful refresh |
-| `pg_trickle_cdc_pending_rows` | gauge | Pending rows in CDC change buffer |
-| `pg_trickle_cdc_buffer_bytes` | gauge | CDC change buffer size in bytes |
+| `pg_trickle_cdc_buffers_pending_rows` | gauge | Pending rows in CDC change buffer |
+| `pg_trickle_cdc_buffers_buffer_bytes` | gauge | CDC change buffer size in bytes |
 | `pg_trickle_scheduler_running` | gauge | 1 if scheduler background worker is alive |
 | `pg_trickle_health_status` | gauge | Overall health: 0=OK, 1=WARNING, 2=CRITICAL |
 | `pg_trickle_target_freshness_seconds` | gauge | Declared interval freshness target per table |
@@ -87,6 +88,11 @@ All metrics are prefixed `pg_trickle_`.
 | `pg_trickle_sla_at_risk_tables` | gauge | Number of interval targets at risk or breaching |
 | `pg_trickle_sla_infeasible_tables` | gauge | Number of interval targets proven infeasible |
 | `pg_trickle_adaptive_worker_target` | gauge | Advisory worker target when adaptive workers are enabled |
+| `pg_trickle_disk_projected_bytes` | gauge | Projected stream-table and buffer footprint |
+| `pg_trickle_full_fallbacks_1h` | gauge | FULL fallbacks in the last hour |
+| `pg_trickle_external_graph_failures_1h` | gauge | Failed external graph refreshes in the last hour |
+| `pg_trickle_output_delta_consumer_lag_batches` | gauge | Slowest output consumer lag in batches |
+| `pg_trickle_cleanup_backlog_rows` | gauge | Rows awaiting cleanup retry |
 
 Freshness metrics are emitted only for interval-targeted tables. Per-table
 series use the stable bounded labels `db_oid`, `db_name`, `schema`, and `name`.
