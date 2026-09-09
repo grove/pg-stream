@@ -33,6 +33,7 @@ pub use insert::execute_topk_refresh;
 pub(crate) use update::*;
 
 pub fn execute_full_refresh(st: &StreamTableMeta) -> Result<(i64, i64), PgTrickleError> {
+    crate::refresh::ensure_full_policy(st, "differential strategy fallback")?;
     let result = execute_full_refresh_target(st)?;
     let _window_plan = crate::window_state::prepare_for_protected_refresh(st)?;
     Ok(result)
@@ -41,6 +42,7 @@ pub fn execute_full_refresh(st: &StreamTableMeta) -> Result<(i64, i64), PgTrickl
 pub(crate) fn execute_full_refresh_target(
     st: &StreamTableMeta,
 ) -> Result<(i64, i64), PgTrickleError> {
+    crate::refresh::ensure_full_policy(st, "full refresh")?;
     crate::cdc::validate_stream_table_row_identity(st)?;
     let dependencies = StDependency::get_for_st(st.pgt_id)?;
     if !st.refresh_mode.is_immediate() {

@@ -49,6 +49,12 @@ pub static PGS_WARN_WRITE_PATH_OVERHEAD_US: GucSetting<f64> = GucSetting::<f64>:
 /// Add pg_trickle properties to PostgreSQL EXPLAIN output.
 pub static PGS_EXPLAIN_ANNOTATIONS: GucSetting<bool> = GucSetting::<bool>::new(false);
 
+/// Enable the experimental Graph V1 coordinator API for this session.
+///
+/// Graph V1 remains unavailable by default until its independent conformance
+/// suite is complete. This opt-in is restricted to superusers.
+pub static PGS_EXPERIMENTAL_GRAPH_V1: GucSetting<bool> = GucSetting::<bool>::new(false);
+
 // ── Registration ──────────────────────────────────────────────────────────
 
 /// Register all GUC variables for the pgtrickle extension.
@@ -140,6 +146,15 @@ pub fn register_gucs() {
         GucFlags::default(),
     );
 
+    GucRegistry::define_bool_guc(
+        c"pg_trickle.experimental_graph_v1",
+        c"Enable the experimental Graph V1 coordinator API.",
+        c"Graph V1 remains disabled by default and is not a stable compatibility contract.",
+        &PGS_EXPERIMENTAL_GRAPH_V1,
+        GucContext::Suset,
+        GucFlags::default(),
+    );
+
     scheduler::register_scheduler_gucs();
     cdc::register_cdc_gucs();
     dvm::register_dvm_gucs();
@@ -175,6 +190,11 @@ pub fn pg_trickle_warn_write_path_overhead_us() -> f64 {
 /// Returns whether EXPLAIN annotations are enabled for this session.
 pub fn pg_trickle_explain_annotations() -> bool {
     PGS_EXPLAIN_ANNOTATIONS.get()
+}
+
+/// Returns whether the experimental Graph V1 coordinator API is enabled.
+pub fn pg_trickle_experimental_graph_v1() -> bool {
+    PGS_EXPERIMENTAL_GRAPH_V1.get()
 }
 
 /// Returns the maximum number of concurrent refresh workers.

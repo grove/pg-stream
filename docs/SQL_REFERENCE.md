@@ -1642,8 +1642,10 @@ infrastructure, and schedules a protected full refresh.
 ## Integration Contracts
 
 The v0.94 contract APIs expose typed metadata and strict transactional graph
-refresh for integrations. The v0.99 capability manifest records that Graph V1
-and Delta V1 remain experimental and disabled until their conformance releases.
+refresh for integrations. In v0.100, Graph V1 is available only as an explicit
+superuser opt-in; stable admission remains deferred until v0.104. The generated
+[capability manifest](capability-manifest.json) is the source of truth for the
+default support state.
 
 ### pgtrickle.integration_capabilities
 
@@ -1726,8 +1728,12 @@ Lists the current owner-visible consumer state, cursor, lag, and contract
 metadata.
 
 Validate and refresh the complete upstream closure of `EXTERNAL` roots in
-topological order inside the caller's transaction. These integration APIs are
-discoverable but fail closed in v0.99 until their assigned conformance releases.
+topological order inside the caller's transaction. Graph V1 remains disabled
+by default in v0.100; enable the experimental path explicitly for a session:
+
+```sql
+SET pg_trickle.experimental_graph_v1 = on;
+```
 
 ```sql
 SELECT * FROM pgtrickle.refresh_graph_strict(
@@ -1741,9 +1747,15 @@ The expected digest is mandatory. The function rejects stale contracts,
 unsupported members, ownership failures, and busy or changed catalog state
 before executing any member. It does not commit.
 
-The `external_graph_refresh` and `output_delta_consumer` capabilities report
-`experimental` and `enabled = false` in v0.99. Calls fail before locks,
-catalog mutation, cursor movement, or payload generation with
+`full_policy => 'ERROR'` rejects any graph member that needs a whole-query FULL
+refresh, including runtime differential fallbacks. `ALLOW` permits the
+existing fallback behavior. Graph refresh holds its source and member locks
+until the caller commits or rolls back, so callers should keep the transaction
+short and treat the returned node results as transaction-local until commit.
+
+The `external_graph_refresh` capability reports `experimental` and is disabled
+by default. The `output_delta_consumer` capability remains disabled. Calls made
+without the Graph V1 opt-in fail before locks or catalog mutation with
 `PGT_EXT_CAPABILITY_DISABLED`.
 
 ---

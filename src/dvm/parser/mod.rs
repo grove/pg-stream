@@ -2695,6 +2695,36 @@ mod tests {
     }
 
     #[test]
+    fn test_row_id_key_columns_project_filter_keyless_scan_uses_output() {
+        let scan = OpTree::Scan {
+            table_oid: 1,
+            table_name: "st".to_string(),
+            schema: "public".to_string(),
+            columns: vec![
+                make_column("origin"),
+                make_column("destination"),
+                make_column("total"),
+            ],
+            pk_columns: Vec::new(),
+            alias: "st".to_string(),
+        };
+        let filter = OpTree::Filter {
+            predicate: col("total"),
+            child: Box::new(scan),
+        };
+        let tree = OpTree::Project {
+            expressions: vec![col("origin"), col("destination")],
+            aliases: vec!["origin".to_string(), "destination".to_string()],
+            child: Box::new(filter),
+        };
+
+        assert_eq!(
+            tree.row_id_key_columns(),
+            Some(vec!["origin".to_string(), "destination".to_string()])
+        );
+    }
+
+    #[test]
     fn test_row_id_key_columns_distinct_returns_all() {
         let tree = OpTree::Distinct {
             child: Box::new(scan_node("t", 1, &["a", "b"])),

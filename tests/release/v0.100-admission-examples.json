@@ -103,6 +103,5 @@
       "docs/CONFIGURATION.md",
       "docs/integrations/citus.md"
     ]
-  },
-  "manifest_digest": "sha256:87fc88d950cd7f3936cd51339ab009b4d1fac4a4359a9048ba042682ecf312b6"
+  }
 }

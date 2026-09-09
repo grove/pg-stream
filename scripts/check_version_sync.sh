@@ -208,7 +208,7 @@ else
     check_fail "META.json .provides.pg_trickle.version ($META_PROVIDES) != Cargo.toml ($VERSION)"
 fi
 
-# 9. The generated v0.99 capability manifest must target this release.
+# 9. The generated capability manifest must target this release.
 CAPABILITY_MANIFEST_VERSION="$(python3 -c 'import json; print(json.load(open("docs/capability-manifest.json", encoding="utf-8")).get("release_version", ""))')"
 if [[ "$CAPABILITY_MANIFEST_VERSION" == "$VERSION" ]]; then
     check_pass "capability manifest release version = $CAPABILITY_MANIFEST_VERSION"

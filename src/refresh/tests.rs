@@ -142,6 +142,47 @@ fn test_effective_mode_is_consumed_once() {
 }
 
 #[test]
+fn test_refresh_context_restores_nested_state_on_error() {
+    assert_eq!(current_safe_bound(), None);
+    assert_eq!(current_full_policy(), FullPolicy::Allow);
+
+    let result: Result<(), PgTrickleError> =
+        with_refresh_context(RefreshContext::graph("0/10", FullPolicy::Error), || {
+            assert_eq!(current_safe_bound().as_deref(), Some("0/10"));
+            assert_eq!(current_full_policy(), FullPolicy::Error);
+
+            with_refresh_context(RefreshContext::manual(), || {
+                assert_eq!(current_safe_bound(), None);
+                assert_eq!(current_full_policy(), FullPolicy::Allow);
+                Ok::<_, PgTrickleError>(())
+            })?;
+
+            assert_eq!(current_safe_bound().as_deref(), Some("0/10"));
+            Err(PgTrickleError::InternalError("context test".to_string()))
+        });
+
+    assert!(result.is_err());
+    assert_eq!(current_safe_bound(), None);
+    assert_eq!(current_full_policy(), FullPolicy::Allow);
+}
+
+#[test]
+fn test_full_policy_rejects_whole_query_transition() {
+    let st = test_st(RefreshMode::Differential, false);
+    let result = with_refresh_context(RefreshContext::graph("0/10", FullPolicy::Error), || {
+        ensure_full_policy(&st, "unit test")
+    });
+
+    assert!(matches!(
+        result,
+        Err(PgTrickleError::IntegrationError {
+            code: "PGT_EXT_FULL_POLICY",
+            ..
+        })
+    ));
+}
+
+#[test]
 fn test_full_refresh_reason_codes_round_trip() {
     for code in [
         FullRefreshReasonCode::FirstRefresh,

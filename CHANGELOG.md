@@ -37,6 +37,7 @@ The cutoff exists because:
 
 <!-- TOC start -->
 - [Unreleased](#unreleased)
+- [0.100.0 — Unified transactional IVM execution](#01000--unified-transactional-ivm-execution)
 - [0.99.0 — Verified capabilities and product truth](#0990--verified-capabilities-and-product-truth)
 - [0.98.1 — Qualified interim baseline](#0981--qualified-interim-baseline)
 - [0.97.0 — Monitoring, Assurance & Packaging](#0970--monitoring-assurance--packaging)
@@ -209,6 +210,19 @@ Run `ALTER EXTENSION pg_trickle UPDATE` after installing the 0.87.12 files.
 ## [Unreleased]
 
 Future changes will be listed here.
+
+## [0.100.0] — Unified transactional IVM execution
+
+v0.100.0 carries one refresh context through manual and Graph V1 execution.
+
+- Adds explicit Graph V1 opt-in through `pg_trickle.experimental_graph_v1`.
+- Preserves downstream change buffers across manual FULL refreshes of composed
+  stream tables, so downstream differential refresh can consume the result.
+- Enforces `full_policy => 'ERROR'` at initial, reinitialization, and runtime
+  fallback boundaries, with effective-mode and fallback-reason reporting.
+- Restores nested refresh context state after both success and failure.
+
+See the [v0.100.0 roadmap](roadmap/v0.100.0.md) and [capability manifest](docs/capability-manifest.json).
 
 ## [0.99.0] — Verified capabilities and product truth
 

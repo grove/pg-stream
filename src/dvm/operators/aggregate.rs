@@ -125,9 +125,9 @@ fn resolve_expr_for_child(expr: &Expr, child_cols: &[String]) -> String {
 
 /// Build a NULL-safe affected-group filter without shadowing source columns.
 ///
-/// The delta columns are renamed inside the subquery so an unqualified source
-/// expression such as `c_custkey` cannot resolve to the inner delta row.
-fn build_group_filter(delta_cte: &str, group_output: &[String]) -> String {
+/// The delta columns are renamed inside the subquery, while the source side
+/// uses the original GROUP BY expressions so joins keep their qualifiers.
+fn build_group_filter(delta_cte: &str, group_by: &[Expr], group_output: &[String]) -> String {
     let delta_cols = group_output
         .iter()
         .enumerate()
@@ -140,12 +140,14 @@ fn build_group_filter(delta_cte: &str, group_output: &[String]) -> String {
         })
         .collect::<Vec<_>>()
         .join(", ");
-    let conditions = group_output
+    let conditions = group_by
         .iter()
+        .zip(group_output)
         .enumerate()
-        .map(|(index, column)| {
+        .map(|(index, (expr, _))| {
             format!(
-                "{column} IS NOT DISTINCT FROM __pgt_d2.{}",
+                "{} IS NOT DISTINCT FROM __pgt_d2.{}",
+                expr.to_sql(),
                 quote_ident(&format!("__pgt_group_{index}")),
             )
         })
@@ -614,7 +616,7 @@ fn build_intermediate_agg_delta(
     let group_filter = if group_output.is_empty() {
         String::new()
     } else {
-        build_group_filter(delta_cte, group_output)
+        build_group_filter(delta_cte, group_by, group_output)
     };
 
     // Determine WHERE/AND connector based on existing WHERE in from_sql.
@@ -1029,7 +1031,7 @@ fn build_rescan_cte(
         let group_filter = if group_output.is_empty() {
             String::new()
         } else {
-            build_group_filter(delta_cte, group_output)
+            build_group_filter(delta_cte, group_by, group_output)
         };
 
         // If the child is a Filter, the FROM already includes WHERE.

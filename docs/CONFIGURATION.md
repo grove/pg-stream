@@ -78,7 +78,7 @@ Not sure which GUC to change? Start here.
 | **Connection-pooler compatibility (PgBouncer)** | `connection_pooler_mode`, `use_prepared_statements` |
 | **Lower memory usage during refresh** | `merge_work_mem_mb`, `max_delta_estimate_rows` |
 | **Improve cost-model accuracy** | `cost_model_safety_margin`, `planner_aggressive`, `differential_max_change_ratio` |
-| **WAL CDC (future)** | `cdc_mode` (rejected in v0.98); WAL tuning settings are retained for compatibility |
+| **WAL CDC (future)** | `cdc_mode` (rejected in v0.100); WAL tuning settings are retained for compatibility |
 | **Prevent a runaway stream table** | `max_consecutive_errors`, `fuse_threshold`, `buffer_alert_threshold` |
 | **Make diagnostics explainable** | `explain_annotations`, `warn_join_sources`, `warn_write_path_overhead_us` |
 
@@ -95,6 +95,11 @@ default of `0`.
 Set `pg_trickle.explain_annotations = on` to add compact pg_trickle properties
 to PostgreSQL 18 `EXPLAIN` output. The default is `off`, so normal planning has
 no annotation lookup cost.
+
+Set `pg_trickle.experimental_graph_v1 = on` only for explicit Graph V1
+integration testing. It is `off` by default, is restricted to superusers, and
+does not make the graph contract stable. Use `full_policy => 'ERROR'` when a
+coordinator must fail instead of allowing a whole-query FULL fallback.
 
 ---
 

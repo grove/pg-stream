@@ -41,13 +41,16 @@ fn v098_capability_target(capability: &str) -> &'static str {
     }
 }
 
-/// v0.98 keeps the incomplete external contracts discoverable but unavailable.
-/// Every public and internal Graph/Delta path uses this guard before doing work.
+/// Keep Graph V1 explicitly experimental while allowing a superuser to opt in
+/// after the common transactional refresh path has been validated.
 pub(crate) fn require_v098_capability(capability: &str) -> Result<(), PgTrickleError> {
+    if capability == GRAPH_V1_CAPABILITY && config::pg_trickle_experimental_graph_v1() {
+        return Ok(());
+    }
     Err(PgTrickleError::IntegrationError {
         code: "PGT_EXT_CAPABILITY_DISABLED",
         detail: format!(
-            "{capability} is experimental and disabled in v0.98.x; implementation and conformance are scheduled for {}",
+            "{capability} is experimental and disabled by default; enable pg_trickle.experimental_graph_v1 for v0.100.0 Graph V1 testing, or wait for stable conformance in {}",
             v098_capability_target(capability)
         ),
     })

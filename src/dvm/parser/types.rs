@@ -2292,6 +2292,19 @@ impl OpTree {
                 // where the differential refresh uses PK-based hash(id) and
                 // the full refresh must produce the same value.
                 if child_out.len() != aliases.len() {
+                    // A keyless source has no stable key outside its visible
+                    // row content. When a projection narrows it, hash the
+                    // downstream output so FULL and DIFFERENTIAL use the
+                    // same identity at the stream-table boundary.
+                    if matches!(
+                        unwrapped,
+                        OpTree::Scan {
+                            pk_columns,
+                            ..
+                        } if pk_columns.is_empty()
+                    ) {
+                        return Some(aliases.clone());
+                    }
                     if matches!(unwrapped, OpTree::CteScan { .. }) {
                         return Some(aliases.clone());
                     }
