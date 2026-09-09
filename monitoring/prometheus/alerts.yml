@@ -312,17 +312,65 @@ groups:
             uncoordinated. Check for lock contention or coordinator failures:
               SELECT * FROM pgtrickle.citus_status();
 
-      # ── Trace export failures (O40-4) ────────────────────────────────────
+      # ── v0.97 assurance signals ─────────────────────────────────────────
 
-      # OpenTelemetry trace export errors detected.
-      - alert: PgTrickleOtelExportErrors
-        expr: pg_trickle_otel_export_errors_total > 0
+      - alert: PgTrickleDiskPressure
+        expr: pg_trickle_disk_projected_bytes >= pg_trickle_disk_headroom_bytes
+          and pg_trickle_disk_headroom_bytes > 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.stream_table }} is at its projected disk headroom"
+          description: >
+            The projected stream-table and CDC-buffer footprint has reached the
+            configured forecast headroom. Review pgtrickle.disk_usage() before
+            storage pressure becomes an outage.
+
+      - alert: PgTrickleFullFallbackRate
+        expr: pg_trickle_full_fallbacks_1h >= 3
         for: 5m
         labels:
           severity: warning
         annotations:
-          summary: "pg_trickle OpenTelemetry trace export errors detected"
+          summary: "{{ $labels.schema }}.{{ $labels.name }} is repeatedly falling back to FULL"
           description: >
-            pg_trickle has recorded {{ $value }} OpenTelemetry trace export
-            errors. Check connectivity to the OTLP endpoint configured in
-            pg_trickle.otel_endpoint and verify the collector is reachable.
+            Differential refresh admission fell back to FULL at least three
+            times in the last hour. Inspect the defining query and
+            pgtrickle.explain_refresh_mode().
+
+      - alert: PgTrickleExternalGraphFailures
+        expr: pg_trickle_external_graph_failures_1h > 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "External graph refresh failed for {{ $labels.schema }}.{{ $labels.name }}"
+          description: >
+            An externally orchestrated stream table has a failed refresh in the
+            last hour. The coordinator should inspect the graph result and
+            retry only after resolving the reported error.
+
+      - alert: PgTrickleOutputDeltaConsumerLag
+        expr: pg_trickle_output_delta_consumer_lag_batches > 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Output-delta consumer lagging for {{ $labels.schema }}.{{ $labels.name }}"
+          description: >
+            At least one output consumer is behind the durable delta log head.
+            Check pgtrickle.output_delta_consumer_status() and acknowledge or
+            resnapshot the consumer as appropriate.
+
+      - alert: PgTrickleCleanupBacklog
+        expr: pg_trickle_cleanup_backlog_rows > 0
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "CDC cleanup backlog is growing"
+          description: >
+            Cleanup has recorded {{ $value | humanize }} rows awaiting retry.
+            Check pgtrickle.health_check() for the source and last cleanup
+            error before retained change buffers consume disk headroom.

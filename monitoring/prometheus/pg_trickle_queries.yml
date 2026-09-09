@@ -292,14 +292,24 @@ pg_trickle_health_summary:
   query: |
     SELECT
         total_stream_tables,
-        active_tables,
-        error_tables,
-        stale_tables,
-        CASE WHEN scheduler_running THEN 1 ELSE 0 END AS scheduler_running,
-        total_refreshes_1h,
-        failed_refreshes_1h,
-        COALESCE(avg_refresh_ms_1h, 0) AS avg_refresh_ms_1h,
-        COALESCE(p99_refresh_ms_1h, 0) AS p99_refresh_ms_1h,
+        active_count AS active_tables,
+        error_count AS error_tables,
+        stale_count AS stale_tables,
+        CASE WHEN scheduler_status = 'ACTIVE' THEN 1 ELSE 0 END AS scheduler_running,
+        (SELECT count(*) FROM pgtrickle.pgt_refresh_history
+          WHERE start_time > now() - interval '1 hour')::bigint AS total_refreshes_1h,
+        (SELECT count(*) FROM pgtrickle.pgt_refresh_history
+          WHERE status = 'FAILED' AND start_time > now() - interval '1 hour')::bigint
+          AS failed_refreshes_1h,
+        COALESCE((SELECT avg(EXTRACT(EPOCH FROM (end_time - start_time)) * 1000)
+          FROM pgtrickle.pgt_refresh_history
+          WHERE status = 'COMPLETED' AND end_time IS NOT NULL
+            AND start_time > now() - interval '1 hour'), 0)::float8 AS avg_refresh_ms_1h,
+        COALESCE((SELECT percentile_cont(0.99) WITHIN GROUP
+              (ORDER BY EXTRACT(EPOCH FROM (end_time - start_time)) * 1000)
+          FROM pgtrickle.pgt_refresh_history
+          WHERE status = 'COMPLETED' AND end_time IS NOT NULL
+            AND start_time > now() - interval '1 hour'), 0)::float8 AS p99_refresh_ms_1h,
         cache_hit_rate
     FROM pgtrickle.health_summary()
   metrics:
@@ -333,6 +343,134 @@ pg_trickle_health_summary:
     - cache_hit_rate:
         usage: GAUGE
         description: "Template cache hit rate (0.0–1.0)"
+
+# ── v0.97 assurance signals ─────────────────────────────────────────────────
+
+pg_trickle_cdc_buffers:
+  query: |
+    SELECT stream_table, source_table, cdc_mode, pending_rows, buffer_bytes
+    FROM pgtrickle.change_buffer_sizes()
+  metrics:
+    - stream_table:
+        usage: LABEL
+        description: "Stream table consuming the change buffer"
+    - source_table:
+        usage: LABEL
+        description: "Source table producing the change buffer"
+    - cdc_mode:
+        usage: LABEL
+        description: "CDC capture mode"
+    - pending_rows:
+        usage: GAUGE
+        description: "Rows waiting in the CDC buffer"
+    - buffer_bytes:
+        usage: GAUGE
+        description: "Estimated CDC buffer size in bytes"
+
+pg_trickle_disk:
+  query: |
+    SELECT stream_table, pressure_state, relation_bytes, change_buffer_bytes,
+           projected_bytes, headroom_bytes
+    FROM pgtrickle.disk_usage()
+  metrics:
+    - stream_table:
+        usage: LABEL
+        description: "Stream table footprint"
+    - pressure_state:
+        usage: LABEL
+        description: "Forecast pressure state"
+    - relation_bytes:
+        usage: GAUGE
+        description: "Stream table relation size in bytes"
+    - change_buffer_bytes:
+        usage: GAUGE
+        description: "Change buffer size in bytes"
+    - projected_bytes:
+        usage: GAUGE
+        description: "Projected stream table plus buffer size in bytes"
+    - headroom_bytes:
+        usage: GAUGE
+        description: "Remaining configured disk headroom in bytes"
+
+pg_trickle_full:
+  query: |
+    SELECT st.pgt_schema AS schema, st.pgt_name AS name,
+           count(*) FILTER (WHERE h.was_full_fallback)::bigint AS fallbacks_1h
+    FROM pgtrickle.pgt_stream_tables st
+    JOIN pgtrickle.pgt_refresh_history h ON h.pgt_id = st.pgt_id
+    WHERE h.start_time > now() - interval '1 hour'
+    GROUP BY st.pgt_schema, st.pgt_name
+  metrics:
+    - schema:
+        usage: LABEL
+        description: "Stream table schema"
+    - name:
+        usage: LABEL
+        description: "Stream table name"
+    - fallbacks_1h:
+        usage: GAUGE
+        description: "Differential refreshes that fell back to FULL in the last hour"
+
+pg_trickle_external_graph:
+  query: |
+    SELECT st.pgt_schema AS schema, st.pgt_name AS name,
+           count(*) FILTER (WHERE h.status = 'FAILED')::bigint AS failures_1h
+    FROM pgtrickle.pgt_stream_tables st
+    JOIN pgtrickle.pgt_refresh_history h ON h.pgt_id = st.pgt_id
+    WHERE st.orchestration_mode = 'EXTERNAL'
+      AND h.start_time > now() - interval '1 hour'
+    GROUP BY st.pgt_schema, st.pgt_name
+  metrics:
+    - schema:
+        usage: LABEL
+        description: "External graph stream table schema"
+    - name:
+        usage: LABEL
+        description: "External graph stream table name"
+    - failures_1h:
+        usage: GAUGE
+        description: "Failed externally orchestrated refreshes in the last hour"
+
+pg_trickle_output_delta:
+  query: |
+    SELECT st.pgt_schema AS schema, st.pgt_name AS name,
+           GREATEST(l.log_head - COALESCE(min(c.acknowledged_batch_token), l.log_head), 0)::bigint
+             AS consumer_lag_batches,
+           count(*) FILTER (WHERE c.state = 'INVALIDATED')::bigint AS invalidated_consumers
+    FROM pgtrickle.pgt_stream_tables st
+    JOIN pgtrickle.pgt_output_delta_logs l ON l.pgt_id = st.pgt_id
+    LEFT JOIN pgtrickle.pgt_output_delta_consumers c ON c.pgt_id = st.pgt_id
+    GROUP BY st.pgt_schema, st.pgt_name, l.log_head
+  metrics:
+    - schema:
+        usage: LABEL
+        description: "Output-delta stream table schema"
+    - name:
+        usage: LABEL
+        description: "Output-delta stream table name"
+    - consumer_lag_batches:
+        usage: GAUGE
+        description: "Batches retained beyond the slowest active output consumer"
+    - invalidated_consumers:
+        usage: GAUGE
+        description: "Output consumers requiring resnapshot"
+
+pg_trickle_cleanup:
+  query: |
+    SELECT count(*)::bigint AS backlog_entries,
+           count(*) FILTER (WHERE blocked)::bigint AS blocked_entries,
+           COALESCE(sum(backlog_rows), 0)::bigint AS backlog_rows
+    FROM pgtrickle.pgt_cleanup_status
+  metrics:
+    - backlog_entries:
+        usage: GAUGE
+        description: "Sources with recorded cleanup state"
+    - blocked_entries:
+        usage: GAUGE
+        description: "Sources whose cleanup is blocked"
+    - backlog_rows:
+        usage: GAUGE
+        description: "Rows waiting for cleanup"
 
 # ── Reliability counters (OPS-10-02) ─────────────────────────────────────────
 # Requires pg_trickle 0.50.0+.

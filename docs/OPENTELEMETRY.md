@@ -201,6 +201,27 @@ Refresh spans exported by pg_trickle include:
 | `pgt.duration_ms` | Refresh duration in milliseconds |
 | `pgt.cycle_id` | Scheduler cycle identifier |
 
+## Stable Span Names
+
+These names are part of the v0.97 compatibility surface. Dashboards and
+collector routing can match them without depending on implementation details:
+
+| Span name | Boundary |
+|-----------|----------|
+| `pgtrickle.cdc_drain` | Drain captured source changes |
+| `pgtrickle.dvm_plan` | Build the differential plan |
+| `pgtrickle.merge_apply` | Apply the result delta |
+| `pgtrickle.notify_emit` | Emit refresh notifications |
+| `pgtrickle.scheduler_tick` | Run one scheduler tick |
+| `pgtrickle.refresh_cycle` | Execute one refresh cycle |
+| `pgtrickle.delta_execute` | Execute a planned delta |
+| `pgtrickle.frontier_advance` | Advance the refresh frontier |
+| `pgtrickle.cleanup` | Retire consumed change state |
+
+The OTLP scope version is the packaged pg_trickle version. This lets a
+collector or trace backend identify the exact extension build that emitted a
+span.
+
 ---
 
 ## Troubleshooting

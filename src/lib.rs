@@ -904,6 +904,12 @@ VALUES (
     'Graph V1 contracts and durable external orchestration ownership'
 )
 ON CONFLICT (version) DO NOTHING;
+INSERT INTO pgtrickle.pgt_schema_version (version, description)
+VALUES (
+    '0.97.0',
+    'Operational assurance, monitoring contracts, and release evidence'
+)
+ON CONFLICT (version) DO NOTHING;
 
 SELECT pg_catalog.pg_extension_config_dump('pgtrickle.pgt_stream_tables', '');
 SELECT pg_catalog.pg_extension_config_dump('pgtrickle.pgt_dependencies', '');

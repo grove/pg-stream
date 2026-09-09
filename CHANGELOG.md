@@ -37,6 +37,7 @@ The cutoff exists because:
 
 <!-- TOC start -->
 - [Unreleased](#unreleased)
+- [0.97.0 — Monitoring, Assurance & Packaging](#0970--monitoring-assurance--packaging)
 - [0.96.0 — Defaults, Bounds & Diagnosis](#0960--defaults-bounds--diagnosis)
 - [0.95.0 — Durable Typed Output Deltas](#0950--durable-typed-output-deltas)
 - [0.94.0 — Strict Transactional Graph Refresh](#0940--strict-transactional-graph-refresh)
@@ -205,6 +206,20 @@ Run `ALTER EXTENSION pg_trickle UPDATE` after installing the 0.87.12 files.
 ## [Unreleased]
 
 Future changes will be listed here.
+
+## [0.97.0] — Monitoring, Assurance & Packaging
+
+v0.97.0 makes the existing operational surfaces verifiable and package-ready.
+
+- Ships an assurance dashboard and Prometheus queries/alerts for freshness,
+  CDC backlog, disk pressure, FULL fallbacks, external graphs, output consumers,
+  and cleanup growth.
+- Adds a real OpenTelemetry Collector contract check and documents the stable
+  refresh span names.
+- Adds the 0.96.0 → 0.97.0 migration, full-install archive, release gate, and
+  machine-readable release evidence manifest.
+
+See the [v0.97 roadmap](roadmap/v0.97.0.md) and [upgrade guide](docs/UPGRADING.md).
 
 ## [0.96.0] — Defaults, Bounds & Diagnosis
 
