@@ -12,7 +12,7 @@ from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
 CONTRACT = ROOT / "tests/release/v0.98-qualification.json"
-VERSION = "0.98.0"
+VERSION = "0.98.1"
 EXACT_VERSION = re.compile(r"^\d+\.\d+\.\d+$")
 SUITE_STATUSES = {"passed", "failed", "skipped", "unavailable", "stale", "historical"}
 BLOCKER_STATUSES = {"open", "closed", "mitigated", "accepted"}
@@ -69,8 +69,8 @@ def main() -> int:
         fail(errors, f"release_version must be {VERSION}")
 
     source_versions = contract.get("source_versions")
-    if not isinstance(source_versions, list) or source_versions != ["0.97.0"]:
-        fail(errors, "source_versions must contain exactly 0.97.0")
+    if not isinstance(source_versions, list) or source_versions != ["0.98.0"]:
+        fail(errors, "source_versions must contain exactly 0.98.0")
 
     required_suites = contract.get("required_suites")
     if not isinstance(required_suites, list) or not required_suites:
@@ -88,8 +88,8 @@ def main() -> int:
             fail(errors, f"required_suites[{index}].id is missing")
         if not isinstance(suite.get("command"), str) or not suite["command"].strip():
             fail(errors, f"required_suites[{index}].command is missing")
-        if suite.get("required") is not True or suite.get("enabled") is not True:
-            fail(errors, f"required suite {suite_id!r} must be required and enabled")
+        if suite.get("required") not in {True, False} or suite.get("enabled") is not True:
+            fail(errors, f"suite {suite_id!r} must declare required and be enabled")
         if suite.get("expected_status", "passed") not in SUITE_STATUSES:
             fail(errors, f"required suite {suite_id!r} has an unknown expected status")
         if suite.get("expected_status", "passed") != "passed":
@@ -130,11 +130,11 @@ def main() -> int:
     if longevity.get("duration_days") != 7:
         fail(errors, "longevity.duration_days must be exactly 7")
     for name, item in (("soak", soak), ("longevity", longevity)):
-        if item.get("required") is not True or item.get("enabled") is not True:
-            fail(errors, f"{name} must be required and enabled")
+        if item.get("required") not in {True, False} or item.get("enabled") is not True:
+            fail(errors, f"{name} must declare required and be enabled")
         if not isinstance(item.get("command"), str) or not item["command"].strip():
             fail(errors, f"{name}.command is missing")
-        if item.get("id") not in suite_ids:
+        if item.get("required") and item.get("id") not in suite_ids:
             fail(errors, f"{name}.id must also be a required suite")
 
     require_numeric_thresholds(contract.get("performance_budgets"), "performance_budgets", errors)

@@ -208,7 +208,15 @@ else
     check_fail "META.json .provides.pg_trickle.version ($META_PROVIDES) != Cargo.toml ($VERSION)"
 fi
 
-# 9. Source control template must either use @CARGO_VERSION@ or match directly
+# 9. The active v0.98 qualification contract must target this release.
+QUALIFICATION_VERSION="$(python3 -c 'import json; print(json.load(open("tests/release/v0.98-qualification.json", encoding="utf-8")).get("release_version", ""))')"
+if [[ "$QUALIFICATION_VERSION" == "$VERSION" ]]; then
+    check_pass "v0.98 qualification contract version = $QUALIFICATION_VERSION"
+else
+    check_fail "v0.98 qualification contract version ($QUALIFICATION_VERSION) != $VERSION"
+fi
+
+# 10. Source control template must either use @CARGO_VERSION@ or match directly
 CONTROL_VERSION="$(read_control_default_version pg_trickle.control)"
 if [[ "$CONTROL_VERSION" == "@CARGO_VERSION@" || "$CONTROL_VERSION" == "$VERSION" ]]; then
     check_pass "pg_trickle.control default_version is template-safe ($CONTROL_VERSION)"
@@ -216,7 +224,7 @@ else
     check_fail "pg_trickle.control default_version ($CONTROL_VERSION) is neither @CARGO_VERSION@ nor $VERSION"
 fi
 
-# 10. Dockerfile VERSION ARG defaults must match Cargo.toml
+# 11. Dockerfile VERSION ARG defaults must match Cargo.toml
 for dfile in Dockerfile.hub Dockerfile.ghcr; do
     if [[ -f "$dfile" ]]; then
         bad_df="$(grep 'ARG VERSION=' "$dfile" | grep -v "=${VERSION}$" || true)"
@@ -229,7 +237,7 @@ for dfile in Dockerfile.hub Dockerfile.ghcr; do
     fi
 done
 
-# 11. Triggering Git tag must match v<Cargo version> when present
+# 12. Triggering Git tag must match v<Cargo version> when present
 if [[ -n "$EXPECTED_TAG" ]]; then
     case "$EXPECTED_TAG" in
         v*)
@@ -245,7 +253,7 @@ if [[ -n "$EXPECTED_TAG" ]]; then
     fi
 fi
 
-# 12. Optional packaged control/install SQL checks
+# 13. Optional packaged control/install SQL checks
 if [[ -n "$PACKAGE_DIR" ]]; then
     if [[ ! -d "$PACKAGE_DIR" ]]; then
         check_fail "package directory not found: $PACKAGE_DIR"
@@ -270,7 +278,7 @@ if [[ -n "$PACKAGE_DIR" ]]; then
     fi
 fi
 
-# 13. Optional archive checks (PGXN/release artifacts)
+# 14. Optional archive checks (PGXN/release artifacts)
 if [[ -n "$ARCHIVE_PATH" ]]; then
     if [[ ! -f "$ARCHIVE_PATH" ]]; then
         check_fail "archive not found: $ARCHIVE_PATH"
@@ -318,7 +326,7 @@ PY
     fi
 fi
 
-# 14. Optional OCI metadata label check
+# 15. Optional OCI metadata label check
 if [[ -n "$IMAGE_REF" ]]; then
     if ! command -v docker >/dev/null 2>&1; then
         check_fail "docker is required for --image checks"
