@@ -483,11 +483,11 @@ diagnostics, and a support-matrix entry.
 
 A September 2026 assessment extends the pre-1.0 sequence beyond v0.98.x. The
 [assessment](plans/pg-trickle-assessment-and-pre-1.0-roadmap.md) keeps the
-PostgreSQL-native architecture and conservative fallbacks, but identifies
-remaining gaps in WAL receipt durability, graph conformance, refresh-path
-parity, product documentation, and release evidence. v0.98.x remains an
-interim stabilization series. v0.99.0 through v0.104.0 close those gaps and
-improve the core IVM engine. v0.105.x performs final qualification.
+PostgreSQL-native architecture and conservative fallbacks. A follow-up
+[assessment of v0.93.0 through v0.97.0](roadmap/v0.98.x.md) identifies release
+blockers that must close first. v0.98.0 contains those risks, and v0.98.1
+qualifies the corrected baseline. v0.99.0 through v0.104.0 then improve and
+freeze the core IVM engine. v0.105.x performs final qualification.
 
 | Version | Theme | User promise | Status | Scope | Full details |
 |---------|-------|--------------|--------|-------|--------------|
@@ -525,8 +525,9 @@ improve the core IVM engine. v0.105.x performs final qualification.
 | [v0.95.0](roadmap/v0.95.0.md) | Durable Typed Output Deltas: typed output-delta relation, consumer registration and cursors, exact-or-invalidation batches, retention and backpressure, and resnapshot | "Consume output changes without private buffers or expensive full scans." | ✅ Released | Large | [Full details](roadmap/v0.95.0.md) |
 | [v0.96.0](roadmap/v0.96.0.md) | Defaults, Bounds & Diagnosis: resource-based defaults, honest hard-bound, throttled, and forecast-and-react guarantees, progress reporting, stable operational error identifiers, and predefined roles | "I can run this for years without hidden resource or repair behavior." | ✅ Released | Large | [Full details](roadmap/v0.96.0.md) |
 | [v0.97.0](roadmap/v0.97.0.md) | Monitoring, Assurance & Packaging: tested Grafana and OTel contracts, same-commit soak and upgrade matrix, performance gates, a longevity environment, reproducible package smoke tests, and a release-evidence baseline | "I can monitor, verify, install, and upgrade the supported build." | ✅ Released | Large | [Full details](roadmap/v0.97.0.md) |
-| [v0.98.x](roadmap/v0.98.x.md) | Interim Stabilization: blockers, compatibility, tests, diagnostics, packaging, documentation, dependency cleanup, and removal or narrowing of unproven optimizer and controller behavior | "The next development baseline contains less risk, not more scope." | Planned | Variable | [Full details](roadmap/v0.98.x.md) |
-| [v0.99.0](roadmap/v0.99.0.md) | Verified Capabilities and Product Truth: executable capability manifest, accurate documentation, graph conformance, and release evidence | "I can determine whether my query will work and how pg_trickle will maintain it." | Planned | Medium | [Full details](roadmap/v0.99.0.md) |
+| [v0.98.0](roadmap/v0.98.0.md) | Risk Containment and Contract Truth: safe capture defaults, fail-closed Graph V1 and Delta V1 admission, operational contract repair, and a fixed qualification contract | "Known correctness risks are fixed or unavailable in stable operation." | Planned | Medium | [Full details](roadmap/v0.98.0.md) |
+| [v0.98.1](roadmap/v0.98.1.md) | Qualified Interim Baseline: candidate-bound correctness, upgrades, packages, soak, longevity, performance gates, and release evidence | "The published build passed its required tests on the artifact that ships." | Planned | Large | [Full details](roadmap/v0.98.1.md) |
+| [v0.99.0](roadmap/v0.99.0.md) | Verified Capabilities and Product Truth: executable capability manifest, accurate documentation, verified Graph and Delta declarations, and release evidence | "I can determine whether my query will work and how pg_trickle will maintain it." | Planned | Medium | [Full details](roadmap/v0.99.0.md) |
 | [v0.100.0](roadmap/v0.100.0.md) | Unified Transactional IVM Execution: one refresh contract across scheduled, manual, graph, and lifecycle paths | "A graph remains incremental when I refresh it manually or through a coordinator." | Planned | Large | [Full details](roadmap/v0.100.0.md) |
 | [v0.101.0](roadmap/v0.101.0.md) | Exact Relational State and Semantic Depth: incremental multiplicity state, narrow DISTINCT state, numeric fidelity, and deliberate identity coverage | "Ordinary SQL workloads remain incremental through duplicates, deletions, and repeated changes." | Planned | Large | [Full details](roadmap/v0.101.0.md) |
 | [v0.102.0](roadmap/v0.102.0.md) | Output-Sensitive Delta Performance: measured operator locality, better delta statistics, and evidence-gated rewrites | "Small relevant changes avoid unnecessary scans, and expensive refreshes explain their cost." | Planned | Large | [Full details](roadmap/v0.102.0.md) |
@@ -537,17 +538,18 @@ improve the core IVM engine. v0.105.x performs final qualification.
 ### Toward v1.0
 
 The mandatory lifecycle path is v0.87.17 → v0.88.0 → v0.91.0 → v0.92.0
-→ v0.93.0 → v0.94.0 → v0.95.0 → v0.96.0 → v0.97.0 → v0.98.x
+→ v0.93.0 → v0.94.0 → v0.95.0 → v0.96.0 → v0.97.0 → v0.98.0 → v0.98.1
 → v0.99.0 → v0.100.0 → v0.101.0 → v0.102.0 → v0.103.0 → v0.104.0
 → v0.105.x → release candidate → v1.0.0.
 v0.89.0 and v0.90.0 form a parallel performance and product track after
 v0.88.0. Their research and unproven automation do not block lifecycle work.
 
-v0.98.x is an interim stabilization-only series for bugs, benchmarks,
-compatibility, upgrades, documentation, real-world workloads, and
-simplification. v0.99.0 through v0.104.0 then execute the finite IVM program
-defined by the September 2026 assessment. The final feature freeze begins after
-v0.104.0. v0.105.x accepts only qualification work and release-blocking fixes.
+v0.98.0 resolves known correctness and contract risks or disables the affected
+behavior. v0.98.1 freezes that result and qualifies one exact candidate. The
+[series assessment](roadmap/v0.98.x.md) defines the boundary. v0.99.0 through
+v0.104.0 then execute the finite IVM program defined by the September 2026
+assessment. The final feature freeze begins after v0.104.0. v0.105.x accepts
+only qualification work and release-blocking fixes.
 
 The release-candidate series follows v0.105.x. `v1.0.0-rc.N` ships first, and
 1.0.0 is tagged only after a candidate has been in the field without a new
@@ -564,9 +566,10 @@ are outside this project's control and do not delay the finished PG 18 contract.
 > V2 encoding, engine integration, and intentional stream-table recreation
 > workflow before vectorized DVM changes begin. v0.91.0 and v0.92.0 split
 > schema evolution from recovery and upgrade work. v0.93.0 through v0.95.0
-> deliver separately gated Graph V1 and Delta V1 contracts. v0.97.0 establishes
-> the first complete assurance baseline, and v0.98.x stabilizes it before the
-> final IVM program. v0.99.0 through v0.104.0 close the assessed contract,
+> deliver separately gated Graph V1 and Delta V1 contracts. v0.97.0 adds the
+> first release-assurance machinery. v0.98.0 repairs or narrows the contracts
+> that lack proof, and v0.98.1 qualifies the corrected baseline. v0.99.0 through
+> v0.104.0 close the assessed contract,
 > execution, state, performance, workload-control, and extension gaps.
 > v0.105.x qualifies the frozen result.
 
@@ -747,9 +750,11 @@ v0.88    ─── Safe engine optimization: DiffContext split, narrow vector pa
     │   │
     │   v0.97    ─── Monitoring, assurance & packaging: Grafana/OTel, same-commit soak and upgrade matrix, longevity, package smoke tests, evidence baseline
     │   │
-    │   v0.98.x  ─── Interim stabilization: blockers, compatibility, tests, docs, packaging, and narrowing of unproven behavior
+    │   v0.98.0  ─── Risk containment: safe capture defaults, contract truth, fail-closed Graph and Delta behavior, qualification contract
     │   │
-    │   v0.99    ─── Verified capabilities: executable support contract, graph conformance, product and release truth
+    │   v0.98.1  ─── Qualified baseline: exact-candidate qualification, upgrades, packages, 72-hour soak, performance, and evidence
+    │   │
+    │   v0.99    ─── Verified capabilities: executable support contract, truthful Graph and Delta declarations, product and release truth
     │   │
     │   v0.100   ─── Unified IVM execution: refresh-path parity, incremental graph composition, strategy enforcement
     │   │
@@ -1151,9 +1156,10 @@ cloning, upgrades, and CDC recovery as a separate mandatory gate. v0.93.0 adds
 canonical contracts and durable external ownership; v0.94.0 completes Graph V1
 with strict transactional refresh. v0.95.0 independently gates durable typed
 output deltas. v0.96.0 defines defaults, resource guarantees, progress,
-diagnostics, and roles. v0.97.0 closes monitoring, soak, compatibility,
-regression, and package gates on one candidate commit. v0.98.x stabilizes that
-interim baseline. The September 2026 assessment then drives v0.99.0 through
+diagnostics, and roles. v0.97.0 adds monitoring, package, and release-evidence
+machinery, but its required qualification is incomplete. v0.98.0 resolves or
+disables the known unsafe contracts. v0.98.1 then runs the release gates on
+one frozen candidate. The September 2026 assessment drives v0.99.0 through
 v0.105.x: align capabilities with public claims, unify refresh execution, close
 relational-state gaps, improve delta locality and workload coexistence, freeze
 the extension contracts, and qualify the exact release artifacts.
