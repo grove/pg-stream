@@ -787,6 +787,10 @@ fn health_check() -> TableIterator<
         ),
     ));
 
+    // v0.96.0: disk growth is forecast-and-react, not a hard bound. Warn
+    // before the configured headroom is consumed while preserving changes.
+    rows.extend(crate::api::release_096::disk_health_rows());
+
     TableIterator::new(rows)
 }
 

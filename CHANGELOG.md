@@ -37,6 +37,7 @@ The cutoff exists because:
 
 <!-- TOC start -->
 - [Unreleased](#unreleased)
+- [0.96.0 — Defaults, Bounds & Diagnosis](#0960--defaults-bounds--diagnosis)
 - [0.95.0 — Durable Typed Output Deltas](#0950--durable-typed-output-deltas)
 - [0.94.0 — Strict Transactional Graph Refresh](#0940--strict-transactional-graph-refresh)
 - [0.93.0 — Graph Contracts and External Ownership](#0930--graph-contracts-and-external-ownership)
@@ -204,6 +205,25 @@ Run `ALTER EXTENSION pg_trickle UPDATE` after installing the 0.87.12 files.
 ## [Unreleased]
 
 Future changes will be listed here.
+
+## [0.96.0] — Defaults, Bounds & Diagnosis
+
+v0.96.0 makes resource choices and operational limits visible and stable.
+
+- Derives the default memory budget from the memory visible to PostgreSQL while
+  preserving explicit GUC overrides.
+- Adds `active_profile()`, `disk_usage()`, and a forecast row in
+  `health_check()` for resource diagnosis without discarding committed work.
+- Adds `pg_stat_progress_pgtrickle` for running refresh operations.
+- Publishes stable operational error identifiers and SQLSTATEs through
+  `error_catalog()`.
+- Adds predefined `pgtrickle_reader`, `pgtrickle_operator`, and
+  `pgtrickle_admin` roles with least-privilege grants. PostgreSQL reserves
+  role names beginning with `pg_`, so the valid role spelling omits that
+  separator.
+- Adds the 0.95.0 → 0.96.0 upgrade migration and full-install archive.
+
+See the [v0.96 roadmap](roadmap/v0.96.0.md) and [upgrade guide](docs/UPGRADING.md).
 
 ## [0.93.0] — Graph Contracts and External Ownership
 

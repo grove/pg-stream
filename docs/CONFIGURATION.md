@@ -6,10 +6,17 @@
 count in one bounded differential apply batch. v0.88 removes the deprecated
 `pg_trickle.merge_batch_size` alias.
 
-`pg_trickle.memory_budget_mb` (default `256`) derives pg_trickle-owned limits:
+`pg_trickle.memory_budget_mb` (default `256`, automatic) derives
+pg_trickle-owned limits from 10% of memory visible to PostgreSQL when the
+default sentinel is active. Set an explicit value to override it. The budget
+allocates:
 75% for the delta pipeline, 15% for template/plan cache, and 5% each for the
 DAG queue and invalidation ring. Change-buffer growth uses the budget as a
 lossless storage guard: committed rows are never discarded to satisfy it.
+`pg_trickle.disk_headroom_mb` (default `1024`) is a forecast-and-react warning
+threshold used by `pgtrickle.disk_usage()` and `health_check()`. It does not
+claim to bound PostgreSQL or source-table disk growth; set it to `0` to disable
+the forecast.
 `pg_trickle.load_shed_threshold` (default `0.80`, `0` disables) defers only
 non-urgent scheduled work under the documented load-pressure proxy.
 

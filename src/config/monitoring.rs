@@ -87,6 +87,12 @@ pub static PGS_METRICS_REQUEST_TIMEOUT_MS: GucSetting<i32> = GucSetting::<i32>::
 /// Default: 24 hours. Range: 1–8760 (1 hour – 1 year).
 pub static PGS_SLA_WINDOW_HOURS: GucSetting<i32> = GucSetting::<i32>::new(24);
 
+/// Disk headroom reserved for pg_trickle's forecast-and-react policy, in MiB.
+///
+/// This is a warning threshold, not a promise about PostgreSQL or source-table
+/// growth. Set to zero to disable the forecast check.
+pub static PGS_DISK_HEADROOM_MB: GucSetting<i32> = GucSetting::<i32>::new(1024);
+
 // ── Enums ─────────────────────────────────────────────────────────────────
 
 /// MON-2: Self-monitoring auto-apply mode enum.
@@ -261,6 +267,18 @@ pub fn register_monitoring_gucs() {
         GucContext::Suset,
         GucFlags::default(),
     );
+
+    GucRegistry::define_int_guc(
+        c"pg_trickle.disk_headroom_mb",
+        c"Reserved disk headroom for forecast-and-react diagnostics in MiB.",
+        c"Used by disk_usage() and health_check() as an early-warning threshold. \
+           It does not bound PostgreSQL or source-table disk growth. Set to 0 to disable.",
+        &PGS_DISK_HEADROOM_MB,
+        0,
+        1_048_576,
+        GucContext::Userset,
+        GucFlags::default(),
+    );
 }
 
 // ── Accessor functions ────────────────────────────────────────────────────
@@ -330,4 +348,9 @@ pub fn pg_trickle_metrics_request_timeout_ms() -> i32 {
 /// SLA-1: Returns the SLA compliance measurement window in hours.
 pub fn pg_trickle_sla_window_hours() -> i32 {
     PGS_SLA_WINDOW_HOURS.get()
+}
+
+/// Return the configured disk headroom in bytes.
+pub fn pg_trickle_disk_headroom_bytes() -> u64 {
+    (PGS_DISK_HEADROOM_MB.get().max(0) as u64) * 1024 * 1024
 }

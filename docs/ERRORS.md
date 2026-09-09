@@ -7,6 +7,22 @@ causes, and suggested fixes. If you encounter an error not listed here, please
 > **Tip:** Most errors include context (table name, OID, or query fragment) in
 > the message text. Use that context to narrow down the root cause.
 
+## Stable Operational Error Identifiers
+
+The `pgtrickle.error_catalog()` function exposes the machine-readable error
+identifiers used by operational retry and alerting code. The identifier and
+SQLSTATE are stable across patch releases; `detail` and `hint` provide the
+operator-facing remediation.
+
+| Error ID | SQLSTATE | Retry class |
+|----------|----------|-------------|
+| `LOCK_TIMEOUT` | `55P03` | Retryable |
+| `STATEMENT_TIMEOUT` | `57014` | Retryable |
+| `DEADLOCK` | `40P01` | Retryable |
+| `SERIALIZATION` | `40001` | Retryable |
+| `OUT_OF_MEMORY` | `53200` | Retry after reducing workload or budget |
+| `PERMANENT` | `XX000` | Not automatically retryable |
+
 ---
 
 ## SQLSTATE Code Reference

@@ -4,7 +4,7 @@
 
 # SQL API Reference — pg_trickle
 
-**161 SQL-callable functions** discovered via `#[pg_extern]` in `src/`.
+**164 SQL-callable functions** discovered via `#[pg_extern]` in `src/`.
 
 See [docs/SQL_REFERENCE.md](SQL_REFERENCE.md) for full signatures and examples.
 
@@ -16,6 +16,7 @@ See [docs/SQL_REFERENCE.md](SQL_REFERENCE.md) for full signatures and examples.
 | `pgtrickle._signal_launcher_rescan()` | `pgtrickle` | `` | Also safe to call manually if the launcher needs a nudge. |
 | `pgtrickle.ack_output_delta()` | `pgtrickle` | `text` | Advance a consumer cursor transactionally. |
 | `pgtrickle.ack_output_delta_resnapshot()` | `pgtrickle` | `text` | Commit a resnapshot baseline and activate the consumer. |
+| `pgtrickle.active_profile()` | `pgtrickle` | `SetOf row` | Report detected constraints and the values pg_trickle selected from them. |
 | `pgtrickle.advance_watermark()` | `pgtrickle` | `void` | - **Monotonic:** rejects watermarks that go backward. |
 | `pgtrickle.alter_stream_table()` | `pgtrickle` | `` | Alter properties of an existing stream table. |
 | `pgtrickle.attach_embedding_outbox()` | `pgtrickle` | `` | The `vector_column` parameter documents which column carries the embedding — it is stored in the outbox headers so consumers can identify the embedding field without inspecting the payload. |
@@ -49,6 +50,7 @@ See [docs/SQL_REFERENCE.md](SQL_REFERENCE.md) for full signatures and examples.
 | `pgtrickle.detach_outbox()` | `pgtrickle` | `` | Removes the entry from `pgtrickle.pgt_outbox_config`. |
 | `pgtrickle.diagnose_errors()` | `pgtrickle` | `SetOf row` | # SQL usage ```sql SELECT * FROM pgtrickle.diagnose_errors('my_stream_table'); ```. |
 | `pgtrickle.diamond_groups()` | `pgtrickle` | `SetOf row` | Returns one row per group member, indicating which group it belongs to, whether it is a convergence (fan-in) node, the group's current epoch, and the effective schedule policy. |
+| `pgtrickle.disk_usage()` | `pgtrickle` | `SetOf row` | Report stream-table storage, pending CDC storage, and configured disk headroom. |
 | `pgtrickle.drain()` | `pgtrickle` | `` | # Example ```sql -- Quiesce before pg_upgrade or rolling restart: SELECT pgtrickle.drain(); -- Confirm drained: SELECT pgtrickle.is_drained(); -- Resume normal operation after maintenance: SELECT pgtrickle.resume_after_drain(); ```. |
 | `pgtrickle.drop_refresh_group()` | `pgtrickle` | `void` | Drop a refresh group by name. |
 | `pgtrickle.drop_snapshot()` | `pgtrickle` | `` | Removes the snapshot table and its catalog row from `pgtrickle.pgt_snapshots`. |
@@ -57,6 +59,7 @@ See [docs/SQL_REFERENCE.md](SQL_REFERENCE.md) for full signatures and examples.
 | `pgtrickle.drop_watermark_group()` | `pgtrickle` | `void` | Drop a watermark group by name. |
 | `pgtrickle.embedding_stream_table()` | `pgtrickle` | `` | # Returns A single-column table with one row per action taken (or SQL line for dry_run). |
 | `pgtrickle.encode_row_id_v2()` | `pgtrickle` | `Vec<u8>` | Encode a PostgreSQL record into exact V2 identity bytes. |
+| `pgtrickle.error_catalog()` | `pgtrickle` | `SetOf row` | Stable operational error identifiers and their PostgreSQL SQLSTATEs. |
 | `pgtrickle.exec_stream_ddl()` | `pgtrickle` | `boolean` | # Example ```sql SELECT pgtrickle.exec_stream_ddl(   'CREATE STREAM TABLE revenue AS SELECT SUM(amount) FROM orders' ); ```. |
 | `pgtrickle.explain()` | `pgtrickle` | `text` | v0.86.0: Explain the bounded refresh/cost/freshness snapshot as text. |
 | `pgtrickle.explain_alter()` | `pgtrickle` | `jsonb` | Explain a defining-query change without mutating catalog, storage, or CDC. |

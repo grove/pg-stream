@@ -513,6 +513,27 @@
       "class": "public_read",
       "execution_policy": "capability_specific"
     },
+    "pgtrickle.active_profile()": {
+      "schema": "pgtrickle",
+      "name": "active_profile",
+      "identity_arguments": "",
+      "class": "public_read",
+      "execution_policy": "capability_specific"
+    },
+    "pgtrickle.disk_usage()": {
+      "schema": "pgtrickle",
+      "name": "disk_usage",
+      "identity_arguments": "",
+      "class": "public_read",
+      "execution_policy": "capability_specific"
+    },
+    "pgtrickle.error_catalog()": {
+      "schema": "pgtrickle",
+      "name": "error_catalog",
+      "identity_arguments": "",
+      "class": "public_read",
+      "execution_policy": "capability_specific"
+    },
     "pgtrickle.history_prune_status()": {
       "schema": "pgtrickle",
       "name": "history_prune_status",

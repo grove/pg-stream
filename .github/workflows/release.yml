@@ -60,6 +60,9 @@ jobs:
       - name: v0.90 freshness-controller release gate
         run: python3 scripts/v0_90_release_gate.py
 
+      - name: v0.96 defaults and diagnosis release gate
+        run: python3 scripts/v0_96_release_gate.py
+
   # ── Build release artifacts for each platform ───────────────────────────
   build-release:
     name: Build (${{ matrix.artifact_suffix }})

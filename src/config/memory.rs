@@ -3,6 +3,9 @@
 use pgrx::guc::*;
 
 /// Master budget for pg_trickle-owned in-process accumulations, in MiB.
+///
+/// The default value of 256 is an automatic sentinel: it derives a budget
+/// from memory visible to PostgreSQL. Set an explicit value to override it.
 pub static PGS_MEMORY_BUDGET_MB: GucSetting<i32> = GucSetting::<i32>::new(256);
 
 /// A bounded component of the pg_trickle memory policy.
@@ -78,7 +81,13 @@ impl MemoryBudget {
     }
 
     pub fn from_guc() -> Self {
-        match Self::from_mb(PGS_MEMORY_BUDGET_MB.get().max(0) as u64) {
+        let configured_mb = PGS_MEMORY_BUDGET_MB.get().max(0) as u64;
+        let effective_mb = if configured_mb == 256 {
+            auto_memory_budget_mb().unwrap_or(configured_mb)
+        } else {
+            configured_mb
+        };
+        match Self::from_mb(effective_mb) {
             Some(budget) => budget,
             None => Self {
                 total_bytes: 256 * Self::MIB,
@@ -119,12 +128,47 @@ impl MemoryBudget {
     }
 }
 
+/// Derive a conservative default from the memory visible to the PostgreSQL
+/// process. The explicit GUC remains the escape hatch for workload tuning.
+fn auto_memory_budget_mb() -> Option<u64> {
+    // ponytail: 10% host-memory heuristic; replace with measured workload
+    // sizing only if production evidence shows this ceiling is insufficient.
+    let bytes = [
+        "/sys/fs/cgroup/memory.max",
+        "/sys/fs/cgroup/memory/memory.limit_in_bytes",
+    ]
+    .iter()
+    .filter_map(|path| std::fs::read_to_string(path).ok())
+    .filter_map(|value| {
+        let value = value.trim();
+        if value == "max" {
+            None
+        } else {
+            value.parse::<u64>().ok().filter(|bytes| *bytes > 0)
+        }
+    })
+    .next()
+    .or_else(|| {
+        std::fs::read_to_string("/proc/meminfo")
+            .ok()
+            .and_then(|text| {
+                text.lines()
+                    .find(|line| line.starts_with("MemTotal:"))
+                    .and_then(|line| line.split_whitespace().nth(1))
+                    .and_then(|kb| kb.parse::<u64>().ok())
+                    .map(|kb| kb.saturating_mul(1024))
+            })
+    })?;
+
+    Some((bytes / 10 / MemoryBudget::MIB).clamp(MemoryBudget::MIN_MB, MemoryBudget::MAX_MB))
+}
+
 /// Register the master memory policy GUC.
 pub fn register_memory_gucs() {
     GucRegistry::define_int_guc(
         c"pg_trickle.memory_budget_mb",
-        c"Master pg_trickle memory budget in MiB.",
-        c"Bounds pg_trickle-owned pipeline, cache, queue, and invalidation accumulations. Change-buffer growth is a lossless storage guard; it never drops committed rows.",
+        c"Master pg_trickle memory budget in MiB (256 = automatic).",
+        c"Bounds pg_trickle-owned pipeline, cache, queue, and invalidation accumulations. The default 256 derives a conservative budget from visible memory. Change-buffer growth is a lossless storage guard; it never drops committed rows.",
         &PGS_MEMORY_BUDGET_MB,
         MemoryBudget::MIN_MB as i32,
         MemoryBudget::MAX_MB as i32,
