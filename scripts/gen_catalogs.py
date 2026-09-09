@@ -349,10 +349,44 @@ def extract_sql_functions_from_pgrx_sql(sql_path: Path) -> list[dict]:
 # SQL API extraction — improved Rust source regex parser
 # ---------------------------------------------------------------------------
 
-_PG_EXTERN_RE = re.compile(r'#\[(?:pgrx::)?pg_extern\s*\(([^)]*)\)\]')
 _FN_SIG_RE = re.compile(
     r'(?:pub\s+)?(?:unsafe\s+)?fn\s+(\w+)\s*\(([^)]*(?:\([^)]*\)[^)]*)*)\)\s*(?:->\s*([^{;]+))?'
 )
+
+
+def _pg_extern_attrs(lines: list[str], index: int) -> str | None:
+    """Return balanced pg_extern attributes, including SQL strings with ')' ."""
+    line_match = re.match(r"[ \t]*#\[(?:pgrx::)?pg_extern", lines[index])
+    if not line_match:
+        return None
+    text = "\n".join(lines[index : index + 30])
+    match = line_match
+    opening = text.find("(", match.end())
+    if opening < 0:
+        return ""
+
+    depth = 0
+    quoted = False
+    escaped = False
+    for position in range(opening, len(text)):
+        char = text[position]
+        if quoted:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                quoted = False
+            continue
+        if char == '"':
+            quoted = True
+        elif char == "(":
+            depth += 1
+        elif char == ")":
+            depth -= 1
+            if depth == 0:
+                return text[opening + 1 : position]
+    return None
 
 
 def extract_sql_functions(src_dir: Path) -> list[dict]:
@@ -364,10 +398,10 @@ def extract_sql_functions(src_dir: Path) -> list[dict]:
         lines = text.splitlines()
 
         for idx, line in enumerate(lines):
-            if not _PG_EXTERN_RE.search(line):
+            attrs = _pg_extern_attrs(lines, idx)
+            if attrs is None:
                 continue
 
-            attrs = _PG_EXTERN_RE.search(line).group(1)
             schema = "pgtrickle"
             m_schema = re.search(r'schema\s*=\s*"([^"]+)"', attrs)
             if m_schema:

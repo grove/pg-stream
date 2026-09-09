@@ -170,6 +170,12 @@ Complete reference for all SQL functions, views, and catalog tables provided by 
 
 ---
 
+## Capability truth
+
+The [generated capability manifest](capability-manifest.json) is the release
+source of truth for supported strategies, fail-closed integrations, and the
+runnable admission examples behind those claims.
+
 ## Functions
 
 > **Parameter naming convention:** Core lifecycle functions use bare,
@@ -1635,9 +1641,9 @@ infrastructure, and schedules a protected full refresh.
 
 ## Integration Contracts
 
-The v0.94 contract APIs expose stable, typed metadata and strict transactional
-graph refresh for integrations. Durable output-delta delivery is available in
-v0.95.0.
+The v0.94 contract APIs expose typed metadata and strict transactional graph
+refresh for integrations. The v0.99 capability manifest records that Graph V1
+and Delta V1 remain experimental and disabled until their conformance releases.
 
 ### pgtrickle.integration_capabilities
 
@@ -1721,7 +1727,7 @@ metadata.
 
 Validate and refresh the complete upstream closure of `EXTERNAL` roots in
 topological order inside the caller's transaction. These integration APIs are
-discoverable but fail closed in v0.98 until their assigned conformance releases.
+discoverable but fail closed in v0.99 until their assigned conformance releases.
 
 ```sql
 SELECT * FROM pgtrickle.refresh_graph_strict(
@@ -1736,7 +1742,7 @@ unsupported members, ownership failures, and busy or changed catalog state
 before executing any member. It does not commit.
 
 The `external_graph_refresh` and `output_delta_consumer` capabilities report
-`experimental` and `enabled = false` in v0.98. Calls fail before locks,
+`experimental` and `enabled = false` in v0.99. Calls fail before locks,
 catalog mutation, cursor movement, or payload generation with
 `PGT_EXT_CAPABILITY_DISABLED`.
 
@@ -5953,50 +5959,3 @@ SELECT pgtrickle.stream_table_spec('public.order_totals'::regclass::oid);
 ```
 
 ---
-
-## DuckLake Sink Observability
-
-### pgtrickle.ducklake_sink_status
-
-**v0.69.0** — Returns one row per stream table that has a DuckLake sink
-configured, showing the most recent delivery outcome.
-
-**Signature:**
-
-```sql
-pgtrickle.ducklake_sink_status()
-RETURNS TABLE (
-    stream_table_name    text,
-    last_delivery_status text,
-    last_delivery_at     timestamptz,
-    last_bytes_written   bigint,
-    last_rows_written    bigint,
-    failed_attempts      bigint,
-    last_error           text
-)
-```
-
-**Columns:**
-
-| Column | Type | Description |
-|--------|------|-------------|
-| `stream_table_name` | `text` | Name of the stream table. |
-| `last_delivery_status` | `text` | Most recent delivery status: `PENDING`, `WRITING`, `DELIVERED`, `FAILED_RETRYABLE`, or `FAILED_PERMANENT`. `NULL` if no delivery has been attempted. |
-| `last_delivery_at` | `timestamptz` | Timestamp when the most recent delivery finished. |
-| `last_bytes_written` | `bigint` | Bytes written in the most recent successful delivery. |
-| `last_rows_written` | `bigint` | Rows written in the most recent successful delivery. |
-| `failed_attempts` | `bigint` | Total number of `FAILED_RETRYABLE` and `FAILED_PERMANENT` rows for this stream table. |
-| `last_error` | `text` | Error message from the most recent failed delivery. `NULL` on success. |
-
-**Example:**
-
-```sql
-SELECT *
-FROM pgtrickle.ducklake_sink_status();
--- stream_table_name | last_delivery_status | last_delivery_at | last_bytes_written | last_rows_written | failed_attempts | last_error
--- revenue_by_region | DELIVERED            | 2026-05-21 ...   |            124208  |               150 |               0 | NULL
-```
-
-Requires the `pgtrickle.pgt_ducklake_sink_delivery` catalog table introduced
-in v0.69.0. Returns an empty result set if no stream tables have a DuckLake
-sink configured.

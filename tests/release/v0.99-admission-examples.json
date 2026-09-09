@@ -1,0 +1,125 @@
+{
+  "manifest_version": 1,
+  "release_version": "0.99.0",
+  "capabilities": [
+    {
+      "id": "trigger-capture",
+      "capability": "trigger_cdc",
+      "major_version": 1,
+      "minor_version": 0,
+      "status": "stable",
+      "enabled": true,
+      "strategy": "trigger",
+      "reason_code": null,
+      "target": null
+    },
+    {
+      "id": "graph-v1",
+      "capability": "external_graph_refresh",
+      "major_version": 1,
+      "minor_version": 0,
+      "status": "experimental",
+      "enabled": false,
+      "strategy": "unavailable",
+      "reason_code": "PGT_EXT_CAPABILITY_DISABLED",
+      "target": "v0.100.0"
+    },
+    {
+      "id": "delta-v1",
+      "capability": "output_delta_consumer",
+      "major_version": 1,
+      "minor_version": 0,
+      "status": "experimental",
+      "enabled": false,
+      "strategy": "unavailable",
+      "reason_code": "PGT_EXT_CAPABILITY_DISABLED",
+      "target": "v0.104.0"
+    },
+    {
+      "id": "wal-capture",
+      "capability": "wal_cdc",
+      "major_version": 1,
+      "minor_version": 0,
+      "status": "unsupported",
+      "enabled": false,
+      "strategy": "unavailable",
+      "reason_code": "PGT_EXT_CDC_UNAVAILABLE",
+      "target": "v0.103.0"
+    }
+  ],
+  "examples": [
+    {
+      "id": "differential-admission",
+      "test": "test_admission_matrix_full_auto_and_explicit_modes",
+      "command": "just test-unit",
+      "sql": "SELECT id FROM source_table",
+      "outcome": "accepted",
+      "strategy": "DIFFERENTIAL",
+      "reason_code": null
+    },
+    {
+      "id": "full-fallback-admission",
+      "test": "test_set_and_mutable_lateral_admission_is_full_only",
+      "command": "just test-unit",
+      "sql": "SELECT id FROM left_table INTERSECT SELECT id FROM right_table",
+      "outcome": "accepted",
+      "strategy": "FULL",
+      "reason_code": "UNSUPPORTED_OPERATOR"
+    },
+    {
+      "id": "wal-rejection",
+      "test": "test_v098_wal_capture_is_disabled",
+      "command": "just test-wal-negative-admission",
+      "sql": "SELECT pgtrickle.create_stream_table(cdc_mode => 'wal', ...)",
+      "outcome": "rejected",
+      "strategy": "UNAVAILABLE",
+      "reason_code": "PGT_EXT_CDC_UNAVAILABLE"
+    },
+    {
+      "id": "graph-rejection",
+      "test": "test_v098_capability_admission",
+      "command": "just test-capability-admission",
+      "sql": "SELECT pgtrickle.refresh_graph_strict(...)",
+      "outcome": "rejected",
+      "strategy": "UNAVAILABLE",
+      "reason_code": "PGT_EXT_CAPABILITY_DISABLED"
+    },
+    {
+      "id": "integration-discovery",
+      "test": "test_v098_integration_capabilities_are_disabled",
+      "command": "just test-light-e2e",
+      "sql": "SELECT * FROM pgtrickle.integration_capabilities()",
+      "outcome": "experimental-disabled",
+      "strategy": "UNAVAILABLE",
+      "reason_code": "PGT_EXT_CAPABILITY_DISABLED"
+    },
+    {
+      "id": "graph-side-effect-free-rejection",
+      "test": "test_v098_graph_contract_admission_rejects_before_work",
+      "command": "just test-light-e2e",
+      "sql": "SELECT * FROM pgtrickle.graph_contract(...)",
+      "outcome": "rejected",
+      "strategy": "UNAVAILABLE",
+      "reason_code": "PGT_EXT_CAPABILITY_DISABLED"
+    }
+  ],
+  "stable_reason_identifiers": [
+    "PGT_EXT_CAPABILITY_DISABLED",
+    "PGT_EXT_CDC_UNAVAILABLE",
+    "UNSUPPORTED_OPERATOR",
+    "VOLATILE_FUNCTION",
+    "recursive_cte_fallback",
+    "WINDOW_RECOMPUTE_CHEAPER"
+  ],
+  "documentation": {
+    "canonical_manifest": "docs/capability-manifest.json",
+    "reconciled_sources": [
+      "README.md",
+      "docs/DVM_SUPPORT_MATRIX.md",
+      "docs/SQL_REFERENCE.md",
+      "docs/GUC_CATALOG.md",
+      "docs/CONFIGURATION.md",
+      "docs/integrations/citus.md"
+    ]
+  }
+}

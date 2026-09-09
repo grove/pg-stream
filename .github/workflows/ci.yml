@@ -628,6 +628,9 @@ jobs:
       - name: Check version references are in sync
         run: ./scripts/check_version_sync.sh
 
+      - name: Validate capability manifest
+        run: python3 scripts/generate_capability_manifest.py --check
+
       - name: Check SQL reference completeness (DX-2)
         run: python3 scripts/gen_sql_reference.py
 

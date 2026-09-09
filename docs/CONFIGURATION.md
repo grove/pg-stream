@@ -1,10 +1,12 @@
 # Configuration
 
+For the current release's supported strategies and unavailable integrations,
+see the generated [capability manifest](capability-manifest.json).
+
 ## Refresh tenancy controls
 
 `pg_trickle.pipeline_batch_size` (default `4096`) is the maximum logical row
-count in one bounded differential apply batch. v0.88 removes the deprecated
-`pg_trickle.merge_batch_size` alias.
+count in one bounded differential apply batch.
 
 `pg_trickle.memory_budget_mb` (default `256`, automatic) derives
 pg_trickle-owned limits from 10% of memory visible to PostgreSQL when the

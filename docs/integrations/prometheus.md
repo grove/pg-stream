@@ -158,7 +158,7 @@ health failure; the breach alert is driven by exact breach duration.
 
 When `pg_trickle.otel_endpoint` is configured, pg_trickle sends one bounded
 OTLP/HTTP JSON metrics batch per monitoring cadence to
-`{endpoint}/v1/metrics`. It exports `pg_trickle.target_freshness`,
+`{endpoint}/v1/metrics`. It exports `pg_trickle_target_freshness_seconds`,
 `pg_trickle.freshness.p95`, and `pg_trickle.sla.breach_duration` in seconds,
 using the same `db_oid`, `db_name`, `schema`, and `name` attributes plus the
 controller status. The batch is best-effort and never blocks refreshes.

@@ -39,6 +39,7 @@ def main() -> None:
     parser.add_argument("--version", required=True)
     parser.add_argument("--candidate-commit", required=True)
     parser.add_argument("--qualification", type=Path)
+    parser.add_argument("--capability-manifest", type=Path)
     parser.add_argument("--artifact", nargs="+", action="append", default=[])
     parser.add_argument("--suite", action="append", default=[])
     parser.add_argument("--skipped", action="append", default=[])
@@ -68,6 +69,19 @@ def main() -> None:
         )
         status = "passed" if not missing and not incomplete else "blocked"
 
+        capability_manifest = None
+        if args.capability_manifest is not None:
+            manifest = json.loads(args.capability_manifest.read_text(encoding="utf-8"))
+            manifest_version = manifest.get("manifest_version")
+            manifest_release = manifest.get("release_version")
+            if not isinstance(manifest_version, int) or not isinstance(manifest_release, str):
+                raise ValueError("capability manifest is missing version metadata")
+            capability_manifest = {
+                "version": manifest_version,
+                "release_version": manifest_release,
+                "sha256": hashlib.sha256(args.capability_manifest.read_bytes()).hexdigest(),
+            }
+
         evidence = {
             "schema_version": 2,
             "release_version": args.version,
@@ -80,6 +94,8 @@ def main() -> None:
             "incomplete_required_suites": incomplete,
             "status": status,
         }
+        if capability_manifest is not None:
+            evidence["capability_manifest"] = capability_manifest
         args.output.parent.mkdir(parents=True, exist_ok=True)
         args.output.write_text(json.dumps(evidence, indent=2) + "\n", encoding="utf-8")
         if status != "passed":

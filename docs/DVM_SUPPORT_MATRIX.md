@@ -8,6 +8,10 @@ incrementally via **Differential View Maintenance (DVM)**, which patterns
 trigger an automatic fallback to FULL refresh, and which are blocked entirely
 in IMMEDIATE mode.
 
+The release-level support contract is the generated
+[capability and strategy manifest](capability-manifest.json). Its admission
+examples point to runnable tests and stable reason identifiers.
+
 ---
 
 ## Table of Contents

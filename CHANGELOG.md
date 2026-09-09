@@ -37,6 +37,7 @@ The cutoff exists because:
 
 <!-- TOC start -->
 - [Unreleased](#unreleased)
+- [0.99.0 — Verified capabilities and product truth](#0990--verified-capabilities-and-product-truth)
 - [0.98.1 — Qualified interim baseline](#0981--qualified-interim-baseline)
 - [0.97.0 — Monitoring, Assurance & Packaging](#0970--monitoring-assurance--packaging)
 - [0.98.0 — Risk Containment and Contract Truth](#0980--risk-containment-and-contract-truth)
@@ -208,6 +209,20 @@ Run `ALTER EXTENSION pg_trickle UPDATE` after installing the 0.87.12 files.
 ## [Unreleased]
 
 Future changes will be listed here.
+
+## [0.99.0] — Verified capabilities and product truth
+
+v0.99.0 makes the supported product surface executable and inspectable.
+
+- Adds a deterministic capability and strategy manifest generated from runnable
+  admission examples and stable reason identifiers.
+- Records Graph V1, Delta V1, and WAL capture as unavailable until their
+  assigned conformance or durable-receipt work is complete.
+- Reconciles active support, configuration, SQL, and integration documentation
+  with the safe v0.99 runtime admission state.
+- Includes the capability-manifest version and digest in release evidence.
+
+See the [v0.99.0 roadmap](roadmap/v0.99.0.md) and [capability manifest](docs/capability-manifest.json).
 
 ## [0.98.1] — Qualified interim baseline
 
