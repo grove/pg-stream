@@ -4,7 +4,7 @@
 
 # GUC Reference — pg_trickle
 
-**146 configuration parameters** extracted from `src/config/`.
+**147 configuration parameters** extracted from `src/config/`.
 
 See [docs/CONFIGURATION.md](CONFIGURATION.md) for full descriptions and usage examples.
 
@@ -95,6 +95,7 @@ See [docs/CONFIGURATION.md](CONFIGURATION.md) for full descriptions and usage ex
 | `pg_trickle.max_parallel_workers` | `int4` | `0` | Default 0 = serial mode (existing behavior preserved). |
 | `pg_trickle.max_parse_depth` | `int4` | `64` | Prevents stack-overflow crashes on pathological queries with deeply nested subqueries, CTEs, or set operations. |
 | `pg_trickle.max_parse_nodes` | `int4` | `100000` | Queries that exceed this limit are rejected with `QueryTooComplex` to prevent unbounded memory allocation in the parse advisory warnings cache and CTE registry. |
+| `pg_trickle.memory_budget_mb` | `int4` | `256` | The default value of 256 is an automatic sentinel: it derives a budget from memory visible to PostgreSQL. |
 | `pg_trickle.merge_join_strategy` | `text` | `"auto"` | Controls the join strategy hint applied via `SET LOCAL` during MERGE: - `"auto"` (default): delta-size heuristics choose the strategy. |
 | `pg_trickle.merge_planner_hints` | `bool` | `true` | Deprecated — use `pg_trickle.planner_aggressive` instead. |
 | `pg_trickle.merge_seqscan_threshold` | `float8` | `0.001` | Set to 0.0 to disable this optimization. |
