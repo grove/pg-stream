@@ -27,6 +27,7 @@
 use crate::catalog::{RefreshRecord, StreamTableMeta};
 use crate::error::PgTrickleError;
 use pgrx::{Spi, prelude::TimestampWithTimeZone};
+use std::cell::RefCell;
 
 pub(crate) mod codegen;
 pub(crate) mod delta_stage;
@@ -71,6 +72,94 @@ pub use merge::{
 pub use orchestrator::{
     RefreshAction, determine_refresh_action, execute_reinitialize_refresh, validate_topk_metadata,
 };
+
+/// Policy carried by a graph refresh while it executes its members.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FullPolicy {
+    Allow,
+    Error,
+}
+
+/// State shared by every refresh operation in one caller transaction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RefreshContext {
+    pub(crate) safe_bound: Option<String>,
+    pub(crate) full_policy: FullPolicy,
+}
+
+impl RefreshContext {
+    pub(crate) fn manual() -> Self {
+        Self {
+            safe_bound: None,
+            full_policy: FullPolicy::Allow,
+        }
+    }
+
+    pub(crate) fn graph(safe_bound: &str, full_policy: FullPolicy) -> Self {
+        Self {
+            safe_bound: Some(safe_bound.to_string()),
+            full_policy,
+        }
+    }
+}
+
+thread_local! {
+    static ACTIVE_CONTEXT: RefCell<Option<RefreshContext>> = const { RefCell::new(None) };
+}
+
+struct ContextRestoreGuard(Option<RefreshContext>);
+
+impl Drop for ContextRestoreGuard {
+    fn drop(&mut self) {
+        ACTIVE_CONTEXT.with(|context| context.replace(self.0.take()));
+    }
+}
+
+/// Run a refresh inside a transaction-scoped context and restore the previous
+/// context on both ordinary and unwinding exits.
+pub(crate) fn with_refresh_context<T>(
+    context: RefreshContext,
+    refresh: impl FnOnce() -> Result<T, PgTrickleError>,
+) -> Result<T, PgTrickleError> {
+    let previous = ACTIVE_CONTEXT.with(|value| value.replace(Some(context)));
+    let _restore = ContextRestoreGuard(previous);
+    refresh()
+}
+
+pub(crate) fn current_safe_bound() -> Option<String> {
+    ACTIVE_CONTEXT.with(|context| {
+        context
+            .borrow()
+            .as_ref()
+            .and_then(|context| context.safe_bound.clone())
+    })
+}
+
+pub(crate) fn current_full_policy() -> FullPolicy {
+    ACTIVE_CONTEXT.with(|context| {
+        context
+            .borrow()
+            .as_ref()
+            .map_or(FullPolicy::Allow, |context| context.full_policy)
+    })
+}
+
+/// Reject a whole-query FULL transition when the active graph forbids it.
+pub(crate) fn ensure_full_policy(
+    st: &StreamTableMeta,
+    transition: &str,
+) -> Result<(), PgTrickleError> {
+    if current_full_policy() == FullPolicy::Error {
+        return Err(PgTrickleError::IntegrationError {
+            code: "PGT_EXT_FULL_POLICY",
+            detail: format!(
+                "{}.{}, {} requires a whole-query FULL refresh",
+                st.pgt_schema, st.pgt_name, transition
+            ),
+        });
+    }
+    Ok(())
+}
 
 /// Run definition-derived SQL with the stream storage owner's role, stored
 /// search path, and RLS policy. Privileged callers resume their original
@@ -1010,6 +1099,12 @@ fn take_merge_strategy() -> &'static str {
 /// in this thread.
 pub fn take_effective_mode() -> &'static str {
     LAST_EFFECTIVE_MODE.with(|m| m.replace(""))
+}
+
+/// Read the effective mode without clearing it so a caller can build the
+/// durable execution record before the common finalizer consumes it.
+pub(crate) fn peek_effective_mode() -> &'static str {
+    LAST_EFFECTIVE_MODE.with(|m| m.get())
 }
 
 pub(crate) fn effective_mode_is_no_data() -> bool {

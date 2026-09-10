@@ -105,7 +105,7 @@ aggregates, window functions, multi-table joins, time-series, and EXISTS subquer
 ### Change data capture
 
 - **Trigger-based CDC** — lightweight `AFTER` row-level triggers; no `wal_level = logical`, no replication slots required.
-- **Safe default** — `pg_trickle.cdc_mode = auto` aliases trigger capture in v0.99; WAL capture is unavailable until durable receipt is proven.
+- **Safe default** — `pg_trickle.cdc_mode = auto` aliases trigger capture in v0.100; WAL capture is unavailable until durable receipt is proven.
 - **Watermark gating** — external loaders publish per-source watermarks; downstream refreshes wait until all sources are aligned before proceeding.
 
 ### Scheduling & dependency management
@@ -290,7 +290,7 @@ Incremental view maintenance is not free on the write side. CDC triggers add ove
 
 Several layers reduce this cost automatically:
 
-- **Trigger CDC** — the v0.99 safe default uses trigger capture; `auto` is an alias for `trigger`, and WAL capture is rejected with `PGT_EXT_CDC_UNAVAILABLE`.
+- **Trigger CDC** — the v0.100 safe default uses trigger capture; `auto` is an alias for `trigger`, and WAL capture is rejected with `PGT_EXT_CDC_UNAVAILABLE`.
 - **Columnar change tracking** — CDC records only the columns referenced by the defining query, using a VARBIT bitmask. UPDATEs that touch only unreferenced columns are skipped entirely, reducing delta volume by **50–90%** for wide tables.
 - **Delta predicate pushdown** — WHERE predicates from the defining query are injected into change buffer scans, filtering irrelevant changes at read time (**5–10x** delta volume reduction for selective queries).
 - **Event-driven scheduler wake** — CDC triggers emit `pg_notify()` to wake the scheduler immediately instead of polling, reducing propagation latency from ~515 ms to ~15 ms median.
@@ -300,7 +300,7 @@ For write-heavy workloads where trigger overhead is a concern, FULL refresh mode
 
 **If overhead is still a concern:**
 
-- **Avoid unsupported WAL capture** — `cdc_mode = 'wal'` is intentionally rejected in v0.99 until durable receipt is implemented.
+- **Avoid unsupported WAL capture** — `cdc_mode = 'wal'` is intentionally rejected in v0.100 until durable receipt is implemented.
 - **Batch writes** — prefer multi-row `INSERT` or `COPY` over single-row statements. Per-row trigger cost is constant, so batching amortizes it across fewer transactions and reduces change buffer pressure.
 - **Narrow the defining query** — referencing fewer source columns lets columnar filtering discard more UPDATE events at capture time. UPDATEs that touch only unreferenced columns are skipped entirely, with no entry written to the change buffer.
 - **Increase `refresh_interval`** — less frequent refreshes allow the compactor to collapse more cancelling changes per cycle, reducing the total delta volume the engine must process.

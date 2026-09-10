@@ -1,0 +1,4 @@
+-- pg_trickle 0.99.0 -> 0.100.0 upgrade migration
+--
+-- v0.100.0 adds the scoped refresh context, Graph V1 opt-in GUC, and release
+-- contract artifacts. The catalog schema is unchanged.

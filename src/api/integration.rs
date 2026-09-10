@@ -135,17 +135,18 @@ pub fn integration_capabilities() -> TableIterator<
         name!(details, JsonB),
     ),
 > {
+    let graph_enabled = crate::config::pg_trickle_experimental_graph_v1();
     TableIterator::new(vec![
         (
             super::GRAPH_V1_CAPABILITY.to_string(),
             1,
             0,
-            false,
+            graph_enabled,
             JsonB(serde_json::json!({
                 "status": "experimental",
-                "enabled": false,
-                "phase": "v0.98_fail_closed",
-                "unavailable_reason": "disabled until v0.100.0 Graph V1 implementation and conformance",
+                "enabled": graph_enabled,
+                "phase": "v0.100_scoped_opt_in",
+                "unavailable_reason": if graph_enabled { serde_json::Value::Null } else { serde_json::json!("enable pg_trickle.experimental_graph_v1 for experimental use") },
                 "refresh_api": "refresh_graph_strict",
                 "max_graph_members": 1024,
                 "source_boundary": "local_trigger"
@@ -865,6 +866,11 @@ pub fn refresh_graph_strict(
                 "full_policy must be ALLOW or ERROR",
             ));
         }
+        let full_policy = if policy == "ERROR" {
+            crate::refresh::FullPolicy::Error
+        } else {
+            crate::refresh::FullPolicy::Allow
+        };
         crate::api::recovery::assert_capture_ready()?;
         let (_, initial_digest, JsonB(initial_graph)) = graph_contract_data(&roots)?;
         if expected_graph_digest != initial_digest {
@@ -974,15 +980,7 @@ pub fn refresh_graph_strict(
             build_source_boundary(&graph, &members, &safe_bound, graph_refresh_id)?;
         let mut node_results = serde_json::Map::new();
         for (relid, meta) in member_ids {
-            if policy == "ERROR"
-                && (meta.refresh_mode != RefreshMode::Differential
-                    || meta.topk_limit.is_some()
-                    || meta.needs_reinit
-                    || meta
-                        .frontier
-                        .as_ref()
-                        .is_none_or(version::Frontier::is_empty))
-            {
+            if policy == "ERROR" && super::refresh_ops::manual_requires_whole_query_full(&meta) {
                 return Err(integration_error(
                     "PGT_EXT_FULL_POLICY",
                     format!(
@@ -992,14 +990,17 @@ pub fn refresh_graph_strict(
                 ));
             }
             let source_oids = super::refresh_ops::get_source_oids_for_manual_refresh(meta.pgt_id)?;
-            let refresh = super::refresh_ops::with_graph_safe_bound(&safe_bound, || {
-                super::refresh_ops::execute_manual_refresh(
-                    &meta,
-                    &meta.pgt_schema,
-                    &meta.pgt_name,
-                    &source_oids,
-                )
-            })?;
+            let refresh = crate::refresh::with_refresh_context(
+                crate::refresh::RefreshContext::graph(&safe_bound, full_policy),
+                || {
+                    super::refresh_ops::execute_manual_refresh(
+                        &meta,
+                        &meta.pgt_schema,
+                        &meta.pgt_name,
+                        &source_oids,
+                    )
+                },
+            )?;
             node_results.insert(
                 relid.to_string(),
                 serde_json::json!({

@@ -4,32 +4,25 @@
 
 use super::*;
 use crate::refresh::RefreshAction;
-use std::cell::RefCell;
-
-thread_local! {
-    static GRAPH_SAFE_BOUND: RefCell<Option<String>> = const { RefCell::new(None) };
-}
-
 /// Run one refresh with the immutable source bound selected by a strict graph.
 pub(crate) fn with_graph_safe_bound<T>(
     bound: &str,
     refresh: impl FnOnce() -> Result<T, PgTrickleError>,
 ) -> Result<T, PgTrickleError> {
-    let previous = GRAPH_SAFE_BOUND.with(|value| value.replace(Some(bound.to_string())));
-    let result = refresh();
-    GRAPH_SAFE_BOUND.with(|value| value.replace(previous));
-    result
+    refresh::with_refresh_context(
+        refresh::RefreshContext::graph(bound, refresh::current_full_policy()),
+        refresh,
+    )
 }
 
 fn refresh_safe_bound() -> Result<String, PgTrickleError> {
-    GRAPH_SAFE_BOUND
-        .with(|value| value.borrow().clone())
+    refresh::current_safe_bound()
         .map(Ok)
         .unwrap_or_else(crate::cdc::get_current_wal_lsn)
 }
 
 fn graph_bound_is_set() -> bool {
-    GRAPH_SAFE_BOUND.with(|value| value.borrow().is_some())
+    refresh::current_safe_bound().is_some()
 }
 
 #[derive(Debug, Clone)]
@@ -38,6 +31,16 @@ pub(crate) struct ManualRefreshResult {
     pub(crate) rows_inserted: i64,
     pub(crate) rows_updated: i64,
     pub(crate) rows_deleted: i64,
+}
+
+/// Whether the requested manual operation needs a whole-query FULL refresh.
+/// TopK is scoped recomputation and is allowed by `full_policy = 'ERROR'`.
+pub(crate) fn manual_requires_whole_query_full(st: &StreamTableMeta) -> bool {
+    st.topk_limit.is_none()
+        && (st.needs_reinit
+            || !st.is_populated
+            || st.frontier.as_ref().is_none_or(version::Frontier::is_empty)
+            || matches!(st.refresh_mode, RefreshMode::Full | RefreshMode::Immediate))
 }
 
 /// Manually trigger a synchronous refresh of a stream table.
@@ -199,7 +202,10 @@ fn refresh_stream_table_impl(
 
     // Transaction-level advisory lock is released automatically at
     // transaction end (commit or rollback); no explicit unlock needed.
-    execute_manual_refresh(&st, &schema, &table_name, &source_oids).map(|_| ())
+    refresh::with_refresh_context(refresh::RefreshContext::manual(), || {
+        execute_manual_refresh(&st, &schema, &table_name, &source_oids)
+    })
+    .map(|_| ())
 }
 
 /// Inner function for manual refresh, called while advisory lock is held.
@@ -215,6 +221,10 @@ pub(crate) fn execute_manual_refresh(
     table_name: &str,
     source_oids: &[pg_sys::Oid],
 ) -> Result<ManualRefreshResult, PgTrickleError> {
+    // Discard a stale mode left by a prior failed Rust-level execution before
+    // the common finalizer observes the next result.
+    let _ = refresh::take_effective_mode();
+
     // EC-25/EC-26: Set the internal_refresh flag so DML guard triggers
     // allow the refresh executor to modify the storage table.
     Spi::run("SET LOCAL pg_trickle.internal_refresh = 'true'")
@@ -233,6 +243,10 @@ pub(crate) fn execute_manual_refresh(
         refresh::with_stream_owner(st, || {
             crate::api::validate_incremental_mode_for_query(&st.defining_query, st.refresh_mode)
         })?;
+    }
+
+    if manual_requires_whole_query_full(st) {
+        refresh::ensure_full_policy(st, "manual refresh")?;
     }
 
     // ERG-D: Determine the action label for history recording.
@@ -342,6 +356,16 @@ pub(crate) fn execute_manual_refresh(
 
     // ERG-D: Complete the refresh history record.
     let mut rows_updated_for_result = 0;
+    let effective_mode = refresh::peek_effective_mode();
+    let effective_action = match effective_mode {
+        "FULL" => RefreshAction::Full,
+        "NO_DATA" => RefreshAction::NoData,
+        _ => match action {
+            "FULL" => RefreshAction::Full,
+            "DIFFERENTIAL" => RefreshAction::Differential,
+            _ => RefreshAction::Reinitialize,
+        },
+    };
     match &result {
         Ok((rows_inserted, rows_deleted)) => {
             let rows_updated = refresh::take_last_rows_updated();
@@ -360,26 +384,22 @@ pub(crate) fn execute_manual_refresh(
                     "DIFFERENTIAL" => RefreshAction::Differential,
                     _ => RefreshAction::Reinitialize,
                 },
-                effective_action: match action {
-                    "FULL" => RefreshAction::Full,
-                    "DIFFERENTIAL" => RefreshAction::Differential,
-                    _ => RefreshAction::Reinitialize,
-                },
+                effective_action,
                 frontier,
                 rows_inserted: *rows_inserted,
                 rows_updated,
                 rows_deleted: *rows_deleted,
                 data_changed: !refresh::effective_mode_is_no_data()
                     && (*rows_inserted > 0 || rows_updated > 0 || *rows_deleted > 0),
-                was_full_fallback: false,
-                full_reason: refresh::FullRefreshReason::for_action(
-                    match action {
-                        "FULL" => RefreshAction::Full,
-                        "DIFFERENTIAL" => RefreshAction::Differential,
-                        _ => RefreshAction::Reinitialize,
-                    },
-                    !st.is_populated,
-                ),
+                was_full_fallback: effective_action == RefreshAction::Full && action != "FULL",
+                full_reason: if effective_action == RefreshAction::Full && action == "DIFFERENTIAL"
+                {
+                    // Differential fallback paths persist their typed reason
+                    // before entering the shared FULL executor.
+                    None
+                } else {
+                    refresh::FullRefreshReason::for_action(effective_action, !st.is_populated)
+                },
                 downstream_capture_complete: true,
             };
             refresh::finalize_success(st, &execution, refresh_id, now, schema, table_name)?;
@@ -400,7 +420,11 @@ pub(crate) fn execute_manual_refresh(
     }
 
     result.map(|(rows_inserted, rows_deleted)| ManualRefreshResult {
-        action: action.to_string(),
+        action: if effective_mode.is_empty() {
+            action.to_string()
+        } else {
+            effective_mode.to_string()
+        },
         rows_inserted,
         rows_updated: rows_updated_for_result,
         rows_deleted,
@@ -484,6 +508,7 @@ fn execute_manual_full_refresh_target(
     table_name: &str,
     source_oids: &[pg_sys::Oid],
 ) -> Result<(i64, i64), PgTrickleError> {
+    refresh::ensure_full_policy(st, "manual refresh")?;
     refresh::set_effective_mode("FULL");
     crate::cdc::validate_stream_table_row_identity(st)?;
     let dependencies = StDependency::get_for_st(st.pgt_id)?;
@@ -493,6 +518,35 @@ fn execute_manual_full_refresh_target(
     crate::cdc::lock_source_relations(source_oids)?;
     crate::cdc::lock_stream_table_sources(st.pgt_id, &dependencies)?;
     let safe_bound = refresh_safe_bound()?;
+
+    let needs_diff_capture =
+        !st.refresh_mode.is_immediate() && refresh::has_downstream_st_consumers(st.pgt_id);
+    let prepared_user_cols = if needs_diff_capture {
+        refresh::get_st_user_columns(st)
+    } else {
+        Vec::new()
+    };
+    if needs_diff_capture && !prepared_user_cols.is_empty() {
+        let col_list = prepared_user_cols
+            .iter()
+            .map(|column| format!("\"{}\"", column.replace('"', "\"\"")))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let quoted_table = format!(
+            "{}.{}",
+            quote_identifier(schema),
+            quote_identifier(table_name),
+        );
+        let pre_select = format!("SELECT __pgt_row_id, {col_list} FROM {quoted_table}");
+        refresh::prepare_owner_temp_table(st, &format!("__pgt_pre_{}", st.pgt_id), &pre_select)?;
+        refresh::with_stream_owner(st, || {
+            Spi::run(&format!(
+                "INSERT INTO pg_temp.{} SELECT __pgt_row_id, {col_list} FROM {quoted_table}",
+                quote_identifier(&format!("__pgt_pre_{}", st.pgt_id)),
+            ))
+            .map_err(|e| PgTrickleError::SpiError(e.to_string()))
+        })?;
+    }
 
     // EC-25/EC-26: Ensure the internal_refresh flag is set so DML guard
     // triggers allow the refresh executor to modify the storage table.
@@ -715,6 +769,16 @@ fn execute_manual_full_refresh_target(
         );
     }
 
+    if needs_diff_capture && !prepared_user_cols.is_empty() {
+        refresh::capture_full_refresh_diff_to_st_buffer(st, &prepared_user_cols).map_err(|e| {
+            PgTrickleError::RefreshFinalizationFailed {
+                pgt_id: st.pgt_id,
+                stage: "manual full-refresh downstream CDC capture".to_string(),
+                reason: e.to_string(),
+            }
+        })?;
+    }
+
     // Compute and store frontier so differential can start from here.
     // S3 optimization: single SPI call combines frontier storage,
     // timestamp update, and marking the ST as populated.
@@ -824,24 +888,32 @@ fn execute_manual_differential_refresh(
         return execute_manual_full_refresh(st, schema, table_name, source_oids);
     }
 
+    // IMMEDIATE upstreams maintain their output through IVM triggers, not the
+    // deferred stream-table change buffer consumed by this path. A FULL
+    // recompute is therefore the safe boundary for this mixed-mode edge.
+    if upstream_immediate_source_requires_full(st)? {
+        refresh::ensure_full_policy(st, "IMMEDIATE upstream source")?;
+        pgrx::info!(
+            "Stream table {}.{}: IMMEDIATE upstream requires FULL refresh",
+            schema,
+            table_name,
+        );
+        return execute_manual_full_refresh(st, schema, table_name, source_oids);
+    }
+
+    if let Some(reason) = upstream_st_source_requires_full(st)? {
+        refresh::ensure_full_policy(st, reason)?;
+        pgrx::info!(
+            "Stream table {}.{}: {} — using FULL refresh",
+            schema,
+            table_name,
+            reason,
+        );
+        return execute_manual_full_refresh(st, schema, table_name, source_oids);
+    }
+
     refresh::poll_foreign_table_sources_for_st(st)?;
     crate::cdc::lock_source_relations(source_oids)?;
-
-    // ST-source guard: if ANY upstream dependency is a STREAM_TABLE, always
-    // fall back to a FULL refresh.  The manual FULL refresh path
-    // (`execute_manual_full_refresh`) does not populate ST change buffers
-    // (`changes_pgt_`), so a downstream DIFFERENTIAL refresh would see an
-    // empty change buffer and silently skip real changes.
-    // The background scheduler handles this correctly (via
-    // `capture_full_refresh_diff_to_st_buffer`), but the manual path
-    // does not, so we must force FULL here.
-    {
-        let deps = StDependency::get_for_st(st.pgt_id).unwrap_or_default();
-        let has_st_source = deps.iter().any(|dep| dep.source_type == "STREAM_TABLE");
-        if has_st_source {
-            return execute_manual_full_refresh(st, schema, table_name, source_oids);
-        }
-    }
 
     // Get current WAL positions for non-ST sources (reuses source_oids — G-N3)
     // The source lock is the visibility proof for this manual refresh: no
@@ -866,6 +938,9 @@ fn execute_manual_differential_refresh(
     let slot_positions = cdc::get_slot_positions_at_bound(source_oids, &safe_bound)?;
     let data_ts = get_data_timestamp_str();
     let mut new_frontier = version::compute_new_frontier(&slot_positions, &data_ts);
+    for (upstream_pgt_id, lsn) in upstream_st_source_positions(st, &safe_bound)? {
+        new_frontier.set_st_source(upstream_pgt_id, lsn, data_ts.clone());
+    }
     // A bounded buffer position can trail the stored frontier. Never replay
     // deltas by letting a differential frontier move backward.
     new_frontier.merge_from(&prev_frontier);
@@ -926,6 +1001,92 @@ fn execute_manual_differential_refresh(
         rows_deleted,
     );
     Ok((rows_inserted, rows_deleted))
+}
+
+fn upstream_st_source_positions(
+    st: &StreamTableMeta,
+    safe_bound: &str,
+) -> Result<Vec<(i64, String)>, PgTrickleError> {
+    let change_schema = crate::config::pg_trickle_change_buffer_schema().replace('"', "\"\"");
+    StDependency::get_for_st(st.pgt_id)?
+        .into_iter()
+        .filter(|dependency| dependency.source_type == "STREAM_TABLE")
+        .map(|dependency| {
+            let upstream_pgt_id = StreamTableMeta::pgt_id_for_relid(dependency.source_relid)
+                .ok_or_else(|| PgTrickleError::CdcStateInvalid {
+                    pgt_id: st.pgt_id,
+                    source_name: format!("OID {}", dependency.source_relid.to_u32()),
+                    buffer: "stream-table dependency".to_string(),
+                    reason: "upstream stream table metadata is missing".to_string(),
+                })?;
+            if !crate::cdc::has_st_change_buffer(upstream_pgt_id, &change_schema) {
+                return Err(PgTrickleError::CdcStateInvalid {
+                    pgt_id: st.pgt_id,
+                    source_name: format!("pgt_id {upstream_pgt_id}"),
+                    buffer: format!("{change_schema}.changes_pgt_{upstream_pgt_id}"),
+                    reason: "required stream-table change buffer is missing".to_string(),
+                });
+            }
+            let lsn = Spi::get_one_with_args::<String>(
+                &format!(
+                    "SELECT LEAST(COALESCE(MAX(lsn), '0/0'::pg_lsn), $1::pg_lsn)::text \
+                     FROM \"{change_schema}\".changes_pgt_{upstream_pgt_id}"
+                ),
+                &[safe_bound.into()],
+            )
+            .map_err(|e| PgTrickleError::CdcStateInvalid {
+                pgt_id: st.pgt_id,
+                source_name: format!("pgt_id {upstream_pgt_id}"),
+                buffer: format!("{change_schema}.changes_pgt_{upstream_pgt_id}"),
+                reason: format!("could not read bounded upstream position: {e}"),
+            })?
+            .ok_or_else(|| PgTrickleError::CdcStateInvalid {
+                pgt_id: st.pgt_id,
+                source_name: format!("pgt_id {upstream_pgt_id}"),
+                buffer: format!("{change_schema}.changes_pgt_{upstream_pgt_id}"),
+                reason: "bounded upstream position was NULL".to_string(),
+            })?;
+            Ok((upstream_pgt_id, lsn))
+        })
+        .collect()
+}
+
+fn upstream_immediate_source_requires_full(st: &StreamTableMeta) -> Result<bool, PgTrickleError> {
+    for dependency in StDependency::get_for_st(st.pgt_id)? {
+        if dependency.source_type == "STREAM_TABLE"
+            && StreamTableMeta::get_by_relid(dependency.source_relid)?
+                .refresh_mode
+                .is_immediate()
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn upstream_st_source_requires_full(
+    st: &StreamTableMeta,
+) -> Result<Option<&'static str>, PgTrickleError> {
+    let mut st_source_count = 0;
+    for dependency in StDependency::get_for_st(st.pgt_id)? {
+        if dependency.source_type != "STREAM_TABLE" {
+            continue;
+        }
+        st_source_count += 1;
+        let upstream = StreamTableMeta::get_by_relid(dependency.source_relid)?;
+        if upstream.topk_limit.is_some()
+            || upstream
+                .window_strategy
+                .as_ref()
+                .is_some_and(|plan| !plan.nodes.is_empty())
+        {
+            return Ok(Some("windowed or scoped upstream requires FULL refresh"));
+        }
+    }
+    if st_source_count > 2 {
+        return Ok(Some("three-way stream-table join requires FULL refresh"));
+    }
+    Ok(None)
 }
 
 /// Get source table OIDs for a stream table (used by manual refresh path).

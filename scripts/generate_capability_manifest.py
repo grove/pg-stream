@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate and validate the v0.99 capability and strategy manifest."""
+"""Generate and validate the current capability and strategy manifest."""
 
 from __future__ import annotations
 
@@ -7,11 +7,13 @@ import hashlib
 import json
 import re
 import sys
+import tomllib
 from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-SOURCE = ROOT / "tests/release/v0.99-admission-examples.json"
+VERSION = tomllib.loads((ROOT / "Cargo.toml").read_text(encoding="utf-8"))["package"]["version"]
+SOURCE = ROOT / f"tests/release/v{VERSION.rsplit('.', 1)[0]}-admission-examples.json"
 OUTPUT = ROOT / "docs/capability-manifest.json"
 OUTCOMES = {"accepted", "rejected", "experimental-disabled"}
 STRATEGIES = {"DIFFERENTIAL", "FULL", "IMMEDIATE", "UNAVAILABLE"}
@@ -31,8 +33,8 @@ def validate(source: dict) -> None:
     errors: list[str] = []
     if source.get("manifest_version") != 1:
         errors.append("manifest_version must be 1")
-    if source.get("release_version") != "0.99.0":
-        errors.append("release_version must be 0.99.0")
+    if source.get("release_version") != VERSION:
+        errors.append(f"release_version must be {VERSION}")
 
     capabilities = source.get("capabilities")
     examples = source.get("examples")
