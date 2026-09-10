@@ -745,7 +745,7 @@ async fn test_ivm_alter_to_immediate_allows_window() {
     // Create as DIFFERENTIAL with a window function query.
     db.execute(
         "SELECT pgtrickle.create_stream_table('sw_win_st', \
-         $$SELECT id, val, row_number() OVER (PARTITION BY grp ORDER BY val) AS rn FROM sw_win$$, \
+         $$SELECT id, val, row_number() OVER (PARTITION BY grp ORDER BY val) AS rn FROM public.sw_win$$, \
          '5m', 'DIFFERENTIAL')",
     )
     .await;
