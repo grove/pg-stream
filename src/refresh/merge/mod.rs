@@ -3128,7 +3128,6 @@ pub fn execute_differential_refresh_with_tuning(
     let phantom_cleanup_count = if query_has_join
         && !query_has_recursive_cte
         && !resolved.is_deduplicated
-        && !st.has_keyless_source
         && st.st_partition_key.is_none()
     {
         let quoted_table = format!(
