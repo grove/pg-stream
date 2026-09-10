@@ -88,7 +88,7 @@ When a defining query joins multiple source tables:
 | `MIN(x)`, `MAX(x)` | ✅ Yes | With reference counting |
 | `AVG(x)` | ✅ Yes | Via sum + count decomposition |
 | `STDDEV(x)`, `VARIANCE(x)` | ✅ Yes | Via sum-of-squares decomposition |
-| `COUNT(DISTINCT x)` | ✅ Yes | Via Z-set algebraic counting |
+| `COUNT/SUM/AVG(DISTINCT x)` | ✅ Narrow | One simple non-collatable input column over one table; bounded by `pg_trickle.distinct_agg_max_values_per_group`, otherwise FULL/AUTO |
 | `ARRAY_AGG(x)` | ❌ No | Order-dependent; use FULL mode |
 | `STRING_AGG(x, sep)` | ❌ No | Order-dependent; use FULL mode |
 | `JSON_AGG(x)` | ❌ No | Order-dependent; use FULL mode |

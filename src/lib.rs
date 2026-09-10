@@ -71,6 +71,8 @@ mod refresh;
 #[allow(dead_code)]
 pub mod scheduler;
 #[allow(dead_code)]
+pub(crate) mod setop_state;
+#[allow(dead_code)]
 mod shmem;
 pub mod sql_builder;
 #[allow(dead_code)]

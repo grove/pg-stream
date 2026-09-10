@@ -348,6 +348,8 @@ O(delta × lineitem) work.
 | Semi-join (EXISTS) | DIFF | — | — |
 | Anti-join (NOT EXISTS) | DIFF | — | — |
 | DISTINCT | DIFF | — | — |
+| COUNT/SUM/AVG(DISTINCT simple scalar) | GROUP_RESCAN | Affected group exceeds `distinct_agg_max_values_per_group` | `DISTINCT_AGG_BOUNDED_STATE_FULL_FALLBACK` |
+| Other DISTINCT aggregates | FULL | Always | `AGG-101-1-DISTINCT` |
 | Non-recursive CTE | DIFF (inlined) | — | — |
 | Recursive CTE | FULL | Always | `recursive_cte_fallback` |
 | UNION ALL | DIFF | — | — |

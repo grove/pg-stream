@@ -37,6 +37,7 @@ The cutoff exists because:
 
 <!-- TOC start -->
 - [Unreleased](#unreleased)
+- [0.101.0 — Exact relational state and semantic depth](#01010--exact-relational-state-and-semantic-depth)
 - [0.100.0 — Unified transactional IVM execution](#01000--unified-transactional-ivm-execution)
 - [0.99.0 — Verified capabilities and product truth](#0990--verified-capabilities-and-product-truth)
 - [0.98.1 — Qualified interim baseline](#0981--qualified-interim-baseline)
@@ -210,6 +211,21 @@ Run `ALTER EXTENSION pg_trickle UPDATE` after installing the 0.87.12 files.
 ## [Unreleased]
 
 Future changes will be listed here.
+
+## [0.101.0] — Exact relational state and semantic depth
+
+v0.101.0 makes duplicate-sensitive set operations and the supported DISTINCT
+aggregate path durable across incremental changes.
+
+- Maintains private branch multiplicity state for `INTERSECT`, `INTERSECT ALL`,
+  `EXCEPT`, and `EXCEPT ALL` without exposing implementation columns.
+- Admits only the bounded DISTINCT aggregate forms whose equality, NULL,
+  deletion, and resource behavior are defined.
+- Exercises repeated retractions, NULLs, duplicates, empty results, numeric
+  fidelity, and private-state lifecycle recovery.
+
+See the [v0.101.0 roadmap](roadmap/v0.101.0.md) and
+[capability manifest](docs/capability-manifest.json).
 
 ## [0.100.0] — Unified transactional IVM execution
 

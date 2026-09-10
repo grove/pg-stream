@@ -485,6 +485,12 @@ pub fn execute_reinitialize_refresh(st: &StreamTableMeta) -> Result<(i64, i64), 
     // transaction after the target reflects the current source definitions.
     let updated = crate::api::reinit_rewrite_if_needed(st)?;
     let _window_plan = crate::window_state::prepare_for_protected_refresh(&updated)?;
+    // REL-101-1: rebuild private set-operation state against the reinitialized
+    // (possibly rewritten) query in the same transaction. Gated on the cheap
+    // set-operation string check so non-set-operation reinit stays unchanged.
+    if crate::dvm::query_needs_dual_count(&updated.defining_query) {
+        crate::setop_state::rebuild_for_full_refresh(&updated)?;
+    }
 
     // Clear reinit flag
     Spi::run(&format!(

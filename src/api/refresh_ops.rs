@@ -467,6 +467,7 @@ pub fn reinit_rewrite_if_needed(st: &StreamTableMeta) -> Result<StreamTableMeta,
     // protected-refresh finalizer regenerates the plan after the target has
     // been materialized from this exact query.
     crate::window_state::drop_for_stream(st.pgt_id)?;
+    crate::setop_state::drop_for_stream(st.pgt_id)?;
     Spi::run_with_args(
         "UPDATE pgtrickle.pgt_stream_tables \
          SET defining_query = $1, defining_query_hash = $2, \
@@ -499,6 +500,11 @@ pub(crate) fn execute_manual_full_refresh(
 ) -> Result<(i64, i64), PgTrickleError> {
     let result = execute_manual_full_refresh_target(st, schema, table_name, source_oids)?;
     let _window_plan = crate::window_state::prepare_for_protected_refresh(st)?;
+    // REL-101-1: (re)build durable, private INTERSECT/EXCEPT branch-multiplicity
+    // state on the manual/create FULL refresh path, matching the scheduler path.
+    if crate::dvm::query_needs_dual_count(&st.defining_query) {
+        crate::setop_state::rebuild_for_full_refresh(st)?;
+    }
     Ok(result)
 }
 

@@ -142,6 +142,7 @@ coordinator must fail instead of allowing a whole-query FULL fallback.
     - [pg\_trickle.max\_buffer\_rows](#pg_tricklemax_buffer_rows)
     - [pg\_trickle.auto\_index](#pg_trickleauto_index)
     - [pg\_trickle.aggregate\_fast\_path](#pg_trickleaggregate_fast_path)
+    - [pg\_trickle.distinct\_agg\_max\_values\_per\_group](#pg_trickledistinct_agg_max_values_per_group)
     - [pg\_trickle.template\_cache](#pg_trickletemplate_cache)
     - [pg\_trickle.buffer\_partitioning](#pg_tricklebuffer_partitioning)
     - [pg\_trickle.max\_grouping\_set\_branches](#pg_tricklemax_grouping_set_branches)
@@ -1319,6 +1320,32 @@ SET pg_trickle.aggregate_fast_path = false;
 
 -- Check the current aggregate path for a stream table
 SELECT * FROM pgtrickle.explain_st('my_agg_st');
+```
+
+---
+
+### pg_trickle.distinct_agg_max_values_per_group
+
+Bounds differential refreshes for admitted DISTINCT aggregates.
+
+| Property | Value |
+|---|---|
+| Type | `int` |
+| Default | `10000` |
+| Context | `SUSET` |
+| Restart Required | No |
+
+`COUNT(DISTINCT x)`, `SUM(DISTINCT x)`, and `AVG(DISTINCT x)` stay
+differential only for the narrow contract: one simple non-collatable input
+column from one table, optional `WHERE`, no aggregate `FILTER`, no aggregate
+`ORDER BY`, and no joins/subqueries in the aggregate input. For each affected
+group, pg_trickle verifies that the current number of distinct non-NULL input
+values is at or below this cap before running the scoped rescan. If the cap is
+exceeded, explicit differential refresh reports a fail-closed reason and
+manual/AUTO execution uses FULL refresh.
+
+```sql
+SET pg_trickle.distinct_agg_max_values_per_group = 5000;
 ```
 
 ---

@@ -5,6 +5,23 @@ use super::*;
 use crate::dag::RefreshMode;
 use crate::error::PgTrickleError;
 
+const BOOLOID: u32 = 16;
+const BYTEAOID: u32 = 17;
+const INT8OID: u32 = 20;
+const INT2OID: u32 = 21;
+const INT4OID: u32 = 23;
+const OIDOID: u32 = 26;
+const FLOAT4OID: u32 = 700;
+const FLOAT8OID: u32 = 701;
+const UUIDOID: u32 = 2950;
+const DATEOID: u32 = 1082;
+const TIMEOID: u32 = 1083;
+const TIMESTAMPOID: u32 = 1114;
+const TIMESTAMPTZOID: u32 = 1184;
+const TIMETZOID: u32 = 1266;
+const INTERVALOID: u32 = 1186;
+const NUMERICOID: u32 = 1700;
+
 /// A structured reason why a query cannot use incremental maintenance.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ValidationIssue {
@@ -242,7 +259,20 @@ fn collect_admission_issues(tree: &OpTree, immediate: bool, issues: &mut Vec<Val
             collect_admission_issues(left, immediate, issues);
             collect_admission_issues(right, immediate, issues);
         }
-        OpTree::Aggregate { child, .. } => collect_admission_issues(child, immediate, issues),
+        OpTree::Aggregate {
+            child,
+            group_by,
+            aggregates,
+        } => {
+            for agg in aggregates {
+                if agg.is_distinct
+                    && let Some(issue) = distinct_aggregate_admission_issue(agg, child, group_by)
+                {
+                    issues.push(issue);
+                }
+            }
+            collect_admission_issues(child, immediate, issues);
+        }
         OpTree::UnionAll { children } => {
             for child in children {
                 collect_admission_issues(child, immediate, issues);
@@ -265,6 +295,136 @@ fn collect_admission_issues(tree: &OpTree, immediate: bool, issues: &mut Vec<Val
         | OpTree::RecursiveSelfRef { .. }
         | OpTree::ConstantSelect { .. } => {}
     }
+}
+
+fn distinct_aggregate_admission_issue(
+    agg: &AggExpr,
+    child: &OpTree,
+    group_by: &[Expr],
+) -> Option<ValidationIssue> {
+    let issue = |reason: String| {
+        ValidationIssue {
+        code: "AGG-101-1-DISTINCT",
+        operator: "DISTINCT_AGG",
+        reason: format!(
+            "{} aggregate '{}' is outside the bounded DISTINCT aggregate contract: {reason}",
+            agg.function.sql_name(),
+            agg.alias,
+        ),
+        hint: "Use FULL or AUTO, or rewrite as COUNT/SUM/AVG(DISTINCT simple non-collatable column) over one table with an optional WHERE clause."
+            .to_string(),
+    }
+    };
+
+    if !matches!(agg.function, AggFunc::Count | AggFunc::Sum | AggFunc::Avg) {
+        return Some(issue(
+            "only COUNT, SUM, and AVG have a proven DISTINCT state path".to_string(),
+        ));
+    }
+    if agg.filter.is_some() {
+        return Some(issue(
+            "aggregate FILTER is not part of the bounded DISTINCT contract".to_string(),
+        ));
+    }
+    if agg.second_arg.is_some()
+        || agg
+            .order_within_group
+            .as_ref()
+            .is_some_and(|o| !o.is_empty())
+    {
+        return Some(issue(
+            "ordered or multi-argument DISTINCT aggregates are not supported".to_string(),
+        ));
+    }
+
+    let Some(columns) = direct_scan_columns(child) else {
+        return Some(issue(
+            "the aggregate input must be one scan, optionally below a WHERE filter".to_string(),
+        ));
+    };
+
+    for expr in group_by {
+        if column_type_oid(expr, columns).is_none() {
+            return Some(issue(
+                "GROUP BY keys must be simple columns from the aggregate input".to_string(),
+            ));
+        }
+    }
+
+    let Some(argument) = agg.argument.as_ref() else {
+        return Some(issue(
+            "DISTINCT aggregate argument must be one simple column".to_string(),
+        ));
+    };
+    let Some(argument_oid) = column_type_oid(argument, columns) else {
+        return Some(issue(
+            "DISTINCT aggregate argument must be one simple input column".to_string(),
+        ));
+    };
+
+    let supported = match agg.function {
+        AggFunc::Count => distinct_scalar_type_supported(argument_oid),
+        AggFunc::Sum | AggFunc::Avg => distinct_numeric_type_supported(argument_oid),
+        _ => false,
+    };
+    if !supported {
+        return Some(issue(format!(
+            "argument '{}' has unsupported or collation-sensitive type OID {argument_oid}",
+            argument.to_sql()
+        )));
+    }
+
+    None
+}
+
+fn direct_scan_columns(child: &OpTree) -> Option<&[Column]> {
+    match child {
+        OpTree::Scan { columns, .. } => Some(columns),
+        OpTree::Filter { child, .. } => match child.as_ref() {
+            OpTree::Scan { columns, .. } => Some(columns),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn column_type_oid(expr: &Expr, columns: &[Column]) -> Option<u32> {
+    let Expr::ColumnRef { column_name, .. } = expr else {
+        return None;
+    };
+    columns
+        .iter()
+        .find(|column| column.name == *column_name)
+        .map(|column| column.type_oid)
+}
+
+fn distinct_scalar_type_supported(oid: u32) -> bool {
+    matches!(
+        oid,
+        BOOLOID
+            | BYTEAOID
+            | INT2OID
+            | INT4OID
+            | INT8OID
+            | OIDOID
+            | FLOAT4OID
+            | FLOAT8OID
+            | NUMERICOID
+            | UUIDOID
+            | DATEOID
+            | TIMEOID
+            | TIMESTAMPOID
+            | TIMESTAMPTZOID
+            | TIMETZOID
+            | INTERVALOID
+    )
+}
+
+fn distinct_numeric_type_supported(oid: u32) -> bool {
+    matches!(
+        oid,
+        INT2OID | INT4OID | INT8OID | FLOAT4OID | FLOAT8OID | NUMERICOID
+    )
 }
 
 // ── Volatility checking ─────────────────────────────────────────────────
@@ -1538,6 +1698,193 @@ pub fn check_monotonicity_with_registry(result: &ParseResult) -> Result<(), PgTr
         check_monotonicity(body)?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod distinct_aggregate_admission_tests {
+    use super::*;
+
+    fn scan() -> OpTree {
+        OpTree::Scan {
+            table_oid: 1,
+            table_name: "t".to_string(),
+            schema: "public".to_string(),
+            alias: "t".to_string(),
+            columns: vec![
+                Column {
+                    name: "grp".to_string(),
+                    type_oid: INT4OID,
+                    is_nullable: false,
+                },
+                Column {
+                    name: "n".to_string(),
+                    type_oid: PG_NUMERIC_TYPE_OID,
+                    is_nullable: true,
+                },
+                Column {
+                    name: "txt".to_string(),
+                    type_oid: 25,
+                    is_nullable: true,
+                },
+            ],
+            pk_columns: vec![],
+        }
+    }
+
+    fn distinct_agg(function: AggFunc, arg: Expr) -> AggExpr {
+        AggExpr {
+            function,
+            argument: Some(arg),
+            alias: "d".to_string(),
+            is_distinct: true,
+            second_arg: None,
+            filter: None,
+            order_within_group: None,
+            statistical_support: None,
+        }
+    }
+
+    fn result(tree: OpTree) -> ParseResult {
+        ParseResult {
+            tree,
+            cte_registry: CteRegistry { entries: vec![] },
+            has_recursion: false,
+            warnings: vec![],
+            window_strategy: None,
+        }
+    }
+
+    #[test]
+    fn test_count_distinct_simple_scalar_is_admitted() {
+        let tree = OpTree::Aggregate {
+            group_by: vec![Expr::ColumnRef {
+                table_alias: None,
+                column_name: "grp".to_string(),
+            }],
+            aggregates: vec![distinct_agg(
+                AggFunc::Count,
+                Expr::ColumnRef {
+                    table_alias: None,
+                    column_name: "n".to_string(),
+                },
+            )],
+            child: Box::new(scan()),
+        };
+        assert!(matches!(
+            incremental_admission(&result(tree), 'i', false).expect("admission"),
+            IncrementalAdmission::Proven
+        ));
+    }
+
+    #[test]
+    fn test_sum_distinct_numeric_with_where_is_admitted() {
+        let tree = OpTree::Aggregate {
+            group_by: vec![],
+            aggregates: vec![distinct_agg(
+                AggFunc::Sum,
+                Expr::ColumnRef {
+                    table_alias: None,
+                    column_name: "n".to_string(),
+                },
+            )],
+            child: Box::new(OpTree::Filter {
+                predicate: Expr::Raw("n > 0".to_string()),
+                child: Box::new(scan()),
+            }),
+        };
+        assert!(matches!(
+            incremental_admission(&result(tree), 'i', false).expect("admission"),
+            IncrementalAdmission::Proven
+        ));
+    }
+
+    #[test]
+    fn test_distinct_text_argument_is_full_only() {
+        let tree = OpTree::Aggregate {
+            group_by: vec![],
+            aggregates: vec![distinct_agg(
+                AggFunc::Count,
+                Expr::ColumnRef {
+                    table_alias: None,
+                    column_name: "txt".to_string(),
+                },
+            )],
+            child: Box::new(scan()),
+        };
+        let IncrementalAdmission::FullOnly(issues) =
+            incremental_admission(&result(tree), 'i', false).expect("admission")
+        else {
+            panic!("text DISTINCT argument must be full-only");
+        };
+        assert_eq!(issues[0].code, "AGG-101-1-DISTINCT");
+    }
+
+    #[test]
+    fn test_distinct_filter_is_full_only() {
+        let mut agg = distinct_agg(
+            AggFunc::Count,
+            Expr::ColumnRef {
+                table_alias: None,
+                column_name: "n".to_string(),
+            },
+        );
+        agg.filter = Some(Expr::Raw("n > 0".to_string()));
+        let tree = OpTree::Aggregate {
+            group_by: vec![],
+            aggregates: vec![agg],
+            child: Box::new(scan()),
+        };
+        assert!(matches!(
+            incremental_admission(&result(tree), 'i', false).expect("admission"),
+            IncrementalAdmission::FullOnly(_)
+        ));
+    }
+
+    #[test]
+    fn test_distinct_expression_argument_is_full_only() {
+        let tree = OpTree::Aggregate {
+            group_by: vec![],
+            aggregates: vec![distinct_agg(
+                AggFunc::Count,
+                Expr::BinaryOp {
+                    op: "+".to_string(),
+                    left: Box::new(Expr::ColumnRef {
+                        table_alias: None,
+                        column_name: "n".to_string(),
+                    }),
+                    right: Box::new(Expr::Literal("1".to_string())),
+                },
+            )],
+            child: Box::new(scan()),
+        };
+        assert!(matches!(
+            incremental_admission(&result(tree), 'i', false).expect("admission"),
+            IncrementalAdmission::FullOnly(_)
+        ));
+    }
+
+    #[test]
+    fn test_distinct_aggregate_over_join_is_full_only() {
+        let tree = OpTree::Aggregate {
+            group_by: vec![],
+            aggregates: vec![distinct_agg(
+                AggFunc::Count,
+                Expr::ColumnRef {
+                    table_alias: None,
+                    column_name: "n".to_string(),
+                },
+            )],
+            child: Box::new(OpTree::InnerJoin {
+                condition: Expr::Literal("true".to_string()),
+                left: Box::new(scan()),
+                right: Box::new(scan()),
+            }),
+        };
+        assert!(matches!(
+            incremental_admission(&result(tree), 'i', false).expect("admission"),
+            IncrementalAdmission::FullOnly(_)
+        ));
+    }
 }
 
 #[cfg(test)]

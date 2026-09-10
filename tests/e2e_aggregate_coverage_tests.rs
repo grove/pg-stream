@@ -258,8 +258,11 @@ async fn test_agg_count_distinct_differential() {
     let db = E2eDb::new().await.with_extension().await;
     db.execute("CREATE TABLE agg_cdist (id SERIAL PRIMARY KEY, grp TEXT, val INT)")
         .await;
-    db.execute("INSERT INTO agg_cdist (grp, val) VALUES ('a', 1), ('a', 1), ('a', 2), ('b', 3)")
-        .await;
+    db.execute(
+        "INSERT INTO agg_cdist (grp, val) VALUES \
+             ('a', 1), ('a', 1), ('a', 2), ('a', NULL), ('b', 3)",
+    )
+    .await;
 
     let q = "SELECT grp, COUNT(DISTINCT val) AS uniq FROM agg_cdist GROUP BY grp";
     db.create_st("agg_cdist_st", q, "1m", "DIFFERENTIAL").await;
@@ -276,6 +279,22 @@ async fn test_agg_count_distinct_differential() {
         .await;
     db.refresh_st("agg_cdist_st").await;
     db.assert_st_matches_query("agg_cdist_st", q).await;
+
+    // Retract duplicates, then the last occurrence.
+    db.execute("DELETE FROM agg_cdist WHERE id IN (SELECT id FROM agg_cdist WHERE grp = 'a' AND val = 1 LIMIT 2)")
+            .await;
+    db.refresh_st("agg_cdist_st").await;
+    db.assert_st_matches_query("agg_cdist_st", q).await;
+
+    db.execute("DELETE FROM agg_cdist WHERE grp = 'a' AND val = 99")
+        .await;
+    db.refresh_st("agg_cdist_st").await;
+    db.assert_st_matches_query("agg_cdist_st", q).await;
+
+    // Empty group transition.
+    db.execute("DELETE FROM agg_cdist WHERE grp = 'b'").await;
+    db.refresh_st("agg_cdist_st").await;
+    db.assert_st_matches_query("agg_cdist_st", q).await;
 }
 
 #[tokio::test]
@@ -283,8 +302,11 @@ async fn test_agg_sum_distinct_differential() {
     let db = E2eDb::new().await.with_extension().await;
     db.execute("CREATE TABLE agg_sdist (id SERIAL PRIMARY KEY, grp TEXT, val INT)")
         .await;
-    db.execute("INSERT INTO agg_sdist (grp, val) VALUES ('a', 10), ('a', 10), ('a', 20), ('b', 5)")
-        .await;
+    db.execute(
+        "INSERT INTO agg_sdist (grp, val) VALUES \
+             ('a', 10), ('a', 10), ('a', 20), ('a', NULL), ('b', 5)",
+    )
+    .await;
 
     let q = "SELECT grp, SUM(DISTINCT val) AS total FROM agg_sdist GROUP BY grp";
     db.create_st("agg_sdist_st", q, "1m", "DIFFERENTIAL").await;
@@ -294,6 +316,118 @@ async fn test_agg_sum_distinct_differential() {
         .await;
     db.refresh_st("agg_sdist_st").await;
     db.assert_st_matches_query("agg_sdist_st", q).await;
+
+    db.execute("DELETE FROM agg_sdist WHERE id IN (SELECT id FROM agg_sdist WHERE grp = 'a' AND val = 10 LIMIT 1)")
+            .await;
+    db.refresh_st("agg_sdist_st").await;
+    db.assert_st_matches_query("agg_sdist_st", q).await;
+
+    db.execute("DELETE FROM agg_sdist WHERE grp = 'a' AND val IN (10, 20, 30)")
+        .await;
+    db.refresh_st("agg_sdist_st").await;
+    db.assert_st_matches_query("agg_sdist_st", q).await;
+}
+
+#[tokio::test]
+async fn test_agg_avg_distinct_numeric_differential() {
+    let db = E2eDb::new().await.with_extension().await;
+    db.execute("CREATE TABLE agg_adist (id SERIAL PRIMARY KEY, grp INT, val NUMERIC)")
+        .await;
+    db.execute(
+        "INSERT INTO agg_adist (grp, val) VALUES \
+             (1, 1000000000000.01), (1, 1000000000000.01), \
+             (1, 1000000000000.02), (1, NULL), (2, 5)",
+    )
+    .await;
+
+    let q = "SELECT grp, AVG(DISTINCT val) AS avg_val FROM agg_adist GROUP BY grp";
+    db.create_st("agg_adist_st", q, "1m", "DIFFERENTIAL").await;
+    db.assert_st_matches_query("agg_adist_st", q).await;
+
+    db.execute("INSERT INTO agg_adist (grp, val) VALUES (1, 1000000000000.03)")
+        .await;
+    db.refresh_st("agg_adist_st").await;
+    db.assert_st_matches_query("agg_adist_st", q).await;
+
+    db.execute("DELETE FROM agg_adist WHERE id IN (SELECT id FROM agg_adist WHERE grp = 1 AND val = 1000000000000.01 LIMIT 2)")
+            .await;
+    db.refresh_st("agg_adist_st").await;
+    db.assert_st_matches_query("agg_adist_st", q).await;
+}
+
+#[tokio::test]
+async fn test_agg_distinct_bound_exceeded_falls_back_to_full() {
+    let db = E2eDb::new().await.with_extension().await;
+    db.execute("CREATE TABLE agg_dbound (id INT PRIMARY KEY, grp INT, val INT)")
+        .await;
+    db.execute("INSERT INTO agg_dbound VALUES (1, 1, 1), (2, 1, 2)")
+        .await;
+
+    let q = "SELECT grp, COUNT(DISTINCT val) AS uniq FROM agg_dbound GROUP BY grp";
+    db.create_st("agg_dbound_st", q, "1m", "DIFFERENTIAL").await;
+    db.assert_st_matches_query("agg_dbound_st", q).await;
+
+    db.execute("INSERT INTO agg_dbound VALUES (3, 1, 3)").await;
+    db.try_execute_with_config(
+        &["SET pg_trickle.distinct_agg_max_values_per_group = 2"],
+        "SELECT pgtrickle.refresh_stream_table('agg_dbound_st')",
+    )
+    .await
+    .expect("DISTINCT bound overflow should fall back to FULL");
+    db.assert_st_matches_query("agg_dbound_st", q).await;
+
+    let (action, full_fallback): (String, bool) = sqlx::query_as(
+        "SELECT action, was_full_fallback FROM pgtrickle.pgt_refresh_history h \
+         JOIN pgtrickle.pgt_stream_tables st USING (pgt_id) \
+         WHERE st.pgt_name = 'agg_dbound_st' \
+         ORDER BY refresh_id DESC LIMIT 1",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .expect("refresh history");
+    assert_eq!(action, "DIFFERENTIAL");
+    assert!(full_fallback);
+}
+
+#[tokio::test]
+async fn test_agg_distinct_unsupported_forms_use_full_or_reject_diff() {
+    let db = E2eDb::new().await.with_extension().await;
+    db.execute("CREATE TABLE agg_dunsupported (id INT PRIMARY KEY, grp INT, txt TEXT, val INT)")
+        .await;
+    db.execute("INSERT INTO agg_dunsupported VALUES (1, 1, 'a', 10), (2, 1, 'A', 20)")
+        .await;
+
+    let explicit = db
+        .try_execute(
+            "SELECT pgtrickle.create_stream_table(
+                    'agg_dunsupported_diff_st',
+                    $$SELECT grp, COUNT(DISTINCT txt) AS uniq FROM agg_dunsupported GROUP BY grp$$,
+                    '1m',
+                    refresh_mode => 'DIFFERENTIAL'
+                )",
+        )
+        .await;
+    assert!(
+        explicit.is_err(),
+        "collation-sensitive DISTINCT must reject explicit DIFF"
+    );
+
+    db.execute(
+        "SELECT pgtrickle.create_stream_table(
+                'agg_dunsupported_auto_st',
+                $$SELECT grp, COUNT(DISTINCT txt) AS uniq FROM agg_dunsupported GROUP BY grp$$,
+                '1m',
+                refresh_mode => 'AUTO'
+            )",
+    )
+    .await;
+    let stored_mode: String = db
+        .query_scalar(
+            "SELECT refresh_mode FROM pgtrickle.pgt_stream_tables \
+                 WHERE pgt_name = 'agg_dunsupported_auto_st'",
+        )
+        .await;
+    assert_eq!(stored_mode, "FULL");
 }
 
 // ═══════════════════════════════════════════════════════════════════════

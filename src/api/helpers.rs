@@ -2912,6 +2912,12 @@ pub(super) fn initialize_st(
             .map_err(|e| PgTrickleError::SpiError(format!("Failed to initialize ST: {}", e)))
     })?;
 
+    // Initial population bypasses the normal FULL-refresh orchestrator, so
+    // build the durable private branch-multiplicity state explicitly here.
+    if crate::dvm::query_needs_dual_count(query) {
+        crate::setop_state::rebuild_for_full_refresh(&st)?;
+    }
+
     // Seed the initial frontier at creation time so every initialized stream
     // table participates in shared change-buffer bookkeeping immediately.
     // Without this, one branch of a diamond can remain frontier-less after the

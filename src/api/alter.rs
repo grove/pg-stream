@@ -1232,6 +1232,7 @@ fn alter_stream_table_query(
     // changing the storage or catalog contract; the surrounding transaction
     // restores it if any later ALTER phase fails.
     crate::window_state::drop_for_stream(st.pgt_id)?;
+    crate::setop_state::drop_for_stream(st.pgt_id)?;
 
     // ── Phase 3: Build isolated shadow storage ──
     publication::ensure_storage_replacement_allowed(&st)?;
@@ -3364,6 +3365,7 @@ pub(crate) fn execute_drop_stream_table(qualified_name: &str) -> Result<(), PgTr
     crate::refresh::flush_pending_cleanups_for_oids(&dep_oids);
 
     crate::window_state::drop_for_stream(st.pgt_id)?;
+    crate::setop_state::drop_for_stream(st.pgt_id)?;
 
     // Drop the storage table
     let drop_sql = format!(
@@ -3580,6 +3582,7 @@ fn repair_stream_table_impl(name: &str) -> Result<String, PgTrickleError> {
     let mut actions: Vec<String> = Vec::new();
     crate::window_state::drop_for_stream(st.pgt_id)?;
     actions.push("window state reset: scheduled protected rebuild".to_string());
+    crate::setop_state::drop_for_stream(st.pgt_id)?;
     let change_schema = config::pg_trickle_change_buffer_schema();
     let deps = StDependency::get_for_st(st.pgt_id).unwrap_or_default();
 
