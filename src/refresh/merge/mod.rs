@@ -708,6 +708,7 @@ pub fn execute_differential_refresh_with_tuning(
     new_frontier: &Frontier,
     tuning: &crate::catalog::RefreshRuntimeTuning,
 ) -> Result<(i64, i64), PgTrickleError> {
+    crate::refresh::clear_last_cost_evidence();
     validate_differential_refresh_inputs(st, prev_frontier)?;
 
     // Persist upgraded strategy metadata. Production v0.89 plans retain
@@ -3491,14 +3492,16 @@ pub fn execute_differential_refresh_with_tuning(
     // PH-E2: Query pg_stat_statements for temp file spill metrics.
     // Store in thread-local for the scheduler to read after this function returns.
     let spill_threshold = crate::config::pg_trickle_spill_threshold_blocks();
-    if spill_threshold > 0 {
+    let temp_blks_written = if spill_threshold > 0 {
         let temp_blks = crate::monitor::query_temp_file_usage(name)
             .map(|(_read, written)| written)
             .unwrap_or(0);
         set_last_temp_blks_written(temp_blks);
+        temp_blks
     } else {
         set_last_temp_blks_written(-1);
-    }
+        -1
+    };
 
     // Determine cache path and hint tier for profiling
     let cache_path = if was_cache_hit {
@@ -3648,6 +3651,44 @@ pub fn execute_differential_refresh_with_tuning(
     // Since we already verified `any_changes=true` above, the MERGE must
     // have processed at least one change buffer entry.
     let effective_count = (merge_count as i64).max(1);
+
+    let mut cost_evidence =
+        crate::refresh::build_differential_cost_evidence(total_change_count, effective_count);
+    if let Some(fields) = cost_evidence.as_object_mut() {
+        fields.insert(
+            "source_rows_estimate".into(),
+            serde_json::json!(_total_table_size.max(0)),
+        );
+        fields.insert(
+            "estimated_output_rows".into(),
+            serde_json::json!(delta_estimate),
+        );
+        fields.insert("operator_scan_count".into(), serde_json::json!(scan_count));
+        fields.insert(
+            "plan_identity".into(),
+            serde_json::json!(st.defining_query_hash),
+        );
+        fields.insert("merge_strategy".into(), serde_json::json!(strategy_label));
+        fields.insert("cache_path".into(), serde_json::json!(cache_path));
+        fields.insert("planner_hint_tier".into(), serde_json::json!(hint_tier));
+        fields.insert(
+            "temp_blocks_written".into(),
+            serde_json::json!(temp_blks_written),
+        );
+        fields.insert(
+            "timings_ms".into(),
+            serde_json::json!({
+                "decision": t_decision.as_secs_f64() * 1000.0,
+                "generate_and_build": t1.duration_since(t0).as_secs_f64() * 1000.0,
+                "apply": t2.duration_since(t1).as_secs_f64() * 1000.0,
+                "cleanup_enqueue": t3.duration_since(t2).as_secs_f64() * 1000.0,
+                "total": (t_decision.as_secs_f64() + t3.duration_since(t0).as_secs_f64()) * 1000.0,
+            }),
+        );
+    }
+    let cost_evidence = serde_json::to_string(&cost_evidence)
+        .map_err(|e| PgTrickleError::InternalError(format!("serialize cost evidence: {e}")))?;
+    crate::refresh::set_last_cost_evidence(cost_evidence);
 
     // ── DAG-3: Delta amplification detection ────────────────────────
     // After the MERGE completes, check whether the output delta is
