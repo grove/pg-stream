@@ -291,6 +291,13 @@ pub(crate) fn execute_full_refresh_target(
         warn_default_partition_growth(&st.pgt_schema, &st.pgt_name);
     }
 
+    // Initial CREATE and reinitialization call the target-level FULL refresh
+    // directly, so rebuild private set-operation state here as well as in the
+    // public FULL-refresh wrapper.
+    if crate::dvm::query_needs_dual_count(&st.defining_query) {
+        crate::setop_state::rebuild_for_full_refresh(st)?;
+    }
+
     Ok((rows_inserted, 0))
 }
 
@@ -426,6 +433,273 @@ fn validate_differential_refresh_inputs(
     }
 
     Ok(())
+}
+
+#[derive(Debug)]
+struct DistinctAggBoundCheck {
+    alias: String,
+    function: &'static str,
+    source_oid: u32,
+    source_schema: String,
+    source_table: String,
+    source_alias: String,
+    filter_sql: Option<String>,
+    group_keys: Vec<(String, String)>,
+    argument_sql: String,
+}
+
+fn collect_distinct_agg_bound_checks(
+    tree: &crate::dvm::parser::OpTree,
+    checks: &mut Vec<DistinctAggBoundCheck>,
+) -> Result<(), PgTrickleError> {
+    use crate::dvm::parser::{Expr, OpTree};
+
+    match tree {
+        OpTree::Aggregate {
+            child,
+            group_by,
+            aggregates,
+        } => {
+            let (scan, filter_sql) = match child.as_ref() {
+                OpTree::Scan { .. } => (child.as_ref(), None),
+                OpTree::Filter { predicate, child } => match child.as_ref() {
+                    OpTree::Scan { .. } => (child.as_ref(), Some(predicate.to_sql())),
+                    _ => {
+                        if aggregates.iter().any(|agg| agg.is_distinct) {
+                            return Err(distinct_agg_bound_error(
+                                "DISTINCT aggregate input is not a single filtered scan",
+                            ));
+                        }
+                        collect_distinct_agg_bound_checks(child, checks)?;
+                        return Ok(());
+                    }
+                },
+                _ => {
+                    if aggregates.iter().any(|agg| agg.is_distinct) {
+                        return Err(distinct_agg_bound_error(
+                            "DISTINCT aggregate input is not a single filtered scan",
+                        ));
+                    }
+                    collect_distinct_agg_bound_checks(child, checks)?;
+                    return Ok(());
+                }
+            };
+
+            let OpTree::Scan {
+                table_oid,
+                schema,
+                table_name,
+                alias,
+                ..
+            } = scan
+            else {
+                return Err(distinct_agg_bound_error(
+                    "DISTINCT aggregate input scan could not be resolved",
+                ));
+            };
+
+            let mut group_keys = Vec::with_capacity(group_by.len());
+            for key in group_by {
+                let Expr::ColumnRef { column_name, .. } = key else {
+                    return Err(distinct_agg_bound_error(
+                        "DISTINCT aggregate GROUP BY key is not a simple column",
+                    ));
+                };
+                group_keys.push((key.to_sql(), column_name.clone()));
+            }
+
+            for agg in aggregates.iter().filter(|agg| agg.is_distinct) {
+                let Some(Expr::ColumnRef { .. }) = agg.argument.as_ref() else {
+                    return Err(distinct_agg_bound_error(
+                        "DISTINCT aggregate argument is not a simple column",
+                    ));
+                };
+                checks.push(DistinctAggBoundCheck {
+                    alias: agg.alias.clone(),
+                    function: agg.function.sql_name(),
+                    source_oid: *table_oid,
+                    source_schema: schema.clone(),
+                    source_table: table_name.clone(),
+                    source_alias: alias.clone(),
+                    filter_sql: filter_sql.clone(),
+                    group_keys: group_keys.clone(),
+                    argument_sql: agg
+                        .argument
+                        .as_ref()
+                        .map(Expr::to_sql)
+                        .unwrap_or_else(|| "NULL".to_string()),
+                });
+            }
+
+            collect_distinct_agg_bound_checks(child, checks)
+        }
+        OpTree::Project { child, .. }
+        | OpTree::Filter { child, .. }
+        | OpTree::Distinct { child }
+        | OpTree::Subquery { child, .. }
+        | OpTree::Window { child, .. }
+        | OpTree::LateralSubquery { child, .. }
+        | OpTree::LateralFunction { child, .. } => collect_distinct_agg_bound_checks(child, checks),
+        OpTree::InnerJoin { left, right, .. }
+        | OpTree::LeftJoin { left, right, .. }
+        | OpTree::FullJoin { left, right, .. }
+        | OpTree::SemiJoin { left, right, .. }
+        | OpTree::AntiJoin { left, right, .. }
+        | OpTree::Intersect { left, right, .. }
+        | OpTree::Except { left, right, .. } => {
+            collect_distinct_agg_bound_checks(left, checks)?;
+            collect_distinct_agg_bound_checks(right, checks)
+        }
+        OpTree::UnionAll { children } => {
+            for child in children {
+                collect_distinct_agg_bound_checks(child, checks)?;
+            }
+            Ok(())
+        }
+        OpTree::ScalarSubquery {
+            child, subquery, ..
+        } => {
+            collect_distinct_agg_bound_checks(child, checks)?;
+            collect_distinct_agg_bound_checks(subquery, checks)
+        }
+        OpTree::RecursiveCte {
+            base, recursive, ..
+        } => {
+            collect_distinct_agg_bound_checks(base, checks)?;
+            collect_distinct_agg_bound_checks(recursive, checks)
+        }
+        OpTree::Scan { .. }
+        | OpTree::CteScan { .. }
+        | OpTree::RecursiveSelfRef { .. }
+        | OpTree::ConstantSelect { .. } => Ok(()),
+    }
+}
+
+fn distinct_agg_bound_error(reason: &str) -> PgTrickleError {
+    PgTrickleError::QueryTooComplex(format!(
+        "DISTINCT_AGG_BOUNDED_STATE_FULL_FALLBACK: {reason}; use FULL/AUTO or rewrite to the documented bounded DISTINCT aggregate subset"
+    ))
+}
+
+fn enforce_distinct_aggregate_bounds(
+    st: &StreamTableMeta,
+    defining_query: &str,
+    prev_frontier: &Frontier,
+    new_frontier: &Frontier,
+    change_schema: &str,
+) -> Result<(), PgTrickleError> {
+    let max_values = crate::config::pg_trickle_distinct_agg_max_values_per_group() as i64;
+    let mut result = crate::dvm::parse_defining_query_full(defining_query)?;
+    let mut checks = Vec::new();
+    collect_distinct_agg_bound_checks(&result.tree, &mut checks)?;
+    for (_, body) in result.cte_registry.entries.drain(..) {
+        collect_distinct_agg_bound_checks(&body, &mut checks)?;
+    }
+    if checks.is_empty() {
+        return Ok(());
+    }
+
+    for check in checks {
+        let observed =
+            distinct_aggregate_max_values(&check, prev_frontier, new_frontier, change_schema)?;
+        if observed > max_values {
+            return Err(PgTrickleError::QueryTooComplex(format!(
+                "DISTINCT_AGG_BOUNDED_STATE_FULL_FALLBACK: {}.{} {}(DISTINCT) '{}' has {observed} distinct non-NULL value(s) in an affected group, exceeding pg_trickle.distinct_agg_max_values_per_group={max_values}; falling back to FULL refresh",
+                st.pgt_schema, st.pgt_name, check.function, check.alias,
+            )));
+        }
+    }
+
+    Ok(())
+}
+
+fn distinct_aggregate_max_values(
+    check: &DistinctAggBoundCheck,
+    prev_frontier: &Frontier,
+    new_frontier: &Frontier,
+    change_schema: &str,
+) -> Result<i64, PgTrickleError> {
+    let q = crate::api::quote_identifier;
+    let source = format!(
+        "{}.{} AS {}",
+        q(&check.source_schema),
+        q(&check.source_table),
+        q(&check.source_alias),
+    );
+    let prev_lsn = prev_frontier.get_lsn(check.source_oid);
+    let new_lsn = new_frontier.get_lsn(check.source_oid);
+    let buffer = crate::cdc::buffer_base_name_for_oid(pg_sys::Oid::from(check.source_oid));
+
+    let changed_predicate = format!(
+        "c.lsn > '{prev_lsn}'::pg_lsn AND c.lsn <= '{new_lsn}'::pg_lsn AND c.action IN ('I', 'D')"
+    );
+    let affected = if check.group_keys.is_empty() {
+        format!(
+            "SELECT 1 WHERE EXISTS (SELECT 1 FROM \"{change_schema}\".{buffer} c WHERE {changed_predicate})"
+        )
+    } else {
+        let select = check
+            .group_keys
+            .iter()
+            .enumerate()
+            .map(|(idx, (_, column))| format!("c.{} AS {}", q(column), q(&format!("g{idx}"))))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!(
+            "SELECT DISTINCT {select} FROM \"{change_schema}\".{buffer} c WHERE {changed_predicate}"
+        )
+    };
+
+    let affected_filter = if check.group_keys.is_empty() {
+        "EXISTS (SELECT 1 FROM __pgt_distinct_affected)".to_string()
+    } else {
+        let conditions = check
+            .group_keys
+            .iter()
+            .enumerate()
+            .map(|(idx, (source_sql, _))| {
+                format!(
+                    "{source_sql} IS NOT DISTINCT FROM a.{}",
+                    q(&format!("g{idx}"))
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(" AND ");
+        format!("EXISTS (SELECT 1 FROM __pgt_distinct_affected a WHERE {conditions})")
+    };
+
+    let where_clause = match &check.filter_sql {
+        Some(filter) => format!("WHERE ({filter}) AND {affected_filter}"),
+        None => format!("WHERE {affected_filter}"),
+    };
+    let group_by = if check.group_keys.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "\nGROUP BY {}",
+            check
+                .group_keys
+                .iter()
+                .map(|(source_sql, _)| source_sql.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    };
+    let sql = format!(
+        "WITH __pgt_distinct_affected AS MATERIALIZED ({affected}) \
+         SELECT COALESCE(MAX(__pgt_distinct_n), 0)::bigint \
+         FROM (SELECT COUNT(DISTINCT {arg})::bigint AS __pgt_distinct_n \
+               FROM {source} {where_clause}{group_by}) __pgt_distinct_bound",
+        arg = check.argument_sql,
+    );
+
+    Spi::get_one::<i64>(&sql)
+        .map_err(|e| PgTrickleError::SpiError(format!("DISTINCT aggregate bound check: {e}")))?
+        .ok_or_else(|| {
+            PgTrickleError::SpiError(
+                "DISTINCT aggregate bound check returned no result".to_string(),
+            )
+        })
 }
 
 pub fn execute_differential_refresh_with_tuning(
@@ -934,6 +1208,16 @@ pub fn execute_differential_refresh_with_tuning(
     if !any_changes && !any_st_changes {
         return Ok((0, 0));
     }
+
+    with_stream_owner(st, || {
+        enforce_distinct_aggregate_bounds(
+            st,
+            &effective_defining_query,
+            prev_frontier,
+            new_frontier,
+            &change_schema,
+        )
+    })?;
 
     // ── A-3a: Append-only heuristic fallback ─────────────────────────
     // When the stream table is marked append-only, check whether any

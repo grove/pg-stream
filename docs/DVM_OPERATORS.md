@@ -20,7 +20,7 @@ This document describes the Differential View Maintenance (DVM) operators implem
 | `INTERSECT` / `EXCEPT` | ✅ | ❌ | ❌ | [Set Operations](#set-operations) |
 | `COUNT`, `SUM`, `AVG` | ✅ | ✅ | ✅ | [Aggregates](#aggregates) |
 | `MIN` / `MAX` | ✅ | ✅ | ✅ | [Aggregates](#aggregates) |
-| `COUNT(DISTINCT)` / `SUM(DISTINCT)` | ✅ | ✅ | ✅ | [Aggregates](#aggregates) |
+| `COUNT/SUM/AVG(DISTINCT)` | ✅ | ✅ | ✅ | [Aggregates](#aggregates) |
 | `STRING_AGG` / `ARRAY_AGG` | ✅ | ⚠️ | ⚠️ | [Aggregates](#aggregates) |
 | `JSONB_AGG` / `JSONB_OBJECT_AGG` | ✅ | ⚠️ | ⚠️ | [Aggregates](#aggregates) |
 | Window functions | ✅ | ⚠️ | ⚠️ | [Window Functions](#window-functions) |
@@ -101,7 +101,7 @@ The following table shows which SQL constructs are supported under each refresh 
 | **Aggregates** | | | | |
 | `COUNT`, `SUM`, `AVG` | ✅ | ✅ | ✅ | Algebraic — fully invertible delta |
 | `MIN`, `MAX` | ✅ | ✅ | ✅ | Semi-algebraic — group rescan on ambiguous delete |
-| `COUNT(DISTINCT)`, `SUM(DISTINCT)` | ✅ | ✅ | ✅ | Algebraic via auxiliary columns |
+| `COUNT/SUM/AVG(DISTINCT simple_scalar)` | ✅ | ✅ | ✅ | Bounded affected-group rescan; unsupported DISTINCT aggregate forms are FULL-only |
 | `BOOL_AND`, `BOOL_OR`, `BIT_AND`, `BIT_OR` | ✅ | ✅ | ✅ | Algebraic via auxiliary columns |
 | `EVERY` | ✅ | ✅ | ✅ | Algebraic via auxiliary columns |
 | `STRING_AGG`, `ARRAY_AGG` | ✅ | ⚠️ | ⚠️ | Group-rescan strategy — warning emitted at creation time in DIFFERENTIAL mode |
@@ -402,9 +402,20 @@ Where:
 | `JSON_OBJECTAGG(key: value ...)` | Group-rescan | SQL-standard JSON aggregation (PostgreSQL 16+); full deparsed SQL preserved |
 | User-defined aggregates (`CREATE AGGREGATE`) | Group-rescan | Any custom aggregate is supported via group-rescan; full aggregate call SQL preserved verbatim |
 
+**DISTINCT aggregate contract:**
+
+`COUNT(DISTINCT x)`, `SUM(DISTINCT x)`, and `AVG(DISTINCT x)` are admitted for
+one simple, non-collatable input column over one table with an optional `WHERE`
+clause. They use PostgreSQL's own `DISTINCT` equality and NULL semantics during
+affected-group rescans, with a hard per-group cap controlled by
+`pg_trickle.distinct_agg_max_values_per_group`. Aggregate `FILTER`, aggregate
+`ORDER BY`, expressions, joins/subqueries, collatable value types, and other
+DISTINCT aggregate functions are FULL-only: AUTO falls back to FULL, explicit
+DIFFERENTIAL/IMMEDIATE rejects the query.
+
 **FILTER Clause:**
 
-All aggregate functions support the `FILTER (WHERE …)` clause:
+Non-DISTINCT aggregate functions support the `FILTER (WHERE …)` clause:
 
 ```sql
 SELECT COUNT(*) FILTER (WHERE status = 'active') AS active_count FROM orders GROUP BY region

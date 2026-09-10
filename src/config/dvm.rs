@@ -119,6 +119,14 @@ pub static PGS_MAX_PARSE_DEPTH: GucSetting<i32> = GucSetting::<i32>::new(64);
 /// any realistic query requires (~10–60 CTEs for TPC-H queries).
 pub static PGS_MAX_DIFF_CTES: GucSetting<i32> = GucSetting::<i32>::new(1000);
 
+/// Maximum distinct input values per group for admitted DISTINCT aggregates.
+///
+/// `COUNT(DISTINCT x)`, `SUM(DISTINCT x)`, and `AVG(DISTINCT x)` use scoped
+/// PostgreSQL re-aggregation for affected groups. This cap bounds the private
+/// distinct value set PostgreSQL may build for any one affected group during a
+/// differential refresh. Exceeding the cap fails closed into FULL fallback.
+pub static PGS_DISTINCT_AGG_MAX_VALUES_PER_GROUP: GucSetting<i32> = GucSetting::<i32>::new(10_000);
+
 /// Number of differential refresh cycles after which algebraic aggregate
 /// stream tables are automatically reinitialized (full recompute) to reset
 /// accumulated floating-point drift in auxiliary sum/sum2 columns.
@@ -739,6 +747,20 @@ pub fn register_dvm_gucs() {
     );
 
     GucRegistry::define_int_guc(
+        c"pg_trickle.distinct_agg_max_values_per_group",
+        c"Maximum DISTINCT aggregate values per affected group.",
+        c"Bounds the private value set used by DISTINCT aggregate group rescans. \
+           COUNT/SUM/AVG(DISTINCT simple_scalar) remain differential only while \
+           every affected group stays within this cap; exceeding it falls back \
+           to FULL refresh.",
+        &PGS_DISTINCT_AGG_MAX_VALUES_PER_GROUP,
+        1,
+        1_000_000,
+        GucContext::Suset,
+        GucFlags::default(),
+    );
+
+    GucRegistry::define_int_guc(
         c"pg_trickle.algebraic_drift_reset_cycles",
         c"Differential cycles between automatic full recomputes for algebraic aggregates.",
         c"After this many differential refresh cycles, stream tables with algebraic \
@@ -1230,6 +1252,11 @@ pub fn pg_trickle_template_cache_enabled() -> bool {
 /// Returns the number of differential cycles before automatic drift reset.
 pub fn pg_trickle_algebraic_drift_reset_cycles() -> i32 {
     PGS_ALGEBRAIC_DRIFT_RESET_CYCLES.get()
+}
+
+/// Returns the per-group DISTINCT aggregate value cap.
+pub fn pg_trickle_distinct_agg_max_values_per_group() -> i32 {
+    PGS_DISTINCT_AGG_MAX_VALUES_PER_GROUP.get()
 }
 
 /// Returns the delta-to-ST ratio threshold for disabling seqscan before MERGE.

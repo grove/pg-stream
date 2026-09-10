@@ -2015,6 +2015,22 @@ fn split_top_level_set_op(query: &str) -> Option<SetOpParts> {
     None
 }
 
+/// Classify a top-level `INTERSECT`/`EXCEPT` query into its catalog
+/// `(operation, is_all)` representation.
+///
+/// Returns `None` when the query is not a top-level set operation. The
+/// `operation` value is `"INTERSECT"` or `"EXCEPT"` (matching the
+/// `pgtrickle.pgt_set_operation_states.operation` CHECK constraint); `is_all`
+/// distinguishes bag (`ALL`) from set semantics.
+pub fn classify_top_level_set_op(defining_query: &str) -> Option<(&'static str, bool)> {
+    split_top_level_set_op(defining_query).map(|parts| match parts.kind {
+        SetOpKind::Intersect => ("INTERSECT", false),
+        SetOpKind::IntersectAll => ("INTERSECT", true),
+        SetOpKind::Except => ("EXCEPT", false),
+        SetOpKind::ExceptAll => ("EXCEPT", true),
+    })
+}
+
 /// For INTERSECT / EXCEPT queries, generate a full-refresh SELECT that
 /// computes per-branch multiplicity counts (`__pgt_count_l`, `__pgt_count_r`)
 /// for the private state shape used by the differential operators.
@@ -2034,40 +2050,27 @@ pub fn try_set_op_refresh_sql(defining_query: &str, column_names: &[String]) -> 
     let left_alias_list = canonical_col_list.clone();
     let right_alias_list = canonical_col_list.clone();
     let group_list = canonical_col_list.clone();
-    let join_condition = canonical_cols
+
+    // Multiset identity groups NULLs together, exactly like SQL `GROUP BY`
+    // (and `IS NOT DISTINCT FROM`). Grouping the tagged union of both branches
+    // and counting per branch avoids a FULL OUTER JOIN on `IS NOT DISTINCT
+    // FROM`, which PostgreSQL rejects because that predicate is neither
+    // merge- nor hash-joinable.
+    let select_cols = canonical_cols
         .iter()
-        .map(|c| format!("l.{c} IS NOT DISTINCT FROM r.{c}"))
+        .zip(column_names)
+        .map(|(canonical, output)| format!("{canonical} AS {}", diff::quote_ident(output)))
         .collect::<Vec<_>>()
-        .join(" AND ");
+        .join(",\n       ");
 
-    // For FULL OUTER JOIN, columns from one side may be NULL.
-    // Use COALESCE to pick from whichever side matched.
-    let (select_cols, hash_items_final) = {
-        let coalesced: Vec<String> = canonical_cols
-            .iter()
-            .zip(column_names)
-            .map(|(canonical, output)| {
-                format!(
-                    "COALESCE(l.{canonical}, r.{canonical}) AS {output}",
-                    canonical = canonical,
-                    output = diff::quote_ident(output),
-                )
-            })
-            .collect();
-        let hash_items_c: Vec<String> = canonical_cols
-            .iter()
-            .map(|c| format!("COALESCE(l.{c}, r.{c})"))
-            .collect();
-        (coalesced.join(",\n       "), hash_items_c)
-    };
-
-    let hash_expr_final = if hash_items_final.len() == 1 {
+    let hash_items: Vec<String> = canonical_cols.clone();
+    let hash_expr_final = if hash_items.len() == 1 {
         format!(
             "pgtrickle.encode_row_id_v2('SET_KEY', ROW({}))",
-            hash_items_final[0]
+            hash_items[0]
         )
     } else {
-        crate::hash::build_row_identity_expr("SET_KEY", &hash_items_final)
+        crate::hash::build_row_identity_expr("SET_KEY", &hash_items)
     };
 
     let sql = format!(
@@ -2077,25 +2080,13 @@ pub fn try_set_op_refresh_sql(defining_query: &str, column_names: &[String]) -> 
          \x20 UNION ALL\n\
          \x20 SELECT {canonical_col_list}, 1::smallint AS __pgt_branch\n\
          \x20 FROM ({right}) AS __pgt_right_branch({right_alias_list})\n\
-         ),\n\
-         __pgt_left AS (\n\
-         \x20 SELECT {canonical_col_list}, COUNT(*) AS __cnt\n\
-         \x20 FROM __pgt_set_branches\n\
-         \x20 WHERE __pgt_branch = 0\n\
-         \x20 GROUP BY {group_list}\n\
-         ),\n\
-         __pgt_right AS (\n\
-         \x20 SELECT {canonical_col_list}, COUNT(*) AS __cnt\n\
-         \x20 FROM __pgt_set_branches\n\
-         \x20 WHERE __pgt_branch = 1\n\
-         \x20 GROUP BY {group_list}\n\
          )\n\
          SELECT {hash_expr_final} AS __pgt_row_id,\n\
          \x20      {select_cols},\n\
-         \x20      COALESCE(l.__cnt, 0) AS __pgt_count_l,\n\
-         \x20      COALESCE(r.__cnt, 0) AS __pgt_count_r\n\
-         FROM __pgt_left l\n\
-         FULL OUTER JOIN __pgt_right r ON {join_condition}",
+         \x20      COUNT(*) FILTER (WHERE __pgt_branch = 0) AS __pgt_count_l,\n\
+         \x20      COUNT(*) FILTER (WHERE __pgt_branch = 1) AS __pgt_count_r\n\
+         FROM __pgt_set_branches\n\
+         GROUP BY {group_list}",
         left = parts.left,
         right = parts.right,
     );
@@ -2609,7 +2600,50 @@ mod tests {
         assert!(!s.needs_pgt_count());
     }
 
+    #[test]
+    fn test_distinct_avg_does_not_request_algebraic_aux_columns() {
+        let s = scan(1, "t", "public", "t", &["amount"]);
+        let mut avg = avg_col("amount", "mean");
+        avg.is_distinct = true;
+        let agg = aggregate(vec![], vec![avg], s);
+        assert!(agg.avg_aux_columns().is_empty());
+    }
+
+    #[test]
+    fn test_distinct_sum_does_not_request_nonnull_aux_columns() {
+        let s = scan(1, "t", "public", "t", &["amount"]);
+        let mut sum = sum_col("amount", "total");
+        sum.is_distinct = true;
+        let agg = aggregate(vec![], vec![sum], s);
+        assert!(agg.nonnull_aux_columns().is_empty());
+    }
+
     // ── split_top_level_set_op ──────────────────────────────────────
+
+    #[test]
+    fn test_classify_top_level_set_op_all_forms() {
+        assert_eq!(
+            classify_top_level_set_op("SELECT a FROM t1 INTERSECT SELECT a FROM t2"),
+            Some(("INTERSECT", false))
+        );
+        assert_eq!(
+            classify_top_level_set_op("SELECT a FROM t1 INTERSECT ALL SELECT a FROM t2"),
+            Some(("INTERSECT", true))
+        );
+        assert_eq!(
+            classify_top_level_set_op("SELECT a FROM t1 EXCEPT SELECT a FROM t2"),
+            Some(("EXCEPT", false))
+        );
+        assert_eq!(
+            classify_top_level_set_op("SELECT a FROM t1 EXCEPT ALL SELECT a FROM t2"),
+            Some(("EXCEPT", true))
+        );
+        assert_eq!(classify_top_level_set_op("SELECT a FROM t1"), None);
+        assert_eq!(
+            classify_top_level_set_op("SELECT a FROM t1 UNION ALL SELECT a FROM t2"),
+            None
+        );
+    }
 
     #[test]
     fn test_split_set_op_intersect() {
@@ -2706,9 +2740,14 @@ mod tests {
             "FROM (SELECT x AS right_name, y FROM right_t) \
              AS __pgt_right_branch(__pgt_set_c1, __pgt_set_c2)"
         ));
-        assert!(sql.contains("l.__pgt_set_c1 IS NOT DISTINCT FROM r.__pgt_set_c1"));
-        assert!(sql.contains("l.__pgt_set_c2 IS NOT DISTINCT FROM r.__pgt_set_c2"));
+        // NULL-safe multiplicity via GROUP BY + per-branch COUNT FILTER, not a
+        // FULL OUTER JOIN on IS NOT DISTINCT FROM (which PostgreSQL rejects).
+        assert!(sql.contains("GROUP BY __pgt_set_c1, __pgt_set_c2"));
+        assert!(sql.contains("COUNT(*) FILTER (WHERE __pgt_branch = 0) AS __pgt_count_l"));
+        assert!(sql.contains("COUNT(*) FILTER (WHERE __pgt_branch = 1) AS __pgt_count_r"));
         assert!(sql.contains("UNION ALL"));
+        assert!(!sql.contains("FULL OUTER JOIN"));
+        assert!(!sql.contains("IS NOT DISTINCT FROM"));
         assert!(!sql.contains(" USING ("));
     }
 
